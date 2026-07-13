@@ -8,6 +8,7 @@ const PDF_HASH = "a".repeat(64);
 const run: RunDto = {
   id: "run-1",
   status: "queued",
+  applicationStatus: "applied",
   revision: 0,
   origin: "initial",
   createdAt: 1,
@@ -24,6 +25,7 @@ function service(overrides: Partial<RunRouteService> = {}) {
     listRuns: () => [run],
     getRun: () => run,
     createRun: async () => run,
+    updateApplicationStatus: async (_id, applicationStatus) => ({ ...run, applicationStatus }),
     retryRun: async () => run,
     regenerateRun: async () => ({ ...run, revision: 1, origin: "machine-regeneration", status: "editing" }),
     editRun: async () => ({ ...run, revision: 1, origin: "human-comments", status: "editing" }),
@@ -50,6 +52,14 @@ function post(body: unknown): RequestInit {
   };
 }
 
+function patch(body: unknown): RequestInit {
+  return {
+    method: "PATCH",
+    headers: { origin: ORIGIN, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  };
+}
+
 describe("run HTTP routes", () => {
   test("creates and lists runs then wakes the scheduler", async () => {
     const target = service();
@@ -60,6 +70,42 @@ describe("run HTTP routes", () => {
     expect(listed.status).toBe(200);
     expect((await listed.json()).runs).toEqual([run]);
     expect(target.kickCount()).toBe(2);
+  });
+
+  test("accepts only application statuses without waking the scheduler", async () => {
+    const applicationStatuses = ["applied", "rejected", "interview", "accepted", "failed"] as const;
+    const received: string[] = [];
+    let updateCalls = 0;
+    const target = service({
+      updateApplicationStatus: async (_id, applicationStatus) => {
+        updateCalls += 1;
+        received.push(applicationStatus);
+        return { ...run, applicationStatus };
+      },
+    });
+
+    for (const body of [
+      { applicationStatus: "queued" },
+      {},
+      { applicationStatus: "applied", extra: true },
+    ]) {
+      const response = await request(target, "/v1/runs/run-1", patch(body));
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: { code: "INVALID_REQUEST", message: "Application status is invalid" },
+      });
+      expect(updateCalls).toBe(0);
+      expect(target.kickCount()).toBe(0);
+    }
+
+    for (const applicationStatus of applicationStatuses) {
+      const response = await request(target, "/v1/runs/run-1", patch({ applicationStatus }));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ...run, applicationStatus });
+    }
+
+    expect(received).toEqual([...applicationStatuses]);
+    expect(target.kickCount()).toBe(0);
   });
 
   test("rejects undersized descriptions and nonempty retry bodies", async () => {

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const PIPELINE_SCHEMA_VERSION = 1;
+export const PIPELINE_SCHEMA_VERSION = 2;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -128,6 +128,11 @@ CREATE TRIGGER run_source_snapshots_no_update BEFORE UPDATE ON run_source_snapsh
 CREATE TRIGGER run_source_snapshots_no_delete BEFORE DELETE ON run_source_snapshots BEGIN SELECT RAISE(ABORT, 'source snapshots are immutable'); END;
 `;
 
+const migration2 = `
+ALTER TABLE runs ADD COLUMN application_status TEXT NOT NULL DEFAULT 'applied'
+  CHECK (application_status IN ('applied','rejected','interview','accepted','failed'));
+`;
+
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
   const version = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
   if (version > PIPELINE_SCHEMA_VERSION) throw new Error(`pipeline database version ${version} is newer than supported ${PIPELINE_SCHEMA_VERSION}`);
@@ -137,8 +142,12 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
     if (version === 0) {
       db.exec(migration1);
       db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, now);
-      db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
     }
+    if (version < 2) {
+      db.exec(migration2);
+      db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, now);
+    }
+    db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");

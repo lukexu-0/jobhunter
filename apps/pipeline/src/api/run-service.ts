@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
-import type { ArtifactDto, ArtifactKind, AttemptDto, AttemptStage, RevisionOrigin as PublicRevisionOrigin, RunDto, RunStatus, TimelineEvent } from "../contracts";
+import type { ApplicationStatus, ArtifactDto, ArtifactKind, AttemptDto, AttemptStage, RevisionOrigin as PublicRevisionOrigin, RunDto, RunStatus, TimelineEvent } from "../contracts";
 import type { ContextSnapshot } from "../context/types.ts";
 import {
   PipelineRepository,
@@ -180,6 +180,10 @@ export class RunApplicationService {
     return await this.#toDto(run);
   }
 
+  async updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto> {
+    return await this.#command(() => this.dependencies.repository.setApplicationStatus(id, applicationStatus));
+  }
+
   async retryRun(id: string): Promise<RunDto> {
     const current = sourceSnapshot(await this.#freshSnapshot());
     return await this.#command(() => this.dependencies.repository.retry(id, current));
@@ -282,6 +286,7 @@ export class RunApplicationService {
     return {
       id: run.id,
       status: run.status,
+      applicationStatus: run.applicationStatus,
       revision: run.currentRevision,
       origin: publicOrigin(repository.resolveCurrentRevisionOrigin(run.id)),
       createdAt: run.createdAt,

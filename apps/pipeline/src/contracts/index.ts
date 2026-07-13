@@ -84,6 +84,12 @@ export const RunStatusSchema = z.enum([
 ]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
+export const APPLICATION_STATUSES = ["applied", "rejected", "interview", "accepted", "failed"] as const;
+export const ApplicationStatusSchema = z.enum(APPLICATION_STATUSES);
+export type ApplicationStatus = z.infer<typeof ApplicationStatusSchema>;
+export const UpdateApplicationStatusRequestSchema =
+  z.object({ applicationStatus: ApplicationStatusSchema }).strict();
+
 export const RevisionOriginSchema = z.enum(["initial", "machine-regeneration", "human-comments"]);
 export type RevisionOrigin = z.infer<typeof RevisionOriginSchema>;
 
@@ -157,6 +163,7 @@ export const RunDtoSchema = z
   .object({
     id: z.string(),
     status: RunStatusSchema,
+    applicationStatus: ApplicationStatusSchema,
     revision: z.number().int().nonnegative(),
     origin: RevisionOriginSchema,
     createdAt: z.number().int(),

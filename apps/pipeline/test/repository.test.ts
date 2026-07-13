@@ -98,6 +98,31 @@ describe("pipeline repository claims", () => {
 });
 
 describe("persisted workflow commands", () => {
+  test("persists an independently user-managed application status", () => {
+    const { db, repo, tick, now } = fixture();
+    const created = repo.createRun("JD");
+    expect(created.applicationStatus).toBe("applied");
+    const eventCount = repo.timeline(created.id).events.length;
+
+    tick(1_000);
+    const updated = repo.setApplicationStatus(created.id, "interview");
+    const secondRepo = new PipelineRepository(db, { now });
+
+    expect(updated.applicationStatus).toBe("interview");
+    expect(repo.getRun(created.id)?.applicationStatus).toBe("interview");
+    expect(secondRepo.getRun(created.id)?.applicationStatus).toBe("interview");
+    expect(updated.status).toBe("queued");
+    expect(updated.updatedAt).toBeGreaterThan(created.updatedAt);
+    expect(repo.timeline(created.id).events).toHaveLength(eventCount);
+
+    const updatedAt = updated.updatedAt;
+    tick(1_000);
+    const unchanged = repo.setApplicationStatus(created.id, "interview");
+
+    expect(unchanged.updatedAt).toBe(updatedAt);
+    expect(repo.timeline(created.id).events).toHaveLength(eventCount);
+  });
+
   test("stores one immutable four-source snapshot and detects drift", () => {
     const { db, repo } = fixture();
     const run = repo.createRun("JD");

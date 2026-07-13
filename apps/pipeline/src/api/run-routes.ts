@@ -4,7 +4,9 @@ import {
   EditRunRequestSchema,
   RegenerateRunRequestSchema,
   RunDtoSchema,
+  UpdateApplicationStatusRequestSchema,
   type RunDto,
+  type ApplicationStatus,
 } from "../contracts";
 import { apiResponse } from "./handler";
 
@@ -12,6 +14,7 @@ export interface RunRouteService {
   listRuns(): Promise<RunDto[]> | RunDto[];
   getRun(id: string): Promise<RunDto | undefined> | RunDto | undefined;
   createRun(jobDescription: string): Promise<RunDto>;
+  updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto>;
   retryRun(id: string): Promise<RunDto>;
   regenerateRun(id: string, expectedPdfSha256: string): Promise<RunDto>;
   editRun(id: string, comments: string, expectedPdfSha256: string): Promise<RunDto>;
@@ -70,6 +73,12 @@ export function createRunRoutes(service: RunRouteService) {
         const run = await service.getRun(runId);
         service.kick();
         return run ? apiResponse.json(checkedRun(run)) : apiResponse.error("RUN_NOT_FOUND", "Run not found", 404);
+      }
+      if (request.method === "PATCH" && segments.length === 3) {
+        const body = UpdateApplicationStatusRequestSchema.safeParse(await parseBody(request));
+        if (!body.success) return apiResponse.error("INVALID_REQUEST", "Application status is invalid", 400);
+        const run = checkedRun(await service.updateApplicationStatus(runId, body.data.applicationStatus));
+        return apiResponse.json(run);
       }
       if (request.method === "GET" && segments[3] === "artifacts" && segments.length === 5) {
         const artifactId = segments[4];

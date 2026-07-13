@@ -121,6 +121,21 @@ describe("RunApplicationService", () => {
     expect(target.repository.acquire()?.runId).toBe(run.id);
   });
 
+  test("updates application status independently and rejects a missing run", async () => {
+    const target = fixture();
+    const created = await target.service.createRun("A detailed role requiring TypeScript systems work, careful testing, ownership, and reliable delivery.");
+    expect(created).toMatchObject({ applicationStatus: "applied", status: "queued" });
+
+    const updated = await target.service.updateApplicationStatus(created.id, "accepted");
+
+    expect(updated).toMatchObject({ applicationStatus: "accepted", status: "queued" });
+    await expect(target.service.getRun(created.id)).resolves.toMatchObject({ applicationStatus: "accepted", status: "queued" });
+    await expect(target.service.updateApplicationStatus("run-missing", "failed")).rejects.toMatchObject({
+      code: "RUN_NOT_FOUND",
+      status: 404,
+    });
+  });
+
   test("maps attempts, retry ancestry and inherited artifacts without exposing internal tokens, paths or logs", async () => {
     const target = fixture();
     const run = await target.service.createRun("A detailed job description for a platform engineer who owns resilient TypeScript delivery systems.");

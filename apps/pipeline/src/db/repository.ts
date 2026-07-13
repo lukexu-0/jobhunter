@@ -4,6 +4,8 @@ import { CLAIM_TTL_MS, createClaimToken, isProcessIdentityAlive, type ClaimToken
 
 export const RUN_STATUSES = ["queued", "analyzing", "tailoring", "editing", "compiling", "repairing", "deterministic_qa", "visual_qa", "review", "approved", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
+export const APPLICATION_STATUSES = ["applied", "rejected", "interview", "accepted", "failed"] as const;
+export type ApplicationStatus = (typeof APPLICATION_STATUSES)[number];
 export type ActiveStage = Exclude<RunStatus, "queued" | "review" | "approved" | "failed">;
 export type RevisionOrigin = "initial" | "retry" | "machine_regenerate" | "human_edit";
 export type AttemptOrigin = RevisionOrigin | "repair_loop";
@@ -35,6 +37,7 @@ interface RunRow {
   id: string;
   job_description: string;
   status: RunStatus;
+  application_status: ApplicationStatus;
   current_revision: number;
   failed_stage: ActiveStage | null;
   visual_ack_required: number;
@@ -62,6 +65,7 @@ export interface PublicRun {
   readonly id: string;
   readonly jobDescription: string;
   readonly status: RunStatus;
+  readonly applicationStatus: ApplicationStatus;
   readonly currentRevision: number;
   readonly failedStage: ActiveStage | null;
   readonly visualAcknowledgementRequired: boolean;
@@ -145,8 +149,8 @@ function assertSafePayload(value: unknown): void {
   }
 }
 function publicRun(row: RunRow): PublicRun {
-  return { id: row.id, jobDescription: row.job_description, status: row.status, currentRevision: row.current_revision,
-    failedStage: row.failed_stage, visualAcknowledgementRequired: row.visual_ack_required === 1,
+  return { id: row.id, jobDescription: row.job_description, status: row.status, applicationStatus: row.application_status,
+    currentRevision: row.current_revision, failedStage: row.failed_stage, visualAcknowledgementRequired: row.visual_ack_required === 1,
     approvedPdfSha256: row.approved_pdf_sha256, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 function publicAttempt(row: AttemptRow): PublicAttempt {
@@ -299,6 +303,15 @@ export class PipelineRepository {
 
   listRuns(limit = 100): PublicRun[] {
     return this.#db.query<RunRow, [number]>("SELECT * FROM runs ORDER BY queue_sequence LIMIT ?").all(limit).map(publicRun);
+  }
+
+  setApplicationStatus(runId: string, applicationStatus: ApplicationStatus): PublicRun {
+    return this.#immediate(() => {
+      const run = this.#run(runId);
+      if (run.application_status === applicationStatus) return publicRun(run);
+      this.#db.query("UPDATE runs SET application_status=?, updated_at=? WHERE id=?").run(applicationStatus, this.#now(), runId);
+      return publicRun(this.#run(runId));
+    });
   }
 
   getRevision(runId: string, revision?: number): RevisionRow | null {
