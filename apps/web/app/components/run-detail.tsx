@@ -27,6 +27,7 @@ import {
   regenerateRun,
   retryRun,
 } from "../lib/pipeline-client";
+import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import {
   publicArtifacts,
   selectCurrentRevisionArtifact,
@@ -881,7 +882,8 @@ export function RunDetail({ runId }: RunDetailProps) {
             <p className={styles.runSubtitle}>{subtitle}</p>
             <dl className={styles.metadataGrid}>
               <div><dt>Run ID</dt><dd title={run.id}>{shortRunId(run.id)}</dd></div>
-              <div><dt>Status</dt><dd>{STATUS_LABELS[run.status]}</dd></div>
+              <div><dt>Application status</dt><dd>{APPLICATION_STATUS_LABELS[run.applicationStatus]}</dd></div>
+              <div><dt>Pipeline status</dt><dd>{STATUS_LABELS[run.status]}</dd></div>
               <div><dt>Revision</dt><dd>{run.revision}</dd></div>
               <div><dt>Revision origin</dt><dd>{humanize(run.origin)}</dd></div>
               <div><dt>Created</dt><dd>{formatDate(run.createdAt)}</dd></div>

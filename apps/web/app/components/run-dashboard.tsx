@@ -3,9 +3,9 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import type { ArtifactDto, RunDto, RunStatus } from "@jobhunter/pipeline/contracts";
-import { PipelineClientError, createRun, listRuns, readJsonArtifact } from "../lib/pipeline-client";
-import { OAuthDashboard } from "./oauth-dashboard";
+import { APPLICATION_STATUSES, type ApplicationStatus, type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
+import { PipelineClientError, createRun, listRuns, readJsonArtifact, updateApplicationStatus } from "../lib/pipeline-client";
+import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 
 const PAGE_SIZE = 8;
 const POLL_INTERVAL_MS = 3_000;
@@ -13,33 +13,6 @@ const MIN_JOB_DESCRIPTION_LENGTH = 40;
 const MAX_JOB_DESCRIPTION_LENGTH = 50_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 
-const RUN_STATUSES = [
-  "queued",
-  "analyzing",
-  "tailoring",
-  "editing",
-  "compiling",
-  "repairing",
-  "deterministic_qa",
-  "visual_qa",
-  "review",
-  "approved",
-  "failed",
-] as const satisfies readonly RunStatus[];
-
-const STATUS_LABELS: Record<RunStatus, string> = {
-  queued: "Queued",
-  analyzing: "Analyzing",
-  tailoring: "Tailoring",
-  editing: "Editing",
-  compiling: "Compiling",
-  repairing: "Repairing",
-  deterministic_qa: "Deterministic QA",
-  visual_qa: "Visual QA",
-  review: "In review",
-  approved: "Approved",
-  failed: "Failed",
-};
 
 const IS_TERMINAL_STATUS: Record<RunStatus, boolean> = {
   queued: false,
@@ -132,13 +105,15 @@ export function RunDashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<RunStatus | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<ApplicationStatus | "all">("all");
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [isComposerOpen, setIsComposerOpen] = useState(false);
   const [jobDescription, setJobDescription] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
+  const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
   const requestedArtifacts = useRef(new Set<string>());
 
   const load = useCallback(async (initial = false) => {
@@ -198,11 +173,11 @@ export function RunDashboard() {
   const filteredRuns = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return runs
-      .filter((run) => statusFilter === "all" || run.status === statusFilter)
+      .filter((run) => statusFilter === "all" || run.applicationStatus === statusFilter)
       .filter((run) => {
         if (!normalizedQuery) return true;
         const identity = jobIdentities[run.id];
-        return [run.id, STATUS_LABELS[run.status], identity?.title, identity?.organization]
+        return [run.id, APPLICATION_STATUS_LABELS[run.applicationStatus], identity?.title, identity?.organization]
           .filter((value): value is string => Boolean(value))
           .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
       })
@@ -226,9 +201,31 @@ export function RunDashboard() {
     setCurrentPage(1);
   };
 
-  const updateStatus = (value: RunStatus | "all") => {
+  const updateStatus = (value: ApplicationStatus | "all") => {
     setStatusFilter(value);
     setCurrentPage(1);
+  };
+
+  const changeApplicationStatus = async (runId: string, applicationStatus: ApplicationStatus) => {
+    setBusyRunIds((current) => {
+      const next = new Set(current);
+      next.add(runId);
+      return next;
+    });
+    setStatusUpdateError(null);
+    try {
+      const updated = await updateApplicationStatus(runId, applicationStatus);
+      setRuns((current) => current.map((run) => run.id === updated.id ? updated : run));
+      setStatusUpdateError(null);
+    } catch {
+      setStatusUpdateError("Application state could not be updated. Try again.");
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        next.delete(runId);
+        return next;
+      });
+    }
   };
 
   const submitRun = async (event: FormEvent<HTMLFormElement>) => {
@@ -260,12 +257,8 @@ export function RunDashboard() {
 
   return (
     <main className="workspace">
-      <div className="workspace__frame">
-        <header className="applications-header">
-          <div>
-            <p className="applications-header__eyebrow">Resume tailoring</p>
-            <h1>Applications</h1>
-          </div>
+      <header className="applications-header">
+        <h1>Applications</h1>
           <button
             className="square-control square-control--primary"
             type="button"
@@ -343,9 +336,9 @@ export function RunDashboard() {
             <div className="applications-toolbar__actions">
               <label className="select-control">
                 <span>State</span>
-                <select value={statusFilter} onChange={(event) => updateStatus(event.target.value as RunStatus | "all")}>
+                <select aria-label="Filter applications by state" value={statusFilter} onChange={(event) => updateStatus(event.target.value as ApplicationStatus | "all")}>
                   <option value="all">All states</option>
-                  {RUN_STATUSES.map((status) => <option value={status} key={status}>{STATUS_LABELS[status]}</option>)}
+                  {APPLICATION_STATUSES.map((status) => <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>)}
                 </select>
               </label>
               <button
@@ -367,6 +360,12 @@ export function RunDashboard() {
             <div className="dashboard-alert dashboard-alert--toolbar" role="alert">
               <span>{loadError}</span>
               <button className="inline-control" type="button" onClick={() => void load()}>Retry</button>
+            </div>
+          ) : null}
+
+          {statusUpdateError ? (
+            <div className="dashboard-alert dashboard-alert--toolbar" role="alert" aria-label="Application state update error">
+              <span>{statusUpdateError}</span>
             </div>
           ) : null}
 
@@ -433,7 +432,21 @@ export function RunDashboard() {
                         </td>
                         <td>{identity?.organization ?? <span className="table-muted">Not available</span>}</td>
                         <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
-                        <td><span className={`run-status run-status--${run.status}`}>{STATUS_LABELS[run.status]}</span></td>
+                        <td>
+                          <select
+                            aria-label={`Application state for ${shortRunId(run.id)}`}
+                            className={`application-status-control application-status-control--${run.applicationStatus}`}
+                            value={run.applicationStatus}
+                            disabled={busyRunIds.has(run.id)}
+                            onChange={(event) => {
+                              void changeApplicationStatus(run.id, event.target.value as ApplicationStatus);
+                            }}
+                          >
+                            {APPLICATION_STATUSES.map((status) => (
+                              <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>
+                            ))}
+                          </select>
+                        </td>
                         <td><span className="revision-value">R{run.revision.toString().padStart(2, "0")}</span></td>
                         <td><Link className="row-arrow" href={href} aria-label={`Open run ${shortRunId(run.id)}`}>→</Link></td>
                       </tr>
@@ -465,14 +478,6 @@ export function RunDashboard() {
           ) : null}
         </section>
 
-        <details className="provider-access">
-          <summary>
-            <span>Provider access</span>
-            <span className="provider-access__hint">OAuth connection controls</span>
-          </summary>
-          <OAuthDashboard />
-        </details>
-      </div>
     </main>
   );
 }

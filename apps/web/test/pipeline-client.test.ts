@@ -11,6 +11,7 @@ import {
   readJsonArtifact,
   regenerateRun,
   retryRun,
+  updateApplicationStatus,
 } from "../app/lib/pipeline-client";
 
 const originalFetch = globalThis.fetch;
@@ -33,6 +34,7 @@ function run(status: RunStatus = "queued"): RunDto {
   return {
     id: `run ${status}`,
     status,
+    applicationStatus: "applied",
     revision: 0,
     origin: "initial",
     createdAt: 1,
@@ -91,6 +93,25 @@ describe("pipeline run requests", () => {
     expect((await listRuns()).map((item) => item.status)).toEqual(statuses);
     expect(requests).toEqual([
       { input: "/api/pipeline/runs", init: { cache: "no-store", method: "GET" } },
+    ]);
+  });
+
+  test("updates the user-managed application status", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const updated: RunDto = { ...run(), applicationStatus: "failed" };
+    capture(json(updated), requests);
+
+    await expect(updateApplicationStatus("run /1", "failed")).resolves.toEqual(updated);
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/runs/run%20%2F1",
+        init: {
+          body: JSON.stringify({ applicationStatus: "failed" }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "PATCH",
+        },
+      },
     ]);
   });
 

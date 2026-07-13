@@ -8,7 +8,9 @@ import {
   RegenerateRunRequestSchema,
   RunDtoSchema,
   RunListResponseSchema,
+  UpdateApplicationStatusRequestSchema,
   type ArtifactDto,
+  type ApplicationStatus,
   type RunDto,
 } from "@jobhunter/pipeline/contracts";
 
@@ -150,6 +152,19 @@ export async function listRuns(): Promise<RunDto[]> {
 
 export function getRun(id: string): Promise<RunDto> {
   return requestRun(runPath(id), { method: "GET" });
+}
+
+export function updateApplicationStatus(
+  id: string,
+  applicationStatus: ApplicationStatus,
+): Promise<RunDto> {
+  const body = { applicationStatus };
+  ensureValidRequest(UpdateApplicationStatusRequestSchema.safeParse(body).success);
+  return requestRun(runPath(id), {
+    body: JSON.stringify(body),
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
 }
 
 export function createRun(jobDescription: string): Promise<RunDto> {
