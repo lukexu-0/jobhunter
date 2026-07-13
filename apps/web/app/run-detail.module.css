@@ -1,3 +1,14 @@
+.detailShell,
+.workflowBand,
+.workflowProgress,
+.statusField,
+.paneGrid,
+.viewerPane,
+.viewerToolbar,
+.viewerCanvas {
+  min-width: 0;
+}
+
 .detailShell {
   min-height: 100svh;
   background: var(--color-canvas);
@@ -1099,7 +1110,7 @@
   color: var(--color-danger) !important;
 }
 
-@media (max-width: 78rem) {
+@container route-workspace (max-width: 78rem) {
   .workflowBand {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1141,7 +1152,7 @@
   }
 }
 
-@media (max-width: 48rem) {
+@container route-workspace (max-width: 48rem) {
   .topBar {
     align-items: stretch;
     flex-direction: column;
@@ -1179,7 +1190,7 @@
   }
 }
 
-@media (max-width: 35rem) {
+@container route-workspace (max-width: 35rem) {
   .topActions {
     grid-template-columns: minmax(0, 1fr) auto;
   }
@@ -1198,6 +1209,25 @@
   .findingHeading {
     align-items: flex-start;
     flex-direction: column;
+  }
+}
+
+@container route-workspace (max-width: 20rem) {
+  .topActions .secondaryButton {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .viewerControls {
+    min-width: 0;
+    max-width: 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+  }
+
+  .overflowMenu > div {
+    width: min(calc(var(--space-12) * 5), calc(100vw - (var(--space-4) * 2)));
   }
 }
 

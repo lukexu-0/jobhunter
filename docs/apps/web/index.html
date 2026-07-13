@@ -23,6 +23,13 @@
       <p>The <code>@jobhunter/web</code> package starts Next.js on <code>127.0.0.1:3456</code>. Its configured rewrite sends same-origin browser requests from <code>/api/pipeline/:path*</code> to the local pipeline at <code>http://127.0.0.1:3457/v1/:path*</code>. The client uses the rewrite, not a user-entered API URL.</p>
       <p>Sources: <a href="../../../apps/web/package.json"><code>apps/web/package.json</code></a>, <a href="../../../apps/web/next.config.ts"><code>apps/web/next.config.ts</code></a>, and <a href="../../../apps/web/app/lib/pipeline-client.ts"><code>apps/web/app/lib/pipeline-client.ts</code></a>. See also <a href="../pipeline/index.html#api">Pipeline API and preconditions</a>.</p>
     </section>
+    <section id="primary-navigation">
+      <h2>Persistent primary navigation</h2>
+      <p>The application root layout renders a persistent sidebar beside the current route’s workspace. Its primary navigation contains <strong>Applications</strong>, which links to <code>/</code>, and <strong>Providers</strong>, which links to <code>/providers</code>.</p>
+      <p>The Applications link receives <code>aria-current="page"</code> on the home route (<code>/</code>) and on every route whose pathname begins <code>/runs/</code>, including an opened run such as <code>/runs/{runId}</code>. The Providers link receives <code>aria-current="page"</code> on <code>/providers</code> and on every route whose pathname begins <code>/providers/</code>. In each case, the other primary-navigation link is not marked as the current page.</p>
+      <p>Sources: <a href="../../../apps/web/app/layout.tsx"><code>apps/web/app/layout.tsx</code></a> and <a href="../../../apps/web/app/components/app-sidebar.tsx"><code>apps/web/app/components/app-sidebar.tsx</code></a>.</p>
+    </section>
+
 
     <section id="dashboard">
       <h2>Applications dashboard</h2>
@@ -44,10 +51,11 @@
     </section>
 
     <section id="oauth">
-      <h2>OAuth disclosure and controls</h2>
-      <p>The dashboard’s expandable <strong>Provider access</strong> section discloses two local OAuth connections: OpenAI Codex is used for the tailoring agent and Google Antigravity is used for visual document inspection. It reads connection status, starts a provider-specific onboarding session, opens an HTTP(S) sign-in URL in a new tab with <code>noopener,noreferrer</code>, shows instructions and manual prompts when supplied, polls a pending session every 2.5 seconds, supports cancellation, and permits logout.</p>
+      <h2>Providers page and OAuth controls</h2>
+      <p>Provider access is available on the dedicated <code>/providers</code> page, opened from the persistent sidebar’s <strong>Providers</strong> link; it is not an expandable part of the Applications dashboard. That route renders the <strong>Provider access</strong> workspace for two local OAuth connections: OpenAI Codex is used for the tailoring agent and Google Antigravity is used for visual document inspection.</p>
+      <p>The page reads connection status, starts a provider-specific onboarding session, opens an HTTP(S) sign-in URL in a new tab with <code>noopener,noreferrer</code>, shows instructions and manual prompts when supplied, polls a pending session every 2.5 seconds, supports cancellation, and permits logout.</p>
       <p>Displayed errors and identity/status text are bounded and redact credential-like tokens. The interface does not ask for, display, or submit provider API keys. OAuth connection status is independent for the two providers.</p>
-      <p>Sources: <a href="../../../apps/web/app/components/oauth-dashboard.tsx"><code>apps/web/app/components/oauth-dashboard.tsx</code></a>, <a href="../../../apps/pipeline/src/contracts/index.ts"><code>apps/pipeline/src/contracts/index.ts</code></a>, and <a href="../../../apps/pipeline/src/auth/service.ts"><code>apps/pipeline/src/auth/service.ts</code></a>.</p>
+      <p>Sources: <a href="../../../apps/web/app/providers/page.tsx"><code>apps/web/app/providers/page.tsx</code></a>, <a href="../../../apps/web/app/components/app-sidebar.tsx"><code>apps/web/app/components/app-sidebar.tsx</code></a>, <a href="../../../apps/web/app/components/oauth-dashboard.tsx"><code>apps/web/app/components/oauth-dashboard.tsx</code></a>, <a href="../../../apps/pipeline/src/contracts/index.ts"><code>apps/pipeline/src/contracts/index.ts</code></a>, and <a href="../../../apps/pipeline/src/auth/service.ts"><code>apps/pipeline/src/auth/service.ts</code></a>.</p>
     </section>
 
     <section id="opened-run">
