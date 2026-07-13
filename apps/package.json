@@ -1,0 +1,12 @@
+{
+  "name": "@jobhunter/apps",
+  "private": true,
+  "workspaces": ["web", "pipeline"],
+  "packageManager": "bun@1.3.14",
+  "scripts": {
+    "dev": "bun scripts/dev.ts",
+    "typecheck": "bun run --cwd pipeline typecheck && bun run --cwd web typecheck",
+    "build": "bun run --cwd pipeline build && bun run --cwd web build",
+    "test": "bun test --cwd pipeline && bun test --cwd web"
+  }
+}

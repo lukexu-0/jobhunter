@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resume Tailoring Apps Workspace</title>
+</head>
+<body>
+  <header>
+    <h1>Resume tailoring applications</h1>
+    <p>The <code>apps/</code> Bun workspace contains the local pipeline API and its Next.js review interface.</p>
+    <nav aria-label="Documentation">
+      <ul>
+        <li><a href="pipeline/index.html">Pipeline service</a></li>
+        <li><a href="web/index.html">Web interface</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <section id="prerequisites">
+      <h2>Prerequisites</h2>
+      <p>The workspace declares <strong>Bun 1.3.14</strong> with the <code>web</code> and <code>pipeline</code> workspaces. The pipeline doctor also requires the <code>latexmk</code> executable and Poppler’s <code>pdfinfo</code>, <code>pdftotext</code>, <code>pdffonts</code>, and <code>pdftoppm</code>. Use the provider-access controls in the web UI to connect the two application-owned OAuth accounts before processing a run; do not supply provider API keys.</p>
+      <p>Source: <a href="../../apps/package.json"><code>apps/package.json</code></a>, <a href="../../apps/pipeline/src/system/doctor.ts"><code>apps/pipeline/src/system/doctor.ts</code></a>, and <a href="../../apps/pipeline/src/auth/service.ts"><code>apps/pipeline/src/auth/service.ts</code></a>.</p>
+    </section>
+
+    <section id="commands">
+      <h2>Install, develop, verify, and build</h2>
+      <p>Run these commands from a repository checkout. They are the workspace scripts defined in <a href="../../apps/package.json"><code>apps/package.json</code></a>.</p>
+      <pre><code>cd apps &amp;&amp; bun install
+cd apps &amp;&amp; bun run dev
+cd apps &amp;&amp; bun run test
+cd apps &amp;&amp; bun run typecheck
+cd apps &amp;&amp; bun run build</code></pre>
+      <p>The development command starts the pipeline first, waits for its health endpoint for up to 30 seconds, and starts the web server only after the endpoint responds successfully. The test, typecheck, and build scripts run pipeline work before web work.</p>
+      <p>For focused operational checks, use the package scripts:</p>
+      <pre><code>cd apps &amp;&amp; bun run --cwd pipeline context:sync
+cd apps &amp;&amp; bun run --cwd pipeline context:sync -- --check
+cd apps &amp;&amp; bun run --cwd pipeline doctor</code></pre>
+    </section>
+
+    <section id="ports-and-boundaries">
+      <h2>Ports and boundaries</h2>
+      <dl>
+        <dt>Web</dt>
+        <dd>Next.js binds to <code>127.0.0.1:3456</code>.</dd>
+        <dt>Pipeline</dt>
+        <dd>The Bun API binds to <code>127.0.0.1:3457</code> and serves versioned routes below <code>/v1</code>.</dd>
+        <dt>Browser API boundary</dt>
+        <dd>Next rewrites same-origin <code>/api/pipeline/:path*</code> to <code>http://127.0.0.1:3457/v1/:path*</code>; browser code therefore calls the web origin rather than the loopback API directly.</dd>
+      </dl>
+      <p>Sources: <a href="../../apps/web/package.json"><code>apps/web/package.json</code></a>, <a href="../../apps/pipeline/src/index.ts"><code>apps/pipeline/src/index.ts</code></a>, and <a href="../../apps/web/next.config.ts"><code>apps/web/next.config.ts</code></a>.</p>
+    </section>
+
+    <section id="directory-map">
+      <h2>Directory map</h2>
+      <ul>
+        <li><a href="../../apps/package.json"><code>apps/package.json</code></a> — workspace declaration and aggregate scripts.</li>
+        <li><a href="../../apps/scripts/dev.ts"><code>apps/scripts/dev.ts</code></a> — coordinated development launcher and signal shutdown.</li>
+        <li><a href="../../apps/pipeline/src/index.ts"><code>apps/pipeline/</code></a> — Bun API, worker, source-context index, SQLite stores, artifact handling, and package-local scripts. See <a href="pipeline/index.html">Pipeline service</a>.</li>
+        <li><a href="../../apps/web/package.json"><code>apps/web/</code></a> — Next.js application, same-origin rewrite, dashboard, and run-review screen. See <a href="web/index.html">Web interface</a>.</li>
+      </ul>
+    </section>
+
+    <section id="startup-shutdown">
+      <h2>Startup and shutdown</h2>
+      <ol>
+        <li>Start development with <code>cd apps &amp;&amp; bun run dev</code>.</li>
+        <li>Open <code>http://127.0.0.1:3456</code>; the pipeline health check is <code>http://127.0.0.1:3457/v1/health</code>.</li>
+        <li>Use <kbd>Ctrl</kbd>+<kbd>C</kbd> (SIGINT) or send SIGTERM to the coordinated launcher. It signals the pipeline and web child processes; the pipeline stops its server and closes its application services.</li>
+      </ol>
+      <p>Sources: <a href="../../apps/scripts/dev.ts"><code>apps/scripts/dev.ts</code></a>, <a href="../../apps/pipeline/src/index.ts"><code>apps/pipeline/src/index.ts</code></a>, and <a href="../../apps/pipeline/src/bootstrap.ts"><code>apps/pipeline/src/bootstrap.ts</code></a>.</p>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting and verification</h2>
+      <p>Run <code>cd apps &amp;&amp; bun run --cwd pipeline doctor</code> to receive bounded JSON checks for Bun, the context index, both OAuth providers, both model descriptors, <code>latexmk</code>, and the four Poppler tools. <code>auth_absent</code> and <code>auth_expired</code> are <em>warnings</em>, not doctor errors; an absent OAuth connection alone does not make the doctor exit nonzero. Missing system tools, stale or invalid context, invalid model descriptors, and invalid auth configuration are errors and make the report unsuccessful.</p>
+      <p>If context is stale, run <code>cd apps &amp;&amp; bun run --cwd pipeline context:sync</code>, then repeat the doctor command. To check without changing the index, use <code>cd apps &amp;&amp; bun run --cwd pipeline context:sync -- --check</code>; a stale check exits nonzero. For API availability, request <code>/v1/health</code> through the pipeline port or through the web rewrite.</p>
+      <p>Sources: <a href="../../apps/pipeline/scripts/doctor.ts"><code>apps/pipeline/scripts/doctor.ts</code></a>, <a href="../../apps/pipeline/src/system/doctor.ts"><code>apps/pipeline/src/system/doctor.ts</code></a>, <a href="../../apps/pipeline/scripts/context-sync.ts"><code>apps/pipeline/scripts/context-sync.ts</code></a>, and <a href="../../apps/pipeline/src/api/handler.ts"><code>apps/pipeline/src/api/handler.ts</code></a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p><a href="pipeline/index.html">Pipeline service documentation</a> · <a href="web/index.html">Web interface documentation</a></p>
+  </footer>
+</body>
+</html>

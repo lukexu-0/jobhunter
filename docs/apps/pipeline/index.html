@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resume Tailoring Pipeline</title>
+</head>
+<body>
+  <header>
+    <h1>Resume tailoring pipeline</h1>
+    <p>Loopback Bun API, single-worker resume-tailoring workflow, local context index, OAuth-only model access, and reviewed artifacts.</p>
+    <nav aria-label="Documentation">
+      <ul>
+        <li><a href="../index.html">Apps workspace</a></li>
+        <li><a href="../web/index.html">Web interface</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <section id="configuration-and-storage">
+      <h2>Configuration and data stores</h2>
+      <p>The package is <code>@jobhunter/pipeline</code>. Its scripts are <code>dev</code>, <code>build</code>, <code>start</code>, <code>typecheck</code>, <code>test</code>, <code>context:sync</code>, and <code>doctor</code>. The API listens only on <code>127.0.0.1:3457</code>; its default allowed mutation origin is <code>http://127.0.0.1:3456</code>, overridable with <code>JOBHUNTER_WEB_ORIGIN</code>.</p>
+      <p>Three SQLite databases are deliberately separate: pipeline state at <code>apps/pipeline/data/state/pipeline.sqlite</code>, context index at <code>apps/pipeline/data/context/context.sqlite</code>, and OAuth storage at <code>apps/pipeline/data/oauth/auth.sqlite</code>. The state and context databases use WAL, foreign keys, and a 5-second busy timeout. Context and OAuth directories are created with mode <code>0700</code>; the context and OAuth database files are set to <code>0600</code>. Run inputs and attempt artifacts are stored beneath <code>apps/pipeline/data/runs</code>.</p>
+      <p>Sources: <a href="../../../apps/pipeline/package.json"><code>package.json</code></a>, <a href="../../../apps/pipeline/src/index.ts"><code>src/index.ts</code></a>, <a href="../../../apps/pipeline/src/bootstrap.ts"><code>src/bootstrap.ts</code></a>, <a href="../../../apps/pipeline/src/db/database.ts"><code>src/db/database.ts</code></a>, <a href="../../../apps/pipeline/src/context/database.ts"><code>src/context/database.ts</code></a>, <a href="../../../apps/pipeline/src/auth/storage.ts"><code>src/auth/storage.ts</code></a>, and <a href="../../../apps/pipeline/src/system/artifacts.ts"><code>src/system/artifacts.ts</code></a>.</p>
+    </section>
+
+    <section id="context">
+      <h2>Authoritative source context</h2>
+      <p>The version-1 manifest is a literal, four-source allowlist: the canonical baseline <code>actual/resume-main/main.tex</code>; <code>actual/current-context/jobs/Example-Company/automated-testing-resume-info.md</code>; <code>actual/current-context/projects/sample-project-archive.md</code>; and <code>actual/current-context/projects/sample-project.md</code>. It also binds “Sample Project” to <code>SampleProject</code>. The manifest rejects extra, missing, duplicate, non-allowlisted, escaping, symbolic-link, or non-regular sources.</p>
+      <p>Synchronize after changing any of those source files:</p>
+      <pre><code>cd apps &amp;&amp; bun run --cwd pipeline context:sync
+cd apps &amp;&amp; bun run --cwd pipeline context:sync -- --check</code></pre>
+      <p>The first command indexes the manifest and verifies freshness; the second only reports freshness and exits nonzero when it is stale. Creating, retrying, regenerating, editing, or approving a run requires a fresh snapshot. Every stage rechecks the run’s source snapshot, so source drift cannot silently continue a claimed run.</p>
+      <p>Sources: <a href="../../../apps/pipeline/context-sources.json"><code>context-sources.json</code></a>, <a href="../../../apps/pipeline/src/context/manifest.ts"><code>src/context/manifest.ts</code></a>, <a href="../../../apps/pipeline/scripts/context-sync.ts"><code>scripts/context-sync.ts</code></a>, <a href="../../../apps/pipeline/src/api/run-service.ts"><code>src/api/run-service.ts</code></a>, and <a href="../../../apps/pipeline/src/stages/processor.ts"><code>src/stages/processor.ts</code></a>.</p>
+    </section>
+
+    <section id="oauth-and-models">
+      <h2>OAuth onboarding and fixed models</h2>
+      <p>The application owns OAuth storage and permits at most one OAuth credential per provider: <code>openai-codex</code> and <code>google-antigravity</code>. Static credentials are rejected, and provider-key and cloud-provider environment variables are scrubbed. Do not configure API keys for this system. The API reports each provider as <code>connected</code> or <code>disconnected</code> with redacted identity fields.</p>
+      <p>Start a provider session from the web UI (or the authentication API), follow the returned browser instructions or prompt, poll the session to a terminal state, and log out using the provider control when needed. OAuth sessions can be <code>pending</code>, <code>succeeded</code>, <code>failed</code>, <code>cancelled</code>, or <code>expired</code>.</p>
+      <dl>
+        <dt>Tailoring, analysis, edit, and repair agent</dt>
+        <dd><code>openai-codex/gpt-5.6-sol</code>, through <code>@openai/agents-core@0.13.2</code> and <code>@oh-my-pi/pi-ai@16.4.6</code>.</dd>
+        <dt>Visual inspection</dt>
+        <dd><code>google-antigravity/gemini-3.5-flash</code>, using <code>@oh-my-pi/pi-ai@16.4.6</code> and <code>@oh-my-pi/pi-catalog@16.4.6</code>.</dd>
+      </dl>
+      <p>Sources: <a href="../../../apps/pipeline/package.json"><code>package.json</code></a>, <a href="../../../apps/pipeline/src/auth/storage.ts"><code>src/auth/storage.ts</code></a>, <a href="../../../apps/pipeline/src/auth/service.ts"><code>src/auth/service.ts</code></a>, <a href="../../../apps/pipeline/src/auth/oauth-only-resolver.ts"><code>src/auth/oauth-only-resolver.ts</code></a>, <a href="../../../apps/pipeline/src/models/oauth-codex-model.ts"><code>src/models/oauth-codex-model.ts</code></a>, and <a href="../../../apps/pipeline/src/models/gemini-inspector.ts"><code>src/models/gemini-inspector.ts</code></a>.</p>
+    </section>
+
+    <section id="workflow">
+      <h2>Workflow, revisions, and attempts</h2>
+      <p>A new run moves from <code>queued</code> through <code>analyzing</code>, <code>tailoring</code>, <code>compiling</code>, <code>deterministic_qa</code>, <code>visual_qa</code>, and <code>review</code>; <code>editing</code> is used for human-comment and regeneration revisions, and <code>repairing</code> is used only after one repairable compile failure. A run ends in <code>approved</code> or <code>failed</code>. The stage processor persists structured analysis, a tailoring plan, evidence ledger, rendered TeX, compilation output, deterministic QA, visual QA, and applicable edit or repair reports.</p>
+      <p>Revisions have initial, machine-regeneration, or human-comments public origins. Attempts record their stage, ordinal, state, agent session identifier, tool count, compile count, and timing. Events, artifacts, edit requests, and source snapshots are protected by database triggers against update and deletion; artifacts are finalized with SHA-256 metadata and source-artifact lineage. A failed run may be retried; human comments or layout regeneration create a new revision from a reviewable PDF.</p>
+      <p>Sources: <a href="../../../apps/pipeline/src/contracts/index.ts"><code>src/contracts/index.ts</code></a>, <a href="../../../apps/pipeline/src/stages/processor.ts"><code>src/stages/processor.ts</code></a>, <a href="../../../apps/pipeline/src/db/migrations.ts"><code>src/db/migrations.ts</code></a>, and <a href="../../../apps/pipeline/src/api/run-service.ts"><code>src/api/run-service.ts</code></a>.</p>
+    </section>
+
+    <section id="claims-and-recovery">
+      <h2>Singleton claim and expiry recovery</h2>
+      <p>Only one run claim exists. A claim has a 60-second lifetime and the worker heartbeats it every 20 seconds. Claim ownership includes a fresh 256-bit base64url token. If a heartbeat or release loses ownership, the worker aborts its work and schedules another acquisition after the claim lifetime.</p>
+      <p>After an expired claim, acquisition examines the interrupted active attempt. If its recorded process is still alive, it requests cancellation and waits; if the process identity is known dead, it cancels that attempt, records the event, and reclaims the runnable run. No manual database edit is the recovery procedure: restore or restart the pipeline process and let the scheduler acquire the work. Check the run timeline and attempts through the API or web UI after recovery.</p>
+      <p>Sources: <a href="../../../apps/pipeline/src/worker/claims.ts"><code>src/worker/claims.ts</code></a>, <a href="../../../apps/pipeline/src/worker/scheduler.ts"><code>src/worker/scheduler.ts</code></a>, and <a href="../../../apps/pipeline/src/db/repository.ts"><code>src/db/repository.ts</code></a>.</p>
+    </section>
+
+    <section id="artifacts-and-compile">
+      <h2>Artifact security and TeX compilation</h2>
+      <p>Artifact roots, run-input directories, and attempt directories must be contained, real directories; symbolic links are rejected. Directories are private (<code>0700</code>), writes are exclusive and private (<code>0600</code>), files are atomically renamed after syncing, and reads reject escaping, symbolic-link, non-regular, oversize files. Limits are: TeX 256 KiB; stdout 256 KiB; stderr 256 KiB; log 1 MiB; PDF 10 MiB; and PNG 25 MiB.</p>
+      <p>The compiler writes a trusted wrapper that requires Latin Modern and invokes <code>latexmk</code> with locked <code>pdflatex</code>, no shell escape, and a private TeX cache. Full compilation has a 120-second timeout; repair candidates have a 60-second timeout. TeX that uses forbidden primitives, shell escape, parent/absolute file access, NULs, or over-limit source is rejected. A repairable compile failure allows one repair stage per revision; its agent has a 10-minute deadline, at most 8 tool calls and 2 MiB of tool I/O, and at most 3 candidate compiles. Repair validation preserves the immutable skeleton, visible body content and order, links, inert comments, and control-sequence order.</p>
+      <p>Public artifacts are a whitelist and are exposed only for the current review revision or an approved revision. Before the response is sent as a no-store attachment, the service enforces the public size limit, rereads the stored content, and verifies its SHA-256 digest; it returns content type, content length, digest, ETag, and <code>nosniff</code>. Internal logs and agent transcripts are not public artifact kinds.</p>
+      <p>Sources: <a href="../../../apps/pipeline/src/system/artifacts.ts"><code>src/system/artifacts.ts</code></a>, <a href="../../../apps/pipeline/src/resume/compiler.ts"><code>src/resume/compiler.ts</code></a>, <a href="../../../apps/pipeline/src/agents/repair-agent.ts"><code>src/agents/repair-agent.ts</code></a>, <a href="../../../apps/pipeline/src/resume/repair.ts"><code>src/resume/repair.ts</code></a>, and <a href="../../../apps/pipeline/src/api/run-service.ts"><code>src/api/run-service.ts</code></a>.</p>
+    </section>
+
+    <section id="quality-assurance">
+      <h2>Deterministic and visual QA</h2>
+      <p>Deterministic QA uses Poppler output to require parseable PDF information, an unencrypted one-page US Letter PDF, extractable text, required headings, selected evidence text, usable font output with embedded fonts, and in-page word bounds. A failing deterministic report fails the run.</p>
+      <p>Visual QA rasterizes page 1 to PNG with Poppler, then sends only that PNG to <code>google-antigravity/gemini-3.5-flash</code> through the OAuth-only resolver. Gemini reports <code>pass</code>, <code>issue</code>, or <code>uncertain</code> plus bounded findings for clipping, overlap, readability, glyphs, spacing, and layout. Any result other than <code>pass</code> requires a human visual acknowledgement before approval.</p>
+      <p>Sources: <a href="../../../apps/pipeline/src/resume/deterministic-qa.ts"><code>src/resume/deterministic-qa.ts</code></a>, <a href="../../../apps/pipeline/src/resume/rasterize.ts"><code>src/resume/rasterize.ts</code></a>, <a href="../../../apps/pipeline/src/models/gemini-inspector.ts"><code>src/models/gemini-inspector.ts</code></a>, and <a href="../../../apps/pipeline/src/stages/processor.ts"><code>src/stages/processor.ts</code></a>.</p>
+    </section>
+
+    <section id="api">
+      <h2>HTTP API and preconditions</h2>
+      <p>All routes are under <code>/v1</code>. JSON responses are <code>no-store</code>. Every mutation requires an <code>Origin</code> exactly equal to the configured web origin and, when it has a body, <code>Content-Type: application/json</code>; otherwise it receives <code>ORIGIN_REJECTED</code> (403) or <code>JSON_REQUIRED</code> (415). Invalid JSON is <code>INVALID_JSON</code> (400), unrecognized routes are <code>NOT_FOUND</code> (404), and route-level unexpected failures are <code>INTERNAL_ERROR</code> (500).</p>
+      <dl>
+        <dt><code>GET /v1/health</code></dt><dd>Returns <code>{"status":"ok"}</code>.</dd>
+        <dt><code>GET /v1/context</code></dt><dd>Returns bounded freshness, manifest-match, missing/stale source, and index summary fields.</dd>
+        <dt><code>POST /v1/context/sync</code></dt><dd>Requires <code>{}</code>; returns synchronized context status, or <code>INVALID_REQUEST</code> (400) / <code>CONTEXT_SYNC_FAILED</code> (500).</dd>
+        <dt><code>GET /v1/auth</code></dt><dd>Returns both provider statuses.</dd>
+        <dt><code>POST /v1/auth/{provider}/sessions</code></dt><dd>Requires <code>{}</code>; starts OAuth onboarding and returns 201. Starting an already-connected provider is <code>AUTH_ALREADY_CONNECTED</code> (409); a second active sign-in for the provider is <code>AUTH_CONFLICT</code> (409).</dd>
+        <dt><code>GET</code>, <code>DELETE /v1/auth/sessions/{sessionId}</code></dt><dd>Reads or cancels a session; an unknown session is <code>AUTH_SESSION_NOT_FOUND</code> (404), and cancelling a finished session is <code>SESSION_TERMINAL</code> (409).</dd>
+        <dt><code>POST /v1/auth/sessions/{sessionId}/prompt</code></dt><dd>Accepts <code>{"value":"…"}</code>. The route schema accepts 1–8192 characters, while the session manager rejects values above 4,096 as <code>INVALID_PROMPT</code> (400); answering when no prompt is pending is <code>INVALID_PROMPT</code> (409), and an unknown session is <code>SESSION_NOT_FOUND</code> (404).</dd>
+        <dt><code>DELETE /v1/auth/{provider}</code></dt><dd>Logs the provider out and returns 204.</dd>
+        <dt><code>GET /v1/runs</code>, <code>GET /v1/runs/{runId}</code></dt><dd>Lists or retrieves the public run view; a missing run is <code>RUN_NOT_FOUND</code> (404).</dd>
+        <dt><code>POST /v1/runs</code></dt><dd>Accepts <code>{"jobDescription":"…"}</code> containing 40–50,000 trimmed characters and returns 201; invalid input is <code>INVALID_REQUEST</code> (400).</dd>
+        <dt><code>POST /v1/runs/{runId}/retry</code></dt><dd>Requires <code>{}</code>.</dd>
+        <dt><code>POST /v1/runs/{runId}/regenerate</code></dt><dd>Requires <code>{"expectedPdfSha256":"64 lowercase hex characters"}</code>.</dd>
+        <dt><code>POST /v1/runs/{runId}/edit</code></dt><dd>Requires 1–8,000 trimmed comment characters and the expected PDF hash.</dd>
+        <dt><code>POST /v1/runs/{runId}/approve</code></dt><dd>Requires the expected PDF hash and optional <code>acknowledgeVisualIssues</code>.</dd>
+        <dt><code>GET /v1/runs/{runId}/artifacts/{artifactId}</code></dt><dd>Downloads only an eligible public artifact; missing or ineligible artifacts are <code>ARTIFACT_NOT_FOUND</code> (404), and content/metadata integrity failures are <code>ARTIFACT_CORRUPT</code> (409).</dd>
+      </dl>
+      <p>Run mutations first require fresh context (<code>CONTEXT_STALE</code>, 409). A changed source snapshot yields <code>SOURCE_DRIFT</code> (409); an outdated expected hash yields <code>STALE_PDF</code> (409); unacknowledged non-pass visual QA yields <code>VISUAL_ACKNOWLEDGEMENT_REQUIRED</code> (409); an active claim yields <code>RUN_CLAIMED</code> (409); other state-precondition conflicts are <code>RUN_CONFLICT</code> (409). Invalid mutation payloads return <code>INVALID_REQUEST</code> (400).</p>
+      <p>Authentication errors are returned as their service code and status, while malformed authentication route payloads are <code>INVALID_REQUEST</code> (400). Context-status loading failure is <code>CONTEXT_STATUS_FAILED</code> (500).</p>
+      <p>Sources: <a href="../../../apps/pipeline/src/api/handler.ts"><code>src/api/handler.ts</code></a>, <a href="../../../apps/pipeline/src/api/context-routes.ts"><code>src/api/context-routes.ts</code></a>, <a href="../../../apps/pipeline/src/api/auth-routes.ts"><code>src/api/auth-routes.ts</code></a>, <a href="../../../apps/pipeline/src/api/run-routes.ts"><code>src/api/run-routes.ts</code></a>, <a href="../../../apps/pipeline/src/api/run-service.ts"><code>src/api/run-service.ts</code></a>, <a href="../../../apps/pipeline/src/auth/service.ts"><code>src/auth/service.ts</code></a>, <a href="../../../apps/pipeline/src/auth/sessions.ts"><code>src/auth/sessions.ts</code></a>, and <a href="../../../apps/pipeline/src/contracts/index.ts"><code>src/contracts/index.ts</code></a>.</p>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting and verification</h2>
+      <pre><code>cd apps &amp;&amp; bun run --cwd pipeline doctor
+cd apps &amp;&amp; bun run --cwd pipeline context:sync -- --check
+cd apps &amp;&amp; bun run --cwd pipeline context:sync</code></pre>
+      <p>The doctor emits JSON. Its checks are <code>ok</code>, <code>warning</code>, or <code>error</code>; only errors make <code>ok</code> false and produce exit code 1. Therefore disconnected OAuth is reported as the <code>auth_absent</code> warning, and expired OAuth as <code>auth_expired</code>; neither is a doctor failure by itself. Connect or refresh OAuth before a workflow needs that provider. Resolve <code>stale_index</code> with the sync command. The doctor classifies unavailable Bun, LaTeX, or Poppler commands as <code>missing_system_tool</code>, and invalid context or descriptor configuration as errors.</p>
+      <p>Sources: <a href="../../../apps/pipeline/scripts/doctor.ts"><code>scripts/doctor.ts</code></a>, <a href="../../../apps/pipeline/src/system/doctor.ts"><code>src/system/doctor.ts</code></a>, and <a href="../../../apps/pipeline/scripts/context-sync.ts"><code>scripts/context-sync.ts</code></a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p><a href="../index.html">Apps workspace documentation</a> · <a href="../web/index.html">Web interface documentation</a></p>
+  </footer>
+</body>
+</html>

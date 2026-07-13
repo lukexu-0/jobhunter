@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "resume-baseline",
+      "relativePath": "actual/resume-main/main.tex",
+      "kind": "baseline",
+      "entityId": "candidate-resume",
+      "displayName": "Canonical resume baseline",
+      "baselineEntityIds": []
+    },
+    {
+      "id": "automated-testing-resume-info",
+      "relativePath": "actual/current-context/jobs/Example-Company/automated-testing-resume-info.md",
+      "kind": "authoritative-markdown",
+      "entityId": "experience:example-company",
+      "displayName": "Sample Testing resume information",
+      "baselineEntityIds": ["Example Company"]
+    },
+    {
+      "id": "sample-project-archive",
+      "relativePath": "actual/current-context/projects/sample-project-archive.md",
+      "kind": "authoritative-markdown",
+      "entityId": "project:sample-project-archive",
+      "displayName": "Sample Project Archive",
+      "baselineEntityIds": ["Sample Project Archive"]
+    },
+    {
+      "id": "sample-project",
+      "relativePath": "actual/current-context/projects/sample-project.md",
+      "kind": "authoritative-markdown",
+      "entityId": "project:sample-project",
+      "displayName": "SampleProject / Sample Project",
+      "baselineEntityIds": ["Sample Project", "SampleProject"]
+    }
+  ],
+  "explicitEntityBindings": {
+    "Sample Project": "SampleProject"
+  }
+}

@@ -1,0 +1,4 @@
+**/node_modules/
+web/.next/
+pipeline/dist/
+pipeline/data/

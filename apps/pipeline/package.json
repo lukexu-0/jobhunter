@@ -1,0 +1,28 @@
+{
+  "name": "@jobhunter/pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./contracts": "./src/contracts/index.ts"
+  },
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build src/index.ts scripts/context-sync.ts scripts/doctor.ts --target bun --outdir dist",
+    "start": "bun dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "context:sync": "bun scripts/context-sync.ts",
+    "doctor": "bun scripts/doctor.ts"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-ai": "16.4.6",
+    "@oh-my-pi/pi-catalog": "16.4.6",
+    "@openai/agents-core": "0.13.2",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.11",
+    "typescript": "6.0.2"
+  }
+}
