@@ -1,6 +1,11 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { access, chmod, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { AuthStorage, type OAuthAccess, type StoredAuthCredential } from "@oh-my-pi/pi-ai";
+import {
+  AuthStorage,
+  type OAuthAccess,
+  type StoredAuthCredential,
+} from "@oh-my-pi/pi-ai";
 
 export const AUTH_PROVIDERS = ["openai-codex", "google-antigravity"] as const;
 export type AuthProvider = (typeof AUTH_PROVIDERS)[number];
@@ -38,9 +43,90 @@ export interface AuthStorageLike {
 
 type StorageFactory = (dbPath: string) => Promise<AuthStorageLike>;
 
+const AUTH_TABLE = "auth_credentials";
+const CHILD_AUTH_TABLES = [
+  "auth_credential_blocks",
+  "auth_credential_refresh_leases",
+] as const;
+
+export async function purgeUnsupportedCredentials(dbPath: string): Promise<void> {
+  try {
+    await access(dbPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+
+  const db = new Database(dbPath, { create: false, readwrite: true });
+  try {
+    db.exec("PRAGMA busy_timeout = 5000; PRAGMA secure_delete = ON;");
+    const tableRows = db.query<{ name: string }, []>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('auth_credentials', 'auth_credential_blocks', 'auth_credential_refresh_leases')",
+    ).all();
+    const tables = new Set(tableRows.map(({ name }) => name));
+    if (!tables.has(AUTH_TABLE)) {
+      throw new AuthConfigurationError("Unsupported credential purge requires the auth_credentials table");
+    }
+    const credentialColumns = new Set(
+      db.query<{ name: string }, []>("PRAGMA table_info(auth_credentials)").all().map(({ name }) => name),
+    );
+    if (!credentialColumns.has("id") || !credentialColumns.has("provider")) {
+      throw new AuthConfigurationError("Unsupported credential purge found a malformed auth_credentials table");
+    }
+
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const table of CHILD_AUTH_TABLES) {
+        if (!tables.has(table)) continue;
+        const statement = db.query(
+          `DELETE FROM ${table} WHERE credential_id IN (
+            SELECT id FROM auth_credentials WHERE provider NOT IN (?, ?)
+          )`,
+        );
+        try {
+          statement.run(...AUTH_PROVIDERS);
+        } finally {
+          statement.finalize();
+        }
+      }
+      const deleteCredentials = db.query("DELETE FROM auth_credentials WHERE provider NOT IN (?, ?)");
+      try {
+        deleteCredentials.run(...AUTH_PROVIDERS);
+      } finally {
+        deleteCredentials.finalize();
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Preserve the deletion failure that made auth initialization unsafe.
+      }
+      throw error;
+    }
+
+    const checkpointStatement = db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)");
+    try {
+      const checkpoint = checkpointStatement.get();
+      if (!checkpoint || checkpoint.busy !== 0) {
+        throw new AuthConfigurationError("Unsupported credential purge could not truncate the auth database WAL");
+      }
+    } finally {
+      checkpointStatement.finalize();
+    }
+  } finally {
+    db.close();
+  }
+}
+
+const defaultStorageFactory: StorageFactory = async (path) => {
+  await purgeUnsupportedCredentials(path);
+  return AuthStorage.create(path);
+};
+
 const oauthDirectory = resolve(import.meta.dir, "../../data/oauth");
 export const authDatabasePath = resolve(oauthDirectory, "auth.sqlite");
-let factory: StorageFactory = (path) => AuthStorage.create(path);
+let factory: StorageFactory = defaultStorageFactory;
 let storagePromise: Promise<AuthStorageLike> | undefined;
 
 function isProvider(value: string): value is AuthProvider {
@@ -128,5 +214,5 @@ export function setAuthStorageFactoryForTests(next: StorageFactory): void {
 
 export function resetAuthStorageFactoryForTests(): void {
   if (storagePromise) throw new Error("Cannot reset auth storage after initialization");
-  factory = (path) => AuthStorage.create(path);
+  factory = defaultStorageFactory;
 }

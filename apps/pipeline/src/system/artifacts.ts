@@ -118,6 +118,28 @@ export class ArtifactStore {
     return await createContainedDirectory(this.root, this.attemptRoot(address), "artifact attempt already exists");
   }
 
+  async removeRun(runId: string): Promise<boolean> {
+    await this.initialize();
+    const target = resolve(this.root, component(runId, "run id"));
+    if (!contained(this.root, target)) throw new Error("run path escapes artifact root");
+    let stat;
+    try {
+      stat = await lstat(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`run artifact root must be a real directory: ${target}`);
+    try {
+      await rm(target, { recursive: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+    await fsyncDirectory(this.root);
+    return true;
+  }
+
   async write(path: string, value: string | Uint8Array, maxBytes: number): Promise<ArtifactMetadata> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid artifact byte limit");
     const target = resolve(path);

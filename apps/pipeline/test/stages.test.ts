@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -23,6 +23,9 @@ import {
 } from "../src/resume/index.ts";
 import { PipelineStageProcessor, type PipelineStageDependencies } from "../src/stages/index.ts";
 import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
+import { TAILORING_WORKFLOW_SHA256, jobAnalysisFixture } from "./job-analysis.fixture.ts";
+
+setDefaultTimeout(15_000);
 
 const baseline = await Bun.file(resolve(import.meta.dir, "../../../actual/resume-main/main.tex")).text();
 const parsedBaseline = parseBaselineResume(baseline);
@@ -120,18 +123,16 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
     evidence,
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
-  const analysis: JobAnalysis = {
-    id: "analysis-1",
+  const analysis = jobAnalysisFixture({
     jobDescriptionSha256: createHash("sha256").update(jobDescription).digest("hex"),
-    target: { title: "Software Engineer" },
-    prioritizedKeywords: [{ keyword: "TypeScript", priority: "required", jdQuote: "Strong TypeScript", evidenceIds: ["evidence-0"] }],
-    guidance: [{ guidance: "Prefer relevant work", evidenceIds: ["evidence-0"] }],
-  };
+    evidenceId: "evidence-0",
+  });
   const evidenceByEntity = new Map(parsedBaseline.entities.map((entity, index) => [entity.entityId, `evidence-${index}`]));
   const plan: TailoringPlan = {
     id: "plan-1",
     analysisId: analysis.id,
     analysisSha256: hashJobAnalysis(analysis),
+    tailoringWorkflowSha256: TAILORING_WORKFLOW_SHA256,
     decisions: parsedBaseline.bullets.map((bullet, index) => ({
       id: `decision-${index}`,
       section: bullet.section,
@@ -267,7 +268,8 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     }),
     tailoringAgent: async (attempt) => {
       agentInputs.tailoring.push(attempt.input);
-      return { plan: fixtures.plan };
+      const tailoredTex = await attempt.input.operations.renderPlan(fixtures.plan, attempt.signal);
+      return { plan: fixtures.plan, tailoredTex, toolCount: 4 };
     },
     editAgent: options.editAgent ?? (async (attempt) => {
       agentInputs.editing.push(attempt.input);
@@ -325,8 +327,11 @@ describe("pipeline stage processor", () => {
       { from: "visual_qa", to: "review", failedStage: null },
     ]);
     expect(harness.agentInputs.analysis).toHaveLength(1);
+    expect(harness.agentInputs.analysis[0]?.canonicalCv).toBe(baseline);
+    expect(harness.agentInputs.analysis[0]?.context).toEqual(harness.fixtures.snapshot);
     expect(harness.agentInputs.tailoring).toHaveLength(1);
     expect(Object.keys(harness.agentInputs.tailoring[0]!)).not.toContain("rawJobDescription");
+    expect(harness.agentInputs.tailoring[0]?.analysis).toEqual(harness.fixtures.analysis);
     const texArtifact = harness.repository.getArtifact(harness.runId, "tailored-tex");
     expect(texArtifact).not.toBeNull();
     expect(await Bun.file(texArtifact!.path).text()).toBe(renderTailoredResume(harness.fixtures.plan, baseline, harness.fixtures.snapshot));
@@ -339,6 +344,27 @@ describe("pipeline stage processor", () => {
     expect(timeline.attempts.find((attempt) => attempt.stage === "compiling")?.compileCount).toBe(1);
     expect(JSON.stringify({ run: harness.repository.getRun(harness.runId), timeline })).not.toContain("token");
     expect(JSON.stringify(harness.repository.listResolvedArtifacts(harness.runId))).not.toContain("Strong TypeScript engineer");
+  });
+
+  test("retries a failed analysis before its immutable artifact exists", async () => {
+    let analysisCalls = 0;
+    const harness = await createHarness({
+      analysisAgent: async () => {
+        analysisCalls += 1;
+        if (analysisCalls === 1) throw new Error("transient analysis failure");
+        return harness.fixtures.analysis;
+      },
+    });
+    await processToStop(harness);
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+
+    harness.repository.retry(harness.runId, harness.fixtures.snapshotInput);
+    await processToStop(harness);
+
+    expect(analysisCalls).toBe(2);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(2);
   });
 
   test("allows at most bounded repair candidate compiles and requires a fresh authoritative full compile", async () => {

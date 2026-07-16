@@ -123,7 +123,7 @@ describe("pipeline run requests", () => {
     });
 
     await getRun("one/two ?");
-    await createRun("A sufficiently long job description for a real opening.");
+    await createRun(" HTTPS://Jobs.Example.TEST:443/roles/Platform#apply ");
     await retryRun("one/two ?");
     await regenerateRun("one/two ?", sha256);
     await editRun("one/two ?", "Make the impact clearer.", sha256);
@@ -134,7 +134,7 @@ describe("pipeline run requests", () => {
       {
         input: "/api/pipeline/runs",
         init: {
-          body: JSON.stringify({ jobDescription: "A sufficiently long job description for a real opening." }),
+          body: JSON.stringify({ jobUrl: "https://jobs.example.test/roles/Platform" }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
           method: "POST",
@@ -157,6 +157,35 @@ describe("pipeline run requests", () => {
         init: { body: JSON.stringify({ expectedPdfSha256: sha256, acknowledgeVisualIssues: true }), cache: "no-store", headers: { "content-type": "application/json" }, method: "POST" },
       },
     ]);
+  });
+
+  test("rejects invalid job URLs locally without fetching", () => {
+    let fetchCalls = 0;
+    setFetchMock(async () => {
+      fetchCalls += 1;
+      return json(run());
+    });
+
+    const invalidUrls = [
+      "/jobs/platform",
+      "ftp://jobs.example.test/platform",
+      "https://user:password@jobs.example.test/platform",
+      `https://jobs.example.test/${"a".repeat(2_049)}`,
+      `https://jobs.example.test/${"é".repeat(400)}`,
+    ];
+
+    for (const jobUrl of invalidUrls) {
+      expect(() => createRun(jobUrl)).toThrow(PipelineClientError);
+      try {
+        createRun(jobUrl);
+      } catch (error) {
+        expect(error).toMatchObject({
+          code: "INVALID_REQUEST",
+          message: "The request is invalid.",
+        });
+      }
+    }
+    expect(fetchCalls).toBe(0);
   });
 
   test("rejects a successful response that does not match its public schema", async () => {
@@ -225,6 +254,26 @@ describe("pipeline run requests", () => {
       status: 502,
       message: "The pipeline request failed.",
     });
+  });
+
+  test("exposes only fixed actionable extraction 5xx messages", async () => {
+    for (const [code, status, message] of [
+      ["JOB_EXTRACTION_UNAVAILABLE", 502, "Job description extraction failed"],
+      ["JOB_EXTRACTION_TIMEOUT", 504, "Job description extraction timed out"],
+    ] as const) {
+      setFetchMock(async () => json({
+        error: {
+          code,
+          message: "authorization=Bearer private-server-secret",
+        },
+      }, { status }));
+
+      await expect(getRun("run-1")).rejects.toMatchObject({
+        code,
+        status,
+        message,
+      });
+    }
   });
 
   test("rejects oversized error bodies before parsing their declared or streamed bytes", async () => {

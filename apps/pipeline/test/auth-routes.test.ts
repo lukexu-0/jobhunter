@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createAuthRoutes, type AuthRouteService } from "../src/api/auth-routes";
 import { createApiHandler } from "../src/api/handler";
-import type { AuthSession, AuthStatusResponse, OAuthProvider } from "../src/contracts";
+import { AuthStatusResponseSchema, type AuthSession, type AuthStatusResponse, type OAuthProvider } from "../src/contracts";
 
 const ORIGIN = "http://127.0.0.1:3456";
 const session: AuthSession = {
@@ -53,6 +53,18 @@ describe("OAuth HTTP routes", () => {
     });
   });
 
+  test("validates exactly two provider statuses and rejects the retired provider", () => {
+    const providers = [
+      { provider: "openai-codex", state: "disconnected" },
+      { provider: "google-antigravity", state: "disconnected" },
+    ];
+    expect(AuthStatusResponseSchema.safeParse({ providers }).success).toBe(true);
+    expect(AuthStatusResponseSchema.safeParse({
+      providers: [...providers, { provider: "unsupported-provider", state: "disconnected" }],
+    }).success).toBe(false);
+    expect(AuthStatusResponseSchema.safeParse({ providers: providers.slice(0, 1) }).success).toBe(false);
+  });
+
   test("starts exact providers with an empty JSON object", async () => {
     let started: OAuthProvider | undefined;
     const response = await request(
@@ -64,6 +76,23 @@ describe("OAuth HTTP routes", () => {
     expect(started).toBe("openai-codex");
     expect(await response.json()).toEqual(session);
   });
+  test("returns public not-found for an unsupported provider route without starting a session", async () => {
+    let started = false;
+    const response = await request(
+      fakeService({
+        startSession: async () => {
+          started = true;
+          return session;
+        },
+      }),
+      "/v1/auth/unsupported-provider/sessions",
+      jsonMutation("POST"),
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: { code: "NOT_FOUND", message: "Route not found" } });
+    expect(started).toBe(false);
+  });
+
 
   test("rejects nonempty start bodies and unknown providers", async () => {
     const invalid = await request(

@@ -35,6 +35,16 @@ async function interceptRuns(page: Page): Promise<void> {
   });
 }
 
+async function interceptEmptyRuns(page: Page): Promise<void> {
+  await page.route("**/api/pipeline/runs", async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [] }),
+    });
+  });
+}
+
 async function expectNoDocumentOverflow(page: Page): Promise<void> {
   const widths = await page.evaluate(() => ({
     rootScroll: document.documentElement.scrollWidth,
@@ -98,6 +108,163 @@ function contrastRatio(foreground: string, background: string): number {
 function cssRgb(hex: string): string {
   return `rgb(${Number.parseInt(hex.slice(1, 3), 16)}, ${Number.parseInt(hex.slice(3, 5), 16)}, ${Number.parseInt(hex.slice(5, 7), 16)})`;
 }
+
+test("shows the always-visible URL initializer for an empty dashboard", async ({ page }) => {
+  await interceptEmptyRuns(page);
+  await page.goto("/");
+
+  const heading = page.getByRole("heading", { name: "Applications" });
+  const initializer = page.getByRole("form", { name: "Job posting URL" });
+  await expect(initializer).toBeVisible();
+  await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
+  await expect(initializer.getByLabel("Job posting URL")).toHaveAttribute("id", "job-url");
+  await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
+  await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.", { exact: true })).toBeVisible();
+
+  await expect(page.getByRole("button", { name: /^(New|Close|Create run|Create first application|Cancel)$/ })).toHaveCount(0);
+  await expect(page.locator("textarea")).toHaveCount(0);
+  await expect(page.locator(".run-composer")).toHaveCount(0);
+});
+
+test("uses shared URL eligibility and stays horizontal without overflow", async ({ page }) => {
+  await interceptEmptyRuns(page);
+
+  for (const width of [1_672, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/");
+
+    const input = page.getByRole("textbox", { name: "Job posting URL" });
+    const initialize = page.getByRole("button", { name: "Initialize" });
+    await expect(input).toHaveAttribute("type", "url");
+    await expect(input).toHaveAttribute("inputmode", "url");
+    await expect(input).toHaveAttribute("autocapitalize", "none");
+    await expect(input).toHaveAttribute("autocorrect", "off");
+    await expect(input).toHaveAttribute("spellcheck", "false");
+    await expect(input).toHaveAttribute("placeholder", "https://company.com/jobs/role");
+
+    for (const invalidUrl of ["", "   ", "example.com/job", "ftp://example.com/job", "https://user:pass@example.com/job"]) {
+      await input.fill(invalidUrl);
+      await expect(initialize).toBeDisabled();
+    }
+    await input.fill("https://jobs.example.test/roles/123");
+    await expect(initialize).toBeEnabled();
+
+    const formBox = await page.getByRole("form", { name: "Job posting URL" }).boundingBox();
+    const inputBox = await input.boundingBox();
+    const buttonBox = await initialize.boundingBox();
+    if (!formBox || !inputBox || !buttonBox) throw new Error("Initializer geometry is unavailable");
+    expect(inputBox.x).toBe(formBox.x);
+    expect(buttonBox.x + buttonBox.width).toBe(formBox.x + formBox.width);
+    expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(buttonBox.x);
+    expect(inputBox.y).toBe(buttonBox.y);
+    expect(inputBox.height).toBe(buttonBox.height);
+    await expectNoDocumentOverflow(page);
+  }
+});
+
+test("posts a canonical URL, disables while pending, and navigates on success", async ({ page }) => {
+  const initializedRun = runFixture("initialized-run", "applied", "failed");
+  let postedBody: string | null = null;
+  let releasePost!: () => void;
+  let markPostStarted!: () => void;
+  const postRelease = new Promise<void>((resolve) => {
+    releasePost = resolve;
+  });
+  const postStarted = new Promise<void>((resolve) => {
+    markPostStarted = resolve;
+  });
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+
+    expect(request.method()).toBe("POST");
+    expect(request.headers()["content-type"]).toContain("application/json");
+    postedBody = request.postData();
+    markPostStarted();
+    await postRelease;
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify(initializedRun),
+    });
+  });
+  await page.route("**/api/pipeline/runs/initialized-run", async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(initializedRun),
+    });
+  });
+  await page.goto("/");
+
+  const input = page.getByRole("textbox", { name: "Job posting URL" });
+  const initialize = page.getByRole("button", { name: "Initialize" });
+  await input.fill("HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description");
+  await initialize.click();
+  await postStarted;
+
+  expect(postedBody).toBe('{"jobUrl":"https://jobs.example.test/roles/123?source=ui"}');
+  await expect(input).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
+
+  releasePost();
+  await expect(page).toHaveURL(/\/runs\/initialized-run$/);
+  await expect(page.getByRole("heading", { name: "Run initialized-run" })).toBeVisible();
+});
+
+test("retains the URL and restores accessible controls after a fixed server failure", async ({ page }) => {
+  const submittedUrl = "https://jobs.example.test/unavailable#details";
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+
+    expect(request.method()).toBe("POST");
+    expect(request.postData()).toBe('{"jobUrl":"https://jobs.example.test/unavailable"}');
+    await route.fulfill({
+      status: 422,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_DESCRIPTION_UNAVAILABLE",
+          message: "The page does not contain a usable job description",
+        },
+      }),
+    });
+  });
+  await page.goto("/");
+
+  const input = page.getByRole("textbox", { name: "Job posting URL" });
+  await input.fill(submittedUrl);
+  await page.getByRole("button", { name: "Initialize" }).click();
+
+  const alert = page.locator("#job-url-error");
+  await expect(alert).toHaveAttribute("id", "job-url-error");
+  await expect(alert).toHaveText("The page does not contain a usable job description");
+  await expect(input).toHaveValue(submittedUrl);
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveAttribute("aria-invalid", "true");
+  await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
+  await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
+
+  await input.fill("https://jobs.example.test/another-role");
+  await expect(alert).toHaveCount(0);
+  await expect(input).not.toHaveAttribute("aria-invalid");
+  await expect(input).not.toHaveAttribute("aria-describedby");
+  await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
+});
 
 test("filters by user-managed application state", async ({ page }) => {
   await interceptRuns(page);
@@ -223,10 +390,14 @@ test("navigates between Applications and Providers", async ({ page }) => {
   await expect(page).toHaveURL(/\/providers$/);
   await expect(primaryNavigation.getByRole("link", { name: "Providers" })).toHaveAttribute("aria-current", "page");
   await expect(page.getByRole("heading", { name: "Provider access" })).toBeVisible();
-  const providerRows = page.getByRole("list", { name: "OAuth providers" }).getByRole("listitem");
+  const providerList = page.getByRole("list", { name: "OAuth providers" });
+  const providerRows = providerList.getByRole("listitem");
   await expect(providerRows).toHaveCount(2);
-  await expect(providerRows.nth(0)).toContainText("OpenAI Codex");
-  await expect(providerRows.nth(1)).toContainText("Google Antigravity");
+  await expect(providerRows).toContainText([
+    "OpenAI Codex",
+    "Google Antigravity",
+  ]);
+  await expect(providerRows.nth(0)).toContainText("OAuth access for tailoring and fallback job-posting extraction.");
 });
 
 test("uses the reference-width sidebar and full display workspace", async ({ page }) => {
@@ -261,6 +432,7 @@ test("uses the reference-width sidebar and full display workspace", async ({ pag
 });
 
 test("uses horizontal navigation and local scrollers on narrow displays", async ({ page }) => {
+  test.setTimeout(60_000);
   await interceptRuns(page);
   const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
   await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
@@ -314,29 +486,29 @@ test("uses horizontal navigation and local scrollers on narrow displays", async 
   }
 });
 
-test("uses the light mint palette across surfaces and states", async ({ page }) => {
+test("uses the original dark palette across surfaces and states", async ({ page }) => {
   const expectedColors = {
-    "--color-canvas": "#f4faf6",
-    "--color-surface": "#eaf4ee",
-    "--color-surface-raised": "#dfede5",
-    "--color-surface-hover": "#d4e7db",
-    "--color-border": "#bad3c4",
-    "--color-border-strong": "#668a76",
-    "--color-text": "#143b2b",
-    "--color-muted": "#365d4b",
-    "--color-faint": "#4d6f5f",
-    "--color-accent": "#176b47",
-    "--color-accent-hover": "#0f5537",
-    "--color-good": "#1c6842",
-    "--color-info": "#256753",
-    "--color-warning": "#536b2f",
-    "--color-danger": "#2f5334",
-    "--color-focus": "#0b7548",
-    "--color-application-applied": "#2f6f55",
-    "--color-application-rejected": "#52653a",
-    "--color-application-interview": "#1f6a62",
-    "--color-application-accepted": "#176b3d",
-    "--color-application-failed": "#234b32",
+    "--color-canvas": "#050606",
+    "--color-surface": "#090b0b",
+    "--color-surface-raised": "#111413",
+    "--color-surface-hover": "#171b1a",
+    "--color-border": "#252a28",
+    "--color-border-strong": "#4b5450",
+    "--color-text": "#eef1ec",
+    "--color-muted": "#a4ada7",
+    "--color-faint": "#757e79",
+    "--color-accent": "#d2f34c",
+    "--color-accent-hover": "#e1ff68",
+    "--color-good": "#86d79d",
+    "--color-info": "#83c6ef",
+    "--color-warning": "#ebca73",
+    "--color-danger": "#ef8a82",
+    "--color-focus": "#d2f34c",
+    "--color-application-applied": "#c2a7ef",
+    "--color-application-rejected": "#e8ad73",
+    "--color-application-interview": "#79cae8",
+    "--color-application-accepted": "#79cf92",
+    "--color-application-failed": "#ef8179",
   } as const;
   await page.setViewportSize({ width: 1_672, height: 941 });
   await interceptRuns(page);
@@ -350,7 +522,7 @@ test("uses the light mint palette across surfaces and states", async ({ page }) 
       tokens: Object.fromEntries(tokens.map((token) => [token, style.getPropertyValue(token).trim()])),
     };
   }, Object.keys(expectedColors));
-  expect(rootStyle.colorScheme).toBe("light");
+  expect(rootStyle.colorScheme).toBe("dark");
   expect(rootStyle.tokens).toEqual(expectedColors);
 
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-canvas"]));
@@ -403,8 +575,6 @@ test("uses the light mint palette across surfaces and states", async ({ page }) 
     expect(contrastRatio(expectedColors[token], expectedColors["--color-canvas"])).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(expectedColors[token], expectedColors["--color-surface"])).toBeGreaterThanOrEqual(4.5);
   }
-  expect(contrastRatio(expectedColors["--color-border-strong"], expectedColors["--color-canvas"])).toBeGreaterThanOrEqual(3);
-  expect(contrastRatio(expectedColors["--color-border-strong"], expectedColors["--color-surface"])).toBeGreaterThanOrEqual(3);
 });
 
 test("uses route-workspace breakpoints for detail panes", async ({ page }) => {

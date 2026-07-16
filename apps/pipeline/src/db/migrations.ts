@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const PIPELINE_SCHEMA_VERSION = 2;
+export const PIPELINE_SCHEMA_VERSION = 3;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -133,6 +133,18 @@ ALTER TABLE runs ADD COLUMN application_status TEXT NOT NULL DEFAULT 'applied'
   CHECK (application_status IN ('applied','rejected','interview','accepted','failed'));
 `;
 
+const migration3 = `
+CREATE TABLE run_artifact_retention (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE RESTRICT,
+  state TEXT NOT NULL CHECK (state IN ('pruning','pruned')),
+  selected_at INTEGER NOT NULL,
+  pruned_at INTEGER,
+  CHECK ((state = 'pruning' AND pruned_at IS NULL) OR
+         (state = 'pruned' AND pruned_at IS NOT NULL))
+) STRICT;
+CREATE INDEX run_artifact_retention_state ON run_artifact_retention(state, selected_at);
+`;
+
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
   const version = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
   if (version > PIPELINE_SCHEMA_VERSION) throw new Error(`pipeline database version ${version} is newer than supported ${PIPELINE_SCHEMA_VERSION}`);
@@ -146,6 +158,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
     if (version < 2) {
       db.exec(migration2);
       db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, now);
+    }
+    if (version < 3) {
+      db.exec(migration3);
+      db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(3, now);
     }
     db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
     db.exec("COMMIT");

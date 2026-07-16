@@ -16,9 +16,14 @@ function redactEmail(email: string): string {
   return `${email[0]}***${email.slice(separator)}`;
 }
 
+const OAUTH_MODELS = {
+  "openai-codex": ["gpt-5.6-sol", "gpt-5.6-luna"],
+  "google-antigravity": ["gemini-3.5-flash"],
+} as const;
+
 function assertModel(provider: AuthProvider, modelId: string): void {
-  const expected = provider === "openai-codex" ? "gpt-5.6-sol" : "gemini-3.5-flash";
-  if (modelId !== expected) throw new Error(`Unsupported OAuth model ${provider}/${modelId}`);
+  const models = OAUTH_MODELS[provider as keyof typeof OAUTH_MODELS] as readonly string[] | undefined;
+  if (!models?.includes(modelId)) throw new Error(`Unsupported OAuth model ${provider}/${modelId}`);
 }
 
 export async function resolveOAuthOnlyWithStorage(

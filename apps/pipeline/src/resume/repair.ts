@@ -27,6 +27,7 @@ function splitBodies(source: string): BodySplit {
   const definitions = [
     { section: "experience" as const, marker: "\\section{Experience}" },
     { section: "projects" as const, marker: "\\section{Projects}" },
+    { section: "competitions-other" as const, marker: "\\section{Competitions \\& Other}" },
     { section: "technical-skills" as const, marker: "\\section{Technical Skills}" },
   ];
   const positions = definitions.map(({ section, marker }) => {
@@ -39,7 +40,7 @@ function splitBodies(source: string): BodySplit {
     if (bodyEnd < 0) throw new ResumeValidationError(`candidate has unterminated ${section} section`);
     return { section, bodyStart, bodyEnd };
   }).sort((a, b) => a.bodyStart - b.bodyStart);
-  if (positions.map((item) => item.section).join(",") !== "experience,projects,technical-skills") throw new ResumeValidationError("editable sections were reordered");
+  if (positions.map((item) => item.section).join(",") !== "experience,projects,competitions-other,technical-skills") throw new ResumeValidationError("editable sections were reordered");
   const bodies = {} as Record<ResumeSection, string>;
   let immutableSkeleton = "";
   let cursor = 0;
@@ -152,7 +153,7 @@ export function validateRepairCandidate(failedTex: string, proposedTex: string, 
   if (forbidden.length) throw new ResumeValidationError(`forbidden TeX primitive ${forbidden[0]}`);
   const normalized = {} as Record<ResumeSection, string>;
   const allCommands: string[] = [];
-  for (const section of ["experience", "projects", "technical-skills"] as const) {
+  for (const section of ["experience", "projects", "competitions-other", "technical-skills"] as const) {
     const before = failed.bodies[section];
     const after = proposed.bodies[section];
     if (fullLineComments(before).join("\n") !== fullLineComments(after).join("\n")) throw new ResumeValidationError(`repair changed inert comments in ${section}`);

@@ -1,10 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
-import type { ApplicationStatus, ArtifactDto, ArtifactKind, AttemptDto, AttemptStage, RevisionOrigin as PublicRevisionOrigin, RunDto, RunStatus, TimelineEvent } from "../contracts";
+import {
+  JobDescriptionSchema,
+  type ApplicationStatus,
+  type ArtifactDto,
+  type ArtifactKind,
+  type AttemptDto,
+  type AttemptStage,
+  type RevisionOrigin as PublicRevisionOrigin,
+  type RunDto,
+  type RunStatus,
+  type TimelineEvent,
+} from "../contracts";
 import type { ContextSnapshot } from "../context/types.ts";
 import {
   PipelineRepository,
   RepositoryConflictError,
+  RunArtifactsPrunedError,
   SourceDriftError,
   type ActiveStage,
   type PublicArtifact,
@@ -12,6 +24,18 @@ import {
   type PublicRun,
   type RunSourceSnapshotInput,
 } from "../db/repository.ts";
+import { OAuthRequiredError } from "../auth/oauth-only-resolver.ts";
+import {
+  extractJobDescriptionWithLuna,
+  LunaJobExtractionError,
+  type ExtractJobDescription,
+} from "../models/luna-job-extractor.ts";
+import {
+  JobSourceError,
+  loadJobSourceFromUrl,
+  type LoadedJobSource,
+  type LoadJobSource,
+} from "./job-source.ts";
 import { ArtifactStore } from "../system/artifacts.ts";
 
 const MAX_JOB_DESCRIPTION_BYTES = 200_000;
@@ -53,10 +77,12 @@ export interface RunApplicationDependencies {
   readonly artifacts: ArtifactStore;
   readonly scheduler: RunScheduler | (() => void);
   readonly idFactory?: () => string;
+  readonly loadJobSource?: LoadJobSource;
+  readonly extractJobDescription?: ExtractJobDescription;
 }
 
 export class RunServiceError extends Error {
-  constructor(readonly code: string, message: string, readonly status: 400 | 404 | 409) {
+  constructor(readonly code: string, message: string, readonly status: 400 | 404 | 409 | 410 | 422 | 502 | 504) {
     super(message);
     this.name = "RunServiceError";
   }
@@ -148,9 +174,13 @@ function artifactDto(runId: string, artifact: PublicArtifact, attemptById: Reado
 
 export class RunApplicationService {
   readonly #idFactory: () => string;
+  readonly #loadJobSource: LoadJobSource;
+  readonly #extractJobDescription: ExtractJobDescription;
 
   constructor(private readonly dependencies: RunApplicationDependencies) {
     this.#idFactory = dependencies.idFactory ?? randomUUID;
+    this.#loadJobSource = dependencies.loadJobSource ?? loadJobSourceFromUrl;
+    this.#extractJobDescription = dependencies.extractJobDescription ?? extractJobDescriptionWithLuna;
   }
 
   kick(): void {
@@ -167,12 +197,72 @@ export class RunApplicationService {
     return run ? await this.#toDto(run) : undefined;
   }
 
-  async createRun(jobDescription: string): Promise<RunDto> {
-    const snapshot = sourceSnapshot(await this.#freshSnapshot());
+  async createRun(jobUrl: string, signal?: AbortSignal): Promise<RunDto> {
+    signal?.throwIfAborted();
+    let source: LoadedJobSource;
+    try {
+      source = await this.#loadJobSource(jobUrl, signal);
+    } catch (error) {
+      if (signal?.aborted) signal.throwIfAborted();
+      throw error;
+    }
+    signal?.throwIfAborted();
+
+    let jobDescription: string | null;
+    if (source.kind === "description") {
+      jobDescription = source.jobDescription;
+    } else {
+      try {
+        jobDescription = await this.#extractJobDescription(source.lines, signal);
+      } catch (error) {
+        if (signal?.aborted) signal.throwIfAborted();
+        if (error instanceof OAuthRequiredError) {
+          throw new RunServiceError(
+            "JOB_EXTRACTION_AUTH_REQUIRED",
+            "Connect OpenAI Codex OAuth before importing this job page",
+            409,
+          );
+        }
+        if (error instanceof LunaJobExtractionError) {
+          if (error.kind === "timeout") {
+            throw new RunServiceError(
+              "JOB_EXTRACTION_TIMEOUT",
+              "Job description extraction timed out",
+              504,
+            );
+          }
+          throw new RunServiceError(
+            "JOB_EXTRACTION_UNAVAILABLE",
+            "Job description extraction failed",
+            502,
+          );
+        }
+        throw error;
+      }
+      signal?.throwIfAborted();
+    }
+    if (jobDescription === null) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+    const validated = JobDescriptionSchema.parse(jobDescription);
+
+    signal?.throwIfAborted();
+    let freshSnapshot: ContextSnapshot;
+    try {
+      freshSnapshot = await this.#freshSnapshot();
+    } catch (error) {
+      if (signal?.aborted) signal.throwIfAborted();
+      throw error;
+    }
+    signal?.throwIfAborted();
+    const snapshot = sourceSnapshot(freshSnapshot);
+
     const runId = this.#idFactory();
     const inputRoot = await this.dependencies.artifacts.createRunInput({ run: runId });
-    const input = await this.dependencies.artifacts.write(join(inputRoot, "job-description.txt"), jobDescription, MAX_JOB_DESCRIPTION_BYTES);
-    const run = this.dependencies.repository.createQueuedRun(jobDescription, snapshot, {
+    const input = await this.dependencies.artifacts.write(
+      join(inputRoot, "job-description.txt"),
+      validated,
+      MAX_JOB_DESCRIPTION_BYTES,
+    );
+    const run = this.dependencies.repository.createQueuedRun(validated, snapshot, {
       sha256: input.sha256,
       path: input.path,
       byteSize: input.bytes,
@@ -185,29 +275,49 @@ export class RunApplicationService {
   }
 
   async retryRun(id: string): Promise<RunDto> {
-    const current = sourceSnapshot(await this.#freshSnapshot());
-    return await this.#command(() => this.dependencies.repository.retry(id, current));
+    return await this.#command(async () => {
+      this.#assertArtifactsRetained(id);
+      const current = sourceSnapshot(await this.#freshSnapshot());
+      return this.dependencies.repository.retry(id, current);
+    });
   }
 
   async regenerateRun(id: string, expectedPdfSha256: string): Promise<RunDto> {
-    const current = sourceSnapshot(await this.#freshSnapshot());
-    return await this.#command(() => this.dependencies.repository.regenerate(id, expectedPdfSha256, current));
+    return await this.#command(async () => {
+      this.#assertArtifactsRetained(id);
+      const current = sourceSnapshot(await this.#freshSnapshot());
+      return this.dependencies.repository.regenerate(id, expectedPdfSha256, current);
+    });
   }
 
   async editRun(id: string, comments: string, expectedPdfSha256: string): Promise<RunDto> {
-    const current = sourceSnapshot(await this.#freshSnapshot());
-    return await this.#command(() => this.dependencies.repository.editRun(id, comments, expectedPdfSha256, current));
+    return await this.#command(async () => {
+      this.#assertArtifactsRetained(id);
+      const current = sourceSnapshot(await this.#freshSnapshot());
+      return this.dependencies.repository.editRun(id, comments, expectedPdfSha256, current);
+    });
   }
 
   async approveRun(id: string, expectedPdfSha256: string, acknowledgeVisualIssues: boolean): Promise<RunDto> {
-    const current = sourceSnapshot(await this.#freshSnapshot());
-    return await this.#command(() => this.dependencies.repository.approve(id, expectedPdfSha256, acknowledgeVisualIssues, current));
+    return await this.#command(async () => {
+      this.#assertArtifactsRetained(id);
+      const current = sourceSnapshot(await this.#freshSnapshot());
+      return this.dependencies.repository.approve(id, expectedPdfSha256, acknowledgeVisualIssues, current);
+    });
   }
 
   async getArtifact(runId: string, artifactId: string): Promise<Response | undefined> {
     const run = this.dependencies.repository.getRun(runId);
-    const artifact = run ? this.dependencies.repository.getArtifactById(runId, artifactId) : null;
-    if (!run || !artifact) return undefined;
+    if (!run) return undefined;
+    if (!this.dependencies.repository.areRunArtifactsRetained(runId)) {
+      throw new RunServiceError(
+        "RUN_ARTIFACTS_PRUNED",
+        "Run artifacts were removed by the ten-run retention policy",
+        410,
+      );
+    }
+    const artifact = this.dependencies.repository.getArtifactById(runId, artifactId);
+    if (!artifact) return undefined;
     const kind = PUBLIC_ARTIFACT_KINDS[artifact.kind];
     if (!kind) return undefined;
     const isCurrentReviewArtifact = (run.status === "review" || run.status === "approved")
@@ -217,7 +327,19 @@ export class RunApplicationService {
 
     const limit = publicArtifactLimit(kind);
     if (artifact.byteSize > limit) throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact exceeds its public size limit", 409);
-    const bytes = await this.dependencies.artifacts.read(artifact.path, limit);
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.dependencies.artifacts.read(artifact.path, limit);
+    } catch (error) {
+      if (!this.dependencies.repository.areRunArtifactsRetained(runId)) {
+        throw new RunServiceError(
+          "RUN_ARTIFACTS_PRUNED",
+          "Run artifacts were removed by the ten-run retention policy",
+          410,
+        );
+      }
+      throw error;
+    }
     if (bytes.byteLength !== artifact.byteSize) throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact metadata does not match stored content", 409);
     const digest = createHash("sha256").update(bytes).digest();
     if (digest.toString("hex") !== artifact.sha256) throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact hash verification failed", 409);
@@ -237,6 +359,10 @@ export class RunApplicationService {
     });
   }
 
+  #assertArtifactsRetained(runId: string): void {
+    if (!this.dependencies.repository.areRunArtifactsRetained(runId)) throw new RunArtifactsPrunedError();
+  }
+
   async #freshSnapshot(): Promise<ContextSnapshot> {
     try {
       return await this.dependencies.context.createSnapshot();
@@ -245,10 +371,17 @@ export class RunApplicationService {
     }
   }
 
-  async #command(command: () => PublicRun): Promise<RunDto> {
+  async #command(command: () => PublicRun | Promise<PublicRun>): Promise<RunDto> {
     try {
-      return await this.#toDto(command());
+      return await this.#toDto(await command());
     } catch (error) {
+      if (error instanceof RunArtifactsPrunedError) {
+        throw new RunServiceError(
+          "RUN_ARTIFACTS_PRUNED",
+          "Run artifacts were removed by the ten-run retention policy",
+          410,
+        );
+      }
       if (error instanceof SourceDriftError) throw new RunServiceError("SOURCE_DRIFT", error.message, 409);
       if (error instanceof RepositoryConflictError) {
         const message = error.message;
@@ -279,10 +412,11 @@ export class RunApplicationService {
       ...(attempt.status === "succeeded" || attempt.status === "failed" || attempt.status === "cancelled" ? { outcome: attempt.status } : {}),
     }));
     const attemptById = new Map(history.attempts.map((attempt) => [attempt.id, attempt.attemptNo]));
-    const visibleArtifacts = run.status === "review" || run.status === "approved"
+    const artifactsRetained = repository.areRunArtifactsRetained(run.id);
+    const visibleArtifacts = artifactsRetained && (run.status === "review" || run.status === "approved")
       ? repository.listResolvedArtifacts(run.id).map((artifact) => artifactDto(run.id, artifact, attemptById)).filter((artifact): artifact is ArtifactDto => artifact !== null)
       : [];
-    const pdf = repository.getArtifact(run.id, "compiled-pdf");
+    const pdf = artifactsRetained ? repository.getArtifact(run.id, "compiled-pdf") : null;
     return {
       id: run.id,
       status: run.status,

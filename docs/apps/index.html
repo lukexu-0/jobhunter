@@ -8,10 +8,11 @@
 <body>
   <header>
     <h1>Resume tailoring applications</h1>
-    <p>The <code>apps/</code> Bun workspace contains the local pipeline API and its Next.js review interface.</p>
+    <p>The <code>apps/</code> source tree includes the local pipeline API and Next.js review interface, plus a standalone Python Browser Use application harness.</p>
     <nav aria-label="Documentation">
       <ul>
         <li><a href="pipeline/index.html">Pipeline service</a></li>
+        <li><a href="browser-harness/application.html">Browser harness application operations</a></li>
         <li><a href="web/index.html">Web interface</a></li>
       </ul>
     </nav>
@@ -20,8 +21,14 @@
   <main>
     <section id="prerequisites">
       <h2>Prerequisites</h2>
-      <p>The workspace declares <strong>Bun 1.3.14</strong> with the <code>web</code> and <code>pipeline</code> workspaces. The pipeline doctor also requires the <code>latexmk</code> executable and Poppler’s <code>pdfinfo</code>, <code>pdftotext</code>, <code>pdffonts</code>, and <code>pdftoppm</code>. Use the provider-access controls in the web UI to connect the two application-owned OAuth accounts before processing a run; do not supply provider API keys.</p>
-      <p>Source: <a href="../../apps/package.json"><code>apps/package.json</code></a>, <a href="../../apps/pipeline/src/system/doctor.ts"><code>apps/pipeline/src/system/doctor.ts</code></a>, and <a href="../../apps/pipeline/src/auth/service.ts"><code>apps/pipeline/src/auth/service.ts</code></a>.</p>
+      <p>The workspace declares <strong>Bun 1.3.14</strong> with the <code>web</code> and <code>pipeline</code> workspaces. The pipeline doctor also requires the <code>latexmk</code> executable and Poppler’s <code>pdfinfo</code>, <code>pdftotext</code>, <code>pdffonts</code>, and <code>pdftoppm</code>. Before processing work that needs a model, open the web interface’s <a href="web/index.html#oauth">Providers page</a> at <code>/providers</code> and use its provider-access controls to connect the two application-owned OAuth providers; do not supply provider API keys.</p>
+      <dl>
+        <dt>OpenAI Codex</dt>
+        <dd><code>openai-codex/gpt-5.6-sol</code> for tailoring, analysis, editing, and repair, and <code>openai-codex/gpt-5.6-luna</code> for static job-posting extraction fallback. OpenAI Codex is required only when an imported HTML page reaches the Luna fallback: deterministic <code>JobPosting</code> or plain-text imports do not require it.</dd>
+        <dt>Google Antigravity</dt>
+        <dd><code>google-antigravity/gemini-3.5-flash</code> for visual document inspection.</dd>
+      </dl>
+      <p>Sources: <a href="../../apps/package.json"><code>apps/package.json</code></a>, <a href="../../apps/pipeline/src/system/doctor.ts"><code>apps/pipeline/src/system/doctor.ts</code></a>, <a href="../../apps/pipeline/src/auth/storage.ts"><code>apps/pipeline/src/auth/storage.ts</code></a>, <a href="../../apps/pipeline/src/auth/sessions.ts"><code>apps/pipeline/src/auth/sessions.ts</code></a>, <a href="../../apps/pipeline/src/models/luna-job-extractor.ts"><code>apps/pipeline/src/models/luna-job-extractor.ts</code></a>, <a href="../../apps/pipeline/src/api/job-source.ts"><code>apps/pipeline/src/api/job-source.ts</code></a>, and <a href="../../apps/web/app/providers/page.tsx"><code>apps/web/app/providers/page.tsx</code></a>.</p>
     </section>
 
     <section id="commands">
@@ -59,6 +66,7 @@ cd apps &amp;&amp; bun run --cwd pipeline doctor</code></pre>
         <li><a href="../../apps/scripts/dev.ts"><code>apps/scripts/dev.ts</code></a> — coordinated development launcher and signal shutdown.</li>
         <li><a href="../../apps/pipeline/src/index.ts"><code>apps/pipeline/</code></a> — Bun API, worker, source-context index, SQLite stores, artifact handling, and package-local scripts. See <a href="pipeline/index.html">Pipeline service</a>.</li>
         <li><a href="../../apps/web/package.json"><code>apps/web/</code></a> — Next.js application, same-origin rewrite, dashboard, and run-review screen. See <a href="web/index.html">Web interface</a>.</li>
+        <li><a href="../../apps/browser-harness/pyproject.toml"><code>apps/browser-harness/</code></a> — Python Browser Use service for local, human-reviewed job applications. See <a href="browser-harness/application.html">Browser harness application operations</a>.</li>
       </ul>
     </section>
 
@@ -74,14 +82,14 @@ cd apps &amp;&amp; bun run --cwd pipeline doctor</code></pre>
 
     <section id="troubleshooting">
       <h2>Troubleshooting and verification</h2>
-      <p>Run <code>cd apps &amp;&amp; bun run --cwd pipeline doctor</code> to receive bounded JSON checks for Bun, the context index, both OAuth providers, both model descriptors, <code>latexmk</code>, and the four Poppler tools. <code>auth_absent</code> and <code>auth_expired</code> are <em>warnings</em>, not doctor errors; an absent OAuth connection alone does not make the doctor exit nonzero. Missing system tools, stale or invalid context, invalid model descriptors, and invalid auth configuration are errors and make the report unsuccessful.</p>
-      <p>If context is stale, run <code>cd apps &amp;&amp; bun run --cwd pipeline context:sync</code>, then repeat the doctor command. To check without changing the index, use <code>cd apps &amp;&amp; bun run --cwd pipeline context:sync -- --check</code>; a stale check exits nonzero. For API availability, request <code>/v1/health</code> through the pipeline port or through the web rewrite.</p>
-      <p>Sources: <a href="../../apps/pipeline/scripts/doctor.ts"><code>apps/pipeline/scripts/doctor.ts</code></a>, <a href="../../apps/pipeline/src/system/doctor.ts"><code>apps/pipeline/src/system/doctor.ts</code></a>, <a href="../../apps/pipeline/scripts/context-sync.ts"><code>apps/pipeline/scripts/context-sync.ts</code></a>, and <a href="../../apps/pipeline/src/api/handler.ts"><code>apps/pipeline/src/api/handler.ts</code></a>.</p>
+      <p>Run <code>cd apps &amp;&amp; bun run --cwd pipeline doctor</code> to receive bounded JSON checks for Bun, the context index, the two OAuth providers (<code>openai-codex</code> and <code>google-antigravity</code>), their three fixed model descriptors (<code>openai-codex/gpt-5.6-sol</code>, <code>google-antigravity/gemini-3.5-flash</code>, and <code>openai-codex/gpt-5.6-luna</code>), <code>latexmk</code>, and the four Poppler tools. <code>auth_absent</code> and <code>auth_expired</code> are <em>warnings</em>, not doctor errors; an absent OAuth connection alone does not make the doctor exit nonzero. Missing system tools, stale or invalid context, invalid model descriptors, and invalid auth configuration are errors and make the report unsuccessful.</p>
+      <p>If context is stale, run <code>cd apps &amp;&amp; bun run --cwd pipeline context:sync</code>, then repeat the doctor command. To check without changing the index, use <code>cd apps &amp;&amp; bun run --cwd pipeline context:sync -- --check</code>; a stale check exits nonzero. For API availability, request <code>/v1/health</code> through the pipeline port or through the web rewrite. A disconnected OpenAI Codex connection blocks only a page that needs the Luna extraction fallback; connect it from <a href="web/index.html#oauth">Providers</a> when that fixed extraction error is returned.</p>
+      <p>Sources: <a href="../../apps/pipeline/scripts/doctor.ts"><code>apps/pipeline/scripts/doctor.ts</code></a>, <a href="../../apps/pipeline/src/system/doctor.ts"><code>apps/pipeline/src/system/doctor.ts</code></a>, <a href="../../apps/pipeline/src/auth/sessions.ts"><code>apps/pipeline/src/auth/sessions.ts</code></a>, <a href="../../apps/pipeline/src/api/run-service.ts"><code>apps/pipeline/src/api/run-service.ts</code></a>, <a href="../../apps/pipeline/scripts/context-sync.ts"><code>apps/pipeline/scripts/context-sync.ts</code></a>, and <a href="../../apps/pipeline/src/api/handler.ts"><code>apps/pipeline/src/api/handler.ts</code></a>.</p>
     </section>
   </main>
 
   <footer>
-    <p><a href="pipeline/index.html">Pipeline service documentation</a> · <a href="web/index.html">Web interface documentation</a></p>
+    <p><a href="pipeline/index.html">Pipeline service documentation</a> · <a href="web/index.html">Web interface documentation</a> · <a href="browser-harness/application.html">Browser harness application operations</a></p>
   </footer>
 </body>
 </html>

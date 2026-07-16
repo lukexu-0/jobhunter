@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { Agent, RunContext, type Model, type ModelProvider, type Tool } from "@openai/agents-core";
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import { z } from "zod";
 import {
   AgentDeadlineError,
@@ -12,20 +15,56 @@ import {
   type AgentRunner,
   type AgentRuntimeDependencies,
 } from "../src/agents/index.ts";
-import type { JobAnalysis, TailoringPlan } from "../src/resume/types.ts";
+import type { ContextSnapshot } from "../src/context/types.ts";
+import { hashJobAnalysis } from "../src/resume/ledger.ts";
+import type { TailoringPlan } from "../src/resume/types.ts";
+import {
+  ANALYSIS_WORKFLOW_PROMPT,
+  ANALYSIS_WORKFLOW_SHA256,
+  TAILORING_WORKFLOW_PROMPT,
+  TAILORING_WORKFLOW_SHA256,
+  jobAnalysisFixture,
+} from "./job-analysis.fixture.ts";
 
-const ANALYSIS: JobAnalysis = {
-  id: "analysis-1",
-  jobDescriptionSha256: "a".repeat(64),
-  target: { title: "Engineer" },
-  prioritizedKeywords: [],
-  guidance: [],
+const RAW_JOB_DESCRIPTION = "raw-jd";
+const RAW_JOB_DESCRIPTION_SHA256 = createHash("sha256").update(RAW_JOB_DESCRIPTION).digest("hex");
+const ANALYSIS = jobAnalysisFixture({ jobDescriptionSha256: RAW_JOB_DESCRIPTION_SHA256 });
+const BASELINE = readFileSync(resolve(import.meta.dir, "../../../actual/resume-main/main.tex"), "utf8");
+const CONTEXT: ContextSnapshot = {
+  manifestSha256: "c".repeat(64),
+  baselineSha256: "d".repeat(64),
+  sourceHashes: { "past-project": "e".repeat(64) },
+  sources: [{
+    id: "past-project",
+    relativePath: "actual/current-context/projects/past-project.md",
+    kind: "authoritative-markdown",
+    entityId: "project:past-project",
+    displayName: "Past project",
+    baselineEntityIds: ["Past Project"],
+    sourceVersionId: "past-project-version",
+    sha256: "e".repeat(64),
+    bytes: 100,
+    indexedAt: 1,
+  }],
+  evidence: [{
+    id: "past-project-evidence",
+    sourceVersionId: "past-project-version",
+    sourceId: "past-project",
+    entityId: "project:past-project",
+    ordinal: 0,
+    headingPath: ["Past Project"],
+    text: "Built a production project with measurable outcomes.",
+    caveats: [],
+    sha256: "f".repeat(64),
+  }],
+  explicitEntityBindings: {},
 };
 
 const PLAN: TailoringPlan = {
   id: "plan-1",
   analysisId: ANALYSIS.id,
-  analysisSha256: "b".repeat(64),
+  analysisSha256: hashJobAnalysis(ANALYSIS),
+  tailoringWorkflowSha256: TAILORING_WORKFLOW_SHA256,
   decisions: [],
   projectOrder: [],
   skillDecisions: [],
@@ -39,6 +78,8 @@ const VALID_REPAIR_TEX = String.raw`\begin{document}
 \resumeSubheading{Role}{Dates}{Entity}{Place}
 \resumeItem{Did work}
 \section{Projects}
+\section{Competitions \& Other}
+\resumeSubheading{Result}{Dates}{Competition}{Place}
 \section{Technical Skills}
 \textbf{Languages}{: TypeScript}
 \end{document}`;
@@ -93,21 +134,58 @@ describe("one-turn agents", () => {
         reasoning: { effort: "medium" }, toolChoice: "submit_job_analysis", parallelToolCalls: false, store: false,
         retry: { maxRetries: 0 },
       });
-      expect(JSON.parse(input).rawJobDescription).toBe("raw-jd");
+      const parsedInput = JSON.parse(input);
+      expect(parsedInput).toMatchObject({
+        analysisWorkflowSha256: ANALYSIS_WORKFLOW_SHA256,
+        jobDescriptionSha256: RAW_JOB_DESCRIPTION_SHA256,
+        rawJobDescription: "raw-jd",
+        canonicalCv: "canonical-cv",
+        candidateContext: CONTEXT,
+      });
+      expect(agent.instructions).toContain(ANALYSIS_WORKFLOW_PROMPT);
       await invoke(agent, "submit_job_analysis", ANALYSIS);
       return { finalOutput: ANALYSIS };
     }, providerIds);
     const signal = new AbortController().signal;
-    await runAnalysisAgent({ attemptSessionId: "attempt-a", input: { rawJobDescription: "raw-jd", evidence: [] }, signal, runtime });
-    await runAnalysisAgent({ attemptSessionId: "attempt-b", input: { rawJobDescription: "raw-jd", evidence: [] }, signal, runtime });
+    await runAnalysisAgent({ attemptSessionId: "attempt-a", input: { rawJobDescription: "raw-jd", canonicalCv: "canonical-cv", context: CONTEXT }, signal, runtime });
+    await runAnalysisAgent({ attemptSessionId: "attempt-b", input: { rawJobDescription: "raw-jd", canonicalCv: "canonical-cv", context: CONTEXT }, signal, runtime });
     expect(calls).toBe(2);
     expect(providerIds).toEqual(["attempt-a", "attempt-b"]);
+  });
+
+  test("rejects analysis produced for a different workflow revision", async () => {
+    const runtime = runtimeWith(async (agent) => {
+      await invoke(agent, "submit_job_analysis", {
+        ...ANALYSIS,
+        analysisWorkflowSha256: "f".repeat(64),
+      });
+      return {};
+    });
+    await expect(runAnalysisAgent({
+      attemptSessionId: "stale-workflow",
+      input: { rawJobDescription: "jd", canonicalCv: "cv", context: CONTEXT },
+      signal: new AbortController().signal,
+      runtime,
+    })).rejects.toThrow("configured analysis workflow");
+  });
+
+  test("rejects analysis produced for a different job description", async () => {
+    const runtime = runtimeWith(async (agent) => {
+      await invoke(agent, "submit_job_analysis", ANALYSIS);
+      return {};
+    });
+    await expect(runAnalysisAgent({
+      attemptSessionId: "stale-job",
+      input: { rawJobDescription: "different-jd", canonicalCv: "cv", context: CONTEXT },
+      signal: new AbortController().signal,
+      runtime,
+    })).rejects.toThrow("supplied job description");
   });
 
   test("rejects plain text or absent submission", async () => {
     const runtime = runtimeWith(async () => ({ finalOutput: "plain text" }));
     await expect(runAnalysisAgent({
-      attemptSessionId: "plain", input: { rawJobDescription: "jd", evidence: [] }, signal: new AbortController().signal, runtime,
+      attemptSessionId: "plain", input: { rawJobDescription: "jd", canonicalCv: "cv", context: CONTEXT }, signal: new AbortController().signal, runtime,
     })).rejects.toThrow("requires exactly one validated terminal call");
   });
 
@@ -118,7 +196,7 @@ describe("one-turn agents", () => {
       return {};
     });
     await expect(runAnalysisAgent({
-      attemptSessionId: "duplicate", input: { rawJobDescription: "jd", evidence: [] }, signal: new AbortController().signal, runtime: duplicateRuntime,
+      attemptSessionId: "duplicate", input: { rawJobDescription: "jd", canonicalCv: "cv", context: CONTEXT }, signal: new AbortController().signal, runtime: duplicateRuntime,
     })).rejects.toThrow("exactly once");
 
     const submission = createTerminalSubmission({
@@ -130,23 +208,72 @@ describe("one-turn agents", () => {
     expect(submission.count()).toBe(0);
   });
 
-  test("tailoring input cannot carry the raw job description", async () => {
+  test("tailoring edits and inspects an isolated working copy before terminal submission", async () => {
+    const tailoredTex = `${BASELINE}\n% isolated tailored copy`;
+    let renderCalls = 0;
     const runtime = runtimeWith(async (agent, input, options) => {
-      runOptionsAreFresh(options, 1);
+      runOptionsAreFresh(options, 9);
       expect(agent.modelSettings).toMatchObject({
-        reasoning: { effort: "medium" }, toolChoice: "submit_tailoring_plan", parallelToolCalls: false, store: false,
+        reasoning: { effort: "medium" }, parallelToolCalls: false, store: false,
         retry: { maxRetries: 0 },
       });
+      expect(agent.modelSettings.toolChoice).toBeUndefined();
       expect(agent.handoffs).toEqual([]);
       expect(agent.mcpServers).toEqual([]);
-      expect(agent.toolUseBehavior).toBe("stop_on_first_tool");
+      expect(agent.toolUseBehavior).toEqual({ stopAtToolNames: ["submit_tailoring_plan"] });
+      expect(agent.tools.map((item) => item.name)).toEqual([
+        "read_working_tex", "apply_tailoring_plan", "submit_tailoring_plan",
+      ]);
+      expect(agent.instructions).toContain(TAILORING_WORKFLOW_PROMPT);
+      expect(agent.instructions).not.toContain("## Step 15");
       expect(input).not.toContain("SECRET RAW JD");
-      expect(Object.keys(JSON.parse(input))).toEqual(["task", "analysis", "baseline", "evidence"]);
+      expect(input).not.toContain("\\documentclass");
+      const parsedInput = JSON.parse(input);
+      expect(Object.keys(parsedInput)).toEqual([
+        "task", "analysisId", "analysisSha256", "tailoringWorkflowSha256", "analysis", "candidateContext", "baselineInventory",
+      ]);
+      expect(parsedInput).toMatchObject({
+        analysisId: ANALYSIS.id,
+        analysisSha256: hashJobAnalysis(ANALYSIS),
+        tailoringWorkflowSha256: TAILORING_WORKFLOW_SHA256,
+        analysis: ANALYSIS,
+        candidateContext: CONTEXT,
+      });
+      expect(parsedInput.baselineInventory.entities.some(
+        (entity: { section: string }) => entity.section === "competitions-other",
+      )).toBeTrue();
+      expect(await invoke(agent, "read_working_tex", {})).toBe(BASELINE);
+      expect(await invoke(agent, "apply_tailoring_plan", {
+        plan: { ...PLAN, tailoringWorkflowSha256: "f".repeat(64) },
+      })).toContain("Plan rejected");
+      expect(await invoke(agent, "apply_tailoring_plan", {
+        plan: { ...PLAN, analysisSha256: "f".repeat(64) },
+      })).toContain("Plan rejected");
+      expect(await invoke(agent, "apply_tailoring_plan", { plan: PLAN })).toMatchObject({ ok: true });
+      expect(await invoke(agent, "read_working_tex", {})).toBe(tailoredTex);
+      await invoke(agent, "submit_tailoring_plan", { plan: PLAN });
       return {};
     });
-    await expect(runTailoringAgent({
-      attemptSessionId: "tailor", input: { analysis: ANALYSIS, baseline: {}, evidence: [] }, signal: new AbortController().signal, runtime,
-    })).rejects.toThrow("requires exactly one validated terminal call");
+    const result = await runTailoringAgent({
+      attemptSessionId: "tailor",
+      input: {
+        analysis: ANALYSIS,
+        baseline: BASELINE,
+        context: CONTEXT,
+        operations: {
+          renderPlan(plan, signal) {
+            renderCalls++;
+            signal.throwIfAborted();
+            expect(plan).toEqual(PLAN);
+            return tailoredTex;
+          },
+        },
+      },
+      signal: new AbortController().signal,
+      runtime,
+    });
+    expect(renderCalls).toBe(1);
+    expect(result).toEqual({ plan: PLAN, tailoredTex, toolCount: 6 });
   });
 
   test("edit is one isolated plan-only run over current immutable artifacts and requirements", async () => {

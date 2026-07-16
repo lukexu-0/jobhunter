@@ -9,22 +9,26 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { Effort } from "@oh-my-pi/pi-catalog";
 
-const REQUEST_KEYS = new Set([
-  "systemInstructions", "input", "previousResponseId", "conversationId", "modelSettings", "tools",
-  "toolsExplicitlyProvided", "outputType", "handoffs", "tracing", "signal", "prompt", "overridePromptModel",
-]);
-const SETTINGS_KEYS = new Set([
-  "temperature", "topP", "frequencyPenalty", "presencePenalty", "toolChoice", "parallelToolCalls", "truncation",
-  "maxTokens", "store", "promptCacheRetention", "promptCacheOptions", "contextManagement", "reasoning", "text",
-  "providerData", "retry",
-]);
-const REASONING_KEYS = new Set(["context", "effort", "mode", "summary"]);
-const TEXT_KEYS = new Set(["verbosity"]);
-const RETRY_KEYS = new Set(["maxRetries", "backoff", "policy"]);
-const OUTPUT_SCHEMA_KEYS = new Set(["type", "name", "strict", "schema"]);
-const FUNCTION_TOOL_KEYS = new Set([
-  "type", "name", "description", "parameters", "strict", "deferLoading", "namespace", "namespaceDescription",
-]);
+const REQUEST_KEYS: Readonly<Record<string, true>> = {
+  systemInstructions: true, input: true, previousResponseId: true, conversationId: true,
+  modelSettings: true, tools: true, toolsExplicitlyProvided: true, outputType: true,
+  handoffs: true, tracing: true, signal: true, prompt: true, overridePromptModel: true, _internal: true,
+};
+const SETTINGS_KEYS: Readonly<Record<string, true>> = {
+  temperature: true, topP: true, frequencyPenalty: true, presencePenalty: true,
+  toolChoice: true, parallelToolCalls: true, truncation: true, maxTokens: true,
+  store: true, promptCacheRetention: true, promptCacheOptions: true, contextManagement: true,
+  reasoning: true, text: true, providerData: true, retry: true,
+};
+const REASONING_KEYS: Readonly<Record<string, true>> = { context: true, effort: true, mode: true, summary: true };
+const TEXT_KEYS: Readonly<Record<string, true>> = { verbosity: true };
+const RETRY_KEYS: Readonly<Record<string, true>> = { maxRetries: true, backoff: true, policy: true };
+const OUTPUT_SCHEMA_KEYS: Readonly<Record<string, true>> = { type: true, name: true, strict: true, schema: true };
+const INTERNAL_REQUEST_KEYS: Readonly<Record<string, true>> = { reasoningEffortImplicit: true, runnerManagedRetry: true };
+const FUNCTION_TOOL_KEYS: Readonly<Record<string, true>> = {
+  type: true, name: true, description: true, parameters: true, strict: true,
+  deferLoading: true, namespace: true, namespaceDescription: true,
+};
 const ZERO_PI_USAGE = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -43,9 +47,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function assertKnownKeys(value: object, allowed: ReadonlySet<string>, label: string): void {
+function assertKnownKeys(value: object, allowed: Readonly<Record<string, true>>, label: string): void {
   for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) throw new Error(`Unsupported ${label} field: ${key}`);
+    if (!allowed[key]) throw new Error(`Unsupported ${label} field: ${key}`);
   }
 }
 
@@ -159,7 +163,7 @@ function mapTools(tools: ModelRequest["tools"]): Tool[] {
   return tools.map((tool, index) => {
     if (!isRecord(tool) || tool.type !== "function") throw new Error(`Unsupported tool type at index ${index}`);
     assertKnownKeys(tool, FUNCTION_TOOL_KEYS, `function tool ${tool.name}`);
-    if (tool.deferLoading !== undefined || tool.namespace !== undefined || tool.namespaceDescription !== undefined) {
+    if (tool.deferLoading === true || tool.namespace !== undefined || tool.namespaceDescription !== undefined) {
       throw new Error(`Deferred or namespaced function tools are not supported: ${tool.name}`);
     }
     if (typeof tool.name !== "string" || typeof tool.description !== "string" || !isRecord(tool.parameters) || typeof tool.strict !== "boolean") {
@@ -187,10 +191,20 @@ export interface MappedCodexRequest {
 
 export function mapAgentsRequest(request: ModelRequest): MappedCodexRequest {
   assertKnownKeys(request, REQUEST_KEYS, "model request");
+  const internal = Reflect.get(request, "_internal");
+  if (internal !== undefined) {
+    if (!isRecord(internal)) throw new Error("Invalid internal model request metadata");
+    assertKnownKeys(internal, INTERNAL_REQUEST_KEYS, "internal model request metadata");
+    for (const [key, value] of Object.entries(internal)) {
+      if (typeof value !== "boolean") throw new Error(`Invalid internal model request metadata field: ${key}`);
+    }
+  }
   rejectPresent(request.previousResponseId, "previousResponseId");
   rejectPresent(request.conversationId, "conversationId");
   rejectPresent(request.prompt, "prompt templates");
-  rejectPresent(request.overridePromptModel, "prompt model overrides");
+  if (request.overridePromptModel !== undefined && typeof request.overridePromptModel !== "boolean") {
+    throw new Error("Invalid prompt model override");
+  }
   if (!Array.isArray(request.handoffs) || request.handoffs.length !== 0) throw new Error("Handoffs are not supported");
   if (typeof request.systemInstructions !== "string" && request.systemInstructions !== undefined) throw new Error("Invalid system instructions");
   if (request.toolsExplicitlyProvided !== undefined && typeof request.toolsExplicitlyProvided !== "boolean") throw new Error("Invalid toolsExplicitlyProvided");

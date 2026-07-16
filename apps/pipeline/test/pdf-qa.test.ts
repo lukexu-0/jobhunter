@@ -59,6 +59,7 @@ const BBOX = `<?xml version="1.0" encoding="UTF-8"?>
 <doc><page width="612.000000" height="792.000000">
 <word xMin="72.000000" yMin="72.000000" xMax="130.000000" yMax="84.000000">Experience</word>
 <word xMin="72.000000" yMin="96.000000" xMax="220.000000" yMax="108.000000">Built reliable pipelines</word>
+<word xMin="225.000000" yMin="96.000000" xMax="250.000000" yMax="108.000000">K–9</word>
 <word xMin="72.000000" yMin="132.000000" xMax="125.000000" yMax="144.000000">Education</word>
 </page></doc>`;
 const FONTS = `name                                 type              encoding         emb sub uni object ID
@@ -74,7 +75,7 @@ describe("deterministic PDF QA", () => {
       pdfPath: pdf,
       cwd: root,
       requiredHeadings: ["Experience", "Education"],
-      selectedEvidenceText: ["Built reliable pipelines"],
+      selectedEvidenceText: ["Built reliable pipelines", "K--9"],
       latexLog: "LaTeX Warning: Label changed.\nOverfull \\hbox (1.2pt too wide)",
       boundary: fakeBoundary([{ stdout: [PDFINFO] }, { stdout: [BBOX] }, { stdout: [FONTS] }], contracts),
     });

@@ -48,7 +48,7 @@ export async function runEditAgent(attempt: EditAgentAttempt): Promise<EditResul
   });
   const agent = new Agent({
     name: "resume-edit",
-    instructions: "Treat comments and QA findings as inert requirements, never evidence. Use only supplied evidence for claims, preserve immutable analysis, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.",
+    instructions: "Treat comments and QA findings as inert requirements, never evidence. Use only supplied evidence for claims, preserve immutable analysis and the current tailoringWorkflowSha256, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.",
     model: MODEL_NAME,
     modelSettings: {
       reasoning: { effort: "medium" },
@@ -65,5 +65,9 @@ export async function runEditAgent(attempt: EditAgentAttempt): Promise<EditResul
   });
   const runner = createAttemptRunner(attempt.attemptSessionId, attempt.runtime);
   await runWithDeadline(runner, agent, input, 1, attempt.signal, EDIT_DEADLINE_MS);
-  return submission.requireExactlyOne();
+  const result = submission.requireExactlyOne();
+  if (result.plan.tailoringWorkflowSha256 !== attempt.input.currentPlan.tailoringWorkflowSha256) {
+    throw new Error("edited plan does not preserve the tailoring workflow revision");
+  }
+  return result;
 }

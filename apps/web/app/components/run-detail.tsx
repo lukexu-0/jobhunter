@@ -270,49 +270,340 @@ function ArtifactState({ artifact, error, loading, label, children }: {
   return <>{children}</>;
 }
 
-function AnalysisContent({ value }: { readonly value: unknown }) {
+const CLARITY_GATE_FIELDS = [
+  { key: "targetRoleOrArchetype", label: "Target role or archetype" },
+  { key: "strongestMatchingStackOrDomain", label: "Strongest matching stack or domain" },
+  { key: "productionOrBusinessOutcome", label: "Production or business outcome" },
+  { key: "appropriateLocationOrRemoteFit", label: "Location or remote fit" },
+  { key: "relevantPortfolioOrCaseStudyLink", label: "Portfolio or case study link" },
+] as const;
+
+const ATS_REVIEW_FIELDS = [
+  { key: "parseableSingleColumnStructure", label: "Parseable single-column structure" },
+  { key: "standardSectionHeaders", label: "Standard section headers" },
+  { key: "selectableUtf8Text", label: "Selectable UTF-8 text" },
+  { key: "truthfulKeywordUse", label: "Truthful keyword use" },
+  { key: "noHiddenTextOrKeywordStuffing", label: "No hidden text or keyword stuffing" },
+  { key: "noUnsupportedSkillsOrMetrics", label: "No unsupported skills or metrics" },
+] as const;
+
+function AnalysisFacts({ rows }: {
+  readonly rows: ReadonlyArray<{ readonly label: string; readonly value: ReactNode }>;
+}) {
+  return (
+    <dl className={styles.compactFacts}>
+      {rows.map((row) => <div key={row.label}><dt>{row.label}</dt><dd>{row.value}</dd></div>)}
+    </dl>
+  );
+}
+
+function EvidenceTextItems({ value, emptyLabel, compact = false }: {
+  readonly value: unknown;
+  readonly emptyLabel: string;
+  readonly compact?: boolean;
+}) {
+  const items = recordArray(value);
+  if (!items.length) return <p className={styles.absent}>No {emptyLabel} were reported.</p>;
+  return (
+    <ul className={compact ? styles.simpleList : styles.findingList}>
+      {items.map((item, index) => {
+        const text = stringValue(item, "text") ?? `Item ${index + 1} text not reported`;
+        return (
+          <li key={`${text}-${index}`}>
+            <p>{text}</p>
+            <EvidenceIds value={item.evidenceIds} />
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function ReviewFindings({ value, fields, detailKey, detailLabel }: {
+  readonly value: unknown;
+  readonly fields: ReadonlyArray<{ readonly key: string; readonly label: string }>;
+  readonly detailKey: string;
+  readonly detailLabel: string;
+}) {
+  const review = asRecord(value);
+  return (
+    <ul className={styles.findingList}>
+      {fields.map(({ key, label }) => {
+        const finding = asRecord(review?.[key]);
+        return (
+          <li key={key}>
+            <div className={styles.findingHeading}>
+              <strong>{label}</strong>
+              <span>{humanize(stringValue(finding, "status") ?? "Status not reported")}</span>
+            </div>
+            <AnalysisFacts rows={[
+              { label: detailLabel, value: stringValue(finding, detailKey) ?? "Not reported" },
+            ]} />
+            <EvidenceIds value={finding?.evidenceIds} />
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+export function AnalysisContent({ value }: { readonly value: unknown }) {
   const analysis = asRecord(value);
-  const target = asRecord(analysis?.target);
-  const keywords = recordArray(analysis?.prioritizedKeywords);
-  const guidance = recordArray(analysis?.guidance);
   if (!analysis) return <p className={styles.panelError}>The analysis artifact has an unexpected shape.</p>;
+
+  const roleSummary = asRecord(analysis.roleSummary);
+  const requirements = recordArray(analysis.requirementEvidence);
+  const recruiterRisks = recordArray(analysis.recruiterRisks);
+  const gaps = recordArray(analysis.gapsAndMitigations);
+  const keywords = recordArray(analysis.keywordAlignment);
+  const proposedContent = asRecord(analysis.proposedCvContent);
+  const professionalSummary = asRecord(proposedContent?.professionalSummary);
+  const reorderedExperience = recordArray(proposedContent?.reorderedExperience);
+  const bulletReviews = recordArray(analysis.businessValueBulletReview);
+  const customizationPlan = recordArray(analysis.customizationPlan);
+  const recommendations = asRecord(analysis.rankedRecommendations);
 
   return (
     <div className={styles.artifactSections}>
-      <dl className={styles.compactFacts}>
-        <div><dt>Target</dt><dd>{stringValue(target, "title") ?? "Not reported"}</dd></div>
-        <div><dt>Organization</dt><dd>{stringValue(target, "organization") ?? "Not reported"}</dd></div>
-        <div><dt>Analysis ID</dt><dd><code>{stringValue(analysis, "id") ?? "Not reported"}</code></dd></div>
-      </dl>
+      <AnalysisFacts rows={[
+        { label: "Analysis ID", value: <code>{stringValue(analysis, "id") ?? "Not reported"}</code> },
+        { label: "Job description SHA-256", value: <code>{stringValue(analysis, "jobDescriptionSha256") ?? "Not reported"}</code> },
+        { label: "Analysis workflow SHA-256", value: <code>{stringValue(analysis, "analysisWorkflowSha256") ?? "Not reported"}</code> },
+      ]} />
+
       <section>
-        <h4>Prioritized job signals ({keywords.length})</h4>
+        <h4>Role summary</h4>
+        <AnalysisFacts rows={[
+          { label: "Company", value: stringValue(roleSummary, "company") ?? "Not reported" },
+          { label: "Role", value: stringValue(roleSummary, "role") ?? "Not reported" },
+          { label: "Archetype", value: stringValue(roleSummary, "archetype") ?? "Not reported" },
+          { label: "Domain", value: humanize(stringValue(roleSummary, "domain") ?? "Not reported") },
+          { label: "Function", value: humanize(stringValue(roleSummary, "function") ?? "Not reported") },
+          { label: "Seniority", value: stringValue(roleSummary, "seniority") ?? "Not reported" },
+          { label: "Work model", value: humanize(stringValue(roleSummary, "workModel") ?? "Not reported") },
+          { label: "Team size", value: stringValue(roleSummary, "teamSize") ?? "Not reported" },
+          { label: "TL;DR", value: stringValue(roleSummary, "tldr") ?? "Not reported" },
+        ]} />
+      </section>
+
+      <section>
+        <h4>Requirement evidence ({requirements.length})</h4>
+        {requirements.length ? (
+          <ul className={styles.findingList}>
+            {requirements.map((item, index) => {
+              const requirement = stringValue(item, "requirement") ?? `Requirement ${index + 1}`;
+              const sourceLines = stringArray(item.cvSourceLines);
+              return (
+                <li key={`${requirement}-${index}`}>
+                  <div className={styles.findingHeading}>
+                    <strong>{requirement}</strong>
+                    <span>{humanize(stringValue(item, "priority") ?? "Priority not reported")}</span>
+                  </div>
+                  <AnalysisFacts rows={[
+                    { label: "Match status", value: humanize(stringValue(item, "matchStatus") ?? "Not reported") },
+                    { label: "Exact CV evidence", value: stringValue(item, "exactCvEvidence") ?? "Not reported" },
+                    {
+                      label: "CV source lines",
+                      value: sourceLines.length
+                        ? <ul className={styles.simpleList}>{sourceLines.map((line, lineIndex) => <li key={`${line}-${lineIndex}`}>{line}</li>)}</ul>
+                        : "Not reported",
+                    },
+                  ]} />
+                  <EvidenceIds value={item.evidenceIds} />
+                </li>
+              );
+            })}
+          </ul>
+        ) : <p className={styles.absent}>No requirement evidence was reported.</p>}
+      </section>
+
+      <section>
+        <h4>Recruiter risks ({recruiterRisks.length})</h4>
+        {recruiterRisks.length ? (
+          <ul className={styles.findingList}>
+            {recruiterRisks.map((item, index) => {
+              const doubt = stringValue(item, "potentialDoubt") ?? `Recruiter risk ${index + 1}`;
+              return (
+                <li key={`${doubt}-${index}`}>
+                  <div className={styles.findingHeading}><strong>{doubt}</strong><span>Risk {index + 1}</span></div>
+                  <AnalysisFacts rows={[
+                    { label: "CV or report evidence", value: stringValue(item, "evidenceFromCvOrReport") ?? "Not reported" },
+                    { label: "Candidate-facing fix", value: stringValue(item, "candidateFacingFix") ?? "Not reported" },
+                  ]} />
+                  <EvidenceIds value={item.evidenceIds} />
+                </li>
+              );
+            })}
+          </ul>
+        ) : <p className={styles.absent}>No recruiter risks were reported.</p>}
+      </section>
+
+      <section>
+        <h4>Gaps and mitigations ({gaps.length})</h4>
+        {gaps.length ? (
+          <ul className={styles.findingList}>
+            {gaps.map((item, index) => {
+              const gap = stringValue(item, "gap") ?? `Gap ${index + 1}`;
+              return (
+                <li key={`${gap}-${index}`}>
+                  <div className={styles.findingHeading}>
+                    <strong>{gap}</strong>
+                    <span>{humanize(stringValue(item, "classification") ?? "Classification not reported")}</span>
+                  </div>
+                  <AnalysisFacts rows={[
+                    { label: "Adjacent experience", value: stringValue(item, "adjacentExperience") ?? "Not reported" },
+                    { label: "Portfolio proof", value: stringValue(item, "portfolioProof") ?? "Not reported" },
+                    { label: "Concrete mitigation", value: stringValue(item, "concreteMitigation") ?? "Not reported" },
+                  ]} />
+                  <EvidenceIds value={item.evidenceIds} />
+                </li>
+              );
+            })}
+          </ul>
+        ) : <p className={styles.absent}>No gaps or mitigations were reported.</p>}
+      </section>
+
+      <section>
+        <h4>Keyword alignment ({keywords.length})</h4>
         {keywords.length ? (
           <ul className={styles.findingList}>
-            {keywords.map((keyword, index) => (
-              <li key={`${stringValue(keyword, "keyword") ?? "keyword"}-${index}`}>
-                <div className={styles.findingHeading}>
-                  <strong>{stringValue(keyword, "keyword") ?? "Unlabeled keyword"}</strong>
-                  <span>{stringValue(keyword, "priority") ?? "Priority not reported"}</span>
-                </div>
-                <blockquote>{stringValue(keyword, "jdQuote") ?? "Source quote not reported"}</blockquote>
-                <EvidenceIds value={keyword.evidenceIds} />
-              </li>
-            ))}
+            {keywords.map((item, index) => {
+              const vocabulary = stringValue(item, "jdVocabulary") ?? `Keyword ${index + 1}`;
+              return (
+                <li key={`${vocabulary}-${index}`}>
+                  <div className={styles.findingHeading}>
+                    <strong>{vocabulary}</strong>
+                    <span>{stringValue(item, "placement") ?? "Placement not reported"}</span>
+                  </div>
+                  <blockquote>{stringValue(item, "jdQuote") ?? "Job-description quote not reported"}</blockquote>
+                  <AnalysisFacts rows={[
+                    { label: "Current truthful CV wording", value: stringValue(item, "currentTruthfulCvWording") ?? "Not reported" },
+                    { label: "Recommended reformulation", value: stringValue(item, "recommendedReformulation") ?? "Not reported" },
+                  ]} />
+                  <EvidenceIds value={item.evidenceIds} />
+                </li>
+              );
+            })}
           </ul>
-        ) : <p className={styles.absent}>No prioritized job signals were reported.</p>}
+        ) : <p className={styles.absent}>No keyword alignment was reported.</p>}
       </section>
+
       <section>
-        <h4>Tailoring guidance ({guidance.length})</h4>
-        {guidance.length ? (
+        <h4>Proposed CV content</h4>
+        <section>
+          <h5>Professional summary</h5>
+          <p>{stringValue(professionalSummary, "text") ?? "Not reported"}</p>
+          <EvidenceIds value={professionalSummary?.evidenceIds} />
+        </section>
+        <section>
+          <h5>Core competencies ({recordArray(proposedContent?.coreCompetencies).length})</h5>
+          <EvidenceTextItems value={proposedContent?.coreCompetencies} emptyLabel="core competencies" />
+        </section>
+        <section>
+          <h5>Reordered experience ({reorderedExperience.length})</h5>
+          {reorderedExperience.length ? (
+            <ul className={styles.findingList}>
+              {reorderedExperience.map((item, index) => {
+                const roleOrCompany = stringValue(item, "roleOrCompany") ?? `Experience ${index + 1}`;
+                return (
+                  <li key={`${roleOrCompany}-${index}`}>
+                    <div className={styles.findingHeading}>
+                      <strong>{roleOrCompany}</strong>
+                      <span>{recordArray(item.bullets).length} bullets</span>
+                    </div>
+                    <EvidenceTextItems value={item.bullets} emptyLabel="experience bullets" compact />
+                  </li>
+                );
+              })}
+            </ul>
+          ) : <p className={styles.absent}>No reordered experience was reported.</p>}
+        </section>
+        <section>
+          <h5>Selected projects ({recordArray(proposedContent?.selectedProjects).length})</h5>
+          <EvidenceTextItems value={proposedContent?.selectedProjects} emptyLabel="selected projects" />
+        </section>
+      </section>
+
+      <section>
+        <h4>Business value bullet review ({bulletReviews.length})</h4>
+        {bulletReviews.length ? (
           <ul className={styles.findingList}>
-            {guidance.map((item, index) => (
-              <li key={index}>
-                <p>{stringValue(item, "guidance") ?? "Guidance text not reported"}</p>
-                <EvidenceIds value={item.evidenceIds} />
-              </li>
-            ))}
+            {bulletReviews.map((item, index) => {
+              const scope = stringValue(item, "systemOrScope") ?? `Bullet ${index + 1}`;
+              return (
+                <li key={`${scope}-${index}`}>
+                  <div className={styles.findingHeading}>
+                    <strong>{scope}</strong>
+                    <span>{humanize(stringValue(item, "action") ?? "Action not reported")}</span>
+                  </div>
+                  <AnalysisFacts rows={[
+                    { label: "Current bullet", value: stringValue(item, "currentBullet") ?? "Not reported" },
+                    { label: "Proposed bullet", value: stringValue(item, "proposedBullet") ?? "Not reported" },
+                    { label: "Tool or approach", value: stringValue(item, "toolOrApproach") ?? "Not reported" },
+                    { label: "Outcome or proof", value: stringValue(item, "outcomeOrProof") ?? "Not reported" },
+                  ]} />
+                  <EvidenceIds value={item.evidenceIds} />
+                </li>
+              );
+            })}
           </ul>
-        ) : <p className={styles.absent}>No tailoring guidance was reported.</p>}
+        ) : <p className={styles.absent}>No business value bullet review was reported.</p>}
+      </section>
+
+      <section>
+        <h4>Six-second clarity gate</h4>
+        <ReviewFindings
+          value={analysis.sixSecondClarityGate}
+          fields={CLARITY_GATE_FIELDS}
+          detailKey="evidenceOrRequiredRewrite"
+          detailLabel="Evidence or required rewrite"
+        />
+      </section>
+
+      <section>
+        <h4>ATS and truthfulness review</h4>
+        <ReviewFindings
+          value={analysis.atsAndTruthfulnessReview}
+          fields={ATS_REVIEW_FIELDS}
+          detailKey="requiredAction"
+          detailLabel="Required action"
+        />
+      </section>
+
+      <section>
+        <h4>Customization plan ({customizationPlan.length})</h4>
+        {customizationPlan.length ? (
+          <ul className={styles.findingList}>
+            {customizationPlan.map((item, index) => {
+              const section = stringValue(item, "section") ?? `Plan item ${index + 1}`;
+              return (
+                <li key={`${section}-${index}`}>
+                  <div className={styles.findingHeading}>
+                    <strong>{section}</strong>
+                    <span>{stringValue(item, "currentStatus") ?? "Status not reported"}</span>
+                  </div>
+                  <AnalysisFacts rows={[
+                    { label: "Proposed change", value: stringValue(item, "proposedChange") ?? "Not reported" },
+                    { label: "Why", value: stringValue(item, "why") ?? "Not reported" },
+                  ]} />
+                  <EvidenceIds value={item.evidenceIds} />
+                </li>
+              );
+            })}
+          </ul>
+        ) : <p className={styles.absent}>No customization plan was reported.</p>}
+      </section>
+
+      <section>
+        <h4>Ranked recommendations</h4>
+        <section>
+          <h5>CV changes ({recordArray(recommendations?.cvChanges).length})</h5>
+          <EvidenceTextItems value={recommendations?.cvChanges} emptyLabel="CV changes" />
+        </section>
+        <section>
+          <h5>LinkedIn changes ({recordArray(recommendations?.linkedInChanges).length})</h5>
+          <EvidenceTextItems value={recommendations?.linkedInChanges} emptyLabel="LinkedIn changes" />
+        </section>
       </section>
     </div>
   );

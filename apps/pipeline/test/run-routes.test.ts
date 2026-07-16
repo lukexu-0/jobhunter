@@ -61,15 +61,41 @@ function patch(body: unknown): RequestInit {
 }
 
 describe("run HTTP routes", () => {
-  test("creates and lists runs then wakes the scheduler", async () => {
-    const target = service();
-    const created = await request(target, "/v1/runs", post({ jobDescription: "A sufficiently detailed job description that exceeds forty characters." }));
+  test("canonicalizes the job URL, forwards the request signal, and kicks only after persistence succeeds", async () => {
+    let received: { jobUrl: string; signal: AbortSignal | undefined } | undefined;
+    const target = service({
+      createRun: async (jobUrl, signal) => {
+        received = { jobUrl, signal };
+        return run;
+      },
+    });
+    const incoming = new Request("http://127.0.0.1:3457/v1/runs", post({
+      jobUrl: " HTTPS://Jobs.Example.Test:443/role#apply ",
+    }));
+    const created = await createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target) })(incoming);
     expect(created.status).toBe(201);
+    expect(created.headers.get("cache-control")).toBe("no-store");
     expect(await created.json()).toEqual(run);
-    const listed = await request(target, "/v1/runs");
-    expect(listed.status).toBe(200);
-    expect((await listed.json()).runs).toEqual([run]);
-    expect(target.kickCount()).toBe(2);
+    expect(received).toEqual({ jobUrl: "https://jobs.example.test/role", signal: incoming.signal });
+    expect(target.kickCount()).toBe(1);
+
+    const failedTarget = service({
+      createRun: async () => {
+        throw Object.assign(new Error("The page does not contain a usable job description"), {
+          code: "JOB_DESCRIPTION_UNAVAILABLE",
+          status: 422,
+        });
+      },
+    });
+    const failed = await request(failedTarget, "/v1/runs", post({ jobUrl: "https://jobs.example.test/role" }));
+    expect(failed.status).toBe(422);
+    expect(await failed.json()).toEqual({
+      error: {
+        code: "JOB_DESCRIPTION_UNAVAILABLE",
+        message: "The page does not contain a usable job description",
+      },
+    });
+    expect(failedTarget.kickCount()).toBe(0);
   });
 
   test("accepts only application statuses without waking the scheduler", async () => {
@@ -108,8 +134,29 @@ describe("run HTTP routes", () => {
     expect(target.kickCount()).toBe(0);
   });
 
-  test("rejects undersized descriptions and nonempty retry bodies", async () => {
-    expect((await request(service(), "/v1/runs", post({ jobDescription: "short" }))).status).toBe(400);
+  test("rejects legacy, malformed, and unsupported create payloads without dispatch or scheduler effects", async () => {
+    let createCalls = 0;
+    const target = service({
+      createRun: async () => {
+        createCalls += 1;
+        return run;
+      },
+    });
+    for (const body of [
+      { jobDescription: "A sufficiently detailed legacy job description that is no longer accepted." },
+      { jobUrl: "example.test/job" },
+      { jobUrl: "ftp://example.test/job" },
+      { jobUrl: "https://user:secret@example.test/job" },
+      { jobUrl: "https://example.test/job", extra: true },
+    ]) {
+      const response = await request(target, "/v1/runs", post(body));
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: { code: "INVALID_REQUEST", message: "Job URL must be a valid HTTP(S) URL" },
+      });
+    }
+    expect(createCalls).toBe(0);
+    expect(target.kickCount()).toBe(0);
     expect((await request(service(), "/v1/runs/run-1/retry", post({ force: true }))).status).toBe(400);
   });
 
@@ -133,18 +180,101 @@ describe("run HTTP routes", () => {
     });
   });
 
-  test("maps stale hashes to a public conflict and hides unexpected errors", async () => {
-    const stale = await request(service({
-      approveRun: async () => {
-        throw Object.assign(new Error("PDF hash is stale"), { code: "STALE_PDF", status: 409 });
+  test("exposes only allowlisted fixed extraction 5xx messages and hides arbitrary server details", async () => {
+    for (const expected of [
+      {
+        code: "JOB_EXTRACTION_UNAVAILABLE",
+        status: 502,
+        message: "Job description extraction failed",
       },
-    }), "/v1/runs/run-1/approve", post({ expectedPdfSha256: PDF_HASH, acknowledgeVisualIssues: false }));
-    expect(stale.status).toBe(409);
-    expect(await stale.json()).toEqual({ error: { code: "STALE_PDF", message: "PDF hash is stale" } });
+      {
+        code: "JOB_EXTRACTION_TIMEOUT",
+        status: 504,
+        message: "Job description extraction timed out",
+      },
+    ]) {
+      const response = await request(service({
+        createRun: async () => {
+          throw Object.assign(new Error("provider_token=secret"), {
+            code: expected.code,
+            status: expected.status,
+          });
+        },
+      }), "/v1/runs", post({ jobUrl: "https://jobs.example.test/role" }));
+      expect(response.status).toBe(expected.status);
+      expect(await response.json()).toEqual({
+        error: { code: expected.code, message: expected.message },
+      });
+    }
 
-    const hidden = await request(service({ listRuns: () => { throw new Error("claim_token=secret"); } }), "/v1/runs");
-    expect(hidden.status).toBe(500);
-    expect(await hidden.text()).not.toContain("secret");
+    const authRequired = await request(service({
+      createRun: async () => {
+        throw Object.assign(new Error("Connect OpenAI Codex OAuth before importing this job page"), {
+          code: "JOB_EXTRACTION_AUTH_REQUIRED",
+          status: 409,
+        });
+      },
+    }), "/v1/runs", post({ jobUrl: "https://jobs.example.test/role" }));
+    expect(authRequired.status).toBe(409);
+    expect(await authRequired.json()).toEqual({
+      error: {
+        code: "JOB_EXTRACTION_AUTH_REQUIRED",
+        message: "Connect OpenAI Codex OAuth before importing this job page",
+      },
+    });
+
+    const hidden = await request(service({
+      createRun: async () => {
+        throw Object.assign(new Error("claim_token=secret"), { code: "ARBITRARY_FAILURE", status: 502 });
+      },
+    }), "/v1/runs", post({ jobUrl: "https://jobs.example.test/role" }));
+    expect(hidden.status).toBe(502);
+    expect(await hidden.json()).toEqual({
+      error: { code: "ARBITRARY_FAILURE", message: "Request failed" },
+    });
+  });
+
+  test("returns stable HTTP 410 responses for pruned downloads and lifecycle commands", async () => {
+    const pruned = Object.assign(
+      new Error("Run artifacts were removed by the ten-run retention policy"),
+      { code: "RUN_ARTIFACTS_PRUNED", status: 410 },
+    );
+    const target = service({
+      retryRun: async () => { throw pruned; },
+      regenerateRun: async () => { throw pruned; },
+      editRun: async () => { throw pruned; },
+      approveRun: async () => { throw pruned; },
+      getArtifact: async () => { throw pruned; },
+    });
+    const commands: readonly [string, unknown][] = [
+      ["/v1/runs/run-1/retry", {}],
+      ["/v1/runs/run-1/regenerate", { expectedPdfSha256: PDF_HASH }],
+      ["/v1/runs/run-1/edit", { comments: "change layout", expectedPdfSha256: PDF_HASH }],
+      ["/v1/runs/run-1/approve", { expectedPdfSha256: PDF_HASH, acknowledgeVisualIssues: false }],
+    ];
+    for (const [path, body] of commands) {
+      const response = await request(target, path, post(body));
+      expect(response.status).toBe(410);
+      expect(await response.json()).toEqual({
+        error: {
+          code: "RUN_ARTIFACTS_PRUNED",
+          message: "Run artifacts were removed by the ten-run retention policy",
+        },
+      });
+    }
+
+    const download = await request(target, "/v1/runs/run-1/artifacts/artifact-1");
+    expect(download.status).toBe(410);
+    expect(await download.json()).toEqual({
+      error: {
+        code: "RUN_ARTIFACTS_PRUNED",
+        message: "Run artifacts were removed by the ten-run retention policy",
+      },
+    });
+    const applicationStatus = await request(target, "/v1/runs/run-1", patch({ applicationStatus: "interview" }));
+    expect(applicationStatus.status).toBe(200);
+    expect(await applicationStatus.json()).toMatchObject({ applicationStatus: "interview" });
+    expect(target.kickCount()).toBe(0);
   });
 
   test("serves only addressed artifacts with no-store", async () => {

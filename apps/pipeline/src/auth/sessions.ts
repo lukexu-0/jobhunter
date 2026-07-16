@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { OAuthController } from "@oh-my-pi/pi-ai/oauth";
 import { assertProviderOAuthConnected, type AuthProvider, type AuthStorageLike } from "./storage";
 
 const SESSION_TTL_MS = 10 * 60_000;
@@ -182,9 +183,9 @@ export class AuthSessionManager {
 
   async #runLogin(session: InternalSession): Promise<void> {
     try {
-      await this.storage.login(session.provider, {
+      const controller = {
         signal: session.controller.signal,
-        onAuth: (info) => {
+        onAuth: (info: { url: string; launchUrl?: string; instructions?: string }) => {
           if (session.terminalAt !== undefined) return;
           session.url = info.url;
           if (info.launchUrl) session.launchUrl = info.launchUrl;
@@ -196,12 +197,12 @@ export class AuthSessionManager {
           }
           session.startDeferred.resolve(publicSession(session));
         },
-        onProgress: (message) => {
+        onProgress: (message: string) => {
           if (session.terminalAt !== undefined) return;
           session.progress.push(boundedPublicText(message, MAX_PROGRESS_LENGTH));
           if (session.progress.length > MAX_PROGRESS) session.progress.shift();
         },
-        onPrompt: (prompt) => this.#requestPrompt(session, {
+        onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => this.#requestPrompt(session, {
           message: boundedPublicText(prompt.message, MAX_PROMPT_LENGTH),
           ...(prompt.placeholder ? { placeholder: boundedPublicText(prompt.placeholder, 120) } : {}),
           kind: "prompt",
@@ -210,7 +211,9 @@ export class AuthSessionManager {
           message: "Enter the authorization code",
           kind: "manual-code",
         }),
-      });
+      } satisfies OAuthController;
+
+      await this.storage.login(session.provider, controller);
       assertProviderOAuthConnected(this.storage, session.provider);
       if (session.terminalAt === undefined) this.#finish(session, "succeeded");
     } catch {

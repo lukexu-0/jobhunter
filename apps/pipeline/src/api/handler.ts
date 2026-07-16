@@ -1,8 +1,11 @@
 import type { ApiError, HealthResponse } from "../contracts";
+type ApiRoute = (request: Request, url: URL) => Response | Promise<Response | null> | null;
+
 
 export interface ApiHandlerOptions {
   webOrigin: string;
-  route?: (request: Request, url: URL) => Response | Promise<Response | null> | null;
+  internalRoute?: ApiRoute;
+  route?: ApiRoute;
 }
 
 const MUTATION_METHODS: Readonly<Record<string, true>> = {
@@ -29,6 +32,8 @@ function error(code: string, message: string, status: number): Response {
 export function createApiHandler(options: ApiHandlerOptions) {
   return async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const internalResponse = await options.internalRoute?.(request, url);
+    if (internalResponse) return internalResponse;
     const isMutation = MUTATION_METHODS[request.method] === true;
 
     if (isMutation && request.headers.get("origin") !== options.webOrigin) {

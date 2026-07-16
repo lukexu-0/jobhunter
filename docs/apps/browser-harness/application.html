@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser Harness Application Operations Guide</title>
+</head>
+<body>
+  <header>
+    <h1>Browser harness application operations</h1>
+    <p>The Browser Use harness is a local, human-reviewed application service. It opens one visible Chrome session, prepares an application from supplied candidate evidence, and pauses for human navigation, origin approval, review, and final submission.</p>
+    <nav aria-label="Documentation">
+      <ul>
+        <li><a href="../index.html">Apps workspace</a></li>
+        <li><a href="../pipeline/index.html#browser-harness-codex">Pipeline OAuth/model gateway</a></li>
+        <li><a href="index.html">Browser harness API reference</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <section id="ownership-boundary">
+      <h2>Ownership boundary: pipeline OAuth, harness browser work</h2>
+      <p>The pipeline process is the sole owner of Provider access and the application-owned OpenAI Codex OAuth connection. Connect <strong>OpenAI Codex</strong> in the existing web UI’s <strong>Provider access</strong> controls; the harness does not open the OAuth database, copy credentials, accept a provider API key, select another model, or provide login, refresh, or logout operations.</p>
+      <p>Instead, the harness creates one reusable local HTTP client for its session and calls the pipeline’s loopback gateway. The fixed model contract is <code>openai-codex/gpt-5.6-sol</code> with <code>high</code> reasoning. The gateway checks that the pipeline’s OpenAI Codex connection is still connected before it resolves a request. If it is not connected, create-session preflight fails before Chrome launches with the fixed actionable error <q>Connect OpenAI Codex in Provider access</q>.</p>
+      <p>The internal gateway is exactly <code>GET</code> and <code>POST /v1/internal/browser-harness/codex</code> on the pipeline, normally <code>http://127.0.0.1:3457</code>. It is an inference-only route: it neither exposes OAuth material nor offers credential or model-management endpoints. The gateway creates the pipeline’s existing OAuth Codex model, which uses the existing OAuth-only resolver; the Python process has no second authentication-store handle.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/pipeline_model.py"><code>apps/browser-harness/src/browser_harness/pipeline_model.py</code></a>, <a href="../../../apps/pipeline/src/api/browser-harness-codex-routes.ts"><code>apps/pipeline/src/api/browser-harness-codex-routes.ts</code></a>, <a href="../../../apps/pipeline/src/models/browser-harness-codex.ts"><code>apps/pipeline/src/models/browser-harness-codex.ts</code></a>, and <a href="../../../apps/pipeline/src/models/oauth-codex-model.ts"><code>apps/pipeline/src/models/oauth-codex-model.ts</code></a>.</p>
+    </section>
+
+    <section id="local-security">
+      <h2>Loopback and shared-bearer security</h2>
+      <p>Set one <code>JOBHUNTER_HARNESS_TOKEN</code> value of at least 32 characters in the trusted local environment of both the pipeline and harness processes. The harness uses it for every <code>/v1/</code> request and when it calls the pipeline gateway. The API compares a digest of the complete bearer value with <code>secrets.compare_digest</code>; the pipeline compares a digest with a constant-time comparison. Missing, malformed, and incorrect credentials are intentionally indistinguishable to each service’s caller.</p>
+      <ul>
+        <li>The harness binds Uvicorn only to <code>127.0.0.1</code>, defaults to port <code>8765</code>, adds no CORS headers, and has no OpenAPI, Swagger UI, or ReDoc endpoint. Only <code>GET /healthz</code> is unauthenticated and returns <code>{"status":"ok"}</code>.</li>
+        <li>Every harness <code>/v1/</code> response is <code>Cache-Control: no-store</code>. A missing or wrong harness bearer returns <code>401 {"code":"unauthorized","message":"Unauthorized"}</code>.</li>
+        <li>The pipeline bridge is dispatched before the pipeline’s public mutation-Origin check so that the loopback harness can use it, but it accepts only its exact path and <code>GET</code> or <code>POST</code>. It is not a browser-facing exception to the public Origin policy and adds no CORS behavior.</li>
+        <li>If <code>JOBHUNTER_HARNESS_TOKEN</code> is unset in the pipeline, the exact gateway path returns <code>404 NOT_FOUND</code> for either method. A configured token shorter than 32 characters prevents pipeline startup; a short or absent token prevents harness startup. Do not put the value in browser JavaScript, a URL, uploads, source control, or logs.</li>
+      </ul>
+      <p>The pipeline URL is an origin-only loopback HTTP URL (default <code>http://127.0.0.1:3457</code>) without credentials, path, query, or fragment. The harness client disables environment-proxy trust and uses a 300-second request timeout. It sends only the gateway’s fixed request/response protocol; it never falls back to another provider, model, reasoning level, API key, or auth store.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/api.py"><code>apps/browser-harness/src/browser_harness/api.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/cli.py"><code>apps/browser-harness/src/browser_harness/cli.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/models.py"><code>apps/browser-harness/src/browser_harness/models.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/pipeline_model.py"><code>apps/browser-harness/src/browser_harness/pipeline_model.py</code></a>, and <a href="../../../apps/pipeline/src/api/browser-harness-codex-routes.ts"><code>apps/pipeline/src/api/browser-harness-codex-routes.ts</code></a>.</p>
+    </section>
+
+    <section id="gateway-protocol">
+      <h2>Pipeline gateway protocol</h2>
+      <p>Use the bridge only from the harness or another trusted local backend. <code>GET /v1/internal/browser-harness/codex</code> returns <code>{"modelProvider":"openai-codex","model":"gpt-5.6-sol","reasoning":"high","oauth":"connected"}</code> when Provider access is connected; otherwise it returns <code>409 OAUTH_REQUIRED</code>. A missing or wrong gateway bearer returns <code>401 UNAUTHORIZED</code>.</p>
+      <p><code>POST</code> requires <code>Content-Type: application/json</code> and a strict object containing a UUID <code>sessionId</code>, UTF-8 <code>systemPrompt</code> of at most 1 MiB, UTF-8 <code>transcript</code> of at most 3 MiB, and optionally an object <code>outputSchema</code>. The schema must be an object with <code>properties</code>, a string-only <code>required</code> array, and <code>additionalProperties: false</code>. The full body, including streamed input, is limited to 4 MiB. The deadline is 300 seconds for both body consumption and model resolution.</p>
+      <p>Structured requests force the one strict <code>emit_browser_use_output</code> function call; text requests disallow function calls. The bridge fixes storage off, tracing off, low text verbosity, high reasoning, a 16,384-token output maximum, no parallel tool calls, and no retry. It returns only fixed provider/model/reasoning metadata, text or structured output, and nonnegative token usage. It does not return reasoning items, OAuth data, prompts, transcripts, account identity, or provider error bodies.</p>
+      <table>
+        <thead><tr><th>Condition</th><th>Gateway response</th></tr></thead>
+        <tbody>
+          <tr><td>Wrong media type</td><td><code>415 JSON_REQUIRED</code></td></tr>
+          <tr><td>Over 4 MiB</td><td><code>413 REQUEST_TOO_LARGE</code></td></tr>
+          <tr><td>Malformed body, UUID, size, or schema</td><td><code>422 INVALID_REQUEST</code></td></tr>
+          <tr><td>OpenAI Codex not connected</td><td><code>409 OAUTH_REQUIRED</code></td></tr>
+          <tr><td>Deadline reached</td><td><code>504 MODEL_TIMEOUT</code></td></tr>
+          <tr><td>Malformed model output</td><td><code>502 INVALID_MODEL_OUTPUT</code></td></tr>
+          <tr><td>Other model failure</td><td><code>502 MODEL_PROVIDER_FAILED</code></td></tr>
+        </tbody>
+      </table>
+      <p>Sources: <a href="../../../apps/pipeline/src/api/browser-harness-codex-routes.ts"><code>apps/pipeline/src/api/browser-harness-codex-routes.ts</code></a> and <a href="../../../apps/pipeline/src/models/browser-harness-codex.ts"><code>apps/pipeline/src/models/browser-harness-codex.ts</code></a>.</p>
+    </section>
+
+    <section id="install-and-start">
+      <h2>Install and start locally</h2>
+      <p>The standalone package name is <code>jobhunter-browser-harness</code>; its Python import namespace is <code>jobhunter_browser_harness</code>. It requires Python 3.12 exactly (<code>&gt;=3.12,&lt;3.13</code>). Its runtime pins Browser Use <code>0.13.4</code> and <code>pypdf==6.10.2</code>; do not substitute a later pypdf pin when reproducing this environment.</p>
+      <pre><code>python3.12 -m venv apps/browser-harness/.venv
+apps/browser-harness/.venv/bin/python -m pip install -e 'apps/browser-harness[dev]'
+apps/browser-harness/.venv/bin/browser-use install</code></pre>
+      <p>The Browser Use <code>0.13.4</code> installer invokes <code>uvx playwright install chromium --no-shell</code>; on Linux it also passes <code>--with-deps</code>. Therefore <code>uvx</code> must be available. The installer command itself does not arrange unattended privilege escalation: satisfy any operating-system dependency/elevation prompt according to the host’s normal administration policy. See the <a href="https://docs.browser-use.com/open-source/quickstart">official Browser Use quickstart</a> for Browser Use’s general installation guidance.</p>
+      <p>The harness’s native launch mode uses an installed system Chrome or Chromium, not the operating system’s everyday profile. Browser Use’s managed Chromium installation can be useful for Browser Use tooling, but it does not replace the harness requirement for a detectable system executable, an explicit <code>--chrome-executable</code>, or a separately running loopback CDP Chrome.</p>
+      <ol>
+        <li>Export one local secret for all trusted backend processes.</li>
+        <li>Start the pipeline, then connect OpenAI Codex through the existing web UI if it is not already connected.</li>
+        <li>Start the harness with either native dedicated-profile Chrome or a pre-started dedicated-profile CDP Chrome.</li>
+      </ol>
+      <pre><code>export JOBHUNTER_HARNESS_TOKEN='replace-with-one-local-secret-of-at-least-32-characters'
+
+# Terminal 1: pipeline
+JOBHUNTER_HARNESS_TOKEN="$JOBHUNTER_HARNESS_TOKEN" bun run --cwd apps/pipeline dev
+
+# Optional terminal: existing Provider access UI, normally http://127.0.0.1:3456
+JOBHUNTER_HARNESS_TOKEN="$JOBHUNTER_HARNESS_TOKEN" bun run --cwd apps/web dev
+
+# Terminal 2: native Chrome; defaults are port 8765 and pipeline port 3457
+JOBHUNTER_HARNESS_TOKEN="$JOBHUNTER_HARNESS_TOKEN" apps/browser-harness/.venv/bin/jobhunter-browser-harness \
+  --chrome-user-data-dir ~/.jobhunter/browser-harness/chrome
+
+# Or terminal 2: attach only to an already-running loopback CDP Chrome
+JOBHUNTER_HARNESS_TOKEN="$JOBHUNTER_HARNESS_TOKEN" apps/browser-harness/.venv/bin/jobhunter-browser-harness \
+  --cdp-url http://127.0.0.1:9222</code></pre>
+      <p>Before creating a session, a trusted operator can verify the bridge metadata without exposing the secret in the command line:</p>
+      <pre><code>curl -H "Authorization: Bearer $JOBHUNTER_HARNESS_TOKEN" \
+  http://127.0.0.1:3457/v1/internal/browser-harness/codex</code></pre>
+      <p>CLI options are <code>--port</code> (default <code>8765</code>), <code>--pipeline-url</code> (default <code>http://127.0.0.1:3457</code>), <code>--session-timeout</code> (default <code>3600</code> seconds), <code>--chrome-executable</code>, <code>--chrome-user-data-dir</code>, and <code>--cdp-url</code>. CDP and a Chrome executable are mutually exclusive; the CLI also rejects a supplied CDP URL together with <code>--chrome-user-data-dir</code>.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/pyproject.toml"><code>apps/browser-harness/pyproject.toml</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/cli.py"><code>apps/browser-harness/src/browser_harness/cli.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/browser.py"><code>apps/browser-harness/src/browser_harness/browser.py</code></a>, and Browser Use <code>0.13.4</code>’s installed <code>browser_use/cli.py</code>.</p>
+    </section>
+
+    <section id="chrome-and-wsl">
+      <h2>Visible Chrome, dedicated profiles, CDP, and WSL</h2>
+      <p>Native mode auto-detects Chrome/Chromium when <code>--chrome-executable</code> is omitted. It creates and requires a mode-<code>0700</code>, dedicated, non-symbolic-link user-data directory; the default is <code>~/.jobhunter/browser-harness/chrome</code>. The directory must be outside the operating-system default Chrome/Chromium profile roots. This is intentional: the harness uses persistent login state in a separate profile and does not attach automation to an everyday profile.</p>
+      <p>For Browser Use <code>0.13.4</code>, the native path constructs a <code>_PersistentChromeProfile</code> with that <code>user_data_dir</code> and <code>profile_directory="Default"</code>. Its profile-copy hook is intentionally a no-op, and the constructed <code>Browser</code> retains that profile rather than reconstructing it as Browser Use’s base profile. The dedicated directory is therefore used in place—not copied to an unmanaged temporary profile—and its harness-site login state persists across sessions.</p>
+      <p>Chrome is headed (<code>headless=False</code>) and kept alive while the session is open. Native launch sets <code>is_local=True</code>, disables default extensions, retains Chromium sandboxing and normal security, and disables HAR, video, and trace recording. Downloads are private session directories. The browser receives allowed domains as canonical <code>origin/</code> strings rather than broad host patterns.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/browser.py"><code>apps/browser-harness/src/browser_harness/browser.py</code></a> and <a href="../../../apps/browser-harness/src/browser_harness/models.py"><code>apps/browser-harness/src/browser_harness/models.py</code></a>.</p>
+    </section>
+
+    <section id="session-api">
+      <h2>Versioned session API and SSE lifecycle</h2>
+      <p>All session routes are under <code>/v1</code> and require the harness bearer. The service allows one active session, including a session waiting for review or ready for human submission. A concurrent create receives <code>409 session_active</code> and the active session ID. Validation failures are sanitized <code>422 invalid_request</code>; commands that do not match the pending gate, state, or limits receive <code>409 command_conflict</code>.</p>
+      <table>
+        <thead><tr><th>Route</th><th>Behavior</th></tr></thead>
+        <tbody>
+          <tr><td><code>POST /v1/sessions</code></td><td>Accepts multipart input, preflights pipeline OAuth/model readiness before Chrome starts, and returns <code>202 {"session_id":"UUID","state":"starting","events_url":"…","commands_url":"…"}</code>.</td></tr>
+          <tr><td><code>GET /v1/sessions/{session_id}</code></td><td>Returns the sanitized snapshot: state, timestamps, public URL, company/role, fixed model metadata, fields, attached file basenames, warnings, revision count, approved origins, and either a catalog error or <code>null</code>.</td></tr>
+          <tr><td><code>GET /v1/sessions/{session_id}/events</code></td><td>Streams authenticated <code>text/event-stream</code> frames with <code>id</code>, <code>event</code>, and JSON <code>HarnessEvent</code> data.</td></tr>
+          <tr><td><code>POST /v1/sessions/{session_id}/commands</code></td><td>Accepts one strict discriminated JSON command and returns <code>202</code> after the applicable human gate accepts it.</td></tr>
+          <tr><td><code>DELETE /v1/sessions/{session_id}</code></td><td>Closes a known session and returns <code>204</code>; repeating it for an already closed known tombstone is idempotent. Unknown or evicted IDs return <code>404 session_not_found</code>.</td></tr>
+        </tbody>
+      </table>
+      <p>The snapshot states are exactly <code>starting</code>, <code>running</code>, <code>awaiting_human_navigation</code>, <code>awaiting_origin_approval</code>, <code>awaiting_human_review</code>, <code>ready_for_human_submit</code>, <code>cancelled</code>, <code>failed</code>, and <code>closed</code>. A failed snapshot has one fixed error code/message: <code>oauth_required</code>, <code>pipeline_unavailable</code>, <code>model_timeout</code>, <code>invalid_model_output</code>, <code>model_failed</code>, <code>browser_failed</code>, <code>application_mismatch</code>, <code>step_limit</code>, or <code>session_timeout</code>. Cancelled and closed snapshots have <code>error: null</code>.</p>
+      <h3>Multipart create contract</h3>
+      <p><code>POST /v1/sessions</code> requires scalar <code>job_url</code>, <code>personal_information</code>, and <code>resume</code>; it accepts zero to 20 repeated <code>allow_domain</code> values, zero to 10 <code>context</code> uploads, zero to 20 <code>anecdote</code> uploads, and <code>max_steps</code> from 1 through 500 (default 100). The job URL is absolute HTTP(S), has no credentials or fragment, retains its path/query privately, and must use HTTPS unless it is loopback. The harness automatically approves the job origin. Each supplied origin must be canonical with no credentials, query, fragment, wildcard, or duplicate and no path beyond an optional <code>/</code>; HTTPS is required except for loopback fixtures. There can be at most 20 approved origins in total, including the derived job origin and later approved origins.</p>
+      <pre><code>curl -X POST http://127.0.0.1:8765/v1/sessions \
+  -H "Authorization: Bearer $JOBHUNTER_HARNESS_TOKEN" \
+  -F 'job_url=https://jobs.example.test/roles/123?source=local' \
+  -F 'max_steps=100' \
+  -F 'personal_information=@candidate.md;type=text/markdown' \
+  -F 'resume=@resume.pdf;type=application/pdf' \
+  -F 'context=@background.md;type=text/markdown' \
+  -F 'anecdote=@incident.md;type=text/markdown'</code></pre>
+      <h3>Events, resumption, and commands</h3>
+      <p>Events have monotonically increasing IDs. Event names are <code>session_started</code>, <code>agent_step</code>, <code>human_navigation_required</code>, <code>origin_approval_required</code>, <code>review_required</code>, <code>revision_applied</code>, <code>ready_for_human_submit</code>, <code>cancelled</code>, <code>failed</code>, and <code>closed</code>. The <code>agent_step</code> detail contains only <code>step_number</code> and a sanitized <code>current_url</code>; navigation requests contain <code>instruction</code>; origin requests contain <code>origin</code>; revision events contain <code>revision_count</code>; other event details are empty because the event’s snapshot carries public review/terminal state.</p>
+      <p>Pass a nonnegative <code>Last-Event-ID</code> to replay newer frames. The active session retains 256 events and sends an <code>event: snapshot</code> frame if the requested ID was evicted or is ahead of the current event stream. Idle streams emit a <code>: heartbeat</code> comment every 15 seconds. Disconnecting the SSE client does not cancel the application session. Terminal history holds at most 32 sanitized tombstones.</p>
+      <pre><code># Resume/replay the event stream.
+curl -N -H "Authorization: Bearer $JOBHUNTER_HARNESS_TOKEN" \
+  -H 'Last-Event-ID: 12' \
+  http://127.0.0.1:8765/v1/sessions/SESSION_ID/events
+
+# Use only when the corresponding gate is pending.
+curl -X POST -H "Authorization: Bearer $JOBHUNTER_HARNESS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"approve_origin","origin":"https://ats.example.test"}' \
+  http://127.0.0.1:8765/v1/sessions/SESSION_ID/commands</code></pre>
+      <ul>
+        <li><code>{"type":"continue"}</code> is valid only while human navigation is pending.</li>
+        <li><code>{"type":"approve_origin","origin":"https://…"}</code> is valid only for the exact pending origin and only while the 20-origin cap permits it.</li>
+        <li><code>{"type":"revise","context":"…"}</code> is valid only during review, must trim to 1–20,000 characters, and is limited to 100 revisions.</li>
+        <li><code>{"type":"ready"}</code> is valid only during review; <code>{"type":"cancel"}</code> is valid for any nonterminal session.</li>
+      </ul>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/api.py"><code>apps/browser-harness/src/browser_harness/api.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/models.py"><code>apps/browser-harness/src/browser_harness/models.py</code></a>, and <a href="../../../apps/browser-harness/src/browser_harness/sessions.py"><code>apps/browser-harness/src/browser_harness/sessions.py</code></a>.</p>
+    </section>
+
+    <section id="uploads-and-evidence">
+      <h2>Uploads, front matter, and evidence precedence</h2>
+      <table>
+        <thead><tr><th>Part</th><th>Required form and limit</th></tr></thead>
+        <tbody>
+          <tr><td><code>personal_information</code></td><td>Required UTF-8 <code>.md</code>, at most 1 MiB.</td></tr>
+          <tr><td><code>resume</code></td><td>Required nonempty <code>.pdf</code>, at most 10 MiB, whose first bytes are <code>%PDF-</code>.</td></tr>
+          <tr><td><code>context</code></td><td>Zero to 10 UTF-8 <code>.md</code> or <code>.txt</code> files; at most 1 MiB each and 5 MiB combined.</td></tr>
+          <tr><td><code>anecdote</code></td><td>Zero to 20 UTF-8 <code>.md</code> or <code>.txt</code> files; at most 256 KiB each and 2 MiB combined.</td></tr>
+        </tbody>
+      </table>
+      <p>Uploads are streamed to a private per-session directory with mode <code>0700</code>; generated files use mode <code>0600</code>. Client filenames are reduced to safe display basenames and never trusted as paths. A bad upload, filename, encoding, extension, byte limit, PDF signature, or front-matter shape removes the partial session input and returns a sanitized <code>422</code>. This is ordinary recursive deletion, not a claim of secure erasure.</p>
+      <h3>Structured direct information</h3>
+      <p>The optional YAML front-matter mapping in <code>personal_information</code> recognizes only <code>full_name</code>, <code>first_name</code>, <code>last_name</code>, <code>email</code>, <code>phone</code>, <code>street_address</code>, <code>city</code>, <code>region</code>, <code>postal_code</code>, <code>country</code>, <code>linkedin_url</code>, <code>portfolio_url</code>, <code>work_authorization</code>, <code>sponsorship_required</code>, <code>relocation</code>, <code>salary_expectation</code>, and <code>start_date</code>. Every supplied value must be a nonempty string; duplicate keys, merge keys, unknown keys, and nonmapping front matter are invalid. If both first and last name are absent but <code>full_name</code> is present, it is split once at the first whitespace; a one-token full name derives only <code>first_name</code>. The Markdown body is narrative evidence, not a second key/value parser.</p>
+      <p>The harness extracts résumé text and rejects an unextractable PDF, an individual source exceeding 100,000 characters, or combined résumé/profile/context/anecdote narrative exceeding 250,000 characters. It labels narrative sources with their sanitized basename and category so their provenance remains visible to the model. Explicit front-matter values are excluded from narrative prompt evidence and become domain-scoped Browser Use sensitive placeholders instead.</p>
+      <h3>What may be used, and when</h3>
+      <ul>
+        <li>Explicit front matter is authoritative for contact, identity, sensitive, and legally significant controls. The harness must not infer legal, demographic, work-authorization, visa/sponsorship, salary, disability, veteran, relocation, background-check, or self-identification answers. If no explicit key exists, the control remains untouched and is reported for review.</li>
+        <li>Ordinary professional controls may use only an unambiguous exact fact from the résumé or attributed profile/context evidence. Only the supplied résumé is uploadable.</li>
+        <li>Anecdotes may be selected and paraphrased only for a relevant professional free-text question and visible job description. They must not invent or transfer metrics, dates, responsibilities, employers, credentials, technologies, or outcomes, and an irrelevant anecdote is not evidence merely because it was uploaded.</li>
+        <li>A human revision is authoritative only for the field it corrects in the current run. Otherwise, missing or contradictory facts remain unfilled and produce a human-review warning.</li>
+      </ul>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/artifacts.py"><code>apps/browser-harness/src/browser_harness/artifacts.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/context.py"><code>apps/browser-harness/src/browser_harness/context.py</code></a>, and <a href="../../../apps/browser-harness/src/browser_harness/agent.py"><code>apps/browser-harness/src/browser_harness/agent.py</code></a>.</p>
+    </section>
+
+    <section id="actions-and-origin-controls">
+      <h2>Browser actions and exact-origin control</h2>
+      <p>The harness keeps Browser Use <code>0.13.4</code>’s complete default action registry and adds human-gate actions alongside it; it does not remove or replace the default <code>done</code> action. The version-pinned registry is: <code>done</code>, <code>search</code>, <code>navigate</code>, <code>go_back</code>, <code>wait</code>, <code>click</code>, <code>input</code>, <code>upload_file</code>, <code>switch</code>, <code>close</code>, <code>extract</code>, <code>search_page</code>, <code>find_elements</code>, <code>scroll</code>, <code>send_keys</code>, <code>find_text</code>, <code>screenshot</code>, <code>save_as_pdf</code>, <code>dropdown_options</code>, <code>select_dropdown</code>, <code>write_file</code>, <code>replace_file</code>, <code>read_file</code>, and <code>evaluate</code>. Native inputs/selects/uploads, intermediate clicks and keypresses, tabs, scrolling, extraction, and JavaScript evaluation are therefore available for intermediate approved-origin controls.</p>
+      <p>Approval is exact, not host-suffix or wildcard based: the canonical scheme, host, and effective port must match. Browser Use receives each approved origin as <code>origin/</code> to avoid its scheme-qualified prefix matcher accepting a lookalike host. Before action dispatch, the harness rechecks the live current origin itself; it rejects non-recovery actions on an unapproved origin. Placeholder replacement is likewise performed immediately before dispatch against the live exact origin, so direct values are available only on an approved origin.</p>
+      <p>When an Apply route reveals a different origin, the model must request human approval before navigating. After any human navigation, the harness parses the current origin and requests approval if it changed. A successful exact <code>approve_origin</code> command appends only that origin’s <code>origin/</code> representation to the Browser Use allowlist and adds that origin’s sensitive placeholders. No wildcard is accepted. This protects origin transitions while preserving the full default action set.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/tools.py"><code>apps/browser-harness/src/browser_harness/tools.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/browser.py"><code>apps/browser-harness/src/browser_harness/browser.py</code></a>, and <a href="../../../apps/browser-harness/src/browser_harness/context.py"><code>apps/browser-harness/src/browser_harness/context.py</code></a>.</p>
+    </section>
+
+    <section id="human-handoff">
+      <h2>Human navigation, review, and final submission</h2>
+      <p>The agent first identifies an active matching posting/form and scans every form step, including knock-out controls. On each step it must complete every accessible, machine-actionable control within approved origins before it asks for human navigation or review; this includes native fields, radios, selects, uploads, intermediate clicks and keypresses, and a site-provided JavaScript interface for a custom widget. A visible control explicitly identified as human-only or manual is different: the agent must not activate it, must finish every other accessible control on that step, and then pauses through <code>request_human_navigation</code>. The same gate is used for login, CAPTCHA, 2FA, inaccessible widgets, missing/contradictory facts, or other manual navigation. It requests an origin gate before crossing an unapproved origin. The operator uses <code>continue</code> only after the requested navigation is complete.</p>
+      <p>After fields and warnings are handled, the agent uses <code>request_human_review</code>. The review snapshot exposes only sanitized field metadata and warnings. A <code>revise</code> command resumes the same session with the revision as long-term memory, increments the revision count, and requires review again. A <code>ready</code> command ends the model workflow immediately at <code>ready_for_human_submit</code>; it performs no later browser action, and the visible form stays open for the person to inspect and personally submit.</p>
+      <p><strong>Final-submit limitation:</strong> the task instruction says not to activate Submit/Send/Apply-now submission controls, press Enter when it submits, call a submission API through <code>evaluate</code>, or use <code>done</code> to bypass review. The configured workflow and local fixture test this behavior, and every application result fixes <code>submit_attempted</code> to <code>false</code>. This is an instruction-level policy, not a browser-enforced capability boundary: unrestricted default <code>click</code>, <code>send_keys</code>, <code>evaluate</code>, and <code>done</code> actions remain available by design. It is not proof that every model or site interaction is technically incapable of automated submission. The harness does not observe or record the human’s eventual Submit click.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/agent.py"><code>apps/browser-harness/src/browser_harness/agent.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/tools.py"><code>apps/browser-harness/src/browser_harness/tools.py</code></a>, and <a href="../../../apps/browser-harness/src/browser_harness/models.py"><code>apps/browser-harness/src/browser_harness/models.py</code></a>.</p>
+    </section>
+
+    <section id="privacy-and-cleanup">
+      <h2>Privacy, redaction, TTL, cleanup, and tombstones</h2>
+      <p>Before Browser Use imports, the package sets <code>ANONYMIZED_TELEMETRY=false</code> and <code>BROWSER_USE_ACTION_TIMEOUT_S=3600</code>. Browser Use, HTTP client, and Uvicorn access logging are restricted to warning-level/no-access-log operation. The agent disables vision, judge, GIF generation, conversation persistence, HAR, video, and trace recording. Candidate narrative, résumé text, context, anecdotes, visible job material, and generated answers necessarily pass to OpenAI Codex through the loopback pipeline gateway; they are not returned by that gateway or copied into harness public API data.</p>
+      <p>Public snapshots and events strip URL credentials, query strings, and fragments. They report field labels/type/presence rather than field values and safe file basenames rather than paths. Known direct values are redacted from public text (including URL-decoded representations), and review warnings are generalized. Gateway errors are mapped to fixed messages rather than provider response bodies. These controls do not make a public browser client safe to receive the shared bearer, and they do not imply a secure-erasure guarantee.</p>
+      <p>The session lifetime is absolute from creation: default <code>3600</code> seconds, configurable with <code>--session-timeout</code>. Expiry produces <code>failed</code> with <code>session_timeout</code>, including when the session is otherwise ready for human submission. On cancellation, failure, deletion, expiry, or shutdown, the manager signals the gate, awaits/cancels agent setup and work, kills the harness-owned browser, closes the per-session pipeline HTTP client, and recursively removes session artifacts (uploads, agent files, and downloads). It publishes the terminal event and releases the singleton only after cleanup completes. A ready session deliberately retains its visible browser and artifacts until deletion or TTL.</p>
+      <p>The manager retains at most 32 sanitized terminal tombstones, each with at most 256 retained events; older IDs are no longer addressable. Deleting a terminal tombstone records a <code>closed</code> event/snapshot and remains idempotent once closed. This bounded history is for observing lifecycle state, not for retaining private application artifacts.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/src/browser_harness/__init__.py"><code>apps/browser-harness/src/browser_harness/__init__.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/agent.py"><code>apps/browser-harness/src/browser_harness/agent.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/tools.py"><code>apps/browser-harness/src/browser_harness/tools.py</code></a>, <a href="../../../apps/browser-harness/src/browser_harness/artifacts.py"><code>apps/browser-harness/src/browser_harness/artifacts.py</code></a>, and <a href="../../../apps/browser-harness/src/browser_harness/sessions.py"><code>apps/browser-harness/src/browser_harness/sessions.py</code></a>.</p>
+    </section>
+
+    <section id="verification">
+      <h2>Focused tests and live smoke procedure</h2>
+      <p>Run the focused gateway test and the harness test suite after installation; these commands do not require real OAuth or an employer site:</p>
+      <pre><code>bun test --cwd apps/pipeline test/browser-harness-codex.test.ts
+apps/browser-harness/.venv/bin/python -m pytest apps/browser-harness/tests</code></pre>
+      <p>The repeatable live smoke uses only the repository’s two-origin loopback fixture. It requires a running pipeline with connected OpenAI Codex Provider access, a running headed harness, and the shared bearer. Its control order is deliberate: before the human gate, the configured workflow selects the <q>Deployment systems</q> radio, completes the intermediate click and its non-submitting Enter checkpoint, and uses the visible evaluation-only instruction to call <code>window.setCustomWidget('evaluation-set')</code>. The fixture labels <strong>Human Next</strong> as human-only; it reveals review only after its required fields, machine controls, and custom widget are complete. The smoke deliberately makes <strong>two manual interactions</strong>: click that Human Next control, then inspect the ready form and click its Submit control exactly once. It is not an unattended test and must never target an employer site.</p>
+      <pre><code>JOBHUNTER_HARNESS_TOKEN="$JOBHUNTER_HARNESS_TOKEN" \
+  apps/browser-harness/.venv/bin/python apps/browser-harness/scripts/smoke_local.py \
+  --harness-url http://127.0.0.1:8765 \
+  --pipeline-url http://127.0.0.1:3457</code></pre>
+      <p><strong>Completed live verification:</strong> the live smoke completed successfully against the running OAuth-connected pipeline and native headed Chromium. Both required human clicks were made. It passed the live gateway’s exact <code>openai-codex/gpt-5.6-sol</code> and <code>high</code> metadata and live model-call check; authenticated API/multipart, singleton, and SSE checks; exact dynamic-origin approval; the same-run revision; direct-profile/radio, relevant-anecdote, intermediate click/Enter/evaluation, and human-navigation checks; and the zero configured-workflow-submit assertion before <code>ready_for_human_submit</code>. After the human clicked Submit, the fixture recorded exactly one submission. Deletion then produced the closed tombstone, completed cleanup, and released the singleton so a new session could start. The script’s captured API/SSE privacy scan also passed: it rejects bearer/OAuth tokens, direct profile values, full prompts, answer bodies, provider error bodies, and reasoning summaries.</p>
+      <p>The completed smoke is behavioral evidence for this configured model workflow and local fixture, including its zero-submit-before-ready assertion. It does not turn the instruction-level final-submit policy into a capability guarantee: the retained unrestricted browser actions still mean the harness cannot prove every model or site interaction is technically incapable of automated submission.</p>
+      <p>Sources: <a href="../../../apps/browser-harness/scripts/smoke_local.py"><code>apps/browser-harness/scripts/smoke_local.py</code></a>, <a href="../../../apps/browser-harness/tests/fixtures/application.html"><code>apps/browser-harness/tests/fixtures/application.html</code></a>, <a href="../../../apps/browser-harness/tests/test_pipeline_model.py"><code>apps/browser-harness/tests/test_pipeline_model.py</code></a>, <a href="../../../apps/browser-harness/tests/test_sessions.py"><code>apps/browser-harness/tests/test_sessions.py</code></a>, and <a href="../../../apps/pipeline/test/browser-harness-codex.test.ts"><code>apps/pipeline/test/browser-harness-codex.test.ts</code></a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p><a href="../index.html">Apps workspace documentation</a> · <a href="../pipeline/index.html#browser-harness-codex">Pipeline OAuth/model gateway</a> · <a href="index.html">Browser harness API reference</a></p>
+  </footer>
+</body>
+</html>

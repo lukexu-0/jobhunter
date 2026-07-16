@@ -1,0 +1,827 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import httpx
+import pytest
+from fastapi import UploadFile
+from pydantic import TypeAdapter, ValidationError
+
+from jobhunter_browser_harness.api import HarnessDependencies, create_app
+from jobhunter_browser_harness.models import (
+    SESSION_ERROR_MESSAGES,
+    ApplicationRunResult,
+    ApproveOriginCommand,
+    BrowserLaunchConfig,
+    CancelCommand,
+    ContinueCommand,
+    FieldResult,
+    HarnessConfig,
+    HarnessServiceError,
+    ReadyCommand,
+    ReviseCommand,
+    SessionCommand,
+    SessionCreateResponse,
+    SessionError,
+    SessionSnapshot,
+    sanitize_public_url,
+    session_error,
+    validate_approved_origin,
+    validate_https_origin,
+    validate_job_url,
+)
+
+TOKEN = "test-token-0123456789abcdef-0123456789"
+SESSION_ID = UUID("39bb70b2-5ea4-4937-8090-32d7404ad597")
+AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
+COMMAND_ADAPTER = TypeAdapter(SessionCommand)
+NOW = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+
+
+def make_snapshot(**overrides: Any) -> SessionSnapshot:
+    values: dict[str, Any] = {
+        "session_id": SESSION_ID,
+        "state": "awaiting_human_review",
+        "created_at": NOW,
+        "updated_at": NOW,
+        "job_url": "https://jobs.example/apply?candidate=private#ignored",
+        "company": "Example Corp",
+        "role": "Engineer",
+        "fields_filled": [
+            {
+                "label": "Email",
+                "field_type": "text",
+                "value_present": True,
+                "note": "",
+            }
+        ],
+        "fields_needing_human": [],
+        "files_attached": ["resume.pdf"],
+        "warnings": [],
+        "revision_count": 0,
+        "approved_origins": ["https://jobs.example"],
+        "error": None,
+    }
+    values.update(overrides)
+    return SessionSnapshot.model_validate(values)
+
+
+@dataclass(slots=True)
+class FakeSessionService:
+    snapshot: SessionSnapshot = field(default_factory=make_snapshot)
+    create_error: HarnessServiceError | None = None
+    snapshot_error: Exception | None = None
+    create_calls: list[dict[str, Any]] = field(default_factory=list)
+    snapshot_calls: list[UUID] = field(default_factory=list)
+    event_calls: list[tuple[UUID, int | None]] = field(default_factory=list)
+    command_calls: list[tuple[UUID, SessionCommand]] = field(default_factory=list)
+    delete_calls: list[UUID] = field(default_factory=list)
+    shutdown_calls: int = 0
+
+    async def create_session(
+        self,
+        *,
+        job_url: str,
+        allow_domains: Sequence[str],
+        max_steps: int,
+        personal_information: UploadFile,
+        resume: UploadFile,
+        context: Sequence[UploadFile],
+        anecdotes: Sequence[UploadFile],
+    ) -> SessionCreateResponse:
+        if self.create_error is not None:
+            raise self.create_error
+        self.create_calls.append(
+            {
+                "job_url": job_url,
+                "allow_domains": list(allow_domains),
+                "max_steps": max_steps,
+                "personal_information": (
+                    personal_information.filename,
+                    await personal_information.read(),
+                ),
+                "resume": (resume.filename, await resume.read()),
+                "context": [
+                    (upload.filename, await upload.read()) for upload in context
+                ],
+                "anecdotes": [
+                    (upload.filename, await upload.read()) for upload in anecdotes
+                ],
+            }
+        )
+        return SessionCreateResponse(
+            session_id=SESSION_ID,
+            events_url=f"http://127.0.0.1:8765/v1/sessions/{SESSION_ID}/events",
+            commands_url=f"http://127.0.0.1:8765/v1/sessions/{SESSION_ID}/commands",
+        )
+
+    def get_snapshot(self, session_id: UUID) -> SessionSnapshot:
+        self.snapshot_calls.append(session_id)
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        if session_id != SESSION_ID:
+            raise HarnessServiceError(404, "session_not_found", "Session not found")
+        return self.snapshot
+
+    async def stream_events(
+        self, session_id: UUID, last_event_id: int | None
+    ) -> AsyncIterator[str]:
+        self.event_calls.append((session_id, last_event_id))
+        yield 'id: 3\nevent: agent_step\ndata: {"step_number":2}\n\n'
+        yield ": heartbeat\n\n"
+
+    async def command(self, session_id: UUID, command: SessionCommand) -> None:
+        if session_id != SESSION_ID:
+            raise HarnessServiceError(404, "session_not_found", "Session not found")
+        self.command_calls.append((session_id, command))
+
+    async def delete(self, session_id: UUID) -> None:
+        if session_id != SESSION_ID:
+            raise HarnessServiceError(404, "session_not_found", "Session not found")
+        # Repeated deletion deliberately remains successful, like a retained tombstone.
+        self.delete_calls.append(session_id)
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+@pytest.fixture
+async def api_client() -> AsyncIterator[tuple[httpx.AsyncClient, FakeSessionService]]:
+    service = FakeSessionService()
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=service),
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://harness.test") as client:
+        yield client, service
+
+
+def multipart_parts(
+    *,
+    domains: Sequence[str] = (),
+    contexts: int = 0,
+    anecdotes: int = 0,
+    max_steps: int | str = 100,
+) -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
+    parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]] = [
+        ("job_url", (None, "https://jobs.example/openings/42?source=board")),
+        ("max_steps", (None, str(max_steps))),
+        (
+            "personal_information",
+            ("profile.md", b"---\nfull_name: Test Person\n---\nProfile", "text/markdown"),
+        ),
+        ("resume", ("resume.pdf", b"%PDF-1.7 synthetic", "application/pdf")),
+    ]
+    parts.extend(("allow_domain", (None, domain)) for domain in domains)
+    parts.extend(
+        (
+            "context",
+            (f"context-{index}.md", f"context {index}".encode(), "text/markdown"),
+        )
+        for index in range(contexts)
+    )
+    parts.extend(
+        (
+            "anecdote",
+            (f"anecdote-{index}.txt", f"anecdote {index}".encode(), "text/plain"),
+        )
+        for index in range(anecdotes)
+    )
+    return parts
+
+
+def test_harness_config_requires_long_token_and_loopback_pipeline() -> None:
+    config = HarnessConfig(
+        bearer_token="x" * 32,
+        pipeline_url="http://LOCALHOST:3457/",
+        port=65_535,
+        session_timeout=1,
+    )
+    assert config.pipeline_url == "http://LOCALHOST:3457"
+
+    for token in ("", "x" * 31):
+        with pytest.raises(ValidationError):
+            HarnessConfig(bearer_token=token)
+
+    for pipeline_url in (
+        "https://127.0.0.1:3457",
+        "http://pipeline.example:3457",
+        "http://user:password@127.0.0.1:3457",
+        "http://127.0.0.1:3457?token=secret",
+        "http://127.0.0.1:3457/#fragment",
+    ):
+        with pytest.raises(ValidationError):
+            HarnessConfig(bearer_token=TOKEN, pipeline_url=pipeline_url)
+
+
+@pytest.mark.parametrize(
+    "cdp_url",
+    [
+        "http://127.0.0.1:9222",
+        "http://localhost:9222/",
+        "http://[::1]:9222",
+    ],
+)
+def test_browser_config_accepts_only_loopback_http_cdp(cdp_url: str) -> None:
+    assert BrowserLaunchConfig(cdp_url=cdp_url).cdp_url == cdp_url.rstrip("/")
+
+
+@pytest.mark.parametrize(
+    "cdp_url",
+    [
+        "https://127.0.0.1:9222",
+        "http://192.0.2.8:9222",
+        "http://user:secret@localhost:9222",
+        "http://localhost:9222?secret=yes",
+        "http://localhost:9222/#fragment",
+    ],
+)
+def test_browser_config_rejects_non_loopback_or_decorated_cdp(cdp_url: str) -> None:
+    with pytest.raises(ValidationError):
+        BrowserLaunchConfig(cdp_url=cdp_url)
+
+
+def test_browser_config_rejects_cdp_and_local_executable_together() -> None:
+    with pytest.raises(ValidationError):
+        BrowserLaunchConfig(
+            cdp_url="http://localhost:9222",
+            chrome_executable=Path("/opt/chrome"),
+        )
+
+
+def test_job_url_validation_preserves_private_path_and_query() -> None:
+    private_url = "https://Jobs.Example/openings/42?candidate=private"
+    assert validate_job_url(private_url) == private_url
+    assert validate_job_url("http://127.0.0.1:8080/form?fixture=1").endswith(
+        "/form?fixture=1"
+    )
+
+    for invalid in (
+        "http://jobs.example/openings/42",
+        "https://user:secret@jobs.example/openings/42",
+        "https://jobs.example/openings/42#apply",
+        "/openings/42",
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            validate_job_url(invalid)
+
+
+def test_public_url_removes_userinfo_query_and_fragment() -> None:
+    public = sanitize_public_url(
+        "HTTPS://user:secret@Jobs.Example:443/apply/42?email=private#answer"
+    )
+    assert public == "https://jobs.example/apply/42"
+    assert all(secret not in public for secret in ("user", "secret", "email", "answer"))
+
+
+def test_origins_are_canonical_exact_and_do_not_admit_lookalikes() -> None:
+    approved = validate_https_origin("HTTPS://ATS.Example/")
+    lookalike = validate_https_origin("https://ats.example.evil/")
+
+    assert approved == "https://ats.example"
+    assert validate_https_origin("https://ats.example:443") == approved
+    assert lookalike == "https://ats.example.evil"
+    assert approved != lookalike
+    assert not f"{lookalike}/".startswith(f"{approved}/")
+    assert validate_approved_origin("http://LOCALHOST:8080/") == "http://localhost:8080"
+
+    for invalid in (
+        "http://ats.example",
+        "https://user:secret@ats.example",
+        "https://ats.example/path",
+        "https://ats.example?next=evil",
+        "https://ats.example#fragment",
+        "https://*.example",
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            validate_https_origin(invalid)
+
+
+def test_field_result_enforces_bounds_and_never_contains_a_value() -> None:
+    result = FieldResult(
+        label="L" * 500,
+        field_type="textarea",
+        value_present=True,
+        note="N" * 1_000,
+    )
+    assert result.model_dump() == {
+        "label": "L" * 500,
+        "field_type": "textarea",
+        "value_present": True,
+        "note": "N" * 1_000,
+    }
+    assert "value" not in FieldResult.model_fields
+
+    for update in (
+        {"label": ""},
+        {"label": "L" * 501},
+        {"note": "N" * 1_001},
+        {"field_type": "password"},
+        {"value_present": 1},
+        {"value": "private answer"},
+    ):
+        values: dict[str, Any] = {
+            "label": "Question",
+            "field_type": "text",
+            "value_present": False,
+        }
+        values.update(update)
+        with pytest.raises(ValidationError):
+            FieldResult.model_validate(values)
+
+
+def test_application_result_sanitizes_urls_and_forces_submit_false() -> None:
+    result = ApplicationRunResult(
+        status="ready_for_human_submit",
+        company="C" * 500,
+        role="R" * 500,
+        job_url="https://user:secret@jobs.example/apply?candidate=private#fragment",
+        final_url="https://ats.example/form/42?answer=private#review",
+        fields_filled=[
+            FieldResult(
+                label="Email",
+                field_type="text",
+                value_present=True,
+                note="filled from explicit profile data",
+            )
+        ],
+        files_attached=[f"file-{index}.pdf" for index in range(20)],
+        warnings=[f"warning {index}" for index in range(100)],
+        revision_count=100,
+    )
+    dumped = result.model_dump(mode="json")
+
+    assert dumped["job_url"] == "https://jobs.example/apply"
+    assert dumped["final_url"] == "https://ats.example/form/42"
+    assert dumped["submit_attempted"] is False
+    serialized = result.model_dump_json()
+    for private in ("user", "secret", "candidate", "answer", "private"):
+        assert private not in serialized
+
+    with pytest.raises(ValidationError):
+        ApplicationRunResult.model_validate(
+            {
+                **dumped,
+                "submit_attempted": True,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("company", "C" * 501),
+        ("role", "R" * 501),
+        (
+            "fields_filled",
+            [
+                {
+                    "label": "Field",
+                    "field_type": "text",
+                    "value_present": True,
+                }
+            ]
+            * 501,
+        ),
+        (
+            "fields_needing_human",
+            [
+                {
+                    "label": "Field",
+                    "field_type": "text",
+                    "value_present": False,
+                }
+            ]
+            * 501,
+        ),
+        ("files_attached", [f"file-{index}.pdf" for index in range(21)]),
+        ("files_attached", ["../resume.pdf"]),
+        ("warnings", ["warning"] * 101),
+        ("warnings", ["W" * 1_001]),
+        ("revision_count", -1),
+        ("revision_count", 101),
+    ],
+)
+def test_application_result_rejects_public_bounds(field: str, invalid_value: Any) -> None:
+    values: dict[str, Any] = {
+        "status": "cancelled",
+        "job_url": "https://jobs.example/posting",
+        "final_url": "https://jobs.example/posting",
+        "submit_attempted": False,
+        field: invalid_value,
+    }
+    with pytest.raises(ValidationError):
+        ApplicationRunResult.model_validate(values)
+
+
+def test_session_errors_are_limited_to_the_fixed_catalog() -> None:
+    expected = {
+        "oauth_required": "Connect OpenAI Codex in Provider access",
+        "pipeline_unavailable": "The local pipeline model service is unavailable",
+        "model_timeout": "The model request timed out",
+        "invalid_model_output": "The model returned invalid output",
+        "model_failed": "The model request failed",
+        "browser_failed": "The browser session failed",
+        "application_mismatch": "The open page does not match the requested job",
+        "step_limit": "The application step limit was reached",
+        "session_timeout": "The application session expired",
+    }
+    assert dict(SESSION_ERROR_MESSAGES) == expected
+    assert {
+        code: session_error(code).model_dump()  # type: ignore[arg-type]
+        for code in expected
+    } == {
+        code: {"code": code, "message": message}
+        for code, message in expected.items()
+    }
+
+    with pytest.raises(ValidationError):
+        SessionError(code="model_failed", message="provider said secret-token")
+    with pytest.raises(ValidationError):
+        SessionError.model_validate({"code": "new_error", "message": "anything"})
+    with pytest.raises(TypeError):
+        SESSION_ERROR_MESSAGES["model_failed"] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("payload", "command_type"),
+    [
+        ({"type": "continue"}, ContinueCommand),
+        ({"type": "approve_origin", "origin": "HTTPS://ATS.Example/"}, ApproveOriginCommand),
+        ({"type": "revise", "context": "  Correct this field.  "}, ReviseCommand),
+        ({"type": "ready"}, ReadyCommand),
+        ({"type": "cancel"}, CancelCommand),
+    ],
+)
+def test_command_union_uses_strict_discriminators(
+    payload: dict[str, Any], command_type: type[SessionCommand]
+) -> None:
+    command = COMMAND_ADAPTER.validate_python(payload)
+    assert isinstance(command, command_type)
+    if isinstance(command, ApproveOriginCommand):
+        assert command.origin == "https://ats.example"
+    if isinstance(command, ReviseCommand):
+        assert command.context == "Correct this field."
+
+
+def test_revision_command_accepts_twenty_thousand_trimmed_characters() -> None:
+    context = "x" * 20_000
+    command = COMMAND_ADAPTER.validate_python(
+        {"type": "revise", "context": f"  {context}  "}
+    )
+
+    assert isinstance(command, ReviseCommand)
+    assert command.context == context
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"type": "unknown"},
+        {"type": "continue", "extra": "rejected"},
+        {"type": "ready", "context": "not allowed"},
+        {"type": "approve_origin"},
+        {"type": "approve_origin", "origin": "https://ats.example/path"},
+        {"type": "revise"},
+        {"type": "revise", "context": ""},
+        {"type": "revise", "context": "   "},
+        {"type": "revise", "context": "x" * 20_001},
+    ],
+)
+def test_command_union_rejects_unknown_empty_oversize_and_extra_values(
+    payload: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        COMMAND_ADAPTER.validate_python(payload)
+
+
+async def test_health_is_unauthenticated_and_returns_only_status(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, _service = api_client
+    response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert response.headers["cache-control"] == "no-store"
+
+async def test_application_lifespan_shuts_down_session_service() -> None:
+    service = FakeSessionService()
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=service),
+    )
+    async with app.router.lifespan_context(app):
+        assert service.shutdown_calls == 0
+    assert service.shutdown_calls == 1
+
+
+async def test_missing_and_wrong_bearer_are_identical_and_cors_is_absent(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    missing = await client.get(f"/v1/sessions/{SESSION_ID}")
+    wrong = await client.get(
+        f"/v1/sessions/{SESSION_ID}",
+        headers={
+            "Authorization": "Bearer wrong-secret-that-is-long-enough",
+            "Origin": "https://web.example",
+        },
+    )
+    non_ascii = await client.get(
+        f"/v1/sessions/{SESSION_ID}",
+        headers=[(b"Authorization", b"Bearer \xff")],
+    )
+
+    assert missing.status_code == wrong.status_code == non_ascii.status_code == 401
+    assert missing.json() == wrong.json() == non_ascii.json() == {
+        "code": "unauthorized",
+        "message": "Unauthorized",
+    }
+    for response in (missing, wrong, non_ascii):
+        assert response.headers["cache-control"] == "no-store"
+        assert not any(name.startswith("access-control-") for name in response.headers)
+    assert service.snapshot_calls == []
+
+
+async def test_authenticated_response_has_no_cors_headers(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, _service = api_client
+    response = await client.get(
+        f"/v1/sessions/{SESSION_ID}",
+        headers={**AUTHORIZATION, "Origin": "https://web.example"},
+    )
+
+    assert response.status_code == 200
+    assert not any(name.startswith("access-control-") for name in response.headers)
+
+
+async def test_multipart_preserves_repeated_domains_files_and_bodies(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    response = await client.post(
+        "/v1/sessions",
+        headers=AUTHORIZATION,
+        files=multipart_parts(
+            domains=("https://jobs.example", "https://ats.example"),
+            contexts=2,
+            anecdotes=2,
+            max_steps=321,
+        ),
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "session_id": str(SESSION_ID),
+        "state": "starting",
+        "events_url": f"http://127.0.0.1:8765/v1/sessions/{SESSION_ID}/events",
+        "commands_url": f"http://127.0.0.1:8765/v1/sessions/{SESSION_ID}/commands",
+    }
+    assert len(service.create_calls) == 1
+    call = service.create_calls[0]
+    assert call["job_url"] == "https://jobs.example/openings/42?source=board"
+    assert call["allow_domains"] == ["https://jobs.example", "https://ats.example"]
+    assert call["max_steps"] == 321
+    assert call["personal_information"] == (
+        "profile.md",
+        b"---\nfull_name: Test Person\n---\nProfile",
+    )
+    assert call["resume"] == ("resume.pdf", b"%PDF-1.7 synthetic")
+    assert call["context"] == [
+        ("context-0.md", b"context 0"),
+        ("context-1.md", b"context 1"),
+    ]
+    assert call["anecdotes"] == [
+        ("anecdote-0.txt", b"anecdote 0"),
+        ("anecdote-1.txt", b"anecdote 1"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("parts", "expected_status"),
+    [
+        (multipart_parts(max_steps=1), 202),
+        (multipart_parts(max_steps=500), 202),
+        (multipart_parts(max_steps=0), 422),
+        (multipart_parts(max_steps=501), 422),
+        (multipart_parts(domains=[f"https://d{index}.example" for index in range(21)]), 422),
+        (multipart_parts(contexts=11), 422),
+        (multipart_parts(anecdotes=21), 422),
+    ],
+)
+async def test_multipart_count_and_max_steps_validation(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]],
+    expected_status: int,
+) -> None:
+    client, service = api_client
+    response = await client.post(
+        "/v1/sessions", headers=AUTHORIZATION, files=parts
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 422:
+        assert response.json() == {
+            "code": "invalid_request",
+            "message": "Request is invalid",
+        }
+        assert service.create_calls == []
+    else:
+        assert len(service.create_calls) == 1
+
+
+async def test_singleton_conflict_passes_through_fixed_service_error(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    service.create_error = HarnessServiceError(
+        409,
+        "session_active",
+        "A session is already active",
+        session_id=SESSION_ID,
+    )
+    response = await client.post(
+        "/v1/sessions", headers=AUTHORIZATION, files=multipart_parts()
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": "session_active",
+        "session_id": str(SESSION_ID),
+    }
+    assert response.headers["cache-control"] == "no-store"
+
+
+async def test_snapshot_get_returns_sanitized_public_model(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    response = await client.get(
+        f"/v1/sessions/{SESSION_ID}", headers=AUTHORIZATION
+    )
+
+    assert response.status_code == 200
+    assert response.json() == service.snapshot.model_dump(mode="json")
+    assert response.json()["job_url"] == "https://jobs.example/apply"
+    assert response.json()["model_provider"] == "openai-codex"
+    assert response.json()["model"] == "gpt-5.6-sol"
+    assert response.json()["reasoning"] == "high"
+    assert service.snapshot_calls == [SESSION_ID]
+
+
+@pytest.mark.parametrize("last_event_id", [0, 2])
+async def test_sse_passes_last_event_id_and_sets_streaming_headers(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    last_event_id: int,
+) -> None:
+    client, service = api_client
+    response = await client.get(
+        f"/v1/sessions/{SESSION_ID}/events",
+        headers={**AUTHORIZATION, "Last-Event-ID": str(last_event_id)},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["connection"] == "keep-alive"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.text == (
+        'id: 3\nevent: agent_step\ndata: {"step_number":2}\n\n'
+        ": heartbeat\n\n"
+    )
+    assert service.snapshot_calls == [SESSION_ID]
+    assert service.event_calls == [(SESSION_ID, last_event_id)]
+
+
+@pytest.mark.parametrize("last_event_id", ["-1", "not-an-integer", "1.5"])
+async def test_sse_rejects_invalid_or_negative_last_event_id(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    last_event_id: str,
+) -> None:
+    client, service = api_client
+    response = await client.get(
+        f"/v1/sessions/{SESSION_ID}/events",
+        headers={**AUTHORIZATION, "Last-Event-ID": last_event_id},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Last-Event-ID must be nonnegative",
+    }
+    assert service.snapshot_calls == []
+    assert service.event_calls == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "command_type"),
+    [
+        ({"type": "continue"}, ContinueCommand),
+        ({"type": "approve_origin", "origin": "https://ats.example"}, ApproveOriginCommand),
+        ({"type": "revise", "context": "  use corrected fact  "}, ReviseCommand),
+        ({"type": "ready"}, ReadyCommand),
+        ({"type": "cancel"}, CancelCommand),
+    ],
+)
+async def test_command_endpoint_dispatches_typed_commands_and_returns_202(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    payload: dict[str, Any],
+    command_type: type[SessionCommand],
+) -> None:
+    client, service = api_client
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/commands",
+        headers=AUTHORIZATION,
+        json=payload,
+    )
+
+    assert response.status_code == 202
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+    assert len(service.command_calls) == 1
+    dispatched_id, dispatched = service.command_calls[0]
+    assert dispatched_id == SESSION_ID
+    assert isinstance(dispatched, command_type)
+    if isinstance(dispatched, ReviseCommand):
+        assert dispatched.context == "use corrected fact"
+
+
+async def test_command_endpoint_rejects_bad_discriminator_without_dispatch(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/commands",
+        headers=AUTHORIZATION,
+        json={"type": "submit", "secret": "must not appear"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert "secret" not in response.text
+    assert service.command_calls == []
+
+
+async def test_delete_is_204_and_idempotent_for_known_fake_session(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    first = await client.delete(
+        f"/v1/sessions/{SESSION_ID}", headers=AUTHORIZATION
+    )
+    second = await client.delete(
+        f"/v1/sessions/{SESSION_ID}", headers=AUTHORIZATION
+    )
+
+    assert first.status_code == second.status_code == 204
+    assert first.content == second.content == b""
+    assert service.delete_calls == [SESSION_ID, SESSION_ID]
+
+
+async def test_unknown_session_exposes_only_fixed_service_error(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, _service = api_client
+    unknown_id = UUID("e276cd41-1c40-4800-a5dc-28311f80fe6e")
+    response = await client.get(
+        f"/v1/sessions/{unknown_id}", headers=AUTHORIZATION
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "code": "session_not_found",
+        "message": "Session not found",
+    }
+    assert response.headers["cache-control"] == "no-store"
+
+
+async def test_unexpected_secret_bearing_exception_is_sanitized(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    secret = "oauth-refresh-token-and-private-answer"
+    service.snapshot_error = RuntimeError(f"provider failed with {secret}")
+    response = await client.get(
+        f"/v1/sessions/{SESSION_ID}", headers=AUTHORIZATION
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "code": "internal_error",
+        "message": "Request failed",
+    }
+    assert secret not in response.text
+    assert TOKEN not in response.text
+    assert response.headers["cache-control"] == "no-store"

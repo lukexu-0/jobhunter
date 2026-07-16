@@ -3,14 +3,12 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { APPLICATION_STATUSES, type ApplicationStatus, type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
+import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
 import { PipelineClientError, createRun, listRuns, readJsonArtifact, updateApplicationStatus } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 
 const PAGE_SIZE = 8;
 const POLL_INTERVAL_MS = 3_000;
-const MIN_JOB_DESCRIPTION_LENGTH = 40;
-const MAX_JOB_DESCRIPTION_LENGTH = 50_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 
 
@@ -108,13 +106,13 @@ export function RunDashboard() {
   const [statusFilter, setStatusFilter] = useState<ApplicationStatus | "all">("all");
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
-  const [isComposerOpen, setIsComposerOpen] = useState(false);
-  const [jobDescription, setJobDescription] = useState("");
+  const [jobUrl, setJobUrl] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
   const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
   const requestedArtifacts = useRef(new Set<string>());
+  const isJobUrlValid = CreateRunRequestSchema.safeParse({ jobUrl }).success;
 
   const load = useCallback(async (initial = false) => {
     if (initial) setIsLoading(true);
@@ -230,26 +228,17 @@ export function RunDashboard() {
 
   const submitRun = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const description = jobDescription.trim();
-    if (description.length < MIN_JOB_DESCRIPTION_LENGTH || description.length > MAX_JOB_DESCRIPTION_LENGTH) {
-      setCreateError(`Enter between ${MIN_JOB_DESCRIPTION_LENGTH} and ${MAX_JOB_DESCRIPTION_LENGTH.toLocaleString()} characters.`);
-      return;
-    }
+    if (isCreating || !CreateRunRequestSchema.safeParse({ jobUrl }).success) return;
 
     setIsCreating(true);
     setCreateError(null);
     try {
-      const run = await createRun(description);
+      const run = await createRun(jobUrl);
       router.push(`/runs/${encodeURIComponent(run.id)}`);
     } catch (error) {
-      setCreateError(publicMessage(error, "The tailoring run could not be created. Try again."));
+      setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
       setIsCreating(false);
     }
-  };
-
-  const toggleComposer = () => {
-    setIsComposerOpen((open) => !open);
-    setCreateError(null);
   };
 
   const showFilteredEmpty = !isLoading && runs.length > 0 && filteredRuns.length === 0;
@@ -259,58 +248,41 @@ export function RunDashboard() {
     <main className="workspace">
       <header className="applications-header">
         <h1>Applications</h1>
-          <button
-            className="square-control square-control--primary"
-            type="button"
-            aria-expanded={isComposerOpen}
-            aria-controls="new-application-form"
-            onClick={toggleComposer}
-          >
-            <span aria-hidden="true">{isComposerOpen ? "−" : "+"}</span>
-            {isComposerOpen ? "Close" : "New"}
-          </button>
-        </header>
+      </header>
 
-        {isComposerOpen ? (
-          <section className="run-composer" id="new-application-form" aria-labelledby="new-application-heading">
-            <div className="run-composer__heading">
-              <div>
-                <p className="applications-label">New application</p>
-                <h2 id="new-application-heading">Paste the job description</h2>
-              </div>
-              <p>Only the job description is submitted to the local pipeline.</p>
-            </div>
-            <form onSubmit={(event) => void submitRun(event)}>
-              <label htmlFor="job-description">Job description</label>
-              <textarea
-                id="job-description"
-                value={jobDescription}
-                minLength={MIN_JOB_DESCRIPTION_LENGTH}
-                maxLength={MAX_JOB_DESCRIPTION_LENGTH}
-                rows={10}
-                required
-                disabled={isCreating}
-                aria-describedby="job-description-help job-description-count"
-                aria-invalid={Boolean(createError)}
-                onChange={(event) => {
-                  setJobDescription(event.target.value);
-                  setCreateError(null);
-                }}
-              />
-              <div className="run-composer__meta">
-                <p id="job-description-help">{MIN_JOB_DESCRIPTION_LENGTH.toLocaleString()}–{MAX_JOB_DESCRIPTION_LENGTH.toLocaleString()} characters</p>
-                <p id="job-description-count">{jobDescription.length.toLocaleString()} / {MAX_JOB_DESCRIPTION_LENGTH.toLocaleString()}</p>
-              </div>
-              {createError ? <p className="dashboard-alert" role="alert">{createError}</p> : null}
-              <div className="run-composer__actions">
-                <button className="square-control" type="button" onClick={toggleComposer} disabled={isCreating}>Cancel</button>
-                <button className="square-control square-control--primary" type="submit" disabled={isCreating || jobDescription.trim().length < MIN_JOB_DESCRIPTION_LENGTH}>
-                  {isCreating ? "Creating…" : "Create run"}
-                </button>
-              </div>
-            </form>
-          </section>
-        ) : null}
+      <form
+        className="run-initializer"
+        aria-label="Job posting URL"
+        noValidate
+        onSubmit={(event) => void submitRun(event)}
+      >
+        <label className="visually-hidden" htmlFor="job-url">Job posting URL</label>
+        <input
+          id="job-url"
+          type="url"
+          inputMode="url"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder="https://company.com/jobs/role"
+          value={jobUrl}
+          disabled={isCreating}
+          aria-invalid={createError ? true : undefined}
+          aria-describedby={createError ? "job-url-error" : undefined}
+          onChange={(event) => {
+            setJobUrl(event.target.value);
+            setCreateError(null);
+          }}
+        />
+        <button
+          className="square-control square-control--primary"
+          type="submit"
+          disabled={isCreating || !isJobUrlValid}
+        >
+          {isCreating ? "Initializing…" : "Initialize"}
+        </button>
+        {createError ? <p className="dashboard-alert" id="job-url-error" role="alert">{createError}</p> : null}
+      </form>
 
         <section className="applications-summary" aria-label="Application count">
           <p className="applications-label">Total applications</p>
@@ -403,8 +375,7 @@ export function RunDashboard() {
                     <tr>
                       <td colSpan={6}>
                         <div className="applications-state applications-state--table">
-                          <p>No applications yet. Create a run from a real job description to begin.</p>
-                          <button className="inline-control" type="button" onClick={() => setIsComposerOpen(true)}>Create first application</button>
+                          <p>No applications yet. Enter a job posting URL above to initialize one.</p>
                         </div>
                       </td>
                     </tr>

@@ -18,7 +18,7 @@ const PROVIDERS = [
   {
     provider: "openai-codex",
     name: "OpenAI Codex",
-    description: "OAuth access for the tailoring agent.",
+    description: "OAuth access for tailoring and fallback job-posting extraction.",
   },
   {
     provider: "google-antigravity",
@@ -349,7 +349,7 @@ export function OAuthDashboard() {
           <p className="kicker">Authorization</p>
           <h2 id="oauth-heading">Provider access</h2>
         </div>
-        <p className="section-caption">Connect local OAuth accounts before creating a tailoring run.</p>
+        <p className="section-caption">Connect OAuth for tailoring, visual inspection, and fallback job-posting extraction.</p>
       </div>
 
       {statusError ? (

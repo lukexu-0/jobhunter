@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
 import { openPipelineDatabase } from "../src/db/database.ts";
-import { ClaimRejectedError, PipelineRepository, RepositoryConflictError, SourceDriftError, type ActiveStage } from "../src/db/repository.ts";
+import { ClaimRejectedError, PipelineRepository, RepositoryConflictError, RunArtifactsPrunedError, SourceDriftError, type ActiveStage } from "../src/db/repository.ts";
 import { isProcessIdentityAlive, readProcessStartToken } from "../src/worker/claims.ts";
 
 const databases: Database[] = [];
@@ -26,8 +26,8 @@ function reachStage(repo: PipelineRepository, claim: { runId: string; token: str
   for (const target of targets) repo.transition(claim, target);
 }
 
-function createReview(repo: PipelineRepository, hash = "a".repeat(64), visualAck = false) {
-  const run = repo.createRun("JD");
+function createReview(repo: PipelineRepository, hash = "a".repeat(64), visualAck = false, id?: string) {
+  const run = repo.createRun("JD", id);
   const claim = repo.acquire();
   if (!claim) throw new Error("claim missing");
   reachStage(repo, claim, ["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
@@ -222,6 +222,83 @@ describe("persisted workflow commands", () => {
     const approved = repo.approve(runId, hash, true);
     expect(approved.status).toBe("approved");
     expect(approved.approvedPdfSha256).toBe(hash);
+  });
+});
+
+describe("artifact retention reservations", () => {
+  test("reserves only inactive runs outside the newest ten by queue sequence", () => {
+    const { repo } = fixture();
+    const ids = ["run-z", "run-2", "run-10", "run-a", "run-01", "run-y", "run-3", "run-b", "run-x", "run-20", "run-c", "run-1"];
+    for (const id of ids) createReview(repo, "a".repeat(64), false, id);
+    repo.setApplicationStatus(ids[0]!, "accepted");
+
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
+    expect(repo.areRunArtifactsRetained(ids[0]!)).toBeFalse();
+    expect(repo.areRunArtifactsRetained(ids[1]!)).toBeFalse();
+    expect(repo.areRunArtifactsRetained(ids[2]!)).toBeTrue();
+    expect(repo.areRunArtifactsRetained(ids[11]!)).toBeTrue();
+    expect(() => repo.reserveArtifactPruneCandidates(0)).toThrow(/positive integer/);
+    expect(() => repo.areRunArtifactsRetained("missing-run")).toThrow(RepositoryConflictError);
+  });
+
+  test("retries pruning rows and defers queued, active, claimed, and active-attempt runs", () => {
+    const { db, repo, tick } = fixture();
+    const ids = Array.from({ length: 16 }, (_, index) => `retention-${index === 0 ? "z" : index}`);
+    for (const id of ids) createReview(repo, "b".repeat(64), false, id);
+    db.query("UPDATE runs SET status='queued' WHERE id=?").run(ids[0]!);
+    db.query("UPDATE runs SET status='analyzing' WHERE id=?").run(ids[4]!);
+    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=? WHERE id=1").run(ids[1]!, "c".repeat(43), 99_999);
+    for (const [index, status] of [[2, "running"], [3, "cancel_requested"]] as const) {
+      db.query(`
+        INSERT INTO attempts(
+          id, run_id, revision, stage, attempt_no, origin, claim_token,
+          attempt_session_id, status, started_at
+        ) VALUES (?, ?, 1, 'analyzing', 1, 'initial', ?, ?, ?, 1000)
+      `).run(`active-${index}`, ids[index]!, "d".repeat(43), `session-${index}`, status);
+    }
+
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[5]!]);
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[5]!]);
+
+    db.query("UPDATE runs SET status='review' WHERE id IN (?, ?)").run(ids[0]!, ids[4]!);
+    db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=1").run();
+    db.query("UPDATE attempts SET status='succeeded', finished_at=2000 WHERE id IN ('active-2','active-3')").run();
+
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 6));
+    tick(1_000);
+    repo.markRunArtifactsPruned(ids[0]!);
+    repo.markRunArtifactsPruned(ids[0]!);
+    repo.markRunArtifactsPruned("unreserved-run");
+
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(1, 6));
+    expect(db.query<{ state: string; pruned_at: number }, [string]>(
+      "SELECT state,pruned_at FROM run_artifact_retention WHERE run_id=?",
+    ).get(ids[0]!)).toEqual({ state: "pruned", pruned_at: 2_000 });
+  });
+
+  test("rejects every artifact-dependent lifecycle command after reservation", () => {
+    const { db, repo } = fixture();
+    const ids = Array.from({ length: 12 }, (_, index) => `command-${index === 0 ? "z" : index}`);
+    for (const id of ids) createReview(repo, "e".repeat(64), false, id);
+    db.query("UPDATE runs SET status='failed', failed_stage='compiling' WHERE id=?").run(ids[0]!);
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
+
+    expect(() => repo.retry(ids[0]!)).toThrow(RunArtifactsPrunedError);
+    expect(() => repo.regenerate(ids[1]!, "e".repeat(64))).toThrow(RunArtifactsPrunedError);
+    expect(() => repo.editRun(ids[1]!, "change the layout", "e".repeat(64))).toThrow(RunArtifactsPrunedError);
+    expect(() => repo.approve(ids[1]!, "e".repeat(64))).toThrow(RunArtifactsPrunedError);
+    expect(repo.setApplicationStatus(ids[1]!, "rejected").applicationStatus).toBe("rejected");
+  });
+
+  test("never reacquires a runnable run with a retention reservation", () => {
+    const { db, repo } = fixture();
+    const ids = Array.from({ length: 12 }, (_, index) => `acquire-${index === 0 ? "z" : index}`);
+    for (const id of ids) createReview(repo, "f".repeat(64), false, id);
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
+    db.query("UPDATE runs SET status='queued' WHERE id IN (?, ?)").run(ids[0]!, ids[11]!);
+    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=0 WHERE id=1").run(ids[0]!, "g".repeat(43));
+
+    expect(repo.acquire()?.runId).toBe(ids[11]);
   });
 });
 

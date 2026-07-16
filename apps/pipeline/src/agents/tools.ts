@@ -74,28 +74,30 @@ export function createSequentialToolBudget(options: {
   maxCalls: number;
   maxBytes: number;
   perToolCalls: Readonly<Record<string, number>>;
+  label?: string;
 }): SequentialToolBudget {
   const counts = new Map<string, number>();
   let calls = 0;
   let bytes = 0;
+  const label = options.label ?? "repair";
   return {
     counts,
     begin(toolName: string, input: unknown): void {
       if (options.sharedSubmitted.value) throw new Error(`${toolName} cannot be called after terminal submission`);
-      if (calls >= options.maxCalls) throw new Error(`repair tool call budget of ${options.maxCalls} exhausted`);
+      if (calls >= options.maxCalls) throw new Error(`${label} tool call budget of ${options.maxCalls} exhausted`);
       const nextForTool = (counts.get(toolName) ?? 0) + 1;
       const limit = options.perToolCalls[toolName];
-      if (limit === undefined) throw new Error(`unknown repair tool ${toolName}`);
+      if (limit === undefined) throw new Error(`unknown ${label} tool ${toolName}`);
       if (nextForTool > limit) throw new Error(`${toolName} call budget of ${limit} exhausted`);
       const nextBytes = bytes + Buffer.byteLength(JSON.stringify(input));
-      if (nextBytes > options.maxBytes) throw new Error(`repair tool byte budget of ${options.maxBytes} exhausted`);
+      if (nextBytes > options.maxBytes) throw new Error(`${label} tool byte budget of ${options.maxBytes} exhausted`);
       calls++;
       bytes = nextBytes;
       counts.set(toolName, nextForTool);
     },
     finish(output: unknown): void {
       const nextBytes = bytes + Buffer.byteLength(JSON.stringify(output));
-      if (nextBytes > options.maxBytes) throw new Error(`repair tool byte budget of ${options.maxBytes} exhausted`);
+      if (nextBytes > options.maxBytes) throw new Error(`${label} tool byte budget of ${options.maxBytes} exhausted`);
       bytes = nextBytes;
     },
     totalCalls: () => calls,

@@ -13,7 +13,7 @@ import { apiResponse } from "./handler";
 export interface RunRouteService {
   listRuns(): Promise<RunDto[]> | RunDto[];
   getRun(id: string): Promise<RunDto | undefined> | RunDto | undefined;
-  createRun(jobDescription: string): Promise<RunDto>;
+  createRun(jobUrl: string, signal?: AbortSignal): Promise<RunDto>;
   updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto>;
   retryRun(id: string): Promise<RunDto>;
   regenerateRun(id: string, expectedPdfSha256: string): Promise<RunDto>;
@@ -31,7 +31,13 @@ function mappedError(error: unknown): Response {
   if (error && typeof error === "object") {
     if ("status" in error && typeof error.status === "number" && error.status >= 400 && error.status <= 599) status = error.status;
     if ("code" in error && typeof error.code === "string") code = error.code;
-    if (status < 500 && "message" in error && typeof error.message === "string") message = error.message;
+    if (status < 500 && "message" in error && typeof error.message === "string") {
+      message = error.message;
+    } else if (code === "JOB_EXTRACTION_UNAVAILABLE") {
+      message = "Job description extraction failed";
+    } else if (code === "JOB_EXTRACTION_TIMEOUT") {
+      message = "Job description extraction timed out";
+    }
   }
   return apiResponse.error(code, message, status);
 }
@@ -61,8 +67,8 @@ export function createRunRoutes(service: RunRouteService) {
       }
       if (request.method === "POST" && segments.length === 2) {
         const body = CreateRunRequestSchema.safeParse(await parseBody(request));
-        if (!body.success) return apiResponse.error("INVALID_REQUEST", "Job description must contain 40 to 50000 characters", 400);
-        const run = checkedRun(await service.createRun(body.data.jobDescription));
+        if (!body.success) return apiResponse.error("INVALID_REQUEST", "Job URL must be a valid HTTP(S) URL", 400);
+        const run = checkedRun(await service.createRun(body.data.jobUrl, request.signal));
         service.kick();
         return apiResponse.json(run, 201);
       }

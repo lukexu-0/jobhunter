@@ -178,8 +178,43 @@ export const RunDtoSchema = z
   .strict();
 export type RunDto = z.infer<typeof RunDtoSchema>;
 
+export const JOB_URL_MAX_CHARS = 2_048;
+export const JOB_DESCRIPTION_MIN_CHARS = 40;
+export const JOB_DESCRIPTION_MAX_CHARS = 50_000;
+
+export const JobDescriptionSchema = z
+  .string()
+  .trim()
+  .min(JOB_DESCRIPTION_MIN_CHARS)
+  .max(JOB_DESCRIPTION_MAX_CHARS);
+
+export const JobUrlSchema = z.string().trim().transform((value, ctx) => {
+  try {
+    if (value.length > JOB_URL_MAX_CHARS) throw new Error("Job URL exceeds the input limit");
+
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error("Job URL uses an unsupported protocol");
+    }
+    if (url.username || url.password) throw new Error("Job URL contains credentials");
+
+    url.hash = "";
+    const canonicalUrl = url.href;
+    if (canonicalUrl.length > JOB_URL_MAX_CHARS) {
+      throw new Error("Canonical job URL exceeds the input limit");
+    }
+    return canonicalUrl;
+  } catch {
+    ctx.addIssue({
+      code: "custom",
+      message: "Job URL must be a valid HTTP(S) URL",
+    });
+    return z.NEVER;
+  }
+});
+
 export const RunListResponseSchema = z.object({ runs: z.array(RunDtoSchema) }).strict();
-export const CreateRunRequestSchema = z.object({ jobDescription: z.string().trim().min(40).max(50_000) }).strict();
+export const CreateRunRequestSchema = z.object({ jobUrl: JobUrlSchema }).strict();
 export const EditRunRequestSchema = z
   .object({
     comments: z.string().trim().min(1).max(8_000),

@@ -15,6 +15,7 @@ export interface WorkerSchedulerOptions {
   clearInterval?: typeof globalThis.clearInterval;
   setTimeout?: typeof globalThis.setTimeout;
   onError?: (error: unknown) => void;
+  afterDrain?: () => void | Promise<void>;
 }
 
 export class WorkerScheduler {
@@ -24,7 +25,10 @@ export class WorkerScheduler {
   readonly #clearInterval: typeof globalThis.clearInterval;
   readonly #setTimeout: typeof globalThis.setTimeout;
   readonly #onError: (error: unknown) => void;
+  readonly #afterDrain: () => void | Promise<void>;
   #running: Promise<void> | undefined;
+  #kickPending = false;
+  #recoveryPending = false;
   #closed = false;
 
   constructor(
@@ -38,22 +42,33 @@ export class WorkerScheduler {
     this.#clearInterval = options.clearInterval ?? globalThis.clearInterval;
     this.#setTimeout = options.setTimeout ?? globalThis.setTimeout;
     this.#onError = options.onError ?? (() => undefined);
+    this.#afterDrain = options.afterDrain ?? (() => undefined);
   }
 
   kick(): void {
-    if (this.#closed || this.#running) return;
+    if (this.#closed || this.#recoveryPending) return;
+    if (this.#running) {
+      this.#kickPending = true;
+      return;
+    }
     this.#running = this.#drain().finally(() => {
       this.#running = undefined;
+      if (this.#kickPending && !this.#closed && !this.#recoveryPending) {
+        this.#kickPending = false;
+        this.kick();
+      }
     });
   }
 
   async waitForIdle(): Promise<void> {
-    await this.#running;
+    while (this.#running) await this.#running;
   }
 
   async close(): Promise<void> {
     this.#closed = true;
-    await this.#running;
+    this.#kickPending = false;
+    this.#recoveryPending = false;
+    await this.waitForIdle();
   }
 
   async #drain(): Promise<void> {
@@ -65,12 +80,19 @@ export class WorkerScheduler {
         this.#onError(error);
         return;
       }
-      if (!claim) return;
-      await this.#processOne(claim);
+      if (!claim) {
+        try {
+          await this.#afterDrain();
+        } catch (error) {
+          this.#onError(error);
+        }
+        return;
+      }
+      if (!await this.#processOne(claim)) return;
     }
   }
 
-  async #processOne(claim: RunClaim): Promise<void> {
+  async #processOne(claim: RunClaim): Promise<boolean> {
     const controller = new AbortController();
     let leaseLive = true;
     let heartbeatRunning = false;
@@ -103,9 +125,15 @@ export class WorkerScheduler {
         }
       }
       if (!leaseLive && !this.#closed) {
-        const recovery = this.#setTimeout(() => this.kick(), this.#recoveryDelayMs);
+        this.#recoveryPending = true;
+        this.#kickPending = false;
+        const recovery = this.#setTimeout(() => {
+          this.#recoveryPending = false;
+          this.kick();
+        }, this.#recoveryDelayMs);
         recovery.unref?.();
       }
     }
+    return leaseLive;
   }
 }

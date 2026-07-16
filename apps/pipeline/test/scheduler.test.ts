@@ -35,30 +35,141 @@ describe("singleton worker scheduler", () => {
     expect(released).toEqual(["run-1", "run-2"]);
   });
 
-  test("aborts the active processor and does not release after heartbeat loss", async () => {
+  test("defers after-drain maintenance until recovery after heartbeat loss", async () => {
     const only = claim("run-1", 3);
     let acquired = false;
     let released = false;
     let aborted = false;
+    let afterDrainCalls = 0;
+    let heartbeat!: () => void;
+    let recovery!: () => void;
+    let signalProcessorStarted!: () => void;
+    const processorStarted = new Promise<void>((resolve) => { signalProcessorStarted = resolve; });
     const repository: SchedulerRepository = {
       acquire: () => acquired ? null : ((acquired = true), only),
       heartbeat: () => { throw new Error("stale claim"); },
       release: () => { released = true; },
     };
     const scheduler = new WorkerScheduler(repository, async (_value, signal) => {
+      signalProcessorStarted();
       await new Promise<void>((resolve) => {
         signal.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true });
       });
     }, {
-      heartbeatMs: 5,
-      recoveryDelayMs: 60_000,
-      setTimeout: (() => ({ unref() {} })) as unknown as typeof globalThis.setTimeout,
+      setInterval: ((callback: () => void) => {
+        heartbeat = callback;
+        return { unref() {} };
+      }) as unknown as typeof globalThis.setInterval,
+      clearInterval: (() => undefined) as unknown as typeof globalThis.clearInterval,
+      setTimeout: ((callback: () => void) => {
+        recovery = callback;
+        return { unref() {} };
+      }) as unknown as typeof globalThis.setTimeout,
+      afterDrain: () => { afterDrainCalls++; },
+    });
+
+    scheduler.kick();
+    await processorStarted;
+    scheduler.kick();
+    heartbeat();
+    await scheduler.waitForIdle();
+    expect(aborted).toBe(true);
+    expect(released).toBe(false);
+    expect(afterDrainCalls).toBe(0);
+
+    recovery();
+    await scheduler.waitForIdle();
+    expect(afterDrainCalls).toBe(1);
+    await scheduler.close();
+  });
+
+  test("awaits one after-drain hook after the queue is exhausted", async () => {
+    const repository: SchedulerRepository = {
+      acquire: () => null,
+      heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+      release: () => undefined,
+    };
+    let releaseHook!: () => void;
+    const hookGate = new Promise<void>((resolve) => { releaseHook = resolve; });
+    let signalHookStarted!: () => void;
+    const hookStartedSignal = new Promise<void>((resolve) => { signalHookStarted = resolve; });
+    let hookStarted = 0;
+    let hookFinished = false;
+    const scheduler = new WorkerScheduler(repository, async () => undefined, {
+      afterDrain: async () => {
+        hookStarted++;
+        signalHookStarted();
+        await hookGate;
+        hookFinished = true;
+      },
+    });
+
+    scheduler.kick();
+    const idle = scheduler.waitForIdle();
+    await hookStartedSignal;
+    expect(hookStarted).toBe(1);
+    expect(hookFinished).toBeFalse();
+    releaseHook();
+    await idle;
+    expect(hookFinished).toBeTrue();
+    expect(hookStarted).toBe(1);
+  });
+
+  test("drains a claim kicked while after-drain maintenance is running", async () => {
+    const queue: RunClaim[] = [];
+    const processed: string[] = [];
+    let afterDrainCalls = 0;
+    let releaseFirstDrain!: () => void;
+    const firstDrainGate = new Promise<void>((resolve) => { releaseFirstDrain = resolve; });
+    let signalFirstDrain!: () => void;
+    const firstDrainStarted = new Promise<void>((resolve) => { signalFirstDrain = resolve; });
+    const scheduler = new WorkerScheduler({
+      acquire: () => queue.shift() ?? null,
+      heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+      release: () => undefined,
+    }, async (value) => {
+      processed.push(value.runId);
+    }, {
+      afterDrain: async () => {
+        afterDrainCalls++;
+        if (afterDrainCalls === 1) {
+          signalFirstDrain();
+          await firstDrainGate;
+        }
+      },
+    });
+
+    scheduler.kick();
+    await firstDrainStarted;
+    queue.push(claim("run-late", 4));
+    scheduler.kick();
+    releaseFirstDrain();
+    await scheduler.waitForIdle();
+
+    expect(processed).toEqual(["run-late"]);
+    expect(afterDrainCalls).toBe(2);
+  });
+
+  test("reports after-drain failures without replaying completed claims", async () => {
+    const queue = [claim("run-1", 4)];
+    const processed: string[] = [];
+    const reported: unknown[] = [];
+    const scheduler = new WorkerScheduler({
+      acquire: () => queue.shift() ?? null,
+      heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+      release: () => undefined,
+    }, async (value) => {
+      processed.push(value.runId);
+    }, {
+      afterDrain: () => { throw new Error("maintenance failed"); },
+      onError: (error) => { reported.push(error); },
     });
 
     scheduler.kick();
     await scheduler.waitForIdle();
-    expect(aborted).toBe(true);
-    expect(released).toBe(false);
-    await scheduler.close();
+    expect(processed).toEqual(["run-1"]);
+    expect(reported).toHaveLength(1);
+    expect(reported[0]).toBeInstanceOf(Error);
+    expect((reported[0] as Error).message).toBe("maintenance failed");
   });
 });

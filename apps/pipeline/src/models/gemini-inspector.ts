@@ -129,9 +129,11 @@ export async function inspectResumePng(
   if (textParts.length !== 1) throw new Error("Gemini must return exactly one JSON text result");
   const jsonText = textParts[0];
   if (jsonText === undefined) throw new Error("Gemini response text is missing");
+  const fencedJson = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/.exec(jsonText.trim());
+  const parseableJson = fencedJson?.[1] ?? jsonText;
   let value: unknown;
   try {
-    value = JSON.parse(jsonText);
+    value = JSON.parse(parseableJson);
   } catch (error) {
     throw new Error("Gemini returned invalid JSON", { cause: error });
   }

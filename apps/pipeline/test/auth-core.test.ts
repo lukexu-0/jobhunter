@@ -1,8 +1,18 @@
+import { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { OAuthAccess, StoredAuthCredential } from "@oh-my-pi/pi-ai";
 import { createOAuthOnlyApiKeyResolver, OAuthRequiredError, resolveOAuthOnlyWithStorage } from "../src/auth/oauth-only-resolver";
 import { AuthService, scrubProviderEnvironment } from "../src/auth/service";
-import { assertOAuthOnlyStorage, AuthConfigurationError, type AuthProvider, type AuthStorageLike } from "../src/auth/storage";
+import {
+  assertOAuthOnlyStorage,
+  AuthConfigurationError,
+  purgeUnsupportedCredentials,
+  type AuthProvider,
+  type AuthStorageLike,
+} from "../src/auth/storage";
 
 interface LoginCallbacks {
   onAuth(info: { url: string; launchUrl?: string; instructions?: string }): void;
@@ -21,7 +31,11 @@ function oauthRow(provider: AuthProvider, overrides: Record<string, unknown> = {
       access: "stored-access-secret",
       refresh: "stored-refresh-secret",
       expires: 2_000_000_000_000,
-      ...(provider === "openai-codex" ? { accountId: "acct-secret-1234" } : { projectId: "project-secret-5678" }),
+      ...(provider === "openai-codex"
+        ? { accountId: "acct-secret-1234" }
+        : provider === "google-antigravity"
+          ? { projectId: "project-secret-5678" }
+          : {}),
       ...overrides,
     },
     disabledCause: null,
@@ -32,13 +46,17 @@ class FakeStorage implements AuthStorageLike {
   rows: StoredAuthCredential[] = [];
   access: OAuthAccess | undefined;
   callbacks: LoginCallbacks | undefined;
+  readonly loginProviders: string[] = [];
   readonly loginGate = Promise.withResolvers<void>();
+  readonly loginValidated = Promise.withResolvers<void>();
+  loginReleased = false;
   readonly accessOptions: Array<{ modelId?: string; signal?: AbortSignal; forceRefresh?: boolean }> = [];
   closed = false;
 
   async reload(): Promise<void> {}
   close(): void { this.closed = true; }
   listStoredCredentials(provider?: string): StoredAuthCredential[] {
+    if (this.loginReleased) this.loginValidated.resolve();
     return provider ? this.rows.filter((row) => row.provider === provider) : [...this.rows];
   }
   getOAuthAccountIdentity(provider: string): { accountId?: string; email?: string; projectId?: string } | undefined {
@@ -58,7 +76,8 @@ class FakeStorage implements AuthStorageLike {
     this.accessOptions.push(options);
     return this.access;
   }
-  async login(_provider: string, callbacks: LoginCallbacks): Promise<void> {
+  async login(provider: string, callbacks: LoginCallbacks): Promise<void> {
+    this.loginProviders.push(provider);
     this.callbacks = callbacks;
     callbacks.onAuth({
       url: "https://provider.example/authorize?state=opaque",
@@ -66,6 +85,7 @@ class FakeStorage implements AuthStorageLike {
       instructions: "Continue in your browser",
     });
     await this.loginGate.promise;
+    this.loginReleased = true;
   }
   async logout(provider: string): Promise<void> {
     this.rows = this.rows.filter((row) => row.provider !== provider);
@@ -87,10 +107,21 @@ describe("app-owned OAuth storage and sessions", () => {
       disabledCause: null,
     } as StoredAuthCredential];
     expect(() => assertOAuthOnlyStorage(staticStorage)).toThrow(AuthConfigurationError);
+    const staticGoogle = new FakeStorage();
+    staticGoogle.rows = [{
+      id: 1,
+      provider: "google-antigravity",
+      credential: { type: "api_key", key: "must-never-be-used" },
+      disabledCause: null,
+    } as StoredAuthCredential];
+    expect(() => assertOAuthOnlyStorage(staticGoogle)).toThrow(AuthConfigurationError);
 
     const duplicateStorage = new FakeStorage();
     duplicateStorage.rows = [oauthRow("openai-codex"), { ...oauthRow("openai-codex"), id: 2 }];
     expect(() => assertOAuthOnlyStorage(duplicateStorage)).toThrow("Multiple active OAuth credentials");
+    const duplicateGoogle = new FakeStorage();
+    duplicateGoogle.rows = [oauthRow("google-antigravity"), { ...oauthRow("google-antigravity"), id: 2 }];
+    expect(() => assertOAuthOnlyStorage(duplicateGoogle)).toThrow("Multiple active OAuth credentials");
   });
 
   test("rejects connect when connected and rejects a concurrent provider session", async () => {
@@ -105,6 +136,7 @@ describe("app-owned OAuth storage and sessions", () => {
     const pending = new FakeStorage();
     const pendingService = new AuthService(pending, { randomId: () => ids.first, schedule: () => undefined });
     await pendingService.startSession("openai-codex");
+    expect(pending.loginProviders).toEqual(["openai-codex"]);
     await expect(pendingService.startSession("openai-codex")).rejects.toMatchObject({
       code: "AUTH_CONFLICT",
       status: 409,
@@ -148,11 +180,32 @@ describe("app-owned OAuth storage and sessions", () => {
     const expiringStorage = new FakeStorage();
     const expiring = new AuthService(expiringStorage, { now: () => now, randomId: () => ids.second, schedule: () => undefined });
     await expiring.startSession("google-antigravity");
+    expect(expiringStorage.loginProviders).toEqual(["google-antigravity"]);
     now += 10 * 60_000;
     expect(expiring.getSession(ids.second)?.state).toBe("expired");
     expect(expiringStorage.callbacks!.signal?.aborted).toBe(true);
     now += 60_000;
     expect(expiring.getSession(ids.second)).toBeUndefined();
+  });
+
+  test("routes both supported providers through storage login and verifies persisted OAuth", async () => {
+    for (const provider of ["openai-codex", "google-antigravity"] as const) {
+      const storage = new FakeStorage();
+      const service = new AuthService(storage, {
+        randomId: () => ids.first,
+        schedule: () => undefined,
+      });
+
+      const started = await service.startSession(provider);
+      expect(started).toMatchObject({ provider, state: "pending" });
+      expect(storage.loginProviders).toEqual([provider]);
+      storage.rows = [oauthRow(provider)];
+      storage.loginGate.resolve();
+      await storage.loginValidated.promise;
+
+      expect(service.getSession(ids.first)?.state).toBe("succeeded");
+      expect(service.getAuthStatus().providers.find((status) => status.provider === provider)?.state).toBe("connected");
+    }
   });
 
   test("returns only redacted account identity and explicitly logs out", async () => {
@@ -164,6 +217,7 @@ describe("app-owned OAuth storage and sessions", () => {
       state: "connected",
       identity: { email: "p***@example.com", accountId: "***1234" },
     });
+    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex", "google-antigravity"]);
     expect(encoded).not.toContain("stored-access-secret");
     expect(encoded).not.toContain("stored-refresh-secret");
     expect(encoded).not.toContain("person@example.com");
@@ -175,11 +229,12 @@ describe("app-owned OAuth storage and sessions", () => {
 });
 
 describe("OAuth-only resolver", () => {
-  test("shapes raw Codex bearer and exact Antigravity JSON without refresh credentials", async () => {
+  test("allows both exact Codex models and rejects every unsupported provider-model pair before storage access", async () => {
     const codex = new FakeStorage();
     codex.rows = [oauthRow("openai-codex")];
     codex.access = { accessToken: "codex-bearer", accountId: "acct" };
-    expect(await resolveOAuthOnlyWithStorage(codex, "openai-codex", "attempt", "gpt-5.6-sol")).toBe("codex-bearer");
+    expect(await resolveOAuthOnlyWithStorage(codex, "openai-codex", "attempt-sol", "gpt-5.6-sol")).toBe("codex-bearer");
+    expect(await resolveOAuthOnlyWithStorage(codex, "openai-codex", "attempt-luna", "gpt-5.6-luna")).toBe("codex-bearer");
 
     const google = new FakeStorage();
     google.rows = [oauthRow("google-antigravity")];
@@ -195,8 +250,22 @@ describe("OAuth-only resolver", () => {
       email: "p***@example.com",
     });
     expect(key).not.toContain("refresh");
-  });
 
+    const wrongPairs: Array<[AuthProvider, string]> = [
+      ["openai-codex", "gpt-5-6-luna"],
+      ["openai-codex", "gemini-3.5-flash"],
+      ["openai-codex", "unknown-model"],
+      ["google-antigravity", "gpt-5.6-sol"],
+      ["google-antigravity", "gpt-5.6-luna"],
+      ["google-antigravity", "unknown-model"],
+    ];
+    for (const [provider, model] of wrongPairs) {
+      await expect(resolveOAuthOnlyWithStorage(codex, provider, "attempt", model))
+        .rejects.toThrow(`Unsupported OAuth model ${provider}/${model}`);
+    }
+    expect(codex.accessOptions).toHaveLength(2);
+    expect(google.accessOptions).toHaveLength(1);
+  });
   test("fails OAUTH_REQUIRED without OAuth and permits only one forced refresh", async () => {
     const missing = new FakeStorage();
     await expect(resolveOAuthOnlyWithStorage(missing, "openai-codex", "attempt", "gpt-5.6-sol")).rejects.toBeInstanceOf(OAuthRequiredError);
@@ -218,6 +287,118 @@ describe("OAuth-only resolver", () => {
     expect(await resolver({ error: new Error("401"), lastChance: true })).toBeUndefined();
     expect(storage.accessOptions.map((options) => options.forceRefresh)).toEqual([false, true]);
   });
+});
+
+test("hard-purges active and disabled unsupported credentials, children, and token bytes without touching Codex", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "jobhunter-auth-purge-"));
+  const dbPath = join(directory, "auth.sqlite");
+  const missingPath = join(directory, "missing.sqlite");
+  const unsupportedAccess = "unsupported-access-sentinel-7f3e0901";
+  const unsupportedRefresh = "unsupported-refresh-sentinel-a18f26c4";
+  const disabledAccess = "disabled-unsupported-access-sentinel-61bb0052";
+  const disabledRefresh = "disabled-unsupported-refresh-sentinel-f5a3d87d";
+  const codexData = JSON.stringify({
+    access: "allowed-codex-access",
+    refresh: "allowed-codex-refresh",
+    expires: 2_000_000_000_000,
+    accountId: "acct-allowed",
+  });
+
+  try {
+    await purgeUnsupportedCredentials(missingPath);
+    expect(existsSync(missingPath)).toBe(false);
+
+    const db = new Database(dbPath);
+    db.exec(`
+      PRAGMA journal_mode=WAL;
+      CREATE TABLE auth_credentials (
+        id INTEGER PRIMARY KEY,
+        provider TEXT NOT NULL,
+        credential_type TEXT NOT NULL,
+        data TEXT NOT NULL,
+        disabled_cause TEXT DEFAULT NULL,
+        identity_key TEXT DEFAULT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE auth_credential_blocks (
+        credential_id INTEGER NOT NULL,
+        provider_key TEXT NOT NULL,
+        block_scope TEXT NOT NULL,
+        blocked_until_ms INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (credential_id, provider_key, block_scope)
+      );
+      CREATE TABLE auth_credential_refresh_leases (
+        credential_id INTEGER PRIMARY KEY,
+        owner TEXT NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    const insertCredential = db.query(
+      "INSERT INTO auth_credentials(id, provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES (?, ?, 'oauth', ?, ?, 1, 1)",
+    );
+    insertCredential.run(1, "retired-provider", JSON.stringify({
+      access: unsupportedAccess,
+      refresh: unsupportedRefresh,
+      expires: 2_000_000_000_000,
+    }), null);
+    insertCredential.run(2, "retired-provider", JSON.stringify({
+      access: disabledAccess,
+      refresh: disabledRefresh,
+      expires: 2_000_000_000_000,
+    }), "retired");
+    insertCredential.run(3, "openai-codex", codexData, null);
+    const insertBlock = db.query(
+      "INSERT INTO auth_credential_blocks(credential_id, provider_key, block_scope, blocked_until_ms, updated_at) VALUES (?, ?, '', 999999, 1)",
+    );
+    insertBlock.run(1, "retired-provider:oauth");
+    insertBlock.run(2, "retired-provider:oauth");
+    insertBlock.run(3, "openai-codex:oauth");
+    const insertLease = db.query(
+      "INSERT INTO auth_credential_refresh_leases(credential_id, owner, expires_at_ms, updated_at) VALUES (?, ?, 999999, 1)",
+    );
+    insertLease.run(1, "unsupported-active");
+    insertLease.run(2, "unsupported-disabled");
+    insertLease.run(3, "codex");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.close();
+
+    expect(readFileSync(dbPath).includes(Buffer.from(unsupportedAccess))).toBe(true);
+    await purgeUnsupportedCredentials(dbPath);
+
+    const verified = new Database(dbPath, { readonly: true });
+    try {
+      expect(verified.query("SELECT id FROM auth_credentials WHERE provider = 'retired-provider'").all()).toEqual([]);
+      expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id IN (1, 2)").all()).toEqual([]);
+      expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id IN (1, 2)").all()).toEqual([]);
+      expect(verified.query("SELECT id, provider, data, disabled_cause FROM auth_credentials WHERE id = 3").get()).toEqual({
+        id: 3,
+        provider: "openai-codex",
+        data: codexData,
+        disabled_cause: null,
+      });
+      expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id = 3").get()).toEqual({
+        credential_id: 3,
+      });
+      expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id = 3").get()).toEqual({
+        credential_id: 3,
+      });
+    } finally {
+      verified.close();
+    }
+
+    for (const path of [dbPath, `${dbPath}-wal`]) {
+      if (!existsSync(path)) continue;
+      const bytes = readFileSync(path);
+      for (const sentinel of [unsupportedAccess, unsupportedRefresh, disabledAccess, disabledRefresh]) {
+        expect(bytes.includes(Buffer.from(sentinel))).toBe(false);
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("provider environment scrubbing retains only allowed Google project hints", () => {

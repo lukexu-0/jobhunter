@@ -195,6 +195,7 @@
 .sectionHeading h2,
 .viewerToolbar h2,
 .artifactSections h4,
+.artifactSections h5,
 .editForm label {
   margin: 0;
   color: var(--color-muted);

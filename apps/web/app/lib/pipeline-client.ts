@@ -20,6 +20,10 @@ const MAX_JSON_ARTIFACT_BYTES = 1024 * 1024;
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const ARTIFACT_PATH = /^\/v1\/runs\/[^/?#]+\/artifacts\/[^/?#]+$/;
 const PUBLIC_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  JOB_EXTRACTION_UNAVAILABLE: "Job description extraction failed",
+  JOB_EXTRACTION_TIMEOUT: "Job description extraction timed out",
+});
 const JsonValueSchema = z.json();
 
 export class PipelineClientError extends Error {
@@ -82,7 +86,7 @@ async function parseErrorResponse(response: Response): Promise<PipelineClientErr
     ? parsed.data.error.code
     : "REQUEST_FAILED";
   const message = response.status >= 500
-    ? "The pipeline request failed."
+    ? PUBLIC_5XX_MESSAGES[code] ?? "The pipeline request failed."
     : publicMessage(parsed.data.error.message);
   return new PipelineClientError(message, code, response.status);
 }
@@ -167,10 +171,12 @@ export function updateApplicationStatus(
   });
 }
 
-export function createRun(jobDescription: string): Promise<RunDto> {
-  const body = { jobDescription };
-  ensureValidRequest(CreateRunRequestSchema.safeParse(body).success);
-  return requestRun("/runs", jsonPost(body));
+export function createRun(jobUrl: string): Promise<RunDto> {
+  const parsed = CreateRunRequestSchema.safeParse({ jobUrl });
+  if (!parsed.success) {
+    throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
+  }
+  return requestRun("/runs", jsonPost(parsed.data));
 }
 
 export function retryRun(id: string): Promise<RunDto> {

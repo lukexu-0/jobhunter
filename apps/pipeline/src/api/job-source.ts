@@ -1,0 +1,751 @@
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import {
+  JOB_DESCRIPTION_MAX_CHARS,
+  JOB_DESCRIPTION_MIN_CHARS,
+  JobDescriptionSchema,
+} from "../contracts";
+import { LUNA_MAX_SOURCE_BYTES, LUNA_MAX_SOURCE_LINES } from "../models/luna-job-extractor";
+
+export type ResolvedAddress = { readonly address: string; readonly family: 4 | 6 };
+export type ResolveHost = (hostname: string) => Promise<readonly ResolvedAddress[]>;
+export type JobSourceFetch = (input: string | URL, init: BunFetchRequestInit) => Promise<Response>;
+export type LoadedJobSource = Readonly<
+  | { kind: "description"; jobDescription: string }
+  | { kind: "model-fallback"; lines: readonly string[] }
+>;
+export type LoadJobSource = (jobUrl: string, signal?: AbortSignal) => Promise<LoadedJobSource>;
+
+export interface JobSourceLoadOptions {
+  readonly fetchImpl?: JobSourceFetch;
+  readonly resolveHost?: ResolveHost;
+  readonly deadlineMs?: number;
+}
+
+export type JobSourceErrorCode =
+  | "JOB_URL_BLOCKED"
+  | "JOB_SOURCE_UNAVAILABLE"
+  | "JOB_SOURCE_UNSUPPORTED"
+  | "JOB_SOURCE_TOO_LARGE"
+  | "JOB_DESCRIPTION_UNAVAILABLE";
+
+const ERROR_DETAILS = {
+  JOB_URL_BLOCKED: [400, "Job URL must resolve to a public HTTP(S) address"],
+  JOB_SOURCE_UNAVAILABLE: [422, "The job posting could not be loaded"],
+  JOB_SOURCE_UNSUPPORTED: [422, "The job posting response is not HTML or plain text"],
+  JOB_SOURCE_TOO_LARGE: [413, "The job posting is too large to import"],
+  JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable job description"],
+} as const satisfies Record<JobSourceErrorCode, readonly [400 | 413 | 422, string]>;
+
+export class JobSourceError extends Error {
+  readonly code: JobSourceErrorCode;
+  readonly status: 400 | 413 | 422;
+
+  constructor(code: JobSourceErrorCode, options?: ErrorOptions) {
+    const [status, message] = ERROR_DETAILS[code];
+    super(message, options);
+    this.name = "JobSourceError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+const NETWORK_DEADLINE_MS = 10_000;
+const MAX_REDIRECT_HOPS = 5;
+const MAX_BODY_BYTES = 1024 * 1024;
+const REDIRECT_STATUSES: Readonly<Record<number, true>> = {
+  301: true,
+  302: true,
+  303: true,
+  307: true,
+  308: true,
+};
+const ACCEPTED_HTML_TYPES: Readonly<Record<string, true>> = {
+  "text/html": true,
+  "application/xhtml+xml": true,
+};
+const JSON_LD_JOB_POSTING_TYPES: Readonly<Record<string, true>> = {
+  JobPosting: true,
+  "http://schema.org/JobPosting": true,
+  "https://schema.org/JobPosting": true,
+};
+const BOUNDARY_ELEMENTS = [
+  "br", "p", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+  "section", "div", "article", "main", "tr",
+] as const;
+const REMOVED_CONTENT_SELECTOR = [
+  "script", "style", "noscript", "template", "iframe", "object", "embed", "svg", "canvas",
+  "nav", "body > header", "body > footer", "form", "input", "button", "[hidden]", '[aria-hidden="true"]',
+].join(", ");
+
+class DeadlineExpired extends Error {}
+
+type ParsedAddress = {
+  readonly address: string;
+  readonly family: 4 | 6;
+  readonly value: bigint;
+  readonly bits: 32 | 128;
+};
+
+type SpecialPrefix = {
+  readonly address: string;
+  readonly prefix: number;
+  readonly globallyReachable: boolean;
+};
+
+// Static snapshot retrieved 2026-07-12 from
+// https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry-1.csv
+// A row is allowed only when Globally Reachable is the literal value True;
+// blank, False, N/A, and footnoted values are blocked.
+const IANA_IPV4_SPECIAL_PREFIXES: readonly SpecialPrefix[] = [
+  { address: "0.0.0.0", prefix: 8, globallyReachable: false },
+  { address: "0.0.0.0", prefix: 32, globallyReachable: false },
+  { address: "10.0.0.0", prefix: 8, globallyReachable: false },
+  { address: "100.64.0.0", prefix: 10, globallyReachable: false },
+  { address: "127.0.0.0", prefix: 8, globallyReachable: false },
+  { address: "169.254.0.0", prefix: 16, globallyReachable: false },
+  { address: "172.16.0.0", prefix: 12, globallyReachable: false },
+  { address: "192.0.0.0", prefix: 24, globallyReachable: false },
+  { address: "192.0.0.0", prefix: 29, globallyReachable: false },
+  { address: "192.0.0.8", prefix: 32, globallyReachable: false },
+  { address: "192.0.0.9", prefix: 32, globallyReachable: true },
+  { address: "192.0.0.10", prefix: 32, globallyReachable: true },
+  { address: "192.0.0.170", prefix: 32, globallyReachable: false },
+  { address: "192.0.0.171", prefix: 32, globallyReachable: false },
+  { address: "192.0.2.0", prefix: 24, globallyReachable: false },
+  { address: "192.31.196.0", prefix: 24, globallyReachable: true },
+  { address: "192.52.193.0", prefix: 24, globallyReachable: true },
+  { address: "192.88.99.0", prefix: 24, globallyReachable: false },
+  { address: "192.88.99.2", prefix: 32, globallyReachable: false },
+  { address: "192.168.0.0", prefix: 16, globallyReachable: false },
+  { address: "192.175.48.0", prefix: 24, globallyReachable: true },
+  { address: "198.18.0.0", prefix: 15, globallyReachable: false },
+  { address: "198.51.100.0", prefix: 24, globallyReachable: false },
+  { address: "203.0.113.0", prefix: 24, globallyReachable: false },
+  { address: "240.0.0.0", prefix: 4, globallyReachable: false },
+  { address: "255.255.255.255", prefix: 32, globallyReachable: false },
+  // Multicast is always blocked independently of the IANA table rows.
+  { address: "224.0.0.0", prefix: 4, globallyReachable: false },
+];
+
+// Static snapshot retrieved 2026-07-12 from
+// https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry-1.csv
+// It uses the same literal-True policy as the IPv4 table.
+const IANA_IPV6_SPECIAL_PREFIXES: readonly SpecialPrefix[] = [
+  { address: "::1", prefix: 128, globallyReachable: false },
+  { address: "::", prefix: 128, globallyReachable: false },
+  { address: "::ffff:0:0", prefix: 96, globallyReachable: false },
+  { address: "64:ff9b::", prefix: 96, globallyReachable: true },
+  { address: "64:ff9b:1::", prefix: 48, globallyReachable: false },
+  { address: "100::", prefix: 64, globallyReachable: false },
+  { address: "100:0:0:1::", prefix: 64, globallyReachable: false },
+  { address: "2001::", prefix: 23, globallyReachable: false },
+  { address: "2001::", prefix: 32, globallyReachable: false },
+  { address: "2001:1::1", prefix: 128, globallyReachable: true },
+  { address: "2001:1::2", prefix: 128, globallyReachable: true },
+  { address: "2001:1::3", prefix: 128, globallyReachable: true },
+  { address: "2001:2::", prefix: 48, globallyReachable: false },
+  { address: "2001:3::", prefix: 32, globallyReachable: true },
+  { address: "2001:4:112::", prefix: 48, globallyReachable: true },
+  { address: "2001:10::", prefix: 28, globallyReachable: false },
+  { address: "2001:20::", prefix: 28, globallyReachable: true },
+  { address: "2001:30::", prefix: 28, globallyReachable: true },
+  { address: "2001:db8::", prefix: 32, globallyReachable: false },
+  { address: "2002::", prefix: 16, globallyReachable: false },
+  { address: "2620:4f:8000::", prefix: 48, globallyReachable: true },
+  { address: "3fff::", prefix: 20, globallyReachable: false },
+  { address: "5f00::", prefix: 16, globallyReachable: false },
+  { address: "fc00::", prefix: 7, globallyReachable: false },
+  { address: "fe80::", prefix: 10, globallyReachable: false },
+  // Multicast is always blocked independently of the IANA table rows.
+  { address: "ff00::", prefix: 8, globallyReachable: false },
+];
+
+function parseIPv4(input: string): ParsedAddress | undefined {
+  if (!input || input.trim() !== input || input.includes(":")) return undefined;
+  try {
+    const parsed = new URL(`http://${input}/`);
+    if (parsed.username || parsed.password || parsed.port || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+      return undefined;
+    }
+    const address = parsed.hostname;
+    if (isIP(address) !== 4) return undefined;
+    const octets = address.split(".").map(Number);
+    const value = octets.reduce((result, octet) => (result << 8n) | BigInt(octet), 0n);
+    return { address, family: 4, value, bits: 32 };
+  } catch {
+    return undefined;
+  }
+}
+
+function parseIPv6Value(input: string): { value: bigint; hextets: readonly number[] } | undefined {
+  if (!input || input.trim() !== input || input.includes("%") || isIP(input) !== 6) return undefined;
+  let source = input.toLowerCase();
+  const lastColon = source.lastIndexOf(":");
+  if (source.includes(".")) {
+    const parsedV4 = parseIPv4(source.slice(lastColon + 1));
+    if (!parsedV4) return undefined;
+    const value = Number(parsedV4.value);
+    const high = (value >>> 16) & 0xffff;
+    const low = value & 0xffff;
+    source = `${source.slice(0, lastColon)}:${high.toString(16)}:${low.toString(16)}`;
+  }
+  const pieces = source.split("::");
+  if (pieces.length > 2) return undefined;
+  const left = pieces[0] ? pieces[0].split(":") : [];
+  const right = pieces.length === 2 && pieces[1] ? pieces[1].split(":") : [];
+  if (left.some((part) => !/^[0-9a-f]{1,4}$/.test(part)) || right.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) {
+    return undefined;
+  }
+  const omitted = 8 - left.length - right.length;
+  if ((pieces.length === 1 && omitted !== 0) || (pieces.length === 2 && omitted < 1)) return undefined;
+  const hextets = [...left.map((part) => Number.parseInt(part, 16)), ...Array(omitted).fill(0), ...right.map((part) => Number.parseInt(part, 16))];
+  if (hextets.length !== 8) return undefined;
+  const value = hextets.reduce((result, hextet) => (result << 16n) | BigInt(hextet), 0n);
+  return { value, hextets };
+}
+
+function formatIPv6(hextets: readonly number[]): string {
+  let bestStart = -1;
+  let bestLength = 0;
+  for (let index = 0; index < hextets.length;) {
+    if (hextets[index] !== 0) { index += 1; continue; }
+    let end = index;
+    while (end < hextets.length && hextets[end] === 0) end += 1;
+    if (end - index > bestLength && end - index >= 2) {
+      bestStart = index;
+      bestLength = end - index;
+    }
+    index = end;
+  }
+  if (bestStart === -1) return hextets.map((value) => value.toString(16)).join(":");
+  const left = hextets.slice(0, bestStart).map((value) => value.toString(16)).join(":");
+  const right = hextets.slice(bestStart + bestLength).map((value) => value.toString(16)).join(":");
+  return `${left}::${right}`;
+}
+
+function parseIPv6(input: string, unwrapMapped = true): ParsedAddress | undefined {
+  const parsed = parseIPv6Value(input);
+  if (!parsed) return undefined;
+  const mappedPrefix = 0xffffn;
+  if (unwrapMapped && (parsed.value >> 32n) === mappedPrefix) {
+    const value = parsed.value & 0xffff_ffffn;
+    const address = [24n, 16n, 8n, 0n].map((shift) => Number((value >> shift) & 0xffn)).join(".");
+    return { address, family: 4, value, bits: 32 };
+  }
+  return { address: formatIPv6(parsed.hextets), family: 6, value: parsed.value, bits: 128 };
+}
+
+function parseAddress(input: string, unwrapMapped = true): ParsedAddress | undefined {
+  return parseIPv4(input) ?? parseIPv6(input, unwrapMapped);
+}
+
+const COMPILED_SPECIAL_PREFIXES = [
+  ...IANA_IPV4_SPECIAL_PREFIXES.map((row) => ({ ...row, parsed: parseIPv4(row.address)! })),
+  ...IANA_IPV6_SPECIAL_PREFIXES.map((row) => ({ ...row, parsed: parseIPv6(row.address, false)! })),
+];
+
+function isPublicAddress(address: ParsedAddress): boolean {
+  let candidate = address;
+  if (address.family === 6) {
+    const unwrapped = parseIPv6(address.address, true);
+    if (unwrapped) candidate = unwrapped;
+  }
+  let best: (typeof COMPILED_SPECIAL_PREFIXES)[number] | undefined;
+  for (const row of COMPILED_SPECIAL_PREFIXES) {
+    if (row.parsed.family !== candidate.family) continue;
+    const shift = BigInt(candidate.bits - row.prefix);
+    if ((candidate.value >> shift) !== (row.parsed.value >> shift)) continue;
+    if (!best || row.prefix > best.prefix) best = row;
+  }
+  return best?.globallyReachable ?? true;
+}
+
+function rawHostname(url: URL): string {
+  const hostname = url.hostname;
+  return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+}
+
+function assignHostname(url: URL, hostname: string, family?: 4 | 6): void {
+  url.hostname = family === 6 || hostname.includes(":") ? `[${hostname}]` : hostname;
+}
+
+function canonicalizeLogicalUrl(value: string | URL): URL {
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new JobSourceError("JOB_URL_BLOCKED");
+  if (url.username || url.password) throw new JobSourceError("JOB_URL_BLOCKED");
+  url.hash = "";
+
+  let hostname = rawHostname(url).toLowerCase();
+  hostname = hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+  if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost")) {
+    throw new JobSourceError("JOB_URL_BLOCKED");
+  }
+  const ip = parseAddress(hostname, false);
+  if (isIP(hostname) !== 0 && !ip) throw new JobSourceError("JOB_URL_BLOCKED");
+  assignHostname(url, ip?.address ?? hostname, ip?.family);
+  return url;
+}
+
+async function defaultResolveHost(hostname: string): Promise<readonly ResolvedAddress[]> {
+  const answers = await lookup(hostname, { all: true, verbatim: true });
+  return answers.map(({ address, family }) => ({ address, family: family as 4 | 6 }));
+}
+
+function cancellationReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
+
+async function hardRace<T>(work: PromiseLike<T>, signal: AbortSignal): Promise<T> {
+  const promise = Promise.resolve(work);
+  void promise.catch(() => {});
+  if (signal.aborted) throw cancellationReason(signal);
+  const { promise: aborted, reject } = Promise.withResolvers<never>();
+  const onAbort = () => reject(cancellationReason(signal));
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function cancelBody(response: Response): void {
+  if (!response.body) return;
+  try {
+    const cancellation = response.body.cancel();
+    void cancellation.catch(() => {});
+  } catch {
+    // A locked/already-consumed body has its reader cancelled by readBoundedBody.
+  }
+}
+
+async function readBoundedBody(response: Response, signal: AbortSignal): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const item = await hardRace(reader.read(), signal);
+      if (item.done) break;
+      length += item.value.byteLength;
+      if (length > MAX_BODY_BYTES) throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+      chunks.push(item.value);
+    }
+  } finally {
+    try {
+      const cancellation = reader.cancel();
+      void cancellation.catch(() => {});
+    } catch {
+      // Cancellation is best-effort cleanup and never changes the public result.
+    }
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+const HTML_NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  apos: "'",
+  bull: "•",
+  cent: "¢",
+  copy: "©",
+  deg: "°",
+  divide: "÷",
+  euro: "€",
+  gt: ">",
+  hellip: "…",
+  laquo: "«",
+  ldquo: "“",
+  lsquo: "‘",
+  lt: "<",
+  mdash: "—",
+  middot: "·",
+  nbsp: "\u00a0",
+  ndash: "–",
+  plusmn: "±",
+  pound: "£",
+  quot: "\"",
+  raquo: "»",
+  rdquo: "”",
+  reg: "®",
+  rsquo: "’",
+  times: "×",
+  trade: "™",
+  yen: "¥",
+};
+
+function decodeHtmlEntities(value: string): string {
+  return value.replace(/&(#(?:x[0-9a-f]+|\d+)|[a-z][a-z0-9]+);/gi, (match, reference: string) => {
+    if (!reference.startsWith("#")) return HTML_NAMED_ENTITIES[reference.toLowerCase()] ?? match;
+    const hexadecimal = reference[1]?.toLowerCase() === "x";
+    const codePoint = Number.parseInt(reference.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
+    if (
+      !Number.isInteger(codePoint)
+      || codePoint <= 0
+      || codePoint > 0x10ffff
+      || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+    ) {
+      return "\uFFFD";
+    }
+    return String.fromCodePoint(codePoint);
+  });
+}
+
+function normalizeText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function htmlDocument(fragment: string): string {
+  return `<!doctype html><job-source-root>${fragment}</job-source-root>`;
+}
+
+async function sanitizeHtml(html: string): Promise<string> {
+  const rewriter = new HTMLRewriter().on(REMOVED_CONTENT_SELECTOR, {
+    element(element) { element.remove(); },
+  });
+  for (const tag of BOUNDARY_ELEMENTS) {
+    rewriter.on(tag, {
+      element(element) {
+        if (!element.removed) element.after("\n", { html: false });
+      },
+    });
+  }
+  return rewriter.transform(new Response(htmlDocument(html), {
+    headers: { "content-type": "text/html; charset=utf-8" },
+  })).text();
+}
+
+async function captureElements(html: string, selector: string): Promise<string[]> {
+  const output: string[] = [];
+  let current: string[] | undefined;
+  await new HTMLRewriter().on(selector, {
+    element(element) {
+      current = [];
+      element.onEndTag(() => {
+        if (current) output.push(current.join(""));
+        current = undefined;
+      });
+    },
+    text(text) { current?.push(text.text); },
+  }).transform(new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })).text();
+  return output.map((value) => normalizeText(decodeHtmlEntities(value)));
+}
+
+async function captureDocument(html: string): Promise<string> {
+  const chunks: string[] = [];
+  await new HTMLRewriter().onDocument({
+    text(text) { chunks.push(text.text); },
+  }).transform(new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })).text();
+  return normalizeText(decodeHtmlEntities(chunks.join("")));
+}
+
+async function normalizeHtmlFragment(fragment: string): Promise<string> {
+  const sanitized = await sanitizeHtml(fragment);
+  return captureDocument(sanitized);
+}
+
+function jsonLdTypeIsJobPosting(value: unknown): boolean {
+  return typeof value === "string"
+    ? JSON_LD_JOB_POSTING_TYPES[value] === true
+    : Array.isArray(value)
+      && value.some((item) => typeof item === "string" && JSON_LD_JOB_POSTING_TYPES[item] === true);
+}
+
+function visitJson(value: unknown, postings: Record<string, unknown>[]): void {
+  if (Array.isArray(value)) {
+    for (const item of value) visitJson(item, postings);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const object = value as Record<string, unknown>;
+  if (jsonLdTypeIsJobPosting(object["@type"])) postings.push(object);
+  for (const child of Object.values(object)) visitJson(child, postings);
+}
+
+async function collectJsonLdScripts(html: string): Promise<string[]> {
+  const scripts: string[] = [];
+  let current: string[] | undefined;
+  await new HTMLRewriter().on("script", {
+    element(element) {
+      const rawType = element.getAttribute("type") ?? "";
+      const type = rawType.split(";", 1)[0]!.trim().toLowerCase();
+      if (type !== "application/ld+json") return;
+      current = [];
+      element.onEndTag(() => {
+        if (current) scripts.push(current.join(""));
+        current = undefined;
+      });
+    },
+    text(text) { current?.push(text.text); },
+  }).transform(new Response(htmlDocument(html), { headers: { "content-type": "text/html; charset=utf-8" } })).text();
+  return scripts;
+}
+
+async function deterministicHtmlDescription(html: string): Promise<string | undefined> {
+  const postings: Record<string, unknown>[] = [];
+  for (const script of await collectJsonLdScripts(html)) {
+    try { visitJson(JSON.parse(script), postings); } catch { /* Ignore each malformed block independently. */ }
+  }
+  const candidates = new Set<string>();
+  for (const posting of postings) {
+    const organization = posting.hiringOrganization;
+    const values = [
+      typeof posting.title === "string" ? posting.title : undefined,
+      organization && typeof organization === "object" && typeof (organization as Record<string, unknown>).name === "string"
+        ? (organization as Record<string, unknown>).name as string
+        : undefined,
+      typeof posting.description === "string" ? posting.description : undefined,
+    ];
+    const normalized: string[] = [];
+    for (const value of values) {
+      if (value === undefined) continue;
+      const text = await normalizeHtmlFragment(value);
+      if (text) normalized.push(text);
+    }
+    const candidate = JobDescriptionSchema.safeParse(normalized.join("\n\n"));
+    if (candidate.success) candidates.add(candidate.data);
+  }
+  return candidates.size === 1 ? candidates.values().next().value : undefined;
+}
+
+function buildFallbackCandidate(candidate: string): LoadedJobSource | "too-large" | undefined {
+  if (candidate.length < JOB_DESCRIPTION_MIN_CHARS) return undefined;
+  if (Buffer.byteLength(candidate, "utf8") > LUNA_MAX_SOURCE_BYTES) return "too-large";
+  let lineCount = 1;
+  for (let index = 0; index < candidate.length; index += 1) {
+    if (candidate.charCodeAt(index) === 10 && ++lineCount > LUNA_MAX_SOURCE_LINES) return "too-large";
+  }
+  return { kind: "model-fallback", lines: candidate.split("\n") };
+}
+
+async function htmlFallback(html: string): Promise<LoadedJobSource> {
+  const sanitized = await sanitizeHtml(html);
+  let sawOversized = false;
+  const mainCandidates = await captureElements(sanitized, "main");
+  const articleCandidates = await captureElements(sanitized, "article");
+  const bodyCandidates = await captureElements(sanitized, "body");
+  const candidateGroups = [mainCandidates, articleCandidates, bodyCandidates];
+  if (bodyCandidates.length === 0) candidateGroups.push([await captureDocument(sanitized)]);
+  for (const candidates of candidateGroups) {
+    for (const candidate of candidates) {
+      const result = buildFallbackCandidate(candidate);
+      if (result === "too-large") sawOversized = true;
+      else if (result) return result;
+    }
+  }
+  throw new JobSourceError(sawOversized ? "JOB_SOURCE_TOO_LARGE" : "JOB_DESCRIPTION_UNAVAILABLE");
+}
+
+function normalizedResolvedAddresses(answers: readonly ResolvedAddress[]): ParsedAddress[] {
+  const output: ParsedAddress[] = [];
+  const seen = new Set<string>();
+  for (const answer of answers) {
+    if (answer.family !== 4 && answer.family !== 6) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+    const parsed = parseAddress(answer.address, true);
+    if (!parsed || (answer.family === 4 && parsed.family !== 4) || (answer.family === 6 && isIP(answer.address) !== 6)) {
+      throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+    }
+    const key = `${parsed.family}:${parsed.value}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      output.push(parsed);
+    }
+  }
+  return output;
+}
+
+async function resolveValidatedAddresses(
+  logicalUrl: URL,
+  resolveHost: ResolveHost,
+  signal: AbortSignal,
+): Promise<ParsedAddress[]> {
+  const hostname = rawHostname(logicalUrl);
+  const literal = parseAddress(hostname, false);
+  const answers = literal
+    ? [{ address: literal.address, family: literal.family } satisfies ResolvedAddress]
+    : await hardRace(resolveHost(hostname), signal);
+  const normalized = normalizedResolvedAddresses(answers);
+  if (normalized.length === 0) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+  if (normalized.some((address) => !isPublicAddress(address))) throw new JobSourceError("JOB_URL_BLOCKED");
+  return normalized;
+}
+
+function fetchInit(logicalUrl: URL, hostname: string): BunFetchRequestInit {
+  const literalHost = parseAddress(hostname, false);
+  const init: BunFetchRequestInit = {
+    method: "GET",
+    redirect: "manual",
+    headers: {
+      Accept: "text/html, application/xhtml+xml, text/plain",
+      "Accept-Encoding": "identity",
+      Host: logicalUrl.host,
+    },
+    decompress: false,
+  };
+  if (logicalUrl.protocol === "https:") {
+    init.tls = literalHost
+      ? { rejectUnauthorized: true }
+      : { rejectUnauthorized: true, serverName: hostname };
+  }
+  return init;
+}
+
+async function fetchPinned(
+  logicalUrl: URL,
+  addresses: readonly ParsedAddress[],
+  fetchImpl: JobSourceFetch,
+  signal: AbortSignal,
+): Promise<Response> {
+  const hostname = rawHostname(logicalUrl);
+  let lastFailure: unknown;
+  for (const address of addresses) {
+    if (signal.aborted) throw cancellationReason(signal);
+    const transportUrl = new URL(logicalUrl.href);
+    assignHostname(transportUrl, address.address, address.family);
+    try {
+      return await hardRace(fetchImpl(transportUrl, { ...fetchInit(logicalUrl, hostname), signal }), signal);
+    } catch (error) {
+      if (signal.aborted) throw cancellationReason(signal);
+      if (error instanceof JobSourceError) throw error;
+      lastFailure = error;
+    }
+  }
+  throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: lastFailure });
+}
+
+function terminalMediaType(response: Response): "html" | "plain" {
+  const contentEncoding = response.headers.get("content-encoding");
+  if (contentEncoding && contentEncoding.trim().toLowerCase() !== "identity") {
+    throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+  }
+  const rawType = response.headers.get("content-type");
+  const type = rawType?.split(";", 1)[0]!.trim().toLowerCase();
+  if (type === "text/plain") return "plain";
+  if (type && ACCEPTED_HTML_TYPES[type]) return "html";
+  throw new JobSourceError("JOB_SOURCE_UNSUPPORTED");
+}
+
+async function loadWithSignal(
+  jobUrl: string,
+  signal: AbortSignal,
+  fetchImpl: JobSourceFetch,
+  resolveHost: ResolveHost,
+): Promise<LoadedJobSource> {
+  let logicalUrl = canonicalizeLogicalUrl(jobUrl);
+  const visited = new Set([logicalUrl.href]);
+  let redirectHops = 0;
+
+  while (true) {
+    if (signal.aborted) throw cancellationReason(signal);
+    const addresses = await resolveValidatedAddresses(logicalUrl, resolveHost, signal);
+    const response = await fetchPinned(logicalUrl, addresses, fetchImpl, signal);
+
+    if (REDIRECT_STATUSES[response.status]) {
+      cancelBody(response);
+      if (redirectHops >= MAX_REDIRECT_HOPS) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+      const location = response.headers.get("location");
+      if (!location) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+      let resolved: URL;
+      try {
+        resolved = new URL(location, logicalUrl);
+      } catch (error) {
+        throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: error });
+      }
+      let target: URL;
+      try {
+        target = canonicalizeLogicalUrl(resolved);
+      } catch (error) {
+        if (error instanceof JobSourceError) throw error;
+        throw new JobSourceError("JOB_URL_BLOCKED", { cause: error });
+      }
+      if (visited.has(target.href)) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+      visited.add(target.href);
+      logicalUrl = target;
+      redirectHops += 1;
+      continue;
+    }
+
+    if (response.status < 200 || response.status > 299) {
+      cancelBody(response);
+      throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+    }
+
+    let mediaType: "html" | "plain";
+    try {
+      mediaType = terminalMediaType(response);
+      const declaredLength = response.headers.get("content-length");
+      if (declaredLength && /^\d+$/.test(declaredLength.trim()) && Number(declaredLength) > MAX_BODY_BYTES) {
+        throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+      }
+    } catch (error) {
+      cancelBody(response);
+      throw error;
+    }
+
+    const bytes = await readBoundedBody(response, signal);
+    let body: string;
+    try {
+      body = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (error) {
+      throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: error });
+    }
+
+    if (mediaType === "plain") {
+      const jobDescription = normalizeText(body);
+      const parsed = JobDescriptionSchema.safeParse(jobDescription);
+      if (parsed.success) return { kind: "description", jobDescription: parsed.data };
+      throw new JobSourceError(
+        jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
+          ? "JOB_SOURCE_TOO_LARGE"
+          : "JOB_DESCRIPTION_UNAVAILABLE",
+      );
+    }
+
+    const deterministic = await deterministicHtmlDescription(body);
+    if (deterministic !== undefined) return { kind: "description", jobDescription: deterministic };
+    return htmlFallback(body);
+  }
+}
+
+export async function loadJobSourceFromUrl(
+  jobUrl: string,
+  signal?: AbortSignal,
+  options: JobSourceLoadOptions = {},
+): Promise<LoadedJobSource> {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const deadlineReason = new DeadlineExpired("Job source network deadline expired");
+  const deadlineMs = options.deadlineMs ?? NETWORK_DEADLINE_MS;
+  const timer = setTimeout(() => controller.abort(deadlineReason), Math.max(0, deadlineMs));
+  const onCallerAbort = () => controller.abort(cancellationReason(signal!));
+  signal?.addEventListener("abort", onCallerAbort, { once: true });
+
+  try {
+    return await loadWithSignal(
+      jobUrl,
+      controller.signal,
+      options.fetchImpl ?? fetch,
+      options.resolveHost ?? defaultResolveHost,
+    );
+  } catch (error) {
+    if (signal?.aborted) throw cancellationReason(signal);
+    if (error instanceof JobSourceError) throw error;
+    throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: error });
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onCallerAbort);
+  }
+}

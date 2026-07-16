@@ -33,6 +33,13 @@ export class SourceDriftError extends RepositoryConflictError {
   }
 }
 
+export class RunArtifactsPrunedError extends RepositoryConflictError {
+  constructor(message = "run artifacts were removed") {
+    super(message);
+    this.name = "RunArtifactsPrunedError";
+  }
+}
+
 interface RunRow {
   id: string;
   job_description: string;
@@ -191,6 +198,20 @@ export class PipelineRepository {
     return row;
   }
 
+  #hasArtifactRetentionReservation(runId: string): boolean {
+    return this.#db.query<{ reserved: number }, [string]>(`
+      SELECT EXISTS (
+        SELECT 1
+        FROM run_artifact_retention
+        WHERE run_id = ?
+      ) AS reserved
+    `).get(runId)?.reserved === 1;
+  }
+
+  #assertRunArtifactsRetained(runId: string): void {
+    if (this.#hasArtifactRetentionReservation(runId)) throw new RunArtifactsPrunedError();
+  }
+
   #assertClaim(claim: Pick<RunClaim, "runId" | "token">, now: number): ClaimRow {
     const row = this.#db.query<ClaimRow, [string, string, number]>("SELECT run_id, claim_token, expires_at FROM run_claim WHERE id=1 AND run_id=? AND claim_token=? AND expires_at>?").get(claim.runId, claim.token, now);
     if (!row) throw new ClaimRejectedError();
@@ -305,6 +326,54 @@ export class PipelineRepository {
     return this.#db.query<RunRow, [number]>("SELECT * FROM runs ORDER BY queue_sequence LIMIT ?").all(limit).map(publicRun);
   }
 
+  reserveArtifactPruneCandidates(retainCount: number): string[] {
+    if (!Number.isSafeInteger(retainCount) || retainCount < 1) throw new Error("artifact retention count must be a positive integer");
+    return this.#immediate(() => {
+      this.#db.query(`
+        INSERT INTO run_artifact_retention(run_id, state, selected_at)
+        SELECT runs.id, 'pruning', ?
+        FROM runs
+        WHERE runs.id NOT IN (SELECT id FROM runs ORDER BY queue_sequence DESC LIMIT ?)
+          AND runs.status IN ('review','approved','failed')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM run_claim
+            WHERE run_claim.id = 1
+              AND run_claim.run_id = runs.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM attempts
+            WHERE attempts.run_id = runs.id
+              AND attempts.status IN ('running','cancel_requested')
+          )
+        ON CONFLICT(run_id) DO NOTHING
+      `).run(this.#now(), retainCount);
+      return this.#db.query<{ run_id: string }, []>(`
+        SELECT run_artifact_retention.run_id
+        FROM run_artifact_retention
+        JOIN runs ON runs.id = run_artifact_retention.run_id
+        WHERE run_artifact_retention.state = 'pruning'
+        ORDER BY runs.queue_sequence
+      `).all().map((row) => row.run_id);
+    });
+  }
+
+  markRunArtifactsPruned(runId: string): void {
+    this.#immediate(() => {
+      this.#db.query(`
+        UPDATE run_artifact_retention
+        SET state = 'pruned', pruned_at = ?
+        WHERE run_id = ? AND state = 'pruning'
+      `).run(this.#now(), runId);
+    });
+  }
+
+  areRunArtifactsRetained(runId: string): boolean {
+    this.#run(runId);
+    return !this.#hasArtifactRetentionReservation(runId);
+  }
+
   setApplicationStatus(runId: string, applicationStatus: ApplicationStatus): PublicRun {
     return this.#immediate(() => {
       const run = this.#run(runId);
@@ -343,7 +412,7 @@ export class PipelineRepository {
       let candidate: RunRow | null = null;
       if (singleton.run_id) {
         const interrupted = this.#run(singleton.run_id);
-        if (runnableStatuses.has(interrupted.status)) {
+        if (runnableStatuses.has(interrupted.status) && !this.#hasArtifactRetentionReservation(interrupted.id)) {
           const active = this.#db.query<AttemptRow, [string]>("SELECT * FROM attempts WHERE run_id=? AND status IN ('running','cancel_requested') ORDER BY started_at DESC LIMIT 1").get(interrupted.id);
           if (active) {
             const knownDead = active.process_pid !== null && active.process_start_token !== null && !this.#isProcessAlive(active.process_pid, active.process_start_token);
@@ -358,7 +427,18 @@ export class PipelineRepository {
         }
       }
       if (!candidate) {
-        candidate = this.#db.query<RunRow, []>("SELECT * FROM runs WHERE status IN ('queued','analyzing','tailoring','editing','compiling','repairing','deterministic_qa','visual_qa') ORDER BY queue_sequence LIMIT 1").get() ?? null;
+        candidate = this.#db.query<RunRow, []>(`
+          SELECT *
+          FROM runs
+          WHERE status IN ('queued','analyzing','tailoring','editing','compiling','repairing','deterministic_qa','visual_qa')
+            AND NOT EXISTS (
+              SELECT 1
+              FROM run_artifact_retention
+              WHERE run_artifact_retention.run_id = runs.id
+            )
+          ORDER BY queue_sequence
+          LIMIT 1
+        `).get() ?? null;
       }
       if (!candidate) {
         this.#db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=1").run();
@@ -548,6 +628,7 @@ export class PipelineRepository {
   retry(runId: string, currentSources?: RunSourceSnapshotInput): PublicRun {
     return this.#immediate(() => {
       const now = this.#now(); const run = this.#assertCommandable(runId, now);
+      this.#assertRunArtifactsRetained(run.id);
       if (currentSources) this.#assertSourceSnapshot(runId, currentSources);
       if (run.status !== "failed" || !run.failed_stage) throw new RepositoryConflictError("only a failed stage can be retried");
       const revision = run.current_revision + 1;
@@ -570,6 +651,7 @@ export class PipelineRepository {
   #createEditRevision(runId: string, origin: "machine_regenerate" | "human_edit", comments: string, expectedPdfSha256: string, currentSources?: RunSourceSnapshotInput): PublicRun {
     return this.#immediate(() => {
       const now = this.#now(); const run = this.#assertCommandable(runId, now);
+      this.#assertRunArtifactsRetained(run.id);
       if (currentSources) this.#assertSourceSnapshot(runId, currentSources);
       if (run.status !== "review") throw new RepositoryConflictError("run is not in review");
       const pdf = this.#exactArtifact(run.id, run.current_revision, "compiled-pdf");
@@ -587,6 +669,7 @@ export class PipelineRepository {
   approve(runId: string, expectedPdfSha256: string, visualAcknowledged = false, currentSources?: RunSourceSnapshotInput): PublicRun {
     return this.#immediate(() => {
       const now = this.#now(); const run = this.#assertCommandable(runId, now);
+      this.#assertRunArtifactsRetained(run.id);
       if (currentSources) this.#assertSourceSnapshot(runId, currentSources);
       if (run.status !== "review") throw new RepositoryConflictError("run is not in review");
       const pdf = this.#exactArtifact(run.id, run.current_revision, "compiled-pdf");

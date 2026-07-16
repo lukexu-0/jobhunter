@@ -1,15 +1,17 @@
-import { getBundledModel } from "@oh-my-pi/pi-catalog";
+import { getBundledModel, resolveWireModelId, type Effort } from "@oh-my-pi/pi-catalog";
 import { getAuthStatus } from "../auth/service.ts";
 import { openContextDatabase } from "../context/database.ts";
 import { loadContextManifest } from "../context/manifest.ts";
 import { checkContextFreshness } from "../context/service.ts";
 import { GEMINI_MODEL_NAME } from "../models/gemini-inspector.ts";
+import { LUNA_MODEL_NAME } from "../models/luna-job-extractor.ts";
 import { MODEL_NAME, OMP_CODEX_MODEL } from "../models/oauth-codex-model.ts";
 
 export type DoctorCheckStatus = "ok" | "warning" | "error";
 
 export interface DoctorCheck {
-  id: "bun" | "context" | "auth-openai" | "auth-gemini" | "model-openai" | "model-gemini"
+  id: "bun" | "context" | "auth-openai" | "auth-gemini"
+    | "model-openai" | "model-gemini" | "model-luna"
     | "latexmk" | "pdfinfo" | "pdftotext" | "pdffonts" | "pdftoppm";
   status: DoctorCheckStatus;
   classification: string;
@@ -23,7 +25,8 @@ export interface DoctorReport {
 }
 
 export type DoctorProvider = "openai-codex" | "google-antigravity";
-export type DoctorModelId = typeof MODEL_NAME | typeof GEMINI_MODEL_NAME;
+export type DoctorModelId = typeof MODEL_NAME | typeof GEMINI_MODEL_NAME | typeof LUNA_MODEL_NAME;
+export type DoctorModelDescriptors = Readonly<Record<DoctorModelId, unknown>>;
 export type DoctorAuthState = "connected" | "disconnected" | "expired";
 
 export interface DoctorAuthStatus {
@@ -45,7 +48,7 @@ export interface DoctorDependencies {
   readonly now?: () => number;
   readonly authStatus?: () => Promise<DoctorAuthStatus>;
   readonly contextStatus?: () => ContextDoctorStatus;
-  readonly modelDescriptors?: () => Readonly<Record<DoctorProvider, unknown>>;
+  readonly modelDescriptors?: () => DoctorModelDescriptors;
   readonly process?: DoctorProcessProbe;
   readonly probeEntitlement?: (provider: DoctorProvider, modelId: DoctorModelId) => Promise<void>;
 }
@@ -102,6 +105,16 @@ const EXPECTED_GEMINI_DESCRIPTOR = Object.freeze({
   },
 });
 
+const EXPECTED_LUNA_DESCRIPTOR = Object.freeze({
+  id: "gpt-5.6-luna", name: "GPT-5.6 Luna", api: "openai-codex-responses", provider: "openai-codex",
+  baseUrl: "https://chatgpt.com/backend-api", reasoning: true, input: ["text", "image"],
+  cost: { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 },
+  remoteCompaction: { enabled: true, api: "openai-codex-responses", v2StreamingEnabled: true },
+  contextWindow: 372_000, maxTokens: 128_000, preferWebsockets: true, useResponsesLite: true, priority: 3,
+  applyPatchToolType: "freeform",
+  thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh", "max"] },
+});
+
 async function readBoundedVersion(stream: ReadableStream<Uint8Array>): Promise<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -148,10 +161,11 @@ function defaultContextStatus(): ContextDoctorStatus {
   }
 }
 
-function defaultModelDescriptors(): Readonly<Record<DoctorProvider, unknown>> {
+function defaultModelDescriptors(): DoctorModelDescriptors {
   return {
-    "openai-codex": OMP_CODEX_MODEL,
-    "google-antigravity": getBundledModel("google-antigravity", GEMINI_MODEL_NAME),
+    [MODEL_NAME]: OMP_CODEX_MODEL,
+    [GEMINI_MODEL_NAME]: getBundledModel("google-antigravity", GEMINI_MODEL_NAME),
+    [LUNA_MODEL_NAME]: getBundledModel("openai-codex", LUNA_MODEL_NAME),
   };
 }
 
@@ -162,6 +176,17 @@ function descriptorMatches(actual: unknown, expected: unknown): boolean {
     return Object.entries(expected).every(([key, value]) => descriptorMatches((actual as Record<string, unknown>)[key], value));
   }
   return actual === expected;
+}
+
+function hasExpectedHighRoute(descriptor: unknown, expected: string): boolean {
+  try {
+    return resolveWireModelId(
+      descriptor as Parameters<typeof resolveWireModelId>[0],
+      "high" as Effort,
+    ) === expected;
+  } catch {
+    return false;
+  }
 }
 
 function check(id: DoctorCheck["id"], status: DoctorCheckStatus, classification: string, detail?: string): DoctorCheck {
@@ -196,17 +221,20 @@ function authCheck(id: "auth-openai" | "auth-gemini", state: DoctorAuthState): D
 
 
 async function modelCheck(
-  id: "model-openai" | "model-gemini",
+  id: "model-openai" | "model-gemini" | "model-luna",
   provider: DoctorProvider,
   modelId: DoctorModelId,
   expectedDescriptor: unknown,
   descriptor: unknown,
+  expectedHighRoute: string | undefined,
   authState: DoctorAuthState,
   dependencies: DoctorDependencies,
   now: number,
   shouldProbe: boolean,
 ): Promise<DoctorCheck> {
-  if (!descriptorMatches(descriptor, expectedDescriptor)) return check(id, "error", "model_descriptor_invalid");
+  const descriptorValid = descriptorMatches(descriptor, expectedDescriptor);
+  const highRouteValid = expectedHighRoute === undefined || hasExpectedHighRoute(descriptor, expectedHighRoute);
+  if (!descriptorValid || !highRouteValid) return check(id, "error", "model_descriptor_invalid");
   if (authState === "disconnected") return check(id, "warning", "auth_absent");
   if (authState === "expired") return check(id, "warning", "auth_expired");
   if (!shouldProbe) return check(id, "ok", "descriptor_valid");
@@ -252,12 +280,13 @@ export async function runDoctor(dependencies: DoctorDependencies, options: Docto
   for (const provider of authStatus.providers) authByProvider[provider.provider] = provider.state;
   const openaiAuth = authByProvider["openai-codex"] ?? "disconnected";
   const geminiAuth = authByProvider["google-antigravity"] ?? "disconnected";
+  const lunaAuth = openaiAuth;
 
-  let descriptors: Readonly<Record<DoctorProvider, unknown>>;
+  let descriptors: DoctorModelDescriptors;
   try {
     descriptors = (dependencies.modelDescriptors ?? defaultModelDescriptors)();
   } catch {
-    descriptors = { "openai-codex": undefined, "google-antigravity": undefined };
+    descriptors = { [MODEL_NAME]: undefined, [GEMINI_MODEL_NAME]: undefined, [LUNA_MODEL_NAME]: undefined };
   }
 
   const bun = await toolCheck("bun", processProbe);
@@ -269,11 +298,15 @@ export async function runDoctor(dependencies: DoctorDependencies, options: Docto
     ? check("auth-gemini", "error", "auth_configuration_invalid")
     : authCheck("auth-gemini", geminiAuth);
   const modelOpenai = await modelCheck("model-openai", "openai-codex", MODEL_NAME, EXPECTED_CODEX_DESCRIPTOR,
-    descriptors["openai-codex"], openaiAuth, dependencies, now, options.probeModels !== false);
+    descriptors[MODEL_NAME], undefined, openaiAuth, dependencies, now, options.probeModels !== false);
   const modelGemini = await modelCheck("model-gemini", "google-antigravity", GEMINI_MODEL_NAME, EXPECTED_GEMINI_DESCRIPTOR,
-    descriptors["google-antigravity"], geminiAuth, dependencies, now, options.probeModels !== false);
+    descriptors[GEMINI_MODEL_NAME], undefined, geminiAuth, dependencies, now, options.probeModels !== false);
+  const modelLuna = await modelCheck("model-luna", "openai-codex", LUNA_MODEL_NAME, EXPECTED_LUNA_DESCRIPTOR,
+    descriptors[LUNA_MODEL_NAME], LUNA_MODEL_NAME, lunaAuth, dependencies, now, options.probeModels !== false);
   const remainingTools = await Promise.all(TOOL_IDS.slice(1).map((id) => toolCheck(id, processProbe)));
-  const checks: DoctorCheck[] = [bun, context, authOpenai, authGemini, modelOpenai, modelGemini, ...remainingTools];
+  const checks: DoctorCheck[] = [
+    bun, context, authOpenai, authGemini, modelOpenai, modelGemini, modelLuna, ...remainingTools,
+  ];
   return Object.freeze({ ok: checks.every((item) => item.status !== "error"), checkedAt: now, checks });
 }
 

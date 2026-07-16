@@ -38,7 +38,7 @@ export interface EvidenceLedger {
   readonly version: 1;
   readonly context: { readonly manifestSha256: string; readonly baselineSha256: string; readonly sourceHashes: Readonly<Record<string, string>> };
   readonly analysis: { readonly id: string; readonly sha256: string; readonly jobDescriptionSha256: string; readonly keywordCitations: readonly { readonly keyword: string; readonly jdQuote: string; readonly evidenceIds: readonly string[] }[] };
-  readonly plan: { readonly id: string; readonly decisions: TailoringPlan["decisions"]; readonly projectOrder: readonly string[]; readonly skillDecisions: TailoringPlan["skillDecisions"]; readonly factWinners: TailoringPlan["factWinners"]; readonly baselineOverrides: TailoringPlan["baselineOverrides"]; readonly omissions: TailoringPlan["omissions"] };
+  readonly plan: { readonly id: string; readonly tailoringWorkflowSha256: string; readonly decisions: TailoringPlan["decisions"]; readonly projectOrder: readonly string[]; readonly skillDecisions: TailoringPlan["skillDecisions"]; readonly factWinners: TailoringPlan["factWinners"]; readonly baselineOverrides: TailoringPlan["baselineOverrides"]; readonly omissions: TailoringPlan["omissions"] };
   readonly entityBindings: Readonly<Record<string, string>>;
   readonly citations: readonly { readonly evidenceId: string; readonly sourceId: string; readonly sourceVersionId: string; readonly entityId: string; readonly caveats: readonly string[]; readonly sha256: string }[];
   readonly comments: readonly { readonly index: number; readonly text: string; readonly disposition: CommentDisposition }[];
@@ -61,8 +61,31 @@ export function buildEvidenceLedger(analysisInput: JobAnalysis, planInput: Tailo
   validateAppliedCommentEvidence(plan, dispositions);
   const evidenceById = new Map(snapshot.evidence.map((block) => [block.id, block]));
   const cited = new Set<string>();
-  for (const keyword of analysis.prioritizedKeywords) for (const id of keyword.evidenceIds) cited.add(id);
-  for (const guidance of analysis.guidance) for (const id of guidance.evidenceIds) cited.add(id);
+  for (const requirement of analysis.requirementEvidence) for (const id of requirement.evidenceIds) cited.add(id);
+  for (const risk of analysis.recruiterRisks) for (const id of risk.evidenceIds) cited.add(id);
+  for (const gap of analysis.gapsAndMitigations) for (const id of gap.evidenceIds) cited.add(id);
+  for (const keyword of analysis.keywordAlignment) for (const id of keyword.evidenceIds) cited.add(id);
+  for (const id of analysis.proposedCvContent.professionalSummary.evidenceIds) cited.add(id);
+  for (const competency of analysis.proposedCvContent.coreCompetencies) for (const id of competency.evidenceIds) cited.add(id);
+  for (const experience of analysis.proposedCvContent.reorderedExperience) {
+    for (const bullet of experience.bullets) for (const id of bullet.evidenceIds) cited.add(id);
+  }
+  for (const project of analysis.proposedCvContent.selectedProjects) for (const id of project.evidenceIds) cited.add(id);
+  for (const bullet of analysis.businessValueBulletReview) for (const id of bullet.evidenceIds) cited.add(id);
+  for (const id of analysis.sixSecondClarityGate.targetRoleOrArchetype.evidenceIds) cited.add(id);
+  for (const id of analysis.sixSecondClarityGate.strongestMatchingStackOrDomain.evidenceIds) cited.add(id);
+  for (const id of analysis.sixSecondClarityGate.productionOrBusinessOutcome.evidenceIds) cited.add(id);
+  for (const id of analysis.sixSecondClarityGate.appropriateLocationOrRemoteFit.evidenceIds) cited.add(id);
+  for (const id of analysis.sixSecondClarityGate.relevantPortfolioOrCaseStudyLink.evidenceIds) cited.add(id);
+  for (const id of analysis.atsAndTruthfulnessReview.parseableSingleColumnStructure.evidenceIds) cited.add(id);
+  for (const id of analysis.atsAndTruthfulnessReview.standardSectionHeaders.evidenceIds) cited.add(id);
+  for (const id of analysis.atsAndTruthfulnessReview.selectableUtf8Text.evidenceIds) cited.add(id);
+  for (const id of analysis.atsAndTruthfulnessReview.truthfulKeywordUse.evidenceIds) cited.add(id);
+  for (const id of analysis.atsAndTruthfulnessReview.noHiddenTextOrKeywordStuffing.evidenceIds) cited.add(id);
+  for (const id of analysis.atsAndTruthfulnessReview.noUnsupportedSkillsOrMetrics.evidenceIds) cited.add(id);
+  for (const item of analysis.customizationPlan) for (const id of item.evidenceIds) cited.add(id);
+  for (const item of analysis.rankedRecommendations.cvChanges) for (const id of item.evidenceIds) cited.add(id);
+  for (const item of analysis.rankedRecommendations.linkedInChanges) for (const id of item.evidenceIds) cited.add(id);
   for (const decision of plan.decisions) for (const id of decision.evidenceIds) cited.add(id);
   for (const skill of plan.skillDecisions) for (const id of skill.evidenceIds) cited.add(id);
   for (const omission of plan.omissions) for (const id of omission.evidenceIds) cited.add(id);
@@ -77,8 +100,8 @@ export function buildEvidenceLedger(analysisInput: JobAnalysis, planInput: Tailo
   return {
     version: 1,
     context: { manifestSha256: snapshot.manifestSha256, baselineSha256: snapshot.baselineSha256, sourceHashes: Object.freeze({ ...snapshot.sourceHashes }) },
-    analysis: { id: analysis.id, sha256: hashJobAnalysis(analysis), jobDescriptionSha256: analysis.jobDescriptionSha256, keywordCitations: analysis.prioritizedKeywords.map(({ keyword, jdQuote, evidenceIds }) => ({ keyword, jdQuote, evidenceIds })) },
-    plan: { id: plan.id, decisions: plan.decisions, projectOrder: plan.projectOrder, skillDecisions: plan.skillDecisions, factWinners: plan.factWinners, baselineOverrides: plan.baselineOverrides, omissions: plan.omissions },
+    analysis: { id: analysis.id, sha256: hashJobAnalysis(analysis), jobDescriptionSha256: analysis.jobDescriptionSha256, keywordCitations: analysis.keywordAlignment.map(({ jdVocabulary: keyword, jdQuote, evidenceIds }) => ({ keyword, jdQuote, evidenceIds })) },
+    plan: { id: plan.id, tailoringWorkflowSha256: plan.tailoringWorkflowSha256, decisions: plan.decisions, projectOrder: plan.projectOrder, skillDecisions: plan.skillDecisions, factWinners: plan.factWinners, baselineOverrides: plan.baselineOverrides, omissions: plan.omissions },
     entityBindings: Object.freeze({ ...snapshot.explicitEntityBindings }),
     citations,
     comments: comments.map((text, index) => ({ index, text, disposition: dispositions.find((item) => item.commentIndex === index)! })),

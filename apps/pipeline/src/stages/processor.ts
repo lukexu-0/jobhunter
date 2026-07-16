@@ -30,7 +30,7 @@ import type { StageRepository, StageSourceContext } from "./types.ts";
 
 const JSON_LIMIT = 2 * 1024 * 1024;
 const JOB_DESCRIPTION_LIMIT = 1024 * 1024;
-const REQUIRED_HEADINGS = ["Education", "Experience", "Projects", "Technical Skills"] as const;
+const REQUIRED_HEADINGS = ["Education", "Experience", "Projects", "Competitions & Other", "Technical Skills"] as const;
 
 export interface PipelineStageDependencies {
   readonly repository: StageRepository;
@@ -173,13 +173,13 @@ export class PipelineStageProcessor {
   }
 
   async #analyze(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
-    if (run.currentRevision !== 1 || this.#repository.getArtifact(run.id, "job-analysis")) throw new Error("analysis is immutable and may run only once in revision 1");
+    if (this.#repository.getArtifact(run.id, "job-analysis")) throw new Error("job analysis is immutable once finalized");
     const inputArtifact = this.#requiredArtifact(run.id, "job-description");
     const rawJobDescription = await this.#readText(inputArtifact, JOB_DESCRIPTION_LIMIT);
     await this.#verifyAgain(run.id, signal);
     const analysis = await this.#analysisAgent({
       attemptSessionId: attempt.attemptSessionId,
-      input: { rawJobDescription, evidence: sources.snapshot.evidence },
+      input: { rawJobDescription, canonicalCv: sources.baseline, context: sources.snapshot },
       signal,
       ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
     });
@@ -201,13 +201,27 @@ export class PipelineStageProcessor {
     await this.#verifyAgain(run.id, signal);
     const result = await this.#tailoringAgent({
       attemptSessionId: attempt.attemptSessionId,
-      input: { analysis, baseline: sources.baseline, evidence: sources.snapshot.evidence },
+      input: {
+        analysis,
+        baseline: sources.baseline,
+        context: sources.snapshot,
+        operations: {
+          renderPlan: (plan, toolSignal) => {
+            toolSignal.throwIfAborted();
+            return renderTailoredResume(plan, sources.baseline, sources.snapshot);
+          },
+        },
+      },
       signal,
       ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
     });
-    audit.toolCount = 1;
+    audit.toolCount = result.toolCount;
     validateAnalysisImmutability(result.plan, analysis);
-    const tailoredTex = renderTailoredResume(result.plan, sources.baseline, sources.snapshot);
+    const trustedTailoredTex = renderTailoredResume(result.plan, sources.baseline, sources.snapshot);
+    if (result.tailoredTex !== trustedTailoredTex) {
+      throw new Error("tailoring agent working copy does not match the trusted plan render");
+    }
+    const tailoredTex = result.tailoredTex;
     const ledger = buildEvidenceLedger(analysis, result.plan, sources.snapshot);
     signal.throwIfAborted();
     await this.#verifyAgain(run.id, signal);

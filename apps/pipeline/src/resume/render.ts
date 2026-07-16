@@ -47,7 +47,8 @@ function evidenceFor(ids: readonly string[], entityId: string, evidence: Readonl
   return ids.map((id) => {
     const block = evidence.get(id);
     if (!block) throw new ResumeValidationError(`unknown evidence ID ${id}`);
-    if (!equivalentEntities(entityId, block.entityId, snapshot)) throw new ResumeValidationError(`evidence ${id} is attributed to ${block.entityId}, not ${entityId}`);
+    const source = snapshot.sources.find((candidate) => candidate.id === block.sourceId);
+    if (source?.kind !== "baseline" && !equivalentEntities(entityId, block.entityId, snapshot)) throw new ResumeValidationError(`evidence ${id} is attributed to ${block.entityId}, not ${entityId}`);
     return block;
   });
 }
@@ -147,20 +148,20 @@ function validatePlan(planInput: TailoringPlan, baseline: ParsedBaselineResume, 
   return plan;
 }
 
-function decisionsByEntity(plan: TailoringPlan, section: "experience" | "projects"): Map<string, TailoringDecision[]> {
+function decisionsByEntity(plan: TailoringPlan, section: BaselineEntity["section"]): Map<string, TailoringDecision[]> {
   const result = new Map<string, TailoringDecision[]>();
   for (const decision of plan.decisions) if (decision.section === section) (result.get(decision.entityId) ?? (result.set(decision.entityId, []), result.get(decision.entityId)!)).push(decision);
   return result;
 }
 
 function renderEntity(entity: BaselineEntity, decisions: readonly TailoringDecision[]): string {
-  const macro = entity.section === "experience" ? "resumeSubheading" : "resumeProjectHeading";
+  const macro = entity.section === "projects" ? "resumeProjectHeading" : "resumeSubheading";
   const heading = `    \\${macro}\n${entity.headingArguments.map((argument) => `      {${argument}}`).join("\n")}`;
   const bullets = decisions.filter((decision) => decision.action !== "omit").map((decision) => `        \\resumeItem{${plainTextToTex(decision.text!)}}`).join("\n");
   return `${heading}\n      \\resumeItemListStart\n${bullets}\n      \\resumeItemListEnd`;
 }
 
-function renderEntitySection(section: "experience" | "projects", parsed: ParsedBaselineResume, plan: TailoringPlan): string {
+function renderEntitySection(section: BaselineEntity["section"], parsed: ParsedBaselineResume, plan: TailoringPlan): string {
   const grouped = decisionsByEntity(plan, section);
   const entities = section === "projects"
     ? plan.projectOrder.map((entityId) => parsed.entities.find((entity) => entity.section === section && entity.entityId === entityId)!)
@@ -186,6 +187,7 @@ export function renderTailoredResume(planInput: TailoringPlan, baselineSource: s
   const replacements = new Map<ResumeSection, string>([
     ["experience", renderEntitySection("experience", parsed, plan)],
     ["projects", renderEntitySection("projects", parsed, plan)],
+    ["competitions-other", renderEntitySection("competitions-other", parsed, plan)],
     ["technical-skills", renderSkills(parsed, plan)],
   ]);
   const regions = Object.values(parsed.regions).sort((a, b) => a.bodyStart - b.bodyStart);
