@@ -225,7 +225,11 @@ describe("one-turn agents", () => {
         "read_working_tex", "apply_tailoring_plan", "submit_tailoring_plan",
       ]);
       expect(agent.instructions).toContain(TAILORING_WORKFLOW_PROMPT);
-      expect(agent.instructions).not.toContain("## Step 15");
+      expect(agent.instructions).not.toContain("## Pipeline validation");
+      expect(agent.instructions).toContain("analysis.keywordAlignment");
+      expect(agent.instructions).toContain("one distinct evidence-backed claim");
+      expect(agent.instructions).toContain("never force or invent a number");
+      expect(agent.instructions).toContain("guidance with judgment rather than mechanically");
       expect(input).not.toContain("SECRET RAW JD");
       expect(input).not.toContain("\\documentclass");
       const parsedInput = JSON.parse(input);
@@ -233,6 +237,7 @@ describe("one-turn agents", () => {
         "task", "analysisId", "analysisSha256", "tailoringWorkflowSha256", "analysis", "candidateContext", "baselineInventory",
       ]);
       expect(parsedInput).toMatchObject({
+        task: "Tailor the resume.",
         analysisId: ANALYSIS.id,
         analysisSha256: hashJobAnalysis(ANALYSIS),
         tailoringWorkflowSha256: TAILORING_WORKFLOW_SHA256,

@@ -15,9 +15,9 @@ const TAILORING_WORKFLOW = readFileSync(
   resolve(import.meta.dir, "../../../actual/pipeline/tailoring.md"),
   "utf8",
 );
-const TAILORING_STEP_15 = TAILORING_WORKFLOW.indexOf("\n## Step 15");
-if (TAILORING_STEP_15 < 0) throw new Error("tailoring fixture workflow is missing Step 15");
-export const TAILORING_WORKFLOW_PROMPT = TAILORING_WORKFLOW.slice(0, TAILORING_STEP_15).trimEnd();
+const TAILORING_PIPELINE_VALIDATION = TAILORING_WORKFLOW.indexOf("\n## Pipeline validation");
+if (TAILORING_PIPELINE_VALIDATION < 0) throw new Error("tailoring fixture workflow is missing the pipeline validation boundary");
+export const TAILORING_WORKFLOW_PROMPT = TAILORING_WORKFLOW.slice(0, TAILORING_PIPELINE_VALIDATION).trimEnd();
 export const TAILORING_WORKFLOW_SHA256 = createHash("sha256")
   .update(TAILORING_WORKFLOW_PROMPT)
   .digest("hex");

@@ -1,9 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { Agent, tool } from "@openai/agents-core";
 import { z } from "zod";
-import { REPOSITORY_ROOT } from "../context/manifest.ts";
 import type { ContextSnapshot } from "../context/types.ts";
 import { MODEL_NAME } from "../models/oauth-codex-model.ts";
 import { hashJobAnalysis, validateAnalysisImmutability } from "../resume/ledger.ts";
@@ -32,10 +29,87 @@ import {
 export const MAX_TAILORING_TOOL_CALLS = 7;
 export const MAX_TAILORING_TOOL_BYTES = 3 * 1024 * 1024;
 
-const rawWorkflow = readFileSync(resolve(REPOSITORY_ROOT, "actual/pipeline/tailoring.md"), "utf8");
-const step15 = rawWorkflow.indexOf("\n## Step 15");
-if (step15 < 0) throw new Error("tailoring workflow is missing the Step 15 boundary");
-const TAILORING_WORKFLOW_PROMPT = rawWorkflow.slice(0, step15).trimEnd();
+const TAILORING_WORKFLOW_PROMPT = `# Resume Tailoring Workflow
+
+Tailor the resume to a specific job while preserving truthful evidence and a strict one-page limit.
+Treat the steps as guidance rather than a mechanical checklist; adapt them to the role, evidence, readability, and page balance.
+
+## Step 1 — Map requirements to existing evidence
+
+Use judgment to focus on requirements that materially affect fit:
+
+- Favor the strongest exact evidence already present in the resume or another verified source.
+- Distinguish direct experience from adjacent experience.
+- Place evidence where it communicates fit most naturally.
+- Leave unsupported requirements as gaps; never create evidence to make them appear covered.
+
+## Step 2 — Rank proof and decide what to keep
+
+Use judgment to rank entries and bullets by role relevance and evidence strength. Generally favor:
+
+- Direct technical evidence for high-priority requirements
+- Verified production, user, operational, or business impact
+- Ownership, system scope, trade-offs, reliability, or security
+- Adjacent technical evidence
+- Communication, leadership, or high-pressure work when it supports the role
+- Unrelated experience only when it adds useful context or space allows
+
+## Step 3 — Align vocabulary truthfully
+
+Use \`analysis.keywordAlignment\` as the authoritative shortlist. Prioritize its supported exact job-description terms naturally where they describe real experience; do not re-extract or add terms outside the shortlist.
+Exclude screening filters, unsupported terms, and subjective culture language unless it names a concrete searchable competency.
+
+Place supported terms where they read naturally and their evidence appears:
+
+- Experience bullets for work performed in a role
+- Project headings or bullets for project-specific tools and outcomes
+- Technical Skills for verified technologies
+- Competitions & Other when the activity genuinely demonstrates the competency
+
+Avoid keyword stuffing, hidden text, unsupported synonyms, or repeated phrases that make the CV unnatural.
+
+## Step 4 — Tailor Experience
+
+When rewriting Experience bullets, apply the principles that improve clarity and relevance:
+
+- Aim for one distinct evidence-backed claim, combining a specific action or verified outcome with concrete scope, relevant methods or technologies, and a verified effect when those elements strengthen the bullet.
+- Include metrics only when supported and meaningful; never force or invent a number.
+- Prefer concrete nouns and verbs over adjectives, responsibility phrases, or implementation details that do not show relevance, difficulty, ownership, or impact.
+- Preserve verified tense and completion status, and order bullets by the strength of their matching evidence.
+
+## Step 5 — Tailor Projects
+
+Projects may be reordered, rewritten, shortened, or replaced based on role fit, evidence strength, and page balance.
+
+- Usually place the strongest-matching project first unless another order improves the narrative.
+- Prefer bullets that add distinct evidence and fit within the page limit.
+- Cut technology repetition that adds no proof.
+- Emphasize the outcomes, architecture, security, reliability, scale, or user value most relevant to the role.
+- Keep every fact and date accurate.
+
+## Step 6 — Tailor Competitions & Other
+
+Keep, shorten, or replace an entry based on its relevance; any replacement must be a verified competition or activity.
+
+## Step 7 — Tailor Technical Skills
+
+Technical Skills should confirm demonstrated evidence rather than compensate for gaps. Use judgment to:
+
+- Keep only technologies supported by verified work, projects, coursework, or demonstrated use.
+- Emphasize relevant terms and remove low-value noise.
+- Add a requested technology only when verified; never list it solely because it appears in the job description.
+- Keep terminology consistent with Experience and Projects, avoiding labels that cannot be defended in an interview.
+
+## Step 8 — Enforce the one-page budget
+
+Use judgment to fit one page. Generally protect:
+
+- the strongest Experience evidence
+- the most relevant Projects and distinct project bullets
+- verified Technical Skills that support the role
+- concise Competitions & Other evidence when it adds value
+
+Before shortening high-value proof, first cut duplicated or low-value bullets, repeated heading or technology labels, lower-priority project detail, and unrelated non-technical Experience.`;
 const TAILORING_WORKFLOW_SHA256 = createHash("sha256").update(TAILORING_WORKFLOW_PROMPT).digest("hex");
 
 const EmptySchema = z.object({}).strict();
@@ -68,7 +142,7 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
   const parsedBaseline = parseBaselineResume(attempt.input.baseline);
   const analysisSha256 = hashJobAnalysis(attempt.input.analysis);
   const input = boundedJson({
-    task: "Execute the trusted tailoring workflow through Step 14 against an isolated working copy. Copy analysisId, analysisSha256, and tailoringWorkflowSha256 exactly into the plan. Use the complete analysis and candidate context. Plan invariants: when factWinners is empty every decision factKeys array must also be empty; every rewrite decision requires one baselineOverride with identical replacement text and supporting evidence; every skillDecision entityId identifies the cited evidence owner, never the stable skill ID. Set factWinners to an empty array unless supplied sources contain genuinely conflicting values for the same fact key; dates and LaTeX escaping are not conflicts. Apply a complete plan to the copy, inspect the edited copy, then submit that exact applied plan. The trusted pipeline performs compilation and later QA after submission.",
+    task: "Tailor the resume.",
     analysisId: attempt.input.analysis.id,
     analysisSha256,
     tailoringWorkflowSha256: TAILORING_WORKFLOW_SHA256,
@@ -166,7 +240,11 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
 
   const agent = new Agent({
     name: "resume-tailoring",
-    instructions: `Execute the trusted workflow below through Step 14. The canonical source is read-only: every reference to editing actual/resume-main/main.tex means editing the isolated working copy with read_working_tex and apply_tailoring_plan. Copy the supplied analysisId, analysisSha256, and tailoringWorkflowSha256 exactly into the plan. Use baselineInventory for exact stable IDs and cover every baseline bullet and skill in the plan. Use all relevant candidate context, cite evidence for every decision, and preserve analysis immutability. When factWinners is [], every decision factKeys array must also be []; every rewrite decision requires exactly one baselineOverride whose replacement equals the decision text and whose evidence supports it; every decision and skillDecision entityId identifies the owner of its cited evidence, never a stable skill ID. Set factWinners to [] unless the supplied sources contain genuinely conflicting values for the same fact key; project dates and TeX-escaped forms of the same value are not conflicts. Read the baseline copy, apply a complete plan, read the resulting copy, and call submit_tailoring_plan with that exact plan. Step 14 is a handoff requirement only: never invoke a shell or compiler; the trusted pipeline compiles after submission.\n\n${TAILORING_WORKFLOW_PROMPT}`,
+    instructions: `Tailor the resume using the workflow below, applying writing and prioritization guidance with judgment rather than mechanically. The runtime input provides immutable identifiers, the complete analysis, candidateContext, and baselineInventory.
+Mandatory: Keep content evidence-grounded and factually accurate; never invent claims, technologies, metrics, dates, tense, or completion status.
+Mandatory: Preserve exact IDs and hashes, cover every baseline bullet and skill, obey plan invariants (matching overrides for rewrites, factKeys only for genuine conflicting factWinners, and evidence-owner entityIds), follow read_working_tex → apply_tailoring_plan → read_working_tex → submit_tailoring_plan, and fit one page.
+
+${TAILORING_WORKFLOW_PROMPT}`,
     model: MODEL_NAME,
     modelSettings: {
       reasoning: { effort: "medium" },
