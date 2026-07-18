@@ -151,6 +151,7 @@ function humanize(value: string): string {
   return value.replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+
 function formatDate(timestamp: number): string {
   return DATE_TIME_FORMATTER.format(new Date(timestamp));
 }
@@ -270,13 +271,6 @@ function ArtifactState({ artifact, error, loading, label, children }: {
   return <>{children}</>;
 }
 
-const CLARITY_GATE_FIELDS = [
-  { key: "targetRoleOrArchetype", label: "Target role or archetype" },
-  { key: "strongestMatchingStackOrDomain", label: "Strongest matching stack or domain" },
-  { key: "productionOrBusinessOutcome", label: "Production or business outcome" },
-  { key: "appropriateLocationOrRemoteFit", label: "Location or remote fit" },
-  { key: "relevantPortfolioOrCaseStudyLink", label: "Portfolio or case study link" },
-] as const;
 
 const ATS_REVIEW_FIELDS = [
   { key: "parseableSingleColumnStructure", label: "Parseable single-column structure" },
@@ -357,11 +351,9 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
   const gaps = recordArray(analysis.gapsAndMitigations);
   const keywords = recordArray(analysis.keywordAlignment);
   const proposedContent = asRecord(analysis.proposedCvContent);
-  const professionalSummary = asRecord(proposedContent?.professionalSummary);
   const reorderedExperience = recordArray(proposedContent?.reorderedExperience);
   const bulletReviews = recordArray(analysis.businessValueBulletReview);
   const customizationPlan = recordArray(analysis.customizationPlan);
-  const recommendations = asRecord(analysis.rankedRecommendations);
 
   return (
     <div className={styles.artifactSections}>
@@ -473,7 +465,7 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
                 <li key={`${vocabulary}-${index}`}>
                   <div className={styles.findingHeading}>
                     <strong>{vocabulary}</strong>
-                    <span>{stringValue(item, "placement") ?? "Placement not reported"}</span>
+                    <span>{stringArray(item.placements).join(", ") || "Placements not reported"}</span>
                   </div>
                   <blockquote>{stringValue(item, "jdQuote") ?? "Job-description quote not reported"}</blockquote>
                   <AnalysisFacts rows={[
@@ -491,13 +483,8 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
       <section>
         <h4>Proposed CV content</h4>
         <section>
-          <h5>Professional summary</h5>
-          <p>{stringValue(professionalSummary, "text") ?? "Not reported"}</p>
-          <EvidenceIds value={professionalSummary?.evidenceIds} />
-        </section>
-        <section>
-          <h5>Core competencies ({recordArray(proposedContent?.coreCompetencies).length})</h5>
-          <EvidenceTextItems value={proposedContent?.coreCompetencies} emptyLabel="core competencies" />
+          <h5>Technical skills ({recordArray(proposedContent?.technicalSkills).length})</h5>
+          <EvidenceTextItems value={proposedContent?.technicalSkills} emptyLabel="technical skills" />
         </section>
         <section>
           <h5>Reordered experience ({reorderedExperience.length})</h5>
@@ -550,15 +537,6 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
         ) : <p className={styles.absent}>No business value bullet review was reported.</p>}
       </section>
 
-      <section>
-        <h4>Six-second clarity gate</h4>
-        <ReviewFindings
-          value={analysis.sixSecondClarityGate}
-          fields={CLARITY_GATE_FIELDS}
-          detailKey="evidenceOrRequiredRewrite"
-          detailLabel="Evidence or required rewrite"
-        />
-      </section>
 
       <section>
         <h4>ATS and truthfulness review</h4>
@@ -594,17 +572,6 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
         ) : <p className={styles.absent}>No customization plan was reported.</p>}
       </section>
 
-      <section>
-        <h4>Ranked recommendations</h4>
-        <section>
-          <h5>CV changes ({recordArray(recommendations?.cvChanges).length})</h5>
-          <EvidenceTextItems value={recommendations?.cvChanges} emptyLabel="CV changes" />
-        </section>
-        <section>
-          <h5>LinkedIn changes ({recordArray(recommendations?.linkedInChanges).length})</h5>
-          <EvidenceTextItems value={recommendations?.linkedInChanges} emptyLabel="LinkedIn changes" />
-        </section>
-      </section>
     </div>
   );
 }
@@ -1184,6 +1151,7 @@ export function RunDetail({ runId }: RunDetailProps) {
             </dl>
           </section>
 
+
           <section className={styles.paneSection} aria-labelledby="attempt-summary-heading">
             <div className={styles.sectionHeading}><h2 id="attempt-summary-heading">Attempt totals</h2><span>{attempts.length} attempts</span></div>
             <dl className={styles.countGrid}>
@@ -1336,10 +1304,11 @@ export function RunDetail({ runId }: RunDetailProps) {
               <ul className={styles.artifactDownloads}>
                 {[...downloadableArtifacts].sort((left, right) => left.kind.localeCompare(right.kind) || right.revision - left.revision).map((artifact) => {
                   const href = safeArtifactHref(artifact);
+                  const label = artifact.kind === "keyword-map-pdf" ? "Keyword Map PDF" : humanize(artifact.kind);
                   return (
                     <li key={artifact.id}>
-                      <div><strong>{humanize(artifact.kind)}</strong><span>Revision {artifact.revision} · Attempt {artifact.attempt} · {NUMBER_FORMATTER.format(artifact.bytes)} bytes</span></div>
-                      {href ? <a href={href} download aria-label={`Download ${humanize(artifact.kind)}, revision ${artifact.revision}`}><Icon name="download" /></a> : <span className={styles.unavailableDownload}>Unavailable</span>}
+                      <div><strong>{label}</strong><span>Revision {artifact.revision} · Attempt {artifact.attempt} · {NUMBER_FORMATTER.format(artifact.bytes)} bytes</span></div>
+                      {href ? <a href={href} download aria-label={`Download ${label}, revision ${artifact.revision}`}><Icon name="download" /></a> : <span className={styles.unavailableDownload}>Unavailable</span>}
                     </li>
                   );
                 })}

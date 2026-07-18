@@ -346,6 +346,7 @@
   font-size: var(--font-size-sm);
 }
 
+
 .metadataGrid {
   display: grid;
   margin: var(--space-5) 0 0;

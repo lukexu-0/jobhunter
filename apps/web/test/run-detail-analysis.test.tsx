@@ -46,12 +46,11 @@ const analysis = {
     jdQuote: "Build reliable agent orchestration",
     currentTruthfulCvWording: "Designed workflow coordination",
     recommendedReformulation: "Designed agent workflow orchestration",
-    placement: "Experience",
+    placements: ["Experience", "Technical Skills"],
     evidenceIds,
   }],
   proposedCvContent: {
-    professionalSummary: { text: "Staff engineer building reliable AI platforms", evidenceIds },
-    coreCompetencies: [{ text: "Agent platforms", evidenceIds }],
+    technicalSkills: [{ text: "Agent platforms", evidenceIds }],
     reorderedExperience: [{
       roleOrCompany: "Acme Platform Lead",
       bullets: [{ text: "Reduced deployment time by half", evidenceIds }],
@@ -67,13 +66,6 @@ const analysis = {
     outcomeOrProof: "Adopted by ten teams",
     evidenceIds,
   }],
-  sixSecondClarityGate: {
-    targetRoleOrArchetype: { status: "clear", evidenceOrRequiredRewrite: "Staff AI platform engineer is explicit", evidenceIds },
-    strongestMatchingStackOrDomain: { status: "clear", evidenceOrRequiredRewrite: "TypeScript platform stack is prominent", evidenceIds },
-    productionOrBusinessOutcome: { status: "revise", evidenceOrRequiredRewrite: "Move the adoption result higher", evidenceIds },
-    appropriateLocationOrRemoteFit: { status: "clear", evidenceOrRequiredRewrite: "Remote location is stated", evidenceIds },
-    relevantPortfolioOrCaseStudyLink: { status: "not-applicable", evidenceOrRequiredRewrite: "No public link is required", evidenceIds },
-  },
   atsAndTruthfulnessReview: {
     parseableSingleColumnStructure: { status: "pass", requiredAction: "Keep the single-column layout", evidenceIds },
     standardSectionHeaders: { status: "pass", requiredAction: "Keep standard headings", evidenceIds },
@@ -83,16 +75,12 @@ const analysis = {
     noUnsupportedSkillsOrMetrics: { status: "pass", requiredAction: "Keep metrics evidence-backed", evidenceIds },
   },
   customizationPlan: [{
-    section: "Summary",
-    currentStatus: "Too general",
-    proposedChange: "Name the agent platform focus",
+    section: "Experience",
+    currentStatus: "Strong evidence appears too late",
+    proposedChange: "Lead with the agent platform focus",
     why: "Makes role fit immediate",
     evidenceIds,
   }],
-  rankedRecommendations: {
-    cvChanges: [{ text: "Promote the model gateway bullet", evidenceIds }],
-    linkedInChanges: [{ text: "Add agent platforms to the headline", evidenceIds }],
-  },
 };
 
 const sectionHeadings = [
@@ -103,14 +91,12 @@ const sectionHeadings = [
   "Keyword alignment",
   "Proposed CV content",
   "Business value bullet review",
-  "Six-second clarity gate",
   "ATS and truthfulness review",
   "Customization plan",
-  "Ranked recommendations",
 ];
 
 describe("job analysis artifact rendering", () => {
-  test("renders all eleven structured sections and their key values", () => {
+  test("renders all nine structured sections and their key values", () => {
     const markup = renderToStaticMarkup(<AnalysisContent value={analysis} />);
 
     for (const heading of sectionHeadings) expect(markup).toContain(heading);
@@ -128,21 +114,17 @@ describe("job analysis artifact rendering", () => {
       "Published an auditability case study",
       "Agent orchestration",
       "Designed agent workflow orchestration",
-      "Staff engineer building reliable AI platforms",
       "Agent platforms",
       "Acme Platform Lead",
       "Reduced deployment time by half",
       "Model gateway case study",
       "Built a gateway serving ten teams",
       "Adopted by ten teams",
-      "Staff AI platform engineer is explicit",
-      "No public link is required",
       "Use agent wording only where supported",
       "Keep metrics evidence-backed",
-      "Name the agent platform focus",
+      "Lead with the agent platform focus",
       "Makes role fit immediate",
-      "Promote the model gateway bullet",
-      "Add agent platforms to the headline",
+      "Experience, Technical Skills",
       "evidence-1",
     ]) expect(markup).toContain(value);
   });
@@ -155,16 +137,13 @@ describe("job analysis artifact rendering", () => {
       gapsAndMitigations: {},
       keywordAlignment: [42],
       proposedCvContent: {
-        professionalSummary: [],
-        coreCompetencies: "not-an-array",
+        technicalSkills: "not-an-array",
         reorderedExperience: [{ bullets: "not-an-array" }],
         selectedProjects: null,
       },
       businessValueBulletReview: null,
-      sixSecondClarityGate: [],
       atsAndTruthfulnessReview: null,
       customizationPlan: 42,
-      rankedRecommendations: "not-a-record",
     };
 
     expect(() => renderToStaticMarkup(<AnalysisContent value={malformed} />)).not.toThrow();
