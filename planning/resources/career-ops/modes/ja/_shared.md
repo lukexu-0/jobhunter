@@ -258,7 +258,7 @@ _Extracted from writing-samples/ on {date}. Re-run if new samples are added._
 
 これらの rules は、candidate-facing documents に入るすべての generated text に適用する。PDF summaries、bullets、cover letters、form answers、LinkedIn messages。Internal evaluation reports には適用しない。
 
-Recruiter-side risk mapping、six-second clarity、business-value bullets、ATS reality checks については `modes/heuristics/recruiter-side.md` を読む。
+Recruiter-side risk mapping、business-value bullets、ATS reality checks については `modes/heuristics/recruiter-side.md` を読む。
 
 ### Avoid cliché phrases
 _`voice-dna.md` が存在する場合、その §3 Banned List が canonical でより完全な list になり、この fallback list より優先される。_

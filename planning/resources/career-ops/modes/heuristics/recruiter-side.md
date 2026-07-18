@@ -21,20 +21,6 @@ interview prep, create a small internal risk map:
 Use the map to reduce review risk. Do not print it unless the mode output
 explicitly asks for analysis. Never invent evidence to close a doubt.
 
-## Six-Second Clarity Gate
-
-For every CV/PDF and cover letter, the top third must make the target fit
-impossible to miss:
-
-- target role/archetype
-- strongest matching stack or domain
-- one production or business outcome
-- location/remote fit only when appropriate for that document
-- portfolio/case-study link when available and relevant
-
-If a recruiter must infer fit from scattered bullets, rewrite the summary and
-first experience bullets.
-
 ## Business-Value Bullets
 
 Prefer:
