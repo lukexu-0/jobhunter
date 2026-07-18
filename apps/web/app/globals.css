@@ -53,7 +53,6 @@
   --focus-offset: 0.1875rem;
   --control-height: 2.75rem;
   --transition-fast: 140ms ease-out;
-  --rail-width: 15.5rem;
   --nav-icon-size: 1.125rem;
   --provider-detail-min: 10rem;
   --table-min: 56rem;
@@ -79,9 +78,7 @@ body {
 }
 
 .app-shell {
-  display: grid;
   min-height: 100svh;
-  grid-template-columns: var(--rail-width) minmax(0, 1fr);
 }
 
 .app-shell__workspace {
@@ -91,51 +88,73 @@ body {
   container: route-workspace / inline-size;
 }
 
-.app-sidebar {
+.app-navigation {
   position: sticky;
   z-index: 40;
   top: 0;
-  width: var(--rail-width);
-  height: 100svh;
-  align-self: start;
-  overflow-y: auto;
-  border-right: var(--border-width) solid var(--color-border);
-  padding: var(--space-8) var(--space-4);
+  width: 100%;
+  height: var(--space-16);
   background: var(--color-surface);
 }
 
-.app-sidebar ul {
+.app-navigation nav,
+.app-navigation ul {
+  height: 100%;
+}
+
+.app-navigation ul {
   display: grid;
   margin: 0;
   padding: 0;
-  gap: var(--space-1);
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   list-style: none;
 }
 
-.app-sidebar a {
-  position: relative;
+.app-navigation li {
   display: flex;
-  min-height: var(--control-height);
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  color: var(--color-muted);
-  text-decoration: none;
+  min-width: 0;
+  height: 100%;
+  align-items: flex-end;
 }
 
-.app-sidebar a:hover {
+.app-navigation a {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: calc(100% - var(--space-3));
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  clip-path: polygon(var(--space-4) 0, calc(100% - var(--space-4)) 0, 100% 100%, 0 100%);
+  padding: var(--space-2) calc(var(--space-4) + var(--space-1));
+  background: var(--color-surface-raised);
+  box-shadow:
+    inset 0 var(--border-width) 0 var(--color-border),
+    inset var(--border-width) 0 0 var(--color-border),
+    inset calc(-1 * var(--border-width)) 0 0 var(--color-border);
+  color: var(--color-muted);
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    height var(--transition-fast),
+    background-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.app-navigation a:not([aria-current="page"]):hover {
   background: var(--color-surface-hover);
   color: var(--color-text);
 }
 
-.app-sidebar a[aria-current="page"] {
-  background: var(--color-surface-raised);
-  box-shadow: inset var(--focus-width) 0 0 var(--color-accent);
+.app-navigation a[aria-current="page"] {
+  z-index: 1;
+  height: calc(100% - var(--space-1));
+  background: var(--color-canvas);
   color: var(--color-text);
 }
 
-.app-sidebar svg {
+.app-navigation svg {
   width: var(--nav-icon-size);
   height: var(--nav-icon-size);
   flex: 0 0 auto;
@@ -699,11 +718,16 @@ a {
 
 .application-link {
   display: inline-flex;
-  flex-direction: column;
-  gap: var(--space-1);
   color: var(--color-text);
+  font-size: var(--font-size-lg);
   font-weight: 700;
   text-decoration: none;
+}
+
+.application-organization-name {
+  color: var(--color-text);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
 }
 
 .application-link:hover > span:first-child,
@@ -713,7 +737,6 @@ a {
   text-underline-offset: var(--space-1);
 }
 
-.application-link__id,
 .table-muted {
   color: var(--color-faint);
   font-size: var(--font-size-xs);
@@ -1188,47 +1211,6 @@ a {
   font-size: var(--font-size-xs);
 }
 
-@media (max-width: 48rem) {
-  .app-shell {
-    display: block;
-  }
-
-  .app-sidebar {
-    width: 100%;
-    height: 3rem;
-    overflow: visible;
-    border-right: 0;
-    border-bottom: var(--border-width) solid var(--color-border);
-    padding: 0;
-  }
-
-  .app-sidebar nav,
-  .app-sidebar ul {
-    height: 100%;
-  }
-
-  .app-sidebar ul {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0;
-    padding-inline: 0.5rem;
-  }
-
-  .app-sidebar li {
-    min-width: 0;
-  }
-
-  .app-sidebar a {
-    height: 100%;
-    min-width: 0;
-    min-height: 3rem;
-    justify-content: center;
-    white-space: nowrap;
-  }
-
-  .app-sidebar a[aria-current="page"] {
-    box-shadow: inset 0 calc(-1 * var(--focus-width)) 0 var(--color-accent);
-  }
-}
 
 @container route-workspace (max-width: 48rem) {
   .workspace {

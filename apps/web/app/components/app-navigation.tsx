@@ -29,13 +29,14 @@ function NavIcon({ name }: { readonly name: "applications" | "providers" }): Rea
   );
 }
 
-export function AppSidebar(): ReactNode {
+export function AppNavigation(): ReactNode {
   const pathname = usePathname();
-  const applicationsCurrent = pathname === "/" || pathname.startsWith("/runs/");
+  if (pathname.startsWith("/runs/")) return null;
+  const applicationsCurrent = pathname === "/";
   const providersCurrent = pathname === "/providers" || pathname.startsWith("/providers/");
 
   return (
-    <aside className="app-sidebar">
+    <header className="app-navigation">
       <nav aria-label="Primary navigation">
         <ul>
           <li>
@@ -52,6 +53,6 @@ export function AppSidebar(): ReactNode {
           </li>
         </ul>
       </nav>
-    </aside>
+    </header>
   );
 }

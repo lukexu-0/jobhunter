@@ -55,13 +55,13 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
   expect(widths.bodyScroll).toBeLessThanOrEqual(widths.rootClient);
 }
 
-async function expectHorizontalNavigation(page: Page, width: number, currentLabel: "Applications" | "Providers"): Promise<void> {
-  const sidebar = page.locator(".app-sidebar");
-  const sidebarBox = await sidebar.boundingBox();
-  if (!sidebarBox) throw new Error("Primary navigation geometry is unavailable");
-  expect(sidebarBox).toMatchObject({ x: 0, y: 0, width, height: 48 });
+async function expectFolderNavigation(page: Page, width: number, currentLabel: "Applications" | "Providers"): Promise<void> {
+  const strip = page.locator("header.app-navigation");
+  const stripBox = await strip.boundingBox();
+  if (!stripBox) throw new Error("Primary navigation geometry is unavailable");
+  expect(stripBox).toMatchObject({ x: 0, y: 0, width, height: 64 });
 
-  const sidebarStyle = await sidebar.evaluate((element) => {
+  const stripStyle = await strip.evaluate((element) => {
     const style = getComputedStyle(element);
     return {
       position: style.position,
@@ -69,28 +69,65 @@ async function expectHorizontalNavigation(page: Page, width: number, currentLabe
       borderBottomWidth: style.borderBottomWidth,
     };
   });
-  expect(sidebarStyle).toEqual({
+  expect(stripStyle).toEqual({
     position: "sticky",
     borderRightWidth: "0px",
-    borderBottomWidth: "1px",
+    borderBottomWidth: "0px",
   });
 
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
   const links = navigation.getByRole("link");
+  await expect(links).toHaveCount(2);
   const firstBox = await links.nth(0).boundingBox();
   const secondBox = await links.nth(1).boundingBox();
   if (!firstBox || !secondBox) throw new Error("Primary navigation links are unavailable");
   expect(Math.abs(firstBox.width - secondBox.width)).toBeLessThanOrEqual(1);
-  expect(firstBox.width + secondBox.width).toBe(width - 16);
-  const linkStyle = await links.nth(0).evaluate((element) => {
+  expect(firstBox.x).toBe(0);
+  expect(secondBox.x).toBe(firstBox.width);
+  expect(firstBox.width + secondBox.width).toBe(width);
+
+  const linkStyles = await links.evaluateAll((elements) => elements.map((element) => {
     const style = getComputedStyle(element);
-    return { justifyContent: style.justifyContent, whiteSpace: style.whiteSpace };
-  });
-  expect(linkStyle).toEqual({ justifyContent: "center", whiteSpace: "nowrap" });
+    return {
+      clipPath: style.clipPath,
+      justifyContent: style.justifyContent,
+      whiteSpace: style.whiteSpace,
+    };
+  }));
+  expect(linkStyles).toEqual([
+    {
+      clipPath: "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)",
+      justifyContent: "center",
+      whiteSpace: "nowrap",
+    },
+    {
+      clipPath: "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)",
+      justifyContent: "center",
+      whiteSpace: "nowrap",
+    },
+  ]);
 
   const current = navigation.getByRole("link", { name: currentLabel });
+  const inactive = navigation.getByRole("link", {
+    name: currentLabel === "Applications" ? "Providers" : "Applications",
+  });
   await expect(current).toHaveAttribute("aria-current", "page");
-  expect((await current.evaluate((element) => getComputedStyle(element).boxShadow))).toContain("0px -3px");
+  const currentBox = await current.boundingBox();
+  const inactiveBox = await inactive.boundingBox();
+  if (!currentBox || !inactiveBox) throw new Error("Primary navigation tab geometry is unavailable");
+  expect(inactiveBox.y - currentBox.y).toBe(8);
+  expect(currentBox.y + currentBox.height).toBe(stripBox.y + stripBox.height);
+  expect(inactiveBox.y + inactiveBox.height).toBe(stripBox.y + stripBox.height);
+}
+
+async function expectFullViewportRunDetail(page: Page, width: number): Promise<void> {
+  await expect(page.getByRole("navigation", { name: "Primary navigation" })).toHaveCount(0);
+  const workspaceBox = await page.locator(".app-shell__workspace").boundingBox();
+  const detailBox = await page.getByRole("main").boundingBox();
+  if (!workspaceBox || !detailBox) throw new Error("Run detail geometry is unavailable");
+  expect(workspaceBox).toMatchObject({ x: 0, width });
+  expect(detailBox).toMatchObject({ x: 0, width });
+  await expectNoDocumentOverflow(page);
 }
 
 function contrastRatio(foreground: string, background: string): number {
@@ -115,16 +152,14 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
 
   const heading = page.getByRole("heading", { name: "Applications" });
   const initializer = page.getByRole("form", { name: "Initialize application" });
-  const keywordMap = initializer.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
+  const keywordMap = initializer.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
   await expect(initializer).toBeVisible();
   await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
   await expect(initializer.getByLabel("Job posting URL")).toHaveAttribute("id", "job-url");
   await expect(keywordMap).toBeEnabled();
   await expect(keywordMap).toBeChecked();
-  await expect(keywordMap).toHaveAttribute("aria-describedby", "generate-keyword-map-help");
-  await expect(page.locator("#generate-keyword-map-help")).toHaveText(
-    "Creates a side-by-side visualization of your resume and the full job description.",
-  );
+  await expect(keywordMap).not.toHaveAttribute("aria-describedby");
+  await expect(page.locator("#generate-keyword-map-help")).toHaveCount(0);
   await expect(initializer.getByRole("textbox")).toHaveCount(1);
   await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
   await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.", { exact: true })).toBeVisible();
@@ -143,7 +178,7 @@ test("uses shared request eligibility and remains usable without overflow", asyn
     const initializer = page.getByRole("form", { name: "Initialize application" });
     const input = initializer.getByRole("textbox", { name: "Job posting URL" });
     const initialize = initializer.getByRole("button", { name: "Initialize" });
-    const keywordMap = initializer.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
+    const keywordMap = initializer.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
     await expect(input).toHaveAttribute("type", "url");
     await expect(input).toHaveAttribute("inputmode", "url");
     await expect(input).toHaveAttribute("autocapitalize", "none");
@@ -217,7 +252,7 @@ test("posts the canonical URL and default keyword map, disables while pending, a
   const initializer = page.getByRole("form", { name: "Initialize application" });
   const input = initializer.getByRole("textbox", { name: "Job posting URL" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
-  const keywordMap = initializer.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
+  const keywordMap = initializer.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
   await input.fill("HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description");
   await expect(keywordMap).toBeChecked();
   await initialize.click();
@@ -239,7 +274,7 @@ test("posts the canonical URL and default keyword map, disables while pending, a
   });
 
   await expect(page).toHaveURL(/\/runs\/initialized-run$/);
-  await expect(page.getByRole("heading", { name: "Run initialized-run" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
 });
 
 test("retains the URL and restores accessible controls after a fixed server failure", async ({ page }) => {
@@ -287,7 +322,7 @@ test("retains the URL and restores accessible controls after a fixed server fail
   await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
 
-  const keywordMap = page.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
+  const keywordMap = page.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
   await expect(keywordMap).toBeChecked();
   await keywordMap.uncheck();
   await expect(alert).toHaveCount(0);
@@ -308,48 +343,22 @@ test("retains the URL and restores accessible controls after a fixed server fail
   expect(postCount).toBe(2);
 });
 
-test("uppercases PDF only for the keyword-map artifact download", async ({ page }) => {
-  const artifactRun: RunDto = {
-    ...runFixture("artifact-run", "applied", "approved"),
-    artifacts: [
-      {
-        id: "compiled",
-        kind: "compiled-pdf",
-        revision: 1,
-        attempt: 1,
-        sha256: "a".repeat(64),
-        bytes: 1_024,
-        mediaType: "application/pdf",
-        href: "/v1/runs/artifact-run/artifacts/compiled",
-        public: true,
-        createdAt: 1_700_000_000_001,
-      },
-      {
-        id: "keyword-map",
-        kind: "keyword-map-pdf",
-        revision: 1,
-        attempt: 1,
-        sha256: "b".repeat(64),
-        bytes: 2_048,
-        mediaType: "application/pdf",
-        href: "/v1/runs/artifact-run/artifacts/keyword-map",
-        public: true,
-        createdAt: 1_700_000_000_002,
-      },
-    ],
+test("leaves the reserved review pane empty", async ({ page }) => {
+  const detailRun: RunDto = {
+    ...runFixture("empty-review-pane", "applied", "failed"),
+    revision: 3,
+    failureCode: "compiling",
   };
-  await page.route("**/api/pipeline/runs/artifact-run", async (route) => {
-    await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify(artifactRun),
-    });
+  await page.route("**/api/pipeline/runs/empty-review-pane", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
   });
 
-  await page.goto("/runs/artifact-run");
+  await page.goto("/runs/empty-review-pane");
 
-  await expect(page.getByText("Keyword Map PDF", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Download Keyword Map PDF, revision 1" })).toBeVisible();
-  await expect(page.getByText("Compiled Pdf", { exact: true })).toBeVisible();
+  const reviewPane = page.getByRole("complementary", { name: "Reserved review workspace" });
+  await expect(reviewPane).toBeVisible();
+  await expect(reviewPane).toBeEmpty();
+  await expect(page.getByRole("button", { name: "Retry failed run" })).toHaveCount(1);
 });
 
 test("filters by user-managed application state", async ({ page }) => {
@@ -450,6 +459,148 @@ test("shows application and pipeline status separately", async ({ page }) => {
   await expect(pipelineStatus).toHaveText("Failed");
 });
 
+test("removes primary navigation and gives run details the full viewport", async ({ page }) => {
+  const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
+  await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
+  });
+
+  for (const width of [1_672, 320]) {
+    await page.setViewportSize({ width, height: 941 });
+    await page.goto("/runs/lifecycle-detail");
+
+    await expectFullViewportRunDetail(page, width);
+  }
+});
+
+test("hides internal run and attempt metadata from the viewer", async ({ page }) => {
+  const detailRun: RunDto = {
+    ...runFixture("run-id-must-be-hidden", "rejected", "failed"),
+    revision: 3,
+    failureCode: "compiling",
+    attempts: [
+      {
+        id: "attempt-id-must-be-hidden",
+        stage: "compile",
+        revision: 3,
+        attempt: 2,
+        state: "failed",
+        toolCalls: 7,
+        compileCalls: 3,
+        startedAt: 1_700_000_000_000,
+        finishedAt: 1_700_000_001_000,
+        outcome: "compile failed",
+      },
+    ],
+  };
+  await page.route("**/api/pipeline/runs/run-id-must-be-hidden", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
+  });
+
+  await page.goto("/runs/run-id-must-be-hidden");
+  await expect(page.getByText("Application details", { exact: true })).toBeVisible();
+
+  await expect(page.getByText("run-id-must-be-hidden", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("Run ID", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Attempt totals", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Tool calls", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Compile calls", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Compile · attempt 2", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Current document", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("resume-revision-3.pdf", { exact: true })).toHaveCount(0);
+});
+
+test("runs the seven-stage workflow line through the Review marker", async ({ page }) => {
+  const detailRun: RunDto = {
+    ...runFixture("workflow-visual", "applied", "failed"),
+    revision: 3,
+    failureCode: "compiling",
+    attempts: [
+      {
+        id: "compile-attempt",
+        stage: "compile",
+        revision: 3,
+        attempt: 1,
+        state: "failed",
+        toolCalls: 0,
+        compileCalls: 1,
+        startedAt: 1_700_000_000_000,
+        finishedAt: 1_700_000_001_000,
+      },
+    ],
+  };
+  await page.route("**/api/pipeline/runs/workflow-visual", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
+  });
+
+  await page.goto("/runs/workflow-visual");
+
+  const workflow = page.getByRole("region", { name: "Workflow stage · revision 3" });
+  const stages = workflow.getByRole("listitem");
+  await expect(stages.locator("span:last-child")).toHaveText([
+    "Analysis",
+    "Tailoring",
+    "Editing",
+    "Compile",
+    "Deterministic QA",
+    "Visual QA",
+    "Review",
+  ]);
+
+  const completed = await stages.nth(2).evaluate((element) => {
+    const marker = element.firstElementChild;
+    if (!marker) throw new Error("Completed stage marker is missing");
+    const connectorStyle = getComputedStyle(element, "::after");
+    const markerStyle = getComputedStyle(marker);
+    return {
+      connectorColor: connectorStyle.backgroundColor,
+      connectorHeight: connectorStyle.height,
+      markerBackground: markerStyle.backgroundColor,
+      markerBorder: markerStyle.borderColor,
+    };
+  });
+  expect(completed).toEqual({
+    connectorColor: "rgb(134, 215, 157)",
+    connectorHeight: "3px",
+    markerBackground: "rgb(134, 215, 157)",
+    markerBorder: "rgb(134, 215, 157)",
+  });
+
+  const incomplete = await stages.nth(3).evaluate((element) => {
+    const marker = element.firstElementChild;
+    if (!marker) throw new Error("Incomplete stage marker is missing");
+    const connectorStyle = getComputedStyle(element, "::after");
+    const markerStyle = getComputedStyle(marker);
+    return {
+      connectorColor: connectorStyle.backgroundColor,
+      connectorHeight: connectorStyle.height,
+      markerBorder: markerStyle.borderColor,
+      markerOutline: markerStyle.outlineStyle,
+    };
+  });
+  expect(incomplete).toEqual({
+    connectorColor: "rgb(117, 126, 121)",
+    connectorHeight: "3px",
+    markerBorder: "rgb(117, 126, 121)",
+    markerOutline: "none",
+  });
+
+  const reviewLineDelta = await stages.evaluateAll((elements) => {
+    const visualQa = elements.at(-2);
+    const reviewMarker = elements.at(-1)?.firstElementChild;
+    if (!visualQa || !reviewMarker) throw new Error("Review connector geometry is unavailable");
+    const visualQaBox = visualQa.getBoundingClientRect();
+    const connectorStyle = getComputedStyle(visualQa, "::after");
+    const reviewMarkerBox = reviewMarker.getBoundingClientRect();
+    const connectorEnd = visualQaBox.left
+      + Number.parseFloat(connectorStyle.left)
+      + Number.parseFloat(connectorStyle.width);
+    const reviewCenter = reviewMarkerBox.left + reviewMarkerBox.width / 2;
+    return Math.abs(connectorEnd - reviewCenter);
+  });
+  expect(reviewLineDelta).toBeLessThanOrEqual(1);
+});
+
 
 test("navigates between Applications and Providers", async ({ page }) => {
   await interceptRuns(page);
@@ -488,38 +639,27 @@ test("navigates between Applications and Providers", async ({ page }) => {
   await expect(providerRows.nth(0)).toContainText("OAuth access for tailoring and fallback job-posting extraction.");
 });
 
-test("uses the reference-width sidebar and full display workspace", async ({ page }) => {
-  await page.setViewportSize({ width: 1_672, height: 941 });
+test("uses full-width physical folder tabs at desktop and narrow widths", async ({ page }) => {
   await interceptRuns(page);
-  await page.goto("/");
 
-  const sidebarBox = await page.locator(".app-sidebar").boundingBox();
-  const shellWorkspaceBox = await page.locator(".app-shell__workspace").boundingBox();
-  const workspaceBox = await page.locator(".workspace").boundingBox();
-  const contentBox = await page.locator(".applications-header").boundingBox();
-  if (!sidebarBox || !shellWorkspaceBox || !workspaceBox || !contentBox) {
-    throw new Error("Application shell geometry is unavailable");
+  for (const width of [1_672, 320]) {
+    await page.setViewportSize({ width, height: 941 });
+    await page.goto("/");
+
+    await expectFolderNavigation(page, width, "Applications");
+    const shellWorkspaceBox = await page.locator(".app-shell__workspace").boundingBox();
+    const workspaceBox = await page.locator(".workspace").boundingBox();
+    if (!shellWorkspaceBox || !workspaceBox) {
+      throw new Error("Application workspace geometry is unavailable");
+    }
+    expect(shellWorkspaceBox).toMatchObject({ x: 0, y: 64, width });
+    expect(workspaceBox).toMatchObject({ x: 0, width });
+    await expect(page.getByText("Resume tailoring", { exact: true })).toHaveCount(0);
+    await expectNoDocumentOverflow(page);
   }
-
-  expect(sidebarBox.width).toBe(248);
-  expect(shellWorkspaceBox.x).toBe(248);
-  expect(shellWorkspaceBox.width).toBe(1_424);
-  expect(workspaceBox.x).toBe(248);
-  expect(workspaceBox.width).toBe(1_424);
-  expect(contentBox.x).toBe(288);
-  expect(contentBox.x + contentBox.width).toBe(1_632);
-  await expect(page.getByText("Resume tailoring", { exact: true })).toHaveCount(0);
-
-  const overflow = await page.evaluate(() => ({
-    rootWidth: document.documentElement.scrollWidth,
-    rootClientWidth: document.documentElement.clientWidth,
-    bodyWidth: document.body.scrollWidth,
-  }));
-  expect(overflow.rootWidth).toBe(overflow.rootClientWidth);
-  expect(overflow.bodyWidth).toBeLessThanOrEqual(overflow.rootClientWidth);
 });
 
-test("uses horizontal navigation and local scrollers on narrow displays", async ({ page }) => {
+test("uses folder navigation and local scrollers on narrow displays", async ({ page }) => {
   test.setTimeout(60_000);
   await interceptRuns(page);
   const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
@@ -542,7 +682,7 @@ test("uses horizontal navigation and local scrollers on narrow displays", async 
     await page.setViewportSize({ width, height: 900 });
 
     await page.goto("/");
-    await expectHorizontalNavigation(page, width, "Applications");
+    await expectFolderNavigation(page, width, "Applications");
     await expectNoDocumentOverflow(page);
     const tableScroller = page.locator(".applications-table-scroll");
     expect(await tableScroller.evaluate((element) => getComputedStyle(element).overflowX)).toBe("auto");
@@ -551,7 +691,7 @@ test("uses horizontal navigation and local scrollers on narrow displays", async 
     );
 
     await page.goto("/providers");
-    await expectHorizontalNavigation(page, width, "Providers");
+    await expectFolderNavigation(page, width, "Providers");
     await expectNoDocumentOverflow(page);
     const providerRow = page.locator(".provider-row").first();
     expect(await providerRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(1);
@@ -561,8 +701,7 @@ test("uses horizontal navigation and local scrollers on narrow displays", async 
     expect(providerRowBox.x + providerRowBox.width).toBeLessThanOrEqual(providerWorkspaceBox.x + providerWorkspaceBox.width);
 
     await page.goto("/runs/lifecycle-detail");
-    await expectHorizontalNavigation(page, width, "Applications");
-    await expectNoDocumentOverflow(page);
+    await expectFullViewportRunDetail(page, width);
     const stageList = page.locator('[class*="stageList"]').first();
     const viewerCanvas = page.locator('[class*="viewerCanvas"]').first();
     expect(await stageList.evaluate((element) => getComputedStyle(element).overflowX)).toBe("auto");
@@ -614,9 +753,9 @@ test("uses the original dark palette across surfaces and states", async ({ page 
   expect(rootStyle.tokens).toEqual(expectedColors);
 
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-canvas"]));
-  expect(await page.locator(".app-sidebar").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-surface"]));
+  expect(await page.locator(".app-navigation").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-surface"]));
   const applicationsLink = page.getByRole("link", { name: "Applications" });
-  expect(await applicationsLink.evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-surface-raised"]));
+  expect(await applicationsLink.evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-canvas"]));
   expect(await page.locator(".search-control").evaluate((element) => getComputedStyle(element).borderColor)).toBe(cssRgb(expectedColors["--color-border-strong"]));
 
   await applicationsLink.focus();
@@ -680,7 +819,7 @@ test("uses route-workspace breakpoints for detail panes", async ({ page }) => {
   expect(wideGeometry.width / wideGeometry.rootFontSize).toBeGreaterThan(78);
   expect(await page.locator('[class*="paneGrid"]').evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(3);
 
-  await page.setViewportSize({ width: 1_440, height: 941 });
+  await page.setViewportSize({ width: 1_248, height: 941 });
   await page.goto("/runs/lifecycle-detail");
   const narrowGeometry = await page.locator(".app-shell__workspace").evaluate((workspace) => ({
     width: workspace.getBoundingClientRect().width,

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
-import { AppSidebar } from "./components/app-sidebar";
+import { AppNavigation } from "./components/app-navigation";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -13,7 +13,7 @@ export default function RootLayout({ children }: Readonly<{ children: ReactNode 
     <html lang="en">
       <body>
         <div className="app-shell">
-          <AppSidebar />
+          <AppNavigation />
           <div className="app-shell__workspace">{children}</div>
         </div>
       </body>

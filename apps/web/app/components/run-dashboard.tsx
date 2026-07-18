@@ -294,7 +294,7 @@ export function RunDashboard() {
             }}
           />
           <label className="run-initializer__option-label" htmlFor="generate-keyword-map">
-            Generate resume to job Description keyword map
+            Generate resume-to-job-description keyword map
           </label>
         </div>
 
@@ -421,10 +421,9 @@ export function RunDashboard() {
                         <td>
                           <Link className="application-link" href={href} aria-label={`Open ${identity?.title ?? "tailoring run"} ${shortRunId(run.id)}`}>
                             <span>{identity?.title ?? "Tailoring run"}</span>
-                            <span className="application-link__id">{shortRunId(run.id)}</span>
                           </Link>
                         </td>
-                        <td>{identity?.organization ?? <span className="table-muted">Not available</span>}</td>
+                        <td>{identity?.organization ? <span className="application-organization-name">{identity.organization}</span> : <span className="table-muted">Not available</span>}</td>
                         <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
                         <td>
                           <select
