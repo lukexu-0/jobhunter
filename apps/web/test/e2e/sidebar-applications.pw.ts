@@ -1,5 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
-import type { ApplicationStatus, RunDto, RunStatus } from "@jobhunter/pipeline/contracts";
+import { expect, test, type Page, type Route } from "@playwright/test";
+import { type ApplicationStatus, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
 
 function runFixture(id: string, applicationStatus: ApplicationStatus, status: RunStatus): RunDto {
   return {
@@ -109,32 +109,41 @@ function cssRgb(hex: string): string {
   return `rgb(${Number.parseInt(hex.slice(1, 3), 16)}, ${Number.parseInt(hex.slice(3, 5), 16)}, ${Number.parseInt(hex.slice(5, 7), 16)})`;
 }
 
-test("shows the always-visible URL initializer for an empty dashboard", async ({ page }) => {
+test("shows the controlled initializer for an empty dashboard", async ({ page }) => {
   await interceptEmptyRuns(page);
   await page.goto("/");
 
   const heading = page.getByRole("heading", { name: "Applications" });
-  const initializer = page.getByRole("form", { name: "Job posting URL" });
+  const initializer = page.getByRole("form", { name: "Initialize application" });
+  const keywordMap = initializer.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
   await expect(initializer).toBeVisible();
   await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
   await expect(initializer.getByLabel("Job posting URL")).toHaveAttribute("id", "job-url");
+  await expect(keywordMap).toBeEnabled();
+  await expect(keywordMap).toBeChecked();
+  await expect(keywordMap).toHaveAttribute("aria-describedby", "generate-keyword-map-help");
+  await expect(page.locator("#generate-keyword-map-help")).toHaveText(
+    "Creates a side-by-side visualization of your resume and the full job description.",
+  );
+  await expect(initializer.getByRole("textbox")).toHaveCount(1);
   await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
   await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.", { exact: true })).toBeVisible();
 
   await expect(page.getByRole("button", { name: /^(New|Close|Create run|Create first application|Cancel)$/ })).toHaveCount(0);
-  await expect(page.locator("textarea")).toHaveCount(0);
   await expect(page.locator(".run-composer")).toHaveCount(0);
 });
 
-test("uses shared URL eligibility and stays horizontal without overflow", async ({ page }) => {
+test("uses shared request eligibility and remains usable without overflow", async ({ page }) => {
   await interceptEmptyRuns(page);
 
   for (const width of [1_672, 320]) {
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/");
 
-    const input = page.getByRole("textbox", { name: "Job posting URL" });
-    const initialize = page.getByRole("button", { name: "Initialize" });
+    const initializer = page.getByRole("form", { name: "Initialize application" });
+    const input = initializer.getByRole("textbox", { name: "Job posting URL" });
+    const initialize = initializer.getByRole("button", { name: "Initialize" });
+    const keywordMap = initializer.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
     await expect(input).toHaveAttribute("type", "url");
     await expect(input).toHaveAttribute("inputmode", "url");
     await expect(input).toHaveAttribute("autocapitalize", "none");
@@ -146,33 +155,39 @@ test("uses shared URL eligibility and stays horizontal without overflow", async 
       await input.fill(invalidUrl);
       await expect(initialize).toBeDisabled();
     }
+    await keywordMap.check();
+    await expect(initialize).toBeDisabled();
     await input.fill("https://jobs.example.test/roles/123");
     await expect(initialize).toBeEnabled();
 
-    const formBox = await page.getByRole("form", { name: "Job posting URL" }).boundingBox();
+    const formBox = await initializer.boundingBox();
     const inputBox = await input.boundingBox();
     const buttonBox = await initialize.boundingBox();
-    if (!formBox || !inputBox || !buttonBox) throw new Error("Initializer geometry is unavailable");
+    const optionBox = await keywordMap.locator("xpath=..").boundingBox();
+    if (!formBox || !inputBox || !buttonBox || !optionBox) throw new Error("Initializer geometry is unavailable");
     expect(inputBox.x).toBe(formBox.x);
-    expect(buttonBox.x + buttonBox.width).toBe(formBox.x + formBox.width);
-    expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(buttonBox.x);
-    expect(inputBox.y).toBe(buttonBox.y);
-    expect(inputBox.height).toBe(buttonBox.height);
+    expect(optionBox.x).toBe(formBox.x);
+    expect(optionBox.width).toBe(formBox.width);
+    expect(optionBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height);
+    if (width > 560) {
+      expect(buttonBox.x + buttonBox.width).toBe(formBox.x + formBox.width);
+      expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(buttonBox.x);
+    } else {
+      expect(buttonBox.x).toBe(formBox.x);
+      expect(buttonBox.width).toBe(formBox.width);
+      expect(buttonBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height);
+      expect(buttonBox.y).toBeGreaterThanOrEqual(optionBox.y + optionBox.height);
+    }
     await expectNoDocumentOverflow(page);
   }
 });
 
-test("posts a canonical URL, disables while pending, and navigates on success", async ({ page }) => {
+
+test("posts the canonical URL and default keyword map, disables while pending, and navigates on success", async ({ page }) => {
   const initializedRun = runFixture("initialized-run", "applied", "failed");
   let postedBody: string | null = null;
-  let releasePost!: () => void;
-  let markPostStarted!: () => void;
-  const postRelease = new Promise<void>((resolve) => {
-    releasePost = resolve;
-  });
-  const postStarted = new Promise<void>((resolve) => {
-    markPostStarted = resolve;
-  });
+  let pendingPost: Route | undefined;
+  const { promise: postStarted, resolve: markPostStarted } = Promise.withResolvers<void>();
 
   await page.route("**/api/pipeline/runs", async (route) => {
     const request = route.request();
@@ -187,13 +202,8 @@ test("posts a canonical URL, disables while pending, and navigates on success", 
     expect(request.method()).toBe("POST");
     expect(request.headers()["content-type"]).toContain("application/json");
     postedBody = request.postData();
+    pendingPost = route;
     markPostStarted();
-    await postRelease;
-    await route.fulfill({
-      status: 201,
-      contentType: "application/json",
-      body: JSON.stringify(initializedRun),
-    });
   });
   await page.route("**/api/pipeline/runs/initialized-run", async (route) => {
     expect(route.request().method()).toBe("GET");
@@ -204,23 +214,37 @@ test("posts a canonical URL, disables while pending, and navigates on success", 
   });
   await page.goto("/");
 
-  const input = page.getByRole("textbox", { name: "Job posting URL" });
-  const initialize = page.getByRole("button", { name: "Initialize" });
+  const initializer = page.getByRole("form", { name: "Initialize application" });
+  const input = initializer.getByRole("textbox", { name: "Job posting URL" });
+  const initialize = initializer.getByRole("button", { name: "Initialize" });
+  const keywordMap = initializer.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
   await input.fill("HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description");
+  await expect(keywordMap).toBeChecked();
   await initialize.click();
   await postStarted;
 
-  expect(postedBody).toBe('{"jobUrl":"https://jobs.example.test/roles/123?source=ui"}');
+  expect(postedBody).toBe(JSON.stringify({
+    jobUrl: "https://jobs.example.test/roles/123?source=ui",
+    generateKeywordMap: true,
+  }));
   await expect(input).toBeDisabled();
+  await expect(keywordMap).toBeDisabled();
   await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
 
-  releasePost();
+  if (!pendingPost) throw new Error("Initialize request was not intercepted");
+  await pendingPost.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify(initializedRun),
+  });
+
   await expect(page).toHaveURL(/\/runs\/initialized-run$/);
   await expect(page.getByRole("heading", { name: "Run initialized-run" })).toBeVisible();
 });
 
 test("retains the URL and restores accessible controls after a fixed server failure", async ({ page }) => {
   const submittedUrl = "https://jobs.example.test/unavailable#details";
+  let postCount = 0;
   await page.route("**/api/pipeline/runs", async (route) => {
     const request = route.request();
     if (request.method() === "GET") {
@@ -232,7 +256,11 @@ test("retains the URL and restores accessible controls after a fixed server fail
     }
 
     expect(request.method()).toBe("POST");
-    expect(request.postData()).toBe('{"jobUrl":"https://jobs.example.test/unavailable"}');
+    postCount += 1;
+    expect(request.postDataJSON()).toEqual({
+      jobUrl: "https://jobs.example.test/unavailable",
+      generateKeywordMap: postCount === 1,
+    });
     await route.fulfill({
       status: 422,
       contentType: "application/json",
@@ -259,11 +287,69 @@ test("retains the URL and restores accessible controls after a fixed server fail
   await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
 
+  const keywordMap = page.getByRole("checkbox", { name: "Generate keyword map PDF", exact: true });
+  await expect(keywordMap).toBeChecked();
+  await keywordMap.uncheck();
+  await expect(alert).toHaveCount(0);
+  await expect(input).toHaveValue(submittedUrl);
+  await expect(input).not.toHaveAttribute("aria-invalid");
+  await expect(input).not.toHaveAttribute("aria-describedby");
+  await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
+
+  await page.getByRole("button", { name: "Initialize" }).click();
+  await expect(alert).toBeVisible();
+  await expect(keywordMap).not.toBeChecked();
+
   await input.fill("https://jobs.example.test/another-role");
   await expect(alert).toHaveCount(0);
   await expect(input).not.toHaveAttribute("aria-invalid");
   await expect(input).not.toHaveAttribute("aria-describedby");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
+  expect(postCount).toBe(2);
+});
+
+test("uppercases PDF only for the keyword-map artifact download", async ({ page }) => {
+  const artifactRun: RunDto = {
+    ...runFixture("artifact-run", "applied", "approved"),
+    artifacts: [
+      {
+        id: "compiled",
+        kind: "compiled-pdf",
+        revision: 1,
+        attempt: 1,
+        sha256: "a".repeat(64),
+        bytes: 1_024,
+        mediaType: "application/pdf",
+        href: "/v1/runs/artifact-run/artifacts/compiled",
+        public: true,
+        createdAt: 1_700_000_000_001,
+      },
+      {
+        id: "keyword-map",
+        kind: "keyword-map-pdf",
+        revision: 1,
+        attempt: 1,
+        sha256: "b".repeat(64),
+        bytes: 2_048,
+        mediaType: "application/pdf",
+        href: "/v1/runs/artifact-run/artifacts/keyword-map",
+        public: true,
+        createdAt: 1_700_000_000_002,
+      },
+    ],
+  };
+  await page.route("**/api/pipeline/runs/artifact-run", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(artifactRun),
+    });
+  });
+
+  await page.goto("/runs/artifact-run");
+
+  await expect(page.getByText("Keyword Map PDF", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Download Keyword Map PDF, revision 1" })).toBeVisible();
+  await expect(page.getByText("Compiled Pdf", { exact: true })).toBeVisible();
 });
 
 test("filters by user-managed application state", async ({ page }) => {
@@ -344,7 +430,7 @@ test("retains application state when an update fails", async ({ page }) => {
   await expect(page.getByRole("alert", { name: "Application state update error" })).toContainText("Application state could not be updated. Try again.");
 });
 
-test("shows application and pipeline status separately on run detail", async ({ page }) => {
+test("shows application and pipeline status separately", async ({ page }) => {
   const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
   await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
     expect(route.request().method()).toBe("GET");
@@ -355,13 +441,15 @@ test("shows application and pipeline status separately on run detail", async ({ 
   });
   await page.goto("/runs/lifecycle-detail");
 
-  const metadata = page.getByRole("complementary", { name: "Run metadata and history" }).locator("dl").first();
+  const metadataPane = page.getByRole("complementary", { name: "Run metadata and history" });
+  const metadata = metadataPane.locator("dl").first();
   const applicationStatus = metadata.locator("dt").filter({ hasText: /^Application status$/ }).locator("..").locator("dd");
   const pipelineStatus = metadata.locator("dt").filter({ hasText: /^Pipeline status$/ }).locator("..").locator("dd");
 
   await expect(applicationStatus).toHaveText("Rejected");
   await expect(pipelineStatus).toHaveText("Failed");
 });
+
 
 test("navigates between Applications and Providers", async ({ page }) => {
   await interceptRuns(page);

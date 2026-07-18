@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { ArtifactDto, RunDto, RunStatus } from "@jobhunter/pipeline/contracts";
+import { type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
 import {
   PipelineClientError,
   approveRun,
@@ -134,7 +134,10 @@ describe("pipeline run requests", () => {
       {
         input: "/api/pipeline/runs",
         init: {
-          body: JSON.stringify({ jobUrl: "https://jobs.example.test/roles/Platform" }),
+          body: JSON.stringify({
+            jobUrl: "https://jobs.example.test/roles/Platform",
+            generateKeywordMap: true,
+          }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
           method: "POST",
@@ -155,6 +158,28 @@ describe("pipeline run requests", () => {
       {
         input: "/api/pipeline/runs/one%2Ftwo%20%3F/approve",
         init: { body: JSON.stringify({ expectedPdfSha256: sha256, acknowledgeVisualIssues: true }), cache: "no-store", headers: { "content-type": "application/json" }, method: "POST" },
+      },
+    ]);
+  });
+
+  test("forwards an explicit keyword-map opt out", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(json(run()), requests);
+
+    await createRun("https://jobs.example.test/roles/platform", false);
+
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/runs",
+        init: {
+          body: JSON.stringify({
+            jobUrl: "https://jobs.example.test/roles/platform",
+            generateKeywordMap: false,
+          }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
       },
     ]);
   });
@@ -187,6 +212,7 @@ describe("pipeline run requests", () => {
     }
     expect(fetchCalls).toBe(0);
   });
+
 
   test("rejects a successful response that does not match its public schema", async () => {
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];

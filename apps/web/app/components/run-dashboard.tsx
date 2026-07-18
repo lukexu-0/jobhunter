@@ -107,12 +107,17 @@ export function RunDashboard() {
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [jobUrl, setJobUrl] = useState("");
+  const [generateKeywordMap, setGenerateKeywordMap] = useState(true);
   const [createError, setCreateError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
   const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
   const requestedArtifacts = useRef(new Set<string>());
-  const isJobUrlValid = CreateRunRequestSchema.safeParse({ jobUrl }).success;
+  const createRunRequest = useMemo(
+    () => CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap }),
+    [generateKeywordMap, jobUrl],
+  );
+  const isCreateRequestValid = createRunRequest.success;
 
   const load = useCallback(async (initial = false) => {
     if (initial) setIsLoading(true);
@@ -228,12 +233,12 @@ export function RunDashboard() {
 
   const submitRun = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (isCreating || !CreateRunRequestSchema.safeParse({ jobUrl }).success) return;
+    if (isCreating || !createRunRequest.success) return;
 
     setIsCreating(true);
     setCreateError(null);
     try {
-      const run = await createRun(jobUrl);
+      const run = await createRun(createRunRequest.data.jobUrl, createRunRequest.data.generateKeywordMap);
       router.push(`/runs/${encodeURIComponent(run.id)}`);
     } catch (error) {
       setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
@@ -252,32 +257,55 @@ export function RunDashboard() {
 
       <form
         className="run-initializer"
-        aria-label="Job posting URL"
+        aria-label="Initialize application"
         noValidate
         onSubmit={(event) => void submitRun(event)}
       >
-        <label className="visually-hidden" htmlFor="job-url">Job posting URL</label>
-        <input
-          id="job-url"
-          type="url"
-          inputMode="url"
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-          placeholder="https://company.com/jobs/role"
-          value={jobUrl}
-          disabled={isCreating}
-          aria-invalid={createError ? true : undefined}
-          aria-describedby={createError ? "job-url-error" : undefined}
-          onChange={(event) => {
-            setJobUrl(event.target.value);
-            setCreateError(null);
-          }}
-        />
+        <div className="run-initializer__field">
+          <label className="run-initializer__label" htmlFor="job-url">Job posting URL</label>
+          <input
+            id="job-url"
+            type="url"
+            inputMode="url"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            placeholder="https://company.com/jobs/role"
+            value={jobUrl}
+            disabled={isCreating}
+            aria-invalid={createError ? true : undefined}
+            aria-describedby={createError ? "job-url-error" : undefined}
+            aria-errormessage={createError ? "job-url-error" : undefined}
+            onChange={(event) => {
+              setJobUrl(event.target.value);
+              setCreateError(null);
+            }}
+          />
+        </div>
+        <div className="run-initializer__option">
+          <input
+            id="generate-keyword-map"
+            type="checkbox"
+            checked={generateKeywordMap}
+            disabled={isCreating}
+            aria-describedby="generate-keyword-map-help"
+            onChange={(event) => {
+              setGenerateKeywordMap(event.target.checked);
+              setCreateError(null);
+            }}
+          />
+          <div className="run-initializer__option-copy">
+            <label className="run-initializer__option-label" htmlFor="generate-keyword-map">Generate keyword map PDF</label>
+            <p className="run-initializer__option-help" id="generate-keyword-map-help">
+              Creates a side-by-side visualization of your resume and the full job description.
+            </p>
+          </div>
+        </div>
+
         <button
           className="square-control square-control--primary"
           type="submit"
-          disabled={isCreating || !isJobUrlValid}
+          disabled={isCreating || !isCreateRequestValid}
         >
           {isCreating ? "Initializing…" : "Initialize"}
         </button>

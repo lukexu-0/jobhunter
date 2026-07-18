@@ -171,8 +171,8 @@ export function updateApplicationStatus(
   });
 }
 
-export function createRun(jobUrl: string): Promise<RunDto> {
-  const parsed = CreateRunRequestSchema.safeParse({ jobUrl });
+export function createRun(jobUrl: string, generateKeywordMap = true): Promise<RunDto> {
+  const parsed = CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap });
   if (!parsed.success) {
     throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
   }
