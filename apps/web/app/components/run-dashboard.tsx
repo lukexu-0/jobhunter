@@ -309,8 +309,8 @@ export function RunDashboard() {
       </form>
 
         <section className="applications-summary" aria-label="Application count">
-          <p className="applications-label">Total applications</p>
           <p className="applications-total">{isLoading || (loadError && runs.length === 0) ? "—" : runs.length.toLocaleString()}</p>
+          <p className="applications-label">Total applications</p>
         </section>
 
         <section className="applications-list" aria-labelledby="applications-list-heading">
