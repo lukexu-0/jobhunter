@@ -107,3 +107,26 @@ test("places the total count before its bottom-aligned label", async ({ page }) 
   expect(totalBox.x + totalBox.width).toBeLessThanOrEqual(labelBox.x);
   expect(Math.abs(totalBox.y + totalBox.height - (labelBox.y + labelBox.height))).toBeLessThanOrEqual(1);
 });
+
+test("scrolls the applications table locally only when five columns do not fit", async ({ page }) => {
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [runFixture()] }),
+    });
+  });
+
+  await page.setViewportSize({ width: 1_280, height: 900 });
+  await page.goto("/");
+  const scroller = page.locator(".applications-table-scroll");
+  await expect(scroller).toBeVisible();
+  expect(await scroller.evaluate((element) => element.scrollWidth)).toBe(
+    await scroller.evaluate((element) => element.clientWidth),
+  );
+
+  await page.setViewportSize({ width: 768, height: 900 });
+  expect(await scroller.evaluate((element) => getComputedStyle(element).overflowX)).toBe("auto");
+  expect(await scroller.evaluate((element) => element.scrollWidth)).toBeGreaterThan(
+    await scroller.evaluate((element) => element.clientWidth),
+  );
+});
