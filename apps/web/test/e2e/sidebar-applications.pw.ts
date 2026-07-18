@@ -492,6 +492,31 @@ test("hides internal run and attempt metadata from the viewer", async ({ page })
         outcome: "compile failed",
       },
     ],
+    timeline: [
+      {
+        id: 1,
+        type: "run.failed",
+        status: "failed",
+        revision: 3,
+        at: 1_700_000_001_000,
+        detail: {
+          runId: "run-id-must-be-hidden",
+          reason: "compile failed",
+        },
+      },
+      {
+        id: 2,
+        type: "attempt.finished",
+        status: "failed",
+        revision: 3,
+        at: 1_700_000_001_001,
+        detail: {
+          attemptId: "attempt-id-must-be-hidden",
+          toolCount: 7,
+          compileCount: 3,
+        },
+      },
+    ],
   };
   await page.route("**/api/pipeline/runs/run-id-must-be-hidden", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
@@ -506,6 +531,11 @@ test("hides internal run and attempt metadata from the viewer", async ({ page })
   await expect(page.getByText("Tool calls", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Compile calls", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Compile · attempt 2", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Attempt.Finished", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("attempt-id-must-be-hidden", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("ToolCount", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("CompileCount", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Run timeline" }).getByRole("listitem")).toHaveCount(1);
   await expect(page.getByText("Current document", { exact: true })).toHaveCount(0);
   await expect(page.getByText("resume-revision-3.pdf", { exact: true })).toHaveCount(0);
 });

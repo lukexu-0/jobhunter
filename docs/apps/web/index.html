@@ -66,30 +66,26 @@
       <h2>Opened-run review workspace</h2>
       <p>Opening a table row navigates to <code>/runs/{runId}</code>. The detail page refreshes active work every 2.5 seconds and renders a three-pane workspace:</p>
       <ol>
-        <li><strong>Left pane:</strong> run summary, the ordered workflow band, a timestamped run timeline, and job analysis.</li>
-        <li><strong>Center pane:</strong> the current review PDF, page-image visual overlays when QA supplied bounding boxes, zoom controls from 75% to 150% in 25% increments, Fit page, and PDF download/fallback.</li>
-        <li><strong>Right pane:</strong> review actions; visual and deterministic QA; source-cited changes; evidence ledger; edit dispositions; repair report; and the public-artifact download list.</li>
+        <li><strong>Left pane:</strong> application and pipeline status, revision metadata, a timestamped public run timeline, and job analysis. Internal run identifiers, attempt histories, attempt timeline events, attempt totals, and tool or compile call counts are not displayed.</li>
+        <li><strong>Center pane:</strong> the current review PDF or page image, visual overlays when QA supplied bounding boxes, zoom controls from 75% to 150% in 25% increments, Fit page, and PDF download/fallback. The toolbar does not expose an internal revision filename.</li>
+        <li><strong>Right pane:</strong> an intentionally empty reserved workspace. Review controls and artifact findings are not exposed there.</li>
       </ol>
-      <p>The workflow band represents Analysis, Tailoring, Editing, Compile, Repair, Deterministic QA, Visual QA, and Review. The timeline is sorted by event timestamp and sequence. The page only fetches JSON artifacts marked public and only displays review artifacts for a review or approved run; it shows explicit unavailable/loading/error states for absent or unreadable artifacts.</p>
+      <p>The workflow band represents Analysis, Tailoring, Editing, Compile, Deterministic QA, Visual QA, and Review. Repair remains an internal pipeline stage but is folded into Compile in this public presentation. A 3px connector runs marker-center to marker-center through Review; completed connectors and markers are green, while incomplete connectors and marker outlines are faint gray. The visible timeline excludes attempt events and run-identifier detail values, then sorts the remaining events by timestamp and sequence. Public job-analysis data and visual-QA bounding boxes may appear in the left pane and document preview; absent or unreadable artifacts retain explicit unavailable, loading, or error states.</p>
       <p>Sources: <a href="../../../apps/web/app/runs/%5Bid%5D/page.tsx"><code>apps/web/app/runs/[id]/page.tsx</code></a>, <a href="../../../apps/web/app/components/run-detail.tsx"><code>apps/web/app/components/run-detail.tsx</code></a>, and <a href="../../../apps/web/app/lib/run-detail-artifacts.ts"><code>apps/web/app/lib/run-detail-artifacts.ts</code></a>.</p>
     </section>
 
     <section id="review-actions">
-      <h2>Edit, regenerate, approve, and download</h2>
+      <h2>Refresh, retry, and download</h2>
       <dl>
-        <dt>Send back for edits</dt>
-        <dd>For a reviewable current PDF, enter 1–8,000 characters of comments and send them to the edit agent. Comments request evidence-grounded content changes; they do not directly modify the PDF. The pipeline creates and processes a new revision.</dd>
-        <dt>Regenerate for layout</dt>
-        <dd>For a reviewable current PDF, request a new machine-regeneration revision.</dd>
-        <dt>Approve current revision</dt>
-        <dd>For a reviewable current PDF, approve the revision. If visual QA did not pass, the acknowledgement checkbox must be selected before approval is enabled. An approved revision is shown as locked while its public artifacts remain available.</dd>
+        <dt>Refresh current state</dt>
+        <dd>The overflow menu reloads the current run without exposing internal run or attempt identifiers in the surrounding viewer chrome.</dd>
         <dt>Retry failed run</dt>
-        <dd>A failed run has a retry control that queues another attempt from the current public run state.</dd>
-        <dt>Download</dt>
-        <dd>The current PDF has download controls in the header and viewer. The public-artifact panel lists each eligible downloadable artifact with revision, attempt, and byte count.</dd>
+        <dd>The center document-unavailable state keeps one retry control that queues another attempt from the current public run state.</dd>
+        <dt>Download current resume</dt>
+        <dd>When the current revision has a matching public PDF, the header and document controls provide a download. The former public-artifact list is not displayed.</dd>
       </dl>
-      <p>Each edit, regeneration, and approval request carries the current PDF’s SHA-256 as its expected hash. The UI disables competing actions while an action or refresh is in progress. If the server rejects an action—such as a stale hash or changed run state—the page displays the bounded public error, reloads the current run, and requires the user to act on fresh state. See <a href="../pipeline/index.html#api">pipeline mutation preconditions</a> for the server error codes.</p>
-      <p>Sources: <a href="../../../apps/web/app/components/run-detail.tsx"><code>apps/web/app/components/run-detail.tsx</code></a>, <a href="../../../apps/web/app/lib/pipeline-client.ts"><code>apps/web/app/lib/pipeline-client.ts</code></a>, <a href="../../../apps/pipeline/src/api/run-service.ts"><code>apps/pipeline/src/api/run-service.ts</code></a>, and <a href="../../../apps/pipeline/src/contracts/index.ts"><code>apps/pipeline/src/contracts/index.ts</code></a>.</p>
+      <p>The UI disables retry, document controls, and downloads while a retry or refresh is in progress. A rejected retry displays its bounded public error in the document-unavailable state and reloads the current run before another action. Edit, regenerate, approval, QA, evidence, disposition, repair-report, and artifact-list controls are intentionally absent from the reserved pane.</p>
+      <p>Sources: <a href="../../../apps/web/app/components/run-detail.tsx"><code>apps/web/app/components/run-detail.tsx</code></a>, <a href="../../../apps/web/app/lib/pipeline-client.ts"><code>apps/web/app/lib/pipeline-client.ts</code></a>, and <a href="../../../apps/pipeline/src/contracts/index.ts"><code>apps/pipeline/src/contracts/index.ts</code></a>.</p>
     </section>
 
     <section id="accessibility-and-responsive-layout">

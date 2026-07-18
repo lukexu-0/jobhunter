@@ -195,8 +195,7 @@
 .sectionHeading h2,
 .viewerToolbar h2,
 .artifactSections h4,
-.artifactSections h5,
-.editForm label {
+.artifactSections h5 {
   margin: 0;
   color: var(--color-muted);
   font-family: var(--font-mono);
@@ -209,7 +208,7 @@
 
 .stageList {
   display: grid;
-  grid-template-columns: repeat(8, minmax(var(--space-10), 1fr));
+  grid-template-columns: repeat(7, minmax(calc(var(--space-12) * 2), 1fr));
   margin: var(--space-4) 0 0;
   padding: 0;
   list-style: none;
@@ -219,10 +218,11 @@
   position: relative;
   display: grid;
   min-width: 0;
-  grid-template-columns: var(--space-6) minmax(0, 1fr);
-  align-items: center;
+  grid-template-rows: var(--space-6) auto;
+  justify-items: center;
   gap: var(--space-2);
-  padding-right: var(--space-2);
+  padding-inline: var(--space-2);
+  text-align: center;
   color: var(--color-muted);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
@@ -231,12 +231,12 @@
 
 .stageItem:not(:last-child)::after {
   position: absolute;
-  right: 0;
-  width: calc(100% - var(--space-6));
-  height: var(--border-width);
-  background: var(--color-border);
+  top: calc((var(--space-6) - 3px) / 2);
+  left: 50%;
+  width: 100%;
+  height: 3px;
+  background: var(--color-faint);
   content: "";
-  transform: translateX(calc(100% - var(--space-1)));
 }
 
 .stageMarker {
@@ -246,10 +246,10 @@
   width: var(--space-6);
   height: var(--space-6);
   place-items: center;
-  border: var(--border-width) solid var(--color-border-strong);
+  border: var(--border-width) solid var(--color-faint);
   border-radius: 50%;
   background: var(--color-surface);
-  color: var(--color-muted);
+  color: var(--color-faint);
 }
 
 .stageMarker .icon {
@@ -262,23 +262,16 @@
   color: var(--color-text);
 }
 
+.stageComplete:not(:last-child)::after {
+  background: var(--color-good);
+}
+
 .stageComplete .stageMarker {
   border-color: var(--color-good);
   background: var(--color-good);
   color: var(--color-canvas);
 }
 
-.stageCurrent .stageMarker {
-  border-color: var(--color-info);
-  color: var(--color-info);
-  outline: var(--focus-width) solid var(--color-info);
-  outline-offset: var(--border-width);
-}
-
-.stageFailed .stageMarker {
-  border-color: var(--color-danger);
-  color: var(--color-danger);
-}
 
 .statusValue {
   display: inline-flex;
@@ -325,10 +318,7 @@
   padding: var(--space-5);
 }
 
-.paneSection + .paneSection,
-.reviewPanel + .reviewPanel,
-.paneSection + .reviewPanel,
-.reviewPanel + .paneSection {
+.paneSection + .paneSection {
   border-top: var(--border-width) solid var(--color-border);
 }
 
@@ -354,8 +344,7 @@
 }
 
 .metadataGrid > div,
-.compactFacts > div,
-.hashList > div {
+.compactFacts > div {
   display: grid;
   grid-template-columns: minmax(var(--space-12), 0.7fr) minmax(0, 1.3fr);
   gap: var(--space-3);
@@ -365,10 +354,7 @@
 
 .metadataGrid dt,
 .compactFacts dt,
-.hashList dt,
-.timelineList dt,
-.citationList dt,
-.countGrid dt {
+.timelineList dt {
   color: var(--color-muted);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
@@ -379,10 +365,7 @@
 
 .metadataGrid dd,
 .compactFacts dd,
-.hashList dd,
-.timelineList dd,
-.citationList dd,
-.countGrid dd {
+.timelineList dd {
   min-width: 0;
   margin: 0;
   overflow-wrap: anywhere;
@@ -391,8 +374,7 @@
 }
 
 .metadataGrid code,
-.compactFacts code,
-.hashList code {
+.compactFacts code {
   color: var(--color-muted);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
@@ -411,42 +393,16 @@
   letter-spacing: var(--tracking-title);
 }
 
-.sectionHeading > span,
-.panelMeta {
+.sectionHeading > span {
   color: var(--color-muted);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
 }
 
-.countGrid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-2);
-  margin: 0 0 var(--space-5);
-}
-
-.countGrid > div {
-  padding: var(--space-3);
-  border: var(--border-width) solid var(--color-border);
-  background: var(--color-surface-raised);
-}
-
-.countGrid dd {
-  margin-top: var(--space-2);
-  color: var(--color-text);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-lg);
-}
 
 .timelineList,
-.attemptList,
 .findingList,
-.changeList,
-.checkList,
-.simpleList,
-.citationList,
-.dispositionList,
-.artifactDownloads {
+.simpleList {
   margin: 0;
   padding: 0;
   list-style: none;
@@ -480,22 +436,19 @@
   padding-bottom: 0;
 }
 
-.timelineList time,
-.attemptList time {
+.timelineList time {
   color: var(--color-muted);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
 }
 
-.timelineList strong,
-.attemptList strong {
+.timelineList strong {
   color: var(--color-text);
   font-size: var(--font-size-sm);
 }
 
 .timelineList > li > span,
-.timelineList dl,
-.attemptList p {
+.timelineList dl {
   margin: 0;
   color: var(--color-muted);
   font-size: var(--font-size-xs);
@@ -507,31 +460,19 @@
   margin-top: var(--space-2);
 }
 
-.timelineList dl > div,
-.citationList dl > div {
+.timelineList dl > div {
   display: grid;
   grid-template-columns: minmax(var(--space-12), 0.8fr) minmax(0, 1.2fr);
   gap: var(--space-2);
 }
 
-.attemptList {
-  display: grid;
-  gap: var(--space-3);
-}
 
-.attemptList > li,
-.findingList > li,
-.changeList > li,
-.citationList > li,
-.dispositionList > li {
+.findingList > li {
   padding: var(--space-3);
   border: var(--border-width) solid var(--color-border);
   background: var(--color-surface-raised);
 }
 
-.attemptList p + p {
-  margin-top: var(--space-1);
-}
 
 .viewerPane {
   display: grid;
@@ -678,35 +619,6 @@
   background: var(--color-surface);
 }
 
-.reviewPanel {
-  background: var(--color-surface);
-}
-
-.reviewPanel > summary {
-  display: flex;
-  min-height: var(--control-height);
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-5);
-  color: var(--color-text);
-  cursor: pointer;
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 700;
-  letter-spacing: var(--tracking-title);
-  list-style-position: inside;
-  text-transform: uppercase;
-}
-
-.reviewPanel[open] > summary {
-  border-bottom: var(--border-width) solid var(--color-border);
-  background: var(--color-surface-raised);
-}
-
-.panelBody {
-  padding: var(--space-4) var(--space-5) var(--space-5);
-}
 
 .artifactSections {
   display: grid;
@@ -723,38 +635,23 @@
   letter-spacing: var(--tracking-title);
 }
 
-.artifactIntro,
 .artifactSections p,
 .findingList p,
-.changeList p,
-.checkList p,
 .simpleList,
 .absent,
-.panelError,
-.panelSuccess,
-.feedback p {
+.panelError {
   margin: 0;
   overflow-wrap: anywhere;
   color: var(--color-muted);
   font-size: var(--font-size-sm);
 }
 
-.artifactIntro code,
-.bbox {
-  color: var(--color-info);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-}
 
-.compactFacts,
-.hashList {
+.compactFacts {
   margin: 0;
 }
 
-.findingList,
-.changeList,
-.citationList,
-.dispositionList {
+.findingList {
   display: grid;
   gap: var(--space-2);
 }
@@ -773,8 +670,7 @@
   font-size: var(--font-size-sm);
 }
 
-.findingHeading span,
-.mutedLine {
+.findingHeading span {
   flex: 0 0 auto;
   color: var(--color-info);
   font-family: var(--font-mono);
@@ -782,8 +678,7 @@
   text-transform: uppercase;
 }
 
-.findingList blockquote,
-.dispositionList blockquote {
+.findingList blockquote {
   margin: var(--space-2) 0;
   border-left: var(--border-width) solid var(--color-info);
   padding-left: var(--space-3);
@@ -798,8 +693,7 @@
   margin-top: var(--space-2);
 }
 
-.evidenceList code,
-.bbox {
+.evidenceList code {
   display: inline-flex;
   border: var(--border-width) solid var(--color-border-strong);
   padding: var(--space-1) var(--space-2);
@@ -808,8 +702,7 @@
 }
 
 .absent,
-.panelError,
-.panelSuccess {
+.panelError {
   border-left: var(--border-width) solid var(--color-border-strong);
   padding: var(--space-3);
   background: var(--color-surface-raised);
@@ -825,64 +718,6 @@
   color: var(--color-danger);
 }
 
-.panelSuccess {
-  border-color: var(--color-good);
-  color: var(--color-good);
-}
-
-.reportStatus {
-  border: var(--border-width) solid currentColor;
-  padding: var(--space-2) var(--space-3);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 700;
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-}
-
-.reportStatusPass {
-  color: var(--color-good) !important;
-}
-
-.reportStatusFail {
-  color: var(--color-danger) !important;
-}
-
-.reportStatusWarn {
-  color: var(--color-warning) !important;
-}
-
-.checkList {
-  display: grid;
-  gap: var(--space-2);
-}
-
-.checkList li {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: var(--space-3);
-  padding-bottom: var(--space-2);
-  border-bottom: var(--border-width) solid var(--color-border);
-}
-
-.checkPass,
-.checkFail {
-  color: var(--color-good);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
-.checkFail {
-  color: var(--color-danger);
-}
-
-.checkList strong {
-  color: var(--color-text);
-  font-size: var(--font-size-xs);
-}
-
 .simpleList {
   display: grid;
   gap: var(--space-2);
@@ -890,227 +725,7 @@
   list-style: square;
 }
 
-.citationList dl {
-  display: grid;
-  gap: var(--space-1);
-  margin: var(--space-2) 0 0;
-}
 
-.editForm {
-  display: grid;
-  gap: var(--space-3);
-}
-
-.editForm label {
-  color: var(--color-text);
-  letter-spacing: var(--tracking-title);
-}
-
-.editForm > p {
-  margin: 0;
-  color: var(--color-muted);
-  font-size: var(--font-size-sm);
-}
-
-.editForm textarea {
-  width: 100%;
-  min-height: calc(var(--control-height) * 3);
-  resize: vertical;
-  border: var(--border-width) solid var(--color-border-strong);
-  border-radius: var(--radius-control);
-  padding: var(--space-3);
-  background: var(--color-canvas);
-  color: var(--color-text);
-  font-family: var(--font-sans);
-  font-size: var(--font-size-sm);
-  line-height: var(--line-base);
-}
-
-.editForm textarea:hover:not(:disabled),
-.editForm textarea:focus {
-  border-color: var(--color-text);
-}
-
-.editForm textarea:disabled {
-  border-color: var(--color-border);
-  background: var(--color-surface-raised);
-  color: var(--color-faint);
-}
-
-.textareaFooter {
-  display: flex;
-  justify-content: flex-end;
-  color: var(--color-muted);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-}
-
-.actionDivider {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  margin: var(--space-5) 0;
-  color: var(--color-muted);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  text-transform: uppercase;
-}
-
-.actionDivider::before,
-.actionDivider::after {
-  height: var(--border-width);
-  flex: 1;
-  background: var(--color-border);
-  content: "";
-}
-
-.reviewActions {
-  display: grid;
-  gap: var(--space-3);
-}
-
-.acknowledgement {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: var(--space-3);
-  padding: var(--space-3);
-  border: var(--border-width) solid var(--color-warning);
-  color: var(--color-text);
-  cursor: pointer;
-}
-
-.acknowledgement input {
-  width: var(--space-4);
-  height: var(--space-4);
-  margin: var(--space-1) 0 0;
-  accent-color: var(--color-warning);
-}
-
-.acknowledgement span {
-  display: grid;
-  gap: var(--space-1);
-}
-
-.acknowledgement strong {
-  font-size: var(--font-size-sm);
-}
-
-.acknowledgement small {
-  color: var(--color-muted);
-  font-size: var(--font-size-xs);
-}
-
-.approvedState,
-.failedState,
-.processingState {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-3);
-  border-left: var(--border-width) solid var(--color-good);
-  padding: var(--space-4);
-  background: var(--color-surface-raised);
-}
-
-.approvedState > .icon {
-  color: var(--color-good);
-}
-
-.approvedState strong,
-.failedState strong,
-.processingState strong {
-  color: var(--color-text);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-}
-
-.approvedState p,
-.failedState p,
-.processingState p {
-  margin: var(--space-2) 0 0;
-  color: var(--color-muted);
-  font-size: var(--font-size-sm);
-}
-
-.failedState {
-  display: grid;
-  border-color: var(--color-danger);
-}
-
-.processingState {
-  border-color: var(--color-info);
-}
-
-.activityDot {
-  width: var(--space-2);
-  height: var(--space-2);
-  flex: 0 0 auto;
-  margin-top: var(--space-2);
-  border-radius: 50%;
-  background: var(--color-info);
-}
-
-.feedback {
-  display: grid;
-  gap: var(--space-2);
-  margin-top: var(--space-4);
-}
-
-.feedback:empty {
-  display: none;
-}
-
-.artifactDownloads {
-  display: grid;
-  border: var(--border-width) solid var(--color-border);
-}
-
-.artifactDownloads li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3);
-}
-
-.artifactDownloads li + li {
-  border-top: var(--border-width) solid var(--color-border);
-}
-
-.artifactDownloads li > div {
-  display: grid;
-  min-width: 0;
-  gap: var(--space-1);
-}
-
-.artifactDownloads strong {
-  color: var(--color-text);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-}
-
-.artifactDownloads span {
-  color: var(--color-muted);
-  font-size: var(--font-size-xs);
-}
-
-.artifactDownloads a {
-  display: grid;
-  width: var(--space-8);
-  height: var(--space-8);
-  place-items: center;
-  border: var(--border-width) solid var(--color-border-strong);
-  color: var(--color-muted);
-}
-
-.artifactDownloads a:hover {
-  border-color: var(--color-text);
-  background: var(--color-surface-hover);
-  color: var(--color-text);
-}
-
-.unavailableDownload {
-  color: var(--color-danger) !important;
-}
 
 @container route-workspace (max-width: 78rem) {
   .workflowBand {
@@ -1163,7 +778,7 @@
 
   .topActions {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .topActions .secondaryButton {
@@ -1172,8 +787,7 @@
 
   .workflowProgress,
   .statusField,
-  .paneSection,
-  .panelBody {
+  .paneSection {
     padding-inline: var(--space-4);
   }
 
@@ -1193,17 +807,9 @@
 }
 
 @container route-workspace (max-width: 35rem) {
-  .topActions {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .topActions .secondaryButton:first-child {
-    grid-column: 1 / -1;
-  }
 
   .metadataGrid > div,
-  .compactFacts > div,
-  .hashList > div {
+  .compactFacts > div {
     grid-template-columns: minmax(0, 1fr);
     gap: var(--space-1);
   }
