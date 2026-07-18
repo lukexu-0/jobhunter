@@ -441,10 +441,6 @@ a {
   cursor: pointer;
 }
 
-.run-initializer__option-copy {
-  display: grid;
-  gap: var(--space-1);
-}
 
 .run-initializer__option-label {
   color: var(--color-text);
@@ -453,20 +449,11 @@ a {
   cursor: pointer;
 }
 
-.run-initializer__option-help {
-  margin: 0;
-  color: var(--color-muted);
-  font-size: var(--font-size-xs);
-}
 
 .run-initializer__option input:disabled,
-.run-initializer__option input:disabled + .run-initializer__option-copy {
+.run-initializer__option input:disabled + .run-initializer__option-label {
   cursor: not-allowed;
   opacity: 0.62;
-}
-
-.run-initializer__option input:disabled + .run-initializer__option-copy .run-initializer__option-label {
-  cursor: not-allowed;
 }
 
 .run-initializer .dashboard-alert {
@@ -734,10 +721,6 @@ a {
   font-weight: 400;
 }
 
-.revision-value {
-  color: var(--color-muted);
-  font-variant-numeric: tabular-nums;
-}
 
 .row-arrow {
   display: inline-flex;

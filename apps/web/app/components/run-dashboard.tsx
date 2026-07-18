@@ -60,14 +60,14 @@ function publicMessage(error: unknown, fallback: string): string {
 }
 
 function parseJobIdentity(value: unknown): JobIdentity | null {
-  if (!value || typeof value !== "object" || !("target" in value)) return null;
-  const target = value.target;
-  if (!target || typeof target !== "object" || !("title" in target)) return null;
-  const title = typeof target.title === "string" ? target.title.trim() : "";
+  if (!value || typeof value !== "object" || !("roleSummary" in value)) return null;
+  const roleSummary = value.roleSummary;
+  if (!roleSummary || typeof roleSummary !== "object" || !("role" in roleSummary)) return null;
+  const title = typeof roleSummary.role === "string" ? roleSummary.role.trim() : "";
   if (!title) return null;
   const organization =
-    "organization" in target && typeof target.organization === "string"
-      ? target.organization.trim()
+    "company" in roleSummary && typeof roleSummary.company === "string"
+      ? roleSummary.company.trim()
       : "";
   return organization ? { title, organization } : { title };
 }
@@ -288,18 +288,14 @@ export function RunDashboard() {
             type="checkbox"
             checked={generateKeywordMap}
             disabled={isCreating}
-            aria-describedby="generate-keyword-map-help"
             onChange={(event) => {
               setGenerateKeywordMap(event.target.checked);
               setCreateError(null);
             }}
           />
-          <div className="run-initializer__option-copy">
-            <label className="run-initializer__option-label" htmlFor="generate-keyword-map">Generate keyword map PDF</label>
-            <p className="run-initializer__option-help" id="generate-keyword-map-help">
-              Creates a side-by-side visualization of your resume and the full job description.
-            </p>
-          </div>
+          <label className="run-initializer__option-label" htmlFor="generate-keyword-map">
+            Generate resume to job Description keyword map
+          </label>
         </div>
 
         <button
@@ -377,14 +373,13 @@ export function RunDashboard() {
                     <th scope="col">Organization</th>
                     <th scope="col">Updated</th>
                     <th scope="col">Status</th>
-                    <th scope="col">Revision</th>
                     <th scope="col"><span className="visually-hidden">Open application</span></th>
                   </tr>
                 </thead>
                 <tbody>
                   {loadError && runs.length === 0 ? (
                     <tr>
-                      <td colSpan={6}>
+                      <td colSpan={5}>
                         <div className="applications-state applications-state--table" role="alert">
                           <p>{loadError}</p>
                           <button className="square-control" type="button" onClick={() => void load(true)}>Try again</button>
@@ -394,14 +389,14 @@ export function RunDashboard() {
                   ) : null}
                   {isLoading && !(loadError && runs.length === 0) ? (
                     <tr>
-                      <td colSpan={6}>
+                      <td colSpan={5}>
                         <div className="applications-state applications-state--table" role="status">Loading applications…</div>
                       </td>
                     </tr>
                   ) : null}
                   {showInitialEmpty ? (
                     <tr>
-                      <td colSpan={6}>
+                      <td colSpan={5}>
                         <div className="applications-state applications-state--table">
                           <p>No applications yet. Enter a job posting URL above to initialize one.</p>
                         </div>
@@ -410,7 +405,7 @@ export function RunDashboard() {
                   ) : null}
                   {showFilteredEmpty ? (
                     <tr>
-                      <td colSpan={6}>
+                      <td colSpan={5}>
                         <div className="applications-state applications-state--table">
                           <p>No applications match the current search and state.</p>
                           <button className="inline-control" type="button" onClick={() => { updateQuery(""); updateStatus("all"); }}>Clear filters</button>
@@ -446,7 +441,6 @@ export function RunDashboard() {
                             ))}
                           </select>
                         </td>
-                        <td><span className="revision-value">R{run.revision.toString().padStart(2, "0")}</span></td>
                         <td><Link className="row-arrow" href={href} aria-label={`Open run ${shortRunId(run.id)}`}>→</Link></td>
                       </tr>
                     );
