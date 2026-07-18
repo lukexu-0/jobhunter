@@ -198,7 +198,7 @@ function decodeXmlText(value: string): string | null {
 }
 
 function normalizeVisibleText(value: string): string {
-  return value.normalize("NFKC").replace(/---/g, "—").replace(/--/g, "–").replace(/\s+/g, " ").trim();
+  return value.normalize("NFKC").replace(/---/g, "—").replace(/--/g, "–").replace(/([$€£¥])\s+(?=\d)/g, "$1").replace(/\s+/g, " ").trim();
 }
 
 function parseTextOutput(value: string): TextOutput | null {

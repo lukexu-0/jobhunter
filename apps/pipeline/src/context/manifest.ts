@@ -7,17 +7,17 @@ export const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");
 export const DEFAULT_CONTEXT_MANIFEST_PATH = resolve(REPOSITORY_ROOT, "apps/pipeline/context-sources.json");
 
 export const CONTEXT_SOURCE_ALLOWLIST = Object.freeze([
-  "actual/resume-main/main.tex",
-  "actual/current-context/jobs/Example-Company/automated-testing-resume-info.md",
-  "actual/current-context/projects/sample-project-archive.md",
-  "actual/current-context/projects/sample-project.md",
+  "apps/user-info/resume-main/main.tex",
+  "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
+  "apps/user-info/current-context/projects/sample-project-archive.md",
+  "apps/user-info/current-context/projects/sample-project.md",
 ] as const);
 
 const ALLOWED: Readonly<Record<string, true>> = Object.freeze({
-  "actual/resume-main/main.tex": true,
-  "actual/current-context/jobs/Example-Company/automated-testing-resume-info.md": true,
-  "actual/current-context/projects/sample-project-archive.md": true,
-  "actual/current-context/projects/sample-project.md": true,
+  "apps/user-info/resume-main/main.tex": true,
+  "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md": true,
+  "apps/user-info/current-context/projects/sample-project-archive.md": true,
+  "apps/user-info/current-context/projects/sample-project.md": true,
 });
 const SOURCE_KEYS: Readonly<Record<string, true>> = Object.freeze({
   id: true,

@@ -14,7 +14,7 @@ import {
 import { ArtifactStore } from "../src/system/artifacts.ts";
 
 const JSON_BYTE_LIMIT = 8 * 1024;
-const CANONICAL_SOURCE_PATH = resolve(import.meta.dir, "../../../actual/resume-main/main.tex");
+const CANONICAL_SOURCE_PATH = resolve(import.meta.dir, "../../user-info/resume-main/main.tex");
 const ADDRESS = Object.freeze({ run: "render-smoke", revision: "canonical", stage: "compile", attempt: 1 });
 
 export const RENDER_SMOKE_REQUIRED_HEADINGS = Object.freeze([

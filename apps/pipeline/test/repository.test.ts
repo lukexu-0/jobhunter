@@ -26,8 +26,8 @@ function reachStage(repo: PipelineRepository, claim: { runId: string; token: str
   for (const target of targets) repo.transition(claim, target);
 }
 
-function createReview(repo: PipelineRepository, hash = "a".repeat(64), visualAck = false, id?: string) {
-  const run = repo.createRun("JD", id);
+function createReview(repo: PipelineRepository, hash = "a".repeat(64), visualAck = false, id?: string, generateKeywordMap = false) {
+  const run = repo.createRun("JD", id, generateKeywordMap);
   const claim = repo.acquire();
   if (!claim) throw new Error("claim missing");
   reachStage(repo, claim, ["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
@@ -98,10 +98,11 @@ describe("pipeline repository claims", () => {
 });
 
 describe("persisted workflow commands", () => {
-  test("persists an independently user-managed application status", () => {
+  test("persists immutable run metadata and independently managed application status", () => {
     const { db, repo, tick, now } = fixture();
-    const created = repo.createRun("JD");
-    expect(created.applicationStatus).toBe("applied");
+    expect(repo.createRun("Default JD", "default-setting").generateKeywordMap).toBe(true);
+    const created = repo.createRun("JD", "enabled-setting", true);
+    expect(created).toMatchObject({ applicationStatus: "applied", generateKeywordMap: true });
     const eventCount = repo.timeline(created.id).events.length;
 
     tick(1_000);
@@ -111,6 +112,7 @@ describe("persisted workflow commands", () => {
     expect(updated.applicationStatus).toBe("interview");
     expect(repo.getRun(created.id)?.applicationStatus).toBe("interview");
     expect(secondRepo.getRun(created.id)?.applicationStatus).toBe("interview");
+    expect(secondRepo.getRun(created.id)?.generateKeywordMap).toBe(true);
     expect(updated.status).toBe("queued");
     expect(updated.updatedAt).toBeGreaterThan(created.updatedAt);
     expect(repo.timeline(created.id).events).toHaveLength(eventCount);
@@ -176,7 +178,7 @@ describe("persisted workflow commands", () => {
 
   test("retry creates retry revision at failed stage and resolves preserved upstream artifacts", () => {
     const { repo } = fixture();
-    const run = repo.createRun("JD");
+    const run = repo.createRun("JD", undefined, true);
     const claim = repo.acquire()!;
     repo.transition(claim, "analyzing");
     const analysisAttempt = repo.startAttempt(claim, "analyzing");
@@ -192,19 +194,55 @@ describe("persisted workflow commands", () => {
     const retried = repo.retry(run.id);
     expect(retried.currentRevision).toBe(2);
     expect(retried.status).toBe("compiling");
+    expect(retried.generateKeywordMap).toBe(true);
     expect(repo.getRevision(run.id, 2)?.origin).toBe("retry");
     expect(repo.getArtifact(run.id, "job-analysis", 2)?.sha256).toBe("f".repeat(64));
     expect(repo.getArtifact(run.id, "latex-log", 2)).toBeNull();
   });
 
+  test("late-stage retry keeps the inherited review PDF valid for approval", () => {
+    const { repo } = fixture();
+    const hash = "7".repeat(64);
+    const run = repo.createRun("JD");
+    const claim = repo.acquire()!;
+    reachStage(repo, claim, ["analyzing", "tailoring", "compiling"]);
+    const compileAttempt = repo.startAttempt(claim, "compiling");
+    repo.finalizeArtifact(claim, {
+      attemptId: compileAttempt.id,
+      stage: "compiling",
+      kind: "compiled-pdf",
+      sha256: hash,
+      path: `/tmp/${run.id}.pdf`,
+      byteSize: 10,
+    });
+    repo.finishAttempt(claim, compileAttempt.id, "succeeded");
+    repo.transition(claim, "deterministic_qa");
+    repo.transition(claim, "visual_qa");
+    const visualAttempt = repo.startAttempt(claim, "visual_qa");
+    repo.finishAttempt(claim, visualAttempt.id, "failed");
+    repo.transition(claim, "failed", { failedStage: "visual_qa" });
+    repo.release(claim);
+
+    expect(repo.retry(run.id).status).toBe("visual_qa");
+    const retryClaim = repo.acquire()!;
+    const retryAttempt = repo.startAttempt(retryClaim, "visual_qa");
+    repo.finishAttempt(retryClaim, retryAttempt.id, "succeeded");
+    repo.transition(retryClaim, "review");
+    repo.release(retryClaim);
+
+    expect(repo.getArtifact(run.id, "compiled-pdf", 2)?.sha256).toBe(hash);
+    expect(repo.approve(run.id, hash).status).toBe("approved");
+  });
+
   test("review edits validate hash, skip analysis, and preserve immutable request origin", () => {
     const { repo, db } = fixture();
     const hash = "1".repeat(64);
-    const runId = createReview(repo, hash);
+    const runId = createReview(repo, hash, false, undefined, true);
     expect(() => repo.editRun(runId, "shorten a bullet", "2".repeat(64))).toThrow(RepositoryConflictError);
     const edited = repo.editRun(runId, "shorten a bullet", hash);
     expect(edited.status).toBe("editing");
     expect(edited.currentRevision).toBe(2);
+    expect(edited.generateKeywordMap).toBe(true);
     const revision = repo.getRevision(runId, 2);
     expect(revision?.origin).toBe("human_edit");
     expect(revision?.source_revision).toBe(1);

@@ -3,7 +3,7 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { AnalysisAgentInput } from "../src/agents/analysis-agent.ts";
 import type { EditAgentInput } from "../src/agents/edit-agent.ts";
 import type { TailoringAgentInput } from "../src/agents/tailoring-agent.ts";
@@ -27,7 +27,7 @@ import { TAILORING_WORKFLOW_SHA256, jobAnalysisFixture } from "./job-analysis.fi
 
 setDefaultTimeout(15_000);
 
-const baseline = await Bun.file(resolve(import.meta.dir, "../../../actual/resume-main/main.tex")).text();
+const baseline = await Bun.file(resolve(import.meta.dir, "../../user-info/resume-main/main.tex")).text();
 const parsedBaseline = parseBaselineResume(baseline);
 const databases: Database[] = [];
 const roots: string[] = [];
@@ -121,6 +121,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
     sourceHashes: Object.fromEntries(sources.map((source) => [source.id, source.sha256])),
     sources,
     evidence,
+    mustIncludeDirectives: [],
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
   const analysis = jobAnalysisFixture({
@@ -178,6 +179,8 @@ interface HarnessOptions {
   readonly analysisAgent?: PipelineStageDependencies["analysisAgent"];
   readonly editAgent?: PipelineStageDependencies["editAgent"];
   readonly repairAgent?: PipelineStageDependencies["repairAgent"];
+  readonly generateKeywordMap?: boolean;
+  readonly keywordMapRenderer?: PipelineStageDependencies["keywordMapRenderer"];
 }
 
 interface AgentInputs {
@@ -194,6 +197,8 @@ interface Harness {
   readonly runId: string;
   readonly compileModes: string[];
   readonly agentInputs: AgentInputs;
+  readonly keywordMapCalls: { count: number };
+  readonly database: Database;
 }
 
 async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
@@ -217,9 +222,10 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     sha256: input.sha256,
     path: input.path,
     byteSize: input.bytes,
-  }, "stage-run");
+  }, "stage-run", options.generateKeywordMap ?? false);
   const compileOutcomes = [...(options.compileOutcomes ?? ["success"])] ;
   const compileModes: string[] = [];
+  const keywordMapCalls = { count: 0 };
   const compiler = async (request: CompileRequest): Promise<CompileResult> => {
     request.signal?.throwIfAborted();
     compileModes.push(request.mode);
@@ -286,6 +292,14 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     }),
     ...(options.repairAgent === undefined ? {} : { repairAgent: options.repairAgent }),
     compiler,
+    keywordMapRenderer: options.keywordMapRenderer ?? (async (request) => {
+      keywordMapCalls.count += 1;
+      return await request.artifacts.write(
+        join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
+        "%PDF-1.7\nkeyword-map",
+        ARTIFACT_LIMITS.pdf,
+      );
+    }),
     deterministicQa: async () => ({
       pass: options.deterministicPass ?? true,
       checks: [],
@@ -299,7 +313,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     visualInspector: async () => options.visual ?? { status: "pass", summary: "Page is readable", findings: [] },
   };
   const processor = new PipelineStageProcessor(dependencies);
-  return { repository, artifacts, processor, fixtures, runId: run.id, compileModes, agentInputs };
+  return { repository, artifacts, processor, fixtures, runId: run.id, compileModes, agentInputs, keywordMapCalls, database };
 }
 
 async function processToStop(harness: Harness): Promise<void> {
@@ -329,9 +343,11 @@ describe("pipeline stage processor", () => {
     expect(harness.agentInputs.analysis).toHaveLength(1);
     expect(harness.agentInputs.analysis[0]?.canonicalCv).toBe(baseline);
     expect(harness.agentInputs.analysis[0]?.context).toEqual(harness.fixtures.snapshot);
+    expect(Object.keys(harness.agentInputs.analysis[0]!)).not.toContain("mustInclude");
     expect(harness.agentInputs.tailoring).toHaveLength(1);
     expect(Object.keys(harness.agentInputs.tailoring[0]!)).not.toContain("rawJobDescription");
     expect(harness.agentInputs.tailoring[0]?.analysis).toEqual(harness.fixtures.analysis);
+    expect(Object.keys(harness.agentInputs.tailoring[0]!)).not.toContain("mustInclude");
     const texArtifact = harness.repository.getArtifact(harness.runId, "tailored-tex");
     expect(texArtifact).not.toBeNull();
     expect(await Bun.file(texArtifact!.path).text()).toBe(renderTailoredResume(harness.fixtures.plan, baseline, harness.fixtures.snapshot));
@@ -344,6 +360,50 @@ describe("pipeline stage processor", () => {
     expect(timeline.attempts.find((attempt) => attempt.stage === "compiling")?.compileCount).toBe(1);
     expect(JSON.stringify({ run: harness.repository.getRun(harness.runId), timeline })).not.toContain("token");
     expect(JSON.stringify(harness.repository.listResolvedArtifacts(harness.runId))).not.toContain("Strong TypeScript engineer");
+    expect(harness.keywordMapCalls.count).toBe(0);
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+  });
+
+  test("generates and finalizes the requested keyword map from the compiled PDF before QA", async () => {
+    const harness = await createHarness({ generateKeywordMap: true });
+    await processToStop(harness);
+
+    expect(harness.keywordMapCalls.count).toBe(1);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    const compiled = harness.repository.getArtifact(harness.runId, "compiled-pdf");
+    const keywordMap = harness.repository.getArtifact(harness.runId, "keyword-map-pdf");
+    expect(compiled).not.toBeNull();
+    expect(keywordMap).not.toBeNull();
+    expect(keywordMap?.revision).toBe(compiled?.revision);
+    expect(harness.database.query<{ source_artifact_id: string | null }, [string]>(
+      "SELECT source_artifact_id FROM artifacts WHERE id=?",
+    ).get(keywordMap!.id)?.source_artifact_id).toBe(compiled!.id);
+    expect(harness.repository.timeline(harness.runId).events
+      .filter((event) => event.kind === "artifact.finalized")
+      .map((event) => event.payload && typeof event.payload === "object" && "kind" in event.payload
+        && typeof event.payload.kind === "string" ? event.payload.kind : undefined)).toEqual(expect.arrayContaining([
+      "compiled-pdf",
+      "keyword-map-pdf",
+      "deterministic-qa",
+    ]));
+  });
+
+  test("fails the compiling attempt when a requested keyword map cannot be generated", async () => {
+    const harness = await createHarness({
+      generateKeywordMap: true,
+      keywordMapRenderer: async () => {
+        throw new Error("bbox extraction failed");
+      },
+    });
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "compiling" });
+    expect(harness.repository.getArtifact(harness.runId, "compiled-pdf")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+    expect(harness.repository.timeline(harness.runId).attempts.find((attempt) => attempt.stage === "compiling")).toMatchObject({
+      status: "failed",
+      compileCount: 1,
+    });
   });
 
   test("retries a failed analysis before its immutable artifact exists", async () => {
@@ -358,6 +418,10 @@ describe("pipeline stage processor", () => {
     await processToStop(harness);
     expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+    const diagnostic = harness.repository.getArtifact(harness.runId, "stage-error");
+    expect(diagnostic).not.toBeNull();
+    expect(Buffer.from(await harness.artifacts.read(diagnostic!.path, ARTIFACT_LIMITS.log)).toString("utf8"))
+      .toBe("Error: transient analysis failure\n");
 
     harness.repository.retry(harness.runId, harness.fixtures.snapshotInput);
     await processToStop(harness);
@@ -463,6 +527,7 @@ describe("pipeline stage processor", () => {
     expect(harness.agentInputs.analysis).toHaveLength(1);
     expect(editInputs).toHaveLength(2);
     expect(editInputs[0]?.comments).toEqual(["shorten the second experience bullet"]);
+    expect(editInputs.every((input) => input.context === harness.fixtures.snapshot)).toBeTrue();
     expect(editInputs[0]?.machineFindings).toBeUndefined();
     expect(editInputs[1]?.comments).toEqual([]);
     expect(editInputs[1]?.machineFindings).toEqual({

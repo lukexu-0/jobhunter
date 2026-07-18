@@ -268,6 +268,7 @@ describe("direct Gemini visual inspector", () => {
     if (user?.role !== "user" || typeof user.content === "string") throw new Error("PNG user message missing");
     expect(user.content).toEqual([{ type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }]);
     expect(contextSeen?.systemPrompt?.[1]).toContain("strict JSON Schema");
+    expect(contextSeen?.systemPrompt?.[1]).not.toContain("\"$schema\"");
     expect(optionsSeen).toMatchObject({ signal, reasoning: "medium" });
   });
 

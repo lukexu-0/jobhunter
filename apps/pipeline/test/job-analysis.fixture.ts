@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import type { JobAnalysis } from "../src/resume/types.ts";
 
 export const ANALYSIS_WORKFLOW_PROMPT = readFileSync(
-  resolve(import.meta.dir, "../../../actual/pipeline/analysis.md"),
+  resolve(import.meta.dir, "../../../planning/pipeline/analysis.md"),
   "utf8",
 );
 export const ANALYSIS_WORKFLOW_SHA256 = createHash("sha256")
@@ -12,7 +12,7 @@ export const ANALYSIS_WORKFLOW_SHA256 = createHash("sha256")
   .digest("hex");
 
 const TAILORING_WORKFLOW = readFileSync(
-  resolve(import.meta.dir, "../../../actual/pipeline/tailoring.md"),
+  resolve(import.meta.dir, "../../../planning/pipeline/tailoring.md"),
   "utf8",
 );
 const TAILORING_PIPELINE_VALIDATION = TAILORING_WORKFLOW.indexOf("\n## Pipeline validation");
@@ -28,11 +28,6 @@ export function jobAnalysisFixture(options: {
 } = {}): JobAnalysis {
   const evidenceIds = options.evidenceId ? [options.evidenceId] : [];
   const supported = (text: string) => ({ text, evidenceIds });
-  const clarity = (evidenceOrRequiredRewrite: string) => ({
-    status: "clear" as const,
-    evidenceOrRequiredRewrite,
-    evidenceIds,
-  });
   const ats = (requiredAction: string) => ({
     status: "pass" as const,
     requiredAction,
@@ -81,12 +76,11 @@ export function jobAnalysisFixture(options: {
       jdQuote: "Build production TypeScript systems",
       currentTruthfulCvWording: options.evidenceId ? "Built TypeScript services" : "No evidence found",
       recommendedReformulation: options.evidenceId ? "Built production TypeScript services" : "Not applicable",
-      placement: "Experience",
+      placements: ["Experience", "Technical Skills"],
       evidenceIds,
     }],
     proposedCvContent: {
-      professionalSummary: supported("Senior engineer building reliable agentic systems."),
-      coreCompetencies: [
+      technicalSkills: [
         supported("TypeScript"),
         supported("Agent orchestration"),
         supported("Evaluation pipelines"),
@@ -113,13 +107,6 @@ export function jobAnalysisFixture(options: {
       outcomeOrProof: "Improved delivery reliability",
       evidenceIds,
     }],
-    sixSecondClarityGate: {
-      targetRoleOrArchetype: clarity("Target agentic engineering role is explicit."),
-      strongestMatchingStackOrDomain: clarity("TypeScript and agentic systems are visible."),
-      productionOrBusinessOutcome: clarity("Production delivery outcome is visible."),
-      appropriateLocationOrRemoteFit: clarity("Remote fit is stated where appropriate."),
-      relevantPortfolioOrCaseStudyLink: clarity("Relevant project evidence is prioritized."),
-    },
     atsAndTruthfulnessReview: {
       parseableSingleColumnStructure: ats("Keep the single-column structure."),
       standardSectionHeaders: ats("Keep standard section headers."),
@@ -129,27 +116,11 @@ export function jobAnalysisFixture(options: {
       noUnsupportedSkillsOrMetrics: ats("Retain only supported skills and metrics."),
     },
     customizationPlan: [{
-      section: "Professional Summary",
-      currentStatus: "Too broad",
+      section: "Experience",
+      currentStatus: "Strong evidence is not prioritized",
       proposedChange: "Lead with agentic systems and production delivery.",
       why: "Makes the strongest truthful fit immediately visible.",
       evidenceIds,
     }],
-    rankedRecommendations: {
-      cvChanges: [
-        supported("Rewrite the professional summary."),
-        supported("Prioritize the strongest matching experience."),
-        supported("Use truthful JD vocabulary."),
-        supported("Feature the most relevant projects."),
-        supported("Strengthen business-value bullets."),
-      ],
-      linkedInChanges: [
-        supported("Align the headline with the target role."),
-        supported("Feature agentic systems in the About section."),
-        supported("Surface the strongest matching project."),
-        supported("Use supported JD vocabulary in experience."),
-        supported("Keep claims consistent with the CV evidence."),
-      ],
-    },
   };
 }

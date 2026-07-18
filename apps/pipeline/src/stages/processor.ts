@@ -11,6 +11,7 @@ import type { ContextSnapshot } from "../context/types.ts";
 import { ClaimRejectedError, type PublicArtifact, type PublicAttempt, type PublicRun } from "../db/repository.ts";
 import { inspectResumePng, type GeminiInspectorOptions } from "../models/gemini-inspector.ts";
 import { compileResume, type CompileResult } from "../resume/compiler.ts";
+import { renderKeywordMapPdf } from "../resume/keyword-map.ts";
 import {
   buildEvidenceLedger,
   JobAnalysisSchema,
@@ -19,6 +20,7 @@ import {
   renderTailoredResume,
   runDeterministicPdfQa,
   TailoringPlanSchema,
+  validateAnalysisDirectives,
   validateAnalysisImmutability,
   validateRepairCandidate,
   type TailoringPlan,
@@ -44,6 +46,7 @@ export interface PipelineStageDependencies {
   readonly editAgent?: typeof runEditAgent;
   readonly repairAgent?: typeof runRepairAgent;
   readonly compiler?: typeof compileResume;
+  readonly keywordMapRenderer?: typeof renderKeywordMapPdf;
   readonly deterministicQa?: typeof runDeterministicPdfQa;
   readonly rasterizer?: typeof rasterizePdfPage;
   readonly visualInspector?: typeof inspectResumePng;
@@ -60,6 +63,14 @@ function isCancellation(error: unknown, signal: AbortSignal): boolean {
 
 function json(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
+}
+
+function failureDiagnostic(error: unknown): Uint8Array {
+  const raw = error instanceof Error ? `${error.name}: ${error.message}` : `NonError: ${String(error)}`;
+  const redacted = raw
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b((?:access|refresh|id)[_-]?token|api[_-]?key|authorization|password|secret)\b\s*[:=]\s*\S+/gi, "$1=[redacted]");
+  return Buffer.from(`${redacted}\n`, "utf8").subarray(0, ARTIFACT_LIMITS.log);
 }
 
 function selectedEvidenceText(plan: TailoringPlan): readonly string[] {
@@ -90,6 +101,7 @@ export class PipelineStageProcessor {
   readonly #editAgent: typeof runEditAgent;
   readonly #repairAgent: typeof runRepairAgent;
   readonly #compiler: typeof compileResume;
+  readonly #keywordMapRenderer: typeof renderKeywordMapPdf;
   readonly #deterministicQa: typeof runDeterministicPdfQa;
   readonly #rasterizer: typeof rasterizePdfPage;
   readonly #visualInspector: typeof inspectResumePng;
@@ -106,6 +118,7 @@ export class PipelineStageProcessor {
     this.#editAgent = dependencies.editAgent ?? runEditAgent;
     this.#repairAgent = dependencies.repairAgent ?? runRepairAgent;
     this.#compiler = dependencies.compiler ?? compileResume;
+    this.#keywordMapRenderer = dependencies.keywordMapRenderer ?? renderKeywordMapPdf;
     this.#deterministicQa = dependencies.deterministicQa ?? runDeterministicPdfQa;
     this.#rasterizer = dependencies.rasterizer ?? rasterizePdfPage;
     this.#visualInspector = dependencies.visualInspector ?? inspectResumePng;
@@ -138,6 +151,15 @@ export class PipelineStageProcessor {
           return;
         }
         if (attempt) {
+          try {
+            await this.#recordFailure(claim, run, attempt, error);
+          } catch (diagnosticError) {
+            if (isCancellation(diagnosticError, signal)) {
+              this.#repository.acknowledgeCancellation(attempt.id, claim.token);
+              return;
+            }
+            console.error("Failed to persist stage diagnostic", diagnosticError);
+          }
           try { this.#repository.finishAttempt(claim, attempt.id, "failed", audit); }
           catch (finishError) {
             if (isCancellation(finishError, signal)) {
@@ -187,6 +209,7 @@ export class PipelineStageProcessor {
     if (analysis.jobDescriptionSha256 !== createHash("sha256").update(rawJobDescription).digest("hex")) {
       throw new Error("job analysis does not match the immutable job description");
     }
+    validateAnalysisDirectives(analysis, sources.snapshot);
     signal.throwIfAborted();
     await this.#verifyAgain(run.id, signal);
     const artifact = await this.#writeJson(run, attempt, "job-analysis", analysis);
@@ -259,7 +282,7 @@ export class PipelineStageProcessor {
         analysis,
         currentPlan,
         currentTailoredTex,
-        evidence: sources.snapshot.evidence,
+        context: sources.snapshot,
         deterministicQa,
         visualQa,
         comments,
@@ -296,6 +319,7 @@ export class PipelineStageProcessor {
     await this.#verifyAgain(run.id, signal);
     const address = this.#address(run, attempt);
     let result: CompileResult;
+    let keywordMap: ArtifactMetadata | undefined;
     try {
       result = await this.#compiler({
         artifacts: this.#artifacts,
@@ -306,6 +330,17 @@ export class PipelineStageProcessor {
         ...(this.#processBoundary ? { processBoundary: this.#processBoundary } : {}),
       });
       audit.compileCount = 1;
+      if (result.ok && run.generateKeywordMap) {
+        const analysis = JobAnalysisSchema.parse(await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")));
+        keywordMap = await this.#keywordMapRenderer({
+          artifacts: this.#artifacts,
+          compiledPdf: result.pdf,
+          jobDescription: run.jobDescription,
+          analysis,
+          signal,
+          ...(this.#processBoundary ? { processBoundary: this.#processBoundary } : {}),
+        });
+      }
     } catch (error) {
       audit.compileCount = 1;
       if (isCancellation(error, signal)) throw error;
@@ -324,7 +359,8 @@ export class PipelineStageProcessor {
     this.#finalize(claim, attempt, "latex-log", result.log, texArtifact.id);
     if (result.tex) this.#finalize(claim, attempt, "tailored-tex", result.tex, texArtifact.id);
     if (result.ok) {
-      this.#finalize(claim, attempt, "compiled-pdf", result.pdf, texArtifact.id);
+      const compiledPdf = this.#finalize(claim, attempt, "compiled-pdf", result.pdf, texArtifact.id);
+      if (keywordMap) this.#finalize(claim, attempt, "keyword-map-pdf", keywordMap, compiledPdf.id);
       this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
       this.#repository.transition(claim, "deterministic_qa");
       return;
@@ -458,6 +494,17 @@ export class PipelineStageProcessor {
     this.#finalize(claim, attempt, "visual-qa", reportMeta, pdf.id);
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
     this.#repository.transition(claim, "review", { visualAcknowledgementRequired: visual.status !== "pass" });
+  }
+
+  async #recordFailure(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, error: unknown): Promise<void> {
+    const root = this.#artifacts.attemptRoot(this.#address(run, attempt));
+    if (!await artifactExists(root)) await this.#artifacts.createAttempt(this.#address(run, attempt));
+    const metadata = await this.#artifacts.write(
+      join(root, "stage-error.log"),
+      failureDiagnostic(error),
+      ARTIFACT_LIMITS.log,
+    );
+    this.#finalize(claim, attempt, "stage-error", metadata);
   }
 
   #requiredRun(runId: string): PublicRun {

@@ -61,11 +61,11 @@ function patch(body: unknown): RequestInit {
 }
 
 describe("run HTTP routes", () => {
-  test("canonicalizes the job URL, forwards the request signal, and kicks only after persistence succeeds", async () => {
-    let received: { jobUrl: string; signal: AbortSignal | undefined } | undefined;
+  test("canonicalizes the job URL, forwards the default map option and request signal, and kicks only after persistence succeeds", async () => {
+    let received: { jobUrl: string; generateKeywordMap: boolean; signal: AbortSignal | undefined } | undefined;
     const target = service({
-      createRun: async (jobUrl, signal) => {
-        received = { jobUrl, signal };
+      createRun: async (jobUrl, generateKeywordMap, signal) => {
+        received = { jobUrl, generateKeywordMap, signal };
         return run;
       },
     });
@@ -76,7 +76,11 @@ describe("run HTTP routes", () => {
     expect(created.status).toBe(201);
     expect(created.headers.get("cache-control")).toBe("no-store");
     expect(await created.json()).toEqual(run);
-    expect(received).toEqual({ jobUrl: "https://jobs.example.test/role", signal: incoming.signal });
+    expect(received).toEqual({
+      jobUrl: "https://jobs.example.test/role",
+      generateKeywordMap: true,
+      signal: incoming.signal,
+    });
     expect(target.kickCount()).toBe(1);
 
     const failedTarget = service({
@@ -96,6 +100,16 @@ describe("run HTTP routes", () => {
       },
     });
     expect(failedTarget.kickCount()).toBe(0);
+
+    let defaulted: boolean | undefined;
+    const defaultTarget = service({
+      createRun: async (_jobUrl, generateKeywordMap) => {
+        defaulted = generateKeywordMap;
+        return run;
+      },
+    });
+    expect((await request(defaultTarget, "/v1/runs", post({ jobUrl: "https://jobs.example.test/default" }))).status).toBe(201);
+    expect(defaulted).toBe(true);
   });
 
   test("accepts only application statuses without waking the scheduler", async () => {
@@ -147,18 +161,21 @@ describe("run HTTP routes", () => {
       { jobUrl: "example.test/job" },
       { jobUrl: "ftp://example.test/job" },
       { jobUrl: "https://user:secret@example.test/job" },
+      { jobUrl: "https://example.test/job", generateKeywordMap: "true" },
       { jobUrl: "https://example.test/job", extra: true },
+      {},
     ]) {
       const response = await request(target, "/v1/runs", post(body));
       expect(response.status).toBe(400);
       expect(await response.json()).toEqual({
-        error: { code: "INVALID_REQUEST", message: "Job URL must be a valid HTTP(S) URL" },
+        error: { code: "INVALID_REQUEST", message: "Run request is invalid" },
       });
     }
     expect(createCalls).toBe(0);
     expect(target.kickCount()).toBe(0);
     expect((await request(service(), "/v1/runs/run-1/retry", post({ force: true }))).status).toBe(400);
   });
+
 
   test("passes immutable edit comments and expected PDF hash", async () => {
     let received: unknown;

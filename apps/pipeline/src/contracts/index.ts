@@ -101,6 +101,7 @@ export const ArtifactKindSchema = z.enum([
   "tailored-tex",
   "latex-log",
   "compiled-pdf",
+  "keyword-map-pdf",
   "page-image",
   "deterministic-qa",
   "visual-qa",
@@ -159,6 +160,7 @@ export const TimelineEventSchema = z
   .strict();
 export type TimelineEvent = z.infer<typeof TimelineEventSchema>;
 
+
 export const RunDtoSchema = z
   .object({
     id: z.string(),
@@ -214,7 +216,10 @@ export const JobUrlSchema = z.string().trim().transform((value, ctx) => {
 });
 
 export const RunListResponseSchema = z.object({ runs: z.array(RunDtoSchema) }).strict();
-export const CreateRunRequestSchema = z.object({ jobUrl: JobUrlSchema }).strict();
+export const CreateRunRequestSchema = z.object({
+  jobUrl: JobUrlSchema,
+  generateKeywordMap: z.boolean().default(true),
+}).strict();
 export const EditRunRequestSchema = z
   .object({
     comments: z.string().trim().min(1).max(8_000),

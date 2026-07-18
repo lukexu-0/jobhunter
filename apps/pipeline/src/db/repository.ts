@@ -45,6 +45,7 @@ interface RunRow {
   job_description: string;
   status: RunStatus;
   application_status: ApplicationStatus;
+  generate_keyword_map: number;
   current_revision: number;
   failed_stage: ActiveStage | null;
   visual_ack_required: number;
@@ -73,6 +74,7 @@ export interface PublicRun {
   readonly jobDescription: string;
   readonly status: RunStatus;
   readonly applicationStatus: ApplicationStatus;
+  readonly generateKeywordMap: boolean;
   readonly currentRevision: number;
   readonly failedStage: ActiveStage | null;
   readonly visualAcknowledgementRequired: boolean;
@@ -156,9 +158,11 @@ function assertSafePayload(value: unknown): void {
   }
 }
 function publicRun(row: RunRow): PublicRun {
-  return { id: row.id, jobDescription: row.job_description, status: row.status, applicationStatus: row.application_status,
-    currentRevision: row.current_revision, failedStage: row.failed_stage, visualAcknowledgementRequired: row.visual_ack_required === 1,
-    approvedPdfSha256: row.approved_pdf_sha256, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, jobDescription: row.job_description, status: row.status,
+    applicationStatus: row.application_status, generateKeywordMap: row.generate_keyword_map === 1,
+    currentRevision: row.current_revision, failedStage: row.failed_stage,
+    visualAcknowledgementRequired: row.visual_ack_required === 1, approvedPdfSha256: row.approved_pdf_sha256,
+    createdAt: row.created_at, updatedAt: row.updated_at };
 }
 function publicAttempt(row: AttemptRow): PublicAttempt {
   return { id: row.id, attemptSessionId: row.attempt_session_id, revision: row.revision, stage: row.stage, attemptNo: row.attempt_no, origin: row.origin,
@@ -228,15 +232,16 @@ export class PipelineRepository {
     return Object.fromEntries(hashes);
   }
 
-  createQueuedRun(jobDescription: string, snapshot: RunSourceSnapshotInput, input: QueuedInputArtifact, id = this.#idFactory()): PublicRun {
+  createQueuedRun(jobDescription: string, snapshot: RunSourceSnapshotInput, input: QueuedInputArtifact, id = this.#idFactory(), generateKeywordMap = true): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     if (!/^[a-f0-9]{64}$/.test(input.sha256) || !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || !input.path) {
       throw new Error("queued input artifact metadata is invalid");
     }
+    if (typeof generateKeywordMap !== "boolean") throw new Error("generate keyword map setting must be boolean");
     const sourceHashes = this.#validateSnapshot(snapshot);
     return this.#immediate(() => {
       const now = this.#now();
-      this.#db.query("INSERT INTO runs(id, job_description, status, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs").run(id, jobDescription, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs").run(id, jobDescription, generateKeywordMap ? 1 : 0, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#db.query("INSERT INTO run_source_snapshots(run_id,manifest_sha256,baseline_sha256,source_hashes_json,created_at) VALUES (?,?,?,?,?)")
         .run(id, snapshot.manifestSha256, snapshot.baselineSha256, JSON.stringify(sourceHashes), now);
@@ -255,11 +260,12 @@ export class PipelineRepository {
   }
 
 
-  createRun(jobDescription: string, id = this.#idFactory()): PublicRun {
+  createRun(jobDescription: string, id = this.#idFactory(), generateKeywordMap = true): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
+    if (typeof generateKeywordMap !== "boolean") throw new Error("generate keyword map setting must be boolean");
     return this.#immediate(() => {
       const now = this.#now();
-      this.#db.query("INSERT INTO runs(id, job_description, status, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs").run(id, jobDescription, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs").run(id, jobDescription, generateKeywordMap ? 1 : 0, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#event(id, 1, "run.created", { status: "queued", origin: "initial" }, now);
       return publicRun(this.#run(id));
@@ -574,9 +580,6 @@ export class PipelineRepository {
     return null;
   }
 
-  #exactArtifact(runId: string, revision: number, kind: string): ArtifactRow | null {
-    return this.#db.query<ArtifactRow, [string, number, string]>("SELECT * FROM artifacts WHERE run_id=? AND revision=? AND kind=? ORDER BY created_at DESC LIMIT 1").get(runId, revision, kind) ?? null;
-  }
 
   listArtifacts(runId: string, revision?: number): PublicArtifact[] {
     const selected = revision ?? this.#run(runId).current_revision;
@@ -654,7 +657,7 @@ export class PipelineRepository {
       this.#assertRunArtifactsRetained(run.id);
       if (currentSources) this.#assertSourceSnapshot(runId, currentSources);
       if (run.status !== "review") throw new RepositoryConflictError("run is not in review");
-      const pdf = this.#exactArtifact(run.id, run.current_revision, "compiled-pdf");
+      const pdf = this.getArtifact(run.id, "compiled-pdf", run.current_revision);
       if (!pdf || pdf.sha256 !== expectedPdfSha256) throw new RepositoryConflictError("review PDF hash is stale");
       const target = run.current_revision + 1;
       this.#db.query("INSERT INTO revisions(run_id,revision,origin,source_revision,status,created_at) VALUES (?,?,?,?, 'editing',?)").run(run.id, target, origin, run.current_revision, now);
@@ -672,7 +675,7 @@ export class PipelineRepository {
       this.#assertRunArtifactsRetained(run.id);
       if (currentSources) this.#assertSourceSnapshot(runId, currentSources);
       if (run.status !== "review") throw new RepositoryConflictError("run is not in review");
-      const pdf = this.#exactArtifact(run.id, run.current_revision, "compiled-pdf");
+      const pdf = this.getArtifact(run.id, "compiled-pdf", run.current_revision);
       if (!pdf || pdf.sha256 !== expectedPdfSha256) throw new RepositoryConflictError("review PDF hash is stale");
       if (run.visual_ack_required === 1 && !visualAcknowledged) throw new RepositoryConflictError("visual acknowledgement is required");
       this.#db.query("UPDATE runs SET status='approved',approved_pdf_sha256=?,updated_at=? WHERE id=?").run(expectedPdfSha256, now, run.id);

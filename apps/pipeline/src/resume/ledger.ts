@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ContextSnapshot } from "../context/types.ts";
+import { extractMustIncludeDirectives } from "../context/directives.ts";
 import { EditResultSchema, JobAnalysisSchema, TailoringPlanSchema, type CommentDisposition, type EditResult, type JobAnalysis, type RepairResult, type TailoringPlan } from "./types.ts";
-import { ResumeValidationError } from "./render.ts";
+import { equivalentEntities, ResumeValidationError, validatePlanDirectives } from "./render.ts";
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -18,6 +19,76 @@ export function validateAnalysisImmutability(planInput: TailoringPlan, analysisI
   const plan = TailoringPlanSchema.parse(planInput);
   const analysis = JobAnalysisSchema.parse(analysisInput);
   if (plan.analysisId !== analysis.id || plan.analysisSha256 !== hashJobAnalysis(analysis)) throw new ResumeValidationError("tailoring plan does not reference the immutable job analysis");
+}
+
+function analysisEvidenceReferences(analysis: JobAnalysis): readonly (readonly string[])[] {
+  return [
+    ...analysis.requirementEvidence.map((item) => item.evidenceIds),
+    ...analysis.recruiterRisks.map((item) => item.evidenceIds),
+    ...analysis.gapsAndMitigations.map((item) => item.evidenceIds),
+    ...analysis.keywordAlignment.map((item) => item.evidenceIds),
+    ...analysis.proposedCvContent.technicalSkills.map((item) => item.evidenceIds),
+    ...analysis.proposedCvContent.reorderedExperience.flatMap((item) => item.bullets.map((bullet) => bullet.evidenceIds)),
+    ...analysis.proposedCvContent.selectedProjects.map((item) => item.evidenceIds),
+    ...analysis.businessValueBulletReview.map((item) => item.evidenceIds),
+    analysis.atsAndTruthfulnessReview.parseableSingleColumnStructure.evidenceIds,
+    analysis.atsAndTruthfulnessReview.standardSectionHeaders.evidenceIds,
+    analysis.atsAndTruthfulnessReview.selectableUtf8Text.evidenceIds,
+    analysis.atsAndTruthfulnessReview.truthfulKeywordUse.evidenceIds,
+    analysis.atsAndTruthfulnessReview.noHiddenTextOrKeywordStuffing.evidenceIds,
+    analysis.atsAndTruthfulnessReview.noUnsupportedSkillsOrMetrics.evidenceIds,
+    ...analysis.customizationPlan.map((item) => item.evidenceIds),
+  ];
+}
+
+export function validateAnalysisDirectives(analysisInput: JobAnalysis, snapshot: ContextSnapshot): void {
+  const analysis = JobAnalysisSchema.parse(analysisInput);
+  const extractedDirectives = extractMustIncludeDirectives(snapshot.sources, snapshot.evidence);
+  if (JSON.stringify(snapshot.mustIncludeDirectives) !== JSON.stringify(extractedDirectives)) {
+    throw new ResumeValidationError("context snapshot must-include directives do not match heading-backed evidence");
+  }
+  const evidenceById = new Map(snapshot.evidence.map((block) => [block.id, block]));
+  const directiveByEvidenceId = new Map(snapshot.mustIncludeDirectives.map((directive) => [directive.evidenceId, directive]));
+  const allReferences = analysisEvidenceReferences(analysis);
+  for (const evidenceId of allReferences.flat()) {
+    if (!evidenceById.has(evidenceId)) throw new ResumeValidationError(`job analysis cites unknown evidence ${evidenceId}`);
+  }
+  const proposedItems = [
+    ...analysis.proposedCvContent.reorderedExperience.flatMap((experience) => experience.bullets),
+    ...analysis.proposedCvContent.selectedProjects,
+  ];
+  const activatedDirectiveIds = new Set<string>();
+  for (const directive of snapshot.mustIncludeDirectives) {
+    const supportingItems = proposedItems.filter((item) => item.evidenceIds.some((evidenceId) => {
+      if (directiveByEvidenceId.has(evidenceId)) return false;
+      const evidence = evidenceById.get(evidenceId);
+      return evidence !== undefined && equivalentEntities(evidence.entityId, directive.entityId, snapshot);
+    }));
+    if (supportingItems.length === 0) continue;
+    activatedDirectiveIds.add(directive.evidenceId);
+    if (!supportingItems.some((item) => item.evidenceIds.includes(directive.evidenceId))) {
+      throw new ResumeValidationError(`proposed content for ${directive.entityId} omits must-include directive ${directive.evidenceId}`);
+    }
+  }
+  for (const item of proposedItems) {
+    for (const evidenceId of item.evidenceIds) {
+      const directive = directiveByEvidenceId.get(evidenceId);
+      if (!directive) continue;
+      const hasSupportingEvidence = item.evidenceIds.some((supportingId) => {
+        if (directiveByEvidenceId.has(supportingId)) return false;
+        const evidence = evidenceById.get(supportingId);
+        return evidence !== undefined && equivalentEntities(evidence.entityId, directive.entityId, snapshot);
+      });
+      if (!hasSupportingEvidence) {
+        throw new ResumeValidationError(`proposed content misattributes must-include directive ${evidenceId}`);
+      }
+    }
+  }
+  for (const evidenceId of allReferences.flat()) {
+    if (directiveByEvidenceId.has(evidenceId) && !activatedDirectiveIds.has(evidenceId)) {
+      throw new ResumeValidationError(`inactive must-include directive ${evidenceId} cannot be cited as evidence`);
+    }
+  }
 }
 
 export function validateCommentDispositions(comments: readonly string[], dispositions: readonly CommentDisposition[], snapshot: ContextSnapshot): void {
@@ -55,37 +126,15 @@ export function buildEvidenceLedger(analysisInput: JobAnalysis, planInput: Tailo
   const analysis = JobAnalysisSchema.parse(analysisInput);
   const plan = TailoringPlanSchema.parse(planInput);
   validateAnalysisImmutability(plan, analysis);
+  validateAnalysisDirectives(analysis, snapshot);
+  validatePlanDirectives(plan, snapshot);
   const comments = options.comments ?? [];
   const dispositions = options.commentDispositions ?? [];
   validateCommentDispositions(comments, dispositions, snapshot);
   validateAppliedCommentEvidence(plan, dispositions);
   const evidenceById = new Map(snapshot.evidence.map((block) => [block.id, block]));
   const cited = new Set<string>();
-  for (const requirement of analysis.requirementEvidence) for (const id of requirement.evidenceIds) cited.add(id);
-  for (const risk of analysis.recruiterRisks) for (const id of risk.evidenceIds) cited.add(id);
-  for (const gap of analysis.gapsAndMitigations) for (const id of gap.evidenceIds) cited.add(id);
-  for (const keyword of analysis.keywordAlignment) for (const id of keyword.evidenceIds) cited.add(id);
-  for (const id of analysis.proposedCvContent.professionalSummary.evidenceIds) cited.add(id);
-  for (const competency of analysis.proposedCvContent.coreCompetencies) for (const id of competency.evidenceIds) cited.add(id);
-  for (const experience of analysis.proposedCvContent.reorderedExperience) {
-    for (const bullet of experience.bullets) for (const id of bullet.evidenceIds) cited.add(id);
-  }
-  for (const project of analysis.proposedCvContent.selectedProjects) for (const id of project.evidenceIds) cited.add(id);
-  for (const bullet of analysis.businessValueBulletReview) for (const id of bullet.evidenceIds) cited.add(id);
-  for (const id of analysis.sixSecondClarityGate.targetRoleOrArchetype.evidenceIds) cited.add(id);
-  for (const id of analysis.sixSecondClarityGate.strongestMatchingStackOrDomain.evidenceIds) cited.add(id);
-  for (const id of analysis.sixSecondClarityGate.productionOrBusinessOutcome.evidenceIds) cited.add(id);
-  for (const id of analysis.sixSecondClarityGate.appropriateLocationOrRemoteFit.evidenceIds) cited.add(id);
-  for (const id of analysis.sixSecondClarityGate.relevantPortfolioOrCaseStudyLink.evidenceIds) cited.add(id);
-  for (const id of analysis.atsAndTruthfulnessReview.parseableSingleColumnStructure.evidenceIds) cited.add(id);
-  for (const id of analysis.atsAndTruthfulnessReview.standardSectionHeaders.evidenceIds) cited.add(id);
-  for (const id of analysis.atsAndTruthfulnessReview.selectableUtf8Text.evidenceIds) cited.add(id);
-  for (const id of analysis.atsAndTruthfulnessReview.truthfulKeywordUse.evidenceIds) cited.add(id);
-  for (const id of analysis.atsAndTruthfulnessReview.noHiddenTextOrKeywordStuffing.evidenceIds) cited.add(id);
-  for (const id of analysis.atsAndTruthfulnessReview.noUnsupportedSkillsOrMetrics.evidenceIds) cited.add(id);
-  for (const item of analysis.customizationPlan) for (const id of item.evidenceIds) cited.add(id);
-  for (const item of analysis.rankedRecommendations.cvChanges) for (const id of item.evidenceIds) cited.add(id);
-  for (const item of analysis.rankedRecommendations.linkedInChanges) for (const id of item.evidenceIds) cited.add(id);
+  for (const evidenceIds of analysisEvidenceReferences(analysis)) for (const id of evidenceIds) cited.add(id);
   for (const decision of plan.decisions) for (const id of decision.evidenceIds) cited.add(id);
   for (const skill of plan.skillDecisions) for (const id of skill.evidenceIds) cited.add(id);
   for (const omission of plan.omissions) for (const id of omission.evidenceIds) cited.add(id);
@@ -126,6 +175,7 @@ function validateAppliedCommentEvidence(plan: TailoringPlan, dispositions: reado
 export function validateEditResult(resultInput: EditResult, comments: readonly string[], analysis: JobAnalysis, snapshot: ContextSnapshot): void {
   const result = EditResultSchema.parse(resultInput);
   validateAnalysisImmutability(result.plan, analysis);
+  validatePlanDirectives(result.plan, snapshot);
   validateCommentDispositions(comments, result.commentDispositions, snapshot);
   validateAppliedCommentEvidence(result.plan, result.commentDispositions);
 }

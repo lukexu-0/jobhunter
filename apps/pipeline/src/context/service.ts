@@ -12,6 +12,7 @@ import {
   type LoadedContextManifest,
 } from "./manifest.ts";
 import { parseEvidenceBlocks } from "./parser.ts";
+import { extractMustIncludeDirectives } from "./directives.ts";
 import { sha256 } from "./sha256.ts";
 
 interface VersionRow {
@@ -215,6 +216,7 @@ export function createContextSnapshot(
     sourceHashes,
     sources: Object.freeze(sources),
     evidence,
+    mustIncludeDirectives: extractMustIncludeDirectives(sources, evidence),
     explicitEntityBindings: Object.freeze({ ...loaded.manifest.explicitEntityBindings }),
   });
 }

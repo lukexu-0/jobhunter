@@ -106,6 +106,23 @@ describe("deterministic PDF QA", () => {
     }
   });
 
+  test("matches currency evidence split into separate PDF words", async () => {
+    const { root, pdf } = await fixture();
+    const currencyBbox = BBOX.replace(
+      "</page>",
+      '<word xMin="255.000000" yMin="96.000000" xMax="260.000000" yMax="108.000000">$</word><word xMin="261.000000" yMin="96.000000" xMax="305.000000" yMax="108.000000">300,000</word></page>',
+    );
+    const report = await runDeterministicPdfQa({
+      pdfPath: pdf,
+      cwd: root,
+      requiredHeadings: ["Experience", "Education"],
+      selectedEvidenceText: ["$300,000"],
+      boundary: fakeBoundary([{ stdout: [PDFINFO] }, { stdout: [currencyBbox] }, { stdout: [FONTS] }]),
+    });
+
+    expect(report.checks.find(({ id }) => id === "selected-evidence")?.status).toBe("pass");
+  });
+
   test("keeps encrypted, page-count, and page-size failures independent", async () => {
     const { root, pdf } = await fixture();
     const cases = [

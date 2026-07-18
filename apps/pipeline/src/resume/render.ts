@@ -1,4 +1,5 @@
 import type { ContextSnapshot, EvidenceBlock } from "../context/types.ts";
+import { extractMustIncludeDirectives } from "../context/directives.ts";
 import { parseBaselineResume, type BaselineEntity, type ParsedBaselineResume } from "./parser.ts";
 import { TailoringPlanSchema, type ResumeSection, type TailoringDecision, type TailoringPlan } from "./types.ts";
 
@@ -15,7 +16,7 @@ export function plainTextToTex(input: string): string {
   return input.normalize("NFC").replace(/[\\{}$&#%_~^]/g, (character) => escaped[character]!).replace(/\s+/g, " ").trim();
 }
 
-function equivalentEntities(left: string, right: string, snapshot: ContextSnapshot): boolean {
+export function equivalentEntities(left: string, right: string, snapshot: ContextSnapshot): boolean {
   if (left === right) return true;
   const graph = new Map<string, Set<string>>();
   const connect = (a: string, b: string) => {
@@ -57,6 +58,48 @@ function assertUnique(values: readonly string[], label: string): void {
   if (new Set(values).size !== values.length) throw new ResumeValidationError(`duplicate ${label}`);
 }
 
+export function validatePlanDirectives(plan: TailoringPlan, snapshot: ContextSnapshot): void {
+  const directiveByEvidenceId = new Map(snapshot.mustIncludeDirectives.map((directive) => [directive.evidenceId, directive]));
+  const decisions = [...plan.decisions, ...plan.skillDecisions];
+  for (const decision of decisions) {
+    for (const evidenceId of decision.evidenceIds) {
+      const directive = directiveByEvidenceId.get(evidenceId);
+      if (!directive) continue;
+      if (decision.action === "omit") throw new ResumeValidationError(`omitted entity ${decision.entityId} cites must-include directive ${evidenceId}`);
+      if (!equivalentEntities(decision.entityId, directive.entityId, snapshot)) {
+        throw new ResumeValidationError(`must-include directive ${evidenceId} belongs to ${directive.entityId}, not ${decision.entityId}`);
+      }
+    }
+  }
+  for (const directive of snapshot.mustIncludeDirectives) {
+    const applicable = decisions.filter((decision) =>
+      decision.action !== "omit" && equivalentEntities(decision.entityId, directive.entityId, snapshot));
+    if (applicable.length > 0 && !applicable.some((decision) => decision.evidenceIds.includes(directive.evidenceId))) {
+      throw new ResumeValidationError(`included entity ${directive.entityId} omits must-include directive ${directive.evidenceId}`);
+    }
+  }
+  for (const winner of plan.factWinners) {
+    if (directiveByEvidenceId.has(winner.evidenceId)) {
+      throw new ResumeValidationError(`fact winner ${winner.factKey} uses a must-include directive as factual evidence`);
+    }
+  }
+  for (const omission of plan.omissions) {
+    for (const evidenceId of omission.evidenceIds) {
+      if (directiveByEvidenceId.has(evidenceId)) throw new ResumeValidationError(`omission cites must-include directive ${evidenceId}`);
+    }
+  }
+  for (const override of plan.baselineOverrides) {
+    for (const evidenceId of override.evidenceIds) {
+      const directive = directiveByEvidenceId.get(evidenceId);
+      if (!directive) continue;
+      const decision = plan.decisions.find((candidate) => candidate.baselineItemId === override.baselineItemId);
+      if (!decision || decision.action === "omit" || !equivalentEntities(decision.entityId, directive.entityId, snapshot)) {
+        throw new ResumeValidationError(`baseline override carries misattributed must-include directive ${evidenceId}`);
+      }
+    }
+  }
+}
+
 function validateSnapshot(snapshot: ContextSnapshot): void {
   assertUnique(snapshot.sources.map((source) => source.id), "context source ID");
   assertUnique(snapshot.sources.map((source) => source.sourceVersionId), "context source version");
@@ -71,6 +114,10 @@ function validateSnapshot(snapshot: ContextSnapshot): void {
     const source = sources.get(block.sourceId);
     if (!source || source.sourceVersionId !== block.sourceVersionId) throw new ResumeValidationError(`evidence ${block.id} has invalid source provenance`);
   }
+  const extractedDirectives = extractMustIncludeDirectives(snapshot.sources, snapshot.evidence);
+  if (JSON.stringify(snapshot.mustIncludeDirectives) !== JSON.stringify(extractedDirectives)) {
+    throw new ResumeValidationError("context snapshot must-include directives do not match heading-backed evidence");
+  }
 }
 
 function validatePlan(planInput: TailoringPlan, baseline: ParsedBaselineResume, snapshot: ContextSnapshot): TailoringPlan {
@@ -80,6 +127,7 @@ function validatePlan(planInput: TailoringPlan, baseline: ParsedBaselineResume, 
   if (snapshot.baselineSha256 !== baseline.sha256) throw new ResumeValidationError("baseline hash does not match immutable context snapshot");
   validateSnapshot(snapshot);
   requireSampleProjectBinding(snapshot);
+  validatePlanDirectives(plan, snapshot);
   assertUnique(plan.decisions.map((decision) => decision.id), "decision ID");
   assertUnique(plan.factWinners.map((winner) => winner.factKey), "fact winner");
   const evidence = new Map(snapshot.evidence.map((block) => [block.id, block]));

@@ -47,6 +47,7 @@ const PUBLIC_ARTIFACT_KINDS: Readonly<Record<string, ArtifactKind>> = Object.fre
   "change-summary": "change-summary",
   "tailored-tex": "tailored-tex",
   "compiled-pdf": "compiled-pdf",
+  "keyword-map-pdf": "keyword-map-pdf",
   "page-image": "page-image",
   "deterministic-qa": "deterministic-qa",
   "visual-qa": "visual-qa",
@@ -97,20 +98,20 @@ function sourceSnapshot(snapshot: ContextSnapshot): RunSourceSnapshotInput {
 }
 
 function mediaType(kind: ArtifactKind): string {
-  if (kind === "compiled-pdf") return "application/pdf";
+  if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return "application/pdf";
   if (kind === "page-image") return "image/png";
   if (kind === "tailored-tex") return "text/x-tex; charset=utf-8";
   return "application/json; charset=utf-8";
 }
 
 function extension(kind: ArtifactKind): string {
-  if (kind === "compiled-pdf") return "pdf";
+  if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return "pdf";
   if (kind === "page-image") return "png";
   if (kind === "tailored-tex") return "tex";
   return "json";
 }
 function publicArtifactLimit(kind: ArtifactKind): number {
-  if (kind === "compiled-pdf") return 10 * 1024 * 1024;
+  if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return 10 * 1024 * 1024;
   if (kind === "page-image") return 25 * 1024 * 1024;
   if (kind === "tailored-tex") return 256 * 1024;
   return MAX_PUBLIC_METADATA_BYTES;
@@ -197,7 +198,9 @@ export class RunApplicationService {
     return run ? await this.#toDto(run) : undefined;
   }
 
-  async createRun(jobUrl: string, signal?: AbortSignal): Promise<RunDto> {
+  async createRun(jobUrl: string, generateKeywordMapOrSignal: boolean | AbortSignal = true, requestSignal?: AbortSignal): Promise<RunDto> {
+    const generateKeywordMap = typeof generateKeywordMapOrSignal === "boolean" ? generateKeywordMapOrSignal : true;
+    const signal = typeof generateKeywordMapOrSignal === "boolean" ? requestSignal : generateKeywordMapOrSignal;
     signal?.throwIfAborted();
     let source: LoadedJobSource;
     try {
@@ -266,7 +269,7 @@ export class RunApplicationService {
       sha256: input.sha256,
       path: input.path,
       byteSize: input.bytes,
-    }, runId);
+    }, runId, generateKeywordMap);
     return await this.#toDto(run);
   }
 

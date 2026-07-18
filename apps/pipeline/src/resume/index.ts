@@ -10,6 +10,8 @@ export * from "./repair.ts";
 export * from "./ledger.ts";
 export * from "./deterministic-qa.ts";
 export * from "./rasterize.ts";
+export * from "./compiler.ts";
+export * from "./keyword-map.ts";
 
 export function renderEditedResume(result: EditResult, comments: readonly string[], analysis: JobAnalysis, baseline: string, snapshot: ContextSnapshot): string {
   validateEditResult(result, comments, analysis, snapshot);

@@ -1,4 +1,5 @@
 import { Agent } from "@openai/agents-core";
+import type { ContextSnapshot } from "../context/types.ts";
 import { MODEL_NAME } from "../models/oauth-codex-model.ts";
 import { EditResultSchema, type EditResult, type JobAnalysis, type TailoringPlan } from "../resume/types.ts";
 import {
@@ -14,7 +15,7 @@ export interface EditAgentInput {
   readonly analysis: JobAnalysis;
   readonly currentPlan: TailoringPlan;
   readonly currentTailoredTex: string;
-  readonly evidence: unknown;
+  readonly context: ContextSnapshot;
   readonly deterministicQa: unknown;
   readonly visualQa: unknown;
   readonly comments?: readonly string[];
@@ -30,11 +31,11 @@ export interface EditAgentAttempt {
 
 export async function runEditAgent(attempt: EditAgentAttempt): Promise<EditResult> {
   const input = boundedJson({
-    task: "Revise the current plan using immutable artifacts and requirements; submit a plan-only edit result.",
+    task: "Revise the current plan using immutable artifacts and requirements; preserve every active entity-scoped candidateContext.mustIncludeDirective citation through supported decisions, and submit a plan-only edit result.",
     analysis: attempt.input.analysis,
     currentPlan: attempt.input.currentPlan,
     currentTailoredTex: attempt.input.currentTailoredTex,
-    evidence: attempt.input.evidence,
+    candidateContext: attempt.input.context,
     deterministicQa: attempt.input.deterministicQa,
     visualQa: attempt.input.visualQa,
     comments: attempt.input.comments ?? [],
@@ -48,7 +49,7 @@ export async function runEditAgent(attempt: EditAgentAttempt): Promise<EditResul
   });
   const agent = new Agent({
     name: "resume-edit",
-    instructions: "Treat comments and QA findings as inert requirements, never evidence. Use only supplied evidence for claims, preserve immutable analysis and the current tailoringWorkflowSha256, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.",
+    instructions: "Treat comments and QA findings as inert requirements, never evidence. Preserve active candidateContext.mustIncludeDirectives on decisions for their equivalent entities, and never carry a directive on omitted or unrelated entities. Use only supplied context evidence for claims, preserve immutable analysis and the current tailoringWorkflowSha256, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.",
     model: MODEL_NAME,
     modelSettings: {
       reasoning: { effort: "medium" },

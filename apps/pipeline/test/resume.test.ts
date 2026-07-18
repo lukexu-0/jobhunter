@@ -5,11 +5,11 @@ import type { ContextSnapshot, EvidenceBlock, IndexedContextSource } from "../sr
 import {
   EditResultSchema, JobAnalysisSchema, TailoringResultSchema, TailoringSubmissionSchema, buildEvidenceLedger, hashJobAnalysis, immutableChunks,
   parseBaselineResume, plainTextToTex, renderEditedResume, renderTailoredResume, scanForbiddenPrimitives,
-  validateRepairCandidate, type EditResult, type JobAnalysis, type TailoringPlan,
+  validateAnalysisDirectives, validateRepairCandidate, type EditResult, type JobAnalysis, type TailoringPlan,
 } from "../src/resume/index.ts";
 import { jobAnalysisFixture } from "./job-analysis.fixture.ts";
 
-const baseline = readFileSync(resolve(import.meta.dir, "../../../actual/resume-main/main.tex"), "utf8");
+const baseline = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/main.tex"), "utf8");
 const parsedBaseline = parseBaselineResume(baseline);
 const sha = "a".repeat(64);
 
@@ -26,6 +26,7 @@ function fixtures(): { snapshot: ContextSnapshot; analysis: JobAnalysis; plan: T
   const snapshot: ContextSnapshot = {
     manifestSha256: sha, baselineSha256: parsedBaseline.sha256,
     sourceHashes: Object.fromEntries(sources.map((source) => [source.id, source.sha256])), sources, evidence,
+    mustIncludeDirectives: [],
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
   const evidenceByEntity = new Map(parsedBaseline.entities.map((entity, index) => [entity.entityId, `evidence-${index}`]));
@@ -47,18 +48,112 @@ function fixtures(): { snapshot: ContextSnapshot; analysis: JobAnalysis; plan: T
   return { snapshot, analysis, plan };
 }
 
+function directiveFixtures() {
+  const fixture = fixtures();
+  const source = fixture.snapshot.sources.find((candidate) => candidate.baselineEntityIds.includes("Example Company"))!;
+  const supportingEvidence = fixture.snapshot.evidence.find((block) => block.entityId === source.entityId)!;
+  const directiveEvidence: EvidenceBlock = {
+    id: "directive-example",
+    sourceVersionId: source.sourceVersionId,
+    sourceId: source.id,
+    entityId: source.entityId,
+    ordinal: 100,
+    headingPath: ["Sample Testing", "21. Must Include"],
+    text: "- **Required framing:** Present Sample Testing/System A as an **agentic testing platform/workflow**, not generic automation.",
+    caveats: [],
+    sha256: "d".repeat(64),
+  };
+  const snapshot: ContextSnapshot = {
+    ...fixture.snapshot,
+    evidence: [...fixture.snapshot.evidence, directiveEvidence],
+    mustIncludeDirectives: [Object.freeze({
+      evidenceId: directiveEvidence.id,
+      sourceId: directiveEvidence.sourceId,
+      entityId: directiveEvidence.entityId,
+      text: directiveEvidence.text,
+    })],
+  };
+  const activatedAnalysis: JobAnalysis = {
+    ...fixture.analysis,
+    proposedCvContent: {
+      ...fixture.analysis.proposedCvContent,
+      selectedProjects: fixture.analysis.proposedCvContent.selectedProjects.map((project, index) =>
+        index === 0 ? { ...project, evidenceIds: [supportingEvidence.id, directiveEvidence.id] } : project),
+    },
+  };
+  const targetDecision = fixture.plan.decisions.find((decision) => decision.entityId === "Example Company")!;
+  const activePlan: TailoringPlan = {
+    ...fixture.plan,
+    analysisSha256: hashJobAnalysis(activatedAnalysis),
+    decisions: fixture.plan.decisions.map((decision) =>
+      decision.id === targetDecision.id
+        ? { ...decision, evidenceIds: [...decision.evidenceIds, directiveEvidence.id] }
+        : decision),
+  };
+  return { ...fixture, snapshot, directiveEvidence, supportingEvidence, activatedAnalysis, activePlan, targetDecision };
+}
+
 describe("strict resume contracts", () => {
   test("tailoring submissions remain plan-only while trusted results carry the working copy", () => {
     const { plan } = fixtures();
     expect(TailoringSubmissionSchema.safeParse({ plan, tailoredTex: "\\input{/etc/passwd}" }).success).toBeFalse();
-    expect(TailoringResultSchema.safeParse({ plan, tailoredTex: baseline, toolCount: 4 }).success).toBeTrue();
+    expect(TailoringResultSchema.safeParse({ plan, tailoredTex: baseline, toolCount: 11 }).success).toBeTrue();
+    expect(TailoringResultSchema.safeParse({ plan, tailoredTex: baseline, toolCount: 12 }).success).toBeFalse();
     expect(EditResultSchema.safeParse({ plan, commentDispositions: [], tailoredTex: "\\documentclass{article}" }).success).toBeFalse();
   });
 
   test("requires every prompt-defined analysis section", () => {
     const analysis = jobAnalysisFixture();
-    const { rankedRecommendations: _omitted, ...incomplete } = analysis;
+    const { customizationPlan: _omitted, ...incomplete } = analysis;
     expect(JobAnalysisSchema.safeParse(incomplete).success).toBeFalse();
+  });
+
+  test("analysis uses unique concrete placements and excludes removed outputs", () => {
+    const analysis = jobAnalysisFixture();
+    expect(JobAnalysisSchema.safeParse(analysis).success).toBeTrue();
+    expect(analysis.keywordAlignment[0]?.placements).toEqual(["Experience", "Technical Skills"]);
+
+    const keyword = analysis.keywordAlignment[0]!;
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      keywordAlignment: [{ ...keyword, placements: [] }],
+    }).success).toBeFalse();
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      keywordAlignment: [{ ...keyword, placements: ["Experience", "Experience"] }],
+    }).success).toBeFalse();
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      keywordAlignment: [{ ...keyword, placements: ["Summary"] }],
+    }).success).toBeFalse();
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      keywordAlignment: [{ ...keyword, placements: ["Skills"] }],
+    }).success).toBeFalse();
+
+    const { placements: _placements, ...legacyKeyword } = keyword;
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      keywordAlignment: [{ ...legacyKeyword, placement: "Experience" }],
+    }).success).toBeFalse();
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      proposedCvContent: {
+        ...analysis.proposedCvContent,
+        professionalSummary: { text: "Removed summary", evidenceIds: [] },
+      },
+    }).success).toBeFalse();
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      proposedCvContent: {
+        ...analysis.proposedCvContent,
+        coreCompetencies: [],
+      },
+    }).success).toBeFalse();
+    expect(JobAnalysisSchema.safeParse({
+      ...analysis,
+      linkedInChanges: [],
+    }).success).toBeFalse();
   });
 
   test("parses canonical sections, entities, bullets, and stable IDs", () => {
@@ -72,6 +167,72 @@ describe("strict resume contracts", () => {
     expect(parsedBaseline.bullets.length).toBeGreaterThan(10);
     expect(parsedBaseline.skills.length).toBeGreaterThan(10);
     expect(again.bullets.map((item) => item.id)).toEqual(parsedBaseline.bullets.map((item) => item.id));
+  });
+});
+
+describe("entity-scoped must-include directives", () => {
+  test("activates only for proposed same-entity evidence and rejects missing, arbitrary, or misattributed citations", () => {
+    const { snapshot, analysis, activatedAnalysis, directiveEvidence, supportingEvidence } = directiveFixtures();
+    expect(() => validateAnalysisDirectives(analysis, snapshot)).toThrow(/omits must-include directive/i);
+    expect(() => validateAnalysisDirectives(activatedAnalysis, snapshot)).not.toThrow();
+
+    const unrelatedEvidence = snapshot.evidence.find((block) =>
+      block.id !== supportingEvidence.id && block.id !== directiveEvidence.id)!;
+    const unrelatedAnalysis = jobAnalysisFixture({
+      jobDescriptionSha256: analysis.jobDescriptionSha256,
+      evidenceId: unrelatedEvidence.id,
+    });
+    expect(() => validateAnalysisDirectives(unrelatedAnalysis, snapshot)).not.toThrow();
+
+    const incorrectDirectiveAnalysis: JobAnalysis = {
+      ...unrelatedAnalysis,
+      proposedCvContent: {
+        ...unrelatedAnalysis.proposedCvContent,
+        selectedProjects: unrelatedAnalysis.proposedCvContent.selectedProjects.map((project, index) =>
+          index === 0 ? { ...project, evidenceIds: [unrelatedEvidence.id, directiveEvidence.id] } : project),
+      },
+    };
+    expect(() => validateAnalysisDirectives(incorrectDirectiveAnalysis, snapshot)).toThrow(/misattributes|inactive/i);
+
+    const arbitraryEvidenceAnalysis: JobAnalysis = {
+      ...unrelatedAnalysis,
+      proposedCvContent: {
+        ...unrelatedAnalysis.proposedCvContent,
+        technicalSkills: unrelatedAnalysis.proposedCvContent.technicalSkills.map((skill, index) =>
+          index === 0 ? { ...skill, evidenceIds: ["arbitrary-directive"] } : skill),
+      },
+    };
+    expect(() => validateAnalysisDirectives(arbitraryEvidenceAnalysis, snapshot)).toThrow(/unknown evidence arbitrary-directive/i);
+  });
+
+  test("requires plan and edit retention for included equivalent entities and preserves directive ledger citations", () => {
+    const { snapshot, activatedAnalysis, activePlan, directiveEvidence, plan } = directiveFixtures();
+    expect(() => renderTailoredResume(activePlan, baseline, snapshot)).not.toThrow();
+    const ledger = buildEvidenceLedger(activatedAnalysis, activePlan, snapshot);
+    expect(ledger.citations.some((citation) => citation.evidenceId === directiveEvidence.id)).toBeTrue();
+
+    const missingPlan: TailoringPlan = {
+      ...plan,
+      analysisSha256: hashJobAnalysis(activatedAnalysis),
+    };
+    expect(() => renderTailoredResume(missingPlan, baseline, snapshot)).toThrow(/omits must-include directive/i);
+    expect(() => renderEditedResume(
+      { plan: missingPlan, commentDispositions: [] },
+      [],
+      activatedAnalysis,
+      baseline,
+      snapshot,
+    )).toThrow(/omits must-include directive/i);
+
+    const unrelatedDecision = activePlan.decisions.find((decision) => decision.entityId !== "Example Company")!;
+    const misattributedPlan: TailoringPlan = {
+      ...activePlan,
+      decisions: activePlan.decisions.map((decision) =>
+        decision.id === unrelatedDecision.id
+          ? { ...decision, evidenceIds: [...decision.evidenceIds, directiveEvidence.id] }
+          : decision),
+    };
+    expect(() => renderTailoredResume(misattributedPlan, baseline, snapshot)).toThrow(/belongs to .* not/i);
   });
 });
 
@@ -145,7 +306,7 @@ describe("trusted rendering", () => {
     expect(() => renderTailoredResume(mismatchedAuthority, baseline, snapshot)).toThrow(/attributed/i);
 
     const baselineSource: IndexedContextSource = {
-      id: "canonical-baseline", relativePath: "actual/resume-main/main.tex", kind: "baseline", entityId: "candidate-resume",
+      id: "canonical-baseline", relativePath: "apps/user-info/resume-main/main.tex", kind: "baseline", entityId: "candidate-resume",
       displayName: "Canonical resume", baselineEntityIds: [], sourceVersionId: "canonical-baseline-version",
       sha256: parsedBaseline.sha256, bytes: Buffer.byteLength(baseline), indexedAt: 1,
     };

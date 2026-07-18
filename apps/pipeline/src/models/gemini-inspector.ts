@@ -108,7 +108,9 @@ export async function inspectResumePng(
   const resolverFactory = inspectorOptions.resolverFactory ?? createOAuthOnlyApiKeyResolver;
   const transport = inspectorOptions.transport ?? completeSimple;
   const apiKey = resolverFactory("google-antigravity", attemptSessionId, GEMINI_MODEL_NAME, signal);
-  const schema = JSON.stringify(z.toJSONSchema(GeminiVisualInspectionSchema));
+  const schemaDocument = z.toJSONSchema(GeminiVisualInspectionSchema);
+  Reflect.deleteProperty(schemaDocument, "$schema");
+  const schema = JSON.stringify(schemaDocument);
   const message = await transport(GEMINI_DESCRIPTOR, {
     systemPrompt: [
       "Inspect the single resume page for clipping, overlap, unreadable text, broken glyphs, poor spacing, or layout defects.",

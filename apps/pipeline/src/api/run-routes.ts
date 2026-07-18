@@ -13,7 +13,7 @@ import { apiResponse } from "./handler";
 export interface RunRouteService {
   listRuns(): Promise<RunDto[]> | RunDto[];
   getRun(id: string): Promise<RunDto | undefined> | RunDto | undefined;
-  createRun(jobUrl: string, signal?: AbortSignal): Promise<RunDto>;
+  createRun(jobUrl: string, generateKeywordMap: boolean, signal?: AbortSignal): Promise<RunDto>;
   updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto>;
   retryRun(id: string): Promise<RunDto>;
   regenerateRun(id: string, expectedPdfSha256: string): Promise<RunDto>;
@@ -67,8 +67,8 @@ export function createRunRoutes(service: RunRouteService) {
       }
       if (request.method === "POST" && segments.length === 2) {
         const body = CreateRunRequestSchema.safeParse(await parseBody(request));
-        if (!body.success) return apiResponse.error("INVALID_REQUEST", "Job URL must be a valid HTTP(S) URL", 400);
-        const run = checkedRun(await service.createRun(body.data.jobUrl, request.signal));
+        if (!body.success) return apiResponse.error("INVALID_REQUEST", "Run request is invalid", 400);
+        const run = checkedRun(await service.createRun(body.data.jobUrl, body.data.generateKeywordMap, request.signal));
         service.kick();
         return apiResponse.json(run, 201);
       }

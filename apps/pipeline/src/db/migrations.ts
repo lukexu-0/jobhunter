@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const PIPELINE_SCHEMA_VERSION = 3;
+export const PIPELINE_SCHEMA_VERSION = 6;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -145,6 +145,19 @@ CREATE TABLE run_artifact_retention (
 CREATE INDEX run_artifact_retention_state ON run_artifact_retention(state, selected_at);
 `;
 
+const migration4 = `
+ALTER TABLE runs ADD COLUMN must_include TEXT NOT NULL DEFAULT '';
+`;
+
+const migration5 = `
+ALTER TABLE runs DROP COLUMN must_include;
+`;
+
+const migration6 = `
+ALTER TABLE runs ADD COLUMN generate_keyword_map INTEGER NOT NULL DEFAULT 0
+  CHECK (generate_keyword_map IN (0,1));
+`;
+
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
   const version = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
   if (version > PIPELINE_SCHEMA_VERSION) throw new Error(`pipeline database version ${version} is newer than supported ${PIPELINE_SCHEMA_VERSION}`);
@@ -162,6 +175,18 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
     if (version < 3) {
       db.exec(migration3);
       db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(3, now);
+    }
+    if (version < 4) {
+      db.exec(migration4);
+      db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(4, now);
+    }
+    if (version < 5) {
+      db.exec(migration5);
+      db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(5, now);
+    }
+    if (version < 6) {
+      db.exec(migration6);
+      db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(6, now);
     }
     db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
     db.exec("COMMIT");

@@ -26,7 +26,7 @@ import {
   DEFAULT_TOOL_TIMEOUT_MS,
 } from "./tools.ts";
 
-export const MAX_TAILORING_TOOL_CALLS = 7;
+export const MAX_TAILORING_TOOL_CALLS = 10;
 export const MAX_TAILORING_TOOL_BYTES = 3 * 1024 * 1024;
 
 const TAILORING_WORKFLOW_PROMPT = `# Resume Tailoring Workflow
@@ -160,7 +160,7 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
     sharedSubmitted,
     maxCalls: MAX_TAILORING_TOOL_CALLS,
     maxBytes: MAX_TAILORING_TOOL_BYTES,
-    perToolCalls: { read_working_tex: 3, apply_tailoring_plan: 5 },
+    perToolCalls: { read_working_tex: 4, apply_tailoring_plan: 6 },
     label: "tailoring",
   });
   let workingTex = attempt.input.baseline;
@@ -240,11 +240,7 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
 
   const agent = new Agent({
     name: "resume-tailoring",
-    instructions: `Tailor the resume using the workflow below, applying writing and prioritization guidance with judgment rather than mechanically. The runtime input provides immutable identifiers, the complete analysis, candidateContext, and baselineInventory.
-Mandatory: Keep content evidence-grounded and factually accurate; never invent claims, technologies, metrics, dates, tense, or completion status.
-Mandatory: Preserve exact IDs and hashes, cover every baseline bullet and skill, obey plan invariants (matching overrides for rewrites, factKeys only for genuine conflicting factWinners, and evidence-owner entityIds), follow read_working_tex → apply_tailoring_plan → read_working_tex → submit_tailoring_plan, and fit one page.
-
-${TAILORING_WORKFLOW_PROMPT}`,
+    instructions: `Tailor the resume using the workflow below, applying writing and prioritization guidance with judgment rather than mechanically. The runtime input provides immutable identifiers, the complete analysis, candidateContext, and baselineInventory.\nMandatory: Keep content evidence-grounded and factually accurate; never invent claims, technologies, metrics, dates, tense, or completion status, and use only candidateContext.mustIncludeDirectives on non-omitted equivalent entities with both directive and same-entity supporting evidence, surfacing unsupported or conflicting directives as limitations.\nMandatory: Preserve exact IDs and hashes, cover every baseline bullet and skill, obey plan invariants (matching overrides for rewrites, factKeys only for genuine conflicting factWinners, and evidence-owner entityIds), follow read_working_tex → apply_tailoring_plan → read_working_tex → submit_tailoring_plan, and fit one page.\n\n${TAILORING_WORKFLOW_PROMPT}`,
     model: MODEL_NAME,
     modelSettings: {
       reasoning: { effort: "medium" },
@@ -259,7 +255,7 @@ ${TAILORING_WORKFLOW_PROMPT}`,
     resetToolChoice: false,
   });
   const runner = createAttemptRunner(attempt.attemptSessionId, attempt.runtime);
-  await runWithDeadline(runner, agent, input, 9, attempt.signal, TAILORING_DEADLINE_MS);
+  await runWithDeadline(runner, agent, input, 12, attempt.signal, TAILORING_DEADLINE_MS);
   const submitted = submission.requireExactlyOne();
   if (!applied) throw new Error("tailoring agent completed without an applied working copy");
   return TailoringResultSchema.parse({

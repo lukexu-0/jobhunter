@@ -112,6 +112,22 @@ describe("allowlisted context ingestion", () => {
       expect(snapshot.sources.find((source) => source.id === "sample-project")?.baselineEntityIds).toContain("Sample Project");
       expect(Object.isFrozen(snapshot)).toBe(true);
       expect(Object.isFrozen(snapshot.evidence)).toBe(true);
+      expect(snapshot.mustIncludeDirectives).toHaveLength(1);
+      const directive = snapshot.mustIncludeDirectives[0]!;
+      const directiveEvidence = snapshot.evidence.find((block) => block.id === directive.evidenceId);
+      expect(directive).toMatchObject({
+        sourceId: "automated-testing-resume-info",
+        entityId: "experience:example-company",
+      });
+      expect(directive.text).toContain("agentic testing platform/workflow");
+      expect(directiveEvidence?.headingPath.at(-1)).toBe("21. Must Include");
+      expect(directiveEvidence?.text).toBe(directive.text);
+      expect(snapshot.evidence.some((block) =>
+        block.headingPath.at(-1) === "21. Must Include"
+        && block.text.normalize("NFC").replace(/\s+/gu, " ").trim() === "None specified")).toBeTrue();
+      expect(snapshot.mustIncludeDirectives.some((item) => item.text === "None specified")).toBeFalse();
+      expect(Object.isFrozen(snapshot.mustIncludeDirectives)).toBeTrue();
+      expect(Object.isFrozen(directive)).toBeTrue();
     } finally {
       database.close();
     }

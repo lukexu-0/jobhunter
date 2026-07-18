@@ -144,7 +144,7 @@ function transition(repository: PipelineRepository, claim: { runId: string; toke
   for (const stage of stages) repository.transition(claim, stage);
 }
 
-async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1.7\nreview", visualAcknowledgementRequired = false): Promise<{ id: string; sha256: string }> {
+async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1.7\nreview", visualAcknowledgementRequired = false, keywordMapBytes?: string): Promise<{ id: string; sha256: string; keywordMapId?: string }> {
   const claim = target.repository.acquire();
   if (!claim || claim.runId !== runId) throw new Error("claim missing");
   const status = target.repository.getRun(runId)?.status;
@@ -162,10 +162,23 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
     path: stored.path,
     byteSize: stored.bytes,
   });
+  let keywordMapId: string | undefined;
+  if (keywordMapBytes !== undefined) {
+    const map = await target.artifacts.write(join(root, "keyword-map.pdf"), keywordMapBytes, 10 * 1024 * 1024);
+    keywordMapId = target.repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "keyword-map-pdf",
+      sha256: map.sha256,
+      path: map.path,
+      byteSize: map.bytes,
+      sourceArtifactId: artifact.id,
+    }).id;
+  }
   target.repository.finishAttempt(claim, attempt.id, "succeeded");
   target.repository.transition(claim, "review", { visualAcknowledgementRequired });
   target.repository.release(claim);
-  return { id: artifact.id, sha256: artifact.sha256 };
+  return { id: artifact.id, sha256: artifact.sha256, ...(keywordMapId ? { keywordMapId } : {}) };
 }
 
 function post(body: unknown): RequestInit {
@@ -179,6 +192,9 @@ describe("RunApplicationService", () => {
     const run = await target.service.createRun(JOB_URL);
 
     expect(run).toMatchObject({ id: "run-1", status: "queued", revision: 1, origin: "initial" });
+    expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(true);
+    const disabled = await target.service.createRun(JOB_URL, false);
+    expect(target.repository.getRun(disabled.id)?.generateKeywordMap).toBe(false);
     expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(4);
     const input = target.repository.getArtifact(run.id, "job-description");
     expect(input).not.toBeNull();
@@ -583,10 +599,10 @@ describe("RunApplicationService", () => {
   });
 
 
-  test("serves only allowlisted current review artifacts with verified immutable download headers", async () => {
+  test("serves public compiled and keyword-map PDFs with verified immutable download metadata", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
-    const pdf = await finalizeReviewPdf(target, run.id);
+    const run = await target.service.createRun(JOB_URL, true);
+    const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nreview", false, "%PDF-1.7\nkeyword-map");
     const response = await target.service.getArtifact(run.id, pdf.id);
     expect(response?.status).toBe(200);
     expect(response?.headers.get("cache-control")).toBe("no-store");
@@ -595,6 +611,18 @@ describe("RunApplicationService", () => {
     expect(response?.headers.get("x-content-sha256")).toBe(pdf.sha256);
     expect(await response?.text()).toBe("%PDF-1.7\nreview");
 
+    const map = await target.service.getArtifact(run.id, pdf.keywordMapId!);
+    expect(map?.status).toBe(200);
+    expect(map?.headers.get("content-type")).toBe("application/pdf");
+    expect(map?.headers.get("content-disposition")).toBe('attachment; filename="keyword-map-pdf.pdf"');
+    expect(await map?.text()).toBe("%PDF-1.7\nkeyword-map");
+
+    const dto = await target.service.getRun(run.id);
+    expect(dto?.artifacts.find((artifact) => artifact.id === pdf.keywordMapId)).toMatchObject({
+      kind: "keyword-map-pdf",
+      mediaType: "application/pdf",
+      public: true,
+    });
     const input = target.repository.getArtifact(run.id, "job-description")!;
     expect(await target.service.getArtifact(run.id, input.id)).toBeUndefined();
   });

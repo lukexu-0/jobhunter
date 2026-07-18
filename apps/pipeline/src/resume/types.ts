@@ -10,16 +10,6 @@ const EvidenceBackedTextSchema = z.object({
   text: PlainText,
   evidenceIds: AnalysisEvidenceIds,
 }).strict();
-const RequiredClarityFindingSchema = z.object({
-  status: z.enum(["clear", "revise"]),
-  evidenceOrRequiredRewrite: PlainText,
-  evidenceIds: AnalysisEvidenceIds,
-}).strict();
-const OptionalClarityFindingSchema = z.object({
-  status: z.enum(["clear", "revise", "not-applicable"]),
-  evidenceOrRequiredRewrite: PlainText,
-  evidenceIds: AnalysisEvidenceIds,
-}).strict();
 const AtsFindingSchema = z.object({
   status: z.enum(["pass", "revise"]),
   requiredAction: PlainText,
@@ -71,12 +61,15 @@ export const JobAnalysisSchema = z.object({
     jdQuote: PlainText,
     currentTruthfulCvWording: PlainText,
     recommendedReformulation: PlainText,
-    placement: z.enum(["Summary", "Experience", "Skills", "Projects"]),
+    placements: z.array(z.enum(["Experience", "Technical Skills", "Projects"]))
+      .min(1)
+      .max(3)
+      .refine((values) => values.every((value, index) => values.indexOf(value) === index), "placements must be unique")
+      .readonly(),
     evidenceIds: AnalysisEvidenceIds,
   }).strict()).min(1).max(100).readonly(),
   proposedCvContent: z.object({
-    professionalSummary: EvidenceBackedTextSchema,
-    coreCompetencies: z.array(EvidenceBackedTextSchema).min(6).max(8).readonly(),
+    technicalSkills: z.array(EvidenceBackedTextSchema).min(6).max(8).readonly(),
     reorderedExperience: z.array(z.object({
       roleOrCompany: PlainText,
       bullets: z.array(EvidenceBackedTextSchema).min(1).max(50).readonly(),
@@ -92,13 +85,6 @@ export const JobAnalysisSchema = z.object({
     outcomeOrProof: PlainText,
     evidenceIds: AnalysisEvidenceIds,
   }).strict()).min(1).max(100).readonly(),
-  sixSecondClarityGate: z.object({
-    targetRoleOrArchetype: RequiredClarityFindingSchema,
-    strongestMatchingStackOrDomain: RequiredClarityFindingSchema,
-    productionOrBusinessOutcome: RequiredClarityFindingSchema,
-    appropriateLocationOrRemoteFit: OptionalClarityFindingSchema,
-    relevantPortfolioOrCaseStudyLink: OptionalClarityFindingSchema,
-  }).strict(),
   atsAndTruthfulnessReview: z.object({
     parseableSingleColumnStructure: AtsFindingSchema,
     standardSectionHeaders: AtsFindingSchema,
@@ -114,10 +100,6 @@ export const JobAnalysisSchema = z.object({
     why: PlainText,
     evidenceIds: AnalysisEvidenceIds,
   }).strict()).min(1).max(100).readonly(),
-  rankedRecommendations: z.object({
-    cvChanges: z.array(EvidenceBackedTextSchema).length(5).readonly(),
-    linkedInChanges: z.array(EvidenceBackedTextSchema).length(5).readonly(),
-  }).strict(),
 }).strict();
 export type JobAnalysis = z.infer<typeof JobAnalysisSchema>;
 
@@ -197,7 +179,7 @@ export type TailoringSubmission = z.infer<typeof TailoringSubmissionSchema>;
 export const TailoringResultSchema = z.object({
   plan: TailoringPlanSchema,
   tailoredTex: z.string().max(256 * 1024),
-  toolCount: z.number().int().min(4).max(8),
+  toolCount: z.number().int().min(4).max(11),
 }).strict();
 export type TailoringResult = z.infer<typeof TailoringResultSchema>;
 

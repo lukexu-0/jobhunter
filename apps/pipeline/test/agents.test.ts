@@ -29,7 +29,7 @@ import {
 const RAW_JOB_DESCRIPTION = "raw-jd";
 const RAW_JOB_DESCRIPTION_SHA256 = createHash("sha256").update(RAW_JOB_DESCRIPTION).digest("hex");
 const ANALYSIS = jobAnalysisFixture({ jobDescriptionSha256: RAW_JOB_DESCRIPTION_SHA256 });
-const BASELINE = readFileSync(resolve(import.meta.dir, "../../../actual/resume-main/main.tex"), "utf8");
+const BASELINE = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/main.tex"), "utf8");
 const CONTEXT: ContextSnapshot = {
   manifestSha256: "c".repeat(64),
   baselineSha256: "d".repeat(64),
@@ -57,6 +57,7 @@ const CONTEXT: ContextSnapshot = {
     caveats: [],
     sha256: "f".repeat(64),
   }],
+  mustIncludeDirectives: [],
   explicitEntityBindings: {},
 };
 
@@ -143,6 +144,10 @@ describe("one-turn agents", () => {
         candidateContext: CONTEXT,
       });
       expect(agent.instructions).toContain(ANALYSIS_WORKFLOW_PROMPT);
+      expect(agent.instructions).toContain("mustIncludeDirective");
+      expect(agent.instructions).toContain("15–20 high-signal ATS keyword phrases");
+      expect(agent.instructions).toContain("screening filters");
+      expect(agent.instructions).toContain("Subjective culture language");
       await invoke(agent, "submit_job_analysis", ANALYSIS);
       return { finalOutput: ANALYSIS };
     }, providerIds);
@@ -212,7 +217,7 @@ describe("one-turn agents", () => {
     const tailoredTex = `${BASELINE}\n% isolated tailored copy`;
     let renderCalls = 0;
     const runtime = runtimeWith(async (agent, input, options) => {
-      runOptionsAreFresh(options, 9);
+      runOptionsAreFresh(options, 12);
       expect(agent.modelSettings).toMatchObject({
         reasoning: { effort: "medium" }, parallelToolCalls: false, store: false,
         retry: { maxRetries: 0 },
@@ -226,10 +231,13 @@ describe("one-turn agents", () => {
       ]);
       expect(agent.instructions).toContain(TAILORING_WORKFLOW_PROMPT);
       expect(agent.instructions).not.toContain("## Pipeline validation");
+      expect(agent.instructions).toContain("use only candidateContext.mustIncludeDirectives");
       expect(agent.instructions).toContain("analysis.keywordAlignment");
+      expect(agent.instructions).toContain("screening filters");
+      expect(agent.instructions).toContain("subjective culture language");
       expect(agent.instructions).toContain("one distinct evidence-backed claim");
       expect(agent.instructions).toContain("never force or invent a number");
-      expect(agent.instructions).toContain("guidance with judgment rather than mechanically");
+      expect(agent.instructions).toContain("guidance rather than a mechanical checklist");
       expect(input).not.toContain("SECRET RAW JD");
       expect(input).not.toContain("\\documentclass");
       const parsedInput = JSON.parse(input);
@@ -288,6 +296,7 @@ describe("one-turn agents", () => {
         reasoning: { effort: "medium" }, toolChoice: "submit_edit_plan", parallelToolCalls: false, store: false,
         retry: { maxRetries: 0 },
       });
+      expect(agent.instructions).toContain("mustIncludeDirectives");
       expect(agent.handoffs).toEqual([]);
       expect(agent.mcpServers).toEqual([]);
       expect(agent.toolUseBehavior).toBe("stop_on_first_tool");
@@ -296,6 +305,7 @@ describe("one-turn agents", () => {
         analysis: ANALYSIS,
         currentPlan: PLAN,
         currentTailoredTex: "immutable tex",
+        candidateContext: CONTEXT,
         comments: ["shorten bullet"],
         machineFindings: { issue: "crowding" },
       });
@@ -309,7 +319,7 @@ describe("one-turn agents", () => {
         analysis: ANALYSIS,
         currentPlan: PLAN,
         currentTailoredTex: "immutable tex",
-        evidence: [],
+        context: CONTEXT,
         deterministicQa: { ok: true },
         visualQa: { status: "issue" },
         comments: ["shorten bullet"],
