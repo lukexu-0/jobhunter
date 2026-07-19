@@ -186,7 +186,7 @@ describe("guarded agents", () => {
       "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills.",
     );
     expect(ANALYSIS_INSTRUCTIONS).toBe(
-      "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills. Use only the supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use or insert evidence-backed keywords when they improve truthful alignment. Edit bullets to more closely align with the job description where helpful. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Never invent facts; copy supplied hashes and call submit_job_analysis once.",
+      "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills. Use only the supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use or insert evidence-backed keywords when they improve truthful alignment. Edit bullets to more closely align with the job description where helpful. Make every project's first bullet a description. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Never invent facts; copy supplied hashes and call submit_job_analysis once.",
     );
     expect(ATS_KEYWORD_EXTRACTION_TASK).toBe(
       "Act as an ATS system and extract all relevant keywords from the supplied job description.",
