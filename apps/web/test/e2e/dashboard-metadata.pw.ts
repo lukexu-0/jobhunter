@@ -39,20 +39,17 @@ async function interceptReviewRun(page: Page): Promise<void> {
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
+        schemaVersion: 2,
         id: "analysis-1",
         jobDescriptionSha256: "b".repeat(64),
         analysisWorkflowSha256: "c".repeat(64),
-        roleSummary: {
-          role: "  Staff AI Engineer  ",
-          company: "  Acme Systems  ",
-          archetype: "Platform builder",
-          domain: "agentic",
-          function: "build",
-          seniority: "Staff",
-          workModel: "hybrid",
-          teamSize: "Not mentioned",
-          tldr: "Build reliable AI infrastructure.",
+        baselineSha256: "d".repeat(64),
+        target: {
+          title: "  Staff AI Engineer  ",
+          organization: "  Acme Systems  ",
         },
+        jdKeywords: [],
+        exactEdits: [],
       }),
     });
   });

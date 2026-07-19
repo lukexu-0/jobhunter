@@ -16,6 +16,52 @@ function runFixture(id: string, applicationStatus: ApplicationStatus, status: Ru
     timeline: [],
   };
 }
+function documentViewerFixture(id: string, includeKeywordMap: boolean): RunDto {
+  const resumeSha256 = "a".repeat(64);
+  const revision = 4;
+  return {
+    ...runFixture(id, "applied", "review"),
+    revision,
+    currentPdfSha256: resumeSha256,
+    artifacts: [
+      {
+        id: "resume-pdf",
+        kind: "compiled-pdf",
+        revision,
+        attempt: 1,
+        sha256: resumeSha256,
+        bytes: 1_024,
+        mediaType: "application/pdf",
+        href: `/v1/runs/${id}/artifacts/resume-pdf`,
+        public: true,
+        createdAt: 1_700_000_000_100,
+      },
+      ...(includeKeywordMap ? [{
+        id: "keyword-map-pdf",
+        kind: "keyword-map-pdf" as const,
+        revision,
+        attempt: 1,
+        sha256: "b".repeat(64),
+        bytes: 2_048,
+        mediaType: "application/pdf",
+        href: `/v1/runs/${id}/artifacts/keyword-map-pdf`,
+        public: true,
+        createdAt: 1_700_000_000_200,
+      }] : []),
+    ],
+  };
+}
+
+async function interceptDocumentRun(page: Page, run: RunDto): Promise<void> {
+  await page.route(`**/api/pipeline/runs/${run.id}`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(`**/v1/runs/${run.id}/artifacts/*`, async (route) => {
+    await route.fulfill({ contentType: "application/pdf", body: "%PDF-1.4\n%%EOF" });
+  });
+}
+
 
 const lifecycleRuns: readonly RunDto[] = [
   runFixture("lifecycle-applied", "applied", "failed"),
@@ -360,6 +406,87 @@ test("leaves the reserved review pane empty", async ({ page }) => {
   await expect(reviewPane).toBeEmpty();
   await expect(page.getByRole("button", { name: "Retry failed run" })).toHaveCount(1);
 });
+test("switches between accessible resume and landscape keyword map tabs", async ({ page }) => {
+  const detailRun = documentViewerFixture("document-tabs", true);
+  await interceptDocumentRun(page, detailRun);
+  await page.setViewportSize({ width: 1_672, height: 941 });
+  await page.goto("/runs/document-tabs");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  const tablist = viewer.getByRole("tablist", { name: "Document views" });
+  const tabs = tablist.getByRole("tab");
+  const resumeTab = tablist.getByRole("tab", { name: "Resume" });
+  const keywordMapTab = tablist.getByRole("tab", { name: "Keyword map" });
+  const resumePanel = viewer.locator("#resume-document-panel");
+  const keywordMapPanel = viewer.locator("#keyword-map-document-panel");
+
+  await expect(tabs).toHaveCount(2);
+  await expect(tabs).toHaveText(["Resume", "Keyword map"]);
+  await expect(resumeTab).toHaveAttribute("aria-controls", "resume-document-panel");
+  await expect(resumeTab).toHaveAttribute("aria-selected", "true");
+  await expect(resumeTab).toHaveAttribute("tabindex", "0");
+  await expect(keywordMapTab).toHaveAttribute("aria-controls", "keyword-map-document-panel");
+  await expect(keywordMapTab).toHaveAttribute("aria-selected", "false");
+  await expect(keywordMapTab).toHaveAttribute("tabindex", "-1");
+  await expect(resumePanel).toHaveAttribute("role", "tabpanel");
+  await expect(resumePanel).toHaveAttribute("aria-labelledby", "resume-document-tab");
+  await expect(resumePanel).toBeVisible();
+  await expect(keywordMapPanel).toBeHidden();
+  await expect(viewer.getByText("Page 1 / 1", { exact: true })).toBeVisible();
+  await expect(viewer.getByRole("button", { name: "Zoom in" })).toBeVisible();
+  await expect(viewer.getByRole("button", { name: "Fit page" })).toBeVisible();
+  await expect(viewer.getByRole("link", { name: "Download current PDF" })).toBeVisible();
+
+  await resumeTab.focus();
+  await resumeTab.press("ArrowRight");
+
+  await expect(resumeTab).toHaveAttribute("aria-selected", "false");
+  await expect(resumeTab).toHaveAttribute("tabindex", "-1");
+  await expect(keywordMapTab).toBeFocused();
+  await expect(keywordMapTab).toHaveAttribute("aria-selected", "true");
+  await expect(keywordMapTab).toHaveAttribute("tabindex", "0");
+  await expect(resumePanel).toBeHidden();
+  await expect(keywordMapPanel).toHaveAttribute("role", "tabpanel");
+  await expect(keywordMapPanel).toHaveAttribute("aria-labelledby", "keyword-map-document-tab");
+  await expect(keywordMapPanel).toBeVisible();
+  await expect(viewer.getByText("Page 1 / 1", { exact: true })).toHaveCount(0);
+  await expect(viewer.getByRole("button", { name: "Zoom in" })).toHaveCount(0);
+
+  const keywordMapDownload = viewer.getByRole("link", { name: "Download keyword map PDF" });
+  await expect(keywordMapDownload).toHaveAttribute("href", "/api/pipeline/runs/document-tabs/artifacts/keyword-map-pdf");
+  await expect(keywordMapDownload).toHaveAttribute("download", "");
+  const keywordMapObject = keywordMapPanel.locator('object[aria-label^="Keyword map PDF"]');
+  await expect(keywordMapObject).toBeVisible();
+  const keywordMapBox = await keywordMapObject.boundingBox();
+  if (!keywordMapBox) throw new Error("Keyword map viewer geometry is unavailable");
+  expect(keywordMapBox.width).toBeGreaterThan(keywordMapBox.height);
+
+  await keywordMapTab.press("Home");
+  await expect(resumeTab).toBeFocused();
+  await expect(resumePanel).toBeVisible();
+  await viewer.getByRole("button", { name: "Zoom in" }).click();
+  await expect(viewer.locator("output")).toHaveText("125%");
+  await viewer.getByRole("button", { name: "Fit page" }).click();
+  await expect(viewer.locator("output")).toHaveText("100%");
+});
+
+test("shows only the Resume tab when the revision has no keyword map", async ({ page }) => {
+  const detailRun = documentViewerFixture("resume-only", false);
+  await interceptDocumentRun(page, detailRun);
+  await page.goto("/runs/resume-only");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  const tablist = viewer.getByRole("tablist", { name: "Document views" });
+  const resumeTab = tablist.getByRole("tab", { name: "Resume" });
+
+  await expect(tablist.getByRole("tab")).toHaveCount(1);
+  await expect(resumeTab).toHaveAttribute("aria-selected", "true");
+  await expect(viewer.getByRole("tab", { name: "Keyword map" })).toHaveCount(0);
+  await expect(viewer.locator("#keyword-map-document-panel")).toHaveCount(0);
+  await expect(viewer.locator("#resume-document-panel")).toBeVisible();
+  await expect(viewer.getByRole("link", { name: "Download current PDF" })).toBeVisible();
+});
+
 
 test("filters by user-managed application state", async ({ page }) => {
   await interceptRuns(page);
@@ -368,6 +495,7 @@ test("filters by user-managed application state", async ({ page }) => {
   const state = page.getByRole("combobox", { name: "Filter applications by state" });
   await expect(state.locator("option")).toHaveText([
     "All states",
+    "Pending",
     "Applied",
     "Rejected",
     "Interview",
@@ -632,41 +760,96 @@ test("runs the seven-stage workflow line through the Review marker", async ({ pa
 });
 
 
-test("navigates between Applications and Providers", async ({ page }) => {
-  await interceptRuns(page);
+test("keeps dashboard snapshots visible while revalidating between Applications and Providers", async ({ page }) => {
+  const stableRuns = Array.from(
+    { length: 7 },
+    (_, index) => runFixture(`stable-${index}`, "applied", "approved"),
+  );
+  let holdRunRefresh = false;
+  let holdAuthRefresh = false;
+  let releaseRunRefresh = () => {};
+  let releaseAuthRefresh = () => {};
+  let markRunRefreshStarted = () => {};
+  let markAuthRefreshStarted = () => {};
+  let markRunRefreshCompleted = () => {};
+  let markAuthRefreshCompleted = () => {};
+  const runRefreshRelease = new Promise<void>((resolve) => {
+    releaseRunRefresh = resolve;
+  });
+  const authRefreshRelease = new Promise<void>((resolve) => {
+    releaseAuthRefresh = resolve;
+  });
+  const runRefreshStarted = new Promise<void>((resolve) => {
+    markRunRefreshStarted = resolve;
+  });
+  const authRefreshStarted = new Promise<void>((resolve) => {
+    markAuthRefreshStarted = resolve;
+  });
+  const runRefreshCompleted = new Promise<void>((resolve) => {
+    markRunRefreshCompleted = resolve;
+  });
+  const authRefreshCompleted = new Promise<void>((resolve) => {
+    markAuthRefreshCompleted = resolve;
+  });
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    expect(route.request().method()).toBe("GET");
+    const shouldHold = holdRunRefresh;
+    if (shouldHold) {
+      markRunRefreshStarted();
+      await runRefreshRelease;
+    }
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: stableRuns }),
+    });
+    if (shouldHold) markRunRefreshCompleted();
+  });
   await page.route("**/api/pipeline/auth", async (route) => {
     expect(route.request().method()).toBe("GET");
+    const shouldHold = holdAuthRefresh;
+    if (shouldHold) {
+      markAuthRefreshStarted();
+      await authRefreshRelease;
+    }
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
         providers: [
-          { provider: "openai-codex", state: "disconnected" },
-          { provider: "google-antigravity", state: "disconnected" },
+          { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
+          { provider: "google-antigravity", state: "connected", identity: { email: "google@example.com" } },
         ],
       }),
     });
+    if (shouldHold) markAuthRefreshCompleted();
   });
   await page.goto("/");
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
+  const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
   await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Providers"]);
-  await expect(primaryNavigation.getByRole("link", { name: "Applications" })).toHaveAttribute("aria-current", "page");
-  await expect(page.getByRole("heading", { name: "Provider access" })).toHaveCount(0);
-  await expect(page.getByRole("list", { name: "OAuth providers" })).toHaveCount(0);
+  await expect(applicationCount).toHaveText("7");
 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
-
   await expect(page).toHaveURL(/\/providers$/);
-  await expect(primaryNavigation.getByRole("link", { name: "Providers" })).toHaveAttribute("aria-current", "page");
-  await expect(page.getByRole("heading", { name: "Provider access" })).toBeVisible();
-  const providerList = page.getByRole("list", { name: "OAuth providers" });
-  const providerRows = providerList.getByRole("listitem");
-  await expect(providerRows).toHaveCount(2);
-  await expect(providerRows).toContainText([
-    "OpenAI Codex",
-    "Google Antigravity",
-  ]);
-  await expect(providerRows.nth(0)).toContainText("OAuth access for tailoring and fallback job-posting extraction.");
+  const providerBadges = page.locator(".status-badge");
+  await expect(providerBadges).toHaveText(["connected", "connected"]);
+
+  holdRunRefresh = true;
+  await primaryNavigation.getByRole("link", { name: "Applications" }).click();
+  await runRefreshStarted;
+  await expect(applicationCount).toHaveText("7");
+  await expect(page.getByText("Loading applications…")).toHaveCount(0);
+  releaseRunRefresh();
+  await runRefreshCompleted;
+
+  holdAuthRefresh = true;
+  await primaryNavigation.getByRole("link", { name: "Providers" }).click();
+  await authRefreshStarted;
+  await expect(providerBadges).toHaveText(["connected", "connected"]);
+  await expect(providerBadges).not.toContainText(["Checking", "Checking"]);
+  releaseAuthRefresh();
+  await authRefreshCompleted;
 });
 
 test("uses full-width physical folder tabs at desktop and narrow widths", async ({ page }) => {

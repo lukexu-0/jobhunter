@@ -6,10 +6,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
 import { PipelineClientError, createRun, listRuns, readJsonArtifact, updateApplicationStatus } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
+import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
 
 const PAGE_SIZE = 8;
 const POLL_INTERVAL_MS = 3_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
+const EMPTY_RUNS: RunDto[] = [];
+const ROW_INTERACTIVE_SELECTOR = "a, button, input, select, textarea, summary, [contenteditable='true']";
 
 
 const IS_TERMINAL_STATUS: Record<RunStatus, boolean> = {
@@ -45,10 +48,6 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "UTC",
 });
 
-interface JobIdentity {
-  title: string;
-  organization?: string;
-}
 
 type SortDirection = "newest" | "oldest";
 
@@ -60,15 +59,19 @@ function publicMessage(error: unknown, fallback: string): string {
 }
 
 function parseJobIdentity(value: unknown): JobIdentity | null {
-  if (!value || typeof value !== "object" || !("roleSummary" in value)) return null;
-  const roleSummary = value.roleSummary;
-  if (!roleSummary || typeof roleSummary !== "object" || !("role" in roleSummary)) return null;
-  const title = typeof roleSummary.role === "string" ? roleSummary.role.trim() : "";
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const analysis = value as Record<string, unknown>;
+  if (analysis.schemaVersion !== 2) return null;
+
+  const target = analysis.target;
+  if (!target || typeof target !== "object" || Array.isArray(target)) return null;
+  const targetRecord = target as Record<string, unknown>;
+  const title = typeof targetRecord.title === "string" ? targetRecord.title.trim() : "";
   if (!title) return null;
-  const organization =
-    "company" in roleSummary && typeof roleSummary.company === "string"
-      ? roleSummary.company.trim()
-      : "";
+
+  const organization = typeof targetRecord.organization === "string"
+    ? targetRecord.organization.trim()
+    : "";
   return organization ? { title, organization } : { title };
 }
 
@@ -98,9 +101,10 @@ function visiblePageNumbers(currentPage: number, totalPages: number): Array<numb
 
 export function RunDashboard() {
   const router = useRouter();
-  const [runs, setRuns] = useState<RunDto[]>([]);
-  const [jobIdentities, setJobIdentities] = useState<Record<string, JobIdentity>>({});
-  const [isLoading, setIsLoading] = useState(true);
+  const { runs: runSnapshot, setRuns, jobIdentities, setJobIdentities } = useDashboardData();
+  const runs = runSnapshot ?? EMPTY_RUNS;
+  const showInitialLoading = useRef(runSnapshot === undefined);
+  const [isLoading, setIsLoading] = useState(showInitialLoading.current);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<ApplicationStatus | "all">("all");
@@ -119,8 +123,8 @@ export function RunDashboard() {
   );
   const isCreateRequestValid = createRunRequest.success;
 
-  const load = useCallback(async (initial = false) => {
-    if (initial) setIsLoading(true);
+  const load = useCallback(async (showLoading = false) => {
+    if (showLoading) setIsLoading(true);
     try {
       const nextRuns = await listRuns();
       setRuns(nextRuns);
@@ -128,12 +132,12 @@ export function RunDashboard() {
     } catch (error) {
       setLoadError(publicMessage(error, "Applications are unavailable. Try again."));
     } finally {
-      if (initial) setIsLoading(false);
+      if (showLoading) setIsLoading(false);
     }
-  }, []);
+  }, [setRuns]);
 
   useEffect(() => {
-    void load(true);
+    void load(showInitialLoading.current);
   }, [load]);
 
   const hasActiveRuns = runs.some((run) => !IS_TERMINAL_STATUS[run.status]);
@@ -171,7 +175,7 @@ export function RunDashboard() {
     return () => {
       current = false;
     };
-  }, [runs]);
+  }, [runs, setJobIdentities]);
 
   const filteredRuns = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -218,7 +222,7 @@ export function RunDashboard() {
     setStatusUpdateError(null);
     try {
       const updated = await updateApplicationStatus(runId, applicationStatus);
-      setRuns((current) => current.map((run) => run.id === updated.id ? updated : run));
+      setRuns((current) => current?.map((run) => run.id === updated.id ? updated : run) ?? current);
       setStatusUpdateError(null);
     } catch {
       setStatusUpdateError("Application state could not be updated. Try again.");
@@ -417,7 +421,14 @@ export function RunDashboard() {
                     const identity = jobIdentities[run.id];
                     const href = `/runs/${encodeURIComponent(run.id)}`;
                     return (
-                      <tr key={run.id}>
+                      <tr
+                        key={run.id}
+                        onClick={(event) => {
+                          const target = event.target;
+                          if (target instanceof Element && target.closest(ROW_INTERACTIVE_SELECTOR)) return;
+                          router.push(href);
+                        }}
+                      >
                         <td>
                           <Link className="application-link" href={href} aria-label={`Open ${identity?.title ?? "tailoring run"} ${shortRunId(run.id)}`}>
                             <span>{identity?.title ?? "Tailoring run"}</span>
@@ -440,7 +451,7 @@ export function RunDashboard() {
                             ))}
                           </select>
                         </td>
-                        <td><Link className="row-arrow" href={href} aria-label={`Open run ${shortRunId(run.id)}`}>→</Link></td>
+                        <td><span className="row-arrow" aria-hidden="true">→</span></td>
                       </tr>
                     );
                   }) : null}

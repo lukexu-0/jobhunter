@@ -16,6 +16,7 @@
   --color-warning: #ebca73;
   --color-danger: #ef8a82;
   --color-focus: #d2f34c;
+  --color-application-pending: var(--color-warning);
   --color-application-applied: #c2a7ef;
   --color-application-rejected: #e8ad73;
   --color-application-interview: #79cae8;
@@ -620,6 +621,10 @@ a {
   font-weight: 700;
 }
 
+.application-status-control--pending {
+  --application-status-color: var(--color-application-pending);
+}
+
 .application-status-control--applied {
   --application-status-color: var(--color-application-applied);
 }
@@ -712,8 +717,17 @@ a {
   transition: background-color var(--transition-fast);
 }
 
+.applications-table tbody tr:has(.application-link) {
+  cursor: pointer;
+}
+
 .applications-table tbody tr:has(.application-link):hover {
   background: var(--color-surface);
+}
+
+.applications-table tbody tr:has(.application-link):hover .row-arrow {
+  color: var(--color-accent);
+  transform: translateX(var(--space-1));
 }
 
 .application-link {
@@ -745,25 +759,19 @@ a {
 
 
 .row-arrow {
-  display: inline-flex;
-  width: var(--control-height);
-  height: var(--control-height);
-  align-items: center;
-  justify-content: center;
-  border: var(--border-width) solid transparent;
+  display: inline-block;
+  border: 0;
+  box-shadow: none;
   color: var(--color-muted);
   font-size: var(--font-size-lg);
-  text-decoration: none;
+  line-height: var(--line-tight);
+  pointer-events: none;
+  text-shadow: none;
   transition:
-    border-color var(--transition-fast),
-    color var(--transition-fast);
+    color var(--transition-fast),
+    transform var(--transition-fast);
 }
 
-.row-arrow:hover,
-.row-arrow:focus-visible {
-  border-color: var(--color-border-strong);
-  color: var(--color-accent);
-}
 
 
 .applications-state {

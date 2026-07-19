@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiErrorSchema,
   AuthSessionSchema,
@@ -9,6 +9,7 @@ import {
   type AuthStatusResponse,
   type OAuthProvider,
 } from "@jobhunter/pipeline/contracts";
+import { useDashboardData } from "../providers/dashboard-data-provider";
 
 const AUTH_ROOT = "/api/pipeline/auth";
 const POLL_INTERVAL_MS = 2_500;
@@ -101,16 +102,17 @@ function terminalMessage(state: AuthSession["state"]): string | null {
 }
 
 export function OAuthDashboard() {
-  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
-  const [isLoadingStatus, setIsLoadingStatus] = useState(true);
+  const { authStatus, setAuthStatus } = useDashboardData();
+  const showInitialLoading = useRef(authStatus === undefined);
+  const [isLoadingStatus, setIsLoadingStatus] = useState(showInitialLoading.current);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<ProviderMap<BrowserAuthSession>>({});
   const [notices, setNotices] = useState<ProviderMap<Notice>>({});
   const [busy, setBusy] = useState<ProviderMap<BusyAction>>({});
   const [promptValues, setPromptValues] = useState<ProviderMap<string>>({});
 
-  const refreshAuthStatus = useCallback(async () => {
-    setIsLoadingStatus(true);
+  const refreshAuthStatus = useCallback(async (showLoading = false) => {
+    if (showLoading) setIsLoadingStatus(true);
 
     try {
       const response = await fetch(AUTH_ROOT, { cache: "no-store" });
@@ -121,15 +123,15 @@ export function OAuthDashboard() {
       setAuthStatus(parsed.data);
       setStatusError(null);
     } catch (error) {
-      setAuthStatus(null);
+      setAuthStatus(undefined);
       setStatusError(error instanceof Error ? redactPublicText(error.message) : "Connection status is unavailable.");
     } finally {
-      setIsLoadingStatus(false);
+      if (showLoading) setIsLoadingStatus(false);
     }
-  }, []);
+  }, [setAuthStatus]);
 
   useEffect(() => {
-    void refreshAuthStatus();
+    void refreshAuthStatus(showInitialLoading.current);
   }, [refreshAuthStatus]);
 
   const statusByProvider = useMemo(

@@ -505,6 +505,49 @@
   white-space: nowrap;
 }
 
+.viewerTabs {
+  display: flex;
+  min-width: 0;
+  gap: var(--space-1);
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
+
+.viewerTab {
+  display: inline-flex;
+  min-height: var(--control-height);
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-4);
+  background: transparent;
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: var(--tracking-label);
+  line-height: var(--line-tight);
+  text-transform: uppercase;
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.viewerTab:hover {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.viewerTab[aria-selected="true"] {
+  border-color: var(--color-accent);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+}
+
 .viewerControls {
   display: flex;
   flex: 0 0 auto;
@@ -541,6 +584,16 @@
 .viewerControls button:disabled {
   color: var(--color-faint);
 }
+.viewerControls .viewerDownload {
+  display: inline-flex;
+  width: auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding-inline: var(--space-3);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
 
 .viewerControls output {
   min-width: var(--space-10);
@@ -555,6 +608,14 @@
   padding: var(--space-8);
   background: var(--color-surface-raised);
 }
+.viewerCanvas[hidden] {
+  display: none;
+}
+
+.keywordMapCanvas {
+  align-content: start;
+}
+
 
 .pageFrame {
   position: relative;
@@ -583,6 +644,11 @@
   border: var(--border-width) solid var(--color-border-strong);
   background: var(--color-text);
 }
+.keywordMapObject {
+  min-height: 0;
+  aspect-ratio: 16 / 9;
+}
+
 
 .pdfObject p {
   margin: var(--space-8);
@@ -795,6 +861,10 @@
     align-items: flex-start;
     flex-direction: column;
   }
+  .viewerTabs {
+    width: 100%;
+  }
+
 
   .viewerControls {
     width: 100%;
@@ -842,7 +912,8 @@
 @media (prefers-reduced-motion: reduce) {
   .backLink,
   .secondaryButton,
-  .primaryButton {
+  .primaryButton,
+  .viewerTab {
     transition-duration: 0ms;
   }
 }

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { AppNavigation } from "./components/app-navigation";
+import { DashboardDataProvider } from "./providers/dashboard-data-provider";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -14,7 +15,9 @@ export default function RootLayout({ children }: Readonly<{ children: ReactNode 
       <body>
         <div className="app-shell">
           <AppNavigation />
-          <div className="app-shell__workspace">{children}</div>
+          <DashboardDataProvider>
+            <div className="app-shell__workspace">{children}</div>
+          </DashboardDataProvider>
         </div>
       </body>
     </html>

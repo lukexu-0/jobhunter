@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import type {
   ArtifactDto,
   ArtifactKind,
@@ -71,6 +71,12 @@ const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 type JsonRecord = Record<string, unknown>;
 type BusyAction = "retry";
+type DocumentView = "resume" | "keyword-map";
+
+const RESUME_TAB_ID = "resume-document-tab";
+const RESUME_PANEL_ID = "resume-document-panel";
+const KEYWORD_MAP_TAB_ID = "keyword-map-document-tab";
+const KEYWORD_MAP_PANEL_ID = "keyword-map-document-panel";
 
 interface RunDetailProps {
   readonly runId: string;
@@ -179,7 +185,9 @@ function isDisplayedJsonArtifact(artifact: ArtifactDto): boolean {
 }
 
 function parseJobIdentity(value: unknown): JobIdentity | null {
-  const target = asRecord(asRecord(value)?.target);
+  const analysis = asRecord(value);
+  if (analysis?.schemaVersion !== 2) return null;
+  const target = asRecord(analysis.target);
   const title = stringValue(target, "title");
   if (!title) return null;
   const organization = stringValue(target, "organization");
@@ -210,13 +218,27 @@ function overlayRect(value: unknown): OverlayRect | null {
   return { top, left, width: right - left, height: bottom - top };
 }
 
-function EvidenceIds({ value }: { readonly value: unknown }) {
+function IdentifierList({ value, ariaLabel, emptyLabel }: {
+  readonly value: unknown;
+  readonly ariaLabel: string;
+  readonly emptyLabel: string;
+}) {
   const ids = stringArray(value);
-  if (ids.length === 0) return <span className={styles.absentInline}>No evidence citations reported</span>;
+  if (ids.length === 0) return <span className={styles.absentInline}>{emptyLabel}</span>;
   return (
-    <span className={styles.evidenceList} aria-label="Evidence citations">
+    <span className={styles.evidenceList} aria-label={ariaLabel}>
       {ids.map((id) => <code key={id}>{id}</code>)}
     </span>
+  );
+}
+
+function EvidenceIds({ value }: { readonly value: unknown }) {
+  return (
+    <IdentifierList
+      value={value}
+      ariaLabel="Evidence IDs"
+      emptyLabel="No evidence IDs reported"
+    />
   );
 }
 
@@ -239,14 +261,6 @@ function ArtifactState({ artifact, error, loading, label, children }: {
 }
 
 
-const ATS_REVIEW_FIELDS = [
-  { key: "parseableSingleColumnStructure", label: "Parseable single-column structure" },
-  { key: "standardSectionHeaders", label: "Standard section headers" },
-  { key: "selectableUtf8Text", label: "Selectable UTF-8 text" },
-  { key: "truthfulKeywordUse", label: "Truthful keyword use" },
-  { key: "noHiddenTextOrKeywordStuffing", label: "No hidden text or keyword stuffing" },
-  { key: "noUnsupportedSkillsOrMetrics", label: "No unsupported skills or metrics" },
-] as const;
 
 function AnalysisFacts({ rows }: {
   readonly rows: ReadonlyArray<{ readonly label: string; readonly value: ReactNode }>;
@@ -258,287 +272,101 @@ function AnalysisFacts({ rows }: {
   );
 }
 
-function EvidenceTextItems({ value, emptyLabel, compact = false }: {
-  readonly value: unknown;
-  readonly emptyLabel: string;
-  readonly compact?: boolean;
-}) {
-  const items = recordArray(value);
-  if (!items.length) return <p className={styles.absent}>No {emptyLabel} were reported.</p>;
-  return (
-    <ul className={compact ? styles.simpleList : styles.findingList}>
-      {items.map((item, index) => {
-        const text = stringValue(item, "text") ?? `Item ${index + 1} text not reported`;
-        return (
-          <li key={`${text}-${index}`}>
-            <p>{text}</p>
-            <EvidenceIds value={item.evidenceIds} />
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
 
-function ReviewFindings({ value, fields, detailKey, detailLabel }: {
-  readonly value: unknown;
-  readonly fields: ReadonlyArray<{ readonly key: string; readonly label: string }>;
-  readonly detailKey: string;
-  readonly detailLabel: string;
-}) {
-  const review = asRecord(value);
-  return (
-    <ul className={styles.findingList}>
-      {fields.map(({ key, label }) => {
-        const finding = asRecord(review?.[key]);
-        return (
-          <li key={key}>
-            <div className={styles.findingHeading}>
-              <strong>{label}</strong>
-              <span>{humanize(stringValue(finding, "status") ?? "Status not reported")}</span>
-            </div>
-            <AnalysisFacts rows={[
-              { label: detailLabel, value: stringValue(finding, detailKey) ?? "Not reported" },
-            ]} />
-            <EvidenceIds value={finding?.evidenceIds} />
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
 
 export function AnalysisContent({ value }: { readonly value: unknown }) {
   const analysis = asRecord(value);
-  if (!analysis) return <p className={styles.panelError}>The analysis artifact has an unexpected shape.</p>;
+  if (analysis?.schemaVersion !== 2) {
+    return (
+      <p className={styles.panelError}>
+        Unsupported legacy job-analysis artifact. This view requires schemaVersion 2.
+      </p>
+    );
+  }
 
-  const roleSummary = asRecord(analysis.roleSummary);
-  const requirements = recordArray(analysis.requirementEvidence);
-  const recruiterRisks = recordArray(analysis.recruiterRisks);
-  const gaps = recordArray(analysis.gapsAndMitigations);
-  const keywords = recordArray(analysis.keywordAlignment);
-  const proposedContent = asRecord(analysis.proposedCvContent);
-  const reorderedExperience = recordArray(proposedContent?.reorderedExperience);
-  const bulletReviews = recordArray(analysis.businessValueBulletReview);
-  const customizationPlan = recordArray(analysis.customizationPlan);
+  const target = asRecord(analysis.target);
+  const keywords = recordArray(analysis.jdKeywords);
+  const exactEdits = recordArray(analysis.exactEdits);
 
   return (
     <div className={styles.artifactSections}>
       <AnalysisFacts rows={[
+        { label: "Schema version", value: <code>2</code> },
         { label: "Analysis ID", value: <code>{stringValue(analysis, "id") ?? "Not reported"}</code> },
+        { label: "Target title", value: stringValue(target, "title") ?? "Not reported" },
+        { label: "Organization", value: stringValue(target, "organization") ?? "Not reported" },
         { label: "Job description SHA-256", value: <code>{stringValue(analysis, "jobDescriptionSha256") ?? "Not reported"}</code> },
         { label: "Analysis workflow SHA-256", value: <code>{stringValue(analysis, "analysisWorkflowSha256") ?? "Not reported"}</code> },
+        { label: "Baseline SHA-256", value: <code>{stringValue(analysis, "baselineSha256") ?? "Not reported"}</code> },
       ]} />
 
       <section>
-        <h4>Role summary</h4>
-        <AnalysisFacts rows={[
-          { label: "Company", value: stringValue(roleSummary, "company") ?? "Not reported" },
-          { label: "Role", value: stringValue(roleSummary, "role") ?? "Not reported" },
-          { label: "Archetype", value: stringValue(roleSummary, "archetype") ?? "Not reported" },
-          { label: "Domain", value: humanize(stringValue(roleSummary, "domain") ?? "Not reported") },
-          { label: "Function", value: humanize(stringValue(roleSummary, "function") ?? "Not reported") },
-          { label: "Seniority", value: stringValue(roleSummary, "seniority") ?? "Not reported" },
-          { label: "Work model", value: humanize(stringValue(roleSummary, "workModel") ?? "Not reported") },
-          { label: "Team size", value: stringValue(roleSummary, "teamSize") ?? "Not reported" },
-          { label: "TL;DR", value: stringValue(roleSummary, "tldr") ?? "Not reported" },
-        ]} />
-      </section>
-
-      <section>
-        <h4>Requirement evidence ({requirements.length})</h4>
-        {requirements.length ? (
-          <ul className={styles.findingList}>
-            {requirements.map((item, index) => {
-              const requirement = stringValue(item, "requirement") ?? `Requirement ${index + 1}`;
-              const sourceLines = stringArray(item.cvSourceLines);
-              return (
-                <li key={`${requirement}-${index}`}>
-                  <div className={styles.findingHeading}>
-                    <strong>{requirement}</strong>
-                    <span>{humanize(stringValue(item, "priority") ?? "Priority not reported")}</span>
-                  </div>
-                  <AnalysisFacts rows={[
-                    { label: "Match status", value: humanize(stringValue(item, "matchStatus") ?? "Not reported") },
-                    { label: "Exact CV evidence", value: stringValue(item, "exactCvEvidence") ?? "Not reported" },
-                    {
-                      label: "CV source lines",
-                      value: sourceLines.length
-                        ? <ul className={styles.simpleList}>{sourceLines.map((line, lineIndex) => <li key={`${line}-${lineIndex}`}>{line}</li>)}</ul>
-                        : "Not reported",
-                    },
-                  ]} />
-                  <EvidenceIds value={item.evidenceIds} />
-                </li>
-              );
-            })}
-          </ul>
-        ) : <p className={styles.absent}>No requirement evidence was reported.</p>}
-      </section>
-
-      <section>
-        <h4>Recruiter risks ({recruiterRisks.length})</h4>
-        {recruiterRisks.length ? (
-          <ul className={styles.findingList}>
-            {recruiterRisks.map((item, index) => {
-              const doubt = stringValue(item, "potentialDoubt") ?? `Recruiter risk ${index + 1}`;
-              return (
-                <li key={`${doubt}-${index}`}>
-                  <div className={styles.findingHeading}><strong>{doubt}</strong><span>Risk {index + 1}</span></div>
-                  <AnalysisFacts rows={[
-                    { label: "CV or report evidence", value: stringValue(item, "evidenceFromCvOrReport") ?? "Not reported" },
-                    { label: "Candidate-facing fix", value: stringValue(item, "candidateFacingFix") ?? "Not reported" },
-                  ]} />
-                  <EvidenceIds value={item.evidenceIds} />
-                </li>
-              );
-            })}
-          </ul>
-        ) : <p className={styles.absent}>No recruiter risks were reported.</p>}
-      </section>
-
-      <section>
-        <h4>Gaps and mitigations ({gaps.length})</h4>
-        {gaps.length ? (
-          <ul className={styles.findingList}>
-            {gaps.map((item, index) => {
-              const gap = stringValue(item, "gap") ?? `Gap ${index + 1}`;
-              return (
-                <li key={`${gap}-${index}`}>
-                  <div className={styles.findingHeading}>
-                    <strong>{gap}</strong>
-                    <span>{humanize(stringValue(item, "classification") ?? "Classification not reported")}</span>
-                  </div>
-                  <AnalysisFacts rows={[
-                    { label: "Adjacent experience", value: stringValue(item, "adjacentExperience") ?? "Not reported" },
-                    { label: "Portfolio proof", value: stringValue(item, "portfolioProof") ?? "Not reported" },
-                    { label: "Concrete mitigation", value: stringValue(item, "concreteMitigation") ?? "Not reported" },
-                  ]} />
-                  <EvidenceIds value={item.evidenceIds} />
-                </li>
-              );
-            })}
-          </ul>
-        ) : <p className={styles.absent}>No gaps or mitigations were reported.</p>}
-      </section>
-
-      <section>
-        <h4>Keyword alignment ({keywords.length})</h4>
+        <h4>JD keywords</h4>
         {keywords.length ? (
           <ul className={styles.findingList}>
             {keywords.map((item, index) => {
-              const vocabulary = stringValue(item, "jdVocabulary") ?? `Keyword ${index + 1}`;
+              const id = stringValue(item, "id") ?? `Keyword ${index + 1}`;
+              const phrase = stringValue(item, "phrase") ?? `Keyword ${index + 1}`;
               return (
-                <li key={`${vocabulary}-${index}`}>
+                <li key={`${id}-${index}`}>
                   <div className={styles.findingHeading}>
-                    <strong>{vocabulary}</strong>
-                    <span>{stringArray(item.placements).join(", ") || "Placements not reported"}</span>
+                    <strong>{phrase}</strong>
+                    <span>{id}</span>
                   </div>
-                  <blockquote>{stringValue(item, "jdQuote") ?? "Job-description quote not reported"}</blockquote>
+                  <blockquote>{stringValue(item, "jdQuote") ?? "Exact JD quote not reported"}</blockquote>
                   <AnalysisFacts rows={[
-                    { label: "Current truthful CV wording", value: stringValue(item, "currentTruthfulCvWording") ?? "Not reported" },
-                    { label: "Recommended reformulation", value: stringValue(item, "recommendedReformulation") ?? "Not reported" },
+                    { label: "Evidence IDs", value: <EvidenceIds value={item.evidenceIds} /> },
                   ]} />
-                  <EvidenceIds value={item.evidenceIds} />
                 </li>
               );
             })}
           </ul>
-        ) : <p className={styles.absent}>No keyword alignment was reported.</p>}
+        ) : <p className={styles.absent}>No evidence-backed JD keywords were identified.</p>}
       </section>
 
       <section>
-        <h4>Proposed CV content</h4>
-        <section>
-          <h5>Technical skills ({recordArray(proposedContent?.technicalSkills).length})</h5>
-          <EvidenceTextItems value={proposedContent?.technicalSkills} emptyLabel="technical skills" />
-        </section>
-        <section>
-          <h5>Reordered experience ({reorderedExperience.length})</h5>
-          {reorderedExperience.length ? (
-            <ul className={styles.findingList}>
-              {reorderedExperience.map((item, index) => {
-                const roleOrCompany = stringValue(item, "roleOrCompany") ?? `Experience ${index + 1}`;
-                return (
-                  <li key={`${roleOrCompany}-${index}`}>
-                    <div className={styles.findingHeading}>
-                      <strong>{roleOrCompany}</strong>
-                      <span>{recordArray(item.bullets).length} bullets</span>
-                    </div>
-                    <EvidenceTextItems value={item.bullets} emptyLabel="experience bullets" compact />
-                  </li>
-                );
-              })}
-            </ul>
-          ) : <p className={styles.absent}>No reordered experience was reported.</p>}
-        </section>
-        <section>
-          <h5>Selected projects ({recordArray(proposedContent?.selectedProjects).length})</h5>
-          <EvidenceTextItems value={proposedContent?.selectedProjects} emptyLabel="selected projects" />
-        </section>
-      </section>
-
-      <section>
-        <h4>Business value bullet review ({bulletReviews.length})</h4>
-        {bulletReviews.length ? (
+        <h4>Exact resume edits</h4>
+        {exactEdits.length ? (
           <ul className={styles.findingList}>
-            {bulletReviews.map((item, index) => {
-              const scope = stringValue(item, "systemOrScope") ?? `Bullet ${index + 1}`;
+            {exactEdits.map((item, index) => {
+              const id = stringValue(item, "id") ?? `Edit ${index + 1}`;
+              const kind = stringValue(item, "kind");
+              const skillEdit = kind === "skill";
+              const ownerLabel = skillEdit ? "Category" : "Entity";
+              const owner = stringValue(item, skillEdit ? "category" : "entityId") ?? "Not reported";
               return (
-                <li key={`${scope}-${index}`}>
+                <li key={`${id}-${index}`}>
                   <div className={styles.findingHeading}>
-                    <strong>{scope}</strong>
-                    <span>{humanize(stringValue(item, "action") ?? "Action not reported")}</span>
+                    <strong>{id}</strong>
+                    <span>{kind ? humanize(kind) : "Kind not reported"}</span>
                   </div>
                   <AnalysisFacts rows={[
-                    { label: "Current bullet", value: stringValue(item, "currentBullet") ?? "Not reported" },
-                    { label: "Proposed bullet", value: stringValue(item, "proposedBullet") ?? "Not reported" },
-                    { label: "Tool or approach", value: stringValue(item, "toolOrApproach") ?? "Not reported" },
-                    { label: "Outcome or proof", value: stringValue(item, "outcomeOrProof") ?? "Not reported" },
+                    { label: ownerLabel, value: owner },
+                    { label: "Baseline item ID", value: <code>{stringValue(item, "baselineItemId") ?? "Not reported"}</code> },
+                    { label: "Before", value: stringValue(item, "before") ?? "Not reported" },
+                    { label: "After", value: stringValue(item, "after") ?? "Not reported" },
+                    {
+                      label: "Keyword IDs",
+                      value: (
+                        <IdentifierList
+                          value={item.keywordIds}
+                          ariaLabel="Linked keyword IDs"
+                          emptyLabel="No linked keyword IDs reported"
+                        />
+                      ),
+                    },
+                    { label: "Evidence IDs", value: <EvidenceIds value={item.evidenceIds} /> },
                   ]} />
-                  <EvidenceIds value={item.evidenceIds} />
                 </li>
               );
             })}
           </ul>
-        ) : <p className={styles.absent}>No business value bullet review was reported.</p>}
+        ) : (
+          <p className={styles.absent}>
+            No exact resume edits were requested; all baseline items are retained.
+          </p>
+        )}
       </section>
-
-
-      <section>
-        <h4>ATS and truthfulness review</h4>
-        <ReviewFindings
-          value={analysis.atsAndTruthfulnessReview}
-          fields={ATS_REVIEW_FIELDS}
-          detailKey="requiredAction"
-          detailLabel="Required action"
-        />
-      </section>
-
-      <section>
-        <h4>Customization plan ({customizationPlan.length})</h4>
-        {customizationPlan.length ? (
-          <ul className={styles.findingList}>
-            {customizationPlan.map((item, index) => {
-              const section = stringValue(item, "section") ?? `Plan item ${index + 1}`;
-              return (
-                <li key={`${section}-${index}`}>
-                  <div className={styles.findingHeading}>
-                    <strong>{section}</strong>
-                    <span>{stringValue(item, "currentStatus") ?? "Status not reported"}</span>
-                  </div>
-                  <AnalysisFacts rows={[
-                    { label: "Proposed change", value: stringValue(item, "proposedChange") ?? "Not reported" },
-                    { label: "Why", value: stringValue(item, "why") ?? "Not reported" },
-                  ]} />
-                  <EvidenceIds value={item.evidenceIds} />
-                </li>
-              );
-            })}
-          </ul>
-        ) : <p className={styles.absent}>No customization plan was reported.</p>}
-      </section>
-
     </div>
   );
 }
@@ -606,10 +434,13 @@ export function RunDetail({ runId }: RunDetailProps) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<BusyAction | null>(null);
   const [zoom, setZoom] = useState(100);
+  const [documentView, setDocumentView] = useState<DocumentView>("resume");
   const [artifactData, setArtifactData] = useState<Record<string, unknown>>({});
   const [artifactErrors, setArtifactErrors] = useState<Record<string, string>>({});
   const [isLoadingArtifacts, setIsLoadingArtifacts] = useState(false);
   const requestVersion = useRef(0);
+  const resumeTabRef = useRef<HTMLButtonElement>(null);
+  const keywordMapTabRef = useRef<HTMLButtonElement>(null);
 
   const loadRun = useCallback(async (initial = false) => {
     const request = ++requestVersion.current;
@@ -725,11 +556,37 @@ export function RunDetail({ runId }: RunDetailProps) {
   const pageImageArtifact = currentPageImage(run);
   const pdfHref = safeArtifactHref(pdfArtifact);
   const pageImageHref = safeArtifactHref(pageImageArtifact);
+  const keywordMapArtifact = artifactFor("keyword-map-pdf");
+  const keywordMapHref = safeArtifactHref(keywordMapArtifact);
+  const selectedDocumentView = documentView === "keyword-map" && keywordMapHref
+    ? "keyword-map"
+    : "resume";
+  const documentSignature = run
+    ? `${run.id}:${run.revision}:${pdfArtifact?.id ?? ""}:${pageImageArtifact?.id ?? ""}:${keywordMapArtifact?.id ?? ""}:${keywordMapHref ?? ""}`
+    : "none";
+  useEffect(() => {
+    setDocumentView("resume");
+    setZoom(100);
+  }, [documentSignature]);
   const visualValue = dataFor("visual-qa");
   const visualFindings = recordArray(asRecord(visualValue)?.findings);
   const overlays = visualFindings.map((finding, index) => ({ finding, index, rect: overlayRect(finding.bbox) })).filter((item): item is { finding: JsonRecord; index: number; rect: OverlayRect } => item.rect !== null);
 
   const actionsDisabled = busyAction !== null || isRefreshing || !isFresh;
+
+  const handleDocumentTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (!keywordMapHref) return;
+    const isResumeTab = event.currentTarget.id === RESUME_TAB_ID;
+    let nextView: DocumentView | null = null;
+    if (event.key === "ArrowRight") nextView = isResumeTab ? "keyword-map" : "resume";
+    if (event.key === "ArrowLeft") nextView = isResumeTab ? "keyword-map" : "resume";
+    if (event.key === "Home") nextView = "resume";
+    if (event.key === "End") nextView = "keyword-map";
+    if (!nextView) return;
+    event.preventDefault();
+    setDocumentView(nextView);
+    (nextView === "resume" ? resumeTabRef : keywordMapTabRef).current?.focus();
+  };
 
   const refreshAfterActionFailure = useCallback(async (request: number) => {
     setIsRefreshing(true);
@@ -846,16 +703,65 @@ export function RunDetail({ runId }: RunDetailProps) {
 
         <section className={`${styles.pane} ${styles.viewerPane}`} aria-label="Document viewer">
           <header className={styles.viewerToolbar}>
-            <div className={styles.viewerControls} aria-label="Document view controls">
-              <span>Page 1 / 1</span>
-              <button type="button" aria-label="Zoom out" disabled={actionsDisabled || zoom <= 75} onClick={() => setZoom((value) => Math.max(75, value - 25))}><Icon name="minus" /></button>
-              <output aria-live="polite">{zoom}%</output>
-              <button type="button" aria-label="Zoom in" disabled={actionsDisabled || zoom >= 150} onClick={() => setZoom((value) => Math.min(150, value + 25))}><Icon name="plus" /></button>
-              <button type="button" aria-label="Fit page" disabled={actionsDisabled} onClick={() => setZoom(100)}><Icon name="fit" /></button>
-              {pdfHref && !actionsDisabled ? <a href={pdfHref} aria-label="Download current PDF" download><Icon name="download" /></a> : null}
+            <div className={styles.viewerTabs} role="tablist" aria-label="Document views" aria-orientation="horizontal">
+              <button
+                aria-controls={RESUME_PANEL_ID}
+                aria-selected={selectedDocumentView === "resume"}
+                className={styles.viewerTab}
+                id={RESUME_TAB_ID}
+                onClick={() => setDocumentView("resume")}
+                onKeyDown={handleDocumentTabKeyDown}
+                ref={resumeTabRef}
+                role="tab"
+                tabIndex={selectedDocumentView === "resume" ? 0 : -1}
+                type="button"
+              >
+                Resume
+              </button>
+              {keywordMapHref ? (
+                <button
+                  aria-controls={KEYWORD_MAP_PANEL_ID}
+                  aria-selected={selectedDocumentView === "keyword-map"}
+                  className={styles.viewerTab}
+                  id={KEYWORD_MAP_TAB_ID}
+                  onClick={() => setDocumentView("keyword-map")}
+                  onKeyDown={handleDocumentTabKeyDown}
+                  ref={keywordMapTabRef}
+                  role="tab"
+                  tabIndex={selectedDocumentView === "keyword-map" ? 0 : -1}
+                  type="button"
+                >
+                  Keyword map
+                </button>
+              ) : null}
             </div>
+            {selectedDocumentView === "resume" ? (
+              <div className={styles.viewerControls} aria-label="Resume view controls">
+                <span>Page 1 / 1</span>
+                <button type="button" aria-label="Zoom out" disabled={actionsDisabled || zoom <= 75} onClick={() => setZoom((value) => Math.max(75, value - 25))}><Icon name="minus" /></button>
+                <output aria-live="polite">{zoom}%</output>
+                <button type="button" aria-label="Zoom in" disabled={actionsDisabled || zoom >= 150} onClick={() => setZoom((value) => Math.min(150, value + 25))}><Icon name="plus" /></button>
+                <button type="button" aria-label="Fit page" disabled={actionsDisabled} onClick={() => setZoom(100)}><Icon name="fit" /></button>
+                {pdfHref && !actionsDisabled ? <a href={pdfHref} aria-label="Download current PDF" download><Icon name="download" /></a> : null}
+              </div>
+            ) : (
+              <div className={styles.viewerControls} aria-label="Keyword map controls">
+                {!actionsDisabled ? (
+                  <a className={styles.viewerDownload} href={keywordMapHref!} aria-label="Download keyword map PDF" download><Icon name="download" /><span>Download keyword map</span></a>
+                ) : (
+                  <button className={styles.viewerDownload} type="button" disabled><Icon name="download" /><span>Download keyword map</span></button>
+                )}
+              </div>
+            )}
           </header>
-          <div className={styles.viewerCanvas}>
+          <div
+            aria-labelledby={RESUME_TAB_ID}
+            className={styles.viewerCanvas}
+            hidden={selectedDocumentView !== "resume"}
+            id={RESUME_PANEL_ID}
+            role="tabpanel"
+            tabIndex={0}
+          >
             {pageImageHref ? (
               <div className={styles.pageFrame} style={{ width: `${zoom * 0.64}%` }}>
                 <img src={pageImageHref} alt={`Rendered resume page for ${title}`} />
@@ -883,6 +789,20 @@ export function RunDetail({ runId }: RunDetailProps) {
               </div>
             )}
           </div>
+          {keywordMapHref ? (
+            <div
+              aria-labelledby={KEYWORD_MAP_TAB_ID}
+              className={`${styles.viewerCanvas} ${styles.keywordMapCanvas}`}
+              hidden={selectedDocumentView !== "keyword-map"}
+              id={KEYWORD_MAP_PANEL_ID}
+              role="tabpanel"
+              tabIndex={0}
+            >
+              <object className={`${styles.pdfObject} ${styles.keywordMapObject}`} data={keywordMapHref} type="application/pdf" aria-label={`Keyword map PDF for ${title}`}>
+                <p>The browser could not display this PDF. <a href={keywordMapHref} download>Download the keyword map</a>.</p>
+              </object>
+            </div>
+          ) : null}
         </section>
 
         <aside className={`${styles.pane} ${styles.rightPane}`} aria-label="Reserved review workspace" />
