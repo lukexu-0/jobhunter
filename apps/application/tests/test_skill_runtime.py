@@ -93,8 +93,8 @@ async def running_runtime(
 ) -> AsyncIterator[_RunningRuntime]:
     monkeypatch.setenv("JOBHUNTER_HARNESS_TOKEN", "parent-only-harness-token")
     monkeypatch.setenv("BROWSER_USE_API_KEY", "parent-only-cloud-token")
-    session_directory = tmp_path / "session"
-    session_directory.mkdir(mode=0o700)
+    session_directory = tmp_path / ("long-session-" + "x" * 100) / "session"
+    session_directory.mkdir(mode=0o700, parents=True)
     workspace = tmp_path / "workspace"
     workspace.mkdir(mode=0o700)
     profile = tmp_path / "profile"
