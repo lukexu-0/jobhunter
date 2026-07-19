@@ -1,10 +1,40 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { ANALYSIS_WORKFLOW_SHA256 } from "../src/agents/analysis-agent.ts";
+import { ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256 } from "../src/agents/ats-keyword-extraction-agent.ts";
 import { parseBaselineResume } from "../src/resume/parser.ts";
-import type { JobAnalysis } from "../src/resume/types.ts";
+import type { AtsKeywordExtraction, JobAnalysis } from "../src/resume/types.ts";
 
 const CANONICAL_BASELINE = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex"), "utf8");
+
+export const KEYWORD_MAP_JOB_DESCRIPTION =
+  "Strong TypeScript engineer using Next.js and Kubernetes";
+
+export function atsKeywordExtractionFixture(options: {
+  readonly rawJobDescription?: string;
+  readonly jobDescriptionSha256?: string;
+} = {}): AtsKeywordExtraction {
+  const rawJobDescription = options.rawJobDescription ?? KEYWORD_MAP_JOB_DESCRIPTION;
+  const supportedKeywords = [
+    { id: "keyword-typescript", phrase: "TypeScript" },
+    { id: "keyword-nextjs", phrase: "Next.js" },
+    { id: "keyword-kubernetes", phrase: "Kubernetes" },
+  ].filter((keyword) => rawJobDescription.toLocaleLowerCase().includes(keyword.phrase.toLocaleLowerCase()));
+  if (supportedKeywords.length === 0) {
+    throw new Error("ATS keyword extraction fixture requires a supported keyword in the job description");
+  }
+  return {
+    schemaVersion: 1,
+    jobDescriptionSha256: options.jobDescriptionSha256
+      ?? createHash("sha256").update(rawJobDescription).digest("hex"),
+    keywordExtractionWorkflowSha256: ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256,
+    keywords: supportedKeywords.map((keyword) => ({
+      ...keyword,
+      jdQuote: rawJobDescription,
+    })),
+  };
+}
 
 export function jobAnalysisFixture(options: {
   readonly jobDescriptionSha256?: string;

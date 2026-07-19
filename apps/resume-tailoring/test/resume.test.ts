@@ -8,10 +8,13 @@ import {
 } from "../src/agents/index.ts";
 import type { ContextSnapshot, EvidenceBlock, IndexedContextSource } from "../src/context/types.ts";
 import {
+  AtsKeywordExtractionSchema,
+  AtsKeywordSchema,
   EditResultSchema,
   JobAnalysisSchema,
   TailoringResultSchema,
   buildEvidenceLedger,
+  collectAnalysisSemanticIssues,
   hashJobAnalysis,
   immutableChunks,
   parseBaselineResume,
@@ -25,7 +28,7 @@ import {
   type JobAnalysis,
   type TailoringPlan,
 } from "../src/resume/index.ts";
-import { jobAnalysisFixture } from "./job-analysis.fixture.ts";
+import { atsKeywordExtractionFixture, jobAnalysisFixture } from "./job-analysis.fixture.ts";
 
 const baseline = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex"), "utf8");
 const parsedBaseline = parseBaselineResume(baseline);
@@ -127,6 +130,28 @@ describe("strict resume contracts", () => {
     expect(EditResultSchema.safeParse({ plan, commentDispositions: [], tailoredTex: "\\documentclass{article}" }).success).toBeFalse();
   });
 
+  test("accepts only strict, non-empty, unique ATS keyword extractions", () => {
+    const extraction = atsKeywordExtractionFixture();
+    expect(AtsKeywordSchema.safeParse(extraction.keywords[0]).success).toBeTrue();
+    expect(AtsKeywordExtractionSchema.safeParse(extraction).success).toBeTrue();
+    expect(AtsKeywordExtractionSchema.safeParse({ ...extraction, keywords: [] }).success).toBeFalse();
+    expect(AtsKeywordExtractionSchema.safeParse({ ...extraction, extra: true }).success).toBeFalse();
+    expect(AtsKeywordExtractionSchema.safeParse({
+      ...extraction,
+      keywords: [
+        extraction.keywords[0],
+        { ...extraction.keywords[1]!, id: extraction.keywords[0]!.id },
+      ],
+    }).error?.issues.some((issue) => issue.message.includes("keyword IDs must be unique"))).toBeTrue();
+    expect(AtsKeywordExtractionSchema.safeParse({
+      ...extraction,
+      keywords: [
+        extraction.keywords[0],
+        { ...extraction.keywords[1]!, phrase: extraction.keywords[0]!.phrase.toLocaleUpperCase() },
+      ],
+    }).error?.issues.some((issue) => issue.message.includes("unique case-insensitively"))).toBeTrue();
+  });
+
   test("rejects invalid keyword links and exact-edit schema values", () => {
     const { analysis } = fixtures();
     const bulletEdit = analysis.exactEdits.find((edit) => edit.kind === "bullet")!;
@@ -159,7 +184,15 @@ describe("strict resume contracts", () => {
 
   test("parses canonical sections, entities, bullets, and stable IDs", () => {
     const again = parseBaselineResume(baseline);
-    expect(parsedBaseline.entities.map((item) => item.entityId)).toContain("Sample Project");
+    expect(parsedBaseline.entities.filter((item) => item.section === "projects").map((item) => item.entityId)).toEqual([
+      "Sample Project Archive",
+      "Sample Project",
+    ]);
+    const legacyBaseline = baseline.replaceAll("\\enspace\\textbar\\enspace", () => "$|$");
+    expect(parseBaselineResume(legacyBaseline).entities.filter((item) => item.section === "projects").map((item) => item.entityId)).toEqual([
+      "Sample Project Archive",
+      "Sample Project",
+    ]);
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");
     expect(competition?.headingArguments).toEqual(["Semifinalist", "Jan 2020 -- Jun 2020", "Example Engineering Competition", ""]);
@@ -176,6 +209,66 @@ describe("analysis validation", () => {
     expect(validateAnalysisAgainstBaseline(analysis, JOB_DESCRIPTION, baseline, snapshot)).toEqual(analysis);
     const baselineSupported = replaceEvidence(analysis, ["canonical-baseline-evidence"]);
     expect(validateAnalysisAgainstBaseline(baselineSupported, JOB_DESCRIPTION, baseline, snapshot)).toEqual(baselineSupported);
+  });
+
+  test("collects structured safe semantic issues without changing fail-fast validation", () => {
+    const { snapshot, analysis } = fixtures();
+    const invalid: JobAnalysis = {
+      ...analysis,
+      jobDescriptionSha256: sha,
+      baselineSha256: sha,
+      jdKeywords: analysis.jdKeywords.map((keyword) => ({
+        ...keyword,
+        jdQuote: "Absent TypeScript quote",
+        evidenceIds: ["unknown-evidence", "evidence-1"],
+      })),
+      exactEdits: analysis.exactEdits.map((edit) => ({
+        ...edit,
+        before: edit.kind === "bullet" ? `${edit.before} stale` : edit.before,
+        after: edit.kind === "skill" ? "TypeScript" : edit.after,
+        evidenceIds: ["unknown-evidence", "evidence-1"],
+      })),
+    };
+    const issues = collectAnalysisSemanticIssues(
+      invalid,
+      JOB_DESCRIPTION,
+      baseline,
+      { ...snapshot, baselineSha256: sha },
+    );
+
+    expect(new Set(issues.map((issue) => issue.category))).toEqual(new Set([
+      "hashes-and-snapshot",
+      "evidence-identifiers",
+      "job-description-grounding",
+      "evidence-provenance",
+      "baseline-targets",
+      "skill-replacements",
+    ]));
+    expect(issues).toContainEqual({
+      code: "unknown-evidence",
+      category: "evidence-identifiers",
+      path: ["jdKeywords", 0, "evidenceIds", 0],
+      message: "must contain only supplied evidence IDs",
+    });
+    expect(issues).toContainEqual({
+      code: "bullet-before",
+      category: "baseline-targets",
+      path: ["exactEdits", 0, "before"],
+      message: "must exactly match the supplied baseline bullet text",
+    });
+    expect(issues).toContainEqual({
+      code: "skill-existing",
+      category: "skill-replacements",
+      path: ["exactEdits", 1, "after"],
+      message: "must not duplicate an existing baseline skill in its category",
+    });
+    expect(issues.map((issue) => issue.message).join("\n")).not.toContain("unknown-evidence");
+    expect(() => validateAnalysisAgainstBaseline(
+      invalid,
+      JOB_DESCRIPTION,
+      baseline,
+      { ...snapshot, baselineSha256: sha },
+    )).toThrow("job analysis job description hash does not match the source");
   });
 
   test("rejects stale hashes, JD text, targets, evidence, and replacements", () => {
@@ -333,6 +426,7 @@ describe("TeX repair validation", () => {
 
   test("accepts safe edits within editable section bodies", () => {
     const reordered = baseline.replace(/(\\resumeItem\{Built a full-stack[^\n]+\}\n)(\s*)(\\resumeItem\{Processed over[^\n]+\})/, "$3\n$2$1");
+    expect(validateRepairCandidate(baseline, baseline).valid).toBeTrue();
     const candidates = [
       baseline.replace("Processed over \\$300,000", "Processed over \\$654,321"),
       baseline.replace("\\section{Projects}", "\\section{Projects}\n% repaired body comment"),
@@ -345,6 +439,8 @@ describe("TeX repair validation", () => {
   test("retains size, immutable-region, primitive, command, brace, and macro safety checks", () => {
     const injected = baseline.replace("\\resumeItem{Built a full-stack", "\\input{/etc/passwd}\\resumeItem{Built a full-stack");
     expect(() => validateRepairCandidate(injected, baseline)).toThrow(/forbidden/i);
+    const misplacedGlyphInput = baseline.replace("\\resumeItem{Built a full-stack", "\\input{glyphtounicode}\\resumeItem{Built a full-stack");
+    expect(() => validateRepairCandidate(misplacedGlyphInput, baseline)).toThrow(/forbidden/i);
     const unknown = baseline.replace("\\resumeItem{Built a full-stack", "\\evil{hidden}\\resumeItem{Built a full-stack");
     expect(() => validateRepairCandidate(unknown, baseline)).toThrow(/unknown body control sequence/i);
     const malformedMacro = baseline.replace("\\resumeItem{Built a full-stack sample workflow", "\\resumeItem Built a full-stack sample workflow");

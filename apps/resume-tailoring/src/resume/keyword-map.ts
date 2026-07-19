@@ -9,7 +9,7 @@ import {
 } from "pdf-lib";
 import { ARTIFACT_LIMITS, type ArtifactMetadata, type ArtifactStore } from "../system/artifacts.ts";
 import { runTrustedProcess, type ProcessBoundary } from "../system/process.ts";
-import type { JobAnalysis } from "./types.ts";
+import type { AtsKeywordExtraction, JobAnalysis } from "./types.ts";
 
 const PAGE_WIDTH = 792;
 const PAGE_HEIGHT = 612;
@@ -23,11 +23,6 @@ const BBOX_OUTPUT_LIMIT = 4 * 1024 * 1024;
 const BBOX_TIMEOUT_MS = 30_000;
 const RED = rgb(0.85, 0.05, 0.05);
 const LIGHT_GRAY = rgb(0.82, 0.82, 0.82);
-const STOP_WORDS: Readonly<Record<string, true>> = Object.freeze({
-  about: true, after: true, also: true, and: true, been: true, being: true, build: true, built: true, from: true,
-  have: true, into: true, more: true, not: true, our: true, that: true, the: true, their: true, this: true,
-  through: true, using: true, with: true, your: true,
-});
 const ASCII_REPLACEMENTS: Readonly<Record<string, string>> = Object.freeze({
   "\u00a0": " ",
   "\u2010": "-",
@@ -52,6 +47,7 @@ export interface KeywordMapRequest {
   readonly compiledPdf: ArtifactMetadata;
   readonly jobDescription: string;
   readonly analysis: JobAnalysis;
+  readonly atsKeywordExtraction: AtsKeywordExtraction;
   readonly signal?: AbortSignal;
   readonly processBoundary?: ProcessBoundary;
 }
@@ -304,14 +300,10 @@ function canonicalTokens(value: string): readonly string[] {
     .toLocaleLowerCase("en-US")
     .replace(/[’']/g, "");
   return normalized
-    .split(/[^\p{Letter}\p{Number}+#.]+/u)
-    .map((token) => token.replace(/^\.+|\.+$/g, ""))
+    .split(/[^\p{Letter}\p{Number}+#]+/u)
     .filter(Boolean);
 }
 
-function wordToken(value: string): string {
-  return canonicalTokens(value).join("");
-}
 
 function range(boxes: readonly WordBox[]): BoxRange {
   const x = Math.min(...boxes.map((box) => box.x));
@@ -324,61 +316,54 @@ function range(boxes: readonly WordBox[]): BoxRange {
 function findPhrase(boxes: readonly WordBox[], phrase: string): BoxRange | undefined {
   const tokens = canonicalTokens(phrase);
   if (tokens.length === 0) return undefined;
-  const boxTokens = boxes.map((box) => wordToken(box.text));
-  for (let start = 0; start + tokens.length <= boxes.length; start++) {
-    const page = boxes[start]!.page;
+  const indexedTokens = boxes.flatMap((box, boxIndex) =>
+    canonicalTokens(box.text).map((token) => ({ token, boxIndex })));
+  for (let start = 0; start + tokens.length <= indexedTokens.length; start++) {
+    const first = indexedTokens[start]!;
+    const page = boxes[first.boxIndex]!.page;
     let matches = true;
     for (let offset = 0; offset < tokens.length; offset++) {
-      if (boxes[start + offset]!.page !== page || boxTokens[start + offset] !== tokens[offset]) {
+      const indexedToken = indexedTokens[start + offset]!;
+      if (boxes[indexedToken.boxIndex]!.page !== page || indexedToken.token !== tokens[offset]) {
         matches = false;
         break;
       }
     }
-    if (matches) return range(boxes.slice(start, start + tokens.length));
+    if (matches) {
+      const last = indexedTokens[start + tokens.length - 1]!;
+      return range(boxes.slice(first.boxIndex, last.boxIndex + 1));
+    }
   }
   return undefined;
 }
 
-function meaningfulTokens(value: string): readonly string[] {
-  return canonicalTokens(value)
-    .filter((token) => STOP_WORDS[token] !== true && !/^\d+$/.test(token) && (token.length >= 4 || /[+#.]/.test(token)))
-    .filter((token, index, values) => values.indexOf(token) === index);
-}
 
-function keywordMatches(analysis: JobAnalysis, resumeBoxes: readonly WordBox[], jobBoxes: readonly WordBox[]): readonly KeywordMatch[] {
+function keywordMatches(
+  atsKeywordExtraction: AtsKeywordExtraction,
+  analysis: JobAnalysis,
+  resumeBoxes: readonly WordBox[],
+  jobBoxes: readonly WordBox[],
+): readonly KeywordMatch[] {
   const matches: KeywordMatch[] = [];
-  for (const keyword of analysis.jdKeywords) {
+  for (const keyword of atsKeywordExtraction.keywords) {
+    const evidenceBackedKeyword = analysis.jdKeywords.find((candidate) =>
+      candidate.id === keyword.id
+      && candidate.phrase === keyword.phrase
+      && candidate.jdQuote === keyword.jdQuote);
     const resumeCandidates = [
       keyword.phrase,
-      ...analysis.exactEdits
-        .filter((edit) => edit.keywordIds.includes(keyword.id))
-        .map((edit) => edit.after),
+      ...(evidenceBackedKeyword
+        ? analysis.exactEdits
+          .filter((edit) => edit.keywordIds.includes(evidenceBackedKeyword.id))
+          .map((edit) => edit.after)
+        : []),
     ];
-    const literalJob = findPhrase(jobBoxes, keyword.phrase);
-    if (literalJob) {
-      const literalResume = resumeCandidates.map((candidate) => findPhrase(resumeBoxes, candidate)).find(Boolean);
-      if (literalResume) {
-        matches.push({ resume: literalResume, job: literalJob });
-        continue;
-      }
-    }
-    const jobTokens = meaningfulTokens(keyword.phrase);
-    let fallback: KeywordMatch | undefined;
-    for (const candidate of resumeCandidates) {
-      const common = meaningfulTokens(candidate)
-        .filter((token) => jobTokens.includes(token))
-        .sort((left, right) => right.length - left.length || left.localeCompare(right));
-      for (const token of common) {
-        const job = findPhrase(jobBoxes, token);
-        const resume = findPhrase(resumeBoxes, token);
-        if (job && resume) {
-          fallback = { resume, job };
-          break;
-        }
-      }
-      if (fallback) break;
-    }
-    if (fallback) matches.push(fallback);
+    const job = findPhrase(jobBoxes, keyword.phrase);
+    if (!job) continue;
+    const resume = resumeCandidates
+      .map((candidate) => findPhrase(resumeBoxes, candidate))
+      .find(Boolean);
+    if (resume) matches.push({ resume, job });
   }
   return matches;
 }
@@ -536,7 +521,12 @@ export async function renderKeywordMapPdf(request: KeywordMapRequest): Promise<A
     pages.push(page);
   }
 
-  const matches = keywordMatches(request.analysis, resumeBoxes, jobBoxes);
+  const matches = keywordMatches(
+    request.atsKeywordExtraction,
+    request.analysis,
+    resumeBoxes,
+    jobBoxes,
+  );
   for (const [pageIndex, page] of pages.entries()) drawPageMatches(page, matches, pageIndex);
   request.signal?.throwIfAborted();
   const bytes = await output.save({ useObjectStreams: false, addDefaultPage: false });

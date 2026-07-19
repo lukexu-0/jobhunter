@@ -17,7 +17,11 @@ import {
 } from "../src/resume/keyword-map.ts";
 import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
 import { runTrustedProcess, type ProcessBoundary } from "../src/system/process.ts";
-import { jobAnalysisFixture } from "./job-analysis.fixture.ts";
+import {
+  atsKeywordExtractionFixture,
+  jobAnalysisFixture,
+  KEYWORD_MAP_JOB_DESCRIPTION,
+} from "./job-analysis.fixture.ts";
 
 const roots: string[] = [];
 
@@ -25,7 +29,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function compiledResume(): Promise<Pick<KeywordMapRequest, "artifacts" | "compiledPdf">> {
+async function compiledResume(
+  resumeText = "Built production TypeScript services with Next.js and reliable APIs.",
+): Promise<Pick<KeywordMapRequest, "artifacts" | "compiledPdf">> {
   const root = await mkdtemp(join(tmpdir(), "keyword-map-"));
   roots.push(root);
   const artifacts = new ArtifactStore(root);
@@ -36,7 +42,7 @@ async function compiledResume(): Promise<Pick<KeywordMapRequest, "artifacts" | "
   const font = await document.embedFont(StandardFonts.Helvetica);
   const page = document.addPage([612, 792]);
   page.drawText("Candidate Resume", { x: 54, y: 730, size: 18, font });
-  page.drawText("Built production TypeScript services and reliable APIs.", {
+  page.drawText(resumeText, {
     x: 54,
     y: 690,
     size: 11,
@@ -101,7 +107,11 @@ describe("keyword map renderer", () => {
       ...paragraphs,
       "FINAL COMPLETE JD MARKER",
     ].join("\n");
-    const analysis = jobAnalysisFixture();
+    const atsKeywordExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const analysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
     const keyword = analysis.jdKeywords[0]!;
     const linkedSkillEdit = analysis.exactEdits.find((edit) => edit.kind === "skill" && edit.keywordIds.includes(keyword.id));
     expect(keyword.phrase).toBe("TypeScript");
@@ -110,6 +120,7 @@ describe("keyword map renderer", () => {
       ...resume,
       jobDescription,
       analysis,
+      atsKeywordExtraction,
     });
 
     expect(rendered.bytes).toBeLessThanOrEqual(ARTIFACT_LIMITS.pdf);
@@ -138,9 +149,129 @@ describe("keyword map renderer", () => {
     expect(operators).toMatch(/\bm\b[\s\S]*\bl\b/);
   });
 
+  test("highlights supported and retained extracted phrases without marking an absent term", async () => {
+    const resume = await compiledResume();
+    const atsKeywordExtraction = atsKeywordExtractionFixture();
+    const analysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: KEYWORD_MAP_JOB_DESCRIPTION,
+    });
+    expect(analysis.jdKeywords.map((keyword) => keyword.phrase)).toEqual(["TypeScript"]);
+    expect(atsKeywordExtraction.keywords.map((keyword) => keyword.phrase)).toEqual([
+      "TypeScript",
+      "Next.js",
+      "Kubernetes",
+    ]);
+
+    const rendered = await renderKeywordMapPdf({
+      ...resume,
+      jobDescription: KEYWORD_MAP_JOB_DESCRIPTION,
+      atsKeywordExtraction,
+      analysis,
+    });
+    const document = await PDFDocument.load(
+      await resume.artifacts.read(rendered.path, ARTIFACT_LIMITS.pdf),
+    );
+    let operators = "";
+    for (const [, object] of document.context.enumerateIndirectObjects()) {
+      if (!(object instanceof PDFRawStream)) continue;
+      try {
+        operators += Buffer.from(decodePDFRawStream(object).decode()).toString("latin1");
+      } catch {
+        // Font and image streams are not content streams and need not be text-decodable.
+      }
+    }
+    expect(operators.match(/0\.85 0\.05 0\.05 RG/g)).toHaveLength(6);
+  });
+
+  test("highlights complete keywords within punctuation-delimited PDF word boxes", async () => {
+    const jobDescription = "TypeScript role requiring Node, Next.js, C++, and C#";
+    const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const atsKeywordExtraction = {
+      ...baseExtraction,
+      keywords: [
+        { id: "keyword-typescript", phrase: "TypeScript", jdQuote: jobDescription },
+        { id: "keyword-node", phrase: "Node", jdQuote: jobDescription },
+        { id: "keyword-nextjs", phrase: "Next.js", jdQuote: jobDescription },
+        { id: "keyword-cpp", phrase: "C++", jdQuote: jobDescription },
+        { id: "keyword-csharp", phrase: "C#", jdQuote: jobDescription },
+      ],
+    };
+    const analysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
+
+    for (const runtime of ["Node/Express", "Node.js"]) {
+      const resume = await compiledResume(
+        `Built production TypeScript services with ${runtime}, Next.js, C++, and C#.`,
+      );
+      const rendered = await renderKeywordMapPdf({
+        ...resume,
+        jobDescription,
+        atsKeywordExtraction,
+        analysis,
+      });
+      const document = await PDFDocument.load(
+        await resume.artifacts.read(rendered.path, ARTIFACT_LIMITS.pdf),
+      );
+      let operators = "";
+      for (const [, object] of document.context.enumerateIndirectObjects()) {
+        if (!(object instanceof PDFRawStream)) continue;
+        try {
+          operators += Buffer.from(decodePDFRawStream(object).decode()).toString("latin1");
+        } catch {
+          // Font and image streams are not content streams and need not be text-decodable.
+        }
+      }
+      expect(operators.match(/0\.85 0\.05 0\.05 RG/g)).toHaveLength(15);
+    }
+  });
+
+  test("does not highlight an unrelated resume phrase sharing only one meaningful token", async () => {
+    const jobDescription = "Seeking TypeScript engineers with a genuinely high engineering bar.";
+    const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const atsKeywordExtraction = {
+      ...baseExtraction,
+      keywords: [
+        { id: "keyword-typescript", phrase: "TypeScript", jdQuote: jobDescription },
+        {
+          id: "keyword-engineering-bar",
+          phrase: "genuinely high engineering bar",
+          jdQuote: jobDescription,
+        },
+      ],
+    };
+    const analysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
+    const resume = await compiledResume("Built production TypeScript services. High School diploma.");
+    const rendered = await renderKeywordMapPdf({
+      ...resume,
+      jobDescription,
+      atsKeywordExtraction,
+      analysis,
+    });
+    const document = await PDFDocument.load(
+      await resume.artifacts.read(rendered.path, ARTIFACT_LIMITS.pdf),
+    );
+    let operators = "";
+    for (const [, object] of document.context.enumerateIndirectObjects()) {
+      if (!(object instanceof PDFRawStream)) continue;
+      try {
+        operators += Buffer.from(decodePDFRawStream(object).decode()).toString("latin1");
+      } catch {
+        // Font and image streams are not content streams and need not be text-decodable.
+      }
+    }
+    expect(operators.match(/0\.85 0\.05 0\.05 RG/g)).toHaveLength(3);
+  });
+
   test("honors cancellation and surfaces pdftotext failures and malformed bbox output", async () => {
     const resume = await compiledResume();
     const analysis = jobAnalysisFixture();
+    const atsKeywordExtraction = atsKeywordExtractionFixture({ rawJobDescription: "TypeScript role" });
     const controller = new AbortController();
     const reason = new DOMException("cancelled", "AbortError");
     controller.abort(reason);
@@ -148,6 +279,7 @@ describe("keyword map renderer", () => {
       ...resume,
       jobDescription: "TypeScript role",
       analysis,
+      atsKeywordExtraction,
       signal: controller.signal,
     })).rejects.toBe(reason);
 
@@ -155,6 +287,7 @@ describe("keyword map renderer", () => {
       ...resume,
       jobDescription: "TypeScript role",
       analysis,
+      atsKeywordExtraction,
       processBoundary: boundary("", 2, "syntax failure"),
     })).rejects.toThrow(/pdftotext bbox extraction failed: syntax failure/i);
 
@@ -162,6 +295,7 @@ describe("keyword map renderer", () => {
       ...resume,
       jobDescription: "TypeScript role",
       analysis,
+      atsKeywordExtraction,
       processBoundary: boundary("<doc><page width=\"612\" height=\"792\"></doc>"),
     })).rejects.toThrow(/exactly one page/i);
   });

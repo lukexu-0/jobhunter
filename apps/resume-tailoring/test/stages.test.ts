@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { AnalysisAgentInput } from "../src/agents/analysis-agent.ts";
+import type { AtsKeywordExtractionAgentInput } from "../src/agents/ats-keyword-extraction-agent.ts";
 import type { EditAgentInput } from "../src/agents/edit-agent.ts";
 import { buildMechanicalTailoringPlan, type TailoringAgentInput } from "../src/agents/tailoring-agent.ts";
 import type { ContextSnapshot, EvidenceBlock, IndexedContextSource } from "../src/context/types.ts";
@@ -15,8 +16,10 @@ import type { CompileRequest, CompileResult } from "../src/resume/compiler.ts";
 import {
   parseBaselineResume,
   renderTailoredResume,
+  type AtsKeywordExtraction,
   type EditResult,
   type DeterministicQaReport,
+  type KeywordMapRequest,
   type JobAnalysis,
   type RepairResult,
   type TailoringPlan,
@@ -24,7 +27,7 @@ import {
 } from "../src/resume/index.ts";
 import { PipelineStageProcessor, type PipelineStageDependencies } from "../src/stages/index.ts";
 import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
-import { jobAnalysisFixture } from "./job-analysis.fixture.ts";
+import { atsKeywordExtractionFixture, jobAnalysisFixture } from "./job-analysis.fixture.ts";
 
 setDefaultTimeout(15_000);
 
@@ -41,6 +44,7 @@ afterEach(async () => {
 interface ResumeFixtures {
   readonly snapshot: ContextSnapshot;
   readonly snapshotInput: RunSourceSnapshotInput;
+  readonly atsKeywordExtraction: AtsKeywordExtraction;
   readonly analysis: JobAnalysis;
   readonly plan: TailoringPlan;
 }
@@ -124,6 +128,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
     evidence,
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
+  const atsKeywordExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
   const analysis = jobAnalysisFixture({
     jobDescriptionSha256: createHash("sha256").update(jobDescription).digest("hex"),
     evidenceId: "evidence-0",
@@ -138,6 +143,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       baselineSha256: snapshot.baselineSha256,
       sourceHashes: snapshot.sourceHashes,
     },
+    atsKeywordExtraction,
     analysis,
     plan,
   };
@@ -148,7 +154,9 @@ interface HarnessOptions {
   readonly deterministicPass?: boolean;
   readonly deterministicReports?: readonly DeterministicQaReport[];
   readonly visual?: GeminiVisualInspection;
+  readonly deterministicQa?: PipelineStageDependencies["deterministicQa"];
   readonly loadSourceContext?: PipelineStageDependencies["loadSourceContext"];
+  readonly atsKeywordExtractionAgent?: PipelineStageDependencies["atsKeywordExtractionAgent"];
   readonly analysisAgent?: PipelineStageDependencies["analysisAgent"];
   readonly tailoringAgent?: PipelineStageDependencies["tailoringAgent"];
   readonly editAgent?: PipelineStageDependencies["editAgent"];
@@ -158,6 +166,7 @@ interface HarnessOptions {
 }
 
 interface AgentInputs {
+  readonly atsKeywordExtraction: AtsKeywordExtractionAgentInput[];
   readonly analysis: AnalysisAgentInput[];
   readonly tailoring: TailoringAgentInput[];
   readonly editing: EditAgentInput[];
@@ -170,9 +179,10 @@ interface Harness {
   readonly fixtures: ResumeFixtures;
   readonly runId: string;
   readonly compileModes: string[];
+  readonly agentOrder: string[];
   readonly agentInputs: AgentInputs;
   readonly tailoringResults: TailoringResult[];
-  readonly keywordMapCalls: { count: number };
+  readonly keywordMapCalls: { count: number; requests: KeywordMapRequest[] };
   readonly database: Database;
 }
 
@@ -181,9 +191,11 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const fixtures = resumeFixtures(jobDescription);
   const database = openPipelineDatabase(":memory:");
   databases.push(database);
+  let now = 0;
   let id = 0;
   let token = 0;
   const repository = new PipelineRepository(database, {
+    now: () => ++now,
     idFactory: () => `stage-id-${++id}`,
     attemptSessionIdFactory: () => `session-${id}`,
     tokenFactory: () => Buffer.alloc(32, ++token).toString("base64url"),
@@ -201,7 +213,10 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   }, "stage-run", options.generateKeywordMap ?? false, queueSequence);
   const compileOutcomes = [...(options.compileOutcomes ?? ["success"])] ;
   const compileModes: string[] = [];
-  const keywordMapCalls = { count: 0 };
+  const keywordMapCalls: { count: number; requests: KeywordMapRequest[] } = {
+    count: 0,
+    requests: [],
+  };
   const deterministicReports = [...(options.deterministicReports ?? [])];
   const compiler = async (request: CompileRequest): Promise<CompileResult> => {
     request.signal?.throwIfAborted();
@@ -240,13 +255,25 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
       },
     };
   };
-  const agentInputs: AgentInputs = { analysis: [], tailoring: [], editing: [] };
+  const agentInputs: AgentInputs = {
+    atsKeywordExtraction: [],
+    analysis: [],
+    tailoring: [],
+    editing: [],
+  };
+  const agentOrder: string[] = [];
   const tailoringResults: TailoringResult[] = [];
   const dependencies: PipelineStageDependencies = {
     repository,
     artifacts,
     loadSourceContext: options.loadSourceContext ?? (() => ({ snapshot: fixtures.snapshot, baseline })),
+    atsKeywordExtractionAgent: options.atsKeywordExtractionAgent ?? (async (attempt) => {
+      agentOrder.push("ats-keyword-extraction");
+      agentInputs.atsKeywordExtraction.push(attempt.input);
+      return fixtures.atsKeywordExtraction;
+    }),
     analysisAgent: options.analysisAgent ?? (async (attempt) => {
+      agentOrder.push("analysis");
       agentInputs.analysis.push(attempt.input);
       return fixtures.analysis;
     }),
@@ -280,16 +307,17 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     compiler,
     keywordMapRenderer: options.keywordMapRenderer ?? (async (request) => {
       keywordMapCalls.count += 1;
+      keywordMapCalls.requests.push(request);
       return await request.artifacts.write(
         join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
         "%PDF-1.7\nkeyword-map",
         ARTIFACT_LIMITS.pdf,
       );
     }),
-    deterministicQa: async () => deterministicReports.shift()
+    deterministicQa: options.deterministicQa ?? (async () => deterministicReports.shift()
       ?? (options.deterministicPass === false
         ? { pass: false, checks: [], warnings: [] }
-        : ONE_PAGE_QA),
+        : ONE_PAGE_QA)),
     rasterizer: async (request) => {
       const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
       const artifact = await artifacts.write(request.outputPath, png, ARTIFACT_LIMITS.png);
@@ -306,6 +334,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     runId: run.id,
     compileModes,
     agentInputs,
+    agentOrder,
     tailoringResults,
     keywordMapCalls,
     database,
@@ -318,6 +347,16 @@ async function processToStop(harness: Harness): Promise<void> {
   await harness.processor.processClaim(claim, new AbortController().signal);
   harness.repository.release(claim);
 }
+async function reportUnexpectedFailure(harness: Harness): Promise<void> {
+  const run = harness.repository.getRun(harness.runId);
+  if (run?.status !== "failed") return;
+  const diagnostic = harness.repository.getArtifact(harness.runId, "stage-error", run.currentRevision);
+  const text = diagnostic
+    ? Buffer.from(await harness.artifacts.read(diagnostic.path, ARTIFACT_LIMITS.log)).toString("utf8")
+    : "(no persisted stage-error artifact)";
+  throw new Error(`Unexpected pipeline failure at ${run.failedStage ?? "unknown stage"}:\n${text}`);
+}
+
 
 const MULTI_PAGE_QA: DeterministicQaReport = {
   pass: false,
@@ -348,9 +387,15 @@ describe("pipeline stage processor", () => {
       { from: "deterministic_qa", to: "visual_qa", failedStage: null },
       { from: "visual_qa", to: "review", failedStage: null },
     ]);
+    expect(harness.agentOrder).toEqual(["ats-keyword-extraction", "analysis"]);
+    expect(harness.agentInputs.atsKeywordExtraction).toEqual([{
+      rawJobDescription: "Strong TypeScript engineer",
+    }]);
     expect(harness.agentInputs.analysis).toHaveLength(1);
     expect(harness.agentInputs.analysis[0]?.canonicalCv).toBe(baseline);
     expect(harness.agentInputs.analysis[0]?.context).toEqual(harness.fixtures.snapshot);
+    expect(harness.agentInputs.analysis[0]?.atsKeywordExtraction)
+      .toBe(harness.fixtures.atsKeywordExtraction);
     expect(harness.agentInputs.tailoring).toHaveLength(1);
     expect(Object.keys(harness.agentInputs.tailoring[0]!)).not.toContain("rawJobDescription");
     expect(Object.keys(harness.agentInputs.tailoring[0]!)).not.toContain("context");
@@ -363,12 +408,22 @@ describe("pipeline stage processor", () => {
       renderTailoredResume(result!.plan, baseline, harness.fixtures.snapshot),
     );
     expect(harness.repository.listResolvedArtifacts(harness.runId).map((artifact) => artifact.kind)).toEqual(expect.arrayContaining([
-      "job-description", "job-analysis", "tailoring-plan", "change-summary", "evidence-ledger", "tailored-tex",
+      "job-description", "ats-keyword-extraction", "job-analysis", "tailoring-plan", "change-summary", "evidence-ledger", "tailored-tex",
       "latex-log", "compiled-pdf", "deterministic-qa", "page-image", "visual-qa",
     ]));
     const timeline = harness.repository.timeline(harness.runId);
     expect(timeline.attempts.map((attempt) => attempt.stage)).toEqual(["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
+    expect(timeline.attempts.find((attempt) => attempt.stage === "analyzing")?.toolCount).toBe(2);
     expect(timeline.attempts.find((attempt) => attempt.stage === "compiling")?.compileCount).toBe(1);
+    const jobDescriptionArtifact = harness.repository.getArtifact(harness.runId, "job-description");
+    const extractionArtifact = harness.repository.getArtifact(harness.runId, "ats-keyword-extraction");
+    const analysisArtifact = harness.repository.getArtifact(harness.runId, "job-analysis");
+    const sourceArtifactId = (artifactId: string): string | null | undefined =>
+      harness.database.query<{ source_artifact_id: string | null }, [string]>(
+        "SELECT source_artifact_id FROM artifacts WHERE id=?",
+      ).get(artifactId)?.source_artifact_id;
+    expect(sourceArtifactId(extractionArtifact!.id)).toBe(jobDescriptionArtifact!.id);
+    expect(sourceArtifactId(analysisArtifact!.id)).toBe(extractionArtifact!.id);
     expect(JSON.stringify({ run: harness.repository.getRun(harness.runId), timeline })).not.toContain("token");
     expect(JSON.stringify(harness.repository.listResolvedArtifacts(harness.runId))).not.toContain("Strong TypeScript engineer");
     expect(harness.keywordMapCalls.count).toBe(0);
@@ -397,6 +452,9 @@ describe("pipeline stage processor", () => {
     await processToStop(harness);
 
     expect(harness.keywordMapCalls.count).toBe(1);
+    expect(harness.keywordMapCalls.requests[0]?.atsKeywordExtraction)
+      .toEqual(harness.fixtures.atsKeywordExtraction);
+    expect(harness.keywordMapCalls.requests[0]?.analysis).toEqual(harness.fixtures.analysis);
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
     const compiled = harness.repository.getArtifact(harness.runId, "compiled-pdf");
     const keywordMap = harness.repository.getArtifact(harness.runId, "keyword-map-pdf");
@@ -423,6 +481,7 @@ describe("pipeline stage processor", () => {
         deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
       });
       await processToStop(harness);
+      await reportUnexpectedFailure(harness);
 
       expect(harness.repository.getRun(harness.runId)).toMatchObject({
         status: "review",
@@ -437,14 +496,63 @@ describe("pipeline stage processor", () => {
         requiredOmissionCount: 1,
       });
       expect(harness.tailoringResults[1]?.plan.omissions).toHaveLength(1);
-      expect(harness.repository.getArtifact(harness.runId, "one-page-correction")).not.toBeNull();
-      expect(harness.repository.timeline(harness.runId).attempts
-        .filter((attempt) => attempt.stage === "deterministic_qa")
+      const timeline = harness.repository.timeline(harness.runId);
+      const deterministicAttempts = timeline.attempts
+        .filter((attempt) => attempt.stage === "deterministic_qa");
+      const compilingAttempts = timeline.attempts
+        .filter((attempt) => attempt.stage === "compiling");
+      const correction = harness.repository.getArtifact(harness.runId, "one-page-correction");
+      const deterministicReport = harness.repository.getArtifact(harness.runId, "deterministic-qa");
+      const compiled = harness.repository.getArtifact(harness.runId, "compiled-pdf");
+      const compiledTex = harness.repository.getArtifact(harness.runId, "tailored-tex");
+      const tailoringPlan = harness.repository.getArtifact(harness.runId, "tailoring-plan");
+      const sourceArtifactId = (artifactId: string): string | null | undefined =>
+        harness.database.query<{ source_artifact_id: string | null }, [string]>(
+          "SELECT source_artifact_id FROM artifacts WHERE id=?",
+        ).get(artifactId)?.source_artifact_id;
+      const firstAttemptArtifacts = harness.database.query<{
+        id: string;
+        kind: string;
+        path: string;
+        source_artifact_id: string | null;
+        source_attempt_id: string | null;
+      }, [string]>(`
+        SELECT artifact.id,
+               artifact.kind,
+               artifact.path,
+               artifact.source_artifact_id,
+               source.attempt_id AS source_attempt_id
+        FROM artifacts AS artifact
+        LEFT JOIN artifacts AS source ON source.id = artifact.source_artifact_id
+        WHERE artifact.attempt_id = ?
+          AND artifact.kind IN ('deterministic-qa', 'one-page-correction')
+        ORDER BY artifact.kind
+      `).all(deterministicAttempts[0]!.id);
+      const firstDeterministicReport = firstAttemptArtifacts
+        .find((artifact) => artifact.kind === "deterministic-qa");
+      const firstCorrection = firstAttemptArtifacts
+        .find((artifact) => artifact.kind === "one-page-correction");
+      expect(firstAttemptArtifacts.map((artifact) => artifact.kind)).toEqual([
+        "deterministic-qa",
+        "one-page-correction",
+      ]);
+      expect(dirname(firstDeterministicReport!.path)).toBe(dirname(firstCorrection!.path));
+      expect(firstCorrection?.source_artifact_id).toBe(firstDeterministicReport?.id);
+      expect(firstDeterministicReport?.source_attempt_id).toBe(compilingAttempts[0]?.id);
+      expect(harness.repository.getArtifact(harness.runId, "stage-error")).toBeNull();
+      expect(correction?.attemptId).toBe(deterministicAttempts[0]?.id);
+      expect(deterministicReport?.attemptId).toBe(deterministicAttempts[1]?.id);
+      expect(compiled?.attemptId).toBe(compilingAttempts[1]?.id);
+      expect(compiledTex?.attemptId).toBe(compilingAttempts[1]?.id);
+      expect(sourceArtifactId(deterministicReport!.id)).toBe(compiled?.id);
+      expect(sourceArtifactId(compiled!.id)).toBe(compiledTex?.id);
+      expect(sourceArtifactId(tailoringPlan!.id)).toBe(correction?.id);
+      expect(deterministicAttempts
         .map((attempt) => ({ revision: attempt.revision, status: attempt.status }))).toEqual([
         { revision: 1, status: "failed" },
         { revision: 1, status: "succeeded" },
       ]);
-      expect(harness.repository.timeline(harness.runId).events
+      expect(timeline.events
         .filter((event) => event.kind === "run.transitioned")
         .map((event) => event.payload)).toEqual(expect.arrayContaining([
         { from: "deterministic_qa", to: "tailoring", failedStage: null },
@@ -462,14 +570,27 @@ describe("pipeline stage processor", () => {
       deterministicReports: [MULTI_PAGE_QA, MULTI_PAGE_QA, ONE_PAGE_QA],
     });
     await processToStop(harness);
+    await reportUnexpectedFailure(harness);
 
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
     expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.failureCount ?? 0)).toEqual([0, 1, 2]);
+    expect(harness.agentInputs.tailoring.map((input) =>
       input.onePageCorrection?.requiredOmissionCount ?? 0)).toEqual([0, 1, 2]);
     expect(harness.tailoringResults.map((result) => result.plan.omissions.length)).toEqual([0, 1, 2]);
-    expect(harness.repository.timeline(harness.runId).attempts
-      .filter((attempt) => attempt.stage === "deterministic_qa")
-      .map((attempt) => attempt.status)).toEqual(["failed", "failed", "succeeded"]);
+    const timeline = harness.repository.timeline(harness.runId);
+    const deterministicAttempts = timeline.attempts
+      .filter((attempt) => attempt.stage === "deterministic_qa");
+    const compilingAttempts = timeline.attempts
+      .filter((attempt) => attempt.stage === "compiling");
+    expect(deterministicAttempts.map((attempt) => attempt.status)).toEqual(["failed", "failed", "succeeded"]);
+    const correction = harness.repository.getArtifact(harness.runId, "one-page-correction");
+    expect(correction?.attemptId).toBe(deterministicAttempts[1]?.id);
+    expect(await Bun.file(correction!.path).json()).toMatchObject({ failureCount: 2 });
+    expect(harness.repository.getArtifact(harness.runId, "deterministic-qa")?.attemptId)
+      .toBe(deterministicAttempts[2]?.id);
+    expect(harness.repository.getArtifact(harness.runId, "compiled-pdf")?.attemptId)
+      .toBe(compilingAttempts[2]?.id);
     expect(harness.keywordMapCalls.count).toBe(1);
     expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).not.toBeNull();
   });
@@ -491,6 +612,56 @@ describe("pipeline stage processor", () => {
     });
   });
 
+  test("fails keyword-map QA instead of falling back from an invalid extraction artifact", async () => {
+    const harness = await createHarness({
+      generateKeywordMap: true,
+      deterministicQa: async () => {
+        const extractionArtifact = harness.repository.getArtifact(
+          harness.runId,
+          "ats-keyword-extraction",
+        );
+        if (!extractionArtifact) throw new Error("test extraction artifact is missing");
+        await Bun.write(extractionArtifact.path, JSON.stringify({
+          ...harness.fixtures.atsKeywordExtraction,
+          jobDescriptionSha256: "f".repeat(64),
+        }));
+        return ONE_PAGE_QA;
+      },
+    });
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "deterministic_qa",
+    });
+    expect(harness.keywordMapCalls.count).toBe(0);
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+  });
+
+  test("finalizes neither analyzing product when ATS extraction fails", async () => {
+    let analysisCalls = 0;
+    const harness = await createHarness({
+      atsKeywordExtractionAgent: async () => {
+        throw new Error("transient ATS extraction failure");
+      },
+      analysisAgent: async () => {
+        analysisCalls += 1;
+        return harness.fixtures.analysis;
+      },
+    });
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "analyzing",
+    });
+    expect(analysisCalls).toBe(0);
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+  });
+
   test("retries a failed analysis before its immutable artifact exists", async () => {
     let analysisCalls = 0;
     const harness = await createHarness({
@@ -503,6 +674,8 @@ describe("pipeline stage processor", () => {
     await processToStop(harness);
     expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(1);
     const diagnostic = harness.repository.getArtifact(harness.runId, "stage-error");
     expect(diagnostic).not.toBeNull();
     expect(Buffer.from(await harness.artifacts.read(diagnostic!.path, ARTIFACT_LIMITS.log)).toString("utf8"))
@@ -512,8 +685,40 @@ describe("pipeline stage processor", () => {
     await processToStop(harness);
 
     expect(analysisCalls).toBe(2);
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(2);
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")?.revision).toBe(2);
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(2);
+  });
+
+  test("inherits analyzing artifacts on later-stage retry without rerunning either agent", async () => {
+    const deterministicFailure: DeterministicQaReport = {
+      pass: false,
+      checks: [{ id: "text-output", status: "fail", detail: "Synthetic deterministic failure" }],
+      warnings: [],
+    };
+    const harness = await createHarness({
+      deterministicReports: [deterministicFailure, ONE_PAGE_QA],
+    });
+    await processToStop(harness);
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "deterministic_qa",
+    });
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(1);
+    expect(harness.agentInputs.analysis).toHaveLength(1);
+
+    harness.repository.retry(harness.runId, harness.fixtures.snapshotInput);
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "review",
+      currentRevision: 2,
+    });
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(1);
+    expect(harness.agentInputs.analysis).toHaveLength(1);
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")?.revision).toBe(1);
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(1);
   });
 
   test("allows at most bounded repair candidate compiles and requires a fresh authoritative full compile", async () => {
@@ -594,6 +799,7 @@ describe("pipeline stage processor", () => {
   test("human and machine edits reuse revision-one analysis and receive exact immutable prior QA", async () => {
     const editInputs: EditAgentInput[] = [];
     const harness = await createHarness({
+      deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
       editAgent: async (attempt) => {
         editInputs.push(attempt.input);
         return {
@@ -619,6 +825,7 @@ describe("pipeline stage processor", () => {
     expect(harness.agentInputs.analysis).toHaveLength(1);
     expect(editInputs).toHaveLength(2);
     expect(editInputs[0]?.comments).toEqual(["shorten the second experience bullet"]);
+    expect(editInputs[0]?.deterministicQa).toEqual(ONE_PAGE_QA);
     expect(editInputs.every((input) => input.context === harness.fixtures.snapshot)).toBeTrue();
     expect(editInputs[0]?.machineFindings).toBeUndefined();
     expect(editInputs[1]?.comments).toEqual([]);
@@ -645,7 +852,9 @@ describe("pipeline stage processor", () => {
     await processToStop(harness);
 
     expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(0);
     expect(harness.agentInputs.analysis).toHaveLength(0);
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
   });
 
@@ -672,6 +881,7 @@ describe("pipeline stage processor", () => {
     expect(attempts).toHaveLength(1);
     expect(attempts[0]).toMatchObject({ stage: "analyzing", status: "cancelled" });
     expect(attempts[0]?.cancellationAcknowledgedAt).not.toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
     expect(harness.repository.getRun(harness.runId)?.status).toBe("analyzing");
   });

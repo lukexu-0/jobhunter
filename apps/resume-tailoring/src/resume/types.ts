@@ -18,6 +18,34 @@ export const JobKeywordSchema = z.object({
 }).strict();
 export type JobKeyword = z.infer<typeof JobKeywordSchema>;
 
+export const AtsKeywordSchema = z.object({
+  id: Id,
+  phrase: PlainText,
+  jdQuote: PlainText,
+}).strict();
+export type AtsKeyword = z.infer<typeof AtsKeywordSchema>;
+
+export const AtsKeywordExtractionSchema = z.object({
+  schemaVersion: z.literal(1),
+  jobDescriptionSha256: Sha256,
+  keywordExtractionWorkflowSha256: Sha256,
+  keywords: z.array(AtsKeywordSchema).min(1).max(100).readonly(),
+}).strict().superRefine((extraction, ctx) => {
+  const keywordIds = extraction.keywords.map((keyword) => keyword.id);
+  if (new Set(keywordIds).size !== keywordIds.length) {
+    ctx.addIssue({ code: "custom", path: ["keywords"], message: "keyword IDs must be unique" });
+  }
+  const normalizedPhrases = extraction.keywords.map((keyword) => keyword.phrase.toLocaleLowerCase());
+  if (new Set(normalizedPhrases).size !== normalizedPhrases.length) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["keywords"],
+      message: "keyword phrases must be unique case-insensitively",
+    });
+  }
+});
+export type AtsKeywordExtraction = z.infer<typeof AtsKeywordExtractionSchema>;
+
 const KeywordIds = z.array(Id)
   .min(1)
   .max(100)

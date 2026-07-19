@@ -2,10 +2,13 @@ import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import {
   ANALYSIS_WORKFLOW_SHA256,
+  runAtsKeywordExtractionAgent,
   runAnalysisAgent,
+  validateAnalysisAgainstAtsKeywordExtraction,
   runEditAgent,
   runRepairAgent,
   runTailoringAgent,
+  validateAtsKeywordExtractionAgainstJobDescription,
   type AgentRuntimeDependencies,
   type OnePageCorrection,
 } from "../agents/index.ts";
@@ -15,6 +18,7 @@ import { inspectResumePng, type GeminiInspectorOptions } from "../models/gemini-
 import { compileResume, type CompileResult } from "../resume/compiler.ts";
 import { renderKeywordMapPdf } from "../resume/keyword-map.ts";
 import {
+  AtsKeywordExtractionSchema,
   buildEvidenceLedger,
   equivalentEntities,
   JobAnalysisSchema,
@@ -25,6 +29,7 @@ import {
   renderTailoredResume,
   runDeterministicPdfQa,
   TailoringPlanSchema,
+  type TailoringPlan,
   validateAnalysisAgainstBaseline,
   validateAnalysisImmutability,
   validateRepairCandidate,
@@ -60,6 +65,26 @@ function parseOnePageCorrectionArtifact(value: unknown): OnePageCorrectionArtifa
   return { failureCount: candidate.failureCount!, note: candidate.note };
 }
 
+function validateOnePageCorrectionPlan(
+  plan: TailoringPlan,
+  correction: OnePageCorrection | undefined,
+): void {
+  const expected = correction?.candidates.slice(0, correction.requiredOmissionCount) ?? [];
+  if (plan.omissions.length !== expected.length) {
+    throw new Error("tailoring plan does not apply the current one-page correction strength");
+  }
+  for (const [index, candidate] of expected.entries()) {
+    const omission = plan.omissions[index];
+    if (!omission
+      || omission.baselineItemId !== candidate.baselineItemId
+      || omission.evidenceIds.length !== candidate.evidenceIds.length
+      || omission.evidenceIds.some((evidenceId, evidenceIndex) =>
+        evidenceId !== candidate.evidenceIds[evidenceIndex])) {
+      throw new Error("tailoring plan does not match the current one-page correction");
+    }
+  }
+}
+
 export interface PipelineStageDependencies {
   readonly repository: StageRepository;
   readonly artifacts: ArtifactStore;
@@ -68,6 +93,7 @@ export interface PipelineStageDependencies {
   readonly processBoundary?: ProcessBoundary;
   readonly gemini?: GeminiInspectorOptions;
   readonly analysisAgent?: typeof runAnalysisAgent;
+  readonly atsKeywordExtractionAgent?: typeof runAtsKeywordExtractionAgent;
   readonly tailoringAgent?: typeof runTailoringAgent;
   readonly editAgent?: typeof runEditAgent;
   readonly repairAgent?: typeof runRepairAgent;
@@ -115,6 +141,7 @@ export class PipelineStageProcessor {
   readonly #processBoundary: ProcessBoundary | undefined;
   readonly #gemini: GeminiInspectorOptions | undefined;
   readonly #analysisAgent: typeof runAnalysisAgent;
+  readonly #atsKeywordExtractionAgent: typeof runAtsKeywordExtractionAgent;
   readonly #tailoringAgent: typeof runTailoringAgent;
   readonly #editAgent: typeof runEditAgent;
   readonly #repairAgent: typeof runRepairAgent;
@@ -132,6 +159,8 @@ export class PipelineStageProcessor {
     this.#processBoundary = dependencies.processBoundary;
     this.#gemini = dependencies.gemini;
     this.#analysisAgent = dependencies.analysisAgent ?? runAnalysisAgent;
+    this.#atsKeywordExtractionAgent =
+      dependencies.atsKeywordExtractionAgent ?? runAtsKeywordExtractionAgent;
     this.#tailoringAgent = dependencies.tailoringAgent ?? runTailoringAgent;
     this.#editAgent = dependencies.editAgent ?? runEditAgent;
     this.#repairAgent = dependencies.repairAgent ?? runRepairAgent;
@@ -213,25 +242,70 @@ export class PipelineStageProcessor {
   }
 
   async #analyze(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
-    if (this.#repository.getArtifact(run.id, "job-analysis")) throw new Error("job analysis is immutable once finalized");
+    if (this.#repository.getArtifact(run.id, "ats-keyword-extraction")) {
+      throw new Error("ATS keyword extraction is immutable once finalized");
+    }
+    if (this.#repository.getArtifact(run.id, "job-analysis")) {
+      throw new Error("job analysis is immutable once finalized");
+    }
     const inputArtifact = this.#requiredArtifact(run.id, "job-description");
     const rawJobDescription = await this.#readText(inputArtifact, JOB_DESCRIPTION_LIMIT);
     await this.#verifyAgain(run.id, signal);
-    const analysis = await this.#analysisAgent({
+    const atsKeywordExtraction = await this.#atsKeywordExtractionAgent({
       attemptSessionId: attempt.attemptSessionId,
-      input: { rawJobDescription, canonicalCv: sources.baseline, context: sources.snapshot },
+      input: { rawJobDescription },
       signal,
       ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
     });
     audit.toolCount = 1;
+    validateAtsKeywordExtractionAgainstJobDescription(
+      atsKeywordExtraction,
+      rawJobDescription,
+    );
+    const analysis = await this.#analysisAgent({
+      attemptSessionId: attempt.attemptSessionId,
+      input: {
+        rawJobDescription,
+        atsKeywordExtraction,
+        canonicalCv: sources.baseline,
+        context: sources.snapshot,
+      },
+      signal,
+      ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
+    });
+    audit.toolCount = 2;
     if (analysis.analysisWorkflowSha256 !== ANALYSIS_WORKFLOW_SHA256) {
       throw new Error("job analysis does not match the configured analysis workflow");
     }
+    validateAnalysisAgainstAtsKeywordExtraction(analysis, atsKeywordExtraction);
     validateAnalysisAgainstBaseline(analysis, rawJobDescription, sources.baseline, sources.snapshot);
     signal.throwIfAborted();
+    const root = await this.#artifacts.createAttempt(this.#address(run, attempt));
+    const extractionMetadata = await this.#artifacts.write(
+      join(root, "ats-keyword-extraction.json"),
+      json(atsKeywordExtraction),
+      JSON_LIMIT,
+    );
+    const analysisMetadata = await this.#artifacts.write(
+      join(root, "job-analysis.json"),
+      json(analysis),
+      JSON_LIMIT,
+    );
     await this.#verifyAgain(run.id, signal);
-    const artifact = await this.#writeJson(run, attempt, "job-analysis", analysis);
-    this.#finalize(claim, attempt, "job-analysis", artifact, inputArtifact.id);
+    const extractionArtifact = this.#finalize(
+      claim,
+      attempt,
+      "ats-keyword-extraction",
+      extractionMetadata,
+      inputArtifact.id,
+    );
+    this.#finalize(
+      claim,
+      attempt,
+      "job-analysis",
+      analysisMetadata,
+      extractionArtifact.id,
+    );
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
     this.#repository.transition(claim, "tailoring");
   }
@@ -239,7 +313,10 @@ export class PipelineStageProcessor {
   async #tailor(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
     const analysisArtifact = this.#requiredArtifact(run.id, "job-analysis");
     const analysis = JobAnalysisSchema.parse(await this.#readJson(analysisArtifact));
-    const onePageCorrection = await this.#onePageCorrection(run, sources, analysis);
+    const correctionArtifact = this.#currentRevisionArtifact(run, "one-page-correction");
+    const onePageCorrection = correctionArtifact
+      ? await this.#onePageCorrection(correctionArtifact, sources, analysis)
+      : undefined;
     await this.#verifyAgain(run.id, signal);
     const result = await this.#tailoringAgent({
       attemptSessionId: attempt.attemptSessionId,
@@ -259,6 +336,7 @@ export class PipelineStageProcessor {
     });
     audit.toolCount = result.toolCount;
     validateAnalysisImmutability(result.plan, analysis);
+    validateOnePageCorrectionPlan(result.plan, onePageCorrection);
     const tailoredTex = renderTailoredResume(result.plan, sources.baseline, sources.snapshot);
     const ledger = buildEvidenceLedger(analysis, result.plan, sources.snapshot);
     signal.throwIfAborted();
@@ -268,10 +346,11 @@ export class PipelineStageProcessor {
     const summaryMeta = await this.#artifacts.write(join(root, "change-summary.json"), json({ planId: result.plan.id, decisions: result.plan.decisions, skillDecisions: result.plan.skillDecisions, omissions: result.plan.omissions }), JSON_LIMIT);
     const ledgerMeta = await this.#artifacts.write(join(root, "evidence-ledger.json"), json(ledger), JSON_LIMIT);
     const texMeta = await this.#artifacts.write(join(root, "resume.tex"), tailoredTex, ARTIFACT_LIMITS.tex);
-    this.#finalize(claim, attempt, "tailoring-plan", planMeta, analysisArtifact.id);
-    this.#finalize(claim, attempt, "change-summary", summaryMeta, analysisArtifact.id);
-    this.#finalize(claim, attempt, "evidence-ledger", ledgerMeta, analysisArtifact.id);
-    this.#finalize(claim, attempt, "tailored-tex", texMeta, analysisArtifact.id);
+    const sourceArtifactId = correctionArtifact?.id ?? analysisArtifact.id;
+    this.#finalize(claim, attempt, "tailoring-plan", planMeta, sourceArtifactId);
+    this.#finalize(claim, attempt, "change-summary", summaryMeta, sourceArtifactId);
+    this.#finalize(claim, attempt, "evidence-ledger", ledgerMeta, sourceArtifactId);
+    this.#finalize(claim, attempt, "tailored-tex", texMeta, sourceArtifactId);
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
     this.#repository.transition(claim, "compiling");
   }
@@ -360,9 +439,10 @@ export class PipelineStageProcessor {
     signal.throwIfAborted();
     await this.#verifyAgain(run.id, signal);
     this.#finalize(claim, attempt, "latex-log", result.log, texArtifact.id);
-    if (result.tex) this.#finalize(claim, attempt, "tailored-tex", result.tex, texArtifact.id);
+    let compiledTexArtifact = texArtifact;
+    if (result.tex) compiledTexArtifact = this.#finalize(claim, attempt, "tailored-tex", result.tex, texArtifact.id);
     if (result.ok) {
-      this.#finalize(claim, attempt, "compiled-pdf", result.pdf, texArtifact.id);
+      this.#finalize(claim, attempt, "compiled-pdf", result.pdf, compiledTexArtifact.id);
       this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
       this.#repository.transition(claim, "deterministic_qa");
       return;
@@ -440,7 +520,7 @@ export class PipelineStageProcessor {
     this.#repository.transition(claim, "compiling");
   }
 
-  async #deterministic(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, _sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
+  async #deterministic(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
     const pdf = this.#requiredArtifact(run.id, "compiled-pdf");
     const log = this.#requiredArtifact(run.id, "latex-log");
     const latexLog = await this.#readText(log, ARTIFACT_LIMITS.log);
@@ -455,20 +535,36 @@ export class PipelineStageProcessor {
     });
     signal.throwIfAborted();
     await this.#verifyAgain(run.id, signal);
-    const artifact = await this.#writeJson(run, attempt, "deterministic-qa", report);
+    const root = await this.#artifacts.createAttempt(this.#address(run, attempt));
+    const artifact = await this.#artifacts.write(join(root, "deterministic-qa.json"), json(report), JSON_LIMIT);
     const deterministicArtifact = this.#finalize(claim, attempt, "deterministic-qa", artifact, pdf.id);
     const onePageCheck = report.checks.find((check) => check.id === "one-page");
     const failedOnePage = onePageCheck?.status === "fail";
-    if (failedOnePage) {
-      const priorArtifact = this.#repository.getArtifact(run.id, "one-page-correction");
+    const failedOtherCheck = report.checks.some((check) =>
+      check.id !== "one-page" && check.status === "fail");
+    if (failedOnePage && !failedOtherCheck) {
+      const priorArtifact = this.#currentRevisionArtifact(run, "one-page-correction");
       const prior = priorArtifact
         ? parseOnePageCorrectionArtifact(await this.#readJson(priorArtifact))
         : undefined;
+      if (priorArtifact && prior) {
+        const analysis = JobAnalysisSchema.parse(await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")));
+        const currentCorrection = await this.#onePageCorrection(priorArtifact, sources, analysis);
+        if (currentCorrection.requiredOmissionCount >= currentCorrection.candidates.length) {
+          this.#repository.finishAttempt(claim, attempt.id, "failed", audit);
+          this.#repository.transition(claim, "failed", { failedStage: "deterministic_qa" });
+          return;
+        }
+      }
       const correction: OnePageCorrectionArtifact = {
         failureCount: (prior?.failureCount ?? 0) + 1,
         note: ONE_PAGE_CORRECTION_NOTE,
       };
-      const correctionMeta = await this.#writeJson(run, attempt, "one-page-correction", correction);
+      const correctionMeta = await this.#artifacts.write(
+        join(root, "one-page-correction.json"),
+        json(correction),
+        JSON_LIMIT,
+      );
       this.#finalize(claim, attempt, "one-page-correction", correctionMeta, deterministicArtifact.id);
       signal.throwIfAborted();
       await this.#verifyAgain(run.id, signal);
@@ -482,7 +578,17 @@ export class PipelineStageProcessor {
       return;
     }
     if (run.generateKeywordMap) {
-      const analysis = JobAnalysisSchema.parse(await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")));
+      const atsKeywordExtraction = AtsKeywordExtractionSchema.parse(
+        await this.#readJson(this.#requiredArtifact(run.id, "ats-keyword-extraction")),
+      );
+      validateAtsKeywordExtractionAgainstJobDescription(
+        atsKeywordExtraction,
+        run.jobDescription,
+      );
+      const analysis = JobAnalysisSchema.parse(
+        await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")),
+      );
+      validateAnalysisAgainstAtsKeywordExtraction(analysis, atsKeywordExtraction);
       const keywordMap = await this.#keywordMapRenderer({
         artifacts: this.#artifacts,
         compiledPdf: {
@@ -492,6 +598,7 @@ export class PipelineStageProcessor {
         },
         jobDescription: run.jobDescription,
         analysis,
+        atsKeywordExtraction,
         signal,
         ...(this.#processBoundary ? { processBoundary: this.#processBoundary } : {}),
       });
@@ -570,22 +677,21 @@ export class PipelineStageProcessor {
   }
 
   async #onePageCorrection(
-    run: PublicRun,
+    artifact: PublicArtifact,
     sources: StageSourceContext,
     analysis: JobAnalysis,
-  ): Promise<OnePageCorrection | undefined> {
-    const artifact = this.#repository.getArtifact(run.id, "one-page-correction");
-    if (!artifact) return undefined;
+  ): Promise<OnePageCorrection> {
     const state = parseOnePageCorrectionArtifact(await this.#readJson(artifact));
     const baseline = parseBaselineResume(sources.baseline);
     const baselineSourceIds = new Set(
       sources.snapshot.sources.filter((source) => source.kind === "baseline").map((source) => source.id),
     );
-    const baselineEvidence = sources.snapshot.evidence.find((evidence) => baselineSourceIds.has(evidence.sourceId));
     const editTargets = new Set(analysis.exactEdits.map((edit) => edit.baselineItemId));
     const candidates = baseline.bullets
       .map((bullet, index) => {
-        const evidence = baselineEvidence
+        const evidence = sources.snapshot.evidence.find((candidate) =>
+          baselineSourceIds.has(candidate.sourceId)
+          && equivalentEntities(candidate.entityId, bullet.entityId, sources.snapshot))
           ?? sources.snapshot.evidence.find((candidate) =>
             equivalentEntities(candidate.entityId, bullet.entityId, sources.snapshot));
         return evidence ? {
@@ -618,6 +724,11 @@ export class PipelineStageProcessor {
       requiredOmissionCount: Math.min(state.failureCount, candidates.length),
       candidates,
     };
+  }
+
+  #currentRevisionArtifact(run: PublicRun, kind: string): PublicArtifact | null {
+    const artifact = this.#repository.getArtifact(run.id, kind, run.currentRevision);
+    return artifact?.revision === run.currentRevision ? artifact : null;
   }
 
   #address(run: PublicRun, attempt: PublicAttempt): ArtifactAddress {
