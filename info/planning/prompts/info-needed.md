@@ -478,14 +478,6 @@ Examples:
 
 Make sure linked repositories have a clear README, setup instructions, screenshots, and an explanation of your contribution.
 
-## 21. Must Include
-
-After the initial repository scan, ask the user to populate this context section:
-
-- Is there any exact fact, framing, technology, impact, or wording that must appear for this project or context entity in the resume information or later tailored materials?
-- Provide the exact requirement and its intended context entity or scope. `None specified` is valid and means that no context directive was provided.
-- Treat a non-empty entry as an inclusion requirement only when it is supported by repository evidence or another explicit source of truth. Surface unsupported or conflicting requests instead of inventing evidence.
-
 Prioritize the below information, when available
 
 1. **Project name and context**
