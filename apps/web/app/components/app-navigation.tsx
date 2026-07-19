@@ -3,8 +3,13 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
+import { KeyRound } from "lucide-react";
 
 function NavIcon({ name }: { readonly name: "applications" | "providers" }): ReactNode {
+  if (name === "providers") {
+    return <KeyRound aria-hidden="true" strokeWidth={1.7} />;
+  }
+
   return (
     <svg
       aria-hidden="true"
@@ -15,16 +20,8 @@ function NavIcon({ name }: { readonly name: "applications" | "providers" }): Rea
       strokeLinecap="round"
       strokeLinejoin="round"
     >
-      {name === "applications" ? (
-        <>
-          <path d="M5 3h9l5 5v13H5V3Z" />
-          <path d="M14 3v5h5M8 12h8M8 16h6" />
-        </>
-      ) : (
-        <>
-          <path d="M8 3v4M16 3v4M6 7h12v3a6 6 0 0 1-6 6v5M8 21h8" />
-        </>
-      )}
+      <path d="M5 3h9l5 5v13H5V3Z" />
+      <path d="M14 3v5h5M8 12h8M8 16h6" />
     </svg>
   );
 }

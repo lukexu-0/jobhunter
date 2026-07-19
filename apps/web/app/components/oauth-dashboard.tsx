@@ -19,17 +19,14 @@ const PROVIDERS = [
   {
     provider: "openai-codex",
     name: "OpenAI Codex",
-    description: "OAuth access for tailoring and fallback job-posting extraction.",
   },
   {
     provider: "google-antigravity",
     name: "Google Antigravity",
-    description: "OAuth access for visual document inspection.",
   },
 ] as const satisfies ReadonlyArray<{
   provider: OAuthProvider;
   name: string;
-  description: string;
 }>;
 
 type BrowserAuthSession = AuthSession & { url?: string };
@@ -345,14 +342,7 @@ export function OAuthDashboard() {
   );
 
   return (
-    <section className="oauth-dashboard" aria-labelledby="oauth-heading">
-      <div className="section-heading">
-        <div>
-          <p className="kicker">Authorization</p>
-          <h2 id="oauth-heading">Provider access</h2>
-        </div>
-        <p className="section-caption">Connect OAuth for tailoring, visual inspection, and fallback job-posting extraction.</p>
-      </div>
+    <section className="oauth-dashboard" aria-label="OAuth provider connections">
 
       {statusError ? (
         <p className="dashboard-notice dashboard-notice--error" role="alert">
@@ -363,7 +353,7 @@ export function OAuthDashboard() {
       <div className="provider-table" aria-busy={isLoadingStatus}>
         <div className="provider-table__head" aria-hidden="true">
           <span>Provider</span>
-          <span>Connection</span>
+          <span>Status</span>
           <span>Action</span>
         </div>
 
@@ -383,7 +373,6 @@ export function OAuthDashboard() {
                 <div className="provider-identity">
                   <p className="provider-identity__name">{provider.name}</p>
                   <p className="provider-identity__id">{provider.provider}</p>
-                  <p className="provider-identity__description">{provider.description}</p>
                 </div>
 
                 <div className="provider-connection">
@@ -440,7 +429,6 @@ export function OAuthDashboard() {
         </ul>
       </div>
 
-      <p className="oauth-footnote">Credentials stay in the local pipeline service. This workspace never displays access or refresh tokens.</p>
     </section>
   );
 }
