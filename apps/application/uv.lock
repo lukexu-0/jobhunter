@@ -701,6 +701,7 @@ name = "jobhunter-browser-harness"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "browser-harness" },
     { name = "browser-use" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -718,6 +719,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "browser-harness", specifier = "==0.1.5" },
     { name = "browser-use", specifier = "==0.13.4" },
     { name = "fastapi", specifier = "==0.139.0" },
     { name = "httpx", specifier = "==0.28.1" },

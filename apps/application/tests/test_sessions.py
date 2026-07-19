@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -26,7 +27,10 @@ from jobhunter_browser_harness.context import (
     CandidateContextProcess,
     load_candidate_context,
 )
-from jobhunter_browser_harness.browser import ResolvedBrowserLaunch
+from jobhunter_browser_harness.browser import (
+    BrowserConfigurationError,
+    ResolvedBrowserLaunch,
+)
 from jobhunter_browser_harness.models import (
     ApplicationRunResult,
     ApproveOriginCommand,
@@ -291,7 +295,11 @@ def make_manager(
     doubles = fakes or Fakes()
     root = tmp_path / "sessions"
     manager = ApplicationSessionManager(
-        HarnessConfig(bearer_token=TOKEN, session_timeout=timeout),
+        HarnessConfig(
+            bearer_token=TOKEN,
+            session_timeout=timeout,
+            browser_skill_workspace=tmp_path / "browser-skill" / "agent-workspace",
+        ),
         artifacts_root=root,
         browser_launch=ResolvedBrowserLaunch(
             cdp_url=None,
@@ -304,6 +312,79 @@ def make_manager(
         application_runner=runner,
     )
     return manager, doubles, root
+
+
+def test_manager_probes_bubblewrap_and_creates_private_skill_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "browser-skill" / "agent-workspace"
+
+    ApplicationSessionManager(
+        HarnessConfig(
+            bearer_token=TOKEN,
+            bubblewrap_executable=Path("/usr/bin/bwrap"),
+            browser_skill_workspace=workspace,
+        ),
+        artifacts_root=tmp_path / "sessions",
+        browser_launch=ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=tmp_path / "fake-chrome",
+            user_data_dir=tmp_path / "profile",
+        ),
+    )
+
+    assert workspace.is_dir()
+    assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
+
+
+def test_manager_rejects_workspace_env_file(tmp_path: Path) -> None:
+    workspace = tmp_path / "browser-skill" / "agent-workspace"
+    workspace.mkdir(mode=0o700, parents=True)
+    workspace.parent.chmod(0o700)
+    (workspace / ".env").write_text("BROWSER_USE_API_KEY=must-not-load\n")
+
+    with pytest.raises(
+        BrowserConfigurationError,
+        match="Browser Use skill workspace contains an unexpected entry",
+    ):
+        ApplicationSessionManager(
+            HarnessConfig(
+                bearer_token=TOKEN,
+                browser_skill_workspace=workspace,
+            ),
+            artifacts_root=tmp_path / "sessions",
+            browser_launch=ResolvedBrowserLaunch(
+                cdp_url=None,
+                executable_path=tmp_path / "fake-chrome",
+                user_data_dir=tmp_path / "profile",
+            ),
+        )
+
+
+def test_manager_rejects_unusable_bubblewrap_without_fallback(tmp_path: Path) -> None:
+    bubblewrap = tmp_path / "broken-bwrap"
+    bubblewrap.write_text("#!/bin/sh\nexit 7\n")
+    bubblewrap.chmod(0o700)
+
+    with pytest.raises(
+        BrowserConfigurationError,
+        match="Bubblewrap namespace isolation is unavailable",
+    ):
+        ApplicationSessionManager(
+            HarnessConfig(
+                bearer_token=TOKEN,
+                bubblewrap_executable=bubblewrap,
+                browser_skill_workspace=(
+                    tmp_path / "browser-skill" / "agent-workspace"
+                ),
+            ),
+            artifacts_root=tmp_path / "sessions",
+            browser_launch=ResolvedBrowserLaunch(
+                cdp_url=None,
+                executable_path=tmp_path / "fake-chrome",
+                user_data_dir=tmp_path / "profile",
+            ),
+        )
 
 
 async def create_valid(manager: ApplicationSessionManager):

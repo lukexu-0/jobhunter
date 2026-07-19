@@ -44,6 +44,18 @@ def _parser() -> argparse.ArgumentParser:
         default=3600,
         help="absolute session lifetime in seconds (default: 3600)",
     )
+    parser.add_argument(
+        "--bubblewrap-executable",
+        type=Path,
+        default=Path("/usr/bin/bwrap"),
+        help="Bubblewrap executable (default: /usr/bin/bwrap)",
+    )
+    parser.add_argument(
+        "--browser-skill-workspace",
+        type=Path,
+        default=Path("~/.jobhunter/application/browser-skill/agent-workspace"),
+        help="persistent Browser Use helper workspace",
+    )
     launch = parser.add_mutually_exclusive_group()
     launch.add_argument(
         "--chrome-executable",
@@ -64,6 +76,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def _resolve_regular_executable(path: Path) -> Path:
+    try:
+        executable = path.expanduser().resolve(strict=True)
+    except OSError:
+        raise ValueError("The Bubblewrap executable is unavailable") from None
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError("The Bubblewrap executable is unavailable")
+    return executable
 
 
 def parse_config(
@@ -94,12 +116,17 @@ def parse_config(
             browser_values["chrome_user_data_dir"] = args.chrome_user_data_dir
 
     try:
+        bubblewrap_executable = _resolve_regular_executable(
+            args.bubblewrap_executable
+        )
         browser = BrowserLaunchConfig.model_validate(browser_values)
         config = HarnessConfig(
             bearer_token=token,
             pipeline_url=args.pipeline_url,
             port=args.port,
             session_timeout=args.session_timeout,
+            bubblewrap_executable=bubblewrap_executable,
+            browser_skill_workspace=args.browser_skill_workspace,
             browser=browser,
         )
         resolved = resolve_browser_launch(browser)

@@ -284,7 +284,11 @@ class HarnessConfig(FrozenPrivateModel):
     ]
     pipeline_url: StrictText = "http://127.0.0.1:3457"
     port: int = Field(default=8765, ge=1, le=65_535)
-    session_timeout: int = Field(default=3_600, ge=1)
+    session_timeout: int = Field(default=3_600, ge=1, le=86_400)
+    bubblewrap_executable: Path = Path("/usr/bin/bwrap")
+    browser_skill_workspace: Path = Path(
+        "~/.jobhunter/application/browser-skill/agent-workspace"
+    )
     browser: BrowserLaunchConfig = Field(default_factory=BrowserLaunchConfig)
 
     @field_validator("pipeline_url")
@@ -542,6 +546,37 @@ class SessionCreateResponse(PublicModel):
     @classmethod
     def _sanitize_endpoint_url(cls, value: str) -> str:
         return sanitize_public_url(value)
+
+
+class BrowserTab(PublicModel):
+    url: StrictText
+    title: StrictText
+    tab_id: StrictText
+    parent_tab_id: StrictText | None = None
+
+
+class BrowserScreenshot(PublicModel):
+    media_type: Literal["image/png"] = "image/png"
+    data: StrictText
+
+
+class BrowserObservation(PublicModel):
+    url: StrictText
+    title: StrictText
+    tabs: list[BrowserTab]
+    dom: Annotated[str, StringConstraints(strict=True, max_length=40_000)]
+    page_info: dict[str, object] | None
+    screenshot: BrowserScreenshot | None
+
+
+class BrowserUseExecutionResult(PublicModel):
+    exit_code: int
+    timed_out: bool
+    stdout: Annotated[str, StringConstraints(strict=True, max_length=20_000)]
+    stderr: Annotated[str, StringConstraints(strict=True, max_length=20_000)]
+    stdout_truncated: bool
+    stderr_truncated: bool
+    observation: BrowserObservation
 
 
 class ApplicationRunResult(PublicModel):

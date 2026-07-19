@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import stat
+import subprocess
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -165,6 +168,101 @@ def _redact_known_values(value: str, candidate: CandidateContext | None) -> str:
     )
 
 
+def _require_private_directory(path: Path, *, description: str) -> Path:
+    try:
+        details = path.lstat()
+    except OSError:
+        raise BrowserConfigurationError(f"The {description} is unavailable") from None
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != 0o700
+    ):
+        raise BrowserConfigurationError(f"The {description} must be a private directory")
+    return path.resolve(strict=True)
+
+
+def _prepare_skill_workspace(configured: Path) -> Path:
+    workspace = configured.expanduser().absolute()
+    parent = workspace.parent
+    try:
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        workspace.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        raise BrowserConfigurationError(
+            "The Browser Use skill workspace is unavailable"
+        ) from None
+
+    _require_private_directory(parent, description="Browser Use skill workspace parent")
+    resolved = _require_private_directory(
+        workspace, description="Browser Use skill workspace"
+    )
+    try:
+        entries = tuple(resolved.iterdir())
+        for entry in entries:
+            details = entry.lstat()
+            if details.st_uid != os.getuid() or stat.S_ISLNK(details.st_mode):
+                raise BrowserConfigurationError(
+                    "The Browser Use skill workspace contains an unsafe entry"
+                )
+            if entry.name == "agent_helpers.py" and stat.S_ISREG(details.st_mode):
+                continue
+            if entry.name == "domain-skills" and stat.S_ISDIR(details.st_mode):
+                continue
+            raise BrowserConfigurationError(
+                "The Browser Use skill workspace contains an unexpected entry"
+            )
+    except BrowserConfigurationError:
+        raise
+    except OSError:
+        raise BrowserConfigurationError(
+            "The Browser Use skill workspace is unavailable"
+        ) from None
+    return resolved
+
+
+def _probe_bubblewrap(executable: Path) -> None:
+    command = (
+        str(executable),
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--share-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--",
+        "/usr/bin/true",
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise BrowserConfigurationError(
+            "Bubblewrap namespace isolation is unavailable"
+        ) from None
+    if completed.returncode != 0:
+        raise BrowserConfigurationError(
+            "Bubblewrap namespace isolation is unavailable"
+        )
+
+
+
 class ApplicationSessionManager:
     """Own exactly one application session and a bounded terminal history."""
 
@@ -188,6 +286,10 @@ class ApplicationSessionManager:
         self._context_process_factory = context_process_factory
         self._browser_factory = browser_factory
         self._application_runner = application_runner
+        self._browser_skill_workspace = _prepare_skill_workspace(
+            config.browser_skill_workspace
+        )
+        _probe_bubblewrap(config.bubblewrap_executable)
         self._lock = asyncio.Lock()
         self._active: _ApplicationSession | None = None
         self._tombstones: OrderedDict[UUID, _Tombstone] = OrderedDict()

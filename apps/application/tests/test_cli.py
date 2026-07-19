@@ -40,6 +40,8 @@ def test_help_succeeds_without_configured_token(
     assert "--port" in captured.out
     assert "--pipeline-url" in captured.out
     assert "--session-timeout" in captured.out
+    assert "--bubblewrap-executable" in captured.out
+    assert "--browser-skill-workspace" in captured.out
     assert "--chrome-executable" in captured.out
     assert "--chrome-user-data-dir" in captured.out
     assert "--cdp-url" in captured.out
@@ -135,6 +137,30 @@ def test_valid_loopback_cdp_configuration(
     )
 
 
+def test_bubblewrap_and_skill_workspace_are_explicit_resolved_configuration(
+    tmp_path: Path,
+) -> None:
+    bubblewrap = tmp_path / "bwrap"
+    bubblewrap.write_bytes(b"fake bubblewrap executable")
+    bubblewrap.chmod(0o700)
+    workspace = tmp_path / "browser-skill" / "agent-workspace"
+
+    config, _ = cli_module.parse_config(
+        [
+            "--cdp-url",
+            LOOPBACK_CDP_URL,
+            "--bubblewrap-executable",
+            str(bubblewrap),
+            "--browser-skill-workspace",
+            str(workspace),
+        ],
+        environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
+    )
+
+    assert config.bubblewrap_executable == bubblewrap.resolve()
+    assert config.browser_skill_workspace == workspace
+
+
 @pytest.mark.parametrize(
     "cdp_url",
     [
@@ -187,6 +213,7 @@ def test_cdp_rejects_native_launch_options(conflicting_option: str) -> None:
             LOOPBACK_CDP_URL,
         ],
         ["--session-timeout", "0", "--cdp-url", LOOPBACK_CDP_URL],
+        ["--session-timeout", "86401", "--cdp-url", LOOPBACK_CDP_URL],
     ],
     ids=[
         "port-zero",
@@ -195,6 +222,7 @@ def test_cdp_rejects_native_launch_options(conflicting_option: str) -> None:
         "https-pipeline",
         "pipeline-query",
         "session-timeout-zero",
+        "session-timeout-overflow",
     ],
 )
 def test_invalid_port_pipeline_and_session_timeout_are_rejected(
