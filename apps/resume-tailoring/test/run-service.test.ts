@@ -1,0 +1,690 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import type { Database } from "bun:sqlite";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { createApiHandler } from "../src/api/handler.ts";
+import { createContextRoutes } from "../src/api/context-routes.ts";
+import { createRunRoutes } from "../src/api/run-routes.ts";
+import { RunApplicationService } from "../src/api/run-service.ts";
+import {
+  JobSourceError,
+  type JobSourceErrorCode,
+  type LoadedJobSource,
+  type LoadJobSource,
+} from "../src/api/job-source.ts";
+import { OAuthRequiredError } from "../src/auth/oauth-only-resolver.ts";
+import {
+  LunaJobExtractionError,
+  type ExtractJobDescription,
+} from "../src/models/luna-job-extractor.ts";
+import type { ContextSnapshot } from "../src/context/types.ts";
+import {
+  CONTEXT_SOURCE_ALLOWLIST,
+  REPOSITORY_ROOT,
+  checkContextFreshness,
+  createContextSnapshot,
+  loadContextManifest,
+  openContextDatabase,
+  syncContext,
+} from "../src/context/index.ts";
+import { openPipelineDatabase } from "../src/db/database.ts";
+import { PipelineRepository, type ActiveStage } from "../src/db/repository.ts";
+import type { LoadedContextManifest } from "../src/context/manifest.ts";
+import { ArtifactStore } from "../src/system/artifacts.ts";
+import { RunDtoSchema } from "../src/contracts/index.ts";
+
+const ORIGIN = "http://127.0.0.1:3456";
+const JOB_URL = "https://jobs.example.test/role";
+const JOB_DESCRIPTION = "A detailed role requiring TypeScript systems work, careful testing, ownership, and reliable delivery.";
+const fixtures: string[] = [];
+const databases: Database[] = [];
+
+afterEach(() => {
+  while (databases.length > 0) databases.pop()?.close();
+  while (fixtures.length > 0) rmSync(fixtures.pop()!, { recursive: true, force: true });
+});
+
+interface FixtureOptions {
+  readonly loadJobSource?: LoadJobSource;
+  readonly extractJobDescription?: ExtractJobDescription;
+  readonly createSnapshot?: (defaultSnapshot: () => ContextSnapshot) => ContextSnapshot | Promise<ContextSnapshot>;
+  readonly idFactory?: () => string;
+}
+
+interface Fixture {
+  readonly root: string;
+  readonly loaded: LoadedContextManifest;
+  readonly contextDatabase: Database;
+  readonly pipelineDatabase: Database;
+  readonly repository: PipelineRepository;
+  readonly artifacts: ArtifactStore;
+  readonly service: RunApplicationService;
+  readonly ids: { count: number };
+  readonly kicks: { count: number };
+}
+function fixture(options: FixtureOptions = {}): Fixture {
+  const root = mkdtempSync(join(tmpdir(), "run-application-"));
+  fixtures.push(root);
+  const manifestRelative = "apps/resume-tailoring/context-sources.json";
+  mkdirSync(dirname(join(root, manifestRelative)), { recursive: true });
+  copyFileSync(join(REPOSITORY_ROOT, manifestRelative), join(root, manifestRelative));
+  for (const relativePath of CONTEXT_SOURCE_ALLOWLIST) {
+    mkdirSync(dirname(join(root, relativePath)), { recursive: true });
+    copyFileSync(join(REPOSITORY_ROOT, relativePath), join(root, relativePath));
+  }
+  const loaded = loadContextManifest(join(root, manifestRelative), root);
+  const contextDatabase = openContextDatabase(":memory:");
+  const pipelineDatabase = openPipelineDatabase(":memory:");
+  databases.push(contextDatabase, pipelineDatabase);
+  syncContext(contextDatabase, loaded, 10);
+  let repositoryId = 0;
+  const repository = new PipelineRepository(pipelineDatabase, {
+    now: () => 100,
+    idFactory: () => `record-${++repositoryId}`,
+    attemptSessionIdFactory: () => `session-${repositoryId}`,
+    tokenFactory: () => Buffer.alloc(32, repositoryId + 1).toString("base64url"),
+  });
+  const artifacts = new ArtifactStore(join(root, "artifacts"));
+  const kicks = { count: 0 };
+  const ids = { count: 0 };
+  const service = new RunApplicationService({
+    repository,
+    context: {
+      createSnapshot: () => options.createSnapshot
+        ? options.createSnapshot(() => createContextSnapshot(contextDatabase, loaded))
+        : createContextSnapshot(contextDatabase, loaded),
+    },
+    artifacts,
+    scheduler: () => { kicks.count += 1; },
+    idFactory: () => {
+      ids.count += 1;
+      return options.idFactory?.() ?? `run-${ids.count}`;
+    },
+    loadJobSource: options.loadJobSource
+      ?? (async () => ({ kind: "description", jobDescription: JOB_DESCRIPTION })),
+    ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
+  });
+  return { root, loaded, contextDatabase, pipelineDatabase, repository, artifacts, service, kicks, ids };
+}
+interface PersistenceCounts {
+  readonly runs: number;
+  readonly revisions: number;
+  readonly snapshots: number;
+  readonly artifacts: number;
+  readonly events: number;
+}
+
+function persistenceCounts(database: Database): PersistenceCounts {
+  const count = (table: string) =>
+    database.query<{ count: number }, []>(`SELECT count(*) AS count FROM ${table}`).get()!.count;
+  return {
+    runs: count("runs"),
+    revisions: count("revisions"),
+    snapshots: count("run_source_snapshots"),
+    artifacts: count("artifacts"),
+    events: count("events"),
+  };
+}
+
+function expectNoPersistence(target: Fixture): void {
+  expect(persistenceCounts(target.pipelineDatabase)).toEqual({
+    runs: 0,
+    revisions: 0,
+    snapshots: 0,
+    artifacts: 0,
+    events: 0,
+  });
+  expect(target.ids.count).toBe(0);
+  expect(target.kicks.count).toBe(0);
+  expect(existsSync(join(target.root, "artifacts"))).toBe(false);
+}
+
+function transition(repository: PipelineRepository, claim: { runId: string; token: string }, stages: readonly ActiveStage[]): void {
+  for (const stage of stages) repository.transition(claim, stage);
+}
+
+async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1.7\nreview", visualAcknowledgementRequired = false, keywordMapBytes?: string): Promise<{ id: string; sha256: string; keywordMapId?: string }> {
+  const claim = target.repository.acquire();
+  if (!claim || claim.runId !== runId) throw new Error("claim missing");
+  const run = target.repository.getRun(runId);
+  if (!run) throw new Error(`run missing: ${runId}`);
+  const status = run.status;
+  if (status === "queued") transition(target.repository, claim, ["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
+  else if (status === "editing") transition(target.repository, claim, ["compiling", "deterministic_qa", "visual_qa"]);
+  else if (status === "compiling") transition(target.repository, claim, ["deterministic_qa", "visual_qa"]);
+  const attempt = target.repository.startAttempt(claim, "visual_qa");
+  const root = await target.artifacts.createAttempt({ run: run.queueSequence, revision: String(run.currentRevision), stage: "visual_qa", attempt: attempt.attemptNo });
+  const stored = await target.artifacts.write(join(root, "resume.pdf"), bytes, 10 * 1024 * 1024);
+  const artifact = target.repository.finalizeArtifact(claim, {
+    attemptId: attempt.id,
+    stage: "visual_qa",
+    kind: "compiled-pdf",
+    sha256: stored.sha256,
+    path: stored.path,
+    byteSize: stored.bytes,
+  });
+  let keywordMapId: string | undefined;
+  if (keywordMapBytes !== undefined) {
+    const map = await target.artifacts.write(join(root, "keyword-map.pdf"), keywordMapBytes, 10 * 1024 * 1024);
+    keywordMapId = target.repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "keyword-map-pdf",
+      sha256: map.sha256,
+      path: map.path,
+      byteSize: map.bytes,
+      sourceArtifactId: artifact.id,
+    }).id;
+  }
+  target.repository.finishAttempt(claim, attempt.id, "succeeded");
+  target.repository.transition(claim, "review", { visualAcknowledgementRequired });
+  target.repository.release(claim);
+  return { id: artifact.id, sha256: artifact.sha256, ...(keywordMapId ? { keywordMapId } : {}) };
+}
+
+function post(body: unknown): RequestInit {
+  return { method: "POST", headers: { origin: ORIGIN, "content-type": "application/json" }, body: JSON.stringify(body) };
+}
+
+describe("RunApplicationService", () => {
+  test("creates a runnable run with one atomic four-source snapshot and immutable queued input", async () => {
+    const target = fixture();
+    const jobDescription = JOB_DESCRIPTION;
+    const run = await target.service.createRun(JOB_URL);
+
+    expect(run).toMatchObject({ id: "run-1", status: "queued", revision: 1, origin: "initial" });
+    expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(true);
+    const disabled = await target.service.createRun(JOB_URL, false);
+    expect(target.repository.getRun(disabled.id)?.generateKeywordMap).toBe(false);
+    expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(4);
+    const input = target.repository.getArtifact(run.id, "job-description");
+    expect(input).not.toBeNull();
+    expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
+    expect(target.repository.acquire()?.runId).toBe(run.id);
+  });
+  test("uses sanitized fallback lines and persists only the exact reconstructed description", async () => {
+    const controller = new AbortController();
+    const lines = [
+      "Senior Platform Engineer",
+      "Example Systems",
+      "Own reliable TypeScript services and production delivery.",
+    ] as const;
+    const selected = `${lines[0]}\n\n${lines[2]}`;
+    const observed: {
+      loader?: { jobUrl: string; signal: AbortSignal | undefined };
+      extractor?: { lines: readonly string[]; signal: AbortSignal | undefined };
+    } = {};
+    const target = fixture({
+      loadJobSource: async (jobUrl, signal) => {
+        observed.loader = { jobUrl, signal };
+        return { kind: "model-fallback", lines };
+      },
+      extractJobDescription: async (sourceLines, signal) => {
+        observed.extractor = { lines: sourceLines, signal };
+        return selected;
+      },
+    });
+
+    const run = await target.service.createRun(JOB_URL, controller.signal);
+
+    expect(observed).toEqual({
+      loader: { jobUrl: JOB_URL, signal: controller.signal },
+      extractor: { lines, signal: controller.signal },
+    });
+    const input = target.repository.getArtifact(run.id, "job-description")!;
+    expect(Buffer.from(await target.artifacts.read(input.path, input.byteSize)).toString("utf8")).toBe(selected);
+    expect(target.pipelineDatabase.query<{ job_description: string }, [string]>(
+      "SELECT job_description FROM runs WHERE id = ?",
+    ).get(run.id)?.job_description).toBe(selected);
+    expect(JSON.stringify(run)).not.toContain(JOB_URL);
+  });
+
+  test("bubbles loader failures and maps only fixed fallback failures before persistence", async () => {
+    for (const code of [
+      "JOB_URL_BLOCKED",
+      "JOB_SOURCE_UNAVAILABLE",
+      "JOB_SOURCE_UNSUPPORTED",
+      "JOB_SOURCE_TOO_LARGE",
+      "JOB_DESCRIPTION_UNAVAILABLE",
+    ] satisfies readonly JobSourceErrorCode[]) {
+      const sourceError = new JobSourceError(code);
+      const sourceTarget = fixture({
+        loadJobSource: async () => { throw sourceError; },
+      });
+      await expect(sourceTarget.service.createRun(JOB_URL)).rejects.toBe(sourceError);
+      expectNoPersistence(sourceTarget);
+    }
+    const nullTarget = fixture({
+      loadJobSource: async () => ({ kind: "model-fallback", lines: ["safe source"] }),
+      extractJobDescription: async () => null,
+    });
+    await expect(nullTarget.service.createRun(JOB_URL)).rejects.toMatchObject({
+      code: "JOB_DESCRIPTION_UNAVAILABLE",
+      status: 422,
+      message: "The page does not contain a usable job description",
+    });
+    expectNoPersistence(nullTarget);
+
+    for (const failure of [
+      {
+        error: new OAuthRequiredError("openai-codex"),
+        expected: {
+          code: "JOB_EXTRACTION_AUTH_REQUIRED",
+          status: 409,
+          message: "Connect OpenAI Codex OAuth before importing this job page",
+        },
+      },
+      {
+        error: new LunaJobExtractionError("timeout", "private timeout detail"),
+        expected: {
+          code: "JOB_EXTRACTION_TIMEOUT",
+          status: 504,
+          message: "Job description extraction timed out",
+        },
+      },
+      {
+        error: new LunaJobExtractionError("unavailable", "private model detail"),
+        expected: {
+          code: "JOB_EXTRACTION_UNAVAILABLE",
+          status: 502,
+          message: "Job description extraction failed",
+        },
+      },
+    ]) {
+      const target = fixture({
+        loadJobSource: async () => ({ kind: "model-fallback", lines: ["safe source"] }),
+        extractJobDescription: async () => { throw failure.error; },
+      });
+      await expect(target.service.createRun(JOB_URL)).rejects.toMatchObject(failure.expected);
+      expectNoPersistence(target);
+    }
+
+    const programmingError = new Error("unexpected extractor bug");
+    const programmingTarget = fixture({
+      loadJobSource: async () => ({ kind: "model-fallback", lines: ["safe source"] }),
+      extractJobDescription: async () => { throw programmingError; },
+    });
+    await expect(programmingTarget.service.createRun(JOB_URL)).rejects.toBe(programmingError);
+    expectNoPersistence(programmingTarget);
+  });
+
+  test("revalidates and outer-trims every final description before the commit point", async () => {
+    const padded = `  ${JOB_DESCRIPTION}  `;
+    const validTarget = fixture({
+      loadJobSource: async () => ({ kind: "description", jobDescription: padded }),
+    });
+    const validRun = await validTarget.service.createRun(JOB_URL);
+    const input = validTarget.repository.getArtifact(validRun.id, "job-description")!;
+    expect(Buffer.from(
+      await validTarget.artifacts.read(input.path, input.byteSize),
+    ).toString("utf8")).toBe(JOB_DESCRIPTION);
+
+    for (const invalidDescription of ["too short", "x".repeat(50_001)]) {
+      const invalidTarget = fixture({
+        loadJobSource: async () => ({
+          kind: "description",
+          jobDescription: invalidDescription,
+        }),
+      });
+      await expect(invalidTarget.service.createRun(JOB_URL)).rejects.toMatchObject({
+        name: "ZodError",
+      });
+      expectNoPersistence(invalidTarget);
+    }
+  });
+
+  test("preserves abort reasons and allocates nothing at every pre-commit cancellation boundary", async () => {
+    const beforeLoadController = new AbortController();
+    const beforeLoadReason = new Error("cancelled before loading");
+    beforeLoadController.abort(beforeLoadReason);
+    let loadCalls = 0;
+    const beforeLoadTarget = fixture({
+      loadJobSource: async () => {
+        loadCalls += 1;
+        return { kind: "description", jobDescription: JOB_DESCRIPTION };
+      },
+    });
+    await expect(beforeLoadTarget.service.createRun(JOB_URL, beforeLoadController.signal)).rejects.toBe(beforeLoadReason);
+    expect(loadCalls).toBe(0);
+    expectNoPersistence(beforeLoadTarget);
+
+    const loading = Promise.withResolvers<LoadedJobSource>();
+    const loadingController = new AbortController();
+    const loadingReason = new Error("cancelled while loading");
+    let loaderSignal: AbortSignal | undefined;
+    const loadingTarget = fixture({
+      loadJobSource: (_jobUrl, signal) => {
+        loaderSignal = signal;
+        return loading.promise;
+      },
+    });
+    const loadingRun = loadingTarget.service.createRun(JOB_URL, loadingController.signal);
+    expect(loaderSignal).toBe(loadingController.signal);
+    loadingController.abort(loadingReason);
+    loading.resolve({ kind: "description", jobDescription: JOB_DESCRIPTION });
+    await expect(loadingRun).rejects.toBe(loadingReason);
+    expectNoPersistence(loadingTarget);
+
+    const extracting = Promise.withResolvers<string | null>();
+    const extractorStarted = Promise.withResolvers<void>();
+    const extractingController = new AbortController();
+    const extractingReason = new Error("cancelled while extracting");
+    let extractorSignal: AbortSignal | undefined;
+    const extractingTarget = fixture({
+      loadJobSource: async () => ({ kind: "model-fallback", lines: ["bounded", "visible", "source"] }),
+      extractJobDescription: (_lines, signal) => {
+        extractorSignal = signal;
+        extractorStarted.resolve();
+        return extracting.promise;
+      },
+    });
+    const extractingRun = extractingTarget.service.createRun(JOB_URL, extractingController.signal);
+    await extractorStarted.promise;
+    expect(extractorSignal).toBe(extractingController.signal);
+    extractingController.abort(extractingReason);
+    extracting.resolve(JOB_DESCRIPTION);
+    await expect(extractingRun).rejects.toBe(extractingReason);
+    expectNoPersistence(extractingTarget);
+
+    const snapshot = Promise.withResolvers<ContextSnapshot>();
+    const snapshotStarted = Promise.withResolvers<void>();
+    const snapshotController = new AbortController();
+    const snapshotReason = new Error("cancelled while snapshotting");
+    let resolvedSnapshot: ContextSnapshot | undefined;
+    const snapshotTarget = fixture({
+      createSnapshot: (defaultSnapshot) => {
+        resolvedSnapshot = defaultSnapshot();
+        snapshotStarted.resolve();
+        return snapshot.promise;
+      },
+    });
+    const snapshotRun = snapshotTarget.service.createRun(JOB_URL, snapshotController.signal);
+    await snapshotStarted.promise;
+    snapshotController.abort(snapshotReason);
+    snapshot.resolve(resolvedSnapshot!);
+    await expect(snapshotRun).rejects.toBe(snapshotReason);
+    expectNoPersistence(snapshotTarget);
+
+    const afterSnapshotController = new AbortController();
+    const afterSnapshotReason = new Error("cancelled immediately after snapshot");
+    const afterSnapshotTarget = fixture({
+      createSnapshot: (defaultSnapshot) => {
+        const value = defaultSnapshot();
+        afterSnapshotController.abort(afterSnapshotReason);
+        return value;
+      },
+    });
+    await expect(
+      afterSnapshotTarget.service.createRun(JOB_URL, afterSnapshotController.signal),
+    ).rejects.toBe(afterSnapshotReason);
+    expectNoPersistence(afterSnapshotTarget);
+  });
+
+  test("ignores a late request abort after the snapshot commit point and completes the queued run", async () => {
+    const controller = new AbortController();
+    const lateReason = new Error("late disconnect");
+    const target = fixture({
+      idFactory: () => {
+        controller.abort(lateReason);
+        return "run-late";
+      },
+    });
+    const route = createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target.service) });
+    const request = new Request("http://127.0.0.1:3457/v1/runs", {
+      ...post({ jobUrl: JOB_URL }),
+      signal: controller.signal,
+    });
+
+    const response = await route(request);
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ id: "run-late", status: "queued", revision: 1 });
+    expect(request.signal.aborted).toBe(true);
+    expect(request.signal.reason).toBe(lateReason);
+    expect(target.ids.count).toBe(1);
+    expect(target.kicks.count).toBe(1);
+    expect(persistenceCounts(target.pipelineDatabase)).toEqual({
+      runs: 1,
+      revisions: 1,
+      snapshots: 1,
+      artifacts: 1,
+      events: 3,
+    });
+    const input = target.repository.getArtifact("run-late", "job-description")!;
+    expect(Buffer.from(await target.artifacts.read(input.path, input.byteSize)).toString("utf8")).toBe(JOB_DESCRIPTION);
+    expect(target.repository.getRun("run-late")).toMatchObject({
+      id: "run-late",
+      status: "queued",
+      jobDescription: JOB_DESCRIPTION,
+    });
+  });
+
+  test("updates application status independently and rejects a missing run", async () => {
+    const target = fixture();
+    const created = await target.service.createRun(JOB_URL);
+    expect(created).toMatchObject({ applicationStatus: "applied", status: "queued" });
+
+    const updated = await target.service.updateApplicationStatus(created.id, "accepted");
+
+    expect(updated).toMatchObject({ applicationStatus: "accepted", status: "queued" });
+    await expect(target.service.getRun(created.id)).resolves.toMatchObject({ applicationStatus: "accepted", status: "queued" });
+    await expect(target.service.updateApplicationStatus("run-missing", "failed")).rejects.toMatchObject({
+      code: "RUN_NOT_FOUND",
+      status: 404,
+    });
+  });
+
+  test("maps attempts, retry ancestry and inherited artifacts without exposing internal tokens, paths or logs", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    const claim = target.repository.acquire()!;
+    target.repository.transition(claim, "analyzing");
+    const analysisAttempt = target.repository.startAttempt(claim, "analyzing");
+    const analysisRoot = await target.artifacts.createAttempt({ run: target.repository.getRun(run.id)!.queueSequence, revision: "1", stage: "analyzing", attempt: 1 });
+    const analysis = await target.artifacts.write(join(analysisRoot, "analysis.json"), "{}", 1024);
+    const analysisArtifact = target.repository.finalizeArtifact(claim, {
+      attemptId: analysisAttempt.id,
+      stage: "analyzing",
+      kind: "job-analysis",
+      sha256: analysis.sha256,
+      path: analysis.path,
+      byteSize: analysis.bytes,
+    });
+    target.repository.finishAttempt(claim, analysisAttempt.id, "succeeded", { toolCount: 1 });
+    transition(target.repository, claim, ["tailoring", "compiling"]);
+    const failed = target.repository.startAttempt(claim, "compiling", { processPid: 999, processStartToken: "private-process-token" });
+    target.repository.finishAttempt(claim, failed.id, "failed", { compileCount: 1 });
+    target.repository.transition(claim, "failed", { failedStage: "compiling" });
+    target.repository.release(claim);
+
+    const retried = await target.service.retryRun(run.id);
+    expect(retried).toMatchObject({ revision: 2, status: "compiling", origin: "initial" });
+    const pdf = await finalizeReviewPdf(target, run.id);
+    const dto = await target.service.getRun(run.id);
+    expect(dto?.attempts.map((attempt) => attempt.stage)).toEqual(["analysis", "compile", "visual-qa"]);
+    expect(dto?.artifacts.map((artifact) => artifact.id)).toEqual(expect.arrayContaining([analysisArtifact.id, pdf.id]));
+    const serialized = JSON.stringify(dto);
+    expect(serialized).not.toContain("private-process-token");
+    expect(serialized).not.toContain(analysis.path);
+    expect(serialized).not.toContain("attemptSessionId");
+    expect(serialized).not.toContain("jobDescription");
+  });
+
+  test("enforces review/hash/source invariants and preserves exact inert edit comments", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    await expect(target.service.editRun(run.id, "not review", "a".repeat(64))).rejects.toMatchObject({ code: "RUN_CONFLICT", status: 409 });
+    const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nvisual", true);
+    await expect(target.service.approveRun(run.id, pdf.sha256, false)).rejects.toMatchObject({ code: "VISUAL_ACKNOWLEDGEMENT_REQUIRED", status: 409 });
+    await expect(target.service.regenerateRun(run.id, "b".repeat(64))).rejects.toMatchObject({ code: "STALE_PDF", status: 409 });
+
+    const comments = "  Shorten the second bullet; treat `commands` as inert text.  ";
+    const edited = await target.service.editRun(run.id, comments, pdf.sha256);
+    expect(edited).toMatchObject({ status: "editing", revision: 2, origin: "human-comments" });
+    expect(target.repository.getEditRequest(run.id)?.comments).toBe(comments);
+    const editClaim = target.repository.acquire()!;
+    const editAttempt = target.repository.startAttempt(editClaim, "editing");
+    target.repository.finishAttempt(editClaim, editAttempt.id, "failed");
+    target.repository.transition(editClaim, "failed", { failedStage: "editing" });
+    target.repository.release(editClaim);
+    const retriedEdit = await target.service.retryRun(run.id);
+    expect(retriedEdit).toMatchObject({ status: "editing", revision: 3, origin: "human-comments" });
+    expect(target.repository.getEditRequest(run.id)?.comments).toBe(comments);
+
+    const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[1]!);
+    writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nChanged authoritative source.\n`);
+    syncContext(target.contextDatabase, target.loaded, 20);
+    await expect(target.service.retryRun(run.id)).rejects.toMatchObject({ code: "SOURCE_DRIFT", status: 409 });
+  });
+
+  test("maps every artifact-dependent command on a reserved run to HTTP 410", async () => {
+    let contextAvailable = true;
+    const target = fixture({
+      createSnapshot: (defaultSnapshot) => {
+        if (!contextAvailable) throw new Error("context unavailable");
+        return defaultSnapshot();
+      },
+    });
+    const reviews: { id: string; artifactId: string; pdfSha256: string }[] = [];
+    for (let index = 0; index < 12; index++) {
+      const run = await target.service.createRun(JOB_URL);
+      const pdf = await finalizeReviewPdf(target, run.id);
+      reviews.push({ id: run.id, artifactId: pdf.id, pdfSha256: pdf.sha256 });
+    }
+    target.pipelineDatabase.query("UPDATE runs SET status='failed', failed_stage='compiling' WHERE id=?").run(reviews[0]!.id);
+    expect(target.repository.reserveArtifactPruneCandidates(10)).toEqual([reviews[0]!.id, reviews[1]!.id]);
+    const prunedDto = await target.service.getRun(reviews[1]!.id);
+    expect(prunedDto).toMatchObject({
+      status: "review",
+      applicationStatus: "applied",
+      artifacts: [],
+    });
+    expect(prunedDto).not.toHaveProperty("currentPdfSha256");
+    expect(prunedDto!.attempts.length).toBeGreaterThan(0);
+    expect(prunedDto!.timeline.length).toBeGreaterThan(0);
+    await expect(target.service.updateApplicationStatus(reviews[1]!.id, "interview")).resolves.toMatchObject({
+      status: "review",
+      applicationStatus: "interview",
+      artifacts: [],
+    });
+    contextAvailable = false;
+    const expected = {
+      code: "RUN_ARTIFACTS_PRUNED",
+      message: "Run artifacts were removed by the ten-run retention policy",
+      status: 410,
+    };
+
+    await expect(target.service.retryRun(reviews[0]!.id)).rejects.toMatchObject(expected);
+    await expect(target.service.regenerateRun(reviews[1]!.id, reviews[1]!.pdfSha256)).rejects.toMatchObject(expected);
+    await expect(target.service.editRun(reviews[1]!.id, "change layout", reviews[1]!.pdfSha256)).rejects.toMatchObject(expected);
+    await expect(target.service.approveRun(reviews[1]!.id, reviews[1]!.pdfSha256, false)).rejects.toMatchObject(expected);
+    await expect(target.service.getArtifact(reviews[1]!.id, reviews[1]!.artifactId)).rejects.toMatchObject(expected);
+  });
+  test("translates a download race with a new pruning reservation to HTTP 410", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    const pdf = await finalizeReviewPdf(target, run.id);
+    target.artifacts.read = async () => {
+      target.pipelineDatabase.query(`
+        INSERT INTO run_artifact_retention(run_id, state, selected_at)
+        VALUES (?, 'pruning', 100)
+      `).run(run.id);
+      throw Object.assign(new Error("artifact disappeared"), { code: "ENOENT" });
+    };
+
+    await expect(target.service.getArtifact(run.id, pdf.id)).rejects.toMatchObject({
+      code: "RUN_ARTIFACTS_PRUNED",
+      message: "Run artifacts were removed by the ten-run retention policy",
+      status: 410,
+    });
+  });
+
+
+  test("serves public compiled and keyword-map PDFs with verified immutable download metadata", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL, true);
+    const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nreview", false, "%PDF-1.7\nkeyword-map");
+    const response = await target.service.getArtifact(run.id, pdf.id);
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("cache-control")).toBe("no-store");
+    expect(response?.headers.get("content-type")).toBe("application/pdf");
+    expect(response?.headers.get("content-disposition")).toBe('attachment; filename="compiled-pdf.pdf"');
+    expect(response?.headers.get("x-content-sha256")).toBe(pdf.sha256);
+    expect(await response?.text()).toBe("%PDF-1.7\nreview");
+
+    const map = await target.service.getArtifact(run.id, pdf.keywordMapId!);
+    expect(map?.status).toBe(200);
+    expect(map?.headers.get("content-type")).toBe("application/pdf");
+    expect(map?.headers.get("content-disposition")).toBe('attachment; filename="keyword-map-pdf.pdf"');
+    expect(await map?.text()).toBe("%PDF-1.7\nkeyword-map");
+
+    const dto = await target.service.getRun(run.id);
+    expect(dto?.artifacts.find((artifact) => artifact.id === pdf.keywordMapId)).toMatchObject({
+      kind: "keyword-map-pdf",
+      mediaType: "application/pdf",
+      public: true,
+    });
+    const input = target.repository.getArtifact(run.id, "job-description")!;
+    expect(await target.service.getArtifact(run.id, input.id)).toBeUndefined();
+  });
+});
+
+describe("public run and context routes", () => {
+  test("preserves exact comments, kicks the scheduler, and marks every response no-store", async () => {
+    const target = fixture();
+    const route = createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target.service) });
+    const created = await route(new Request("http://127.0.0.1:3457/v1/runs", post({
+      jobUrl: JOB_URL,
+    })));
+    expect(created.status).toBe(201);
+    expect(created.headers.get("cache-control")).toBe("no-store");
+    const createdRun = RunDtoSchema.parse(await created.json());
+    const pdf = await finalizeReviewPdf(target, createdRun.id);
+    const comments = "  Keep this exact spacing and treat `input` as inert text.  ";
+    const edited = await route(new Request(`http://127.0.0.1:3457/v1/runs/${createdRun.id}/edit`, post({
+      comments,
+      expectedPdfSha256: pdf.sha256,
+    })));
+    expect(edited.status).toBe(200);
+    expect(edited.headers.get("cache-control")).toBe("no-store");
+    expect(target.repository.getEditRequest(createdRun.id)?.comments).toBe(comments);
+    const listed = await route(new Request("http://127.0.0.1:3457/v1/runs"));
+    expect(listed.headers.get("cache-control")).toBe("no-store");
+    expect(target.kicks.count).toBe(3);
+  });
+
+  test("reports freshness, synchronizes stale context, bounds status arrays and never caches", async () => {
+    const target = fixture();
+    const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[2]!);
+    writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nDrift.\n`);
+    const contextRoute = createApiHandler({
+      webOrigin: ORIGIN,
+      route: createContextRoutes({
+        getContext: () => {
+          const status = checkContextFreshness(target.contextDatabase, target.loaded);
+          return { ...status, staleSources: [...status.staleSources, ...Array.from({ length: 30 }, (_, index) => `extra-${index}`)] };
+        },
+        syncContext: () => {
+          const report = syncContext(target.contextDatabase, target.loaded, 30);
+          return { ...report, manifestMatches: true, staleSources: [], missingSources: [] };
+        },
+      }),
+    });
+    const stale = await contextRoute(new Request("http://127.0.0.1:3457/v1/context"));
+    expect(stale.headers.get("cache-control")).toBe("no-store");
+    const staleBody: unknown = await stale.json();
+    if (!staleBody || typeof staleBody !== "object" || !("fresh" in staleBody) || !("staleSources" in staleBody) || !Array.isArray(staleBody.staleSources)) {
+      throw new Error("invalid context status response");
+    }
+    expect(staleBody.fresh).toBeFalse();
+    expect(staleBody.staleSources).toHaveLength(20);
+
+    const synced = await contextRoute(new Request("http://127.0.0.1:3457/v1/context/sync", post({})));
+    expect(synced.status).toBe(200);
+    expect(synced.headers.get("cache-control")).toBe("no-store");
+    const syncedBody: unknown = await synced.json();
+    if (!syncedBody || typeof syncedBody !== "object" || !("fresh" in syncedBody)) throw new Error("invalid context sync response");
+    expect(syncedBody.fresh).toBeTrue();
+  });
+});

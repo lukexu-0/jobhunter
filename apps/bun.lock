@@ -5,7 +5,7 @@
     "": {
       "name": "@jobhunter/apps",
     },
-    "pipeline": {
+    "resume-tailoring": {
       "name": "@jobhunter/pipeline",
       "version": "0.1.0",
       "dependencies": {

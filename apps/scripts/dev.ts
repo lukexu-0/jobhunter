@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 
 const appsRoot = resolve(import.meta.dir, "..");
-const pipeline = Bun.spawn(["bun", "run", "--cwd", "pipeline", "dev"], {
+const pipeline = Bun.spawn(["bun", "run", "--cwd", "resume-tailoring", "dev"], {
   cwd: appsRoot,
   stdin: "inherit",
   stdout: "inherit",
