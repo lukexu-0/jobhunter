@@ -102,7 +102,7 @@ describe("persisted workflow commands", () => {
     const { db, repo, tick, now } = fixture();
     expect(repo.createRun("Default JD", "default-setting").generateKeywordMap).toBe(true);
     const created = repo.createRun("JD", "enabled-setting", true);
-    expect(created).toMatchObject({ applicationStatus: "applied", generateKeywordMap: true });
+    expect(created).toMatchObject({ applicationStatus: "pending", generateKeywordMap: true });
     const eventCount = repo.timeline(created.id).events.length;
 
     tick(1_000);

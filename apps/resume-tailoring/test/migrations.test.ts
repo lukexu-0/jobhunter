@@ -129,10 +129,31 @@ function versionSixDatabase(): Database {
   `);
   return db;
 }
+function versionSevenDatabase(): Database {
+  const db = new Database(":memory:");
+  databases.push(db);
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      application_status TEXT NOT NULL DEFAULT 'applied'
+        CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed'))
+    ) STRICT;
+    INSERT INTO runs(id) VALUES ('existing-run');
+    INSERT INTO schema_migrations(version, applied_at)
+      VALUES (1, 1000), (2, 1100), (3, 1200), (6, 1300), (7, 1400);
+    PRAGMA user_version = 7;
+  `);
+  return db;
+}
 
 
 
-test("fresh databases accept pending while retaining applied as the default", () => {
+
+test("fresh databases default to pending while accepting applied", () => {
   const db = new Database(":memory:");
   databases.push(db);
 
@@ -140,22 +161,40 @@ test("fresh databases accept pending while retaining applied as the default", ()
   db.exec(`
     INSERT INTO runs(
       id, job_description, status, application_status, queue_sequence, created_at, updated_at
-    ) VALUES ('pending-run', 'pending job description', 'queued', 'pending', 1, 2000, 2000);
+    ) VALUES ('applied-run', 'applied job description', 'queued', 'applied', 1, 2000, 2000);
     INSERT INTO runs(
       id, job_description, status, queue_sequence, created_at, updated_at
     ) VALUES ('default-run', 'default job description', 'queued', 2, 2000, 2000);
   `);
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(7);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
   expect(db.query<{ application_status: string }, []>(
     "SELECT application_status FROM runs ORDER BY queue_sequence",
   ).all()).toEqual([
-    { application_status: "pending" },
     { application_status: "applied" },
+    { application_status: "pending" },
   ]);
   expect(() => db.query(
-    "UPDATE runs SET application_status = 'queued' WHERE id = 'pending-run'",
+    "UPDATE runs SET application_status = 'queued' WHERE id = 'default-run'",
   ).run()).toThrow();
+});
+
+test("migrates version seven defaults without changing existing statuses", () => {
+  const db = versionSevenDatabase();
+
+  migratePipelineDatabase(db, 2_000);
+  db.exec("INSERT INTO runs(id) VALUES ('new-run')");
+
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
+  expect(db.query<{ version: number }, []>(
+    "SELECT version FROM schema_migrations ORDER BY version",
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8]);
+  expect(db.query<{ id: string; application_status: string }, []>(
+    "SELECT id, application_status FROM runs ORDER BY id",
+  ).all()).toEqual([
+    { id: "existing-run", application_status: "applied" },
+    { id: "new-run", application_status: "pending" },
+  ]);
 });
 
 test("migrates version six runs without breaking data, foreign keys, indexes, or history", () => {
@@ -163,7 +202,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
 
   migratePipelineDatabase(db, 2_000);
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(7);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
   expect(db.query<{ version: number; applied_at: number }, []>(
     "SELECT version, applied_at FROM schema_migrations ORDER BY version",
   ).all()).toEqual([
@@ -172,6 +211,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 3, applied_at: 1200 },
     { version: 6, applied_at: 1300 },
     { version: 7, applied_at: 2000 },
+    { version: 8, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -212,8 +252,8 @@ test("migrates existing runs to application status applied atomically", () => {
 
   migratePipelineDatabase(migrated, 2_000);
 
-  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(7);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7]);
+  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8]);
   expect(migrated.query<{ application_status: string; generate_keyword_map: number }, []>("SELECT application_status, generate_keyword_map FROM runs WHERE id = 'run-1'").get()).toEqual({ application_status: "applied", generate_keyword_map: 0 });
 
   const rolledBack = versionOneDatabase({ includesApplicationStatus: true });
@@ -228,8 +268,8 @@ test("migrates version two retention state atomically without changing history",
 
   migratePipelineDatabase(migrated, 2_000);
 
-  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(7);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7]);
+  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

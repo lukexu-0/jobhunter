@@ -463,7 +463,7 @@ describe("RunApplicationService", () => {
   test("updates application status independently and rejects a missing run", async () => {
     const target = fixture();
     const created = await target.service.createRun(JOB_URL);
-    expect(created).toMatchObject({ applicationStatus: "applied", status: "queued" });
+    expect(created).toMatchObject({ applicationStatus: "pending", status: "queued" });
 
     const updated = await target.service.updateApplicationStatus(created.id, "accepted");
 
@@ -557,7 +557,7 @@ describe("RunApplicationService", () => {
     const prunedDto = await target.service.getRun(reviews[1]!.id);
     expect(prunedDto).toMatchObject({
       status: "review",
-      applicationStatus: "applied",
+      applicationStatus: "pending",
       artifacts: [],
     });
     expect(prunedDto).not.toHaveProperty("currentPdfSha256");

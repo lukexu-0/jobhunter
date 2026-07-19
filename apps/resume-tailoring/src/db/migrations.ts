@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const PIPELINE_SCHEMA_VERSION = 7;
+export const PIPELINE_SCHEMA_VERSION = 8;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -151,17 +151,9 @@ ALTER TABLE runs ADD COLUMN generate_keyword_map INTEGER NOT NULL DEFAULT 0
   CHECK (generate_keyword_map IN (0,1));
 `;
 
-const previousApplicationStatusCheck =
-  /CHECK\s*\(\s*application_status\s+IN\s*\(\s*'applied'\s*,\s*'rejected'\s*,\s*'interview'\s*,\s*'accepted'\s*,\s*'failed'\s*\)\s*\)/i;
+const runsTableDeclaration = /^CREATE TABLE\s+(?:"runs"|runs)(?=\s*\()/i;
 
-function migrateApplicationStatusPending(db: Database): void {
-  const runsSql = db.query<{ sql: string | null }, []>(
-    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
-  ).get()?.sql;
-  if (!runsSql || !previousApplicationStatusCheck.test(runsSql) || !/^CREATE TABLE runs\b/i.test(runsSql)) {
-    throw new Error("runs application_status constraint does not match schema version 6");
-  }
-
+function replaceRunsTable(db: Database, upgradedRunsSql: string): void {
   const dependentObjects = db.query<{ sql: string }, []>(`
     SELECT sql
     FROM sqlite_schema
@@ -170,12 +162,6 @@ function migrateApplicationStatusPending(db: Database): void {
       AND sql IS NOT NULL
     ORDER BY type, name
   `).all();
-  const upgradedRunsSql = runsSql
-    .replace(/^CREATE TABLE runs\b/i, "CREATE TABLE runs_pending_migration")
-    .replace(
-      previousApplicationStatusCheck,
-      "CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed'))",
-    );
 
   db.exec(upgradedRunsSql);
   db.exec("INSERT INTO runs_pending_migration SELECT * FROM runs");
@@ -185,6 +171,53 @@ function migrateApplicationStatusPending(db: Database): void {
 
   const foreignKeyFailures = db.query<{ table: string }, []>("PRAGMA foreign_key_check").all();
   if (foreignKeyFailures.length > 0) throw new Error("foreign key integrity check failed after runs migration");
+}
+
+const previousApplicationStatusCheck =
+  /CHECK\s*\(\s*application_status\s+IN\s*\(\s*'applied'\s*,\s*'rejected'\s*,\s*'interview'\s*,\s*'accepted'\s*,\s*'failed'\s*\)\s*\)/i;
+
+function migrateApplicationStatusPending(db: Database): void {
+  const runsSql = db.query<{ sql: string | null }, []>(
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+  ).get()?.sql;
+  if (!runsSql || !previousApplicationStatusCheck.test(runsSql) || !runsTableDeclaration.test(runsSql)) {
+    throw new Error("runs application_status constraint does not match schema version 6");
+  }
+
+  const upgradedRunsSql = runsSql
+    .replace(runsTableDeclaration, "CREATE TABLE runs_pending_migration")
+    .replace(
+      previousApplicationStatusCheck,
+      "CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed'))",
+    );
+  replaceRunsTable(db, upgradedRunsSql);
+}
+
+const currentApplicationStatusCheck =
+  /CHECK\s*\(\s*application_status\s+IN\s*\(\s*'pending'\s*,\s*'applied'\s*,\s*'rejected'\s*,\s*'interview'\s*,\s*'accepted'\s*,\s*'failed'\s*\)\s*\)/i;
+const appliedApplicationStatusDefault =
+  /application_status\s+TEXT\s+NOT\s+NULL\s+DEFAULT\s+'applied'/i;
+
+function migrateApplicationStatusDefaultPending(db: Database): void {
+  const runsSql = db.query<{ sql: string | null }, []>(
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+  ).get()?.sql;
+  if (
+    !runsSql
+    || !currentApplicationStatusCheck.test(runsSql)
+    || !appliedApplicationStatusDefault.test(runsSql)
+    || !runsTableDeclaration.test(runsSql)
+  ) {
+    throw new Error("runs application_status default does not match schema version 7");
+  }
+
+  const upgradedRunsSql = runsSql
+    .replace(runsTableDeclaration, "CREATE TABLE runs_pending_migration")
+    .replace(
+      appliedApplicationStatusDefault,
+      "application_status TEXT NOT NULL DEFAULT 'pending'",
+    );
+  replaceRunsTable(db, upgradedRunsSql);
 }
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
@@ -217,6 +250,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 7) {
         migrateApplicationStatusPending(db);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(7, now);
+      }
+      if (version < 8) {
+        migrateApplicationStatusDefaultPending(db);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(8, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");
