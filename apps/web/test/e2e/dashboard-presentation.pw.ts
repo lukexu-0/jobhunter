@@ -310,6 +310,37 @@ test("uses the shared lifecycle order and presents one named row link with a vis
   await expect(arrow).toHaveCSS("text-shadow", "none");
 });
 
+test("keeps the row arrow fully visible while hovering a populated application", async ({ page }) => {
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [runFixture()] }),
+    });
+  });
+  await page.setViewportSize({ width: 1_280, height: 900 });
+  await page.goto("/");
+
+  const scroller = page.locator(".applications-table-scroll");
+  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const row = page.getByRole("row").filter({ has: rowStatus });
+  const arrow = row.locator(".row-arrow");
+
+  await expect(row).toBeVisible();
+  await expect(arrow).toBeVisible();
+  await row.hover();
+  await arrow.evaluate(async (element) => {
+    await Promise.all(element.getAnimations().map((animation) => animation.finished));
+  });
+
+  const scrollerBox = await scroller.boundingBox();
+  const arrowBox = await arrow.boundingBox();
+  if (!scrollerBox || !arrowBox) throw new Error("Hovered application row geometry is unavailable");
+
+  expect(arrowBox.x + arrowBox.width, "Hovered row arrow should remain fully visible").toBeLessThanOrEqual(
+    scrollerBox.x + scrollerBox.width + 1,
+  );
+});
+
 test("opens a run from a non-interactive cell without letting the status selector navigate", async ({ page }) => {
   const run = runFixture();
   let patchCount = 0;

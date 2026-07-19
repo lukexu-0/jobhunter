@@ -663,12 +663,11 @@ test("hides internal run and attempt metadata from the viewer", async ({ page })
   await expect(page.getByText("attempt-id-must-be-hidden", { exact: false })).toHaveCount(0);
   await expect(page.getByText("ToolCount", { exact: true })).toHaveCount(0);
   await expect(page.getByText("CompileCount", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("region", { name: "Run timeline" }).getByRole("listitem")).toHaveCount(1);
   await expect(page.getByText("Current document", { exact: true })).toHaveCount(0);
   await expect(page.getByText("resume-revision-3.pdf", { exact: true })).toHaveCount(0);
 });
 
-test("runs the seven-stage workflow line through the Review marker", async ({ page }) => {
+test("uses the simplified opened-run header workflow layout", async ({ page }) => {
   const detailRun: RunDto = {
     ...runFixture("workflow-visual", "applied", "failed"),
     revision: 3,
@@ -693,17 +692,29 @@ test("runs the seven-stage workflow line through the Review marker", async ({ pa
 
   await page.goto("/runs/workflow-visual");
 
-  const workflow = page.getByRole("region", { name: "Workflow stage · revision 3" });
+  const pageHeader = page.getByRole("main").locator(":scope > header");
+  await expect(pageHeader.getByRole("link", { name: "Back to applications" })).toBeVisible();
+
+  const workflow = pageHeader.getByRole("list");
   const stages = workflow.getByRole("listitem");
-  await expect(stages.locator("span:last-child")).toHaveText([
-    "Analysis",
-    "Tailoring",
-    "Editing",
-    "Compile",
-    "Deterministic QA",
-    "Visual QA",
-    "Review",
+  await expect(stages).toHaveText([
+    /Analysis$/,
+    /Tailoring$/,
+    /Editing$/,
+    /Compile$/,
+    /Deterministic QA$/,
+    /Visual QA$/,
+    /Review$/,
   ]);
+
+  await expect(page.getByText(/Workflow stage · revision 3/)).toBeHidden();
+  await expect(
+    pageHeader
+      .getByRole("link", { name: "Download resume" })
+      .or(pageHeader.getByRole("button", { name: "Download resume" })),
+  ).toHaveCount(0);
+  await expect(pageHeader.getByRole("button", { name: "More run actions" })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Run timeline" })).toHaveCount(0);
 
   const completed = await stages.nth(2).evaluate((element) => {
     const marker = element.firstElementChild;
@@ -719,28 +730,9 @@ test("runs the seven-stage workflow line through the Review marker", async ({ pa
   });
   expect(completed).toEqual({
     connectorColor: "rgb(134, 215, 157)",
-    connectorHeight: "3px",
+    connectorHeight: "4px",
     markerBackground: "rgb(134, 215, 157)",
     markerBorder: "rgb(134, 215, 157)",
-  });
-
-  const incomplete = await stages.nth(3).evaluate((element) => {
-    const marker = element.firstElementChild;
-    if (!marker) throw new Error("Incomplete stage marker is missing");
-    const connectorStyle = getComputedStyle(element, "::after");
-    const markerStyle = getComputedStyle(marker);
-    return {
-      connectorColor: connectorStyle.backgroundColor,
-      connectorHeight: connectorStyle.height,
-      markerBorder: markerStyle.borderColor,
-      markerOutline: markerStyle.outlineStyle,
-    };
-  });
-  expect(incomplete).toEqual({
-    connectorColor: "rgb(117, 126, 121)",
-    connectorHeight: "3px",
-    markerBorder: "rgb(117, 126, 121)",
-    markerOutline: "none",
   });
 
   const reviewLineDelta = await stages.evaluateAll((elements) => {

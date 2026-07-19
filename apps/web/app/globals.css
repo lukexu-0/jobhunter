@@ -692,7 +692,7 @@ a {
 .applications-table th:last-child,
 .applications-table td:last-child {
   width: 8%;
-  padding-right: 0;
+  padding-right: var(--space-1);
   text-align: right;
 }
 

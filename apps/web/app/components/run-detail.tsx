@@ -8,7 +8,6 @@ import type {
   AttemptDto,
   RunDto,
   RunStatus,
-  TimelineEvent,
 } from "@jobhunter/pipeline/contracts";
 import {
   PipelineClientError,
@@ -372,51 +371,17 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
 }
 
 
-function StatusBand({ run }: { readonly run: RunDto }) {
+function WorkflowProgress({ run }: { readonly run: RunDto }) {
   const activeIndex = activeWorkflowIndex(run);
   return (
-    <section className={styles.workflowBand} aria-labelledby="workflow-heading">
-      <div className={styles.workflowProgress}>
-        <p className={styles.eyebrow} id="workflow-heading">Workflow stage · revision {run.revision}</p>
-        <ol className={styles.stageList}>
-          {WORKFLOW_STAGES.map((stage, index) => {
-            const completed = run.status === "approved" || index < activeIndex;
-            const current = index === activeIndex;
-            return (
-              <li className={`${styles.stageItem} ${completed ? styles.stageComplete : ""} ${current ? styles.stageCurrent : ""}`} key={stage.status} aria-current={current ? "step" : undefined}>
-                <span className={styles.stageMarker}>{completed ? <Icon name="check" /> : index + 1}</span>
-                <span>{stage.label}</span>
-              </li>
-            );
-          })}
-        </ol>
-      </div>
-      <div className={styles.statusField}>
-        <span className={styles.eyebrow}>Status</span>
-        <strong className={`${styles.statusValue} ${run.status === "failed" ? styles.statusValueFailed : ""}`}>{STATUS_LABELS[run.status]}</strong>
-      </div>
-    </section>
-  );
-}
-
-function Timeline({ events, runId }: { readonly events: TimelineEvent[]; readonly runId: string }) {
-  if (!events.length) return <p className={styles.absent}>No timeline events have been recorded.</p>;
-  return (
-    <ol className={styles.timelineList}>
-      {[...events].sort((left, right) => left.at - right.at || left.id - right.id).map((event) => {
-        const details = Object.entries(event.detail ?? {}).filter((entry): entry is [string, string | number | boolean] => {
-          const [key, value] = entry;
-          const normalizedKey = key.replace(/[^a-z]/gi, "").toLowerCase();
-          return ["string", "number", "boolean"].includes(typeof value)
-            && !normalizedKey.endsWith("runid")
-            && value !== runId;
-        });
+    <ol className={styles.stageList} aria-label="Workflow progress">
+      {WORKFLOW_STAGES.map((stage, index) => {
+        const completed = run.status === "approved" || index < activeIndex;
+        const current = index === activeIndex;
         return (
-          <li key={event.id}>
-            <time dateTime={new Date(event.at).toISOString()}>{formatDate(event.at)}</time>
-            <strong>{humanize(event.type)}</strong>
-            <span>{STATUS_LABELS[event.status]} · Revision {event.revision}</span>
-            {details.length ? <dl>{details.map(([key, value]) => <div key={key}><dt>{humanize(key)}</dt><dd>{String(value)}</dd></div>)}</dl> : null}
+          <li className={`${styles.stageItem} ${completed ? styles.stageComplete : ""} ${current ? styles.stageCurrent : ""}`} key={stage.status} aria-current={current ? "step" : undefined}>
+            <span className={styles.stageMarker}>{completed ? <Icon name="check" /> : index + 1}</span>
+            <span>{stage.label}</span>
           </li>
         );
       })}
@@ -649,24 +614,13 @@ export function RunDetail({ runId }: RunDetailProps) {
 
   const title = identity?.title ?? "Application";
   const subtitle = identity?.organization ?? `Revision ${run.revision} · ${humanize(run.origin)}`;
-  const timelineEvents = run.timeline.filter((event) => !event.type.toLowerCase().startsWith("attempt."));
 
   return (
     <main className={styles.detailShell} aria-busy={isRefreshing || busyAction !== null || isLoadingArtifacts}>
       <header className={styles.topBar}>
         <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to applications</Link>
-        <div className={styles.topActions}>
-          {pdfHref && !actionsDisabled ? <a className={styles.secondaryButton} href={pdfHref} download><Icon name="download" />Download resume</a> : <button className={styles.secondaryButton} type="button" disabled><Icon name="download" />Download resume</button>}
-          <details className={styles.overflowMenu}>
-            <summary aria-label="More run actions">•••</summary>
-            <div>
-              <button type="button" disabled={isRefreshing || busyAction !== null} onClick={() => void loadRun()}><Icon name="refresh" />Refresh current state</button>
-            </div>
-          </details>
-        </div>
+        <WorkflowProgress run={run} />
       </header>
-
-      <StatusBand run={run} />
 
       <div className={styles.paneGrid}>
         <aside className={`${styles.pane} ${styles.leftPane}`} aria-label="Run metadata and history">
@@ -688,10 +642,6 @@ export function RunDetail({ runId }: RunDetailProps) {
 
 
 
-          <section className={styles.paneSection} aria-labelledby="timeline-heading">
-            <div className={styles.sectionHeading}><h2 id="timeline-heading">Run timeline</h2><span>{timelineEvents.length} event{timelineEvents.length === 1 ? "" : "s"}</span></div>
-            <Timeline events={timelineEvents} runId={run.id} />
-          </section>
 
           <section className={styles.paneSection} aria-labelledby="analysis-heading">
             <div className={styles.sectionHeading}><h2 id="analysis-heading">Job analysis</h2>{analysisArtifact ? <span>Revision {analysisArtifact.revision}</span> : null}</div>
