@@ -7,14 +7,14 @@ export const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");
 export const DEFAULT_CONTEXT_MANIFEST_PATH = resolve(REPOSITORY_ROOT, "apps/resume-tailoring/context-sources.json");
 
 export const CONTEXT_SOURCE_ALLOWLIST = Object.freeze([
-  "apps/user-info/resume-main/main.tex",
+  "apps/user-info/resume-main/Alex_Example_Resume.tex",
   "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
   "apps/user-info/current-context/projects/sample-project-archive.md",
   "apps/user-info/current-context/projects/sample-project.md",
 ] as const);
 
 const ALLOWED: Readonly<Record<string, true>> = Object.freeze({
-  "apps/user-info/resume-main/main.tex": true,
+  "apps/user-info/resume-main/Alex_Example_Resume.tex": true,
   "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md": true,
   "apps/user-info/current-context/projects/sample-project-archive.md": true,
   "apps/user-info/current-context/projects/sample-project.md": true,

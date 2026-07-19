@@ -57,11 +57,9 @@ const TRUSTED_BASELINE_PRIMITIVES: Record<string, true> = {
 const SHELL_ESCAPE = /(?:--shell-escape|--enable-write18|\\(?:pdf)?shellescape\b)/i;
 const PARENT_OR_ABSOLUTE_FILE = /(?:\\(?:input|include|includegraphics|bibliography|addbibresource|usepackage|documentclass)\s*(?:\[[^\]]*\]\s*)?\{\s*(?:\.\.(?:[\\/]|\})|[\\/]|[A-Za-z]:[\\/]))/i;
 const REPAIRABLE_LOG = /(?:undefined control sequence|missing\s+[{}$]|extra\s+[{}$]|runaway argument|file ended while scanning use of|paragraph ended before \\[^\s]+ was complete|argument of \\[^\s]+ has an extra|misplaced alignment tab character|macro parameter character|illegal parameter number|use of \\[^\s]+ doesn't match its definition|too many \}'s|unbalanced|double subscript|double superscript)/i;
-const TRUSTED_GLYPH_INPUT_PREFIX = "\\usepackage{tabularx}\n";
 const TRUSTED_GLYPH_INPUT = "\\input{glyphtounicode}";
-const TRUSTED_GLYPH_INPUT_SUFFIX = "\n\n\n%----------FONT OPTIONS----------";
-const TRUSTED_BASELINE_END = "%%%%%%  RESUME STARTS HERE  %%%%%%%%%%%%%%%%%%%%%%%%%%%%";
-const TRUSTED_BASELINE_SHA256 = "ef2669d6aa7cf0fc0fe2ccfd49c815c9a22aa736176f4206e5ec888f56fc1f4a";
+const TRUSTED_BASELINE_END = "\\begin{document}";
+const TRUSTED_BASELINE_SHA256 = "abe8b2120bd736a860e47919dbfb1673a7e5166c2a03d973f2b03a73ea3edccd";
 
 function validateTex(tex: string): void {
   const bytes = Buffer.byteLength(tex, "utf8");
@@ -78,13 +76,14 @@ function validateTex(tex: string): void {
     && createHash("sha256").update(tex.slice(0, baselineEnd), "utf8").digest("hex") === TRUSTED_BASELINE_SHA256
     ? baselineEnd
     : -1;
-  const trustedAnchor = `${TRUSTED_GLYPH_INPUT_PREFIX}${TRUSTED_GLYPH_INPUT}${TRUSTED_GLYPH_INPUT_SUFFIX}`;
-  const anchorIndex = trustedBaselineEnd < 0 ? -1 : tex.indexOf(trustedAnchor);
-  const trustedInputIndex = anchorIndex < 0 || anchorIndex >= trustedBaselineEnd
-    ? -1
-    : anchorIndex + TRUSTED_GLYPH_INPUT_PREFIX.length;
+  const glyphInputIndex = tex.indexOf(TRUSTED_GLYPH_INPUT);
+  const trustedGlyphInputIndex = glyphInputIndex >= 0
+    && glyphInputIndex < trustedBaselineEnd
+    && tex.indexOf(TRUSTED_GLYPH_INPUT, glyphInputIndex + TRUSTED_GLYPH_INPUT.length) < 0
+    ? glyphInputIndex
+    : -1;
   for (const match of tex.matchAll(FORBIDDEN_TEX)) {
-    if (match[0].toLowerCase() === "\\input" && match.index === trustedInputIndex) continue;
+    if (match.index === trustedGlyphInputIndex) continue;
     if (match.index < trustedBaselineEnd && TRUSTED_BASELINE_PRIMITIVES[match[0].toLowerCase()]) continue;
     throw new Error(`forbidden TeX primitive ${match[0]}`);
   }

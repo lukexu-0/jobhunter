@@ -4,7 +4,7 @@ import { ANALYSIS_WORKFLOW_SHA256 } from "../src/agents/analysis-agent.ts";
 import { parseBaselineResume } from "../src/resume/parser.ts";
 import type { JobAnalysis } from "../src/resume/types.ts";
 
-const CANONICAL_BASELINE = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/main.tex"), "utf8");
+const CANONICAL_BASELINE = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex"), "utf8");
 
 export function jobAnalysisFixture(options: {
   readonly jobDescriptionSha256?: string;

@@ -144,7 +144,7 @@ function transition(repository: PipelineRepository, claim: { runId: string; toke
   for (const stage of stages) repository.transition(claim, stage);
 }
 
-async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1.7\nreview", visualAcknowledgementRequired = false, keywordMapBytes?: string): Promise<{ id: string; sha256: string; keywordMapId?: string }> {
+async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1.7\nreview", visualAcknowledgementRequired = false, keywordMapBytes?: string, tailoredTexBytes?: string): Promise<{ id: string; sha256: string; keywordMapId?: string; tailoredTexId?: string }> {
   const claim = target.repository.acquire();
   if (!claim || claim.runId !== runId) throw new Error("claim missing");
   const run = target.repository.getRun(runId);
@@ -164,6 +164,18 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
     path: stored.path,
     byteSize: stored.bytes,
   });
+  let tailoredTexId: string | undefined;
+  if (tailoredTexBytes !== undefined) {
+    const tex = await target.artifacts.write(join(root, "resume.tex"), tailoredTexBytes, 256 * 1024);
+    tailoredTexId = target.repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "tailored-tex",
+      sha256: tex.sha256,
+      path: tex.path,
+      byteSize: tex.bytes,
+    }).id;
+  }
   let keywordMapId: string | undefined;
   if (keywordMapBytes !== undefined) {
     const map = await target.artifacts.write(join(root, "keyword-map.pdf"), keywordMapBytes, 10 * 1024 * 1024);
@@ -180,7 +192,12 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
   target.repository.finishAttempt(claim, attempt.id, "succeeded");
   target.repository.transition(claim, "review", { visualAcknowledgementRequired });
   target.repository.release(claim);
-  return { id: artifact.id, sha256: artifact.sha256, ...(keywordMapId ? { keywordMapId } : {}) };
+  return {
+    id: artifact.id,
+    sha256: artifact.sha256,
+    ...(keywordMapId ? { keywordMapId } : {}),
+    ...(tailoredTexId ? { tailoredTexId } : {}),
+  };
 }
 
 function post(body: unknown): RequestInit {
@@ -601,17 +618,23 @@ describe("RunApplicationService", () => {
   });
 
 
-  test("serves public compiled and keyword-map PDFs with verified immutable download metadata", async () => {
+  test("serves public resume artifacts with renamed downloads and preserves keyword-map naming", async () => {
     const target = fixture();
     const run = await target.service.createRun(JOB_URL, true);
-    const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nreview", false, "%PDF-1.7\nkeyword-map");
+    const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nreview", false, "%PDF-1.7\nkeyword-map", "\\documentclass{article}");
     const response = await target.service.getArtifact(run.id, pdf.id);
     expect(response?.status).toBe(200);
     expect(response?.headers.get("cache-control")).toBe("no-store");
     expect(response?.headers.get("content-type")).toBe("application/pdf");
-    expect(response?.headers.get("content-disposition")).toBe('attachment; filename="compiled-pdf.pdf"');
+    expect(response?.headers.get("content-disposition")).toBe('attachment; filename="Alex_Example_Resume.pdf"');
     expect(response?.headers.get("x-content-sha256")).toBe(pdf.sha256);
     expect(await response?.text()).toBe("%PDF-1.7\nreview");
+
+    const tex = await target.service.getArtifact(run.id, pdf.tailoredTexId!);
+    expect(tex?.status).toBe(200);
+    expect(tex?.headers.get("content-type")).toBe("text/x-tex; charset=utf-8");
+    expect(tex?.headers.get("content-disposition")).toBe('attachment; filename="Alex_Example_Resume.tex"');
+    expect(await tex?.text()).toBe("\\documentclass{article}");
 
     const map = await target.service.getArtifact(run.id, pdf.keywordMapId!);
     expect(map?.status).toBe(200);

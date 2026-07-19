@@ -110,6 +110,13 @@ function extension(kind: ArtifactKind): string {
   if (kind === "tailored-tex") return "tex";
   return "json";
 }
+
+function publicFilename(kind: ArtifactKind): string {
+  if (kind === "compiled-pdf") return "Alex_Example_Resume.pdf";
+  if (kind === "tailored-tex") return "Alex_Example_Resume.tex";
+  return `${kind}.${extension(kind)}`;
+}
+
 function publicArtifactLimit(kind: ArtifactKind): number {
   if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return 10 * 1024 * 1024;
   if (kind === "page-image") return 25 * 1024 * 1024;
@@ -365,7 +372,7 @@ export class RunApplicationService {
         "cache-control": "no-store",
         "content-type": mediaType(kind),
         "content-length": String(bytes.byteLength),
-        "content-disposition": `attachment; filename="${kind}.${extension(kind)}"`,
+        "content-disposition": `attachment; filename="${publicFilename(kind)}"`,
         "etag": `"sha256-${artifact.sha256}"`,
         "digest": `sha-256=${digest.toString("base64")}`,
         "x-content-sha256": artifact.sha256,

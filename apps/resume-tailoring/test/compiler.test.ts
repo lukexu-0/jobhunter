@@ -109,9 +109,9 @@ describe("trusted processes", () => {
 
 describe("trusted resume compiler", () => {
   test("allows only the canonical glyph mapping input to reach the compiler boundary", async () => {
-    const canonical = await readFile(new URL("../../user-info/resume-main/main.tex", import.meta.url), "utf8");
+    const canonical = await readFile(new URL("../../user-info/resume-main/Alex_Example_Resume.tex", import.meta.url), "utf8");
     const trustedInput = "\\input{glyphtounicode}";
-    const trustedAnchor = `\\usepackage{tabularx}\n${trustedInput}\n\n\n%----------FONT OPTIONS----------`;
+    const trustedAnchor = `\\usepackage[english]{babel}\n${trustedInput}\n\n\\pagestyle{fancy}`;
     let canonicalSpawned = false;
     const canonicalArtifacts = new ArtifactStore(await root());
     const canonicalResult = await compileResume({
@@ -133,6 +133,9 @@ describe("trusted resume compiler", () => {
       canonical.replace(trustedInput, "\\input {glyphtounicode}"),
       canonical.replace(trustedInput, "\\input glyphtounicode"),
       canonical.replace(trustedInput, "\\input{./glyphtounicode}"),
+      canonical.replace(trustedInput, "\\input{glyphtounicode.tex}"),
+      canonical.replace(trustedInput, "\\input{glyphtounicode }"),
+      canonical.replace(trustedInput, "\\INPUT{glyphtounicode}"),
       canonical.replace(trustedInput, `${trustedInput}\n${trustedInput}`),
       canonical.replace(trustedAnchor, `${trustedAnchor}\n${trustedAnchor}`),
       canonical.replace(trustedAnchor, "").replace("\\begin{document}", `\\begin{document}\n${trustedAnchor}`),
@@ -163,7 +166,7 @@ describe("trusted resume compiler", () => {
   });
 
   test("rejects dynamic primitive construction and side-effect wrappers before spawning", async () => {
-    const canonical = await readFile(new URL("../../user-info/resume-main/main.tex", import.meta.url), "utf8");
+    const canonical = await readFile(new URL("../../user-info/resume-main/Alex_Example_Resume.tex", import.meta.url), "utf8");
     const candidates = [
       String.raw`\csname input\endcsname{secret}`,
       String.raw`\endcsname`,

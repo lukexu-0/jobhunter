@@ -3,7 +3,7 @@
   "sources": [
     {
       "id": "resume-baseline",
-      "relativePath": "apps/user-info/resume-main/main.tex",
+      "relativePath": "apps/user-info/resume-main/Alex_Example_Resume.tex",
       "kind": "baseline",
       "entityId": "candidate-resume",
       "displayName": "Canonical resume baseline",

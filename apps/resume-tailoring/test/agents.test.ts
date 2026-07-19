@@ -35,7 +35,7 @@ import { jobAnalysisFixture } from "./job-analysis.fixture.ts";
 
 const RAW_JOB_DESCRIPTION = "Build production TypeScript systems";
 const RAW_JOB_DESCRIPTION_SHA256 = createHash("sha256").update(RAW_JOB_DESCRIPTION).digest("hex");
-const BASELINE = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/main.tex"), "utf8");
+const BASELINE = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex"), "utf8");
 const BASELINE_INVENTORY = parseBaselineResume(BASELINE);
 const ANALYSIS = jobAnalysisFixture({
   jobDescriptionSha256: RAW_JOB_DESCRIPTION_SHA256,

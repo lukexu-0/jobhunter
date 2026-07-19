@@ -28,7 +28,7 @@ import { jobAnalysisFixture } from "./job-analysis.fixture.ts";
 
 setDefaultTimeout(15_000);
 
-const baseline = await Bun.file(resolve(import.meta.dir, "../../user-info/resume-main/main.tex")).text();
+const baseline = await Bun.file(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex")).text();
 const parsedBaseline = parseBaselineResume(baseline);
 const databases: Database[] = [];
 const roots: string[] = [];

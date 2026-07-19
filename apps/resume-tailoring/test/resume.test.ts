@@ -27,7 +27,7 @@ import {
 } from "../src/resume/index.ts";
 import { jobAnalysisFixture } from "./job-analysis.fixture.ts";
 
-const baseline = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/main.tex"), "utf8");
+const baseline = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex"), "utf8");
 const parsedBaseline = parseBaselineResume(baseline);
 const JOB_DESCRIPTION = "Build production TypeScript systems. Deliver reliable software.";
 const JOB_DESCRIPTION_SHA256 = createHash("sha256").update(JOB_DESCRIPTION).digest("hex");
@@ -64,7 +64,7 @@ function fixtures(): { snapshot: ContextSnapshot; analysis: JobAnalysis; plan: T
   }));
   const baselineSource: IndexedContextSource = {
     id: "canonical-baseline",
-    relativePath: "apps/user-info/resume-main/main.tex",
+    relativePath: "apps/user-info/resume-main/Alex_Example_Resume.tex",
     kind: "baseline",
     entityId: "candidate-resume",
     displayName: "Canonical resume",
@@ -291,6 +291,10 @@ describe("mechanical tailoring and canonical rendering", () => {
     const bulletEdit = analysis.exactEdits.find((edit) => edit.kind === "bullet")!;
     const skillEdit = analysis.exactEdits.find((edit) => edit.kind === "skill")!;
     expect(output).toContain(plainTextToTex(bulletEdit.after));
+    const experience = parsedBaseline.entities.find((entity) => entity.section === "experience")!;
+    const project = parsedBaseline.entities.find((entity) => entity.section === "projects")!;
+    expect(output).toContain(`\\resumeSubheading\n${experience.headingArguments.map((argument) => `      {${argument}}`).join("\n")}\n      \\resumeItemListStart[0.35in]`);
+    expect(output).toContain(`\\resumeProjectHeading\n${project.headingArguments.map((argument) => `      {${argument}}`).join("\n")}\n      \\resumeItemListStart\n`);
     expect(output).toContain(plainTextToTex(skillEdit.after));
     expect(immutableChunks(rendered)).toEqual(immutableChunks(parsedBaseline));
     expect(rendered.bullets).toHaveLength(parsedBaseline.bullets.length);

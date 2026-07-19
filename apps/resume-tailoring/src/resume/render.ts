@@ -158,8 +158,9 @@ function decisionsByEntity(plan: TailoringPlan, section: BaselineEntity["section
 function renderEntity(entity: BaselineEntity, decisions: readonly TailoringDecision[]): string {
   const macro = entity.section === "projects" ? "resumeProjectHeading" : "resumeSubheading";
   const heading = `    \\${macro}\n${entity.headingArguments.map((argument) => `      {${argument}}`).join("\n")}`;
+  const itemListStart = entity.section === "experience" ? "\\resumeItemListStart[0.35in]" : "\\resumeItemListStart";
   const bullets = decisions.filter((decision) => decision.action !== "omit").map((decision) => `        \\resumeItem{${plainTextToTex(decision.text!)}}`).join("\n");
-  return `${heading}\n      \\resumeItemListStart\n${bullets}\n      \\resumeItemListEnd`;
+  return `${heading}\n      ${itemListStart}\n${bullets}\n      \\resumeItemListEnd`;
 }
 
 function renderEntitySection(section: BaselineEntity["section"], parsed: ParsedBaselineResume, plan: TailoringPlan): string {
