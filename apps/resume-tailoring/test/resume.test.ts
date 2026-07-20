@@ -13,7 +13,10 @@ import {
   EditResultSchema,
   JobAnalysisSchema,
   TailoringResultSchema,
+  TailoringPlanSchema,
   buildEvidenceLedger,
+  buildResumeDiff,
+  assertResumeDiffMatchesTailoredSource,
   collectAnalysisSemanticIssues,
   hashJobAnalysis,
   immutableChunks,
@@ -200,6 +203,131 @@ describe("strict resume contracts", () => {
     expect(parsedBaseline.bullets.length).toBeGreaterThan(10);
     expect(parsedBaseline.skills.length).toBeGreaterThan(10);
     expect(again.bullets.map((item) => item.id)).toEqual(parsedBaseline.bullets.map((item) => item.id));
+  });
+
+  test("builds a complete canonical-to-current diff with aligned changes", () => {
+    const { plan } = fixtures();
+    const retained = plan.decisions.find((decision) => decision.section === "experience" && decision.action === "retain");
+    const rewritten = plan.decisions.find((decision) => decision.action === "rewrite");
+    const deleted = plan.decisions.find((decision) => (
+      decision.section === "experience"
+      && decision.action === "retain"
+      && decision.id !== retained?.id
+    ));
+    if (!retained?.baselineItemId || !rewritten?.baselineItemId || !deleted?.baselineItemId) {
+      throw new Error("diff test requires retained, rewritten, and deletable baseline bullets");
+    }
+
+    const addition = {
+      id: "decision:diff-added",
+      section: deleted.section,
+      entityId: deleted.entityId,
+      baselineItemId: null,
+      action: "add" as const,
+      text: "Added zero-downtime delivery checks.",
+      evidenceIds: ["evidence-0"],
+      factKeys: [],
+      rationale: "Add an evidence-backed delivery result.",
+    };
+    const diffPlan = TailoringPlanSchema.parse({
+      ...plan,
+      decisions: plan.decisions.flatMap((decision) => decision.id === deleted.id
+        ? [
+            {
+              ...decision,
+              action: "omit" as const,
+              text: null,
+              evidenceIds: ["evidence-0"],
+              rationale: "Remove lower-priority content.",
+            },
+            addition,
+          ]
+        : [decision]),
+      omissions: [
+        ...plan.omissions,
+        {
+          baselineItemId: deleted.baselineItemId,
+          rationale: "Remove lower-priority content.",
+          evidenceIds: ["evidence-0"],
+        },
+      ],
+    });
+
+    const diff = buildResumeDiff(baseline, diffPlan);
+    const rows = diff.sections.flatMap((section) => section.groups.flatMap((group) => group.rows));
+    const baselineBullets = new Map(parsedBaseline.bullets.map((bullet) => [bullet.id, bullet.text]));
+
+    expect(diff.sections.map((section) => section.id)).toEqual([
+      "experience",
+      "projects",
+      "competitions-other",
+      "technical-skills",
+    ]);
+    expect(rows).toHaveLength(parsedBaseline.bullets.length + parsedBaseline.skills.length + 1);
+    expect(rows.find((row) => row.id === retained.baselineItemId)).toEqual({
+      id: retained.baselineItemId,
+      kind: "bullet",
+      change: "unchanged",
+      before: retained.text,
+      after: retained.text,
+    });
+    expect(rows.find((row) => row.id === rewritten.baselineItemId)).toEqual({
+      id: rewritten.baselineItemId,
+      kind: "bullet",
+      change: "edited",
+      before: baselineBullets.get(rewritten.baselineItemId)!,
+      after: rewritten.text,
+    });
+    expect(rows.find((row) => row.id === deleted.baselineItemId)).toEqual({
+      id: deleted.baselineItemId,
+      kind: "bullet",
+      change: "deleted",
+      before: baselineBullets.get(deleted.baselineItemId)!,
+      after: null,
+    });
+    expect(rows.find((row) => row.id === addition.id)).toEqual({
+      id: addition.id,
+      kind: "bullet",
+      change: "added",
+      before: null,
+      after: addition.text,
+    });
+
+    const omittedSkillIndex = plan.skillDecisions.findIndex((decision) => decision.action === "omit");
+    const omittedSkill = plan.skillDecisions[omittedSkillIndex];
+    const replacementSkill = plan.skillDecisions[omittedSkillIndex + 1];
+    if (!omittedSkill || replacementSkill?.action !== "add") {
+      throw new Error("diff test requires an adjacent skill replacement");
+    }
+    const baselineSkill = parsedBaseline.skills.find((skill) => (
+      skill.category === omittedSkill.category && skill.skill === omittedSkill.skill
+    ));
+    if (!baselineSkill) throw new Error("diff test requires the omitted baseline skill");
+    expect(rows.find((row) => row.id === baselineSkill.id)).toEqual({
+      id: baselineSkill.id,
+      kind: "skill",
+      change: "edited",
+      before: omittedSkill.skill,
+      after: replacementSkill.skill,
+    });
+  });
+
+  test("rejects a tailored source that would make its published diff stale", () => {
+    const { snapshot, plan } = fixtures();
+    const diff = buildResumeDiff(baseline, plan);
+    const tailored = renderTailoredResume(plan, baseline, snapshot);
+    const editedRow = diff.sections
+      .flatMap((section) => section.groups)
+      .flatMap((group) => group.rows)
+      .find((row) => row.change === "edited" && row.after !== null);
+    const editedText = editedRow?.after;
+    if (!editedText) throw new Error("diff test requires an edited current line");
+
+    expect(() => assertResumeDiffMatchesTailoredSource(diff, tailored)).not.toThrow();
+    expect(() => assertResumeDiffMatchesTailoredSource(
+      diff,
+      tailored.replace(editedText, "Changed without updating the published diff."),
+    )).toThrow("tailored resume content does not match the published resume diff");
   });
 });
 

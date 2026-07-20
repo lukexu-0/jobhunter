@@ -651,6 +651,46 @@ describe("RunApplicationService", () => {
     const input = target.repository.getArtifact(run.id, "job-description")!;
     expect(await target.service.getArtifact(run.id, input.id)).toBeUndefined();
   });
+
+  test("serves the current resume diff as public JSON", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    const claim = target.repository.acquire()!;
+    transition(target.repository, claim, ["analyzing", "tailoring"]);
+    const attempt = target.repository.startAttempt(claim, "tailoring");
+    const root = await target.artifacts.createAttempt({
+      run: target.repository.getRun(run.id)!.queueSequence,
+      revision: "1",
+      stage: "tailoring",
+      attempt: attempt.attemptNo,
+    });
+    const body = JSON.stringify({ schemaVersion: 1, sections: [] });
+    const stored = await target.artifacts.write(join(root, "resume-diff.json"), body, 1024 * 1024);
+    const artifact = target.repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "tailoring",
+      kind: "resume-diff",
+      sha256: stored.sha256,
+      path: stored.path,
+      byteSize: stored.bytes,
+    });
+    target.repository.finishAttempt(claim, attempt.id, "succeeded");
+    transition(target.repository, claim, ["compiling", "deterministic_qa", "visual_qa"]);
+    target.repository.release(claim);
+    await finalizeReviewPdf(target, run.id);
+
+    const dto = RunDtoSchema.parse(await target.service.getRun(run.id));
+    expect(dto.artifacts.find((candidate) => candidate.id === artifact.id)).toMatchObject({
+      kind: "resume-diff",
+      mediaType: "application/json; charset=utf-8",
+      public: true,
+    });
+    const response = await target.service.getArtifact(run.id, artifact.id);
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(response?.headers.get("content-disposition")).toBe('attachment; filename="resume-diff.json"');
+    expect(await response?.text()).toBe(body);
+  });
 });
 
 describe("public run and context routes", () => {

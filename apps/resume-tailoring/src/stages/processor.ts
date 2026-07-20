@@ -13,12 +13,15 @@ import {
   type OnePageCorrection,
 } from "../agents/index.ts";
 import type { ContextSnapshot } from "../context/types.ts";
+import { ResumeDiffSchema } from "../contracts/index.ts";
 import { ClaimRejectedError, type PublicArtifact, type PublicAttempt, type PublicRun } from "../db/repository.ts";
 import { inspectResumePng, type GeminiInspectorOptions } from "../models/gemini-inspector.ts";
 import { compileResume, type CompileResult } from "../resume/compiler.ts";
 import { renderKeywordMapPdf } from "../resume/keyword-map.ts";
 import {
   AtsKeywordExtractionSchema,
+  assertResumeDiffMatchesTailoredSource,
+  buildResumeDiff,
   buildEvidenceLedger,
   equivalentEntities,
   JobAnalysisSchema,
@@ -339,16 +342,19 @@ export class PipelineStageProcessor {
     validateOnePageCorrectionPlan(result.plan, onePageCorrection);
     const tailoredTex = renderTailoredResume(result.plan, sources.baseline, sources.snapshot);
     const ledger = buildEvidenceLedger(analysis, result.plan, sources.snapshot);
+    const resumeDiff = buildResumeDiff(sources.baseline, result.plan);
     signal.throwIfAborted();
     await this.#verifyAgain(run.id, signal);
     const root = await this.#artifacts.createAttempt(this.#address(run, attempt));
     const planMeta = await this.#artifacts.write(join(root, "tailoring-plan.json"), json(result.plan), JSON_LIMIT);
     const summaryMeta = await this.#artifacts.write(join(root, "change-summary.json"), json({ planId: result.plan.id, decisions: result.plan.decisions, skillDecisions: result.plan.skillDecisions, omissions: result.plan.omissions }), JSON_LIMIT);
+    const diffMeta = await this.#artifacts.write(join(root, "resume-diff.json"), json(resumeDiff), JSON_LIMIT);
     const ledgerMeta = await this.#artifacts.write(join(root, "evidence-ledger.json"), json(ledger), JSON_LIMIT);
     const texMeta = await this.#artifacts.write(join(root, "resume.tex"), tailoredTex, ARTIFACT_LIMITS.tex);
     const sourceArtifactId = correctionArtifact?.id ?? analysisArtifact.id;
-    this.#finalize(claim, attempt, "tailoring-plan", planMeta, sourceArtifactId);
+    const finalizedPlan = this.#finalize(claim, attempt, "tailoring-plan", planMeta, sourceArtifactId);
     this.#finalize(claim, attempt, "change-summary", summaryMeta, sourceArtifactId);
+    this.#finalize(claim, attempt, "resume-diff", diffMeta, finalizedPlan.id);
     this.#finalize(claim, attempt, "evidence-ledger", ledgerMeta, sourceArtifactId);
     this.#finalize(claim, attempt, "tailored-tex", texMeta, sourceArtifactId);
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
@@ -388,6 +394,7 @@ export class PipelineStageProcessor {
     audit.toolCount = 1;
     const tailoredTex = renderEditedResume(result, comments, analysis, sources.baseline, sources.snapshot);
     const ledger = buildEvidenceLedger(analysis, result.plan, sources.snapshot, { comments, commentDispositions: result.commentDispositions });
+    const resumeDiff = buildResumeDiff(sources.baseline, result.plan);
     signal.throwIfAborted();
     await this.#verifyAgain(run.id, signal);
     const root = await this.#artifacts.createAttempt(this.#address(run, attempt));
@@ -395,12 +402,14 @@ export class PipelineStageProcessor {
     const reportMeta = await this.#artifacts.write(join(root, "edit-report.json"), json(result), JSON_LIMIT);
     const planMeta = await this.#artifacts.write(join(root, "tailoring-plan.json"), json(result.plan), JSON_LIMIT);
     const summaryMeta = await this.#artifacts.write(join(root, "change-summary.json"), json({ planId: result.plan.id, decisions: result.plan.decisions, skillDecisions: result.plan.skillDecisions, omissions: result.plan.omissions, commentDispositions: result.commentDispositions }), JSON_LIMIT);
+    const diffMeta = await this.#artifacts.write(join(root, "resume-diff.json"), json(resumeDiff), JSON_LIMIT);
     const ledgerMeta = await this.#artifacts.write(join(root, "evidence-ledger.json"), json(ledger), JSON_LIMIT);
     const texMeta = await this.#artifacts.write(join(root, "resume.tex"), tailoredTex, ARTIFACT_LIMITS.tex);
     this.#finalize(claim, attempt, "edit-request", requestMeta);
     this.#finalize(claim, attempt, "edit-report", reportMeta, planArtifact.id);
-    this.#finalize(claim, attempt, "tailoring-plan", planMeta, planArtifact.id);
+    const finalizedPlan = this.#finalize(claim, attempt, "tailoring-plan", planMeta, planArtifact.id);
     this.#finalize(claim, attempt, "change-summary", summaryMeta, planArtifact.id);
+    this.#finalize(claim, attempt, "resume-diff", diffMeta, finalizedPlan.id);
     this.#finalize(claim, attempt, "evidence-ledger", ledgerMeta, planArtifact.id);
     this.#finalize(claim, attempt, "tailored-tex", texMeta, texArtifact.id);
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
@@ -514,6 +523,9 @@ export class PipelineStageProcessor {
       return;
     }
     validateRepairCandidate(result.tailoredTex, sources.baseline);
+    const diffArtifact = this.#requiredArtifact(run.id, "resume-diff");
+    const resumeDiff = ResumeDiffSchema.parse(await this.#readJson(diffArtifact));
+    assertResumeDiffMatchesTailoredSource(resumeDiff, result.tailoredTex);
     const texMeta = await this.#artifacts.write(join(root, "resume.tex"), result.tailoredTex, ARTIFACT_LIMITS.tex);
     this.#finalize(claim, attempt, "tailored-tex", texMeta, texArtifact.id);
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);

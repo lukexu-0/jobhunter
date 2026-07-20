@@ -45,6 +45,7 @@ const PUBLIC_ARTIFACT_KINDS: Readonly<Record<string, ArtifactKind>> = Object.fre
   "tailoring-plan": "tailoring-plan",
   "evidence-ledger": "evidence-ledger",
   "change-summary": "change-summary",
+  "resume-diff": "resume-diff",
   "tailored-tex": "tailored-tex",
   "compiled-pdf": "compiled-pdf",
   "keyword-map-pdf": "keyword-map-pdf",

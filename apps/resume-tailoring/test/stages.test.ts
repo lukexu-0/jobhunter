@@ -8,13 +8,16 @@ import type { AnalysisAgentInput } from "../src/agents/analysis-agent.ts";
 import type { AtsKeywordExtractionAgentInput } from "../src/agents/ats-keyword-extraction-agent.ts";
 import type { EditAgentInput } from "../src/agents/edit-agent.ts";
 import { buildMechanicalTailoringPlan, type TailoringAgentInput } from "../src/agents/tailoring-agent.ts";
+import { ResumeDiffSchema } from "../src/contracts/index.ts";
 import type { ContextSnapshot, EvidenceBlock, IndexedContextSource } from "../src/context/types.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
 import { ClaimRejectedError, PipelineRepository, type RunSourceSnapshotInput } from "../src/db/repository.ts";
 import type { GeminiVisualInspection } from "../src/models/gemini-inspector.ts";
 import type { CompileRequest, CompileResult } from "../src/resume/compiler.ts";
 import {
+  buildResumeDiff,
   parseBaselineResume,
+  parseMacroCalls,
   renderTailoredResume,
   type AtsKeywordExtraction,
   type EditResult,
@@ -407,8 +410,13 @@ describe("pipeline stage processor", () => {
     expect(await Bun.file(texArtifact!.path).text()).toBe(
       renderTailoredResume(result!.plan, baseline, harness.fixtures.snapshot),
     );
+    const diffArtifact = harness.repository.getArtifact(harness.runId, "resume-diff");
+    expect(diffArtifact).not.toBeNull();
+    expect(ResumeDiffSchema.parse(JSON.parse(await Bun.file(diffArtifact!.path).text()))).toEqual(
+      buildResumeDiff(baseline, result!.plan),
+    );
     expect(harness.repository.listResolvedArtifacts(harness.runId).map((artifact) => artifact.kind)).toEqual(expect.arrayContaining([
-      "job-description", "ats-keyword-extraction", "job-analysis", "tailoring-plan", "change-summary", "evidence-ledger", "tailored-tex",
+      "job-description", "ats-keyword-extraction", "job-analysis", "tailoring-plan", "change-summary", "resume-diff", "evidence-ledger", "tailored-tex",
       "latex-log", "compiled-pdf", "deterministic-qa", "page-image", "visual-qa",
     ]));
     const timeline = harness.repository.timeline(harness.runId);
@@ -747,6 +755,42 @@ describe("pipeline stage processor", () => {
     expect(harness.repository.getArtifact(harness.runId, "repair-report")).not.toBeNull();
   });
 
+  test("rejects a repair that would make the current resume diff stale", async () => {
+    let candidateValidated = false;
+    let candidateCompiled = false;
+    const harness = await createHarness({
+      compileOutcomes: ["repairable", "success"],
+      repairAgent: async (attempt): Promise<RepairResult> => {
+        const parsed = parseBaselineResume(attempt.input.failedTex);
+        const [firstBullet] = parseMacroCalls(parsed.regions.experience.body, "resumeItem", 1);
+        if (!firstBullet) throw new Error("repair test requires an experience bullet");
+        const start = parsed.regions.experience.bodyStart + firstBullet.start;
+        const end = parsed.regions.experience.bodyStart + firstBullet.end;
+        const tailoredTex = `${attempt.input.failedTex.slice(0, start)}\\resumeItem{Changed without updating the resume diff.}${attempt.input.failedTex.slice(end)}`;
+        const valid = await attempt.input.operations.validateCandidate(tailoredTex, attempt.signal);
+        candidateValidated = valid.ok;
+        if (!valid.ok) throw new Error(valid.diagnostics.join("\n"));
+        const candidate = await attempt.input.operations.compileCandidate(tailoredTex, attempt.signal);
+        candidateCompiled = candidate.ok;
+        if (!candidate.ok) throw new Error(candidate.diagnostics.join("\n"));
+        return {
+          status: "repaired",
+          tailoredTex,
+          changes: [{ category: "escaping", summary: "Changed a resume bullet" }],
+          remainingDiagnostics: [],
+        };
+      },
+    });
+    await processToStop(harness);
+
+    expect(candidateValidated).toBeTrue();
+    expect(candidateCompiled).toBeTrue();
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "repairing",
+    });
+  });
+
   test("treats the post-repair full compile as authority and terminalizes a failed repaired revision", async () => {
     const harness = await createHarness({
       compileOutcomes: ["repairable", "success", "repairable"],
@@ -836,6 +880,11 @@ describe("pipeline stage processor", () => {
     expect(Object.keys(editInputs[0] ?? {})).not.toContain("rawJobDescription");
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(1);
     expect(harness.repository.getArtifact(harness.runId, "edit-request")?.revision).toBe(3);
+    const currentDiff = harness.repository.getArtifact(harness.runId, "resume-diff");
+    expect(currentDiff?.revision).toBe(3);
+    expect(ResumeDiffSchema.parse(JSON.parse(await Bun.file(currentDiff!.path).text()))).toEqual(
+      buildResumeDiff(baseline, editInputs[1]!.currentPlan),
+    );
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
   });
 

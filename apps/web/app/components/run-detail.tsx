@@ -1,13 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import type {
-  ArtifactDto,
-  ArtifactKind,
-  AttemptDto,
-  RunDto,
-  RunStatus,
+import { Fragment, useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import {
+  ResumeDiffSchema,
+  type ArtifactDto,
+  type ArtifactKind,
+  type AttemptDto,
+  type ResumeDiff,
+  type RunDto,
+  type RunStatus,
 } from "@jobhunter/pipeline/contracts";
 import {
   PipelineClientError,
@@ -70,12 +72,14 @@ const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 type JsonRecord = Record<string, unknown>;
 type BusyAction = "retry";
-type DocumentView = "resume" | "keyword-map";
+type DocumentView = "resume" | "keyword-map" | "diff";
 
 const RESUME_TAB_ID = "resume-document-tab";
 const RESUME_PANEL_ID = "resume-document-panel";
 const KEYWORD_MAP_TAB_ID = "keyword-map-document-tab";
 const KEYWORD_MAP_PANEL_ID = "keyword-map-document-panel";
+const DIFF_TAB_ID = "resume-diff-document-tab";
+const DIFF_PANEL_ID = "resume-diff-document-panel";
 
 interface RunDetailProps {
   readonly runId: string;
@@ -180,7 +184,7 @@ function safeArtifactHref(artifact: ArtifactDto | undefined): string | null {
 function isDisplayedJsonArtifact(artifact: ArtifactDto): boolean {
   return artifact.public
     && artifact.mediaType.toLowerCase().startsWith("application/json")
-    && (artifact.kind === "job-analysis" || artifact.kind === "visual-qa");
+    && (artifact.kind === "job-analysis" || artifact.kind === "resume-diff" || artifact.kind === "visual-qa");
 }
 
 function parseJobIdentity(value: unknown): JobIdentity | null {
@@ -371,6 +375,55 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
 }
 
 
+export function ResumeDiffContent({ diff }: { readonly diff: ResumeDiff }) {
+  return (
+    <table className={styles.diffTable} aria-label="Canonical and current resume comparison">
+      <thead>
+        <tr>
+          <th scope="col">BEFORE</th>
+          <th scope="col">AFTER</th>
+        </tr>
+      </thead>
+      {diff.sections.map((section) => (
+        <tbody key={section.id}>
+          <tr className={styles.diffSection}>
+            <th colSpan={2} scope="rowgroup">{section.label}</th>
+          </tr>
+          {section.groups.map((group) => (
+            <Fragment key={group.id}>
+              <tr className={styles.diffGroup}>
+                <th colSpan={2} scope="rowgroup">{group.label}</th>
+              </tr>
+              {group.rows.map((row) => (
+                <tr className={`${styles.diffRow} ${styles[`diffRow--${row.change}`]}`} key={row.id}>
+                  <td>
+                    {row.before === null ? (
+                      <span className={styles.diffBlank} aria-label="No canonical line">—</span>
+                    ) : row.change === "unchanged" ? (
+                      <span>{row.before}</span>
+                    ) : (
+                      <del>{row.before}</del>
+                    )}
+                  </td>
+                  <td>
+                    {row.after === null ? (
+                      <span className={styles.diffBlank} aria-label="No current line">—</span>
+                    ) : row.change === "unchanged" ? (
+                      <span>{row.after}</span>
+                    ) : (
+                      <mark>{row.after}</mark>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </Fragment>
+          ))}
+        </tbody>
+      ))}
+    </table>
+  );
+}
+
 function WorkflowProgress({ run }: { readonly run: RunDto }) {
   const activeIndex = activeWorkflowIndex(run);
   return (
@@ -406,6 +459,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   const requestVersion = useRef(0);
   const resumeTabRef = useRef<HTMLButtonElement>(null);
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
+  const diffTabRef = useRef<HTMLButtonElement>(null);
 
   const loadRun = useCallback(async (initial = false) => {
     const request = ++requestVersion.current;
@@ -523,11 +577,16 @@ export function RunDetail({ runId }: RunDetailProps) {
   const pageImageHref = safeArtifactHref(pageImageArtifact);
   const keywordMapArtifact = artifactFor("keyword-map-pdf");
   const keywordMapHref = safeArtifactHref(keywordMapArtifact);
-  const selectedDocumentView = documentView === "keyword-map" && keywordMapHref
-    ? "keyword-map"
-    : "resume";
+  const resumeDiffArtifact = artifactFor("resume-diff");
+  const parsedResumeDiff = ResumeDiffSchema.safeParse(dataFor("resume-diff"));
+  const resumeDiff = parsedResumeDiff.success ? parsedResumeDiff.data : undefined;
+  const selectedDocumentView = documentView === "diff" && resumeDiff
+    ? "diff"
+    : documentView === "keyword-map" && keywordMapHref
+      ? "keyword-map"
+      : "resume";
   const documentSignature = run
-    ? `${run.id}:${run.revision}:${pdfArtifact?.id ?? ""}:${pageImageArtifact?.id ?? ""}:${keywordMapArtifact?.id ?? ""}:${keywordMapHref ?? ""}`
+    ? `${run.id}:${run.revision}:${pdfArtifact?.id ?? ""}:${pageImageArtifact?.id ?? ""}:${keywordMapArtifact?.id ?? ""}:${keywordMapHref ?? ""}:${resumeDiffArtifact?.id ?? ""}:${resumeDiffArtifact?.sha256 ?? ""}`
     : "none";
   useEffect(() => {
     setDocumentView("resume");
@@ -538,19 +597,33 @@ export function RunDetail({ runId }: RunDetailProps) {
   const overlays = visualFindings.map((finding, index) => ({ finding, index, rect: overlayRect(finding.bbox) })).filter((item): item is { finding: JsonRecord; index: number; rect: OverlayRect } => item.rect !== null);
 
   const actionsDisabled = busyAction !== null || isRefreshing || !isFresh;
+  const availableDocumentViews: DocumentView[] = ["resume"];
+  if (keywordMapHref) availableDocumentViews.push("keyword-map");
+  if (resumeDiff) availableDocumentViews.push("diff");
+
+  const focusDocumentTab = (view: DocumentView) => {
+    if (view === "resume") resumeTabRef.current?.focus();
+    else if (view === "keyword-map") keywordMapTabRef.current?.focus();
+    else diffTabRef.current?.focus();
+  };
 
   const handleDocumentTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
-    if (!keywordMapHref) return;
-    const isResumeTab = event.currentTarget.id === RESUME_TAB_ID;
-    let nextView: DocumentView | null = null;
-    if (event.key === "ArrowRight") nextView = isResumeTab ? "keyword-map" : "resume";
-    if (event.key === "ArrowLeft") nextView = isResumeTab ? "keyword-map" : "resume";
-    if (event.key === "Home") nextView = "resume";
-    if (event.key === "End") nextView = "keyword-map";
-    if (!nextView) return;
+    const currentView = event.currentTarget.id === RESUME_TAB_ID
+      ? "resume"
+      : event.currentTarget.id === KEYWORD_MAP_TAB_ID
+        ? "keyword-map"
+        : "diff";
+    const currentIndex = availableDocumentViews.indexOf(currentView);
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % availableDocumentViews.length;
+    if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + availableDocumentViews.length) % availableDocumentViews.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = availableDocumentViews.length - 1;
+    if (nextIndex === null) return;
     event.preventDefault();
+    const nextView = availableDocumentViews[nextIndex]!;
     setDocumentView(nextView);
-    (nextView === "resume" ? resumeTabRef : keywordMapTabRef).current?.focus();
+    focusDocumentTab(nextView);
   };
 
   const refreshAfterActionFailure = useCallback(async (request: number) => {
@@ -684,6 +757,22 @@ export function RunDetail({ runId }: RunDetailProps) {
                   Keyword map
                 </button>
               ) : null}
+              {resumeDiff ? (
+                <button
+                  aria-controls={DIFF_PANEL_ID}
+                  aria-selected={selectedDocumentView === "diff"}
+                  className={styles.viewerTab}
+                  id={DIFF_TAB_ID}
+                  onClick={() => setDocumentView("diff")}
+                  onKeyDown={handleDocumentTabKeyDown}
+                  ref={diffTabRef}
+                  role="tab"
+                  tabIndex={selectedDocumentView === "diff" ? 0 : -1}
+                  type="button"
+                >
+                  Diff
+                </button>
+              ) : null}
             </div>
             {selectedDocumentView === "resume" ? (
               <div className={styles.viewerControls} aria-label="Resume view controls">
@@ -694,7 +783,7 @@ export function RunDetail({ runId }: RunDetailProps) {
                 <button type="button" aria-label="Fit page" disabled={actionsDisabled} onClick={() => setZoom(100)}><Icon name="fit" /></button>
                 {pdfHref && !actionsDisabled ? <a href={pdfHref} aria-label="Download current PDF" download><Icon name="download" /></a> : null}
               </div>
-            ) : (
+            ) : selectedDocumentView === "keyword-map" ? (
               <div className={styles.viewerControls} aria-label="Keyword map controls">
                 {!actionsDisabled ? (
                   <a className={styles.viewerDownload} href={keywordMapHref!} aria-label="Download keyword map PDF" download><Icon name="download" /><span>Download keyword map</span></a>
@@ -702,7 +791,7 @@ export function RunDetail({ runId }: RunDetailProps) {
                   <button className={styles.viewerDownload} type="button" disabled><Icon name="download" /><span>Download keyword map</span></button>
                 )}
               </div>
-            )}
+            ) : null}
           </header>
           <div
             aria-labelledby={RESUME_TAB_ID}
@@ -751,6 +840,18 @@ export function RunDetail({ runId }: RunDetailProps) {
               <object className={`${styles.pdfObject} ${styles.keywordMapObject}`} data={keywordMapHref} type="application/pdf" aria-label={`Keyword map PDF for ${title}`}>
                 <p>The browser could not display this PDF. <a href={keywordMapHref} download>Download the keyword map</a>.</p>
               </object>
+            </div>
+          ) : null}
+          {resumeDiff ? (
+            <div
+              aria-labelledby={DIFF_TAB_ID}
+              className={`${styles.viewerCanvas} ${styles.diffCanvas}`}
+              hidden={selectedDocumentView !== "diff"}
+              id={DIFF_PANEL_ID}
+              role="tabpanel"
+              tabIndex={0}
+            >
+              <ResumeDiffContent diff={resumeDiff} />
             </div>
           ) : null}
         </section>

@@ -93,11 +93,65 @@ export const UpdateApplicationStatusRequestSchema =
 export const RevisionOriginSchema = z.enum(["initial", "machine-regeneration", "human-comments"]);
 export type RevisionOrigin = z.infer<typeof RevisionOriginSchema>;
 
+const ResumeDiffIdSchema = z.string().trim().min(1).max(200);
+const ResumeDiffTextSchema = z.string().trim().min(1).max(2_000);
+
+export const ResumeDiffChangeSchema = z.enum(["unchanged", "edited", "deleted", "added"]);
+export type ResumeDiffChange = z.infer<typeof ResumeDiffChangeSchema>;
+
+export const ResumeDiffRowSchema = z.object({
+  id: ResumeDiffIdSchema,
+  kind: z.enum(["bullet", "skill"]),
+  change: ResumeDiffChangeSchema,
+  before: ResumeDiffTextSchema.nullable(),
+  after: ResumeDiffTextSchema.nullable(),
+}).strict().superRefine((row, ctx) => {
+  if (row.change === "unchanged" && (row.before === null || row.after === null || row.before !== row.after)) {
+    ctx.addIssue({ code: "custom", message: "unchanged rows require matching before and after text" });
+  }
+  if (row.change === "edited" && (row.before === null || row.after === null || row.before === row.after)) {
+    ctx.addIssue({ code: "custom", message: "edited rows require different before and after text" });
+  }
+  if (row.change === "deleted" && (row.before === null || row.after !== null)) {
+    ctx.addIssue({ code: "custom", message: "deleted rows require only before text" });
+  }
+  if (row.change === "added" && (row.before !== null || row.after === null)) {
+    ctx.addIssue({ code: "custom", message: "added rows require only after text" });
+  }
+});
+export type ResumeDiffRow = z.infer<typeof ResumeDiffRowSchema>;
+
+export const ResumeDiffSchema = z.object({
+  schemaVersion: z.literal(1),
+  baselineSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  planId: ResumeDiffIdSchema,
+  sections: z.array(z.object({
+    id: z.enum(["experience", "projects", "competitions-other", "technical-skills"]),
+    label: ResumeDiffTextSchema,
+    groups: z.array(z.object({
+      id: ResumeDiffIdSchema,
+      label: ResumeDiffTextSchema,
+      rows: z.array(ResumeDiffRowSchema).min(1).max(500).readonly(),
+    }).strict()).max(200).readonly(),
+  }).strict()).min(1).max(4).readonly(),
+}).strict().superRefine((diff, ctx) => {
+  const sectionIds = diff.sections.map((section) => section.id);
+  if (new Set(sectionIds).size !== sectionIds.length) {
+    ctx.addIssue({ code: "custom", path: ["sections"], message: "resume diff sections must be unique" });
+  }
+  const rowIds = diff.sections.flatMap((section) => section.groups.flatMap((group) => group.rows.map((row) => row.id)));
+  if (new Set(rowIds).size !== rowIds.length) {
+    ctx.addIssue({ code: "custom", path: ["sections"], message: "resume diff row IDs must be unique" });
+  }
+});
+export type ResumeDiff = z.infer<typeof ResumeDiffSchema>;
+
 export const ArtifactKindSchema = z.enum([
   "job-analysis",
   "tailoring-plan",
   "evidence-ledger",
   "change-summary",
+  "resume-diff",
   "tailored-tex",
   "latex-log",
   "compiled-pdf",

@@ -52,12 +52,98 @@ function documentViewerFixture(id: string, includeKeywordMap: boolean): RunDto {
   };
 }
 
+const resumeDiffArtifactId = "resume-diff-json";
+const resumeDiff = {
+  schemaVersion: 1,
+  baselineSha256: "c".repeat(64),
+  planId: "plan-current",
+  sections: [
+    {
+      id: "experience",
+      label: "Experience",
+      groups: [
+        {
+          id: "acme-platform",
+          label: "Acme Platform",
+          rows: [
+            {
+              id: "unchanged-bullet",
+              kind: "bullet",
+              change: "unchanged",
+              before: "Owned reliable deployment services.",
+              after: "Owned reliable deployment services.",
+            },
+            {
+              id: "edited-bullet",
+              kind: "bullet",
+              change: "edited",
+              before: "Built typed deployment services.",
+              after: "Built Production TypeScript deployment services.",
+            },
+            {
+              id: "deleted-bullet",
+              kind: "bullet",
+              change: "deleted",
+              before: "Maintained a retired internal tool.",
+              after: null,
+            },
+            {
+              id: "added-bullet",
+              kind: "bullet",
+              change: "added",
+              before: null,
+              after: "Added zero-downtime delivery checks.",
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+function diffDocumentViewerFixture(id: string): RunDto {
+  const run = documentViewerFixture(id, true);
+  return {
+    ...run,
+    artifacts: [
+      ...run.artifacts,
+      {
+        id: resumeDiffArtifactId,
+        kind: "resume-diff" as const,
+        revision: run.revision,
+        attempt: 1,
+        sha256: "c".repeat(64),
+        bytes: 4_096,
+        mediaType: "application/json; charset=utf-8",
+        href: `/v1/runs/${id}/artifacts/${resumeDiffArtifactId}`,
+        public: true,
+        createdAt: 1_700_000_000_300,
+      },
+    ],
+  };
+}
+
 async function interceptDocumentRun(page: Page, run: RunDto): Promise<void> {
   await page.route(`**/api/pipeline/runs/${run.id}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
   });
   await page.route(`**/v1/runs/${run.id}/artifacts/*`, async (route) => {
+    await route.fulfill({ contentType: "application/pdf", body: "%PDF-1.4\n%%EOF" });
+  });
+}
+
+async function interceptDiffDocumentRun(page: Page, run: RunDto): Promise<void> {
+  await page.route(`**/api/pipeline/runs/${run.id}`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route(`**/api/pipeline/runs/${run.id}/artifacts/*`, async (route) => {
+    const artifactId = new URL(route.request().url()).pathname.split("/").at(-1);
+    if (artifactId === resumeDiffArtifactId) {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(resumeDiff) });
+      return;
+    }
     await route.fulfill({ contentType: "application/pdf", body: "%PDF-1.4\n%%EOF" });
   });
 }
@@ -468,6 +554,51 @@ test("switches between accessible resume and landscape keyword map tabs", async 
   await expect(viewer.locator("output")).toHaveText("125%");
   await viewer.getByRole("button", { name: "Fit page" }).click();
   await expect(viewer.locator("output")).toHaveText("100%");
+});
+
+test("shows the canonical and current resumes in an accessible diff tab", async ({ page }) => {
+  const detailRun = diffDocumentViewerFixture("resume-diff");
+  await interceptDiffDocumentRun(page, detailRun);
+  await page.goto("/runs/resume-diff");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  const tablist = viewer.getByRole("tablist", { name: "Document views" });
+  const tabs = tablist.getByRole("tab");
+  const resumeTab = tablist.getByRole("tab", { name: "Resume" });
+  const keywordMapTab = tablist.getByRole("tab", { name: "Keyword map" });
+  const diffTab = tablist.getByRole("tab", { name: "Diff" });
+  const diffPanel = viewer.locator("#resume-diff-document-panel");
+
+  await expect(tabs).toHaveText(["Resume", "Keyword map", "Diff"]);
+  await expect(diffTab).toHaveAttribute("aria-controls", "resume-diff-document-panel");
+  await resumeTab.focus();
+  await resumeTab.press("End");
+  await expect(diffTab).toBeFocused();
+  await expect(diffTab).toHaveAttribute("aria-selected", "true");
+  await expect(diffPanel).toHaveAttribute("role", "tabpanel");
+  await expect(diffPanel).toHaveAttribute("aria-labelledby", "resume-diff-document-tab");
+  await expect(diffPanel).toBeVisible();
+
+  const comparison = diffPanel.getByRole("table", { name: "Canonical and current resume comparison" });
+  await expect(comparison.getByRole("columnheader")).toHaveText(["BEFORE", "AFTER"]);
+  await expect(comparison.getByText("Owned reliable deployment services.", { exact: true })).toHaveCount(2);
+  await expect(comparison.locator("del")).toHaveText([
+    "Built typed deployment services.",
+    "Maintained a retired internal tool.",
+  ]);
+  await expect(comparison.locator("mark")).toHaveText([
+    "Built Production TypeScript deployment services.",
+    "Added zero-downtime delivery checks.",
+  ]);
+
+  await diffTab.press("ArrowRight");
+  await expect(resumeTab).toBeFocused();
+  await resumeTab.press("ArrowLeft");
+  await expect(diffTab).toBeFocused();
+  await diffTab.press("Home");
+  await expect(resumeTab).toBeFocused();
+  await resumeTab.press("ArrowRight");
+  await expect(keywordMapTab).toBeFocused();
 });
 
 test("shows only the Resume tab when the revision has no keyword map", async ({ page }) => {
