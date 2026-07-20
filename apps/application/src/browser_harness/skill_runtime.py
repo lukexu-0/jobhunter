@@ -5,19 +5,20 @@ import base64
 import io
 import ipaddress
 import json
+import errno
 import os
 import shutil
 import signal
 import stat
 import struct
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from browser_use.browser.events import SwitchTabEvent
-from browser_use.skills.browser_use import skill_text
 from PIL import Image
 
 from .models import (
@@ -33,8 +34,10 @@ _MAX_OUTPUT_CHARS = 20_000
 _MAX_DOM_CHARS = 40_000
 _MAX_PNG_BYTES = 8 * 1024 * 1024
 _MAX_IMAGE_SIDE = 1_800
-_RESULT_MARKER_START = "\x1eJOBHUNTER_BROWSER_RESULT:"
-_RESULT_MARKER_END = ":JOBHUNTER_BROWSER_RESULT_END\x1e"
+_MAX_URL_CHARS = 4_096
+_MAX_TITLE_CHARS = 4_096
+_MAX_TAB_ID_CHARS = 512
+_MAX_TABS = 100
 
 
 class BrowserSkillRuntimeError(Exception):
@@ -86,9 +89,16 @@ def _json_object(raw: bytes) -> dict[str, Any]:
             result[key] = value
         return result
 
+    def reject_constant(_value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=object_pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=object_pairs,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         raise BrowserSkillRuntimeError("browser_failed") from None
     if not isinstance(value, dict):
         raise BrowserSkillRuntimeError("browser_failed")
@@ -109,6 +119,8 @@ def _validate_execute_response(value: dict[str, Any]) -> dict[str, Any]:
         "stderr",
         "stdout_truncated",
         "stderr_truncated",
+        "marker",
+        "cancelled",
     }
     if set(value) != expected or value.get("ok") is not True:
         raise BrowserSkillRuntimeError("browser_failed")
@@ -119,37 +131,49 @@ def _validate_execute_response(value: dict[str, Any]) -> dict[str, Any]:
         "deadline_exhausted",
         "stdout_truncated",
         "stderr_truncated",
+        "cancelled",
     ):
         if type(value[key]) is not bool:
             raise BrowserSkillRuntimeError("browser_failed")
     for key in ("stdout", "stderr"):
         if not isinstance(value[key], str) or len(value[key]) > _MAX_OUTPUT_CHARS:
             raise BrowserSkillRuntimeError("browser_failed")
+    marker = value["marker"]
+    if marker is not None:
+        if type(marker) is not dict or set(marker) != {"current_tab", "page_info"}:
+            raise BrowserSkillRuntimeError("browser_failed")
+        current_tab = marker["current_tab"]
+        page_info = marker["page_info"]
+        if (
+            type(current_tab) is not dict
+            or set(current_tab) != {"targetId", "url", "title"}
+            or not isinstance(current_tab["targetId"], str)
+            or not current_tab["targetId"]
+            or len(current_tab["targetId"]) > 512
+            or not isinstance(current_tab["url"], str)
+            or len(current_tab["url"]) > 4_096
+            or not isinstance(current_tab["title"], str)
+            or len(current_tab["title"]) > 4_096
+            or not (isinstance(page_info, dict) or page_info is None)
+        ):
+            raise BrowserSkillRuntimeError("browser_failed")
+        try:
+            marker_size = len(
+                json.dumps(
+                    marker,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            )
+        except (TypeError, ValueError, RecursionError):
+            raise BrowserSkillRuntimeError("browser_failed") from None
+        if marker_size > 16_000:
+            raise BrowserSkillRuntimeError("browser_failed")
+
     return value
 
 
-def _marker_payload(stdout: str) -> tuple[str, dict[str, Any] | None]:
-    start = stdout.rfind(_RESULT_MARKER_START)
-    if start < 0:
-        return stdout, None
-    payload_start = start + len(_RESULT_MARKER_START)
-    end = stdout.find(_RESULT_MARKER_END, payload_start)
-    if end < 0:
-        return stdout[:start], None
-    cleaned = stdout[:start] + stdout[end + len(_RESULT_MARKER_END) :]
-    try:
-        payload = _json_object(stdout[payload_start:end].encode("utf-8"))
-    except BrowserSkillRuntimeError:
-        return cleaned, None
-    if set(payload) != {"current_tab", "page_info"}:
-        return cleaned, None
-    current_tab = payload["current_tab"]
-    page_info = payload["page_info"]
-    if not isinstance(current_tab, dict) or not (
-        isinstance(page_info, dict) or page_info is None
-    ):
-        return cleaned, None
-    return cleaned, payload
 
 
 def _bounded_append(value: str, suffix: str) -> tuple[str, bool]:
@@ -175,10 +199,10 @@ def _png_screenshot(value: str | None) -> BrowserScreenshot | None:
             width, height = image.size
             if width <= 0 or height <= 0 or width * height > 100_000_000:
                 raise BrowserSkillRuntimeError("browser_failed")
+            image.load()
             if max(width, height) <= _MAX_IMAGE_SIDE:
                 encoded = value
             else:
-                image.load()
                 image.thumbnail(
                     (_MAX_IMAGE_SIDE, _MAX_IMAGE_SIDE),
                     Image.Resampling.LANCZOS,
@@ -251,26 +275,59 @@ class BrowserSkillRuntime:
         self._supervisor: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._active_task: asyncio.Task[Any] | None = None
+        self._quarantine_directory: Path | None = None
 
     def _remaining(self) -> float:
         return self._deadline - asyncio.get_running_loop().time()
 
     def _prepare_session_paths(self) -> None:
+        quarantine: Path | None = None
         try:
             self._session_directory = self._session_directory.resolve(strict=True)
             self._workspace = self._workspace.resolve(strict=True)
+            if (
+                self._session_directory == self._workspace
+                or self._session_directory.is_relative_to(self._workspace)
+                or self._workspace.is_relative_to(self._session_directory)
+                or self._quarantine_directory is not None
+            ):
+                raise OSError("overlapping runtime paths")
             for path in (
                 self._session_directory / "browser-skill-home",
                 self._session_directory / "browser-skill-runtime",
                 self._session_directory / "browser-skill-tmp",
-                self._session_directory / "browser-skill-quarantine",
             ):
                 path.mkdir(mode=0o700, exist_ok=True)
                 details = path.lstat()
-                if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+                if (
+                    stat.S_ISLNK(details.st_mode)
+                    or not stat.S_ISDIR(details.st_mode)
+                    or details.st_uid != os.getuid()
+                ):
                     raise OSError("unsafe runtime path")
                 path.chmod(0o700)
+            quarantine = Path(
+                tempfile.mkdtemp(
+                    prefix=".browser-skill-quarantine-",
+                    dir=self._session_directory.parent,
+                )
+            )
+            quarantine.chmod(0o700)
+            details = quarantine.lstat()
+            if (
+                stat.S_ISLNK(details.st_mode)
+                or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o700
+            ):
+                raise OSError("unsafe quarantine path")
+            self._quarantine_directory = quarantine
         except OSError:
+            if quarantine is not None:
+                try:
+                    shutil.rmtree(quarantine)
+                except OSError:
+                    pass
             raise BrowserSkillRuntimeError("browser_failed") from None
 
     def _bubblewrap_command(self) -> tuple[str, ...]:
@@ -282,6 +339,8 @@ class BrowserSkillRuntime:
                 (environment_root, *_python_runtime_roots(), application_source)
             )
         )
+        if Path("/") in read_only_custom:
+            raise BrowserSkillRuntimeError("browser_failed")
         writable = (self._session_directory, self._workspace)
         command: list[str] = [
             str(self._bubblewrap_executable),
@@ -308,9 +367,11 @@ class BrowserSkillRuntime:
             command.extend(("--ro-bind", str(path), str(path)))
         for path in writable:
             command.extend(("--bind", str(path), str(path)))
-        home = self._session_directory / "browser-skill-home"
-        runtime = self._session_directory / "browser-skill-runtime"
-        temporary = self._session_directory / "browser-skill-tmp"
+        sandbox_session = Path("/jobhunter-session")
+        command.extend(("--bind", str(self._session_directory), str(sandbox_session)))
+        home = sandbox_session / "browser-skill-home"
+        runtime = sandbox_session / "browser-skill-runtime"
+        temporary = sandbox_session / "browser-skill-tmp"
         environment = {
             "HOME": str(home),
             "XDG_CONFIG_HOME": str(home / ".config"),
@@ -330,7 +391,7 @@ class BrowserSkillRuntime:
             "TMPDIR": "/tmp",
             "LANG": "C.UTF-8",
             "JOBHUNTER_SESSION_DEADLINE": repr(self._deadline),
-            "JOBHUNTER_SESSION_DIRECTORY": str(self._session_directory),
+            "JOBHUNTER_SESSION_DIRECTORY": str(sandbox_session),
             self._cdp_environment[0]: self._cdp_environment[1],
         }
         command.append("--clearenv")
@@ -339,7 +400,7 @@ class BrowserSkillRuntime:
         command.extend(
             (
                 "--chdir",
-                str(self._session_directory),
+                str(sandbox_session),
                 "--",
                 sys.executable,
                 "-m",
@@ -375,6 +436,7 @@ class BrowserSkillRuntime:
                 raise BrowserSkillRuntimeError("browser_failed") from None
             self._cdp_environment = _loopback_cdp_environment(self._browser.cdp_url)
             self._prepare_session_paths()
+            self._quarantine_workspace_entries()
             try:
                 process = await asyncio.create_subprocess_exec(
                     *self._bubblewrap_command(),
@@ -384,8 +446,16 @@ class BrowserSkillRuntime:
                     start_new_session=True,
                 )
             except asyncio.CancelledError:
+                try:
+                    self._remove_quarantine_directory()
+                except BrowserSkillRuntimeError:
+                    pass
                 raise
             except Exception:
+                try:
+                    self._remove_quarantine_directory()
+                except BrowserSkillRuntimeError:
+                    pass
                 raise BrowserSkillRuntimeError("browser_failed") from None
             self._supervisor = process
             assert process.stderr is not None
@@ -399,6 +469,10 @@ class BrowserSkillRuntime:
                 pass
             else:
                 await self._terminate_supervisor()
+                try:
+                    self._remove_quarantine_directory()
+                except BrowserSkillRuntimeError:
+                    pass
                 raise BrowserSkillRuntimeError("browser_failed")
             self._started = True
 
@@ -447,8 +521,68 @@ class BrowserSkillRuntime:
             if self._remaining() <= 0:
                 raise BrowserSkillRuntimeError("session_timeout") from None
             raise BrowserSkillRuntimeError("browser_failed") from None
+    async def _cancel_execution(
+        self,
+        response_task: asyncio.Task[dict[str, Any]],
+    ) -> None:
+        try:
+            if not response_task.done():
+                await self._write_frame({"op": "cancel"})
+            async with asyncio.timeout(10.0):
+                response = await asyncio.shield(response_task)
+            _validate_execute_response(response)
+        except (BrowserSkillRuntimeError, TimeoutError, asyncio.CancelledError):
+            response_task.cancel()
+            await asyncio.gather(response_task, return_exceptions=True)
+            await self._terminate_supervisor()
+
+    async def _exchange_execution(
+        self,
+        request: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        await self._write_frame(request)
+        response_task = asyncio.create_task(
+            self._read_frame(),
+            name="browser-skill-execution-response",
+        )
+        try:
+            async with asyncio.timeout(timeout):
+                return await asyncio.shield(response_task)
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(
+                self._cancel_execution(response_task),
+                name="browser-skill-execution-cancellation",
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(cleanup_task)
+            raise
+        except TimeoutError:
+            response_task.cancel()
+            await asyncio.gather(response_task, return_exceptions=True)
+            if self._remaining() <= 0:
+                raise BrowserSkillRuntimeError("session_timeout") from None
+            raise BrowserSkillRuntimeError("browser_failed") from None
+
 
     async def _observe(
+        self,
+        marker: dict[str, Any] | None,
+    ) -> BrowserObservation:
+        remaining = self._remaining()
+        if remaining <= 0:
+            raise BrowserSkillRuntimeError("session_timeout")
+        try:
+            async with asyncio.timeout(remaining):
+                return await self._observe_with_no_deadline(marker)
+        except TimeoutError:
+            raise BrowserSkillRuntimeError("session_timeout") from None
+
+
+    async def _observe_with_no_deadline(
         self,
         marker: dict[str, Any] | None,
     ) -> BrowserObservation:
@@ -482,16 +616,20 @@ class BrowserSkillRuntime:
             dom = state.dom_state.llm_representation()[:_MAX_DOM_CHARS]
             tabs = [
                 BrowserTab(
-                    url=tab.url,
-                    title=tab.title,
-                    tab_id=tab.target_id,
-                    parent_tab_id=tab.parent_target_id,
+                    url=tab.url[:_MAX_URL_CHARS],
+                    title=tab.title[:_MAX_TITLE_CHARS],
+                    tab_id=tab.target_id[:_MAX_TAB_ID_CHARS],
+                    parent_tab_id=(
+                        tab.parent_target_id[:_MAX_TAB_ID_CHARS]
+                        if tab.parent_target_id is not None
+                        else None
+                    ),
                 )
-                for tab in state.tabs
+                for tab in state.tabs[:_MAX_TABS]
             ]
             return BrowserObservation(
-                url=state.url,
-                title=state.title,
+                url=state.url[:_MAX_URL_CHARS],
+                title=state.title[:_MAX_TITLE_CHARS],
                 tabs=tabs,
                 dom=dom,
                 page_info=page_info,
@@ -504,8 +642,80 @@ class BrowserSkillRuntime:
         except Exception:
             raise BrowserSkillRuntimeError("browser_failed") from None
 
+    @staticmethod
+    def _move_to_quarantine(
+        entry: Path,
+        destination: Path,
+        details: os.stat_result,
+    ) -> None:
+        try:
+            os.rename(entry, destination)
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+        if stat.S_ISLNK(details.st_mode):
+            os.symlink(os.readlink(entry), destination)
+            entry.unlink()
+            return
+        if stat.S_ISREG(details.st_mode):
+            source_descriptor = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                destination_descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                try:
+                    with (
+                        os.fdopen(source_descriptor, "rb", closefd=False) as source,
+                        os.fdopen(
+                            destination_descriptor, "wb", closefd=False
+                        ) as target,
+                    ):
+                        shutil.copyfileobj(source, target, length=64 * 1024)
+                finally:
+                    os.close(destination_descriptor)
+            finally:
+                os.close(source_descriptor)
+            entry.unlink()
+            return
+        if stat.S_ISDIR(details.st_mode):
+            shutil.copytree(entry, destination, symlinks=True)
+            shutil.rmtree(entry)
+            return
+        entry.unlink()
+
+
+    def _checked_quarantine_directory(self) -> Path:
+        quarantine = self._quarantine_directory
+        if quarantine is None:
+            raise BrowserSkillRuntimeError("browser_failed")
+        try:
+            details = quarantine.lstat()
+        except OSError:
+            raise BrowserSkillRuntimeError("browser_failed") from None
+        if (
+            stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != 0o700
+        ):
+            raise BrowserSkillRuntimeError("browser_failed")
+        return quarantine
+
+    def _remove_quarantine_directory(self) -> None:
+        if self._quarantine_directory is None:
+            return
+        quarantine = self._checked_quarantine_directory()
+        try:
+            shutil.rmtree(quarantine)
+        except OSError:
+            raise BrowserSkillRuntimeError("browser_failed") from None
+        self._quarantine_directory = None
+
     def _quarantine_workspace_entries(self) -> None:
-        quarantine = self._session_directory / "browser-skill-quarantine"
+        quarantine = self._checked_quarantine_directory()
         try:
             for entry in tuple(self._workspace.iterdir()):
                 details = entry.lstat()
@@ -513,6 +723,7 @@ class BrowserSkillRuntime:
                     entry.name == "agent_helpers.py"
                     and stat.S_ISREG(details.st_mode)
                     and not stat.S_ISLNK(details.st_mode)
+                    and details.st_nlink == 1
                 ) or (
                     entry.name == "domain-skills"
                     and stat.S_ISDIR(details.st_mode)
@@ -521,7 +732,7 @@ class BrowserSkillRuntime:
                 if allowed:
                     continue
                 destination = quarantine / f"{uuid4().hex}-{entry.name}"
-                shutil.move(str(entry), destination)
+                self._move_to_quarantine(entry, destination, details)
         except OSError:
             raise BrowserSkillRuntimeError("browser_failed") from None
 
@@ -537,7 +748,12 @@ class BrowserSkillRuntime:
                 raise BrowserSkillRuntimeError("session_timeout")
             self._active_task = task
             try:
-                if len(code.encode("utf-8")) > _MAX_SOURCE_BYTES:
+                self._quarantine_workspace_entries()
+                try:
+                    encoded_code = code.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise BrowserSkillRuntimeError("browser_failed") from None
+                if len(encoded_code) > _MAX_SOURCE_BYTES:
                     observation = await self._observe(None)
                     return BrowserUseExecutionResult(
                         exit_code=2,
@@ -550,14 +766,17 @@ class BrowserSkillRuntime:
                     )
                 wait_seconds = min(125.0, remaining + 0.25)
                 response = _validate_execute_response(
-                    await self._exchange(
+                    await self._exchange_execution(
                         {"op": "execute", "code": code},
                         timeout=wait_seconds,
                     )
                 )
+                if response["cancelled"]:
+                    raise BrowserSkillRuntimeError("browser_failed")
                 if response["deadline_exhausted"]:
                     raise BrowserSkillRuntimeError("session_timeout")
-                stdout, marker = _marker_payload(response["stdout"])
+                stdout = response["stdout"]
+                marker = response["marker"]
                 stderr = response["stderr"]
                 stderr_truncated = response["stderr_truncated"]
                 if response["timed_out"]:
@@ -572,7 +791,6 @@ class BrowserSkillRuntime:
                         "Browser Use result metadata was unavailable.",
                     )
                     stderr_truncated = stderr_truncated or added_truncation
-                self._quarantine_workspace_entries()
                 observation = await self._observe(marker)
                 return BrowserUseExecutionResult(
                     exit_code=response["exit_code"],
@@ -587,13 +805,17 @@ class BrowserSkillRuntime:
                     observation=observation,
                 )
             except asyncio.CancelledError:
-                await asyncio.shield(self._terminate_supervisor())
                 raise
             except BrowserSkillRuntimeError:
-                if self._supervisor is not None and self._supervisor.returncode is not None:
-                    await self._terminate_supervisor()
+                await self._terminate_supervisor()
                 raise
             finally:
+                active_exception = sys.exc_info()[0] is not None
+                try:
+                    self._quarantine_workspace_entries()
+                except BrowserSkillRuntimeError:
+                    if not active_exception:
+                        raise
                 if self._active_task is task:
                     self._active_task = None
 
@@ -615,6 +837,7 @@ class BrowserSkillRuntime:
                             pass
                         await process.wait()
                 self._supervisor = None
+            self._started = False
             stderr_task = self._stderr_task
             self._stderr_task = None
             if stderr_task is not None:
@@ -645,6 +868,7 @@ class BrowserSkillRuntime:
                             response["exit_code"] != 0
                             or response["timed_out"]
                             or response["deadline_exhausted"]
+                            or response["cancelled"]
                             or response["stdout"]
                             or response["stderr"]
                             or response["stdout_truncated"]
@@ -654,15 +878,12 @@ class BrowserSkillRuntime:
                 except (BrowserSkillRuntimeError, asyncio.CancelledError):
                     stop_failed = True
             await self._terminate_supervisor()
+            try:
+                self._remove_quarantine_directory()
+            except BrowserSkillRuntimeError:
+                stop_failed = True
             self._close_complete = True
             if stop_failed:
                 raise BrowserSkillRuntimeError("browser_failed")
 
 
-def load_browser_skill() -> str:
-    """Return the exact Browser Use skill bundled by the pinned dependency."""
-
-    return skill_text()
-
-
-__all__ = ["BrowserSkillRuntime", "BrowserSkillRuntimeError", "load_browser_skill"]
