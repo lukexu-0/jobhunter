@@ -16,6 +16,8 @@ function runFixture(): RunDto {
     id: "presentation-run",
     status: "approved",
     applicationStatus: "applied",
+    queueSequence: 1,
+    generateKeywordMap: false,
     revision: 1,
     origin: "initial",
     createdAt: 1_700_000_000_000,
@@ -31,6 +33,8 @@ async function interceptAnalyzedRun(page: Page): Promise<void> {
   const run: RunDto = {
     ...runFixture(),
     id: "presentation-identity-run",
+    queueSequence: 1,
+    generateKeywordMap: false,
     artifacts: [{
       id: "presentation-job-analysis",
       kind: "job-analysis",
@@ -47,6 +51,8 @@ async function interceptAnalyzedRun(page: Page): Promise<void> {
   const explicitOrganizationRun: RunDto = {
     ...runFixture(),
     id: "presentation-not-mentioned",
+    queueSequence: 2,
+    generateKeywordMap: false,
     artifacts: [{
       id: "not-mentioned-job-analysis",
       kind: "job-analysis",
@@ -63,6 +69,8 @@ async function interceptAnalyzedRun(page: Page): Promise<void> {
   const malformedTargetRun: RunDto = {
     ...runFixture(),
     id: "presentation-malformed-target",
+    queueSequence: 3,
+    generateKeywordMap: false,
     artifacts: [{
       id: "malformed-target-job-analysis",
       kind: "job-analysis",

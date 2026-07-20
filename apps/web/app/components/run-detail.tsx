@@ -20,10 +20,7 @@ import {
   retryRun,
 } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
-import {
-  selectCurrentRevisionArtifact,
-  selectReusableJobAnalysis,
-} from "../lib/run-detail-artifacts";
+import { selectResolvedArtifact } from "../lib/run-detail-artifacts";
 import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
@@ -151,14 +148,13 @@ function currentPdfArtifact(run: RunDto | null): ArtifactDto | undefined {
   return run.artifacts.find(
     (artifact) => artifact.public
       && artifact.kind === "compiled-pdf"
-      && artifact.revision === run.revision
       && artifact.sha256 === run.currentPdfSha256,
   );
 }
 
 function currentPageImage(run: RunDto | null): ArtifactDto | undefined {
   if (!run || !REVIEW_STATUSES[run.status]) return undefined;
-  return selectCurrentRevisionArtifact(run.artifacts, run.revision, "page-image");
+  return selectResolvedArtifact(run.artifacts, "page-image");
 }
 
 function safeArtifactHref(artifact: ArtifactDto | undefined): string | null {
@@ -591,9 +587,7 @@ export function RunDetail({ runId }: RunDetailProps) {
 
   const artifactFor = useCallback((kind: ArtifactKind) => {
     if (!run) return undefined;
-    return kind === "job-analysis"
-      ? selectReusableJobAnalysis(run.artifacts)
-      : selectCurrentRevisionArtifact(run.artifacts, run.revision, kind);
+    return selectResolvedArtifact(run.artifacts, kind);
   }, [run]);
   const dataFor = useCallback((kind: ArtifactKind): unknown => {
     const artifact = artifactFor(kind);
@@ -607,12 +601,8 @@ export function RunDetail({ runId }: RunDetailProps) {
   const analysisArtifact = artifactFor("job-analysis");
   const analysis = dataFor("job-analysis");
   const identity = parseJobIdentity(analysis);
-  const extractionArtifact = analysisArtifact && run
-    ? selectCurrentRevisionArtifact(
-      run.artifacts,
-      analysisArtifact.revision,
-      "ats-keyword-extraction",
-    )
+  const extractionArtifact = analysisArtifact
+    ? artifactFor("ats-keyword-extraction")
     : undefined;
   const extraction = extractionArtifact ? artifactData[extractionArtifact.id] : undefined;
   const extractionError = extractionArtifact ? artifactErrors[extractionArtifact.id] : undefined;

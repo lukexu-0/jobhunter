@@ -5,6 +5,8 @@ const reviewRun: RunDto = {
   id: "metadata-review-run",
   status: "review",
   applicationStatus: "applied",
+  queueSequence: 1,
+  generateKeywordMap: false,
   revision: 4,
   origin: "initial",
   createdAt: 1_700_000_000_000,
@@ -73,6 +75,8 @@ test("keeps loading a tailoring run artifact across polling and eventually shows
     ...reviewRun,
     id: "metadata-tailoring-run",
     status: "tailoring",
+    queueSequence: 1,
+    generateKeywordMap: false,
     artifacts: [{
       ...reviewRun.artifacts[0],
       id: "tailoring-job-analysis",

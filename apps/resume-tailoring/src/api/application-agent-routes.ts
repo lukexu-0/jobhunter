@@ -156,7 +156,7 @@ export function createApplicationAgentRoutes(
     const deadlineSignal = AbortSignal.timeout(input.deadlineMs);
     const invokeSignal = AbortSignal.any([request.signal, deadlineSignal]);
     try {
-      const success = await service.invoke(input, invokeSignal);
+      const success = await runAbortable(() => service.invoke(input, invokeSignal), invokeSignal);
       request.signal.throwIfAborted();
       if (deadlineSignal.aborted) {
         return apiResponse.error("MODEL_TIMEOUT", "The model request timed out", 504);

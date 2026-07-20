@@ -17,6 +17,14 @@ TOKEN = "test-token-0123456789abcdef-0123456789"
 LOOPBACK_CDP_URL = "http://127.0.0.1:9222"
 
 
+@pytest.fixture
+def fake_bubblewrap(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-bwrap"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return executable
+
+
 def _assert_parse_error(argv: list[str], *, environ: dict[str, str] | None = None) -> None:
     with pytest.raises(SystemExit) as raised:
         cli_module.parse_config(
@@ -72,6 +80,7 @@ def test_token_must_come_from_environment_and_have_at_least_32_characters(
 
 def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profile(
     tmp_path: Path,
+    fake_bubblewrap: Path,
 ) -> None:
     executable = tmp_path / "chrome"
     executable.write_bytes(b"fake Chrome executable")
@@ -86,6 +95,8 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
             "http://localhost:4567",
             "--session-timeout",
             "123",
+            "--bubblewrap-executable",
+            str(fake_bubblewrap),
             "--chrome-executable",
             str(executable),
             "--chrome-user-data-dir",
@@ -99,6 +110,7 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
         pipeline_url="http://localhost:4567",
         port=9876,
         session_timeout=123,
+        bubblewrap_executable=fake_bubblewrap.resolve(),
         browser=BrowserLaunchConfig(
             chrome_executable=executable,
             chrome_user_data_dir=profile,
@@ -124,9 +136,15 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
 def test_valid_loopback_cdp_configuration(
     provided: str,
     canonical: str,
+    fake_bubblewrap: Path,
 ) -> None:
     config, launch = cli_module.parse_config(
-        ["--cdp-url", provided],
+        [
+            "--cdp-url",
+            provided,
+            "--bubblewrap-executable",
+            str(fake_bubblewrap),
+        ],
         environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
     )
 
@@ -140,10 +158,9 @@ def test_valid_loopback_cdp_configuration(
 
 def test_runtime_paths_are_explicit_resolved_configuration(
     tmp_path: Path,
+    fake_bubblewrap: Path,
 ) -> None:
-    bubblewrap = tmp_path / "bwrap"
-    bubblewrap.write_bytes(b"fake bubblewrap executable")
-    bubblewrap.chmod(0o700)
+    bubblewrap = fake_bubblewrap
     workspace = tmp_path / "browser-skill" / "agent-workspace"
     user_info_json = tmp_path / "private" / "user-info.json"
 
@@ -254,6 +271,7 @@ def test_public_host_token_options_and_long_option_abbreviations_do_not_exist(
 
 def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     tmp_path: Path,
+    fake_bubblewrap: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executable = tmp_path / "chrome"
@@ -308,6 +326,8 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
             "http://localhost:3458",
             "--session-timeout",
             "1800",
+            "--bubblewrap-executable",
+            str(fake_bubblewrap),
             "--chrome-executable",
             str(executable),
             "--chrome-user-data-dir",
@@ -324,6 +344,7 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         pipeline_url="http://localhost:3458",
         port=8766,
         session_timeout=1800,
+        bubblewrap_executable=fake_bubblewrap.resolve(),
         browser=expected_browser,
     )
     assert resolve_calls == [expected_browser]

@@ -35,6 +35,8 @@ function run(status: RunStatus = "queued"): RunDto {
     id: `run ${status}`,
     status,
     applicationStatus: "applied",
+    queueSequence: 1,
+    generateKeywordMap: false,
     revision: 0,
     origin: "initial",
     createdAt: 1,

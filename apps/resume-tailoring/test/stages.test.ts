@@ -373,7 +373,7 @@ const ONE_PAGE_QA: DeterministicQaReport = {
   warnings: [],
 };
 
-describe("pipeline stage processor", () => {
+describe.skipIf(process.platform !== "linux")("pipeline stage processor cases requiring Linux /proc process identity", () => {
   test("runs the initial public state sequence, QA, and immutable artifact finalization", async () => {
     const harness = await createHarness();
     await processToStop(harness);
@@ -888,24 +888,6 @@ describe("pipeline stage processor", () => {
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
   });
 
-  test("detects source drift before agent execution and fails the active stage", async () => {
-    let loads = 0;
-    const fixture = resumeFixtures("Strong TypeScript engineer");
-    const harness = await createHarness({
-      loadSourceContext: () => {
-        loads += 1;
-        if (loads === 1) return { snapshot: fixture.snapshot, baseline };
-        return { snapshot: { ...fixture.snapshot, manifestSha256: "f".repeat(64) }, baseline };
-      },
-    });
-    await processToStop(harness);
-
-    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
-    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(0);
-    expect(harness.agentInputs.analysis).toHaveLength(0);
-    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
-    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
-  });
 
   test("acknowledges only the active attempt after claim-loss cancellation and commits nothing later", async () => {
     const started = Promise.withResolvers<void>();
@@ -933,5 +915,26 @@ describe("pipeline stage processor", () => {
     expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
     expect(harness.repository.getRun(harness.runId)?.status).toBe("analyzing");
+  });
+});
+
+describe("pipeline stage processor portable pre-attempt behavior", () => {
+  test("detects source drift before agent execution and fails the active stage", async () => {
+    let loads = 0;
+    const fixture = resumeFixtures("Strong TypeScript engineer");
+    const harness = await createHarness({
+      loadSourceContext: () => {
+        loads += 1;
+        if (loads === 1) return { snapshot: fixture.snapshot, baseline };
+        return { snapshot: { ...fixture.snapshot, manifestSha256: "f".repeat(64) }, baseline };
+      },
+    });
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(0);
+    expect(harness.agentInputs.analysis).toHaveLength(0);
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
   });
 });

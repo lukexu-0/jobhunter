@@ -221,6 +221,8 @@ export const RunDtoSchema = z
     id: z.string(),
     status: RunStatusSchema,
     applicationStatus: ApplicationStatusSchema,
+    generateKeywordMap: z.boolean(),
+    queueSequence: z.number().int().positive(),
     revision: z.number().int().nonnegative(),
     origin: RevisionOriginSchema,
     createdAt: z.number().int(),

@@ -450,6 +450,50 @@ describe("application agent HTTP boundary", () => {
       deadlineSpy.mockRestore();
     }
   });
+  test("returns MODEL_TIMEOUT when invocation ignores the expired deadline signal", async () => {
+    const bodyController = new AbortController();
+    const deadlineController = new AbortController();
+    const invocation = Promise.withResolvers<typeof SUCCESS>();
+    const invocationStarted = Promise.withResolvers<void>();
+    let seenSignal: AbortSignal | undefined;
+    let timeoutIndex = 0;
+    const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation(() => (
+      timeoutIndex++ === 0 ? bodyController.signal : deadlineController.signal
+    ));
+    let responsePromise: Promise<Response | null> | undefined;
+    try {
+      const route = createApplicationAgentRoutes(fakeService({
+        invoke: (_input, signal) => {
+          seenSignal = signal;
+          invocationStarted.resolve();
+          return invocation.promise;
+        },
+      }), TOKEN);
+      responsePromise = route(request(APPLICATION_AGENT_PATH, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ ...INPUT, deadlineMs: 1_000 }),
+      }), new URL(`${API_ORIGIN}${APPLICATION_AGENT_PATH}`));
+      await invocationStarted.promise;
+
+      deadlineController.abort(new DOMException("Deadline expired", "TimeoutError"));
+      expect(seenSignal?.aborted).toBe(true);
+      const settledPromptly = (async (): Promise<never> => {
+        for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+        throw new Error("application-agent POST did not settle after its deadline");
+      })();
+      const response = await Promise.race([responsePromise, settledPromptly]);
+
+      expect(response?.status).toBe(504);
+      expect(await response?.json()).toEqual({
+        error: { code: "MODEL_TIMEOUT", message: "The model request timed out" },
+      });
+    } finally {
+      invocation.resolve(SUCCESS);
+      await responsePromise?.catch(() => undefined);
+      timeoutSpy.mockRestore();
+    }
+  });
   test("propagates the request abort reason by identity", async () => {
     const controller = new AbortController();
     const abortReason = new Error("caller cancellation identity");

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -25,6 +25,8 @@ import {
 
 const roots: string[] = [];
 
+const testWithPdftotext = test.skipIf(Bun.which("pdftotext") === null);
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -32,7 +34,7 @@ afterEach(async () => {
 async function compiledResume(
   resumeText = "Built production TypeScript services with Next.js and reliable APIs.",
 ): Promise<Pick<KeywordMapRequest, "artifacts" | "compiledPdf">> {
-  const root = await mkdtemp(join(tmpdir(), "keyword-map-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "keyword-map-")));
   roots.push(root);
   const artifacts = new ArtifactStore(root);
   const attempt = await artifacts.createAttempt({ run: 1, revision: "1", stage: "compiling", attempt: 1 });
@@ -97,7 +99,7 @@ describe("keyword map renderer", () => {
       .toBe("Platform Engineer\n- Build & own APIs");
   });
 
-  test("renders every normalized JD line across landscape pages with repeated resume and red match operators", async () => {
+  testWithPdftotext("renders every normalized JD line across landscape pages with repeated resume and red match operators", async () => {
     const resume = await compiledResume();
     const paragraphs = Array.from({ length: 145 }, (_, index) =>
       `Requirement ${index + 1}: Own TypeScript delivery, testing, observability, and reliable production systems.`,
@@ -149,7 +151,7 @@ describe("keyword map renderer", () => {
     expect(operators).toMatch(/\bm\b[\s\S]*\bl\b/);
   });
 
-  test("red-boxes matched extracted phrases and yellow-highlights only the absent JD phrase", async () => {
+  testWithPdftotext("red-boxes matched extracted phrases and yellow-highlights only the absent JD phrase", async () => {
     const resume = await compiledResume();
     const atsKeywordExtraction = atsKeywordExtractionFixture();
     const analysis = jobAnalysisFixture({
@@ -185,7 +187,7 @@ describe("keyword map renderer", () => {
     expect(operators.match(/1 0\.85 0 rg/g)).toHaveLength(1);
   });
 
-  test("highlights complete keywords within punctuation-delimited PDF word boxes", async () => {
+  testWithPdftotext("highlights complete keywords within punctuation-delimited PDF word boxes", async () => {
     const jobDescription = "TypeScript role requiring Node, Next.js, C++, and C#";
     const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
     const atsKeywordExtraction = {
@@ -229,7 +231,7 @@ describe("keyword map renderer", () => {
     }
   });
 
-  test("does not highlight an unrelated resume phrase sharing only one meaningful token", async () => {
+  testWithPdftotext("does not highlight an unrelated resume phrase sharing only one meaningful token", async () => {
     const jobDescription = "Seeking TypeScript engineers with a genuinely high engineering bar.";
     const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
     const atsKeywordExtraction = {

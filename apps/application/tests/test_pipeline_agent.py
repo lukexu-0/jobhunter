@@ -612,6 +612,21 @@ async def test_close_is_idempotent_and_rejects_new_requests(
     assert len(harness.requests) == request_count
 
 
+async def test_uppercase_loopback_pipeline_origin_is_canonicalized_for_requests(
+    build_client: Callable[..., ClientHarness],
+) -> None:
+    harness = build_client(
+        lambda _request: httpx.Response(200, json=_status_payload()),
+        pipeline_url="HTTP://LOCALHOST:3457/",
+    )
+
+    assert await harness.agent.check_ready() is None
+    assert len(harness.requests) == 1
+    assert harness.requests[0].url == httpx.URL(
+        "http://localhost:3457/v1/internal/application-agent"
+    )
+
+
 @pytest.mark.parametrize(
     "pipeline_url",
     [

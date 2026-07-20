@@ -19,6 +19,13 @@ function selectLatestPublic(
   return selected;
 }
 
+export function selectResolvedArtifact(
+  artifacts: readonly ArtifactDto[],
+  kind: ArtifactKind,
+): ArtifactDto | undefined {
+  return selectLatestPublic(artifacts, kind);
+}
+
 export function selectCurrentRevisionArtifact(
   artifacts: readonly ArtifactDto[],
   revision: number,
@@ -28,7 +35,7 @@ export function selectCurrentRevisionArtifact(
 }
 
 export function selectReusableJobAnalysis(artifacts: readonly ArtifactDto[]): ArtifactDto | undefined {
-  return selectLatestPublic(artifacts, "job-analysis");
+  return selectResolvedArtifact(artifacts, "job-analysis");
 }
 
 export function publicArtifacts(artifacts: readonly ArtifactDto[]): ArtifactDto[] {

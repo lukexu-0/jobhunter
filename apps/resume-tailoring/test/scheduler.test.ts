@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { WorkerScheduler, type SchedulerRepository } from "../src/worker/scheduler";
 import type { RunClaim } from "../src/worker/claims";
 
@@ -33,6 +33,68 @@ describe("singleton worker scheduler", () => {
     expect(maximumActive).toBe(1);
     expect(order).toEqual(["start:run-1", "finish:run-1", "start:run-2", "finish:run-2"]);
     expect(released).toEqual(["run-1", "run-2"]);
+  });
+
+  test("close aborts and joins the active processor", async () => {
+    vi.useFakeTimers();
+    try {
+      const only = claim("run-1", 3);
+      let acquired = false;
+      let signalProcessorStarted!: () => void;
+      const processorStarted = new Promise<void>((resolve) => { signalProcessorStarted = resolve; });
+      let signalAbortObserved!: () => void;
+      const abortObserved = new Promise<void>((resolve) => { signalAbortObserved = resolve; });
+      let releaseProcessor!: () => void;
+      const processorGate = new Promise<void>((resolve) => { releaseProcessor = resolve; });
+      let expireWatchdog!: () => void;
+      const watchdog = new Promise<"timeout">((resolve) => {
+        expireWatchdog = () => resolve("timeout");
+      });
+      const watchdogTimer = setTimeout(expireWatchdog, 100);
+      let processorFinished = false;
+      const scheduler = new WorkerScheduler({
+        acquire: () => acquired ? null : ((acquired = true), only),
+        heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+        release: () => undefined,
+      }, async (_value, signal) => {
+        signalProcessorStarted();
+        const outcome = await Promise.race([
+          new Promise<"aborted">((resolve) => {
+            signal.addEventListener("abort", () => {
+              signalAbortObserved();
+              resolve("aborted");
+            }, { once: true });
+          }),
+          watchdog,
+        ]);
+        if (outcome === "aborted") await processorGate;
+        processorFinished = true;
+      });
+
+      scheduler.kick();
+      await processorStarted;
+      let closeSettled = false;
+      const closing = scheduler.close().then(() => { closeSettled = true; });
+      const closeAbortOutcomePromise = Promise.race([
+        abortObserved.then(() => "aborted" as const),
+        watchdog,
+      ]);
+      await Promise.resolve();
+      vi.advanceTimersByTime(100);
+      const closeAbortOutcome = await closeAbortOutcomePromise;
+      await Promise.resolve();
+      const settledBeforeProcessorFinished = closeSettled;
+      releaseProcessor();
+      await closing;
+      clearTimeout(watchdogTimer);
+
+      expect(closeAbortOutcome).toBe("aborted");
+      expect(settledBeforeProcessorFinished).toBeFalse();
+      expect(processorFinished).toBeTrue();
+      expect(closeSettled).toBeTrue();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("defers after-drain maintenance until recovery after heartbeat loss", async () => {

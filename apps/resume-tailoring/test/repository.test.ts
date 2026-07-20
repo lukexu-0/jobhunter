@@ -383,7 +383,7 @@ describe("artifact retention reservations", () => {
   });
 });
 
-test("process start tokens distinguish the live worker from a reused or dead PID", () => {
+test.skipIf(process.platform !== "linux")("process start tokens distinguish the live worker from a reused or dead PID (requires Linux /proc)", () => {
   const startToken = readProcessStartToken();
   expect(startToken).toMatch(/^\d+$/);
   expect(isProcessIdentityAlive(process.pid, startToken!)).toBe(true);

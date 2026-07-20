@@ -318,6 +318,20 @@ def test_startup_rejects_symlink_and_non_regular_targets(tmp_path: Path) -> None
         UserInfoStore(directory)
 
 
+def test_startup_rejects_store_beneath_symlinked_parent(tmp_path: Path) -> None:
+    actual_parent = tmp_path / "actual-parent"
+    actual_parent.mkdir()
+    symlinked_parent = tmp_path / "symlinked-parent"
+    symlinked_parent.symlink_to(actual_parent, target_is_directory=True)
+    path = symlinked_parent / "private" / "user-info.json"
+
+    with pytest.raises(BrowserConfigurationError) as raised:
+        UserInfoStore(path)
+
+    assert str(raised.value) == "The user information store is invalid or unavailable"
+    assert not (actual_parent / "private" / "user-info.json").exists()
+
+
 def _compact_size(value: object) -> int:
     return len(
         json.dumps(

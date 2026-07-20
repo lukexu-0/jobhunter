@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -28,7 +29,7 @@ function digest(bytes: Uint8Array): string {
 }
 
 function createRepositoryFixture() {
-  const root = mkdtempSync(join(tmpdir(), "context-application-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "context-application-")));
   fixtures.push(root);
   const manifestRelativePath = "apps/resume-tailoring/context-sources.json";
   mkdirSync(dirname(join(root, manifestRelativePath)), { recursive: true });

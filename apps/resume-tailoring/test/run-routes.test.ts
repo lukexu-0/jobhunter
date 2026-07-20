@@ -9,6 +9,8 @@ const run: RunDto = {
   id: "run-1",
   status: "queued",
   applicationStatus: "applied",
+  queueSequence: 1,
+  generateKeywordMap: true,
   revision: 0,
   origin: "initial",
   createdAt: 1,

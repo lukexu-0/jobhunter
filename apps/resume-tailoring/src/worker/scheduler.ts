@@ -26,7 +26,9 @@ export class WorkerScheduler {
   readonly #setTimeout: typeof globalThis.setTimeout;
   readonly #onError: (error: unknown) => void;
   readonly #afterDrain: () => void | Promise<void>;
+  readonly #shutdownReason = new DOMException("Worker scheduler closed", "AbortError");
   #running: Promise<void> | undefined;
+  #activeController: AbortController | undefined;
   #kickPending = false;
   #recoveryPending = false;
   #closed = false;
@@ -66,6 +68,7 @@ export class WorkerScheduler {
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#activeController?.abort(this.#shutdownReason);
     this.#kickPending = false;
     this.#recoveryPending = false;
     await this.waitForIdle();
@@ -94,6 +97,7 @@ export class WorkerScheduler {
 
   async #processOne(claim: RunClaim): Promise<boolean> {
     const controller = new AbortController();
+    this.#activeController = controller;
     let leaseLive = true;
     let heartbeatRunning = false;
     const heartbeat = async () => {
@@ -133,6 +137,7 @@ export class WorkerScheduler {
         }, this.#recoveryDelayMs);
         recovery.unref?.();
       }
+      if (this.#activeController === controller) this.#activeController = undefined;
     }
     return leaseLive;
   }

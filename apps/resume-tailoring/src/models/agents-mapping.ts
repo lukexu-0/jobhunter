@@ -25,6 +25,7 @@ const TEXT_KEYS: Readonly<Record<string, true>> = { verbosity: true };
 const RETRY_KEYS: Readonly<Record<string, true>> = { maxRetries: true, backoff: true, policy: true };
 const OUTPUT_SCHEMA_KEYS: Readonly<Record<string, true>> = { type: true, name: true, strict: true, schema: true };
 const INTERNAL_REQUEST_KEYS: Readonly<Record<string, true>> = { reasoningEffortImplicit: true, runnerManagedRetry: true };
+const ASSISTANT_PROVIDER_DATA_KEYS: Readonly<Record<string, true>> = { textSignature: true };
 const FUNCTION_TOOL_KEYS: Readonly<Record<string, true>> = {
   type: true, name: true, description: true, parameters: true, strict: true,
   deferLoading: true, namespace: true, namespaceDescription: true,
@@ -146,9 +147,18 @@ function mapInputItem(item: AgentInputItem, timestamp: number): Message {
     }
     if (item.role === "assistant") {
       if (item.status !== "completed") throw new Error(`Unsupported assistant status: ${item.status}`);
-      const content = item.content.map((part) => {
-        if (part.providerData !== undefined || part.type !== "output_text") throw new Error(`Unsupported assistant content type: ${part.type}`);
-        return { type: "text" as const, text: part.text };
+      const content = item.content.map((part, index) => {
+        if (!isRecord(part) || part.type !== "output_text" || typeof part.text !== "string") {
+          throw new Error(`Unsupported assistant content at index ${index}`);
+        }
+        const providerData = part.providerData;
+        if (providerData === undefined) return { type: "text" as const, text: part.text };
+        if (!isRecord(providerData)) throw new Error(`Invalid assistant provider data at index ${index}`);
+        assertKnownKeys(providerData, ASSISTANT_PROVIDER_DATA_KEYS, `assistant provider data at index ${index}`);
+        if (!Object.prototype.hasOwnProperty.call(providerData, "textSignature") || typeof providerData.textSignature !== "string" || providerData.textSignature.length === 0) {
+          throw new Error(`Invalid assistant text signature at index ${index}`);
+        }
+        return { type: "text" as const, text: part.text, textSignature: providerData.textSignature };
       });
       return {
         role: "assistant", api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol",

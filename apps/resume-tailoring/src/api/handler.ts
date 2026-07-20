@@ -43,7 +43,7 @@ export function createApiHandler(options: ApiHandlerOptions) {
     if (
       isMutation &&
       request.body !== null &&
-      !request.headers.get("content-type")?.toLowerCase().startsWith("application/json")
+      !/^application\/json(?:\s*;|$)/i.test(request.headers.get("content-type") ?? "")
     ) {
       return error("JSON_REQUIRED", "Mutation request bodies must use application/json", 415);
     }

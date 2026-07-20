@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -23,7 +23,7 @@ afterEach(() => {
 });
 
 function createRepositoryFixture(): string {
-  const root = mkdtempSync(join(tmpdir(), "context-index-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "context-index-")));
   fixtures.push(root);
   const manifestRelative = "apps/resume-tailoring/context-sources.json";
   mkdirSync(dirname(join(root, manifestRelative)), { recursive: true });

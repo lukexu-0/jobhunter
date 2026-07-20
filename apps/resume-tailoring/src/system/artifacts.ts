@@ -185,14 +185,36 @@ export class ArtifactStore {
       throw error;
     }
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`run artifact root must be a real directory: ${target}`);
+
+    const claim = join(this.root, `.${runComponent(run)}.${process.pid}.${randomBytes(12).toString("hex")}.removing`);
+    if (!contained(this.root, claim)) throw new Error("run removal claim escapes artifact root");
     try {
-      await rm(target, { recursive: true });
+      await rename(target, claim);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
     }
-    await fsyncDirectory(this.root);
-    return true;
+
+    let deleted = false;
+    try {
+      const claimedStat = await lstat(claim);
+      if (!claimedStat.isDirectory() || claimedStat.isSymbolicLink()) {
+        throw new Error(`run artifact root must be a real directory: ${target}`);
+      }
+      await rm(claim, { recursive: true });
+      deleted = true;
+      await fsyncDirectory(this.root);
+      return true;
+    } catch (error) {
+      if (!deleted) {
+        try {
+          await rm(claim, { recursive: true, force: true });
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], `run artifact removal cleanup failed: ${target}`);
+        }
+      }
+      throw error;
+    }
   }
 
   async write(path: string, value: string | Uint8Array, maxBytes: number): Promise<ArtifactMetadata> {

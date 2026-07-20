@@ -8,6 +8,8 @@ function runFixture(id: string, applicationStatus: ApplicationStatus, status: Ru
     applicationStatus,
     revision: 1,
     origin: "initial",
+    queueSequence: 1,
+    generateKeywordMap: false,
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_000,
     visualAcknowledgementRequired: false,
@@ -21,6 +23,7 @@ function documentViewerFixture(id: string, includeKeywordMap: boolean): RunDto {
   const revision = 4;
   return {
     ...runFixture(id, "applied", "review"),
+    generateKeywordMap: includeKeywordMap,
     revision,
     currentPdfSha256: resumeSha256,
     artifacts: [
@@ -319,7 +322,11 @@ function contrastRatio(foreground: string, background: string): number {
 }
 
 function cssRgb(hex: string): string {
-  return `rgb(${Number.parseInt(hex.slice(1, 3), 16)}, ${Number.parseInt(hex.slice(3, 5), 16)}, ${Number.parseInt(hex.slice(5, 7), 16)})`;
+  const digits = hex.slice(1);
+  const normalized = digits.length === 3
+    ? [...digits].map((digit) => digit.repeat(2)).join("")
+    : digits;
+  return `rgb(${Number.parseInt(normalized.slice(0, 2), 16)}, ${Number.parseInt(normalized.slice(2, 4), 16)}, ${Number.parseInt(normalized.slice(4, 6), 16)})`;
 }
 
 test("shows the controlled initializer for an empty dashboard", async ({ page }) => {
@@ -791,7 +798,7 @@ test("shows only the Resume tab when the revision has no keyword map", async ({ 
 });
 
 
-test("filters by user-managed application state", async ({ page }) => {
+test("filters by selectable application state and keeps stored Failed display-only", async ({ page }) => {
   await interceptRuns(page);
   await page.goto("/");
 
@@ -803,16 +810,17 @@ test("filters by user-managed application state", async ({ page }) => {
     "Rejected",
     "Interview",
     "Accepted",
-    "Failed",
   ]);
+  await expect(state.locator('option[value="failed"]')).toHaveCount(0);
 
   await state.selectOption("interview");
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await expect(page.locator('tbody a.application-link[href="/runs/lifecycle-interview"]')).toBeVisible();
 
-  await state.selectOption("failed");
-  await expect(page.locator("tbody tr")).toHaveCount(1);
-  await expect(page.locator('tbody a.application-link[href="/runs/lifecycle-failed"]')).toBeVisible();
+  await state.selectOption("all");
+  const failedState = page.getByRole("combobox", { name: "Application state for lifecycl…iled" });
+  await expect(failedState).toHaveValue("failed");
+  await expect(failedState.locator('option[value="failed"]')).toBeDisabled();
 });
 
 test("lets the user change application state", async ({ page }) => {
@@ -825,7 +833,7 @@ test("lets the user change application state", async ({ page }) => {
       contentType: "application/json",
       body: JSON.stringify({
         ...lifecycleRuns[0],
-        applicationStatus: "failed",
+        applicationStatus: "interview",
         updatedAt: 1_700_000_001_000,
       }),
     });
@@ -837,10 +845,10 @@ test("lets the user change application state", async ({ page }) => {
   });
   await expect(applicationState).toHaveValue("applied");
 
-  await applicationState.selectOption("failed");
+  await applicationState.selectOption("interview");
 
-  expect(requestBody).toBe('{\"applicationStatus\":\"failed\"}');
-  await expect(applicationState).toHaveValue("failed");
+  expect(requestBody).toBe('{\"applicationStatus\":\"interview\"}');
+  await expect(applicationState).toHaveValue("interview");
   await expect(applicationState).toBeEnabled();
 });
 
@@ -863,15 +871,15 @@ test("retains application state when an update fails", async ({ page }) => {
   });
   await expect(applicationState).toHaveValue("applied");
 
-  await applicationState.selectOption("failed");
+  await applicationState.selectOption("interview");
 
   await expect(applicationState).toHaveValue("applied");
   await expect(applicationState).toBeEnabled();
   await expect(page.getByRole("alert", { name: "Application state update error" })).toContainText("Application state could not be updated. Try again.");
 });
 
-test("shows application and pipeline status separately", async ({ page }) => {
-  const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
+test("shows application lifecycle and pipeline progress separately without legacy metadata", async ({ page }) => {
+  const detailRun = runFixture("lifecycle-detail", "rejected", "review");
   await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
@@ -881,13 +889,13 @@ test("shows application and pipeline status separately", async ({ page }) => {
   });
   await page.goto("/runs/lifecycle-detail");
 
-  const metadataPane = page.getByRole("complementary", { name: "Run metadata and history" });
-  const metadata = metadataPane.locator("dl").first();
-  const applicationStatus = metadata.locator("dt").filter({ hasText: /^Application status$/ }).locator("..").locator("dd");
-  const pipelineStatus = metadata.locator("dt").filter({ hasText: /^Pipeline status$/ }).locator("..").locator("dd");
+  const applicationSummary = page.getByRole("complementary", { name: "Application summary and keyword comparison" });
+  const workflow = page.getByRole("list", { name: "Workflow progress" });
 
-  await expect(applicationStatus).toHaveText("Rejected");
-  await expect(pipelineStatus).toHaveText("Failed");
+  await expect(applicationSummary.getByText("Rejected", { exact: true })).toBeVisible();
+  await expect(workflow.getByRole("listitem").filter({ hasText: "Review" })).toHaveAttribute("aria-current", "step");
+  await expect(page.getByRole("complementary", { name: "Run metadata and history" })).toHaveCount(0);
+  await expect(page.getByText("Pipeline status", { exact: true })).toHaveCount(0);
 });
 
 test("removes primary navigation and gives run details the full viewport", async ({ page }) => {
@@ -954,7 +962,8 @@ test("hides internal run and attempt metadata from the viewer", async ({ page })
   });
 
   await page.goto("/runs/run-id-must-be-hidden");
-  await expect(page.getByText("Application details", { exact: true })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Application summary and keyword comparison" })).toBeVisible();
+  await expect(page.getByText("Application details", { exact: true })).toHaveCount(0);
 
   await expect(page.getByText("run-id-must-be-hidden", { exact: false })).toHaveCount(0);
   await expect(page.getByText("Run ID", { exact: true })).toHaveCount(0);
@@ -1223,6 +1232,7 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
 
 test("uses the original dark palette across surfaces and states", async ({ page }) => {
   const expectedColors = {
+    white: "#fff",
     "--color-canvas": "#050606",
     "--color-surface": "#090b0b",
     "--color-surface-raised": "#111413",
@@ -1245,6 +1255,7 @@ test("uses the original dark palette across surfaces and states", async ({ page 
     "--color-application-accepted": "#79cf92",
     "--color-application-failed": "#ef8179",
   } as const;
+  const { white: expectedStatusText, ...expectedRootColors } = expectedColors;
   await page.setViewportSize({ width: 1_672, height: 941 });
   await interceptRuns(page);
   await page.goto("/");
@@ -1256,9 +1267,9 @@ test("uses the original dark palette across surfaces and states", async ({ page 
       colorScheme: style.colorScheme,
       tokens: Object.fromEntries(tokens.map((token) => [token, style.getPropertyValue(token).trim()])),
     };
-  }, Object.keys(expectedColors));
+  }, Object.keys(expectedRootColors));
   expect(rootStyle.colorScheme).toBe("dark");
-  expect(rootStyle.tokens).toEqual(expectedColors);
+  expect(rootStyle.tokens).toEqual(expectedRootColors);
 
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-canvas"]));
   expect(await page.locator(".app-navigation").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-surface"]));
@@ -1283,7 +1294,7 @@ test("uses the original dark palette across surfaces and states", async ({ page 
     });
     expect(style).toEqual({
       statusColor: expectedColors[token],
-      color: cssRgb(expectedColors[token]),
+      color: cssRgb(expectedStatusText),
       borderColor: cssRgb(expectedColors[token]),
       backgroundColor: cssRgb(expectedColors["--color-surface"]),
     });

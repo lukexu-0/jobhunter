@@ -167,6 +167,49 @@ describe("OAuth Codex Agents model bridge", () => {
     expect(response.usage.outputTokensDetails).toEqual([{ reasoning_tokens: 2 }]);
   });
 
+  test("round-trips signed assistant text into the next model request", async () => {
+    const signedResponse = await new OAuthCodexModel("attempt-signed-response", {
+      resolverFactory: inertResolver,
+      transport: completedTransport(assistantMessage([
+        { type: "text", text: "Signed answer", textSignature: "signed-text-1" },
+      ])),
+    }).getResponse(modelRequest());
+    expect(signedResponse.output).toContainEqual({
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      id: "response-1",
+      content: [{
+        type: "output_text",
+        text: "Signed answer",
+        providerData: { textSignature: "signed-text-1" },
+      }],
+    });
+
+    let nextContext: Context | undefined;
+    const nextModel = new OAuthCodexModel("attempt-after-signed-response", {
+      resolverFactory: inertResolver,
+      transport: completedTransport(
+        assistantMessage([{ type: "text", text: "Next answer" }]),
+        (context) => { nextContext = context; },
+      ),
+    });
+    await expect(nextModel.getResponse(modelRequest({
+      input: [
+        ...signedResponse.output,
+        { role: "user", content: [{ type: "input_text", text: "Follow-up question" }] },
+      ],
+    }))).resolves.toBeDefined();
+
+    expect(nextContext?.messages.map((message) => message.role)).toEqual(["assistant", "user"]);
+    const signedHistory = nextContext?.messages[0];
+    expect(signedHistory?.role).toBe("assistant");
+    if (signedHistory?.role !== "assistant") throw new Error("Signed assistant history missing");
+    expect(signedHistory.content).toEqual([
+      { type: "text", text: "Signed answer", textSignature: "signed-text-1" },
+    ]);
+  });
+
   test("emits a valid response_done stream carrying final output and usage", async () => {
     const message = assistantMessage([{ type: "text", text: "hello" }, { type: "toolCall", id: "call-s", name: "submit", arguments: { answer: "stream" } }]);
     const events = [];

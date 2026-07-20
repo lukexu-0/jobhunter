@@ -223,6 +223,7 @@ export async function runTrustedProcess(request: TrustedProcessRequest, boundary
     const timer = setTimeout(() => interrupt("timeout"), request.timeoutMs);
     const abort = () => interrupt("abort");
     request.signal?.addEventListener("abort", abort, { once: true });
+    if (request.signal?.aborted) abort();
     let timedOut = false;
     let aborted = false;
     let killAcknowledged = false;

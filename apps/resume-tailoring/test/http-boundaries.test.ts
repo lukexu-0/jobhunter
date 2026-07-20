@@ -34,6 +34,37 @@ describe("HTTP boundary policy", () => {
     expect(response.status).toBe(415);
   });
 
+  test("rejects JSON-prefixed non-JSON media types before routing", async () => {
+    let routeCalls = 0;
+    const guardedHandler = createApiHandler({
+      webOrigin: WEB_ORIGIN,
+      route: () => {
+        routeCalls += 1;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    for (const contentType of ["application/jsonp", "application/json-evil"]) {
+      const response = await guardedHandler(
+        new Request("http://127.0.0.1:3457/v1/known-mutation", {
+          method: "POST",
+          headers: { origin: WEB_ORIGIN, "content-type": contentType },
+          body: "{}",
+        }),
+      );
+
+      expect(response.status).toBe(415);
+      expect(await response.json()).toEqual({
+        error: {
+          code: "JSON_REQUIRED",
+          message: "Mutation request bodies must use application/json",
+        },
+      });
+    }
+
+    expect(routeCalls).toBe(0);
+  });
+
   test("permits bodyless DELETE requests without a content type", async () => {
     const response = await handler(
       new Request("http://127.0.0.1:3457/v1/auth/sessions/not-found", {

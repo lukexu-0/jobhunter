@@ -76,6 +76,18 @@ JOB_URL = "https://jobs.example/openings/42?candidate=private-secret"
 PROFILE_SECRET = "ada.private@example.test"
 
 
+def _fake_bubblewrap(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-bwrap"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return executable
+
+
+@pytest.fixture
+def fake_bubblewrap(tmp_path: Path) -> Path:
+    return _fake_bubblewrap(tmp_path)
+
+
 def upload(filename: str, content: bytes) -> UploadFile:
     return UploadFile(file=BytesIO(content), filename=filename)
 
@@ -407,6 +419,7 @@ def make_manager(
         HarnessConfig(
             bearer_token=TOKEN,
             session_timeout=timeout,
+            bubblewrap_executable=_fake_bubblewrap(tmp_path),
             browser_skill_workspace=tmp_path / "browser-skill" / "agent-workspace",
             user_info_json=tmp_path / "user-info.json",
         ),
@@ -427,13 +440,14 @@ def make_manager(
 
 def test_manager_probes_bubblewrap_and_creates_private_skill_workspace(
     tmp_path: Path,
+    fake_bubblewrap: Path,
 ) -> None:
     workspace = tmp_path / "browser-skill" / "agent-workspace"
 
     ApplicationSessionManager(
         HarnessConfig(
             bearer_token=TOKEN,
-            bubblewrap_executable=Path("/usr/bin/bwrap"),
+            bubblewrap_executable=fake_bubblewrap,
             browser_skill_workspace=workspace,
             user_info_json=tmp_path / "user-info.json",
         ),
@@ -449,7 +463,10 @@ def test_manager_probes_bubblewrap_and_creates_private_skill_workspace(
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
 
 
-def test_manager_rejects_workspace_env_file(tmp_path: Path) -> None:
+def test_manager_rejects_workspace_env_file(
+    tmp_path: Path,
+    fake_bubblewrap: Path,
+) -> None:
     workspace = tmp_path / "browser-skill" / "agent-workspace"
     workspace.mkdir(mode=0o700, parents=True)
     workspace.parent.chmod(0o700)
@@ -463,6 +480,7 @@ def test_manager_rejects_workspace_env_file(tmp_path: Path) -> None:
             HarnessConfig(
                 bearer_token=TOKEN,
                 browser_skill_workspace=workspace,
+                bubblewrap_executable=fake_bubblewrap,
                 user_info_json=tmp_path / "user-info.json",
             ),
             artifacts_root=tmp_path / "sessions",

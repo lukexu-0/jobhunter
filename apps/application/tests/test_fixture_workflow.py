@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -351,6 +352,10 @@ def _set_review_code(value: str) -> str:
     return f"js({script!r})\nprint(page_info())"
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Bubblewrap namespace execution requires Linux",
+)
 @pytest.mark.asyncio
 async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
     tmp_path: Path,

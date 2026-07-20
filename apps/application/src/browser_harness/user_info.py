@@ -176,7 +176,7 @@ class UserInfoStore:
 
     def _initialize(self) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
+            _prepare_private_directory(self._path.parent, create=True)
             if self._path.is_symlink():
                 raise BrowserConfigurationError(
                     "The user information store must not be a symbolic link"
@@ -236,6 +236,7 @@ class UserInfoStore:
         replaced = False
         fd = -1
         try:
+            _prepare_private_directory(self._path.parent, create=False)
             fd, temp_name = tempfile.mkstemp(
                 dir=self._path.parent,
                 prefix=f".{self._path.name}.",
@@ -578,6 +579,58 @@ def _valid_utc_timestamp(value: str) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None and parsed.utcoffset() == timezone.utc.utcoffset(None)
+
+
+def _prepare_private_directory(path: Path, *, create: bool) -> None:
+    lexical = Path(path)
+    if ".." in lexical.parts:
+        raise ValueError("user information paths cannot contain parent traversal")
+    absolute = Path(os.path.abspath(os.fspath(lexical)))
+    parts = absolute.parts
+    descriptor = os.open(
+        parts[0],
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | _no_follow_flag(),
+    )
+    try:
+        for part in parts[1:]:
+            next_descriptor: int | None = None
+            try:
+                try:
+                    next_descriptor = os.open(
+                        part,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | _no_follow_flag(),
+                        dir_fd=descriptor,
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                    next_descriptor = os.open(
+                        part,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | _no_follow_flag(),
+                        dir_fd=descriptor,
+                    )
+                    os.fchmod(next_descriptor, 0o700)
+            except BaseException:
+                if next_descriptor is not None:
+                    os.close(next_descriptor)
+                raise
+            if next_descriptor is None:
+                raise RuntimeError("failed to open user information directory")
+            previous_descriptor = descriptor
+            descriptor = next_descriptor
+            os.close(previous_descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _require_regular_file(path: Path) -> None:

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ProcessBoundary, SpawnContract } from "../src/system/process.ts";
@@ -11,7 +11,7 @@ afterEach(async () => {
 });
 
 async function fixture(): Promise<{ root: string; pdf: string }> {
-  const root = await mkdtemp(join(tmpdir(), "pipeline-pdf-qa-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pipeline-pdf-qa-")));
   roots.push(root);
   const pdf = join(root, "resume.pdf");
   await writeFile(pdf, "%PDF-1.7\nfixture");

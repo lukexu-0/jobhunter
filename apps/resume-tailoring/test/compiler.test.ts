@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { fstatSync, lstatSync, realpathSync, writeFileSync } from "node:fs";
-import { chmod, lstat, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactStore } from "../src/system/artifacts.ts";
@@ -8,7 +8,7 @@ import { runTrustedProcess, sanitizedEnvironment, type ProcessBoundary, type Run
 import { COMPILE_TIMEOUTS, compileResume } from "../src/resume/compiler.ts";
 
 async function root(): Promise<string> {
-  return await mkdtemp(join(tmpdir(), "pipeline-compiler-"));
+  return await realpath(await mkdtemp(join(tmpdir(), "pipeline-compiler-")));
 }
 
 function chunks(...values: string[]): AsyncIterable<Uint8Array> {
@@ -21,6 +21,8 @@ function exited(pid = 101, stdout = "", stderr = "", code = 0): RunningProcess {
 
 const address = { run: 1, revision: "revision-1", stage: "compile", attempt: 1 } as const;
 const safeTex = "\\documentclass{article}\n\\begin{document}Hello\\end{document}\n";
+
+const testWithLinuxTexCache = test.skipIf(process.platform !== "linux");
 
 async function storeWithAttempt(): Promise<{ store: ArtifactStore; attempt: string }> {
   const store = new ArtifactStore(await root());
@@ -108,26 +110,29 @@ describe("trusted processes", () => {
 });
 
 describe("trusted resume compiler", () => {
-  test("allows only the canonical glyph mapping input to reach the compiler boundary", async () => {
+  testWithLinuxTexCache("allows the canonical glyph mapping input to reach the compiler boundary", async () => {
     const canonical = await readFile(new URL("../../user-info/resume-main/Alex_Example_Resume.tex", import.meta.url), "utf8");
-    const trustedInput = "\\input{glyphtounicode}";
-    const trustedAnchor = `\\usepackage[english]{babel}\n${trustedInput}\n\n\\pagestyle{fancy}`;
-    let canonicalSpawned = false;
-    const canonicalArtifacts = new ArtifactStore(await root());
-    const canonicalResult = await compileResume({
-      artifacts: canonicalArtifacts,
+    let spawned = false;
+    const artifacts = new ArtifactStore(await root());
+    const result = await compileResume({
+      artifacts,
       address,
       tex: canonical,
       mode: "full",
       processBoundary: (contract) => {
-        canonicalSpawned = true;
+        spawned = true;
         writeFileSync(join(contract.cwd, "compile.pdf"), "%PDF-1.4\n%%EOF");
         return exited();
       },
     });
-    expect(canonicalResult.ok).toBeTrue();
-    expect(canonicalSpawned).toBeTrue();
+    expect(result.ok).toBeTrue();
+    expect(spawned).toBeTrue();
+  });
 
+  test("rejects noncanonical glyph mapping inputs before spawning", async () => {
+    const canonical = await readFile(new URL("../../user-info/resume-main/Alex_Example_Resume.tex", import.meta.url), "utf8");
+    const trustedInput = "\\input{glyphtounicode}";
+    const trustedAnchor = `\\usepackage[english]{babel}\n${trustedInput}\n\n\\pagestyle{fancy}`;
     const noncanonicalInputs = [
       canonical.replace(trustedInput, "\\input{other}"),
       canonical.replace(trustedInput, "\\input {glyphtounicode}"),
@@ -257,14 +262,16 @@ describe("trusted resume compiler", () => {
     }
   });
 
-  test("uses a locked recipe, isolated policy, owner-only local TeX caches, and candidate/full timeouts", async () => {
+  testWithLinuxTexCache("uses a locked recipe, isolated policy, owner-only local TeX caches, and candidate/full timeouts", async () => {
     for (const mode of ["candidate", "full"] as const) {
       let seen: SpawnContract | undefined;
       const boundary: ProcessBoundary = (contract) => {
         seen = contract;
         expect(typeof contract.attemptRootFd).toBe("number");
         expect(fstatSync(contract.attemptRootFd!).isDirectory()).toBeTrue();
-        expect(realpathSync(`/proc/self/fd/${contract.attemptRootFd}`)).toBe(realpathSync(contract.cwd));
+        if (process.platform === "linux") {
+          expect(realpathSync(`/proc/self/fd/${contract.attemptRootFd}`)).toBe(realpathSync(contract.cwd));
+        }
         expect(JSON.stringify(contract.env)).not.toContain(contract.cwd);
         for (const directory of [
           ".tex-cache",
@@ -307,7 +314,7 @@ describe("trusted resume compiler", () => {
     }
   });
 
-  test("always finalizes a bounded log and publishes no PDF on failure", async () => {
+  testWithLinuxTexCache("always finalizes a bounded log and publishes no PDF on failure", async () => {
     const artifacts = new ArtifactStore(await root());
     const huge = "x".repeat(700_000);
     const result = await compileResume({ artifacts, address, tex: safeTex, mode: "full", processBoundary: () => exited(104, huge, huge, 1) });
@@ -318,7 +325,7 @@ describe("trusted resume compiler", () => {
     await expect(artifacts.read(join(result.attemptRoot, "resume.pdf"), 10 * 1024 * 1024)).rejects.toThrow();
   });
 
-  test("distinguishes repairable TeX diagnostics from terminal compiler failures", async () => {
+  testWithLinuxTexCache("distinguishes repairable TeX diagnostics from terminal compiler failures", async () => {
     const cases = [
       ["! Undefined control sequence.\\n\\resumeIten", "repairable"],
       ["! File ended while scanning use of \\resumeItem.", "repairable"],
@@ -333,7 +340,7 @@ describe("trusted resume compiler", () => {
     }
   });
 
-  test("publishes a capped immutable PDF only after successful compilation", async () => {
+  testWithLinuxTexCache("publishes a capped immutable PDF only after successful compilation", async () => {
     const artifacts = new ArtifactStore(await root());
     const pdfBytes = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\n%%EOF");
     const result = await compileResume({
@@ -350,7 +357,7 @@ describe("trusted resume compiler", () => {
     await expect(artifacts.write(result.pdf.path, "replacement", 100)).rejects.toThrow(/already exists/i);
   });
 
-  test("turns an oversized success PDF into a terminal failure with a finalized log", async () => {
+  testWithLinuxTexCache("turns an oversized success PDF into a terminal failure with a finalized log", async () => {
     const artifacts = new ArtifactStore(await root());
     const result = await compileResume({
       artifacts,

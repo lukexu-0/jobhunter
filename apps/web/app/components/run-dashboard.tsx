@@ -105,6 +105,7 @@ export function RunDashboard() {
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
   const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
   const requestedArtifacts = useRef(new Set<string>());
+  const latestListRequest = useRef(0);
   const createRunRequest = useMemo(
     () => CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap }),
     [generateKeywordMap, jobUrl],
@@ -112,20 +113,26 @@ export function RunDashboard() {
   const isCreateRequestValid = createRunRequest.success;
 
   const load = useCallback(async (showLoading = false) => {
+    const requestId = ++latestListRequest.current;
     if (showLoading) setIsLoading(true);
     try {
       const nextRuns = await listRuns();
+      if (requestId !== latestListRequest.current) return;
       setRuns(nextRuns);
       setLoadError(null);
     } catch (error) {
+      if (requestId !== latestListRequest.current) return;
       setLoadError(publicMessage(error, "Applications are unavailable. Try again."));
     } finally {
-      if (showLoading) setIsLoading(false);
+      if (requestId === latestListRequest.current) setIsLoading(false);
     }
   }, [setRuns]);
 
   useEffect(() => {
     void load(showInitialLoading.current);
+    return () => {
+      latestListRequest.current += 1;
+    };
   }, [load]);
 
   const hasActiveRuns = runs.some((run) => !IS_TERMINAL_STATUS[run.status]);

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runTrustedProcess, sanitizedEnvironment, type ProcessBoundary, type SpawnContract } from "../src/system/process.ts";
 
-describe("trusted process environment", () => {
+describe.skipIf(process.platform !== "linux")("trusted process TeX environment (requires Linux /proc parent-held cache descriptors)", () => {
   test("uses only fixed sanitized values and an opaque parent-held TeX root", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "pipeline-process-"));
     let seen: SpawnContract | undefined;
@@ -171,5 +171,45 @@ describe("trusted process lifecycle", () => {
       expect(Buffer.from(result.stdout.data).toString()).toBe("stdo");
       expect(Buffer.from(result.stderr.data).toString()).toBe("std");
     }
+  });
+
+  test("kills a process when the request is aborted during boundary registration", async () => {
+    const controller = new AbortController();
+    const exit = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+    let killSignal: NodeJS.Signals | undefined;
+    let killTarget: "process-group" | undefined;
+
+    const boundary: ProcessBoundary = () => {
+      const running = {
+        pid: 4103,
+        stdout: (async function* () {})(),
+        stderr: (async function* () {})(),
+        wait: () => exit.promise,
+        kill: async (signal: NodeJS.Signals, target: "process-group") => {
+          killSignal = signal;
+          killTarget = target;
+          exit.resolve({ code: null, signal });
+        },
+      };
+      controller.abort();
+      return running;
+    };
+
+    const result = await runTrustedProcess({
+      command: "pdfinfo",
+      args: [],
+      cwd: process.cwd(),
+      timeoutMs: 50,
+      signal: controller.signal,
+    }, boundary);
+
+    expect(controller.signal.aborted).toBeTrue();
+    expect(killSignal).toBe("SIGKILL");
+    expect(killTarget).toBe("process-group");
+    expect(result.code).toBeNull();
+    expect(result.signal).toBe("SIGKILL");
+    expect(result.timedOut).toBeFalse();
+    expect(result.aborted).toBeTrue();
+    expect(result.killAcknowledged).toBeTrue();
   });
 });

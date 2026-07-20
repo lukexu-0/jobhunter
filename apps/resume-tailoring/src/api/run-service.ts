@@ -445,6 +445,8 @@ export class RunApplicationService {
       id: run.id,
       status: run.status,
       applicationStatus: run.applicationStatus,
+      generateKeywordMap: run.generateKeywordMap,
+      queueSequence: run.queueSequence,
       revision: run.currentRevision,
       origin: publicOrigin(repository.resolveCurrentRevisionOrigin(run.id)),
       createdAt: run.createdAt,

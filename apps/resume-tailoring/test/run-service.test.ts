@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createApiHandler } from "../src/api/handler.ts";
@@ -64,7 +64,7 @@ interface Fixture {
   readonly kicks: { count: number };
 }
 function fixture(options: FixtureOptions = {}): Fixture {
-  const root = mkdtempSync(join(tmpdir(), "run-application-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "run-application-")));
   fixtures.push(root);
   const manifestRelative = "apps/resume-tailoring/context-sources.json";
   mkdirSync(dirname(join(root, manifestRelative)), { recursive: true });
@@ -219,6 +219,17 @@ describe("RunApplicationService", () => {
     expect(input).not.toBeNull();
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
     expect(target.repository.acquire()?.runId).toBe(run.id);
+  });
+  test("exposes durable queue settings on created, listed, and retrieved run DTOs", async () => {
+    const target = fixture();
+    const created = await target.service.createRun(JOB_URL, false);
+    const listed = await target.service.listRuns();
+    const retrieved = await target.service.getRun(created.id);
+
+    expect(created).toMatchObject({ queueSequence: 1, generateKeywordMap: false });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({ queueSequence: 1, generateKeywordMap: false });
+    expect(retrieved).toMatchObject({ queueSequence: 1, generateKeywordMap: false });
   });
   test("uses sanitized fallback lines and persists only the exact reconstructed description", async () => {
     const controller = new AbortController();

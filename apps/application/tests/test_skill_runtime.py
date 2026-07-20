@@ -5,6 +5,7 @@ import json
 import io
 import queue
 import struct
+import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -21,6 +22,14 @@ from jobhunter_browser_harness.skill_runtime import (
     BrowserSkillRuntime,
     BrowserSkillRuntimeError,
 )
+
+
+@pytest.fixture
+def fake_bubblewrap(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-bwrap"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return executable
 
 
 
@@ -44,13 +53,14 @@ class _LoopbackEndpointBrowser:
 
 async def test_start_calls_browser_once_and_rejects_non_loopback_cdp(
     tmp_path: Path,
+    fake_bubblewrap: Path,
 ) -> None:
     browser = _InvalidEndpointBrowser()
     runtime = BrowserSkillRuntime(
         browser=browser,
         session_directory=tmp_path / "session",
         workspace=tmp_path / "workspace",
-        bubblewrap_executable=Path("/usr/bin/bwrap"),
+        bubblewrap_executable=fake_bubblewrap,
         deadline=asyncio.get_running_loop().time() + 30,
     )
 
@@ -64,6 +74,7 @@ async def test_start_calls_browser_once_and_rejects_non_loopback_cdp(
 @pytest.mark.parametrize("workspace_relation", ["inside", "ancestor"])
 async def test_start_rejects_session_workspace_overlap_before_sandbox_start(
     tmp_path: Path,
+    fake_bubblewrap: Path,
     workspace_relation: str,
 ) -> None:
     root = tmp_path / "root"
@@ -80,7 +91,7 @@ async def test_start_rejects_session_workspace_overlap_before_sandbox_start(
         browser=_LoopbackEndpointBrowser(),
         session_directory=session_directory,
         workspace=workspace,
-        bubblewrap_executable=Path("/usr/bin/bwrap"),
+        bubblewrap_executable=fake_bubblewrap,
         deadline=asyncio.get_running_loop().time() + 30,
     )
 
@@ -96,6 +107,7 @@ async def test_start_rejects_session_workspace_overlap_before_sandbox_start(
 
 async def test_observation_bounds_page_metadata_and_tab_inventory(
     tmp_path: Path,
+    fake_bubblewrap: Path,
 ) -> None:
     long_url = "https://example.test/" + "u" * 10_000
     long_title = "t" * 10_000
@@ -132,7 +144,7 @@ async def test_observation_bounds_page_metadata_and_tab_inventory(
         browser=ObservationBrowser(),
         session_directory=tmp_path / "session",
         workspace=tmp_path / "workspace",
-        bubblewrap_executable=Path("/usr/bin/bwrap"),
+        bubblewrap_executable=fake_bubblewrap,
         deadline=asyncio.get_running_loop().time() + 30,
     )
 
@@ -178,6 +190,8 @@ async def running_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[_RunningRuntime]:
+    if sys.platform != "linux":
+        pytest.skip("Bubblewrap namespace execution requires Linux")
     monkeypatch.setenv("JOBHUNTER_HARNESS_TOKEN", "parent-only-harness-token")
     monkeypatch.setenv("BROWSER_USE_API_KEY", "parent-only-cloud-token")
     session_directory = tmp_path / ("long-session-" + "x" * 100) / "session"
