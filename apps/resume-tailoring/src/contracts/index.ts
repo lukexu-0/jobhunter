@@ -148,6 +148,7 @@ export type ResumeDiff = z.infer<typeof ResumeDiffSchema>;
 
 export const ArtifactKindSchema = z.enum([
   "job-analysis",
+  "ats-keyword-extraction",
   "tailoring-plan",
   "evidence-ledger",
   "change-summary",

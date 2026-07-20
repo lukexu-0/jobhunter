@@ -618,15 +618,43 @@ describe("RunApplicationService", () => {
   });
 
 
-  test("serves public resume artifacts with renamed downloads and preserves keyword-map naming", async () => {
+  test("serves public resume and JSON artifacts with their public media metadata", async () => {
     const target = fixture();
     const run = await target.service.createRun(JOB_URL, true);
+    const claim = target.repository.acquire()!;
+    target.repository.transition(claim, "analyzing");
+    const analysisAttempt = target.repository.startAttempt(claim, "analyzing");
+    const analysisRoot = await target.artifacts.createAttempt({
+      run: target.repository.getRun(run.id)!.queueSequence,
+      revision: "1",
+      stage: "analyzing",
+      attempt: analysisAttempt.attemptNo,
+    });
+    const extractionBody = JSON.stringify({
+      keywords: [{ id: "keyword-typescript", phrase: "TypeScript", jdQuote: "TypeScript" }],
+    });
+    const storedExtraction = await target.artifacts.write(
+      join(analysisRoot, "ats-keyword-extraction.json"),
+      extractionBody,
+      1024 * 1024,
+    );
+    const extraction = target.repository.finalizeArtifact(claim, {
+      attemptId: analysisAttempt.id,
+      stage: "analyzing",
+      kind: "ats-keyword-extraction",
+      sha256: storedExtraction.sha256,
+      path: storedExtraction.path,
+      byteSize: storedExtraction.bytes,
+    });
+    target.repository.finishAttempt(claim, analysisAttempt.id, "succeeded");
+    transition(target.repository, claim, ["tailoring", "compiling", "deterministic_qa", "visual_qa"]);
+    target.repository.release(claim);
     const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nreview", false, "%PDF-1.7\nkeyword-map", "\\documentclass{article}");
     const response = await target.service.getArtifact(run.id, pdf.id);
     expect(response?.status).toBe(200);
     expect(response?.headers.get("cache-control")).toBe("no-store");
     expect(response?.headers.get("content-type")).toBe("application/pdf");
-    expect(response?.headers.get("content-disposition")).toBe('attachment; filename="Alex_Example_Resume.pdf"');
+    expect(response?.headers.get("content-disposition")).toBe('inline; filename="Alex_Example_Resume.pdf"');
     expect(response?.headers.get("x-content-sha256")).toBe(pdf.sha256);
     expect(await response?.text()).toBe("%PDF-1.7\nreview");
 
@@ -639,15 +667,24 @@ describe("RunApplicationService", () => {
     const map = await target.service.getArtifact(run.id, pdf.keywordMapId!);
     expect(map?.status).toBe(200);
     expect(map?.headers.get("content-type")).toBe("application/pdf");
-    expect(map?.headers.get("content-disposition")).toBe('attachment; filename="keyword-map-pdf.pdf"');
+    expect(map?.headers.get("content-disposition")).toBe('inline; filename="keyword-map-pdf.pdf"');
     expect(await map?.text()).toBe("%PDF-1.7\nkeyword-map");
 
-    const dto = await target.service.getRun(run.id);
+    const dto = RunDtoSchema.parse(await target.service.getRun(run.id));
     expect(dto?.artifacts.find((artifact) => artifact.id === pdf.keywordMapId)).toMatchObject({
       kind: "keyword-map-pdf",
       mediaType: "application/pdf",
       public: true,
     });
+    expect(dto.artifacts.find((artifact) => artifact.id === extraction.id)).toMatchObject({
+      kind: "ats-keyword-extraction",
+      mediaType: "application/json; charset=utf-8",
+      public: true,
+    });
+    const extractionResponse = await target.service.getArtifact(run.id, extraction.id);
+    expect(extractionResponse?.status).toBe(200);
+    expect(extractionResponse?.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(await extractionResponse?.text()).toBe(extractionBody);
     const input = target.repository.getArtifact(run.id, "job-description")!;
     expect(await target.service.getArtifact(run.id, input.id)).toBeUndefined();
   });

@@ -42,6 +42,7 @@ const MAX_JOB_DESCRIPTION_BYTES = 200_000;
 const MAX_PUBLIC_METADATA_BYTES = 1024 * 1024;
 const PUBLIC_ARTIFACT_KINDS: Readonly<Record<string, ArtifactKind>> = Object.freeze({
   "job-analysis": "job-analysis",
+  "ats-keyword-extraction": "ats-keyword-extraction",
   "tailoring-plan": "tailoring-plan",
   "evidence-ledger": "evidence-ledger",
   "change-summary": "change-summary",
@@ -373,7 +374,7 @@ export class RunApplicationService {
         "cache-control": "no-store",
         "content-type": mediaType(kind),
         "content-length": String(bytes.byteLength),
-        "content-disposition": `attachment; filename="${publicFilename(kind)}"`,
+        "content-disposition": `${kind === "compiled-pdf" || kind === "keyword-map-pdf" ? "inline" : "attachment"}; filename="${publicFilename(kind)}"`,
         "etag": `"sha256-${artifact.sha256}"`,
         "digest": `sha-256=${digest.toString("base64")}`,
         "x-content-sha256": artifact.sha256,
