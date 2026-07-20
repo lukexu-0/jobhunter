@@ -163,11 +163,13 @@ async function runtimeAction(
       throw new ApplicationAgentFailure("MODEL_TIMEOUT");
     }
     if (error instanceof ApplicationRuntimeError) {
-      const code = error.code === "step_limit"
-        ? "STEP_LIMIT"
-        : error.code === "browser_failed"
-          ? "BROWSER_FAILED"
-          : "MODEL_PROVIDER_FAILED";
+      const code = error.code === "model_timeout"
+        ? "MODEL_TIMEOUT"
+        : error.code === "step_limit"
+          ? "STEP_LIMIT"
+          : error.code === "browser_failed"
+            ? "BROWSER_FAILED"
+            : "MODEL_PROVIDER_FAILED";
       throw new ApplicationAgentFailure(code);
     }
     throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");

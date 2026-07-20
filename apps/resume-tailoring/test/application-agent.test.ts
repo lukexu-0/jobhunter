@@ -16,6 +16,10 @@ import {
 } from "../src/agents/application-agent.ts";
 import { ApplicationRuntimeError } from "../src/agents/application-runtime-client.ts";
 import {
+  APPLICATION_AGENT_PATH,
+  createApplicationAgentRoutes,
+} from "../src/api/application-agent-routes.ts";
+import {
   AgentDeadlineError,
   type AgentRunner,
   type AgentRunOptions,
@@ -712,6 +716,66 @@ describe("application agent", () => {
       RUN_INPUT,
       new AbortController().signal,
     )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+  });
+
+  test("maps a runtime model timeout through the public error boundary", async () => {
+    const token = "test-token-0123456789abcdef-0123456789";
+    const privateProviderBody = "private provider timeout response";
+    const runtimeError = Object.assign(new ApplicationRuntimeError("model_timeout"), {
+      privateProviderBody,
+    });
+    let runtimeCalls = 0;
+    const dependencies = dependenciesWith(
+      async () => {
+        runtimeCalls += 1;
+        throw runtimeError;
+      },
+      async (agent, _input, options) => {
+        await functionTool(agent, "browser_use").invoke(
+          new RunContext(options.context),
+          JSON.stringify({ code: "print('x')" }),
+        );
+        throw new Error("runtime timeout must terminate the run");
+      },
+    );
+    const route = createApplicationAgentRoutes({
+      status: () => ({
+        modelProvider: "openai-codex",
+        model: "gpt-5.6-sol",
+        reasoning: "high",
+        oauth: "connected",
+      }),
+      invoke: async (input, signal) => ({
+        modelProvider: "openai-codex",
+        model: "gpt-5.6-sol",
+        reasoning: "high",
+        result: await runApplicationAgent(input, signal, dependencies),
+      }),
+    }, token);
+    const request = new Request(
+      `http://127.0.0.1:3457${APPLICATION_AGENT_PATH}`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(RUN_INPUT),
+      },
+    );
+
+    const response = await route(request, new URL(request.url));
+
+    expect(runtimeCalls).toBe(1);
+    expect(response?.status).toBe(504);
+    const serialized = await response?.text() ?? "";
+    expect(JSON.parse(serialized)).toEqual({
+      error: {
+        code: "MODEL_TIMEOUT",
+        message: "The model request timed out",
+      },
+    });
+    expect(serialized).not.toContain(privateProviderBody);
   });
 
   test("maps the application run deadline to the fixed model timeout", async () => {
