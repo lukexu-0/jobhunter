@@ -6,9 +6,10 @@ const repositoryRoot = resolve(import.meta.dir, "../../..");
 const documents = [
   "info/docs/apps/index.html",
   "info/docs/apps/pipeline/index.html",
+  "info/docs/apps/browser-harness/index.html",
+  "info/docs/apps/browser-harness/application.html",
   "info/docs/apps/web/index.html",
-] as const;
-
+];
 function localHref(value: string): boolean {
   return !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value);
 }
