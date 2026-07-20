@@ -32,7 +32,7 @@ import { createTerminalSubmission } from "./tools.ts";
 export const ANALYSIS_TASK =
   "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills.";
 export const ANALYSIS_INSTRUCTIONS =
-  "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills. Use only the supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use or insert evidence-backed keywords when they improve truthful alignment. Edit bullets to more closely align with the job description where helpful. Make every project's first bullet a description. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Never invent facts; copy supplied hashes and call submit_job_analysis once.";
+  "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills. Use only the supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use evidence-backed keywords and edit bullets for truthful JD alignment. Use conventional terminology, do not use unconventional terms such as \"Agentic workflow systems\". Make every project's first bullet a description. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Copy supplied hashes and call submit_job_analysis once.";
 export const ANALYSIS_WORKFLOW_SHA256 = createHash("sha256")
   .update(`${ANALYSIS_TASK}\n${ANALYSIS_INSTRUCTIONS}`)
   .digest("hex");
