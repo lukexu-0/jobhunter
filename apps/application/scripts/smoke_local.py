@@ -37,8 +37,7 @@ from fixtures.local_application import LocalApplicationFixture  # noqa: E402
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
 MODEL_REASONING = "high"
-GATEWAY_PATH = "/v1/internal/browser-harness/codex"
-MODEL_MARKER = "JOBHUNTER_LIVE_MODEL_SMOKE_OK"
+GATEWAY_PATH = "/v1/internal/application-agent"
 FULL_NAME = "Ada Smokequill"
 EMAIL = "ada.smokequill@example.test"
 PROFILE_NARRATIVE = (
@@ -68,9 +67,10 @@ REVISION = (
 )
 REVISION_VALUE = "Human revision: emphasize careful incident ownership."
 RESUME_NAME = "smoke-resume.pdf"
+SUMMER_AVAILABILITY = "June through August 2027"
+REFERRAL_SOURCE = "Employee referral"
 
 REQUEST_TIMEOUT = httpx.Timeout(connect=5.0, read=35.0, write=35.0, pool=5.0)
-MODEL_TIMEOUT = httpx.Timeout(connect=5.0, read=310.0, write=30.0, pool=5.0)
 EVENT_WAIT_SECONDS = 900.0
 FIXTURE_WAIT_SECONDS = 120.0
 
@@ -130,6 +130,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=loopback_base_url,
         default="http://127.0.0.1:3457",
         help="running pipeline loopback origin (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--user-info-json",
+        type=lambda value: Path(value).expanduser().resolve(),
+        default=(Path(tempfile.gettempdir()) / "user-info.json").resolve(),
+        help=(
+            "private user-info store configured on the running harness "
+            "(default: %(default)s)"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -328,7 +337,12 @@ class EventStream:
                         None,
                     )
                     if failed is not None and event_name != "failed":
-                        raise SmokeFailure("Harness session failed before the expected workflow gate")
+                        session = failed.get("session")
+                        public_error = session.get("error") if isinstance(session, dict) else None
+                        raise SmokeFailure(
+                            "Harness session failed before the expected workflow gate: "
+                            f"{json.dumps(public_error, sort_keys=True)}"
+                        )
                     task = self._task
                     require(task is not None, "Harness SSE task was not started")
                     if task.done():
@@ -351,6 +365,22 @@ class EventStream:
         except TimeoutError:
             raise SmokeFailure(f"Timed out waiting for harness event: {event_name}") from None
 
+    async def wait_for_one_of(
+        self,
+        event_names: tuple[str, ...],
+        *,
+        after_id: int = 0,
+    ) -> dict[str, Any]:
+        tasks = [
+            asyncio.create_task(self.wait_for(name, after_id=after_id))
+            for name in event_names
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        return next(iter(done)).result()
+
     async def close(self) -> None:
         if self._task is None:
             return
@@ -370,7 +400,7 @@ async def post_command(
     capture: Capture,
     url: str,
     headers: dict[str, str],
-    command: dict[str, str],
+    command: dict[str, Any],
     failure: str,
 ) -> None:
     response = await client.post(url, headers=headers, json=command)
@@ -397,26 +427,182 @@ async def create_session(
     return response, payload
 
 
-def assert_gateway_completion(payload: dict[str, Any]) -> None:
+def read_user_info(path: Path) -> dict[str, Any]:
+    require(path.is_file(), f"Configured user-info store is unavailable: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SmokeFailure("Configured user-info store is not valid UTF-8 JSON") from error
+    require(isinstance(value, dict), "Configured user-info store was not a JSON object")
+    return value
+
+
+def assert_empty_user_info(path: Path) -> None:
     require(
-        set(payload) == {"modelProvider", "model", "reasoning", "output", "usage"},
-        "Live gateway completion returned an unexpected response shape",
+        read_user_info(path) == {"version": 1, "global": {}, "applications": {}},
+        "Smoke requires a fresh empty user-info store",
     )
-    require(payload.get("modelProvider") == MODEL_PROVIDER, "Live gateway used the wrong provider")
-    require(payload.get("model") == MODEL_NAME, "Live gateway used the wrong model")
-    require(payload.get("reasoning") == MODEL_REASONING, "Live gateway used the wrong reasoning level")
-    output = payload.get("output")
-    require(isinstance(output, dict), "Live gateway completion output was missing")
-    require(set(output) == {"type", "text"}, "Live gateway text output had an unexpected shape")
-    require(output.get("type") == "text", "Live gateway did not return unstructured text")
-    require(output.get("text", "").strip() == MODEL_MARKER, "Live gateway did not return the smoke marker")
-    usage = payload.get("usage")
-    require(isinstance(usage, dict), "Live gateway usage metadata was missing")
+
+
+def assert_saved_user_info(
+    path: Path,
+    job_url: str,
+    global_fact_key: str,
+    application_fact_key: str,
+) -> None:
+    document = read_user_info(path)
+    require(set(document) == {"version", "global", "applications"}, "User-info document shape changed")
+    require(document.get("version") == 1, "User-info document version changed")
+    global_facts = document.get("global")
+    applications = document.get("applications")
     require(
-        set(usage) == {"inputTokens", "outputTokens", "totalTokens"}
-        and all(isinstance(usage[key], int) and usage[key] >= 0 for key in usage),
-        "Live gateway usage metadata was invalid",
+        isinstance(global_facts, dict) and set(global_facts) == {global_fact_key},
+        "User-info store did not contain exactly the expected global fact",
     )
+    require(
+        isinstance(applications, dict) and set(applications) == {job_url},
+        "User-info store contained a cross-application bucket",
+    )
+    application_facts = applications[job_url]
+    require(
+        isinstance(application_facts, dict)
+        and set(application_facts) == {application_fact_key},
+        "User-info store did not contain exactly the expected application fact",
+    )
+    expected_records = (
+        (global_facts[global_fact_key], "text", SUMMER_AVAILABILITY),
+        (application_facts[application_fact_key], "single_select", REFERRAL_SOURCE),
+    )
+    for record, answer_type, expected_value in expected_records:
+        require(isinstance(record, dict), "User-info fact was not an object")
+        require(
+            set(record) == {"answer_type", "status", "value", "question", "updated_at"},
+            "User-info fact shape changed",
+        )
+        require(record.get("answer_type") == answer_type, "User-info fact answer type changed")
+        require(record.get("status") == "answered", "User-info fact was not answered")
+        require(record.get("value") == expected_value, "User-info fact persisted the wrong value")
+        require(
+            isinstance(record.get("question"), str) and bool(record["question"].strip()),
+            "User-info fact omitted its source question",
+        )
+        require(
+            isinstance(record.get("updated_at"), str) and bool(record["updated_at"]),
+            "User-info fact omitted its update timestamp",
+        )
+
+
+def additional_info_command(
+    event: dict[str, Any],
+) -> tuple[dict[str, Any], str, str]:
+    detail = event.get("detail")
+    require(isinstance(detail, dict), "Additional-information event omitted its detail")
+    questions = detail.get("questions")
+    require(
+        isinstance(questions, list) and len(questions) == 2,
+        "Agent did not ask exactly the two fixture questions in one batch",
+    )
+    require(
+        all(isinstance(question, dict) for question in questions),
+        "Additional-information event contained an invalid question",
+    )
+    global_questions = [
+        question
+        for question in questions
+        if question.get("scope") == "global"
+        and question.get("answer_type") == "text"
+    ]
+    require(
+        len(global_questions) == 1,
+        "Agent requested the global fixture fact with the wrong shape",
+    )
+    global_question = global_questions[0]
+    require(
+        global_question.get("scope") == "global"
+        and global_question.get("answer_type") == "text"
+        and isinstance(global_question.get("id"), str),
+        "Agent requested the global fixture fact with the wrong shape",
+    )
+    application_questions = [
+        question
+        for question in questions
+        if question.get("scope") == "application"
+        and question.get("answer_type") == "single_select"
+    ]
+    require(
+        len(application_questions) == 1,
+        "Agent requested the application fixture fact with the wrong shape",
+    )
+    application_question = application_questions[0]
+    require(
+        application_question.get("scope") == "application"
+        and application_question.get("answer_type") == "single_select"
+        and isinstance(application_question.get("id"), str),
+        "Agent requested the application fixture fact with the wrong shape",
+    )
+    options = application_question.get("options")
+    require(
+        isinstance(options, list) and len(options) >= 2,
+        "Agent omitted bounded referral-source options",
+    )
+    selected = next(
+        (
+            option
+            for option in options
+            if isinstance(option, dict) and option.get("label") == REFERRAL_SOURCE
+        ),
+        None,
+    )
+    require(
+        isinstance(selected, dict) and isinstance(selected.get("id"), str),
+        "Agent omitted the expected referral-source option",
+    )
+    require(
+        isinstance(global_question.get("key"), str)
+        and isinstance(application_question.get("key"), str),
+        "Agent omitted a fixture fact key",
+    )
+    command = {
+        "type": "provide_additional_info",
+        "answers": [
+            {
+                "id": global_question["id"],
+                "status": "answered",
+                "value": SUMMER_AVAILABILITY,
+            },
+            {
+                "id": application_question["id"],
+                "status": "answered",
+                "option_id": selected["id"],
+            },
+        ],
+    }
+    return command, global_question["key"], application_question["key"]
+
+
+async def wait_fixture_values(
+    fixture: LocalApplicationFixture,
+    expected: dict[str, Any],
+    failure: str,
+) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + FIXTURE_WAIT_SECONDS
+    latest_progress: dict[str, Any] = {}
+    while asyncio.get_running_loop().time() < deadline:
+        snapshot = await asyncio.to_thread(fixture.progress_snapshot)
+        progress = snapshot.get("progress")
+        if isinstance(progress, dict):
+            latest_progress = progress
+        if isinstance(progress, dict) and all(
+            progress.get(key) == value for key, value in expected.items()
+        ):
+            return progress
+        await asyncio.sleep(0.1)
+    mismatched = sorted(
+        key for key, value in expected.items() if latest_progress.get(key) != value
+    )
+    raise SmokeFailure(f"{failure}; mismatched fields: {', '.join(mismatched)}")
+
+
 
 
 def assert_subsequence(actual: list[str], expected: list[str]) -> None:
@@ -447,7 +633,7 @@ def assert_snapshot(
     require(snapshot.get("files_attached") == ["resume.pdf"], "Snapshot did not record the sanitized resume")
     require(snapshot.get("fields_needing_human") == [], "Snapshot still reported fields needing human input")
     fields = snapshot.get("fields_filled")
-    require(isinstance(fields, list) and len(fields) >= 10, "Snapshot did not report all fixture fields")
+    require(isinstance(fields, list) and len(fields) >= 12, "Snapshot did not report all fixture fields")
     require(
         all(
             isinstance(field, dict)
@@ -496,6 +682,8 @@ def assert_fixture_progress(progress: dict[str, Any]) -> None:
         "focus": "deployment-systems",
         "truthful": True,
         "years": "7",
+        "summerAvailability": SUMMER_AVAILABILITY,
+        "referralSource": REFERRAL_SOURCE,
         "resume": RESUME_NAME,
         "intermediateClick": "true",
         "intermediateEnter": "true",
@@ -521,6 +709,14 @@ async def wait_for_one_submit(fixture: LocalApplicationFixture) -> None:
             require(submission.get("full_name") == FULL_NAME, "Submitted fixture name changed after ready")
             require(submission.get("email") == EMAIL, "Submitted fixture email changed after ready")
             require(submission.get("review_answer") == REVISION_VALUE, "Submitted fixture revision changed after ready")
+            require(
+                submission.get("summer_availability") == SUMMER_AVAILABILITY,
+                "Submitted fixture global answer changed after ready",
+            )
+            require(
+                submission.get("referral_source") == REFERRAL_SOURCE,
+                "Submitted fixture application answer changed after ready",
+            )
             require(submission.get("resume") == RESUME_NAME, "Submitted fixture resume changed after ready")
             serialized = json.dumps(submission, sort_keys=True).lower()
             require(
@@ -569,6 +765,7 @@ def privacy_scan(capture: Capture, token: str) -> None:
         IRRELEVANT_ANECDOTE,
         REVISION,
         REVISION_VALUE,
+        SUMMER_AVAILABILITY,
     )
     for value in forbidden_values:
         require(value not in corpus, "Captured API/SSE data failed the privacy scan")
@@ -606,7 +803,6 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
     event_stream: EventStream | None = None
     fixture: LocalApplicationFixture | None = None
     client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=False)
-    model_client = httpx.AsyncClient(timeout=MODEL_TIMEOUT, follow_redirects=False)
 
     with tempfile.TemporaryDirectory(prefix="jobhunter-browser-harness-smoke-") as temporary:
         inputs = create_inputs(Path(temporary))
@@ -641,23 +837,8 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 },
                 "Pipeline model status metadata was not exact",
             )
+            assert_empty_user_info(args.user_info_json)
 
-            live_response = await model_client.post(
-                f"{args.pipeline_url}{GATEWAY_PATH}",
-                headers={**headers, "Content-Type": "application/json"},
-                json={
-                    "sessionId": str(uuid4()),
-                    "systemPrompt": f"Return exactly {MODEL_MARKER} and no other text.",
-                    "transcript": "User: Return the requested local smoke marker now.",
-                },
-            )
-            live_completion = response_json_object(
-                capture,
-                live_response,
-                "Live pipeline gateway response was not JSON",
-            )
-            require_status(live_response, 200, "Live pipeline model call failed")
-            assert_gateway_completion(live_completion)
 
             create_response, created = await create_session(
                 client, capture, args.harness_url, headers, fixture, inputs
@@ -705,8 +886,71 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 "Harness rejected exact dynamic form-origin approval",
             )
 
+            additional_info = await event_stream.wait_for(
+                "additional_info_required", after_id=int(approval["id"])
+            )
+            initial_progress = await wait_fixture_values(
+                fixture,
+                {
+                    "fullName": FULL_NAME,
+                    "email": EMAIL,
+                    "workStyle": "remote",
+                    "focus": "deployment-systems",
+                    "truthful": True,
+                    "years": "7",
+                    "resume": RESUME_NAME,
+                },
+                "Agent requested additional information before filling fields supported by initial data",
+            )
+            initial_incident = initial_progress.get("incident")
+            require(
+                isinstance(initial_incident, str)
+                and "rollback" in initial_incident.lower()
+                and "service health" in initial_incident.lower(),
+                "Agent requested additional information before applying initial incident evidence",
+            )
+            info_command, global_fact_key, application_fact_key = (
+                additional_info_command(additional_info)
+            )
+            await post_command(
+                client,
+                capture,
+                commands_url,
+                headers,
+                info_command,
+                "Harness rejected the complete additional-information batch",
+            )
+            saved_info = await event_stream.wait_for(
+                "additional_info_saved", after_id=int(additional_info["id"])
+            )
+            require(
+                saved_info.get("detail") == {"count": 2},
+                "Harness did not report both saved information answers",
+            )
+            assert_saved_user_info(
+                args.user_info_json,
+                fixture.posting_url,
+                global_fact_key,
+                application_fact_key,
+            )
+
             navigation = await event_stream.wait_for(
-                "human_navigation_required", after_id=int(approval["id"])
+                "human_navigation_required", after_id=int(saved_info["id"])
+            )
+            await wait_fixture_values(
+                fixture,
+                {
+                    "summerAvailability": SUMMER_AVAILABILITY,
+                    "referralSource": REFERRAL_SOURCE,
+                    "humanNext": "",
+                    "reviewVisible": False,
+                },
+                "Agent did not apply both accepted answers in the same model run",
+            )
+            before_navigation_submit = await asyncio.to_thread(fixture.submit_snapshot)
+            require(
+                before_navigation_submit.get("submit_count") == 0,
+                "Agent submitted while applying additional information",
             )
             print('In headed Chrome, click "Human Next" on the fixture, then press Enter here.')
             await asyncio.to_thread(input)
@@ -758,6 +1002,8 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 [
                     "session_started",
                     "origin_approval_required",
+                    "additional_info_required",
+                    "additional_info_saved",
                     "human_navigation_required",
                     "review_required",
                     "revision_applied",
@@ -768,6 +1014,8 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             expected_states = {
                 "session_started": "running",
                 "origin_approval_required": "awaiting_origin_approval",
+                "additional_info_required": "awaiting_additional_info",
+                "additional_info_saved": "running",
                 "human_navigation_required": "awaiting_human_navigation",
                 "review_required": "awaiting_human_review",
                 "revision_applied": "running",
@@ -818,36 +1066,102 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             await event_stream.close()
             event_stream = None
 
-            cleanup_create_response, cleanup_created = await create_session(
+            followup_create_response, followup_created = await create_session(
                 client, capture, args.harness_url, headers, fixture, inputs
             )
             require_status(
-                cleanup_create_response,
+                followup_create_response,
                 202,
-                "A new session could not start after ordered cleanup released the singleton",
+                "A fresh session could not start after ordered cleanup released the singleton",
             )
-            cleanup_session_id = str(cleanup_created.get("session_id"))
             try:
-                UUID(cleanup_session_id)
+                followup_session_id = str(UUID(str(followup_created.get("session_id"))))
             except (ValueError, TypeError, AttributeError):
-                raise SmokeFailure("Cleanup-proof create returned an invalid session id") from None
-            active_session_id = cleanup_session_id
-            cleanup_delete = await client.delete(
-                f"{args.harness_url}/v1/sessions/{cleanup_session_id}", headers=headers
+                raise SmokeFailure("Follow-up create returned an invalid session id") from None
+            active_session_id = followup_session_id
+            followup_events_url = followup_created.get("events_url")
+            followup_commands_url = followup_created.get("commands_url")
+            require(
+                isinstance(followup_events_url, str)
+                and isinstance(followup_commands_url, str),
+                "Follow-up create omitted gate URLs",
             )
-            capture.response(cleanup_delete)
-            require_status(cleanup_delete, 204, "Cleanup-proof session DELETE failed")
-            require(cleanup_delete.content == b"", "Cleanup-proof DELETE 204 unexpectedly contained a body")
-            cleanup_snapshot_response = await client.get(
-                f"{args.harness_url}/v1/sessions/{cleanup_session_id}", headers=headers
+            event_stream = EventStream(client, followup_events_url, headers, capture)
+            event_stream.start()
+            await event_stream.wait_for("session_started")
+            followup_approval = await event_stream.wait_for("origin_approval_required")
+            require(
+                followup_approval.get("detail") == {"origin": fixture.form_origin},
+                "Follow-up session requested the wrong application origin",
             )
-            cleanup_snapshot = response_json_object(
+            await post_command(
+                client,
                 capture,
-                cleanup_snapshot_response,
-                "Cleanup-proof closed snapshot was not JSON",
+                followup_commands_url,
+                headers,
+                {"type": "approve_origin", "origin": fixture.form_origin},
+                "Harness rejected follow-up origin approval",
             )
-            require_status(cleanup_snapshot_response, 200, "Cleanup-proof closed tombstone was unavailable")
-            require(cleanup_snapshot.get("state") == "closed", "Cleanup-proof session was not closed")
+            followup_gate = await event_stream.wait_for_one_of(
+                ("human_navigation_required", "additional_info_required"),
+                after_id=int(followup_approval["id"]),
+            )
+            require(
+                followup_gate.get("event") == "human_navigation_required",
+                "Follow-up session repeated an already answered information gate",
+            )
+            await wait_fixture_values(
+                fixture,
+                {
+                    "fullName": FULL_NAME,
+                    "email": EMAIL,
+                    "summerAvailability": SUMMER_AVAILABILITY,
+                    "referralSource": REFERRAL_SOURCE,
+                    "humanNext": "",
+                    "reviewVisible": False,
+                },
+                "Follow-up session did not apply both scoped saved facts",
+            )
+            require(
+                "additional_info_required"
+                not in [event.get("event") for event in event_stream.events],
+                "Follow-up event history contained a repeated information gate",
+            )
+            assert_saved_user_info(
+                args.user_info_json,
+                fixture.posting_url,
+                global_fact_key,
+                application_fact_key,
+            )
+
+            followup_delete = await client.delete(
+                f"{args.harness_url}/v1/sessions/{followup_session_id}", headers=headers
+            )
+            capture.response(followup_delete)
+            require_status(followup_delete, 204, "Follow-up session DELETE failed")
+            require(followup_delete.content == b"", "Follow-up DELETE 204 unexpectedly contained a body")
+            await event_stream.wait_for(
+                "closed", after_id=int(followup_gate["id"]), timeout=60
+            )
+            await event_stream.close()
+            event_stream = None
+            followup_snapshot_response = await client.get(
+                f"{args.harness_url}/v1/sessions/{followup_session_id}", headers=headers
+            )
+            followup_snapshot = response_json_object(
+                capture,
+                followup_snapshot_response,
+                "Follow-up closed snapshot was not JSON",
+            )
+            require_status(
+                followup_snapshot_response,
+                200,
+                "Follow-up closed tombstone was unavailable",
+            )
+            require(
+                followup_snapshot.get("state") == "closed",
+                "Follow-up session was not closed",
+            )
             active_session_id = None
             final_submit = await asyncio.to_thread(fixture.submit_snapshot)
             require(final_submit.get("submit_count") == 1, "Cleanup changed the one-submit fixture invariant")
@@ -865,7 +1179,6 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 await event_stream.close()
             if fixture is not None:
                 await asyncio.to_thread(fixture.close)
-            await model_client.aclose()
             await client.aclose()
 
 
@@ -882,7 +1195,8 @@ async def run(args: argparse.Namespace) -> None:
     try:
         privacy_scan(capture, token)
     except BaseException as error:
-        failure = error
+        if failure is None:
+            failure = error
     if failure is not None:
         if isinstance(failure, SmokeFailure):
             raise failure

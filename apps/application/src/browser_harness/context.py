@@ -14,13 +14,14 @@ from pypdf import PdfReader
 import pypdf.filters as pypdf_filters
 
 from .artifacts import StoredCandidateArtifacts, StoredUpload
-from .models import HarnessServiceError, validate_approved_origin, validate_sanitized_basename
+from .models import HarnessServiceError, validate_sanitized_basename
 
 MAX_SOURCE_CHARACTERS = 100_000
 MAX_COMBINED_NARRATIVE_CHARACTERS = 250_000
 MAX_PDF_STREAM_BYTES = 2 * 1024 * 1024
 
 SourceCategory = Literal["profile", "context", "anecdote"]
+EvidenceCategory = Literal["resume", "profile", "context", "anecdote"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,27 @@ class CandidateContext:
     context_sources: tuple[AttributedSource, ...]
     anecdotes: tuple[AttributedSource, ...]
 
+
+
+@dataclass(frozen=True, slots=True)
+class AttributedEvidence:
+    category: EvidenceCategory
+    name: str
+    text: str
+
+    def __post_init__(self) -> None:
+        if self.category not in {"resume", "profile", "context", "anecdote"}:
+            raise ValueError("candidate evidence has an invalid category")
+        validate_sanitized_basename(self.name)
+        if len(self.text) > MAX_SOURCE_CHARACTERS:
+            raise ValueError("candidate evidence exceeds the character limit")
+
+    def as_task_value(self) -> dict[str, str]:
+        return {
+            "category": self.category,
+            "name": self.name,
+            "text": self.text,
+        }
 
 
 def _invalid_context() -> HarnessServiceError:
@@ -143,51 +165,61 @@ def load_candidate_context(artifacts: StoredCandidateArtifacts) -> CandidateCont
         raise _invalid_context() from None
 
 
-def _render_source(category: str, name: str, text: str) -> str:
-    safe_name = validate_sanitized_basename(name)
-    return json.dumps(
-        {"category": category, "name": safe_name, "text": text},
-        ensure_ascii=False,
-        separators=(",", ":"),
+def candidate_evidence_records(
+    candidate: CandidateContext,
+    resume_name: str,
+) -> tuple[AttributedEvidence, ...]:
+    records = [
+        AttributedEvidence(
+            category="resume",
+            name=resume_name,
+            text=candidate.resume_text,
+        )
+    ]
+    if candidate.profile_narrative.text:
+        records.append(
+            AttributedEvidence(
+                category=candidate.profile_narrative.category,
+                name=candidate.profile_narrative.name,
+                text=candidate.profile_narrative.text,
+            )
+        )
+    records.extend(
+        AttributedEvidence(
+            category=source.category,
+            name=source.name,
+            text=source.text,
+        )
+        for source in candidate.context_sources
     )
+    records.extend(
+        AttributedEvidence(
+            category=source.category,
+            name=source.name,
+            text=source.text,
+        )
+        for source in candidate.anecdotes
+    )
+    return tuple(records)
 
 
 def render_candidate_evidence(candidate: CandidateContext, resume_name: str) -> str:
-    """Render attributed narrative evidence; explicit direct values are intentionally excluded."""
+    """Render the retained JSONL debug view of attributed evidence."""
 
-    sections = [_render_source("resume", resume_name, candidate.resume_text)]
-    if candidate.profile_narrative.text:
-        sections.append(
-            _render_source(
-                candidate.profile_narrative.category,
-                candidate.profile_narrative.name,
-                candidate.profile_narrative.text,
-            )
+    sections = (
+        json.dumps(
+            record.as_task_value(),
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
-    sections.extend(_render_source(source.category, source.name, source.text) for source in candidate.context_sources)
-    sections.extend(_render_source(source.category, source.name, source.text) for source in candidate.anecdotes)
-    return "Candidate evidence sources (one JSON object per line):\n" + "\n".join(sections)
+        for record in candidate_evidence_records(candidate, resume_name)
+    )
+    return "Candidate evidence sources (one JSON object per line):\n" + "\n".join(
+        sections
+    )
 
 
-def build_sensitive_data(
-    candidate: CandidateContext,
-    approved_origins: tuple[str, ...] | list[str],
-) -> dict[str, dict[str, str]]:
-    """Build Browser Use's domain-scoped placeholder map from explicit front matter only."""
 
-    origins = [validate_approved_origin(origin) for origin in approved_origins]
-    if len(set(origins)) != len(origins):
-        raise ValueError("approved origins must be unique")
-    values = dict(candidate.direct_fields)
-    return {origin: dict(values) for origin in origins}
-
-
-def sensitive_placeholder_instruction(candidate: CandidateContext) -> str:
-    names = sorted(candidate.direct_fields)
-    if not names:
-        return "No explicit personal-data placeholders are available."
-    placeholders = ", ".join(f"<secret>{name}</secret>" for name in names)
-    return f"Use only these placeholders for explicit personal data: {placeholders}."
 
 
 def _serialize_candidate_context(candidate: CandidateContext) -> dict[str, object]:

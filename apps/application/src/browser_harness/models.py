@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -27,6 +28,7 @@ SessionState: TypeAlias = Literal[
     "running",
     "awaiting_human_navigation",
     "awaiting_origin_approval",
+    "awaiting_additional_info",
     "awaiting_human_review",
     "ready_for_human_submit",
     "cancelled",
@@ -103,6 +105,46 @@ OptionalShortText = Annotated[
 WarningText = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=1_000),
+]
+
+AdditionalInfoQuestionId = Annotated[
+    str,
+    StringConstraints(strict=True, pattern=r"^[a-z][a-z0-9_]{0,63}$"),
+]
+UserInfoKey = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        max_length=100,
+        pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+    ),
+]
+AdditionalInfoQuestionText = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=500,
+    ),
+]
+AdditionalInfoOptionLabel = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=200,
+    ),
+]
+AdditionalInfoTextValue = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=2_000,
+    ),
 ]
 
 
@@ -234,6 +276,159 @@ class FrozenPrivateModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+class AdditionalInfoOption(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    label: AdditionalInfoOptionLabel
+
+
+class _AdditionalInfoQuestionBase(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    key: UserInfoKey
+    scope: Literal["global", "application"]
+    question: AdditionalInfoQuestionText
+
+
+class AdditionalInfoTextQuestion(_AdditionalInfoQuestionBase):
+    answer_type: Literal["text"]
+
+
+class AdditionalInfoBooleanQuestion(_AdditionalInfoQuestionBase):
+    answer_type: Literal["boolean"]
+
+
+class _AdditionalInfoSelectQuestion(_AdditionalInfoQuestionBase):
+    options: list[AdditionalInfoOption] = Field(min_length=2, max_length=20)
+
+    @field_validator("options")
+    @classmethod
+    def _validate_unique_options(
+        cls, values: list[AdditionalInfoOption]
+    ) -> list[AdditionalInfoOption]:
+        if len({option.id for option in values}) != len(values):
+            raise ValueError("option ids must be unique")
+        return values
+
+
+class AdditionalInfoSingleSelectQuestion(_AdditionalInfoSelectQuestion):
+    answer_type: Literal["single_select"]
+
+
+class AdditionalInfoMultiSelectQuestion(_AdditionalInfoSelectQuestion):
+    answer_type: Literal["multi_select"]
+
+
+AdditionalInfoQuestion: TypeAlias = Annotated[
+    AdditionalInfoTextQuestion
+    | AdditionalInfoBooleanQuestion
+    | AdditionalInfoSingleSelectQuestion
+    | AdditionalInfoMultiSelectQuestion,
+    Field(discriminator="answer_type"),
+]
+
+
+class AdditionalInfoDeclinedCommandAnswer(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    status: Literal["declined"]
+
+
+class AdditionalInfoTextCommandAnswer(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    status: Literal["answered"]
+    value: AdditionalInfoTextValue
+
+
+class AdditionalInfoBooleanCommandAnswer(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    status: Literal["answered"]
+    value: bool
+
+
+class AdditionalInfoSingleSelectCommandAnswer(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    status: Literal["answered"]
+    option_id: AdditionalInfoQuestionId
+
+
+class AdditionalInfoMultiSelectCommandAnswer(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    status: Literal["answered"]
+    option_ids: list[AdditionalInfoQuestionId] = Field(
+        min_length=1,
+        max_length=20,
+    )
+
+    @field_validator("option_ids")
+    @classmethod
+    def _validate_unique_option_ids(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values):
+            raise ValueError("option_ids must be unique")
+        return values
+
+
+AdditionalInfoCommandAnswer: TypeAlias = (
+    AdditionalInfoDeclinedCommandAnswer
+    | AdditionalInfoTextCommandAnswer
+    | AdditionalInfoBooleanCommandAnswer
+    | AdditionalInfoSingleSelectCommandAnswer
+    | AdditionalInfoMultiSelectCommandAnswer
+)
+
+
+class AcceptedAdditionalInfoAnswer(FrozenPrivateModel):
+    id: AdditionalInfoQuestionId
+    key: UserInfoKey
+    scope: Literal["global", "application"]
+    answer_type: Literal["text", "boolean", "single_select", "multi_select"]
+    status: Literal["answered", "declined"]
+    value: StrictText | bool | list[StrictText] | None = None
+
+    @model_validator(mode="after")
+    def _validate_semantic_value(self) -> AcceptedAdditionalInfoAnswer:
+        value_was_supplied = "value" in self.model_fields_set
+        if self.status == "declined":
+            if value_was_supplied:
+                raise ValueError("declined answers must omit value")
+            return self
+        if not value_was_supplied:
+            raise ValueError("answered answers require value")
+        if self.answer_type == "boolean":
+            if not isinstance(self.value, bool):
+                raise ValueError("boolean answers require a boolean value")
+            return self
+        if self.answer_type in {"text", "single_select"}:
+            maximum = 2_000 if self.answer_type == "text" else 200
+            if (
+                not isinstance(self.value, str)
+                or self.value != self.value.strip()
+                or not 1 <= len(self.value) <= maximum
+            ):
+                raise ValueError("text answers require a bounded string value")
+            return self
+        if (
+            not isinstance(self.value, list)
+            or not 1 <= len(self.value) <= 20
+            or any(
+                not value or value != value.strip() or len(value) > 200
+                for value in self.value
+            )
+        ):
+            raise ValueError("multi-select answers require bounded string values")
+        return self
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "id": self.id,
+            "key": self.key,
+            "scope": self.scope,
+            "answer_type": self.answer_type,
+            "status": self.status,
+        }
+        if self.status == "answered":
+            result["value"] = self.value
+        return result
+
+
 class HarnessServiceError(Exception):
     """Sanitized service failure safe to expose through the loopback API."""
 
@@ -288,6 +483,9 @@ class HarnessConfig(FrozenPrivateModel):
     bubblewrap_executable: Path = Path("/usr/bin/bwrap")
     browser_skill_workspace: Path = Path(
         "~/.jobhunter/application/browser-skill/agent-workspace"
+    )
+    user_info_json: Path = Path(
+        "apps/user-info/current-context/personal/user-info.json"
     )
     browser: BrowserLaunchConfig = Field(default_factory=BrowserLaunchConfig)
 
@@ -445,12 +643,22 @@ class RevisionAppliedDetail(PublicModel):
     revision_count: int = Field(ge=1, le=100)
 
 
+class AdditionalInfoRequiredDetail(PublicModel):
+    questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
+
+
+class AdditionalInfoSavedDetail(PublicModel):
+    count: int = Field(ge=1, le=20)
+
+
 HarnessEventDetail: TypeAlias = (
     EmptyEventDetail
     | AgentStepDetail
     | HumanNavigationDetail
     | OriginApprovalDetail
     | RevisionAppliedDetail
+    | AdditionalInfoRequiredDetail
+    | AdditionalInfoSavedDetail
 )
 HarnessEventType: TypeAlias = Literal[
     "snapshot",
@@ -460,6 +668,8 @@ HarnessEventType: TypeAlias = Literal[
     "origin_approval_required",
     "review_required",
     "revision_applied",
+    "additional_info_required",
+    "additional_info_saved",
     "ready_for_human_submit",
     "cancelled",
     "failed",
@@ -484,6 +694,10 @@ class HarnessEvent(PublicModel):
             expected = OriginApprovalDetail
         elif self.event == "revision_applied":
             expected = RevisionAppliedDetail
+        elif self.event == "additional_info_required":
+            expected = AdditionalInfoRequiredDetail
+        elif self.event == "additional_info_saved":
+            expected = AdditionalInfoSavedDetail
         else:
             expected = EmptyEventDetail
         if not isinstance(self.detail, expected):
@@ -526,12 +740,27 @@ class CancelCommand(PublicModel):
     type: Literal["cancel"]
 
 
+class ProvideAdditionalInfoCommand(PublicModel):
+    type: Literal["provide_additional_info"]
+    answers: list[AdditionalInfoCommandAnswer] = Field(min_length=1, max_length=20)
+
+    @field_validator("answers")
+    @classmethod
+    def _validate_unique_answer_ids(
+        cls, values: list[AdditionalInfoCommandAnswer]
+    ) -> list[AdditionalInfoCommandAnswer]:
+        if len({answer.id for answer in values}) != len(values):
+            raise ValueError("answer ids must be unique")
+        return values
+
+
 SessionCommand: TypeAlias = Annotated[
     ContinueCommand
     | ApproveOriginCommand
     | ReviseCommand
     | ReadyCommand
-    | CancelCommand,
+    | CancelCommand
+    | ProvideAdditionalInfoCommand,
     Field(discriminator="type"),
 ]
 
@@ -549,21 +778,26 @@ class SessionCreateResponse(PublicModel):
 
 
 class BrowserTab(PublicModel):
-    url: StrictText
-    title: StrictText
-    tab_id: StrictText
-    parent_tab_id: StrictText | None = None
+    url: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
+    title: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
+    tab_id: Annotated[str, StringConstraints(strict=True, max_length=512)]
+    parent_tab_id: (
+        Annotated[str, StringConstraints(strict=True, max_length=512)] | None
+    ) = None
 
 
 class BrowserScreenshot(PublicModel):
     media_type: Literal["image/png"] = "image/png"
-    data: StrictText
+    data: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=11_184_812),
+    ]
 
 
 class BrowserObservation(PublicModel):
-    url: StrictText
-    title: StrictText
-    tabs: list[BrowserTab]
+    url: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
+    title: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
+    tabs: list[BrowserTab] = Field(max_length=100)
     dom: Annotated[str, StringConstraints(strict=True, max_length=40_000)]
     page_info: dict[str, object] | None
     screenshot: BrowserScreenshot | None
@@ -601,3 +835,164 @@ class ApplicationRunResult(PublicModel):
     @classmethod
     def _validate_files(cls, values: list[str]) -> list[str]:
         return [validate_sanitized_basename(value) for value in values]
+
+
+class BrowserUseRuntimeAction(PublicModel):
+    type: Literal["browser_use"]
+    code: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=65_536),
+    ]
+
+
+class RequestHumanNavigationRuntimeAction(PublicModel):
+    type: Literal["request_human_navigation"]
+    instruction: Annotated[
+        str,
+        StringConstraints(
+            strict=True,
+            strip_whitespace=True,
+            min_length=1,
+            max_length=2_000,
+        ),
+    ]
+
+
+class RequestOriginApprovalRuntimeAction(PublicModel):
+    type: Literal["request_origin_approval"]
+    origin: StrictText
+
+    @field_validator("origin")
+    @classmethod
+    def _validate_origin(cls, value: str) -> str:
+        return validate_approved_origin(value)
+
+
+
+
+class RequestAdditionalInfoRuntimeAction(PublicModel):
+    type: Literal["request_additional_info"]
+    questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
+
+    @field_validator("questions")
+    @classmethod
+    def _validate_unique_questions(
+        cls, values: list[AdditionalInfoQuestion]
+    ) -> list[AdditionalInfoQuestion]:
+        if len({question.id for question in values}) != len(values):
+            raise ValueError("question ids must be unique")
+        scoped_keys = {(question.scope, question.key) for question in values}
+        if len(scoped_keys) != len(values):
+            raise ValueError("question scope and key pairs must be unique")
+        return values
+
+
+class RequestHumanReviewRuntimeAction(PublicModel):
+    type: Literal["request_human_review"]
+    result: ApplicationRunResult
+
+
+class ReportApplicationMismatchRuntimeAction(PublicModel):
+    type: Literal["report_application_mismatch"]
+
+
+RuntimeActionRequest: TypeAlias = Annotated[
+    BrowserUseRuntimeAction
+    | RequestHumanNavigationRuntimeAction
+    | RequestOriginApprovalRuntimeAction
+    | RequestAdditionalInfoRuntimeAction
+    | RequestHumanReviewRuntimeAction
+    | ReportApplicationMismatchRuntimeAction,
+    Field(discriminator="type"),
+]
+
+
+class BrowserUseResultRuntimeActionResponse(BrowserUseExecutionResult):
+    type: Literal["browser_use_result"]
+
+
+class ContinueRuntimeActionResponse(PublicModel):
+    type: Literal["continue"]
+
+
+class ApproveRuntimeActionResponse(PublicModel):
+    type: Literal["approve"]
+    origin: StrictText
+    approved_origins: list[StrictText] = Field(min_length=1, max_length=20)
+
+    @field_validator("origin")
+    @classmethod
+    def _validate_origin(cls, value: str) -> str:
+        return validate_approved_origin(value)
+
+    @field_validator("approved_origins")
+    @classmethod
+    def _validate_approved_origins(cls, values: list[str]) -> list[str]:
+        canonical = [validate_approved_origin(value) for value in values]
+        if len(set(canonical)) != len(canonical):
+            raise ValueError("approved_origins must not contain duplicates")
+        return canonical
+
+    @model_validator(mode="after")
+    def _validate_origin_is_approved(self) -> ApproveRuntimeActionResponse:
+        if self.origin not in self.approved_origins:
+            raise ValueError("origin must be present in approved_origins")
+        return self
+
+
+class ReviseRuntimeActionResponse(PublicModel):
+    type: Literal["revise"]
+    context: Annotated[
+        str,
+        StringConstraints(
+            strict=True,
+            strip_whitespace=True,
+            min_length=1,
+            max_length=20_000,
+        ),
+    ]
+    revision_count: int = Field(ge=1, le=100)
+
+
+class ReadyRuntimeActionResponse(PublicModel):
+    type: Literal["ready"]
+    result: ApplicationRunResult
+
+    @model_validator(mode="after")
+    def _validate_ready_result(self) -> ReadyRuntimeActionResponse:
+        if self.result.status != "ready_for_human_submit":
+            raise ValueError("ready response requires a ready result")
+        return self
+
+
+class CancelRuntimeActionResponse(PublicModel):
+    type: Literal["cancel"]
+    result: ApplicationRunResult
+
+    @model_validator(mode="after")
+    def _validate_cancel_result(self) -> CancelRuntimeActionResponse:
+        if self.result.status != "cancelled":
+            raise ValueError("cancel response requires a cancelled result")
+        return self
+
+
+class AdditionalInfoRuntimeActionResponse(PublicModel):
+    type: Literal["additional_info"]
+    answers: list[AcceptedAdditionalInfoAnswer] = Field(min_length=1, max_length=20)
+
+
+class ApplicationMismatchRuntimeActionResponse(PublicModel):
+    type: Literal["application_mismatch"]
+
+
+RuntimeActionResponse: TypeAlias = Annotated[
+    BrowserUseResultRuntimeActionResponse
+    | ContinueRuntimeActionResponse
+    | ApproveRuntimeActionResponse
+    | ReviseRuntimeActionResponse
+    | ReadyRuntimeActionResponse
+    | CancelRuntimeActionResponse
+    | AdditionalInfoRuntimeActionResponse
+    | ApplicationMismatchRuntimeActionResponse,
+    Field(discriminator="type"),
+]

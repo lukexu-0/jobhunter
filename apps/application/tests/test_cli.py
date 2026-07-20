@@ -42,6 +42,7 @@ def test_help_succeeds_without_configured_token(
     assert "--session-timeout" in captured.out
     assert "--bubblewrap-executable" in captured.out
     assert "--browser-skill-workspace" in captured.out
+    assert "--user-info-json" in captured.out
     assert "--chrome-executable" in captured.out
     assert "--chrome-user-data-dir" in captured.out
     assert "--cdp-url" in captured.out
@@ -137,13 +138,14 @@ def test_valid_loopback_cdp_configuration(
     )
 
 
-def test_bubblewrap_and_skill_workspace_are_explicit_resolved_configuration(
+def test_runtime_paths_are_explicit_resolved_configuration(
     tmp_path: Path,
 ) -> None:
     bubblewrap = tmp_path / "bwrap"
     bubblewrap.write_bytes(b"fake bubblewrap executable")
     bubblewrap.chmod(0o700)
     workspace = tmp_path / "browser-skill" / "agent-workspace"
+    user_info_json = tmp_path / "private" / "user-info.json"
 
     config, _ = cli_module.parse_config(
         [
@@ -153,12 +155,15 @@ def test_bubblewrap_and_skill_workspace_are_explicit_resolved_configuration(
             str(bubblewrap),
             "--browser-skill-workspace",
             str(workspace),
+            "--user-info-json",
+            str(user_info_json),
         ],
         environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
     )
 
     assert config.bubblewrap_executable == bubblewrap.resolve()
     assert config.browser_skill_workspace == workspace
+    assert config.user_info_json == user_info_json.resolve()
 
 
 @pytest.mark.parametrize(

@@ -1,94 +1,66 @@
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
-from urllib.parse import unquote, urlsplit
+from typing import Literal, TypeAlias
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
-from typing_extensions import Annotated
-
-from browser_use.agent.views import ActionModel, ActionResult
+from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
-from browser_use.filesystem.file_system import FileSystem
-from browser_use.llm.base import BaseChatModel
-from browser_use.tools.service import Tools
 
-from .context import CandidateContext
 from .models import (
+    AcceptedAdditionalInfoAnswer,
+    AdditionalInfoBooleanCommandAnswer,
+    AdditionalInfoBooleanQuestion,
+    AdditionalInfoCommandAnswer,
+    AdditionalInfoDeclinedCommandAnswer,
+    AdditionalInfoMultiSelectCommandAnswer,
+    AdditionalInfoMultiSelectQuestion,
+    AdditionalInfoOption,
+    AdditionalInfoQuestion,
+    AdditionalInfoRuntimeActionResponse,
+    AdditionalInfoSingleSelectCommandAnswer,
+    AdditionalInfoSingleSelectQuestion,
+    AdditionalInfoTextCommandAnswer,
+    AdditionalInfoTextQuestion,
     ApplicationRunResult,
     FieldResult,
-    sanitize_public_url,
     HarnessServiceError,
     SessionState,
+    sanitize_public_url,
     validate_approved_origin,
+    validate_job_url,
 )
+from .user_info import UserInfoStore
 
-DEFAULT_ACTIONS_0_13_4 = frozenset(
-    {
-        "done",
-        "search",
-        "navigate",
-        "go_back",
-        "wait",
-        "click",
-        "input",
-        "upload_file",
-        "switch",
-        "close",
-        "extract",
-        "search_page",
-        "find_elements",
-        "scroll",
-        "send_keys",
-        "find_text",
-        "screenshot",
-        "save_as_pdf",
-        "dropdown_options",
-        "select_dropdown",
-        "write_file",
-        "replace_file",
-        "read_file",
-        "evaluate",
-    }
-)
+
 MAX_APPROVED_ORIGINS = 20
-APPLICATION_MISMATCH_RESULT = '{"harness_failure":"application_mismatch"}'
+
 
 GateEventPublisher = Callable[
     [SessionState, str | None, Mapping[str, object]], Awaitable[None]
 ]
 ReviewSnapshotSink = Callable[[ApplicationRunResult], Awaitable[None]]
-GateKind = Literal["navigation", "origin", "review"]
-DecisionKind = Literal["continue", "approve", "revise", "ready", "cancel"]
-
-
-class _StrictActionModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-
-class HumanNavigationRequest(_StrictActionModel):
-    instruction: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=2_000),
-    ]
-
-
-class OriginApprovalRequest(_StrictActionModel):
-    origin: str
-
-    @field_validator("origin")
-    @classmethod
-    def validate_origin(cls, value: str) -> str:
-        return validate_approved_origin(value)
+GateKind = Literal["navigation", "origin", "additional_info", "review"]
+DecisionKind = Literal[
+    "continue",
+    "approve",
+    "additional_info",
+    "revise",
+    "ready",
+    "cancel",
+]
+GatePayload: TypeAlias = str | tuple[AcceptedAdditionalInfoAnswer, ...] | None
+GateDecision: TypeAlias = tuple[DecisionKind, GatePayload]
 
 
 @dataclass(slots=True)
 class _PendingGate:
     kind: GateKind
-    future: asyncio.Future[tuple[DecisionKind, str | None]]
+    future: asyncio.Future[GateDecision]
     browser_session: BrowserSession
     origin: str | None = None
-
+    questions: tuple[AdditionalInfoQuestion, ...] = ()
+    storage_questions: tuple[AdditionalInfoQuestion, ...] = ()
 
 def _origin_from_url(value: str) -> str:
     parsed = urlsplit(value)
@@ -117,30 +89,50 @@ def _decode_public_text(value: str) -> str:
 
 def redact_public_text(
     value: str | None,
-    direct_values: Mapping[str, str],
+    private_values: Iterable[str],
+    *,
+    max_length: int | None = None,
 ) -> str | None:
     if value is None:
         return None
     redacted = _decode_public_text(value)
     secrets = {
         representation
-        for secret in direct_values.values()
-        if secret
+        for secret in private_values
+        if isinstance(secret, str) and secret
         for representation in (secret, _decode_public_text(secret))
         if representation
     }
     for secret in sorted(secrets, key=len, reverse=True):
         redacted = redacted.replace(secret, "[redacted]")
+    if not redacted:
+        redacted = "[redacted]"
+    if max_length is not None:
+        if max_length < 1:
+            raise ValueError("max_length must be positive")
+        if len(redacted) > max_length:
+            redacted = redacted[: max_length - 1] + "…"
     return redacted
+
+
+def redact_public_url(value: str, private_values: Iterable[str]) -> str:
+    parsed = urlsplit(value)
+    redacted_path = redact_public_text(parsed.path, private_values) or ""
+    safe_path = quote(redacted_path, safe="/:@-._~!$&'()*+,;=[]")
+    return sanitize_public_url(
+        urlunsplit((parsed.scheme, parsed.netloc, safe_path, "", ""))
+    )
 
 
 def sanitize_application_result(
     result: ApplicationRunResult,
-    direct_values: Mapping[str, str],
+    private_values: Iterable[str],
     revision_count: int,
 ) -> ApplicationRunResult:
+    redaction_values = tuple(private_values)
+
     def safe_field(field: FieldResult) -> FieldResult:
-        label = redact_public_text(field.label, direct_values) or "Field"
+        label = redact_public_text(field.label, redaction_values) or "Field"
         return FieldResult(
             label=label,
             field_type=field.field_type,
@@ -155,10 +147,10 @@ def sanitize_application_result(
     )
     return ApplicationRunResult(
         status="ready_for_human_submit",
-        company=redact_public_text(result.company, direct_values),
-        role=redact_public_text(result.role, direct_values),
-        job_url=result.job_url,
-        final_url=result.final_url,
+        company=redact_public_text(result.company, redaction_values),
+        role=redact_public_text(result.role, redaction_values),
+        job_url=redact_public_url(result.job_url, redaction_values),
+        final_url=redact_public_url(result.final_url, redaction_values),
         fields_filled=[safe_field(field) for field in result.fields_filled],
         fields_needing_human=[
             safe_field(field) for field in result.fields_needing_human
@@ -170,14 +162,152 @@ def sanitize_application_result(
     )
 
 
+def _prepare_additional_info_questions(
+    questions: Sequence[AdditionalInfoQuestion],
+    private_values: Iterable[str],
+) -> tuple[
+    tuple[AdditionalInfoQuestion, ...],
+    tuple[AdditionalInfoQuestion, ...],
+]:
+    original = tuple(questions)
+    if not 1 <= len(original) <= 20:
+        raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+    if len({question.id for question in original}) != len(original):
+        raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+    if len({(question.scope, question.key) for question in original}) != len(original):
+        raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+    redaction_values = frozenset(private_values)
+    public: list[AdditionalInfoQuestion] = []
+    storage: list[AdditionalInfoQuestion] = []
+    for question in original:
+        safe_question = redact_public_text(
+            question.question,
+            redaction_values,
+            max_length=500,
+        )
+        assert safe_question is not None
+        storage.append(
+            question.model_copy(
+                deep=True,
+                update={"question": safe_question},
+            )
+        )
+        if isinstance(
+            question,
+            (AdditionalInfoSingleSelectQuestion, AdditionalInfoMultiSelectQuestion),
+        ):
+            safe_options = [
+                AdditionalInfoOption(
+                    id=option.id,
+                    label=redact_public_text(
+                        option.label,
+                        redaction_values,
+                        max_length=200,
+                    )
+                    or "[redacted]",
+                )
+                for option in question.options
+            ]
+            public.append(
+                question.model_copy(
+                    deep=True,
+                    update={
+                        "question": safe_question,
+                        "options": safe_options,
+                    },
+                )
+            )
+        else:
+            public.append(
+                question.model_copy(
+                    deep=True,
+                    update={"question": safe_question},
+                )
+            )
+    return tuple(public), tuple(storage)
+
+
+def _private_values_from_answers(
+    questions: Sequence[AdditionalInfoQuestion],
+    answers: Sequence[AdditionalInfoCommandAnswer],
+) -> frozenset[str]:
+    if len(answers) != len(questions):
+        raise HarnessServiceError(
+            409,
+            "command_conflict",
+            "The additional-information answers are incomplete",
+        )
+    question_by_id = {question.id: question for question in questions}
+    answer_by_id: dict[str, AdditionalInfoCommandAnswer] = {}
+    for answer in answers:
+        if answer.id in answer_by_id or answer.id not in question_by_id:
+            raise HarnessServiceError(
+                409,
+                "command_conflict",
+                "The additional-information answers do not match the pending questions",
+            )
+        answer_by_id[answer.id] = answer
+    if set(answer_by_id) != set(question_by_id):
+        raise HarnessServiceError(
+            409,
+            "command_conflict",
+            "The additional-information answers are incomplete",
+        )
+
+    values: set[str] = set()
+    for question in questions:
+        answer = answer_by_id[question.id]
+        if isinstance(answer, AdditionalInfoDeclinedCommandAnswer):
+            continue
+        if isinstance(question, AdditionalInfoTextQuestion) and isinstance(
+            answer, AdditionalInfoTextCommandAnswer
+        ):
+            values.add(answer.value)
+            continue
+        if isinstance(question, AdditionalInfoBooleanQuestion) and isinstance(
+            answer, AdditionalInfoBooleanCommandAnswer
+        ):
+            continue
+        if isinstance(question, AdditionalInfoSingleSelectQuestion) and isinstance(
+            answer, AdditionalInfoSingleSelectCommandAnswer
+        ):
+            options = {option.id: option.label for option in question.options}
+            if answer.option_id not in options:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "An additional-information option is invalid",
+                )
+            values.add(options[answer.option_id])
+            continue
+        if isinstance(question, AdditionalInfoMultiSelectQuestion) and isinstance(
+            answer, AdditionalInfoMultiSelectCommandAnswer
+        ):
+            options = {option.id: option.label for option in question.options}
+            if any(option_id not in options for option_id in answer.option_ids):
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "An additional-information option is invalid",
+                )
+            values.update(options[option_id] for option_id in answer.option_ids)
+            continue
+        raise HarnessServiceError(
+            409,
+            "command_conflict",
+            "An additional-information answer has the wrong type",
+        )
+    return frozenset(values)
+
+
 class HumanGate:
     def __init__(
         self,
         *,
         job_url: str,
-        candidate: CandidateContext,
-        approved_origins: list[str] | tuple[str, ...],
-        sensitive_data: dict[str, dict[str, str]],
+        private_values: Iterable[str],
+        user_info_store: UserInfoStore,
+        approved_origins: Sequence[str],
         publish: GateEventPublisher,
         review_snapshot: ReviewSnapshotSink | None = None,
         action_timeout: float = 3_600,
@@ -189,11 +319,14 @@ class HumanGate:
             raise ValueError("approved origins must be unique")
         if action_timeout <= 0:
             raise ValueError("action_timeout must be positive")
-        self._job_url = job_url
-        self._candidate = candidate
+        self._job_url = validate_job_url(job_url)
         self._approved_origins = canonical_origins
-        self._sensitive_data = sensitive_data
-        self._placeholders = dict(candidate.direct_fields)
+        self._redaction_values = {
+            value
+            for value in private_values
+            if isinstance(value, str) and value
+        }
+        self._user_info_store = user_info_store
         self._publish = publish
         self._review_snapshot = review_snapshot
         self._action_timeout = action_timeout
@@ -208,19 +341,12 @@ class HumanGate:
         return tuple(self._approved_origins)
 
     @property
+    def redaction_values(self) -> frozenset[str]:
+        return frozenset(self._redaction_values)
+
+    @property
     def revision_count(self) -> int:
         return self._revision_count
-
-    @property
-    def sensitive_data(self) -> dict[str, dict[str, str]]:
-        return self._sensitive_data
-
-    @property
-    def placeholder_values(self) -> dict[str, str]:
-        return dict(self._placeholders)
-
-    def is_origin_approved(self, origin: str) -> bool:
-        return validate_approved_origin(origin) in self._approved_origins
 
     @property
     def ready_accepted(self) -> bool:
@@ -242,7 +368,7 @@ class HumanGate:
             state="awaiting_human_navigation",
             event="human_navigation_required",
             detail={
-                "instruction": redact_public_text(instruction, self._placeholders)
+                "instruction": redact_public_text(instruction, self._redaction_values)
                 or "Human action is required"
             },
         )
@@ -299,6 +425,40 @@ class HumanGate:
             long_term_memory="The new origin is approved; re-scan the page before entering data.",
         )
 
+    async def request_additional_info(
+        self,
+        questions: Sequence[AdditionalInfoQuestion],
+        browser_session: BrowserSession,
+    ) -> ActionResult:
+        public_questions, storage_questions = _prepare_additional_info_questions(
+            questions,
+            self._redaction_values,
+        )
+        decision, payload = await self._wait_for_gate(
+            kind="additional_info",
+            browser_session=browser_session,
+            state="awaiting_additional_info",
+            event="additional_info_required",
+            detail={"questions": list(public_questions)},
+            questions=tuple(questions),
+            storage_questions=storage_questions,
+        )
+        if decision == "cancel":
+            return await self._cancelled_result(browser_session)
+        if decision != "additional_info" or not isinstance(payload, tuple):
+            raise RuntimeError("Additional-information gate returned an invalid result")
+        response = AdditionalInfoRuntimeActionResponse(
+            type="additional_info",
+            answers=list(payload),
+        )
+        return ActionResult(
+            extracted_content=response.model_dump_json(),
+            long_term_memory=(
+                "Human-provided information was saved. Apply it, re-scan the "
+                "current application step, and continue."
+            ),
+        )
+
     async def request_human_review(
         self,
         result: ApplicationRunResult,
@@ -306,7 +466,7 @@ class HumanGate:
     ) -> ActionResult:
         review_result = sanitize_application_result(
             result,
-            self._placeholders,
+            self._redaction_values,
             self._revision_count,
         )
         if self._review_snapshot is not None:
@@ -355,8 +515,30 @@ class HumanGate:
                 raise self._conflict("The origin is already approved")
             domains.append(pattern)
             self._approved_origins.append(canonical_origin)
-            self._sensitive_data[canonical_origin] = dict(self._placeholders)
             pending.future.set_result(("approve", None))
+
+    async def provide_additional_info(
+        self,
+        answers: Sequence[AdditionalInfoCommandAnswer],
+    ) -> None:
+        async with self._lock:
+            pending = self._require_pending("additional_info")
+            private_values = _private_values_from_answers(
+                pending.questions,
+                answers,
+            )
+            self._redaction_values.update(private_values)
+            accepted = await self._user_info_store.merge(
+                self._job_url,
+                pending.storage_questions,
+                answers,
+            )
+            await self._publish(
+                "running",
+                "additional_info_saved",
+                {"count": len(accepted)},
+            )
+            pending.future.set_result(("additional_info", accepted))
 
     async def revise(self, context: str) -> None:
         trimmed = context.strip()
@@ -396,14 +578,25 @@ class HumanGate:
         event: str,
         detail: Mapping[str, object],
         origin: str | None = None,
-    ) -> tuple[DecisionKind, str | None]:
+        questions: tuple[AdditionalInfoQuestion, ...] = (),
+        storage_questions: tuple[AdditionalInfoQuestion, ...] = (),
+    ) -> GateDecision:
         async with self._lock:
             if self._cancelled:
                 return "cancel", None
             if self._pending is not None and not self._pending.future.done():
                 raise RuntimeError("A human gate is already pending")
-            future = asyncio.get_running_loop().create_future()
-            pending = _PendingGate(kind, future, browser_session, origin)
+            future: asyncio.Future[GateDecision] = (
+                asyncio.get_running_loop().create_future()
+            )
+            pending = _PendingGate(
+                kind=kind,
+                future=future,
+                browser_session=browser_session,
+                origin=origin,
+                questions=questions,
+                storage_questions=storage_questions,
+            )
             self._pending = pending
             await self._publish(state, event, detail)
         try:
@@ -434,9 +627,12 @@ class HumanGate:
         result: ApplicationRunResult | None = None,
     ) -> ActionResult:
         try:
-            current_url = sanitize_public_url(await browser_session.get_current_page_url())
+            current_url = redact_public_url(
+                await browser_session.get_current_page_url(),
+                self._redaction_values,
+            )
         except Exception:
-            current_url = sanitize_public_url(self._job_url)
+            current_url = redact_public_url(self._job_url, self._redaction_values)
         if result is not None:
             cancelled = ApplicationRunResult.model_validate(
                 {
@@ -452,7 +648,7 @@ class HumanGate:
                 status="cancelled",
                 company=None,
                 role=None,
-                job_url=self._job_url,
+                job_url=redact_public_url(self._job_url, self._redaction_values),
                 final_url=current_url,
                 revision_count=self._revision_count,
                 submit_attempted=False,
@@ -464,222 +660,3 @@ class HumanGate:
             long_term_memory="The browser harness session was cancelled.",
         )
 
-
-class _HarnessTools(Tools):
-    _RECOVERY_ACTIONS = frozenset(
-        {
-            "request_human_navigation",
-            "request_origin_approval",
-            "report_application_mismatch",
-            "navigate",
-            "go_back",
-            "switch",
-            "close",
-        }
-    )
-    _SENSITIVE_INPUT_ACTIONS = frozenset({"input", "select_dropdown"})
-
-    def __init__(
-        self,
-        human_gate: HumanGate,
-        resume_upload_path: str | None,
-    ) -> None:
-        super().__init__()
-        self._human_gate = human_gate
-        self._resume_upload_path = resume_upload_path
-
-        original_replace_sensitive_data = self.registry._replace_sensitive_data
-
-        def replace_sensitive_data_at_dispatch(params, sensitive_data, current_url=None):
-            del sensitive_data
-            try:
-                current_origin = _origin_from_url(current_url or "")
-            except (RuntimeError, ValueError):
-                scoped_values: dict[str, str] = {}
-            else:
-                scoped_values = (
-                    self._human_gate.placeholder_values
-                    if self._human_gate.is_origin_approved(current_origin)
-                    else {}
-                )
-            return original_replace_sensitive_data(
-                params,
-                scoped_values,
-                current_url,
-            )
-
-        # Browser Use 0.13.4 performs placeholder expansion in Registry immediately
-        # before dispatch. Recheck the exact live origin there instead of relying on
-        # its port-insensitive domain matcher or only on the earlier policy check.
-        self.registry._replace_sensitive_data = replace_sensitive_data_at_dispatch
-
-        original_execute_action = self.registry.execute_action
-
-        async def execute_action_at_exact_origin(
-            *,
-            action_name,
-            params,
-            browser_session=None,
-            **context,
-        ):
-            if action_name not in self._RECOVERY_ACTIONS:
-                try:
-                    dispatch_origin = _origin_from_url(
-                        await browser_session.get_current_page_url()
-                    )
-                except (AttributeError, RuntimeError, ValueError):
-                    dispatch_origin = None
-                if dispatch_origin not in self._human_gate.approved_origins:
-                    return ActionResult(
-                        error=(
-                            "The current origin requires exact human approval "
-                            "before this action."
-                        )
-                    )
-            return await original_execute_action(
-                action_name=action_name,
-                params=params,
-                browser_session=browser_session,
-                **context,
-            )
-
-        self.registry.execute_action = execute_action_at_exact_origin
-
-    async def act(
-        self,
-        action: ActionModel,
-        browser_session: BrowserSession,
-        page_extraction_llm: BaseChatModel | None = None,
-        sensitive_data: dict[str, str | dict[str, str]] | None = None,
-        available_file_paths: list[str] | None = None,
-        file_system: FileSystem | None = None,
-        extraction_schema: dict | None = None,
-        action_timeout: float | None = None,
-    ) -> ActionResult:
-        del sensitive_data, available_file_paths
-        active_actions = [
-            (name, params)
-            for name, params in action.model_dump(exclude_unset=True).items()
-            if params is not None
-        ]
-        if len(active_actions) != 1:
-            return ActionResult(error="Exactly one browser action is required.")
-        action_name, params = active_actions[0]
-
-        try:
-            current_origin = _origin_from_url(
-                await browser_session.get_current_page_url()
-            )
-        except (RuntimeError, ValueError):
-            current_origin = None
-
-        if (
-            current_origin not in self._human_gate.approved_origins
-            and action_name not in self._RECOVERY_ACTIONS
-        ):
-            return ActionResult(
-                error="The current origin requires exact human approval before this action."
-            )
-
-        if action_name == "upload_file":
-            upload_path = params.get("path") if isinstance(params, dict) else None
-            if (
-                self._resume_upload_path is None
-                or upload_path != self._resume_upload_path
-            ):
-                return ActionResult(
-                    error="Only the supplied resume path may be uploaded."
-                )
-
-        scoped_sensitive_data: dict[str, str] | None = None
-        if (
-            action_name in self._SENSITIVE_INPUT_ACTIONS
-            and current_origin is not None
-            and self._human_gate.is_origin_approved(current_origin)
-        ):
-            scoped_sensitive_data = self._human_gate.placeholder_values
-
-        allowed_file_paths = (
-            [self._resume_upload_path]
-            if self._resume_upload_path is not None
-            else []
-        )
-        return await super().act(
-            action,
-            browser_session,
-            page_extraction_llm=page_extraction_llm,
-            sensitive_data=scoped_sensitive_data,
-            available_file_paths=allowed_file_paths,
-            file_system=file_system,
-            extraction_schema=extraction_schema,
-            action_timeout=action_timeout,
-        )
-
-
-def create_unfiltered_tools(
-    human_gate: HumanGate,
-    resume_upload_path: str | None = None,
-) -> Tools:
-    tools = _HarnessTools(human_gate, resume_upload_path)
-    defaults = frozenset(tools.registry.registry.actions)
-    if defaults != DEFAULT_ACTIONS_0_13_4:
-        raise RuntimeError("Browser Use 0.13.4 default action registry changed")
-    original_done = tools.registry.registry.actions["done"]
-
-    @tools.action(
-        "Pause while the human completes navigation, CAPTCHA, 2FA, or another manual step.",
-        param_model=HumanNavigationRequest,
-        terminates_sequence=True,
-    )
-    async def request_human_navigation(
-        params: HumanNavigationRequest,
-        browser_session: BrowserSession,
-    ) -> ActionResult:
-        return await human_gate.request_human_navigation(
-            params.instruction,
-            browser_session,
-        )
-
-    @tools.action(
-        "Request approval for an exact new HTTPS origin before navigating to it or entering data there.",
-        param_model=OriginApprovalRequest,
-        terminates_sequence=True,
-    )
-    async def request_origin_approval(
-        params: OriginApprovalRequest,
-        browser_session: BrowserSession,
-    ) -> ActionResult:
-        return await human_gate.request_origin_approval(
-            params.origin,
-            browser_session,
-        )
-
-    @tools.action(
-        "Stop because the open posting/form is closed or materially mismatches the requested company or role.",
-        terminates_sequence=True,
-    )
-    async def report_application_mismatch(
-        browser_session: BrowserSession,
-    ) -> ActionResult:
-        del browser_session
-        return ActionResult(
-            is_done=True,
-            success=False,
-            extracted_content=APPLICATION_MISMATCH_RESULT,
-            long_term_memory="The open page does not match the requested active job.",
-        )
-
-    @tools.action(
-        "Pause for final human review after every field is handled and before any final submission.",
-        param_model=ApplicationRunResult,
-        terminates_sequence=True,
-    )
-    async def request_human_review(
-        params: ApplicationRunResult,
-        browser_session: BrowserSession,
-    ) -> ActionResult:
-        return await human_gate.request_human_review(params, browser_session)
-
-    if tools.registry.registry.actions["done"] is not original_done:
-        raise RuntimeError("Browser Use done action was replaced")
-    return tools

@@ -1,8 +1,8 @@
 import type { Database } from "bun:sqlite";
 import {
-  createBrowserHarnessCodexRoutes,
-  type BrowserHarnessCodexRouteService,
-} from "./api/browser-harness-codex-routes.ts";
+  createApplicationAgentRoutes,
+  type ApplicationAgentRouteService,
+} from "./api/application-agent-routes.ts";
 import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
 import { createApiHandler } from "./api/handler.ts";
@@ -18,7 +18,7 @@ import { PipelineRepository } from "./db/repository.ts";
 import { ArtifactStore, DEFAULT_ARTIFACT_ROOT } from "./system/artifacts.ts";
 import { migrateRunOutputLayout } from "./system/run-output-migration.ts";
 import { enforceRunArtifactRetention } from "./system/run-retention.ts";
-import { BrowserHarnessCodexService } from "./models/browser-harness-codex.ts";
+import { ApplicationAgentService } from "./agents/application-agent-service.ts";
 import {
   createPipelineWorkerRuntime,
   type PipelineWorkerRuntimeOptions,
@@ -56,7 +56,7 @@ export interface PipelineApplicationOptions {
   readonly auth?: ClosableAuthRouteService;
   readonly closeAuth?: () => void | Promise<void>;
   readonly browserHarnessToken?: string;
-  readonly browserHarnessCodex?: BrowserHarnessCodexRouteService;
+  readonly applicationAgent?: ApplicationAgentRouteService;
 }
 
 /** Internal handles are exposed for typed integration tests, not serialized by any route. */
@@ -127,8 +127,16 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
   });
   const auth = options.auth ?? defaultAuthService;
-  const browserHarnessCodex = options.browserHarnessCodex ?? new BrowserHarnessCodexService();
-  const routeBrowserHarnessCodex = createBrowserHarnessCodexRoutes(browserHarnessCodex, browserHarnessToken);
+  const applicationAgent = options.applicationAgent
+    ?? (browserHarnessToken === undefined
+      ? undefined
+      : new ApplicationAgentService(browserHarnessToken, {
+          authStatusReader: () => auth.getAuthStatus(),
+        }));
+  const routeApplicationAgent = createApplicationAgentRoutes(
+    applicationAgent,
+    browserHarnessToken,
+  );
   const closeAuth = options.closeAuth
     ?? (options.auth ? options.auth.close?.bind(options.auth) ?? (() => undefined) : defaultAuthService.closeAuth);
 
@@ -136,7 +144,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeContext = createContextRoutes(context);
   const routeRuns = createRunRoutes(runs);
   const fetch = createApiHandler({
-    internalRoute: routeBrowserHarnessCodex,
+    internalRoute: routeApplicationAgent,
     webOrigin: options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
     route: async (request, url) =>
       (await routeAuth(request, url))

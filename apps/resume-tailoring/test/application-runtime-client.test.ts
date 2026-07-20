@@ -1,0 +1,838 @@
+import { describe, expect, test } from "bun:test";
+import {
+  AdditionalInfoQuestionSchema,
+  AcceptedAdditionalInfoAnswerSchema,
+  AdditionalInfoRuntimeActionResponseSchema,
+  ApplicationRuntimeError,
+  HttpApplicationRuntimeClient,
+  RequestAdditionalInfoRuntimeActionSchema,
+  RuntimeActionRequestSchema,
+  RuntimeActionResponseSchema,
+  type AdditionalInfoQuestion,
+  type RuntimeActionRequest,
+  type RuntimeActionResponse,
+} from "../src/agents/application-runtime-client";
+
+const RUNTIME_URL = "http://127.0.0.1:8765";
+const SESSION_ID = "123e4567-e89b-42d3-a456-426614174000";
+const TOKEN = "test-token-0123456789abcdef-0123456789";
+const READY_RESULT = {
+  status: "ready_for_human_submit" as const,
+  company: "Example Corp",
+  role: "Engineer",
+  job_url: "https://jobs.example.test/roles/123",
+  final_url: "https://ats.example.test/applications/456",
+  fields_filled: [
+    {
+      label: "Full name",
+      field_type: "text" as const,
+      value_present: true,
+      note: "",
+    },
+  ],
+  fields_needing_human: [],
+  files_attached: ["resume.pdf"],
+  warnings: ["Review the application before submitting."],
+  revision_count: 0,
+  submit_attempted: false as const,
+};
+
+
+function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
+  return Response.json(value, init);
+}
+
+const ADDITIONAL_INFO_QUESTIONS: AdditionalInfoQuestion[] = [
+  {
+    id: "summer_availability",
+    key: "availability.summer_2027",
+    scope: "global" as const,
+    question: "What dates are you available in Summer 2027?",
+    answer_type: "text" as const,
+  },
+  {
+    id: "work_setting",
+    key: "preferences.work_setting",
+    scope: "application" as const,
+    question: "Which work settings can you accept?",
+    answer_type: "multi_select" as const,
+    options: [
+      { id: "remote", label: "Remote" },
+      { id: "onsite", label: "On-site" },
+    ],
+  },
+  {
+    id: "sponsorship",
+    key: "eligibility.sponsorship",
+    scope: "global" as const,
+    question: "Will you now or later require sponsorship?",
+    answer_type: "boolean" as const,
+  },
+  {
+    id: "referral",
+    key: "referral.source",
+    scope: "application" as const,
+    question: "How did you hear about this position?",
+    answer_type: "single_select" as const,
+    options: [
+      { id: "company_site", label: "Company website" },
+      { id: "other", label: "Other" },
+    ],
+  },
+];
+
+test("mirrors strict additional-information question and request constraints", () => {
+  for (const question of ADDITIONAL_INFO_QUESTIONS) {
+    expect(AdditionalInfoQuestionSchema.parse(question)).toEqual(question);
+  }
+  const request = {
+    type: "request_additional_info" as const,
+    questions: ADDITIONAL_INFO_QUESTIONS,
+  };
+  expect(RequestAdditionalInfoRuntimeActionSchema.parse(request)).toEqual(request);
+  expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
+});
+
+test("mirrors strict accepted-answer and additional-information response constraints", () => {
+  const answers = [
+    {
+      id: "summer_availability",
+      key: "availability.summer_2027",
+      scope: "global" as const,
+      answer_type: "text" as const,
+      status: "answered" as const,
+      value: "June through August 2027",
+    },
+    {
+      id: "sponsorship",
+      key: "eligibility.sponsorship",
+      scope: "global" as const,
+      answer_type: "boolean" as const,
+      status: "answered" as const,
+      value: false,
+    },
+    {
+      id: "referral",
+      key: "referral.source",
+      scope: "application" as const,
+      answer_type: "single_select" as const,
+      status: "answered" as const,
+      value: "Company website",
+    },
+    {
+      id: "work_setting",
+      key: "preferences.work_setting",
+      scope: "application" as const,
+      answer_type: "multi_select" as const,
+      status: "answered" as const,
+      value: ["Remote", "On-site"],
+    },
+    {
+      id: "salary",
+      key: "compensation.salary",
+      scope: "application" as const,
+      answer_type: "text" as const,
+      status: "declined" as const,
+    },
+  ];
+  for (const answer of answers) {
+    expect(AcceptedAdditionalInfoAnswerSchema.parse(answer)).toEqual(answer);
+  }
+  const response = { type: "additional_info" as const, answers };
+  expect(AdditionalInfoRuntimeActionResponseSchema.parse(response)).toEqual(response);
+  expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
+});
+
+test("rejects malformed additional-information questions, batches, and accepted answers", () => {
+  const textQuestion = ADDITIONAL_INFO_QUESTIONS[0]!;
+  const selectQuestion = ADDITIONAL_INFO_QUESTIONS[1]!;
+  const invalidQuestions: unknown[] = [
+    { ...textQuestion, id: "Summer" },
+    { ...textQuestion, key: "availability..summer" },
+    { ...textQuestion, key: `a.${"b".repeat(99)}` },
+    { ...textQuestion, question: "   " },
+    { ...textQuestion, question: "x".repeat(501) },
+    { ...textQuestion, options: [{ id: "yes", label: "Yes" }] },
+    { ...selectQuestion, options: [{ id: "remote", label: "Remote" }] },
+    {
+      ...selectQuestion,
+      options: [{ id: "remote", label: "Remote" }, { id: "remote", label: "On-site" }],
+    },
+    {
+      ...selectQuestion,
+      options: [{ id: "remote", label: " " }, { id: "onsite", label: "On-site" }],
+    },
+    {
+      ...selectQuestion,
+      options: [
+        { id: "Remote", label: "Remote" },
+        { id: "onsite", label: "On-site" },
+      ],
+    },
+    {
+      ...selectQuestion,
+      options: [
+        { id: "remote", label: "x".repeat(201) },
+        { id: "onsite", label: "On-site" },
+      ],
+    },
+    {
+      ...selectQuestion,
+      options: Array.from(
+        { length: 21 },
+        (_, index) => ({ id: `option_${index}`, label: `Option ${index}` }),
+      ),
+    },
+    { ...selectQuestion, unexpected: true },
+  ];
+  for (const question of invalidQuestions) {
+    expect(AdditionalInfoQuestionSchema.safeParse(question).success).toBe(false);
+  }
+
+  const duplicateId = [
+    textQuestion,
+    { ...selectQuestion, id: textQuestion.id },
+  ];
+  const duplicateScopedKey = [
+    textQuestion,
+    { ...selectQuestion, id: "other", key: textQuestion.key, scope: textQuestion.scope },
+  ];
+  for (const questions of [[], duplicateId, duplicateScopedKey]) {
+    expect(RequestAdditionalInfoRuntimeActionSchema.safeParse({
+      type: "request_additional_info",
+      questions,
+    }).success).toBe(false);
+  }
+  expect(RequestAdditionalInfoRuntimeActionSchema.safeParse({
+    type: "request_additional_info",
+    questions: Array.from({ length: 21 }, (_, index) => ({
+      ...textQuestion,
+      id: `question_${index}`,
+      key: `question.key_${index}`,
+    })),
+  }).success).toBe(false);
+
+  const acceptedText = {
+    id: "summer_availability",
+    key: "availability.summer_2027",
+    scope: "global",
+    answer_type: "text",
+    status: "answered",
+    value: "June through August 2027",
+  };
+  const invalidAnswers: unknown[] = [
+    { ...acceptedText, value: " " },
+    { ...acceptedText, value: ` ${acceptedText.value}` },
+    { ...acceptedText, value: "x".repeat(2_001) },
+    { ...acceptedText, answer_type: "boolean" },
+    { ...acceptedText, status: "declined" },
+    { ...acceptedText, status: "declined", value: undefined },
+    { ...acceptedText, answer_type: "single_select", value: "x".repeat(201) },
+    { ...acceptedText, answer_type: "multi_select", value: [] },
+    { ...acceptedText, answer_type: "multi_select", value: [" Remote"] },
+    {
+      ...acceptedText,
+      answer_type: "multi_select",
+      value: Array.from({ length: 21 }, (_, index) => `Option ${index}`),
+    },
+    { ...acceptedText, unexpected: true },
+  ];
+  for (const answer of invalidAnswers) {
+    expect(AcceptedAdditionalInfoAnswerSchema.safeParse(answer).success).toBe(false);
+  }
+  expect(AdditionalInfoRuntimeActionResponseSchema.safeParse({
+    type: "additional_info",
+    answers: [],
+  }).success).toBe(false);
+  expect(AdditionalInfoRuntimeActionResponseSchema.safeParse({
+    type: "additional_info",
+    answers: Array.from({ length: 21 }, () => acceptedText),
+  }).success).toBe(false);
+});
+
+describe("HttpApplicationRuntimeClient", () => {
+  test("posts an authenticated action to the exact session runtime endpoint", async () => {
+    const requests: Array<{ url: string; init: RequestInit }> = [];
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (input, init) => {
+        requests.push({ url: String(input), init: init ?? {} });
+        return jsonResponse({ type: "continue" });
+      },
+    );
+    const action: RuntimeActionRequest = {
+      type: "request_human_navigation",
+      instruction: "Complete the CAPTCHA",
+    };
+
+    await expect(client.action(action, new AbortController().signal, 1_000)).resolves.toEqual({
+      type: "continue",
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe(
+      "http://127.0.0.1:8765/v1/sessions/123e4567-e89b-42d3-a456-426614174000/runtime/actions",
+    );
+    expect(requests[0]?.init).toMatchObject({
+      method: "POST",
+      redirect: "manual",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(action),
+    });
+    expect(requests[0]?.init.signal).toBeInstanceOf(AbortSignal);
+  });
+  test("validates and serializes every runtime action variant", async () => {
+    const bodies: unknown[] = [];
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ type: "continue" });
+      },
+    );
+    const actions: RuntimeActionRequest[] = [
+      { type: "browser_use", code: "print(page_info())" },
+      { type: "request_human_navigation", instruction: "Complete the CAPTCHA" },
+      { type: "request_origin_approval", origin: "https://ats.example.test" },
+      { type: "request_additional_info", questions: [...ADDITIONAL_INFO_QUESTIONS] },
+      { type: "request_human_review", result: READY_RESULT },
+      { type: "report_application_mismatch" },
+    ];
+
+    for (const action of actions) {
+      await client.action(action, new AbortController().signal, 1_000);
+    }
+
+    expect(bodies).toEqual(actions);
+  });
+
+  test("strictly parses every Python runtime success response variant", async () => {
+    const cancelledResult = { ...READY_RESULT, status: "cancelled" as const };
+    const responses = [
+      {
+        type: "browser_use_result",
+        exit_code: 0,
+        timed_out: false,
+        stdout: "filled name",
+        stderr: "",
+        stdout_truncated: false,
+        stderr_truncated: false,
+        observation: {
+          url: "https://ats.example.test/apply",
+          title: "Apply",
+          tabs: [
+            {
+              url: "https://ats.example.test/apply",
+              title: "Apply",
+              tab_id: "tab-1",
+              parent_tab_id: null,
+            },
+          ],
+          dom: "button Submit",
+          page_info: { viewport: { width: 1280, height: 720 } },
+          screenshot: { media_type: "image/png", data: "iVBORw0KGgo=" },
+        },
+      },
+      { type: "continue" },
+      {
+        type: "approve",
+        origin: "https://ats.example.test",
+        approved_origins: ["https://jobs.example.test", "https://ats.example.test"],
+      },
+      { type: "revise", context: "Use the revised answer.", revision_count: 1 },
+      {
+        type: "additional_info",
+        answers: [{
+          id: "summer_availability",
+          key: "availability.summer_2027",
+          scope: "global",
+          answer_type: "text",
+          status: "answered",
+          value: "June through August 2027",
+        }],
+      },
+      { type: "ready", result: READY_RESULT },
+      { type: "cancel", result: cancelledResult },
+      { type: "application_mismatch" },
+    ] satisfies RuntimeActionResponse[];
+    let responseIndex = 0;
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => jsonResponse(responses[responseIndex++]),
+    );
+
+    for (const expected of responses) {
+      await expect(
+        client.action(
+          { type: "report_application_mismatch" },
+          new AbortController().signal,
+          1_000,
+        ),
+      ).resolves.toEqual(expected);
+    }
+  });
+  test("matches Python character bounds by Unicode code point", () => {
+    const character = "😀";
+    const browserResponse = {
+      type: "browser_use_result",
+      exit_code: 0,
+      timed_out: false,
+      stdout: character.repeat(20_000),
+      stderr: character.repeat(20_000),
+      stdout_truncated: false,
+      stderr_truncated: false,
+      observation: {
+        url: "https://ats.example.test/apply",
+        title: character.repeat(4_096),
+        tabs: [{
+          url: "https://ats.example.test/apply",
+          title: character.repeat(4_096),
+          tab_id: character.repeat(512),
+          parent_tab_id: character.repeat(512),
+        }],
+        dom: character.repeat(40_000),
+        page_info: null,
+        screenshot: null,
+      },
+    } as const;
+    const unicodeReady = {
+      ...READY_RESULT,
+      company: character.repeat(500),
+      role: character.repeat(500),
+      fields_filled: [{
+        label: character.repeat(500),
+        field_type: "text" as const,
+        value_present: true,
+        note: character.repeat(1_000),
+      }],
+      warnings: [character.repeat(1_000)],
+    };
+
+    expect(RuntimeActionResponseSchema.safeParse(browserResponse).success).toBe(true);
+    expect(RuntimeActionResponseSchema.safeParse({
+      ...browserResponse,
+      stdout: character.repeat(20_001),
+    }).success).toBe(false);
+    expect(RuntimeActionResponseSchema.safeParse({
+      type: "ready",
+      result: unicodeReady,
+    }).success).toBe(true);
+    expect(RuntimeActionResponseSchema.safeParse({
+      type: "ready",
+      result: { ...unicodeReady, company: character.repeat(501) },
+    }).success).toBe(false);
+    expect(RuntimeActionResponseSchema.safeParse({
+      type: "revise",
+      context: character.repeat(20_000),
+      revision_count: 1,
+    }).success).toBe(true);
+    expect(RuntimeActionResponseSchema.safeParse({
+      type: "revise",
+      context: character.repeat(20_001),
+      revision_count: 1,
+    }).success).toBe(false);
+    expect(RuntimeActionRequestSchema.safeParse({
+      type: "request_human_navigation",
+      instruction: character.repeat(2_000),
+    }).success).toBe(true);
+    expect(RuntimeActionRequestSchema.safeParse({
+      type: "request_human_navigation",
+      instruction: character.repeat(2_001),
+    }).success).toBe(false);
+  });
+
+
+  test("rejects invalid and non-strict runtime action inputs before fetching", async () => {
+    let fetchCalls = 0;
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => {
+        fetchCalls += 1;
+        return jsonResponse({ type: "continue" });
+      },
+    );
+    const invalidInputs: unknown[] = [
+      { type: "browser_use", code: "x".repeat(65_537) },
+      { type: "request_human_navigation", instruction: "   " },
+      {
+        type: "request_origin_approval",
+        origin: "http://not-loopback.example.test",
+      },
+      { type: "request_additional_info", questions: [] },
+      {
+        type: "request_human_review",
+        result: { ...READY_RESULT, files_attached: ["../resume.pdf"] },
+      },
+      { type: "report_application_mismatch", unexpected: true },
+      { type: "unknown" },
+    ];
+
+    for (const input of invalidInputs) {
+      await expect(
+        client.action(
+          input as RuntimeActionRequest,
+          new AbortController().signal,
+          1_000,
+        ),
+      ).rejects.toEqual(new ApplicationRuntimeError("model_failed"));
+    }
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("maps only flat step and browser errors without leaking response content", async () => {
+    const cases = [
+      {
+        response: jsonResponse(
+          { code: "step_limit", message: "private server detail" },
+          { status: 409 },
+        ),
+        expected: new ApplicationRuntimeError("step_limit"),
+      },
+      {
+        response: jsonResponse(
+          { code: "browser_failed", message: "private browser detail" },
+          { status: 502 },
+        ),
+        expected: new ApplicationRuntimeError("browser_failed"),
+      },
+      {
+        response: jsonResponse(
+          { code: "command_conflict", message: "private conflict detail" },
+          { status: 409 },
+        ),
+        expected: new ApplicationRuntimeError("model_failed"),
+      },
+      {
+        response: jsonResponse(
+          { error: { code: "step_limit", message: "nested secret" } },
+          { status: 409 },
+        ),
+        expected: new ApplicationRuntimeError("model_failed"),
+      },
+    ];
+
+    for (const { response, expected } of cases) {
+      const client = new HttpApplicationRuntimeClient(
+        RUNTIME_URL,
+        SESSION_ID,
+        TOKEN,
+        async () => response,
+      );
+      let failure: unknown;
+      try {
+        await client.action(
+          { type: "report_application_mismatch" },
+          new AbortController().signal,
+          1_000,
+        );
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toEqual(expected);
+      expect(String(failure)).not.toContain("private");
+      expect(String(failure)).not.toContain("secret");
+    }
+
+    const networkClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => {
+        throw new Error(`upstream echoed Bearer ${TOKEN}`);
+      },
+    );
+    let networkFailure: unknown;
+    try {
+      await networkClient.action(
+        { type: "report_application_mismatch" },
+        new AbortController().signal,
+        1_000,
+      );
+    } catch (error) {
+      networkFailure = error;
+    }
+    expect(networkFailure).toEqual(new ApplicationRuntimeError("model_failed"));
+    expect(String(networkFailure)).not.toContain(TOKEN);
+  });
+
+  test("accepts only loopback HTTP origins, valid UUIDs, and sufficiently long bearers", async () => {
+    const requestedUrls: string[] = [];
+    for (const runtimeUrl of [
+      "http://localhost:8765/",
+      "http://127.42.0.7:8765",
+      "http://[::1]:8765",
+    ]) {
+      const client = new HttpApplicationRuntimeClient(
+        runtimeUrl,
+        SESSION_ID,
+        TOKEN,
+        async (input) => {
+          requestedUrls.push(String(input));
+          return jsonResponse({ type: "continue" });
+        },
+      );
+      await client.action(
+        { type: "report_application_mismatch" },
+        new AbortController().signal,
+        1_000,
+      );
+    }
+    expect(requestedUrls).toEqual([
+      `http://localhost:8765/v1/sessions/${SESSION_ID}/runtime/actions`,
+      `http://127.42.0.7:8765/v1/sessions/${SESSION_ID}/runtime/actions`,
+      `http://[::1]:8765/v1/sessions/${SESSION_ID}/runtime/actions`,
+    ]);
+
+    const invalidArguments: Array<[string, string, string]> = [
+      ["https://127.0.0.1:8765", SESSION_ID, TOKEN],
+      ["http://runtime.example.test:8765", SESSION_ID, TOKEN],
+      ["http://127.0.0.1:8765/path", SESSION_ID, TOKEN],
+      ["http://127.0.0.1:8765?secret=yes", SESSION_ID, TOKEN],
+      ["http://user:password@127.0.0.1:8765", SESSION_ID, TOKEN],
+      ["not a URL", SESSION_ID, TOKEN],
+      [RUNTIME_URL, "not-a-uuid", TOKEN],
+      [RUNTIME_URL, SESSION_ID, "short-token"],
+    ];
+    for (const arguments_ of invalidArguments) {
+      expect(
+        () => new HttpApplicationRuntimeClient(...arguments_),
+      ).toThrow(new ApplicationRuntimeError("model_failed"));
+    }
+  });
+
+  test("rejects invalid timeout values before fetching", async () => {
+    let fetchCalls = 0;
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => {
+        fetchCalls += 1;
+        return jsonResponse({ type: "continue" });
+      },
+    );
+    for (const timeoutMs of [0, -1, 1.5, Number.POSITIVE_INFINITY, 4_294_967_296]) {
+      await expect(
+        client.action(
+          { type: "report_application_mismatch" },
+          new AbortController().signal,
+          timeoutMs,
+        ),
+      ).rejects.toEqual(new ApplicationRuntimeError("model_failed"));
+    }
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("rejects malformed, non-strict, and redirect responses", async () => {
+    const followedRedirect = jsonResponse({ type: "continue" });
+    Object.defineProperty(followedRedirect, "redirected", { value: true });
+    const malformedResponses = [
+      new Response("{", { headers: { "content-type": "application/json" } }),
+      new Response(JSON.stringify({ type: "continue" }), {
+        headers: { "content-type": "text/plain" },
+      }),
+      jsonResponse({ type: "continue", unexpected: true }),
+      jsonResponse({
+        type: "approve",
+        origin: "https://ats.example.test",
+        approved_origins: ["https://ats.example.test", "https://ats.example.test"],
+      }),
+      jsonResponse({
+        type: "ready",
+        result: { ...READY_RESULT, status: "cancelled" },
+      }),
+      jsonResponse({ type: "additional_info", answers: [] }),
+      jsonResponse({
+        type: "additional_info",
+        answers: [{
+          id: "summer_availability",
+          key: "availability.summer_2027",
+          scope: "global",
+          answer_type: "text",
+          status: "declined",
+          value: "must be omitted",
+        }],
+      }),
+      jsonResponse({
+        type: "browser_use_result",
+        exit_code: 0,
+        timed_out: false,
+        stdout: "",
+        stderr: "",
+        stdout_truncated: false,
+        stderr_truncated: false,
+        observation: {
+          url: "https://ats.example.test",
+          title: "x".repeat(4_097),
+          tabs: [],
+          dom: "",
+          page_info: null,
+          screenshot: null,
+        },
+      }),
+      jsonResponse({ type: "continue" }, { status: 302 }),
+      followedRedirect,
+    ];
+
+    for (const response of malformedResponses) {
+      const client = new HttpApplicationRuntimeClient(
+        RUNTIME_URL,
+        SESSION_ID,
+        TOKEN,
+        async () => response,
+      );
+      await expect(
+        client.action(
+          { type: "report_application_mismatch" },
+          new AbortController().signal,
+          1_000,
+        ),
+      ).rejects.toEqual(new ApplicationRuntimeError("model_failed"));
+    }
+  });
+
+  test("rejects declared and streamed responses over 16 MiB", async () => {
+    let declaredBodyCancelled = false;
+    const declaredBody = new ReadableStream<Uint8Array>({
+      pull() {
+        // Keep the stream open; the declared size must make the client cancel it.
+      },
+      cancel() {
+        declaredBodyCancelled = true;
+      },
+    });
+    const declaredClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => new Response(declaredBody, {
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(16 * 1024 * 1024 + 1),
+        },
+      }),
+    );
+    await expect(
+      declaredClient.action(
+        { type: "report_application_mismatch" },
+        new AbortController().signal,
+        1_000,
+      ),
+    ).rejects.toEqual(new ApplicationRuntimeError("model_failed"));
+    expect(declaredBodyCancelled).toBe(true);
+
+    let streamedBodyCancelled = false;
+    const streamedBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(8 * 1024 * 1024));
+        controller.enqueue(new Uint8Array(8 * 1024 * 1024 + 1));
+      },
+      cancel() {
+        streamedBodyCancelled = true;
+      },
+    });
+    const streamedClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => new Response(streamedBody, {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await expect(
+      streamedClient.action(
+        { type: "report_application_mismatch" },
+        new AbortController().signal,
+        1_000,
+      ),
+    ).rejects.toEqual(new ApplicationRuntimeError("model_failed"));
+    expect(streamedBodyCancelled).toBe(true);
+  });
+
+  test("propagates the caller abort reason before and during the request", async () => {
+    const preAborted = new AbortController();
+    const preAbortReason = new Error("caller stopped before request");
+    preAborted.abort(preAbortReason);
+    let fetchCalls = 0;
+    const preAbortedClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => {
+        fetchCalls += 1;
+        return jsonResponse({ type: "continue" });
+      },
+    );
+    await expect(
+      preAbortedClient.action(
+        { type: "report_application_mismatch" },
+        preAborted.signal,
+        1_000,
+      ),
+    ).rejects.toBe(preAbortReason);
+    expect(fetchCalls).toBe(0);
+
+    const controller = new AbortController();
+    const abortReason = new Error("caller stopped active request");
+    let requestSignal: AbortSignal | undefined;
+    const activeClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        requestSignal = init?.signal ?? undefined;
+        return await new Promise<Response>(() => {});
+      },
+    );
+    const pending = activeClient.action(
+      { type: "report_application_mismatch" },
+      controller.signal,
+      1_000,
+    );
+    controller.abort(abortReason);
+
+    await expect(pending).rejects.toBe(abortReason);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(requestSignal?.reason).toBe(abortReason);
+  });
+
+  test("composes a timeout signal without aborting the caller signal", async () => {
+    const caller = new AbortController();
+    let requestSignal: AbortSignal | undefined;
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        requestSignal = init?.signal ?? undefined;
+        return await new Promise<Response>(() => {});
+      },
+    );
+
+    let failure: unknown;
+    try {
+      await client.action(
+        { type: "report_application_mismatch" },
+        caller.signal,
+        5,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(DOMException);
+    expect((failure as DOMException).name).toBe("TimeoutError");
+    expect(requestSignal?.aborted).toBe(true);
+    expect(caller.signal.aborted).toBe(false);
+  });
+});

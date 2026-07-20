@@ -24,10 +24,8 @@ from jobhunter_browser_harness.artifacts import (
 from jobhunter_browser_harness.context import (
     MAX_COMBINED_NARRATIVE_CHARACTERS,
     MAX_SOURCE_CHARACTERS,
-    build_sensitive_data,
     load_candidate_context,
     render_candidate_evidence,
-    sensitive_placeholder_instruction,
 )
 from jobhunter_browser_harness.models import DIRECT_FIELD_NAMES, HarnessServiceError
 
@@ -858,66 +856,3 @@ def test_combined_narrative_character_limit_is_exact_and_never_truncates(
         == MAX_COMBINED_NARRATIVE_CHARACTERS
     )
 
-
-def test_sensitive_data_uses_exact_bare_normalized_origins_and_explicit_values_only(
-    tmp_path: Path,
-) -> None:
-    artifacts = candidate_artifacts(
-        tmp_path / "sensitive",
-        direct_fields=(
-            ("email", "private@example.test"),
-            ("sponsorship_required", "No"),
-        ),
-    )
-    candidate = load_candidate_context(artifacts)
-
-    sensitive = build_sensitive_data(
-        candidate,
-        ["https://JOBS.EXAMPLE:443/", "http://127.0.0.1:80"],
-    )
-
-    assert sensitive == {
-        "https://jobs.example": {
-            "email": "private@example.test",
-            "sponsorship_required": "No",
-        },
-        "http://127.0.0.1": {
-            "email": "private@example.test",
-            "sponsorship_required": "No",
-        },
-    }
-    assert all(not origin.endswith("/") for origin in sensitive)
-    assert "https://jobs.example.evil" not in sensitive
-    assert sensitive_placeholder_instruction(candidate) == (
-        "Use only these placeholders for explicit personal data: "
-        "<secret>email</secret>, <secret>sponsorship_required</secret>."
-    )
-    instruction = sensitive_placeholder_instruction(candidate)
-    assert "private@example.test" not in instruction
-    assert "No" not in instruction
-
-
-def test_sensitive_data_rejects_wildcards_lookalike_paths_and_duplicate_origins(
-    tmp_path: Path,
-) -> None:
-    candidate = load_candidate_context(candidate_artifacts(tmp_path / "invalid-origin"))
-
-    for origin in (
-        "https://*.jobs.example",
-        "https://jobs.example.evil/apply",
-        "https://jobs.example?redirect=https://evil.example",
-        "https://user:secret@jobs.example",
-        "http://jobs.example",
-    ):
-        with pytest.raises(ValueError):
-            build_sensitive_data(candidate, [origin])
-
-    with pytest.raises(ValueError, match="unique"):
-        build_sensitive_data(candidate, ["https://jobs.example", "https://JOBS.EXAMPLE:443/"])
-
-
-def test_sensitive_placeholder_instruction_handles_no_explicit_fields(tmp_path: Path) -> None:
-    candidate = load_candidate_context(candidate_artifacts(tmp_path / "no-sensitive"))
-    assert sensitive_placeholder_instruction(candidate) == (
-        "No explicit personal-data placeholders are available."
-    )

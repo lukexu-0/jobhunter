@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthRouteService } from "../src/api/auth-routes.ts";
+import type { ApplicationAgentRouteService } from "../src/agents/application-agent-service.ts";
 import { createPipelineApplication, type PipelineWorkerHandle } from "../src/bootstrap.ts";
 import {
   loadJobSourceFromUrl,
@@ -24,6 +25,7 @@ import { ArtifactStore } from "../src/system/artifacts.ts";
 const WEB_ORIGIN = "http://127.0.0.1:3456";
 const JOB_URL = "https://jobs.example.test/platform";
 const JOB_DESCRIPTION = "Platform Engineer\n\nBuild and maintain a reliable TypeScript platform for job seekers.";
+const HARNESS_TOKEN = "bootstrap-harness-token-0123456789abcdef";
 const fixtures: string[] = [];
 
 afterEach(() => {
@@ -33,6 +35,9 @@ afterEach(() => {
 interface IngestionOverrides {
   readonly loadJobSource?: LoadJobSource;
   readonly extractJobDescription?: ExtractJobDescription;
+  readonly browserHarnessToken?: string;
+  readonly applicationAgent?: ApplicationAgentRouteService;
+  readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
 }
 
 function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {}) {
@@ -55,12 +60,12 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     close: async () => { calls.close.push("worker"); },
   };
   const auth: AuthRouteService & { close(): void } = {
-    getAuthStatus: () => ({
+    getAuthStatus: ingestion.getAuthStatus ?? (() => ({
       providers: [
         { provider: "openai-codex", state: "disconnected" },
         { provider: "google-antigravity", state: "disconnected" },
       ],
-    }),
+    })),
     startSession: async () => {
       calls.startAuth += 1;
       throw new Error("authentication must not start in this test");
@@ -114,6 +119,12 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     worker,
     auth,
     ...(runs ? { runs } : {}),
+    ...(ingestion.browserHarnessToken
+      ? { browserHarnessToken: ingestion.browserHarnessToken }
+      : {}),
+    ...(ingestion.applicationAgent
+      ? { applicationAgent: ingestion.applicationAgent }
+      : {}),
     loadJobSource: ingestion.loadJobSource ?? (async (jobUrl, signal): Promise<LoadedJobSource> => {
       calls.loadedUrls.push(jobUrl);
       calls.loadedSignals.push(signal);
@@ -298,6 +309,108 @@ describe("pipeline application bootstrap", () => {
     expect(await response.json()).toEqual({ error: { code: "ORIGIN_REJECTED", message: "Mutation origin is not allowed" } });
     expect(fixture.calls.startAuth).toBe(0);
     await fixture.app.close();
+  });
+
+  test("wires the authenticated application agent before public origin policy", async () => {
+    let invocations = 0;
+    const result = {
+      status: "cancelled" as const,
+      company: null,
+      role: null,
+      job_url: "https://jobs.example.test/platform",
+      final_url: "https://jobs.example.test/platform",
+      fields_filled: [],
+      fields_needing_human: [],
+      files_attached: [],
+      warnings: [],
+      revision_count: 0,
+      submit_attempted: false as const,
+    };
+    const applicationAgent: ApplicationAgentRouteService = {
+      status: () => ({
+        modelProvider: "openai-codex",
+        model: "gpt-5.6-sol",
+        reasoning: "high",
+        oauth: "connected",
+      }),
+      invoke: async () => {
+        invocations += 1;
+        return {
+          modelProvider: "openai-codex",
+          model: "gpt-5.6-sol",
+          reasoning: "high",
+          result,
+        };
+      },
+    };
+    const fixture = createFixture(false, {
+      browserHarnessToken: HARNESS_TOKEN,
+      applicationAgent,
+    });
+    const response = await fixture.app.fetch(
+      new Request("http://127.0.0.1:3457/v1/internal/application-agent", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${HARNESS_TOKEN}`,
+          "content-type": "application/json",
+          origin: "https://attacker.invalid",
+        },
+        body: JSON.stringify({
+          sessionId: "123e4567-e89b-42d3-a456-426614174000",
+          runtimeUrl: "http://127.0.0.1:8765",
+          task: "Complete the application",
+          maxTurns: 25,
+          deadlineMs: 30_000,
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      modelProvider: "openai-codex",
+      model: "gpt-5.6-sol",
+      reasoning: "high",
+      result,
+    });
+    expect(invocations).toBe(1);
+    await fixture.app.close();
+  });
+
+  test("shares the injected auth status with the default application agent", async () => {
+    let authStatusReads = 0;
+    const fixture = createFixture(false, {
+      browserHarnessToken: HARNESS_TOKEN,
+      getAuthStatus: () => {
+        authStatusReads += 1;
+        return {
+          providers: [
+            { provider: "openai-codex", state: "connected" },
+            { provider: "google-antigravity", state: "disconnected" },
+          ],
+        };
+      },
+    });
+
+    const response = await fixture.app.fetch(new Request(
+      "http://127.0.0.1:3457/v1/internal/application-agent",
+      { headers: { authorization: `Bearer ${HARNESS_TOKEN}` } },
+    ));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      modelProvider: "openai-codex",
+      model: "gpt-5.6-sol",
+      reasoning: "high",
+      oauth: "connected",
+    });
+    expect(authStatusReads).toBe(1);
+    await fixture.app.close();
+  });
+
+  test("rejects a short harness token before constructing dependencies", () => {
+    expect(() => createPipelineApplication({
+      browserHarnessToken: "too-short",
+    })).toThrow("JOBHUNTER_HARNESS_TOKEN must contain at least 32 characters");
   });
 
   test("starts worker scheduling only when kicked and exactly once per startup kick", async () => {

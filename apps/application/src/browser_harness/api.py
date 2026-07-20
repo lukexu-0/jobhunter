@@ -17,6 +17,8 @@ from .models import (
     HarnessConfig,
     HarnessServiceError,
     SessionCommand,
+    RuntimeActionRequest,
+    RuntimeActionResponse,
     SessionCreateResponse,
     SessionSnapshot,
 )
@@ -40,6 +42,12 @@ class HarnessSessionService(Protocol):
     def stream_events(self, session_id: UUID, last_event_id: int | None) -> AsyncIterator[str]: ...
 
     async def command(self, session_id: UUID, command: SessionCommand) -> None: ...
+
+    async def runtime_action(
+        self,
+        session_id: UUID,
+        action: RuntimeActionRequest,
+    ) -> RuntimeActionResponse: ...
 
     async def delete(self, session_id: UUID) -> None: ...
 
@@ -175,6 +183,17 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
     ) -> Response:
         await dependencies.sessions.command(session_id, command)
         return Response(status_code=202, headers={"cache-control": "no-store"})
+
+    @app.post(
+        "/v1/sessions/{session_id}/runtime/actions",
+        response_model=RuntimeActionResponse,
+    )
+    async def runtime_action(
+        session_id: UUID,
+        action: Annotated[RuntimeActionRequest, Body(discriminator="type")],
+    ) -> RuntimeActionResponse:
+        return await dependencies.sessions.runtime_action(session_id, action)
+
 
     @app.delete("/v1/sessions/{session_id}", status_code=204)
     async def delete_session(session_id: UUID) -> Response:

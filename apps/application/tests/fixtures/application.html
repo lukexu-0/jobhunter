@@ -44,6 +44,16 @@
       <label>Years of relevant experience
         <input id="years" name="years" type="number" min="0" max="50" required>
       </label>
+      <label>Summer 2027 availability
+        <input id="summer-availability" name="summer_availability" type="text" data-user-info-key="availability.summer_2027" data-user-info-scope="global" required>
+      </label>
+      <label>Referral source
+        <select id="referral-source" name="referral_source" data-user-info-key="referral.source" data-user-info-scope="application" required>
+          <option value="">Choose one</option>
+          <option value="Employee referral">Employee referral</option>
+          <option value="Job board">Job board</option>
+        </select>
+      </label>
       <label>Résumé
         <input id="resume" name="resume" type="file" accept="application/pdf" required>
       </label>
@@ -102,6 +112,8 @@
         focus: document.querySelector('input[name=focus]:checked')?.value || '',
         truthful: document.getElementById('truthful').checked,
         years: document.getElementById('years').value,
+        summerAvailability: document.getElementById('summer-availability').value,
+        referralSource: document.getElementById('referral-source').value,
         resume: document.getElementById('resume').files[0]?.name || '',
         intermediateClick: clickButton.dataset.completed || '',
         intermediateEnter: keypressTarget.dataset.completed || '',

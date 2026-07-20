@@ -20,7 +20,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 import jobhunter_browser_harness.sessions as sessions_module
 from jobhunter_browser_harness.artifacts import cleanup_session_artifacts, store_uploads
-from jobhunter_browser_harness.agent import ApplicationAgentFailure, ApplicationRunRequest
+from jobhunter_browser_harness.agent import ApplicationRunRequest
 from jobhunter_browser_harness.api import HarnessDependencies, create_app
 from jobhunter_browser_harness.context import (
     CandidateContext,
@@ -32,17 +32,40 @@ from jobhunter_browser_harness.browser import (
     ResolvedBrowserLaunch,
 )
 from jobhunter_browser_harness.models import (
+    AdditionalInfoOption,
+    AdditionalInfoDeclinedCommandAnswer,
+    AdditionalInfoRuntimeActionResponse,
+    AdditionalInfoSingleSelectCommandAnswer,
+    AdditionalInfoSingleSelectQuestion,
+    AdditionalInfoTextCommandAnswer,
+    AdditionalInfoTextQuestion,
     ApplicationRunResult,
+    ApplicationMismatchRuntimeActionResponse,
+    ApproveRuntimeActionResponse,
     ApproveOriginCommand,
+    BrowserObservation,
+    BrowserUseExecutionResult,
+    BrowserUseResultRuntimeActionResponse,
+    BrowserUseRuntimeAction,
+    CancelRuntimeActionResponse,
+    ContinueRuntimeActionResponse,
     CancelCommand,
     ContinueCommand,
     HarnessConfig,
+    ProvideAdditionalInfoCommand,
     HarnessServiceError,
     ReadyCommand,
+    ReadyRuntimeActionResponse,
+    ReportApplicationMismatchRuntimeAction,
+    RequestAdditionalInfoRuntimeAction,
+    RequestHumanNavigationRuntimeAction,
+    RequestHumanReviewRuntimeAction,
+    RequestOriginApprovalRuntimeAction,
+    ReviseRuntimeActionResponse,
     ReviseCommand,
     SESSION_ERROR_MESSAGES,
 )
-from jobhunter_browser_harness.pipeline_model import PipelineModelError, PipelineOAuthChatModel
+from jobhunter_browser_harness.pipeline_agent import PipelineApplicationAgentError
 from jobhunter_browser_harness.sessions import ApplicationSessionManager
 from jobhunter_browser_harness.tools import HumanGate
 
@@ -139,7 +162,7 @@ def ready_result(*, revision_count: int = 0) -> ApplicationRunResult:
 @dataclass(slots=True)
 class FakeModel:
     order: list[str]
-    ready_error: PipelineModelError | None = None
+    ready_error: PipelineApplicationAgentError | None = None
     check_blocker: asyncio.Event | None = None
     check_started: asyncio.Event = field(default_factory=asyncio.Event)
     active_started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -148,6 +171,9 @@ class FakeModel:
     close_failures: int = 0
     close_started: asyncio.Event = field(default_factory=asyncio.Event)
     close_blocker: asyncio.Event | None = None
+    run_result: ApplicationRunResult | None = None
+    run_calls: list[dict[str, Any]] = field(default_factory=list)
+    run_error: Exception | None = None
 
     async def check_ready(self) -> None:
         self.order.append("model.check_ready")
@@ -165,6 +191,16 @@ class FakeModel:
         finally:
             self.order.append("model.active_finished")
             self.active_finished.set()
+
+    async def run(self, **kwargs: Any) -> ApplicationRunResult:
+        self.order.append("model.run")
+        self.run_calls.append(kwargs)
+        if self.run_error is not None:
+            raise self.run_error
+        if self.run_result is None:
+            raise AssertionError("No synthetic application-agent result configured")
+        return self.run_result
+
 
     async def aclose(self) -> None:
         self.order.append("model.aclose")
@@ -207,17 +243,79 @@ class FakeBrowser:
         self.killed = True
 
 
+
+def browser_execution_result(
+    url: str = "https://jobs.example/openings/42?private=value",
+) -> BrowserUseExecutionResult:
+    return BrowserUseExecutionResult(
+        exit_code=0,
+        timed_out=False,
+        stdout="completed",
+        stderr="",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        observation=BrowserObservation(
+            url=url,
+            title="Application",
+            tabs=[],
+            dom="Application form",
+            page_info={"url": url},
+            screenshot=None,
+        ),
+    )
+
+
+@dataclass(slots=True)
+class FakeSkillRuntime:
+    result: BrowserUseExecutionResult = field(
+        default_factory=browser_execution_result
+    )
+    blocker: asyncio.Event | None = None
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    codes: list[str] = field(default_factory=list)
+    order: list[str] | None = None
+    runtime_started: bool = False
+    closed: bool = False
+    active_task: asyncio.Task[Any] | None = None
+
+    async def start(self) -> None:
+        if self.order is not None:
+            self.order.append("runtime.start")
+        self.runtime_started = True
+
+    async def execute(self, code: str) -> BrowserUseExecutionResult:
+        self.active_task = asyncio.current_task()
+        self.codes.append(code)
+        self.started.set()
+        try:
+            if self.blocker is not None:
+                await self.blocker.wait()
+            return self.result
+        finally:
+            self.active_task = None
+
+    async def close(self) -> None:
+        if self.order is not None:
+            self.order.append("runtime.close")
+        active = self.active_task
+        if active is not None and active is not asyncio.current_task() and not active.done():
+            active.cancel()
+            await asyncio.gather(active, return_exceptions=True)
+        self.closed = True
+
 class Fakes:
     def __init__(
         self,
         *,
         order: list[str] | None = None,
-        ready_error: PipelineModelError | None = None,
+        ready_error: PipelineApplicationAgentError | None = None,
         check_blocker: asyncio.Event | None = None,
         browser_kill_failures: int = 0,
         browser_kill_blocker: asyncio.Event | None = None,
         model_close_failures: int = 0,
         model_close_blocker: asyncio.Event | None = None,
+        agent_result: ApplicationRunResult | None = None,
+        agent_error: Exception | None = None,
     ) -> None:
         self.order = order if order is not None else []
         self.ready_error = ready_error
@@ -226,8 +324,11 @@ class Fakes:
         self.browser_kill_blocker = browser_kill_blocker
         self.model_close_failures = model_close_failures
         self.model_close_blocker = model_close_blocker
+        self.agent_result = agent_result
+        self.agent_error = agent_error
         self.models: list[FakeModel] = []
         self.browsers: list[FakeBrowser] = []
+        self.runtimes: list[FakeSkillRuntime] = []
 
     def model_factory(
         self, _session_id: UUID, _pipeline_url: str, _token: str
@@ -238,6 +339,8 @@ class Fakes:
             check_blocker=self.check_blocker,
             close_failures=self.model_close_failures,
             close_blocker=self.model_close_blocker,
+            run_result=self.agent_result,
+            run_error=self.agent_error,
         )
         self.models.append(model)
         return model
@@ -258,6 +361,12 @@ class Fakes:
         )
         self.browsers.append(browser)
         return browser
+
+    def skill_runtime_factory(self, **_kwargs: Any) -> FakeSkillRuntime:
+        self.order.append("runtime.factory")
+        runtime = FakeSkillRuntime(order=self.order)
+        self.runtimes.append(runtime)
+        return runtime
 
 
 class ImmediateContextProcess:
@@ -286,7 +395,7 @@ Runner = Callable[
 
 def make_manager(
     tmp_path: Path,
-    runner: Runner,
+    runner: Runner | None,
     *,
     fakes: Fakes | None = None,
     timeout: int = 3600,
@@ -299,6 +408,7 @@ def make_manager(
             bearer_token=TOKEN,
             session_timeout=timeout,
             browser_skill_workspace=tmp_path / "browser-skill" / "agent-workspace",
+            user_info_json=tmp_path / "user-info.json",
         ),
         artifacts_root=root,
         browser_launch=ResolvedBrowserLaunch(
@@ -310,6 +420,7 @@ def make_manager(
         context_process_factory=context_process_factory,
         browser_factory=doubles.browser_factory,
         application_runner=runner,
+        skill_runtime_factory=doubles.skill_runtime_factory,
     )
     return manager, doubles, root
 
@@ -324,6 +435,7 @@ def test_manager_probes_bubblewrap_and_creates_private_skill_workspace(
             bearer_token=TOKEN,
             bubblewrap_executable=Path("/usr/bin/bwrap"),
             browser_skill_workspace=workspace,
+            user_info_json=tmp_path / "user-info.json",
         ),
         artifacts_root=tmp_path / "sessions",
         browser_launch=ResolvedBrowserLaunch(
@@ -351,6 +463,7 @@ def test_manager_rejects_workspace_env_file(tmp_path: Path) -> None:
             HarnessConfig(
                 bearer_token=TOKEN,
                 browser_skill_workspace=workspace,
+                user_info_json=tmp_path / "user-info.json",
             ),
             artifacts_root=tmp_path / "sessions",
             browser_launch=ResolvedBrowserLaunch(
@@ -377,6 +490,7 @@ def test_manager_rejects_unusable_bubblewrap_without_fallback(tmp_path: Path) ->
                 browser_skill_workspace=(
                     tmp_path / "browser-skill" / "agent-workspace"
                 ),
+                user_info_json=tmp_path / "user-info.json",
             ),
             artifacts_root=tmp_path / "sessions",
             browser_launch=ResolvedBrowserLaunch(
@@ -505,6 +619,25 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
         raise AssertionError("unreachable")
 
     manager, fakes, _root = make_manager(tmp_path, runner, fakes=Fakes(order=order))
+    await manager._user_info_store.merge(
+        JOB_URL,
+        (
+            AdditionalInfoTextQuestion(
+                id="saved_path",
+                key="privacy.saved_path",
+                scope="global",
+                question="Saved path value?",
+                answer_type="text",
+            ),
+        ),
+        (
+            AdditionalInfoTextCommandAnswer(
+                id="saved_path",
+                status="answered",
+                value="openings",
+            ),
+        ),
+    )
     response = await create_valid(manager)
     snapshot = manager.get_snapshot(response.session_id)
 
@@ -513,7 +646,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
     assert response.commands_url == f"http://127.0.0.1:8765/v1/sessions/{response.session_id}/commands"
     assert order[:2] == ["model.check_ready", "browser.factory"]
     assert snapshot.state == "starting"
-    assert snapshot.job_url == "https://jobs.example/openings/42"
+    assert snapshot.job_url == "https://jobs.example/[redacted]/42"
     assert snapshot.approved_origins == ["https://jobs.example"]
 
     await asyncio.wait_for(runner_started.wait(), timeout=1)
@@ -532,11 +665,12 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
         }
     )
     assert PROFILE_SECRET not in public
+    assert "openings" not in public
     assert "candidate=private-secret" not in public
     assert "answer=private" not in public
     assert decode_frame(sessions_module._sse_frame(record.events[-1]))["detail"] == {
         "step_number": 1,
-        "current_url": "https://jobs.example/openings/42",
+        "current_url": "https://jobs.example/[redacted]/42",
     }
 
     await manager.delete(response.session_id)
@@ -554,7 +688,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
 async def test_preflight_errors_cleanup_before_browser_factory(
     tmp_path: Path, code: str, message: str, status: int
 ) -> None:
-    fakes = Fakes(ready_error=PipelineModelError(code, message))
+    fakes = Fakes(ready_error=PipelineApplicationAgentError(code, message))
     manager, fakes, root = make_manager(tmp_path, blocked_runner, fakes=fakes)
 
     with pytest.raises(HarnessServiceError) as caught:
@@ -650,7 +784,6 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
         "https://jobs.example",
         "https://ats.example",
     )
-    assert record.human_gate.sensitive_data["https://ats.example"]["email"] == PROFILE_SECRET
     assert record.browser.browser_profile.allowed_domains == [
         "https://jobs.example/",
         "https://ats.example/",
@@ -733,7 +866,8 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     await manager.delete(created.session_id)
 
     assert order.index("gate.cancel") < order.index("runner.done")
-    assert order.index("runner.done") < order.index("browser.kill")
+    assert order.index("runner.done") < order.index("runtime.close")
+    assert order.index("runtime.close") < order.index("browser.kill")
     assert order.index("browser.kill") < order.index("model.aclose")
     assert order.index("model.aclose") < order.index("artifacts.cleanup")
     assert order.index("artifacts.cleanup") < order.index("event.closed")
@@ -744,6 +878,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     assert tombstone.events[-1].event == "closed"
     assert manager._active is None
     assert fakes.browsers[0].killed and fakes.models[0].closed
+    assert fakes.runtimes[0].closed
 
     event_count = len(tombstone.events)
     await manager.delete(created.session_id)
@@ -759,24 +894,42 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
 @pytest.mark.parametrize(
     ("failure", "expected_code"),
     [
-        (ApplicationAgentFailure("application_mismatch"), "application_mismatch"),
-        (ApplicationAgentFailure("step_limit"), "step_limit"),
         (
-            PipelineModelError("oauth_required", SESSION_ERROR_MESSAGES["oauth_required"]),
+            PipelineApplicationAgentError(
+                "application_mismatch",
+                SESSION_ERROR_MESSAGES["application_mismatch"],
+            ),
+            "application_mismatch",
+        ),
+        (
+            PipelineApplicationAgentError(
+                "step_limit",
+                SESSION_ERROR_MESSAGES["step_limit"],
+            ),
+            "step_limit",
+        ),
+        (
+            PipelineApplicationAgentError(
+                "oauth_required", SESSION_ERROR_MESSAGES["oauth_required"]
+            ),
             "oauth_required",
         ),
         (
-            PipelineModelError("model_timeout", SESSION_ERROR_MESSAGES["model_timeout"]),
+            PipelineApplicationAgentError(
+                "model_timeout", SESSION_ERROR_MESSAGES["model_timeout"]
+            ),
             "model_timeout",
         ),
         (
-            PipelineModelError(
+            PipelineApplicationAgentError(
                 "invalid_model_output", SESSION_ERROR_MESSAGES["invalid_model_output"]
             ),
             "invalid_model_output",
         ),
         (
-            PipelineModelError("model_failed", SESSION_ERROR_MESSAGES["model_failed"]),
+            PipelineApplicationAgentError(
+                "model_failed", SESSION_ERROR_MESSAGES["model_failed"]
+            ),
             "model_failed",
         ),
         (RuntimeError("raw provider secret must not escape"), "browser_failed"),
@@ -922,7 +1075,7 @@ async def test_absolute_ttl_maps_to_session_timeout_without_real_sleep(tmp_path:
     record = manager._active
     assert record is not None and record.ttl_task is not None
     record.ttl_task.cancel()
-    record.created_monotonic = asyncio.get_running_loop().time() - 1
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
 
     await manager._expire_session(record)
     await wait_state(manager, created.session_id, "failed")
@@ -1227,9 +1380,11 @@ async def test_cleanup_observation_timeouts_do_not_cancel_owned_tasks_or_release
     close_blocker.set()
     await wait_state(manager, created.session_id, "cancelled")
     assert timed_out == {30}
-    assert observations == 4
+    assert observations == 5
     assert manager._active is None
     assert fakes.browsers[0].killed and fakes.models[0].closed
+    assert fakes.runtimes[0].closed
+    assert fakes.order.count("runtime.close") == 1
     assert fakes.order.count("browser.kill") == 1
     assert fakes.order.count("model.aclose") == 1
 
@@ -1304,7 +1459,7 @@ async def test_absolute_ttl_begins_during_model_preflight_setup(tmp_path: Path) 
     record = manager._active
     assert record is not None and record.ttl_task is not None
     record.ttl_task.cancel()
-    record.created_monotonic = asyncio.get_running_loop().time() - 1
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
 
     await manager._expire_session(record)
     with pytest.raises(HarnessServiceError) as expired:
@@ -1611,7 +1766,7 @@ async def test_transient_cleanup_failure_retries_while_retaining_ownership(
     assert manager._tombstones[created.session_id].events[-1].event == "closed"
 
 
-async def test_resume_path_resolution_task_is_joined_before_browser_and_artifacts(
+async def test_resume_path_resolution_is_joined_before_artifacts_without_creating_browser(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     started = ThreadEvent()
@@ -1641,13 +1796,13 @@ async def test_resume_path_resolution_task_is_joined_before_browser_and_artifact
     await asyncio.sleep(0)
     assert not deletion.done()
     assert artifact_directory.exists()
-    assert fakes.browsers[0].killed is False
+    assert fakes.browsers == []
     release.set()
     await asyncio.wait_for(deletion, timeout=1)
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(creation, timeout=1)
 
-    assert order.index("resume.resolved") < order.index("browser.kill")
+    assert order == ["resume.resolved"]
     assert not artifact_directory.exists()
     assert manager.get_snapshot(record.session_id).state == "closed"
 
@@ -1811,67 +1966,8 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     await manager.delete(created.session_id)
 
 
-async def test_pipeline_model_close_cancellation_preserves_and_joins_client_task() -> None:
-    class BlockingClient:
-        def __init__(self) -> None:
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
-            self.calls = 0
-            self.is_closed = False
-
-        async def aclose(self) -> None:
-            self.calls += 1
-            self.started.set()
-            await self.release.wait()
-
-    model = PipelineOAuthChatModel(uuid4(), "http://127.0.0.1:3457", TOKEN)
-    await model._client.aclose()
-    client = BlockingClient()
-    model._client = client  # type: ignore[assignment]
-    first = asyncio.create_task(model.aclose())
-    await asyncio.wait_for(client.started.wait(), timeout=1)
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    assert model._close_task is not None
-    assert not model._close_task.cancelled()
-
-    joined = asyncio.create_task(model.aclose())
-    await asyncio.sleep(0)
-    assert not joined.done()
-    client.release.set()
-    await asyncio.wait_for(joined, timeout=1)
-    assert client.calls == 1
-    assert model._closed is True
 
 
-async def test_pipeline_model_retries_pinned_transport_close_after_closed_client_failure() -> None:
-    class RetryTransport:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def aclose(self) -> None:
-            self.calls += 1
-            if self.calls == 1:
-                raise RuntimeError("synthetic transport close failure")
-
-    class ClosedClient:
-        def __init__(self, transport: RetryTransport) -> None:
-            self.is_closed = True
-            self._transport = transport
-
-    model = PipelineOAuthChatModel(uuid4(), "http://127.0.0.1:3457", TOKEN)
-    await model._client.aclose()
-    transport = RetryTransport()
-    model._client = ClosedClient(transport)  # type: ignore[assignment]
-
-    with pytest.raises(RuntimeError, match="synthetic transport close failure"):
-        await model.aclose()
-    assert model._close_task is None
-    assert model._closed is False
-    await model.aclose()
-    assert transport.calls == 2
-    assert model._closed is True
 
 
 async def test_candidate_context_process_returns_valid_context_and_closes(
@@ -2058,3 +2154,765 @@ async def test_shutdown_upgrades_active_to_terminal_race_tombstone_to_closed(
     tombstone = manager._tombstones[created.session_id]
     assert tombstone.snapshot.state == "closed"
     assert [event.event for event in tombstone.events][-2:] == ["cancelled", "closed"]
+
+
+async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_limit(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    personal, resume = valid_uploads()
+    created = await manager.create_session(
+        job_url=JOB_URL,
+        allow_domains=[],
+        max_steps=1,
+        personal_information=personal,
+        resume=resume,
+        context=[],
+        anecdotes=[],
+    )
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    runtime = FakeSkillRuntime(
+        result=browser_execution_result().model_copy(
+            update={"exit_code": 124, "timed_out": True}
+        )
+    )
+    record.skill_runtime = runtime
+
+    result = await manager.runtime_action(
+        created.session_id,
+        BrowserUseRuntimeAction(type="browser_use", code="print(page_info())"),
+    )
+
+    assert isinstance(result, BrowserUseResultRuntimeActionResponse)
+    assert result.stdout == "completed"
+    assert result.exit_code == 124
+    assert result.timed_out is True
+    assert record.browser_action_count == 1
+    assert runtime.codes == ["print(page_info())"]
+    step = record.events[-1]
+    assert step.event == "agent_step"
+    assert step.detail.step_number == 1
+    assert step.detail.current_url == "https://jobs.example/openings/42"
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.runtime_action(
+            created.session_id,
+            BrowserUseRuntimeAction(type="browser_use", code="print('again')"),
+        )
+
+    assert_service_error(
+        raised.value,
+        409,
+        "step_limit",
+        SESSION_ERROR_MESSAGES["step_limit"],
+    )
+    assert record.browser_action_count == 1
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    record.skill_runtime = FakeSkillRuntime()
+    action = RequestAdditionalInfoRuntimeAction(
+        type="request_additional_info",
+        questions=[
+            AdditionalInfoTextQuestion(
+                id="availability",
+                key="availability.summer_2027",
+                scope="global",
+                question="What dates are available?",
+                answer_type="text",
+            ),
+            AdditionalInfoSingleSelectQuestion(
+                id="referral",
+                key="referral.source",
+                scope="application",
+                question="How did you hear about this role?",
+                answer_type="single_select",
+                options=[
+                    AdditionalInfoOption(id="friend", label="A friend"),
+                    AdditionalInfoOption(id="board", label="Job board"),
+                ],
+            ),
+        ],
+    )
+
+    with pytest.raises(HarnessServiceError) as before_browser:
+        await manager.runtime_action(created.session_id, action)
+    assert_service_error(
+        before_browser.value,
+        409,
+        "command_conflict",
+        "Inspect the application before requesting additional information",
+    )
+
+    await manager.runtime_action(
+        created.session_id,
+        BrowserUseRuntimeAction(type="browser_use", code="print(page_info())"),
+    )
+    pending = asyncio.create_task(
+        manager.runtime_action(created.session_id, action)
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "additional_info")
+    assert manager.get_snapshot(created.session_id).state == "awaiting_additional_info"
+    required = record.events[-1]
+    assert required.event == "additional_info_required"
+    assert [question.id for question in required.detail.questions] == [
+        "availability",
+        "referral",
+    ]
+    previous_store = (tmp_path / "user-info.json").read_bytes()
+    with pytest.raises(HarnessServiceError) as partial:
+        await manager.command(
+            created.session_id,
+            ProvideAdditionalInfoCommand(
+                type="provide_additional_info",
+                answers=[
+                    AdditionalInfoTextCommandAnswer(
+                        id="availability",
+                        status="answered",
+                        value="partial value",
+                    )
+                ],
+            ),
+        )
+    assert_service_error(
+        partial.value,
+        409,
+        "command_conflict",
+        "The additional-information answers are incomplete",
+    )
+    assert (tmp_path / "user-info.json").read_bytes() == previous_store
+    assert record.human_gate.pending_kind == "additional_info"
+
+    answer_value = "June through August 2027"
+    await manager.command(
+        created.session_id,
+        ProvideAdditionalInfoCommand(
+            type="provide_additional_info",
+            answers=[
+                AdditionalInfoTextCommandAnswer(
+                    id="availability",
+                    status="answered",
+                    value=answer_value,
+                ),
+                AdditionalInfoSingleSelectCommandAnswer(
+                    id="referral",
+                    status="answered",
+                    option_id="friend",
+                ),
+            ],
+        ),
+    )
+    response = await pending
+
+    assert response == AdditionalInfoRuntimeActionResponse(
+        type="additional_info",
+        answers=response.answers,
+    )
+    assert [answer.value for answer in response.answers] == [
+        answer_value,
+        "A friend",
+    ]
+    assert manager.get_snapshot(created.session_id).state == "running"
+    saved = record.events[-1]
+    assert saved.event == "additional_info_saved"
+    assert saved.detail.count == 2
+    assert answer_value not in saved.model_dump_json()
+    disk = json.loads((tmp_path / "user-info.json").read_text(encoding="utf-8"))
+    assert disk["global"]["availability.summer_2027"]["value"] == answer_value
+    assert disk["applications"][JOB_URL]["referral.source"]["value"] == "A friend"
+
+    with pytest.raises(HarnessServiceError) as stale:
+        await manager.command(
+            created.session_id,
+            ProvideAdditionalInfoCommand(
+                type="provide_additional_info",
+                answers=[
+                    AdditionalInfoTextCommandAnswer(
+                        id="availability",
+                        status="answered",
+                        value=answer_value,
+                    ),
+                    AdditionalInfoSingleSelectCommandAnswer(
+                        id="referral",
+                        status="answered",
+                        option_id="friend",
+                    ),
+                ],
+            ),
+        )
+    assert stale.value.code == "command_conflict"
+
+    record.additional_info_question_count = 99
+    with pytest.raises(HarnessServiceError) as over_limit:
+        await manager.runtime_action(created.session_id, action)
+    assert_service_error(
+        over_limit.value,
+        409,
+        "command_conflict",
+        "The additional-information question limit was reached",
+    )
+    assert record.additional_info_question_count == 99
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_action_rejects_concurrency_without_cancelling_active_call(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    blocker = asyncio.Event()
+    runtime = FakeSkillRuntime(blocker=blocker)
+    record.skill_runtime = runtime
+    active = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            BrowserUseRuntimeAction(type="browser_use", code="print('blocked')"),
+        )
+    )
+    await runtime.started.wait()
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.runtime_action(
+            created.session_id,
+            ReportApplicationMismatchRuntimeAction(
+                type="report_application_mismatch"
+            ),
+        )
+
+    assert_service_error(
+        raised.value,
+        409,
+        "command_conflict",
+        "A runtime action is already pending",
+    )
+    assert not active.done()
+    blocker.set()
+    assert isinstance(await active, BrowserUseResultRuntimeActionResponse)
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_navigation_releases_command_lock_and_returns_nested_approval(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert (
+        record is not None
+        and record.browser is not None
+        and record.human_gate is not None
+    )
+    record.skill_runtime = FakeSkillRuntime()
+
+    navigation = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanNavigationRuntimeAction(
+                type="request_human_navigation",
+                instruction="Complete the hardware-key prompt.",
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "navigation")
+    record.browser.current_url = "https://ats.example/application/42?private=value"
+    await manager.command(created.session_id, ContinueCommand(type="continue"))
+    await wait_until(lambda: record.human_gate.pending_kind == "origin")
+    await manager.command(
+        created.session_id,
+        ApproveOriginCommand(type="approve_origin", origin="https://ats.example"),
+    )
+
+    approved = await navigation
+    assert isinstance(approved, ApproveRuntimeActionResponse)
+    assert approved.origin == "https://ats.example"
+    assert approved.approved_origins == [
+        "https://jobs.example",
+        "https://ats.example",
+    ]
+
+    already_approved = await manager.runtime_action(
+        created.session_id,
+        RequestOriginApprovalRuntimeAction(
+            type="request_origin_approval",
+            origin="https://ats.example",
+        ),
+    )
+    assert isinstance(already_approved, ApproveRuntimeActionResponse)
+    assert already_approved == approved
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_review_rejects_a_result_for_another_job_before_gate(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    record.skill_runtime = FakeSkillRuntime()
+    mismatched_result = ready_result().model_copy(
+        update={"job_url": "https://other.example/jobs/42"}
+    )
+
+    response = await asyncio.wait_for(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanReviewRuntimeAction(
+                type="request_human_review",
+                result=mismatched_result,
+            ),
+        ),
+        timeout=0.1,
+    )
+
+    assert isinstance(response, ApplicationMismatchRuntimeActionResponse)
+    assert record.human_gate.pending_kind is None
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.state == "running"
+    assert snapshot.job_url == "https://jobs.example/openings/42"
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_review_returns_revision_then_ready_and_seals_runtime(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    record.skill_runtime = FakeSkillRuntime()
+
+    review = RequestHumanReviewRuntimeAction(
+        type="request_human_review",
+        result=ready_result(),
+    )
+    first = asyncio.create_task(manager.runtime_action(created.session_id, review))
+    await wait_until(lambda: record.human_gate.pending_kind == "review")
+    await manager.command(
+        created.session_id,
+        ReviseCommand(type="revise", context="Use the corrected date."),
+    )
+    revised = await first
+    assert revised == ReviseRuntimeActionResponse(
+        type="revise",
+        context="Use the corrected date.",
+        revision_count=1,
+    )
+
+    second = asyncio.create_task(manager.runtime_action(created.session_id, review))
+    await wait_until(lambda: record.human_gate.pending_kind == "review")
+    await manager.command(created.session_id, ReadyCommand(type="ready"))
+    ready = await second
+    assert isinstance(ready, ReadyRuntimeActionResponse)
+    assert ready.result.status == "ready_for_human_submit"
+    assert ready.result.revision_count == 1
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.runtime_action(
+            created.session_id,
+            ReportApplicationMismatchRuntimeAction(
+                type="report_application_mismatch"
+            ),
+        )
+    assert raised.value.code == "command_conflict"
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_review_returns_typed_cancel_result(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    record.skill_runtime = FakeSkillRuntime()
+    review = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanReviewRuntimeAction(
+                type="request_human_review",
+                result=ready_result(),
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "review")
+
+    await record.human_gate.cancel()
+    cancelled = await review
+
+    assert isinstance(cancelled, CancelRuntimeActionResponse)
+    assert cancelled.result.status == "cancelled"
+    assert cancelled.result.submit_attempted is False
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_mismatch_is_typed_and_unknown_session_is_not_found(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    record.skill_runtime = FakeSkillRuntime()
+
+    mismatch = await manager.runtime_action(
+        created.session_id,
+        ReportApplicationMismatchRuntimeAction(
+            type="report_application_mismatch"
+        ),
+    )
+
+    assert isinstance(mismatch, ApplicationMismatchRuntimeActionResponse)
+    with pytest.raises(HarnessServiceError) as missing:
+        await manager.runtime_action(
+            uuid4(),
+            ReportApplicationMismatchRuntimeAction(
+                type="report_application_mismatch"
+            ),
+        )
+    assert_service_error(
+        missing.value,
+        404,
+        "session_not_found",
+        "Session was not found",
+    )
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_action_rejects_starting_and_terminal_sessions(
+    tmp_path: Path,
+) -> None:
+    preflight_release = asyncio.Event()
+    fakes = Fakes(check_blocker=preflight_release)
+    manager, _, _ = make_manager(tmp_path, blocked_runner, fakes=fakes)
+    creation = asyncio.create_task(create_valid(manager))
+    await wait_until(
+        lambda: bool(fakes.models) and fakes.models[0].check_started.is_set()
+    )
+    record = manager._active
+    assert record is not None
+    action = ReportApplicationMismatchRuntimeAction(
+        type="report_application_mismatch"
+    )
+
+    with pytest.raises(HarnessServiceError) as starting:
+        await manager.runtime_action(record.session_id, action)
+    assert_service_error(
+        starting.value,
+        409,
+        "command_conflict",
+        "The session is still starting",
+    )
+
+    preflight_release.set()
+    created = await creation
+    await wait_state(manager, created.session_id, "running")
+    record.skill_runtime = FakeSkillRuntime()
+    await manager.delete(created.session_id)
+
+    with pytest.raises(HarnessServiceError) as terminal:
+        await manager.runtime_action(created.session_id, action)
+    assert_service_error(
+        terminal.value,
+        409,
+        "command_conflict",
+        "The session is terminal",
+    )
+
+
+async def test_create_starts_skill_runtime_before_accepting_runtime_actions(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _ = make_manager(tmp_path, blocked_runner)
+
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+
+    assert record is not None
+    assert record.skill_runtime is fakes.runtimes[0]
+    assert fakes.runtimes[0].runtime_started is True
+    assert fakes.order.index("browser.factory") < fakes.order.index("runtime.factory")
+    assert fakes.order.index("runtime.factory") < fakes.order.index("runtime.start")
+
+    response = await manager.runtime_action(
+        created.session_id,
+        BrowserUseRuntimeAction(type="browser_use", code="print('connected')"),
+    )
+    assert isinstance(response, BrowserUseResultRuntimeActionResponse)
+    await manager.delete(created.session_id)
+
+
+async def test_terminal_cleanup_cancels_active_runtime_action_before_browser_cleanup(
+    tmp_path: Path,
+) -> None:
+    order: list[str] = []
+    manager, fakes, _ = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=Fakes(order=order),
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    runtime = fakes.runtimes[0]
+    runtime.blocker = asyncio.Event()
+    assert record is not None
+    action = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            BrowserUseRuntimeAction(
+                type="browser_use",
+                code="import time; time.sleep(30)",
+            ),
+        )
+    )
+    await runtime.started.wait()
+
+    await manager.delete(created.session_id)
+
+    with pytest.raises(asyncio.CancelledError):
+        await action
+    assert runtime.closed
+    assert order.index("runtime.close") < order.index("browser.kill")
+    events = manager._tombstones[created.session_id].events
+    assert all(event.event != "agent_step" for event in events)
+
+
+async def test_full_application_agent_receives_one_session_scoped_run_request(
+    tmp_path: Path,
+) -> None:
+    cancelled = ready_result().model_copy(update={"status": "cancelled"})
+    fakes = Fakes(agent_result=cancelled)
+    manager, fakes, _ = make_manager(tmp_path, None, fakes=fakes)
+    await manager._user_info_store.merge(
+        JOB_URL,
+        (
+            AdditionalInfoTextQuestion(
+                id="saved_global",
+                key="availability.summer_2027",
+                scope="global",
+                question="When are you available?",
+                answer_type="text",
+            ),
+            AdditionalInfoTextQuestion(
+                id="saved_application",
+                key="application.follow_up",
+                scope="application",
+                question="Application-specific follow-up?",
+                answer_type="text",
+            ),
+        ),
+        (
+            AdditionalInfoTextCommandAnswer(
+                id="saved_global",
+                status="answered",
+                value="June through August 2027",
+            ),
+            AdditionalInfoDeclinedCommandAnswer(
+                id="saved_application",
+                status="declined",
+            ),
+        ),
+    )
+
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "cancelled")
+
+    assert len(fakes.models[0].run_calls) == 1
+    call = fakes.models[0].run_calls[0]
+    assert set(call) == {
+        "runtime_url",
+        "task",
+        "max_turns",
+        "deadline_ms",
+    }
+    assert call["runtime_url"] == "http://127.0.0.1:8765"
+    task = json.loads(call["task"])
+    assert task["job"]["url"] == JOB_URL
+    assert task["user_info"]["explicit"]["email"] == PROFILE_SECRET
+    assert task["user_info"]["saved_global"] == {
+        "availability.summer_2027": {
+            "answer_type": "text",
+            "status": "answered",
+            "value": "June through August 2027",
+        }
+    }
+    assert task["user_info"]["saved_application"] == {
+        "application.follow_up": {
+            "answer_type": "text",
+            "status": "declined",
+        }
+    }
+    assert "question" not in call["task"]
+    assert "updated_at" not in call["task"]
+    assert task["evidence"][0]["category"] == "resume"
+    assert "workflow" not in call["task"].lower()
+    assert call["max_turns"] == 100
+    assert 1_000 <= call["deadline_ms"] <= 3_600_000
+    assert fakes.order.index("model.check_ready") < fakes.order.index(
+        "browser.factory"
+    )
+    assert fakes.order.count("model.run") == 1
+
+
+async def test_oversized_data_task_fails_before_preflight_and_browser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sessions_module,
+        "build_application_task",
+        lambda _request: "x" * (1024 * 1024 + 1),
+    )
+    manager, fakes, root = make_manager(tmp_path, None)
+
+    with pytest.raises(HarnessServiceError) as caught:
+        await create_valid(manager)
+
+    assert_service_error(
+        caught.value,
+        422,
+        "invalid_request",
+        "Request is invalid",
+    )
+    assert fakes.models == []
+    assert fakes.browsers == []
+    assert fakes.runtimes == []
+    assert manager._active is None
+    assert not root.exists() or tuple(root.iterdir()) == ()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_code"),
+    [
+        (ready_result(), "invalid_model_output"),
+        (
+            ready_result().model_copy(
+                update={
+                    "status": "cancelled",
+                    "job_url": "https://other.example/jobs/42",
+                }
+            ),
+            "application_mismatch",
+        ),
+    ],
+    ids=["ready-without-human-acceptance", "wrong-job-url"],
+)
+async def test_full_agent_result_requires_matching_job_and_accepted_review(
+    tmp_path: Path,
+    result: ApplicationRunResult,
+    expected_code: str,
+) -> None:
+    fakes = Fakes(agent_result=result)
+    manager, fakes, _ = make_manager(tmp_path, None, fakes=fakes)
+
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "failed")
+
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.error is not None
+    assert snapshot.error.code == expected_code
+    assert len(fakes.models[0].run_calls) == 1
+    assert fakes.runtimes[0].closed
+    assert fakes.browsers[0].killed
+    assert fakes.models[0].closed
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "oauth_required",
+        "model_timeout",
+        "invalid_model_output",
+        "model_failed",
+        "application_mismatch",
+        "step_limit",
+        "browser_failed",
+    ],
+)
+async def test_full_agent_errors_become_sanitized_terminal_failures(
+    tmp_path: Path,
+    code: str,
+) -> None:
+    fakes = Fakes(
+        agent_error=PipelineApplicationAgentError(
+            code,
+            SESSION_ERROR_MESSAGES[code],
+        )
+    )
+    manager, fakes, _ = make_manager(tmp_path, None, fakes=fakes)
+
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "failed")
+
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.error is not None
+    assert snapshot.error.model_dump() == {
+        "code": code,
+        "message": SESSION_ERROR_MESSAGES[code],
+    }
+    assert len(fakes.models[0].run_calls) == 1
+
+
+async def test_subsecond_remaining_deadline_waits_for_ttl_without_posting(
+    tmp_path: Path,
+) -> None:
+    preflight_release = asyncio.Event()
+    ttl_release = asyncio.Event()
+    cancelled = ready_result().model_copy(update={"status": "cancelled"})
+    fakes = Fakes(
+        check_blocker=preflight_release,
+        agent_result=cancelled,
+    )
+    manager, fakes, _ = make_manager(
+        tmp_path,
+        None,
+        fakes=fakes,
+        timeout=1,
+    )
+    expire_session = manager._expire_session
+
+    async def controlled_expiration(record: Any) -> None:
+        await ttl_release.wait()
+        await expire_session(record)
+
+    manager._expire_session = controlled_expiration  # type: ignore[method-assign]
+    creation = asyncio.create_task(create_valid(manager))
+    await wait_until(lambda: bool(fakes.models))
+    await asyncio.wait_for(fakes.models[0].check_started.wait(), timeout=1)
+    await asyncio.sleep(0.2)
+    preflight_release.set()
+
+    created = await creation
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert manager.get_snapshot(created.session_id).state == "running"
+    record = manager._active
+    assert record is not None
+    assert record.final_request is None
+    assert fakes.models[0].run_calls == []
+
+    ttl_release.set()
+    await wait_state(manager, created.session_id, "failed")
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.error is not None
+    assert snapshot.error.code == "session_timeout"

@@ -11,14 +11,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from browser_use.browser import BrowserSession
 from fastapi import UploadFile
 from pydantic import ValidationError
 
-from .agent import ApplicationAgentFailure, ApplicationRunRequest, run_application
+from .agent import ApplicationRunRequest, build_application_task
 from .artifacts import (
     StoredCandidateArtifacts,
     cleanup_session_artifacts,
@@ -32,34 +32,68 @@ from .browser import (
     resolve_browser_launch,
     resolve_resume_upload_path,
 )
-from .context import CandidateContext, CandidateContextProcess, build_sensitive_data
+from .context import CandidateContext, CandidateContextProcess
 from .models import (
+    AdditionalInfoRequiredDetail,
+    AdditionalInfoRuntimeActionResponse,
+    AdditionalInfoSavedDetail,
     AgentStepDetail,
     ApplicationRunResult,
+    ApplicationMismatchRuntimeActionResponse,
+    ApproveRuntimeActionResponse,
     ApproveOriginCommand,
     CancelCommand,
+    BrowserUseResultRuntimeActionResponse,
+    BrowserUseRuntimeAction,
+    CancelRuntimeActionResponse,
+    ContinueRuntimeActionResponse,
     ContinueCommand,
     EmptyEventDetail,
     HarnessConfig,
+    ProvideAdditionalInfoCommand,
     HarnessEvent,
     HarnessServiceError,
     HumanNavigationDetail,
     OriginApprovalDetail,
     ReadyCommand,
     ReviseCommand,
+    ReadyRuntimeActionResponse,
+    ReportApplicationMismatchRuntimeAction,
+    RequestAdditionalInfoRuntimeAction,
+    RequestHumanNavigationRuntimeAction,
+    RequestHumanReviewRuntimeAction,
+    RequestOriginApprovalRuntimeAction,
+    ReviseRuntimeActionResponse,
+    RuntimeActionRequest,
+    RuntimeActionResponse,
     RevisionAppliedDetail,
     SessionCommand,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionSnapshot,
     SessionState,
+    SESSION_ERROR_MESSAGES,
     UploadedArtifacts,
     session_error,
     validate_approved_origin,
     validate_job_url,
+    sanitize_public_url,
 )
-from .pipeline_model import PipelineModelError, PipelineOAuthChatModel
-from .tools import HumanGate, redact_public_text, sanitize_application_result
+from .pipeline_agent import (
+    PipelineApplicationAgentClient,
+    PipelineApplicationAgentError,
+)
+from .skill_runtime import (
+    BrowserSkillRuntime,
+    BrowserSkillRuntimeError,
+)
+from .tools import (
+    HumanGate,
+    redact_public_text,
+    redact_public_url,
+    sanitize_application_result,
+)
+from .user_info import UserInfoSnapshot, UserInfoStore
 
 
 logger = logging.getLogger(__name__)
@@ -67,15 +101,16 @@ _EVENT_LIMIT = 256
 _TOMBSTONE_LIMIT = 32
 _HEARTBEAT_SECONDS = 15.0
 _CLEANUP_RETRY_MAX_SECONDS = 5.0
+_MAX_APPLICATION_TASK_BYTES = 1024 * 1024
 
-ModelFactory = Callable[[UUID, str, str], PipelineOAuthChatModel]
+ModelFactory = Callable[[UUID, str, str], PipelineApplicationAgentClient]
 BrowserFactory = Callable[
     [ResolvedBrowserLaunch, tuple[str, ...] | list[str], Path], BrowserSession
 ]
 ApplicationRunner = Callable[
     [
         ApplicationRunRequest,
-        PipelineOAuthChatModel,
+        Any,
         BrowserSession,
         HumanGate,
         Callable[[int, str], Awaitable[None]],
@@ -83,6 +118,7 @@ ApplicationRunner = Callable[
     Awaitable[ApplicationRunResult],
 ]
 ContextProcessFactory = Callable[[StoredCandidateArtifacts], CandidateContextProcess]
+SkillRuntimeFactory = Callable[..., BrowserSkillRuntime]
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,27 +132,35 @@ class _TerminalRequest:
 class _ApplicationSession:
     session_id: UUID
     snapshot: SessionSnapshot
-    created_monotonic: float
+    deadline_monotonic: float
     events: deque[HarnessEvent] = field(
         default_factory=lambda: deque(maxlen=_EVENT_LIMIT)
     )
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     closed_event: asyncio.Event = field(default_factory=asyncio.Event)
     request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    runtime_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    runtime_action_pending: bool = False
+    browser_action_count: int = 0
+    additional_info_question_count: int = 0
     setup_task: asyncio.Task[Any] | None = None
     context_process: CandidateContextProcess | None = None
     resume_path_task: asyncio.Task[str] | None = None
     resume_upload_path: str | None = None
     request: SessionCreateRequest | None = None
+    user_info: UserInfoSnapshot | None = None
+    application_task: str | None = None
     stored: StoredCandidateArtifacts | None = None
     candidate: CandidateContext | None = None
-    model: PipelineOAuthChatModel | None = None
+    model: PipelineApplicationAgentClient | None = None
     browser: BrowserSession | None = None
     human_gate: HumanGate | None = None
+    skill_runtime: BrowserSkillRuntime | None = None
     agent_task: asyncio.Task[None] | None = None
     ttl_task: asyncio.Task[None] | None = None
     finalizer_task: asyncio.Task[None] | None = None
     browser_kill_task: asyncio.Task[None] | None = None
+    runtime_close_task: asyncio.Task[None] | None = None
     model_close_task: asyncio.Task[None] | None = None
     final_request: _TerminalRequest | None = None
     next_event_id: int = 1
@@ -157,15 +201,19 @@ def _sse_frame(event: HarnessEvent) -> str:
     )
 
 
-def _redact_known_values(value: str, candidate: CandidateContext | None) -> str:
-    if candidate is None:
-        return value
-    parsed = urlsplit(value)
-    redacted_path = redact_public_text(parsed.path, candidate.direct_fields) or ""
-    safe_path = quote(redacted_path, safe="/:@-._~!$&'()*+,;=[]")
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, safe_path, parsed.query, parsed.fragment)
-    )
+
+def _saved_private_values(snapshot: UserInfoSnapshot) -> frozenset[str]:
+    values: set[str] = set()
+    for facts in (snapshot.saved_global, snapshot.saved_application):
+        for fact in facts.values():
+            if fact.status != "answered" or fact.answer_type == "boolean":
+                continue
+            if isinstance(fact.value, str):
+                values.add(fact.value)
+            elif isinstance(fact.value, tuple):
+                values.update(fact.value)
+    return frozenset(values)
+
 
 
 def _require_private_directory(path: Path, *, description: str) -> Path:
@@ -272,10 +320,12 @@ class ApplicationSessionManager:
         *,
         artifacts_root: Path | None = None,
         browser_launch: ResolvedBrowserLaunch | None = None,
-        model_factory: ModelFactory = PipelineOAuthChatModel,
+        model_factory: ModelFactory = PipelineApplicationAgentClient,
         context_process_factory: ContextProcessFactory = CandidateContextProcess,
         browser_factory: BrowserFactory = create_browser,
-        application_runner: ApplicationRunner = run_application,
+        application_runner: ApplicationRunner | None = None,
+        skill_runtime_factory: SkillRuntimeFactory = BrowserSkillRuntime,
+        user_info_store: UserInfoStore | None = None,
     ) -> None:
         self._config = config
         self._artifacts_root = (
@@ -286,6 +336,8 @@ class ApplicationSessionManager:
         self._context_process_factory = context_process_factory
         self._browser_factory = browser_factory
         self._application_runner = application_runner
+        self._skill_runtime_factory = skill_runtime_factory
+        self._user_info_store = user_info_store or UserInfoStore(config.user_info_json)
         self._browser_skill_workspace = _prepare_skill_workspace(
             config.browser_skill_workspace
         )
@@ -321,6 +373,7 @@ class ApplicationSessionManager:
 
         session_id = uuid4()
         created_at = _now()
+        accepted_monotonic = asyncio.get_running_loop().time()
         record = _ApplicationSession(
             session_id=session_id,
             snapshot=SessionSnapshot(
@@ -331,7 +384,9 @@ class ApplicationSessionManager:
                 job_url=f"{origins[0]}/",
                 approved_origins=list(origins),
             ),
-            created_monotonic=asyncio.get_running_loop().time(),
+            deadline_monotonic=(
+                accepted_monotonic + self._config.session_timeout
+            ),
             setup_task=asyncio.current_task(),
         )
 
@@ -367,18 +422,19 @@ class ApplicationSessionManager:
             candidate = await record.context_process.result()
             record.context_process = None
             record.candidate = candidate
+            user_info = self._user_info_store.snapshot(validated_job_url)
+            record.user_info = user_info
+            redaction_values = (
+                *candidate.direct_fields.values(),
+                *_saved_private_values(user_info),
+            )
             record.snapshot = self._updated_snapshot(
                 record.snapshot,
-                job_url=_redact_known_values(validated_job_url, candidate),
+                job_url=redact_public_url(
+                    validated_job_url,
+                    redaction_values,
+                ),
             )
-
-            model = self._model_factory(
-                session_id,
-                self._config.pipeline_url,
-                self._config.bearer_token,
-            )
-            record.model = model
-            await model.check_ready()
 
             uploaded = UploadedArtifacts(
                 session_directory=stored.session_directory,
@@ -396,13 +452,6 @@ class ApplicationSessionManager:
                 direct_fields=tuple(candidate.direct_fields.items()),
             )
             record.request = request
-
-            browser = self._browser_factory(
-                self._browser_launch,
-                origins,
-                stored.session_directory / "downloads",
-            )
-            record.browser = browser
             record.resume_path_task = asyncio.create_task(
                 asyncio.to_thread(
                     resolve_resume_upload_path,
@@ -415,7 +464,43 @@ class ApplicationSessionManager:
                 record.resume_path_task
             )
             record.resume_path_task = None
-            sensitive_data = build_sensitive_data(candidate, origins)
+            run_request = ApplicationRunRequest(
+                session=request,
+                candidate=candidate,
+                resume_display_name=stored.resume.display_name,
+                user_info=user_info,
+                resume_upload_path=record.resume_upload_path,
+            )
+            application_task = build_application_task(run_request)
+            if len(application_task.encode("utf-8")) > _MAX_APPLICATION_TASK_BYTES:
+                raise HarnessServiceError(
+                    422, "invalid_request", "Request is invalid"
+                )
+            record.application_task = application_task
+
+            model = self._model_factory(
+                session_id,
+                self._config.pipeline_url,
+                self._config.bearer_token,
+            )
+            record.model = model
+            await model.check_ready()
+
+            browser = self._browser_factory(
+                self._browser_launch,
+                origins,
+                stored.session_directory / "downloads",
+            )
+            record.browser = browser
+            runtime = self._skill_runtime_factory(
+                browser=browser,
+                session_directory=stored.session_directory,
+                workspace=self._browser_skill_workspace,
+                bubblewrap_executable=self._config.bubblewrap_executable,
+                deadline=record.deadline_monotonic,
+            )
+            record.skill_runtime = runtime
+            await runtime.start()
 
             async def publish_gate(
                 state: SessionState,
@@ -429,9 +514,12 @@ class ApplicationSessionManager:
 
             record.human_gate = HumanGate(
                 job_url=validated_job_url,
-                candidate=candidate,
+                private_values=(
+                    *candidate.direct_fields.values(),
+                    *_saved_private_values(user_info),
+                ),
+                user_info_store=self._user_info_store,
                 approved_origins=origins,
-                sensitive_data=sensitive_data,
                 publish=publish_gate,
                 review_snapshot=review_snapshot,
                 action_timeout=float(self._config.session_timeout),
@@ -460,20 +548,29 @@ class ApplicationSessionManager:
                     "The application session expired",
                 ) from None
             raise
-        except PipelineModelError as error:
+        except PipelineApplicationAgentError as error:
             record.setup_task = None
+            terminal = (
+                _TerminalRequest("closed", "closed")
+                if error.code == "invalid_request"
+                else _TerminalRequest("failed", "failed", error.code)
+            )
             await self._begin_finalization(
                 record,
-                _TerminalRequest("failed", "failed", error.code),
+                terminal,
                 duplicate_ok=True,
             )
             await self._join_finalizer(record)
             status_code = {
+                "invalid_request": 422,
                 "oauth_required": 409,
                 "pipeline_unavailable": 503,
                 "model_timeout": 504,
                 "invalid_model_output": 502,
                 "model_failed": 502,
+                "application_mismatch": 409,
+                "step_limit": 409,
+                "browser_failed": 502,
             }.get(error.code, 502)
             raise HarnessServiceError(
                 status_code, error.code, error.public_message
@@ -487,7 +584,12 @@ class ApplicationSessionManager:
             )
             await self._join_finalizer(record)
             raise
-        except (BrowserConfigurationError, OSError, ValidationError):
+        except (
+            BrowserConfigurationError,
+            BrowserSkillRuntimeError,
+            OSError,
+            ValidationError,
+        ):
             record.setup_task = None
             await self._begin_finalization(
                 record,
@@ -580,10 +682,231 @@ class ApplicationSessionManager:
                 await gate.revise(command.context)
             elif isinstance(command, ReadyCommand):
                 await gate.ready()
+            elif isinstance(command, ProvideAdditionalInfoCommand):
+                await gate.provide_additional_info(command.answers)
             else:
                 raise HarnessServiceError(
                     422, "invalid_request", "Command is invalid"
                 )
+    async def runtime_action(
+        self,
+        session_id: UUID,
+        action: RuntimeActionRequest,
+    ) -> RuntimeActionResponse:
+        record = self._active
+        if record is None or record.session_id != session_id:
+            if session_id in self._tombstones:
+                raise HarnessServiceError(
+                    409, "command_conflict", "The session is terminal"
+                )
+            raise self._not_found()
+
+        async with record.request_lock:
+            if record.finalized or record.final_request is not None:
+                raise HarnessServiceError(
+                    409, "command_conflict", "The session is terminal"
+                )
+            if (
+                record.snapshot.state == "ready_for_human_submit"
+                or (
+                    record.human_gate is not None
+                    and record.human_gate.ready_accepted
+                )
+            ):
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "The application is already ready for human submission",
+                )
+            if (
+                record.snapshot.state == "starting"
+                or record.skill_runtime is None
+                or record.human_gate is None
+                or record.browser is None
+                or record.request is None
+            ):
+                raise HarnessServiceError(
+                    409, "command_conflict", "The session is still starting"
+                )
+            if record.runtime_action_pending:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "A runtime action is already pending",
+                )
+            record.runtime_action_pending = True
+
+        try:
+            async with record.runtime_lock:
+                return await self._dispatch_runtime_action(record, action)
+        finally:
+            async with record.request_lock:
+                record.runtime_action_pending = False
+
+    async def _dispatch_runtime_action(
+        self,
+        record: _ApplicationSession,
+        action: RuntimeActionRequest,
+    ) -> RuntimeActionResponse:
+        runtime = record.skill_runtime
+        gate = record.human_gate
+        browser = record.browser
+        request = record.request
+        if runtime is None or gate is None or browser is None or request is None:
+            raise HarnessServiceError(
+                409, "command_conflict", "The session is still starting"
+            )
+
+        if isinstance(action, BrowserUseRuntimeAction):
+            if record.browser_action_count >= request.max_steps:
+                error = session_error("step_limit")
+                raise HarnessServiceError(
+                    409,
+                    error.code,
+                    error.message,
+                )
+            try:
+                result = await runtime.execute(action.code)
+            except BrowserSkillRuntimeError as error:
+                public = session_error(error.code)
+                raise HarnessServiceError(
+                    504 if error.code == "session_timeout" else 502,
+                    public.code,
+                    public.message,
+                ) from None
+            async with record.request_lock:
+                if record.finalized or record.final_request is not None:
+                    raise asyncio.CancelledError
+                record.browser_action_count += 1
+                await self._agent_step(
+                    record,
+                    record.browser_action_count,
+                    result.observation.url,
+                )
+                return BrowserUseResultRuntimeActionResponse(
+                    type="browser_use_result",
+                    **result.model_dump(),
+                )
+
+        if isinstance(action, RequestHumanNavigationRuntimeAction):
+            before = gate.approved_origins
+            gate_result = await gate.request_human_navigation(
+                action.instruction,
+                browser,
+            )
+            terminal = self._runtime_gate_terminal_response(gate_result)
+            if terminal is not None:
+                return terminal
+            approved = gate.approved_origins
+            if approved != before:
+                return ApproveRuntimeActionResponse(
+                    type="approve",
+                    origin=approved[-1],
+                    approved_origins=list(approved),
+                )
+            return ContinueRuntimeActionResponse(type="continue")
+
+        if isinstance(action, RequestOriginApprovalRuntimeAction):
+            gate_result = await gate.request_origin_approval(
+                action.origin,
+                browser,
+            )
+            terminal = self._runtime_gate_terminal_response(gate_result)
+            if terminal is not None:
+                return terminal
+            return ApproveRuntimeActionResponse(
+                type="approve",
+                origin=action.origin,
+                approved_origins=list(gate.approved_origins),
+            )
+
+        if isinstance(action, RequestAdditionalInfoRuntimeAction):
+            if record.browser_action_count < 1:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "Inspect the application before requesting additional information",
+                )
+            if (
+                record.additional_info_question_count + len(action.questions)
+                > 100
+            ):
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "The additional-information question limit was reached",
+                )
+            record.additional_info_question_count += len(action.questions)
+            gate_result = await gate.request_additional_info(
+                action.questions,
+                browser,
+            )
+            terminal = self._runtime_gate_terminal_response(gate_result)
+            if terminal is not None:
+                return terminal
+            try:
+                return AdditionalInfoRuntimeActionResponse.model_validate_json(
+                    gate_result.extracted_content
+                )
+            except (TypeError, ValidationError):
+                public = session_error("browser_failed")
+                raise HarnessServiceError(
+                    502,
+                    public.code,
+                    public.message,
+                ) from None
+        if isinstance(action, RequestHumanReviewRuntimeAction):
+            if action.result.job_url != sanitize_public_url(request.job_url):
+                return ApplicationMismatchRuntimeActionResponse(
+                    type="application_mismatch"
+                )
+            gate_result = await gate.request_human_review(
+                action.result,
+                browser,
+            )
+            terminal = self._runtime_gate_terminal_response(gate_result)
+            if terminal is not None:
+                return terminal
+            return ReviseRuntimeActionResponse(
+                type="revise",
+                context=gate_result.long_term_memory,
+                revision_count=gate.revision_count,
+            )
+
+        if isinstance(action, ReportApplicationMismatchRuntimeAction):
+            return ApplicationMismatchRuntimeActionResponse(
+                type="application_mismatch"
+            )
+
+        raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+
+    @staticmethod
+    def _runtime_gate_terminal_response(
+        gate_result: Any,
+    ) -> ReadyRuntimeActionResponse | CancelRuntimeActionResponse | None:
+        if not gate_result.is_done:
+            return None
+        try:
+            result = ApplicationRunResult.model_validate_json(
+                gate_result.extracted_content
+            )
+        except (TypeError, ValidationError):
+            public = session_error("browser_failed")
+            raise HarnessServiceError(
+                502,
+                public.code,
+                public.message,
+            ) from None
+        if gate_result.success and result.status == "ready_for_human_submit":
+            return ReadyRuntimeActionResponse(type="ready", result=result)
+        if not gate_result.success and result.status == "cancelled":
+            return CancelRuntimeActionResponse(type="cancel", result=result)
+        public = session_error("browser_failed")
+        raise HarnessServiceError(
+            502,
+            public.code,
+            public.message,
+        )
 
     async def delete(self, session_id: UUID) -> None:
         record = self._active
@@ -659,6 +982,8 @@ class ApplicationSessionManager:
             or gate is None
             or record.stored is None
             or record.resume_upload_path is None
+            or record.application_task is None
+            or record.user_info is None
         ):
             record.agent_task = None
             await self._begin_finalization(
@@ -670,18 +995,51 @@ class ApplicationSessionManager:
 
         await self._set_state_and_event(record, "running", "session_started", {})
         try:
-            result = await self._application_runner(
-                ApplicationRunRequest(
-                    session=request,
-                    candidate=candidate,
-                    resume_display_name=record.stored.resume.display_name,
-                    resume_upload_path=record.resume_upload_path,
-                ),
-                model,
-                browser,
-                gate,
-                lambda step, url: self._agent_step(record, step, url),
-            )
+            if self._application_runner is None:
+                remaining_ms = int(
+                    (
+                        record.deadline_monotonic
+                        - asyncio.get_running_loop().time()
+                    )
+                    * 1_000
+                )
+                if remaining_ms < 1_000:
+                    record.agent_task = None
+                    return
+                result = await model.run(
+                    runtime_url=f"http://127.0.0.1:{self._config.port}",
+                    task=record.application_task,
+                    max_turns=request.max_steps,
+                    deadline_ms=min(remaining_ms, 86_400_000),
+                )
+            else:
+                result = await self._application_runner(
+                    ApplicationRunRequest(
+                        session=request,
+                        candidate=candidate,
+                        resume_display_name=record.stored.resume.display_name,
+                        user_info=record.user_info,
+                        resume_upload_path=record.resume_upload_path,
+                    ),
+                    model,
+                    browser,
+                    gate,
+                    lambda step, url: self._agent_step(record, step, url),
+                )
+            if self._application_runner is None:
+                if result.job_url != sanitize_public_url(request.job_url):
+                    raise PipelineApplicationAgentError(
+                        "application_mismatch",
+                        SESSION_ERROR_MESSAGES["application_mismatch"],
+                    )
+                if (
+                    result.status == "ready_for_human_submit"
+                    and not gate.ready_accepted
+                ):
+                    raise PipelineApplicationAgentError(
+                        "invalid_model_output",
+                        SESSION_ERROR_MESSAGES["invalid_model_output"],
+                    )
             if record.final_request is not None:
                 return
             if result.status == "cancelled":
@@ -694,7 +1052,7 @@ class ApplicationSessionManager:
                 return
             sanitized = sanitize_application_result(
                 result,
-                candidate.direct_fields,
+                gate.redaction_values,
                 gate.revision_count,
             )
             self._apply_result(record, sanitized)
@@ -712,18 +1070,16 @@ class ApplicationSessionManager:
                     _TerminalRequest("cancelled", "cancelled"),
                     duplicate_ok=True,
                 )
-        except PipelineModelError as error:
-            record.agent_task = None
-            await self._begin_finalization(
-                record,
-                _TerminalRequest("failed", "failed", error.code),
-                duplicate_ok=True,
+        except PipelineApplicationAgentError as error:
+            error_code = (
+                "invalid_model_output"
+                if error.code == "invalid_request"
+                else error.code
             )
-        except ApplicationAgentFailure as error:
             record.agent_task = None
             await self._begin_finalization(
                 record,
-                _TerminalRequest("failed", "failed", error.code),
+                _TerminalRequest("failed", "failed", error_code),
                 duplicate_ok=True,
             )
         except Exception:
@@ -735,8 +1091,10 @@ class ApplicationSessionManager:
             )
 
     async def _expire_session(self, record: _ApplicationSession) -> None:
-        deadline = record.created_monotonic + self._config.session_timeout
-        delay = max(0.0, deadline - asyncio.get_running_loop().time())
+        delay = max(
+            0.0,
+            record.deadline_monotonic - asyncio.get_running_loop().time(),
+        )
         try:
             await asyncio.sleep(delay)
             await self._request_terminal(
@@ -859,6 +1217,29 @@ class ApplicationSessionManager:
                 await asyncio.shield(agent_task)
             except (asyncio.CancelledError, Exception):
                 pass
+
+        while record.skill_runtime is not None:
+            if record.runtime_close_task is None:
+                record.runtime_close_task = asyncio.create_task(
+                    record.skill_runtime.close()
+                )
+            try:
+                await self._await_owned_cleanup(
+                    record.runtime_close_task,
+                    "Browser skill runtime",
+                )
+            except Exception:
+                logger.warning(
+                    "Browser-skill runtime cleanup failed; retaining ownership and retrying"
+                )
+                record.runtime_close_task = None
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(
+                    retry_delay * 2, _CLEANUP_RETRY_MAX_SECONDS
+                )
+            else:
+                record.skill_runtime = None
+                record.runtime_close_task = None
 
         while record.browser is not None:
             if record.browser_kill_task is None:
@@ -983,7 +1364,14 @@ class ApplicationSessionManager:
             "agent_step",
             {
                 "step_number": step_number,
-                "current_url": _redact_known_values(current_url, record.candidate),
+                "current_url": redact_public_url(
+                    current_url,
+                    (
+                        record.human_gate.redaction_values
+                        if record.human_gate is not None
+                        else ()
+                    ),
+                ),
             },
         )
 
@@ -994,7 +1382,14 @@ class ApplicationSessionManager:
             record.snapshot,
             company=result.company,
             role=result.role,
-            job_url=_redact_known_values(result.job_url, record.candidate),
+            job_url=redact_public_url(
+                result.job_url,
+                (
+                    record.human_gate.redaction_values
+                    if record.human_gate is not None
+                    else ()
+                ),
+            ),
             fields_filled=result.fields_filled,
             fields_needing_human=result.fields_needing_human,
             files_attached=result.files_attached,
@@ -1048,6 +1443,10 @@ class ApplicationSessionManager:
             detail_model = OriginApprovalDetail.model_validate(detail)
         elif event == "revision_applied":
             detail_model = RevisionAppliedDetail.model_validate(detail)
+        elif event == "additional_info_required":
+            detail_model = AdditionalInfoRequiredDetail.model_validate(detail)
+        elif event == "additional_info_saved":
+            detail_model = AdditionalInfoSavedDetail.model_validate(detail)
         else:
             detail_model = EmptyEventDetail()
         public_event = HarnessEvent(

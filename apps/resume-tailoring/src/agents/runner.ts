@@ -1,4 +1,10 @@
-import { Runner, setTracingDisabled, type Agent, type ModelProvider } from "@openai/agents-core";
+import {
+  Runner,
+  setTracingDisabled,
+  type Agent,
+  type CallModelInputFilter,
+  type ModelProvider,
+} from "@openai/agents-core";
 import { OAuthCodexModelProvider } from "../models/oauth-codex-provider.ts";
 
 export const ATS_KEYWORD_EXTRACTION_DEADLINE_MS = 120_000;
@@ -17,8 +23,20 @@ export function bootstrapAgentRuntime(): void {
   tracingBootstrapped = true;
 }
 
+export interface AgentRunOptions<TContext> {
+  maxTurns: number;
+  signal: AbortSignal;
+  context?: TContext;
+  callModelInputFilter?: CallModelInputFilter<TContext>;
+  assertTranscript?: (result: unknown) => void;
+}
+
 export interface AgentRunner {
-  run(agent: Agent<unknown, "text">, input: string, options: { maxTurns: number; signal: AbortSignal }): Promise<unknown>;
+  run<TContext>(
+    agent: Agent<TContext, "text">,
+    input: string,
+    options: AgentRunOptions<TContext>,
+  ): Promise<unknown>;
 }
 
 export type ModelProviderFactory = (attemptSessionId: string) => ModelProvider;
@@ -90,13 +108,17 @@ export class AgentDeadlineError extends Error {
   }
 }
 
-export async function runWithDeadline(
+export async function runWithDeadline<TContext>(
   runner: AgentRunner,
-  agent: Agent<unknown, "text">,
+  agent: Agent<TContext, "text">,
   input: string,
   maxTurns: number,
   outerSignal: AbortSignal,
   deadlineMs: number,
+  additionalOptions: Pick<
+    AgentRunOptions<TContext>,
+    "context" | "callModelInputFilter" | "assertTranscript"
+  > = {},
 ): Promise<unknown> {
   if (outerSignal.aborted) throw outerSignal.reason ?? new DOMException("Aborted", "AbortError");
   const controller = new AbortController();
@@ -112,13 +134,21 @@ export async function runWithDeadline(
     controller.abort(deadlineError);
     gate.reject(deadlineError);
   }, deadlineMs);
-  const runPromise = runner.run(agent, input, { maxTurns, signal: controller.signal });
+  const runOptions: AgentRunOptions<TContext> = { maxTurns, signal: controller.signal };
+  if (additionalOptions.context !== undefined) runOptions.context = additionalOptions.context;
+  if (additionalOptions.callModelInputFilter !== undefined) {
+    runOptions.callModelInputFilter = additionalOptions.callModelInputFilter;
+  }
+  if (additionalOptions.assertTranscript !== undefined) {
+    runOptions.assertTranscript = additionalOptions.assertTranscript;
+  }
+  const runPromise = runner.run(agent, input, runOptions);
   try {
     const result = await Promise.race([runPromise, gate.promise]);
-    assertBoundedTranscript(result);
+    (runOptions.assertTranscript ?? assertBoundedTranscript)(result);
     return result;
   } catch (error) {
-    if (controller.signal.aborted) await runPromise.then(() => undefined, () => undefined);
+    if (controller.signal.aborted) void runPromise.then(() => undefined, () => undefined);
     if (controller.signal.reason === deadlineError) throw deadlineError;
     throw error;
   } finally {

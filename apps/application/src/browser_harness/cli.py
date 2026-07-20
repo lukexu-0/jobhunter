@@ -56,6 +56,12 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("~/.jobhunter/application/browser-skill/agent-workspace"),
         help="persistent Browser Use helper workspace",
     )
+    parser.add_argument(
+        "--user-info-json",
+        type=Path,
+        default=None,
+        help="durable scoped user-information JSON store",
+    )
     launch = parser.add_mutually_exclusive_group()
     launch.add_argument(
         "--chrome-executable",
@@ -127,6 +133,11 @@ def parse_config(
             session_timeout=args.session_timeout,
             bubblewrap_executable=bubblewrap_executable,
             browser_skill_workspace=args.browser_skill_workspace,
+            user_info_json=(
+                Path("apps/user-info/current-context/personal/user-info.json")
+                if args.user_info_json is None
+                else args.user_info_json.expanduser().resolve()
+            ),
             browser=browser,
         )
         resolved = resolve_browser_launch(browser)

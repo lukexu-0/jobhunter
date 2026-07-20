@@ -15,7 +15,14 @@ from pydantic import TypeAdapter, ValidationError
 from jobhunter_browser_harness.api import HarnessDependencies, create_app
 from jobhunter_browser_harness.models import (
     SESSION_ERROR_MESSAGES,
+    AdditionalInfoRuntimeActionResponse,
     ApplicationRunResult,
+    ApproveRuntimeActionResponse,
+    BrowserUseResultRuntimeActionResponse,
+    BrowserUseRuntimeAction,
+    CancelRuntimeActionResponse,
+    ContinueRuntimeActionResponse,
+    ProvideAdditionalInfoCommand,
     ApproveOriginCommand,
     BrowserLaunchConfig,
     CancelCommand,
@@ -23,6 +30,15 @@ from jobhunter_browser_harness.models import (
     FieldResult,
     HarnessConfig,
     HarnessServiceError,
+    ReadyRuntimeActionResponse,
+    RequestAdditionalInfoRuntimeAction,
+    RequestHumanNavigationRuntimeAction,
+    RequestHumanReviewRuntimeAction,
+    RequestOriginApprovalRuntimeAction,
+    ReportApplicationMismatchRuntimeAction,
+    ReviseRuntimeActionResponse,
+    RuntimeActionRequest,
+    RuntimeActionResponse,
     ReadyCommand,
     ReviseCommand,
     SessionCommand,
@@ -40,6 +56,8 @@ TOKEN = "test-token-0123456789abcdef-0123456789"
 SESSION_ID = UUID("39bb70b2-5ea4-4937-8090-32d7404ad597")
 AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
 COMMAND_ADAPTER = TypeAdapter(SessionCommand)
+RUNTIME_ACTION_ADAPTER = TypeAdapter(RuntimeActionRequest)
+RUNTIME_ACTION_RESPONSE_ADAPTER = TypeAdapter(RuntimeActionResponse)
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
 
 
@@ -80,6 +98,12 @@ class FakeSessionService:
     snapshot_calls: list[UUID] = field(default_factory=list)
     event_calls: list[tuple[UUID, int | None]] = field(default_factory=list)
     command_calls: list[tuple[UUID, SessionCommand]] = field(default_factory=list)
+    runtime_action_calls: list[tuple[UUID, RuntimeActionRequest]] = field(
+        default_factory=list
+    )
+    runtime_action_response: RuntimeActionResponse = field(
+        default_factory=lambda: ContinueRuntimeActionResponse(type="continue")
+    )
     delete_calls: list[UUID] = field(default_factory=list)
     shutdown_calls: int = 0
 
@@ -139,6 +163,16 @@ class FakeSessionService:
         if session_id != SESSION_ID:
             raise HarnessServiceError(404, "session_not_found", "Session not found")
         self.command_calls.append((session_id, command))
+
+    async def runtime_action(
+        self,
+        session_id: UUID,
+        action: RuntimeActionRequest,
+    ) -> RuntimeActionResponse:
+        if session_id != SESSION_ID:
+            raise HarnessServiceError(404, "session_not_found", "Session not found")
+        self.runtime_action_calls.append((session_id, action))
+        return self.runtime_action_response
 
     async def delete(self, session_id: UUID) -> None:
         if session_id != SESSION_ID:
@@ -457,6 +491,23 @@ def test_session_errors_are_limited_to_the_fixed_catalog() -> None:
         ({"type": "revise", "context": "  Correct this field.  "}, ReviseCommand),
         ({"type": "ready"}, ReadyCommand),
         ({"type": "cancel"}, CancelCommand),
+        (
+            {
+                "type": "provide_additional_info",
+                "answers": [
+                    {
+                        "id": "summer_availability",
+                        "status": "answered",
+                        "value": "June through August 2027",
+                    },
+                    {
+                        "id": "referral_source",
+                        "status": "declined",
+                    },
+                ],
+            },
+            ProvideAdditionalInfoCommand,
+        ),
     ],
 )
 def test_command_union_uses_strict_discriminators(
@@ -772,6 +823,239 @@ async def test_command_endpoint_rejects_bad_discriminator_without_dispatch(
     }
     assert "secret" not in response.text
     assert service.command_calls == []
+
+
+def _application_result_payload(
+    status: str = "ready_for_human_submit",
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "company": "Example Corp",
+        "role": "Engineer",
+        "job_url": "https://jobs.example/openings/42",
+        "final_url": "https://ats.example/application/42",
+        "fields_filled": [],
+        "fields_needing_human": [],
+        "files_attached": ["resume.pdf"],
+        "warnings": [],
+        "revision_count": 1,
+        "submit_attempted": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "action_type"),
+    [
+        (
+            {"type": "browser_use", "code": "print(page_info())"},
+            BrowserUseRuntimeAction,
+        ),
+        (
+            {
+                "type": "request_human_navigation",
+                "instruction": "Complete the hardware-key prompt.",
+            },
+            RequestHumanNavigationRuntimeAction,
+        ),
+        (
+            {
+                "type": "request_origin_approval",
+                "origin": "https://ats.example",
+            },
+            RequestOriginApprovalRuntimeAction,
+        ),
+        (
+            {
+                "type": "request_human_review",
+                "result": _application_result_payload(),
+            },
+            RequestHumanReviewRuntimeAction,
+        ),
+        (
+            {"type": "report_application_mismatch"},
+            ReportApplicationMismatchRuntimeAction,
+        ),
+        (
+            {
+                "type": "request_additional_info",
+                "questions": [
+                    {
+                        "id": "summer_availability",
+                        "key": "availability.summer_2027",
+                        "scope": "global",
+                        "question": "What dates are you available?",
+                        "answer_type": "text",
+                    },
+                    {
+                        "id": "referral_source",
+                        "key": "referral.source",
+                        "scope": "application",
+                        "question": "How did you hear about this position?",
+                        "answer_type": "single_select",
+                        "options": [
+                            {"id": "friend", "label": "A friend"},
+                            {"id": "board", "label": "Job board"},
+                        ],
+                    },
+                ],
+            },
+            RequestAdditionalInfoRuntimeAction,
+        ),
+    ],
+)
+async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    payload: dict[str, Any],
+    action_type: type[RuntimeActionRequest],
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/runtime/actions",
+        headers=AUTHORIZATION,
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"type": "continue"}
+    assert response.headers["cache-control"] == "no-store"
+    assert len(service.runtime_action_calls) == 1
+    dispatched_id, dispatched = service.runtime_action_calls[0]
+    assert dispatched_id == SESSION_ID
+    assert isinstance(dispatched, action_type)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "unknown"},
+        {"type": "browser_use", "code": "print('ok')", "token": "secret"},
+        {"type": "request_human_navigation", "instruction": " "},
+        {"type": "request_origin_approval", "origin": "https://ats.example/path"},
+        {"type": "request_human_review", "result": {"status": "cancelled"}},
+        {
+            "type": "request_additional_info",
+            "questions": [
+                {
+                    "id": "duplicate",
+                    "key": "first.key",
+                    "scope": "global",
+                    "question": "First?",
+                    "answer_type": "boolean",
+                },
+                {
+                    "id": "duplicate",
+                    "key": "second.key",
+                    "scope": "application",
+                    "question": "Second?",
+                    "answer_type": "boolean",
+                },
+            ],
+        },
+    ],
+)
+async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    payload: dict[str, Any],
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/runtime/actions",
+        headers=AUTHORIZATION,
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.runtime_action_calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "browser_use_result",
+            "exit_code": 0,
+            "timed_out": False,
+            "stdout": "ok",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "observation": {
+                "url": "https://jobs.example/openings/42",
+                "title": "Application",
+                "tabs": [
+                    {
+                        "url": "https://jobs.example/openings/42",
+                        "title": "Application",
+                        "tab_id": "target-1",
+                        "parent_tab_id": None,
+                    }
+                ],
+                "dom": "Application form",
+                "page_info": {"url": "https://jobs.example/openings/42"},
+                "screenshot": {
+                    "media_type": "image/png",
+                    "data": "cG5n",
+                },
+            },
+        },
+        {"type": "continue"},
+        {
+            "type": "approve",
+            "origin": "https://ats.example",
+            "approved_origins": [
+                "https://jobs.example",
+                "https://ats.example",
+            ],
+        },
+        {"type": "revise", "context": "Use the corrected date.", "revision_count": 1},
+        {"type": "ready", "result": _application_result_payload()},
+        {"type": "cancel", "result": _application_result_payload("cancelled")},
+        {"type": "application_mismatch"},
+        {
+            "type": "additional_info",
+            "answers": [
+                {
+                    "id": "summer_availability",
+                    "key": "availability.summer_2027",
+                    "scope": "global",
+                    "answer_type": "text",
+                    "status": "answered",
+                    "value": "June through August 2027",
+                },
+                {
+                    "id": "referral_source",
+                    "key": "referral.source",
+                    "scope": "application",
+                    "answer_type": "single_select",
+                    "status": "declined",
+                },
+            ],
+        },
+    ],
+)
+def test_runtime_action_response_union_is_strict_and_round_trips(
+    payload: dict[str, Any],
+) -> None:
+    parsed = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(payload)
+
+    assert parsed.model_dump(mode="json") == payload
+
+
+def test_runtime_action_unions_reject_unknown_properties() -> None:
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_ADAPTER.validate_python(
+            {"type": "report_application_mismatch", "unexpected": True}
+        )
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {"type": "continue", "unexpected": True}
+        )
 
 
 async def test_delete_is_204_and_idempotent_for_known_fake_session(
