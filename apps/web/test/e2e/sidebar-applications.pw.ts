@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { type ApplicationStatus, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
+import { type ApplicationStatus, type ArtifactKind, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
 
 function runFixture(id: string, applicationStatus: ApplicationStatus, status: RunStatus): RunDto {
   return {
@@ -108,8 +108,20 @@ function diffDocumentViewerFixture(id: string): RunDto {
     artifacts: [
       ...run.artifacts,
       {
+        id: "resume-page-image",
+        kind: "page-image",
+        revision: run.revision,
+        attempt: 1,
+        sha256: "d".repeat(64),
+        bytes: 1_024,
+        mediaType: "image/png",
+        href: `/v1/runs/${id}/artifacts/resume-page-image`,
+        public: true,
+        createdAt: 1_700_000_000_250,
+      },
+      {
         id: resumeDiffArtifactId,
-        kind: "resume-diff" as const,
+        kind: "resume-diff" as ArtifactKind,
         revision: run.revision,
         attempt: 1,
         sha256: "c".repeat(64),
@@ -123,28 +135,60 @@ function diffDocumentViewerFixture(id: string): RunDto {
   };
 }
 
-async function interceptDocumentRun(page: Page, run: RunDto): Promise<void> {
-  await page.route(`**/api/pipeline/runs/${run.id}`, async (route) => {
-    expect(route.request().method()).toBe("GET");
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
-  });
-  await page.route(`**/v1/runs/${run.id}/artifacts/*`, async (route) => {
-    await route.fulfill({ contentType: "application/pdf", body: "%PDF-1.4\n%%EOF" });
-  });
+function landscapePdfFixture(): Buffer {
+  const stream = "BT /F1 24 Tf 72 540 Td (Keyword map fixture) Tj ET";
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+  ];
+  let body = "%PDF-1.4\n";
+  const offsets: number[] = [];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(body));
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  body += offsets.map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(body);
 }
 
-async function interceptDiffDocumentRun(page: Page, run: RunDto): Promise<void> {
+const LANDSCAPE_PDF_FIXTURE = landscapePdfFixture();
+
+async function interceptDocumentRun(
+  page: Page,
+  run: RunDto,
+  jsonArtifacts: Readonly<Record<string, unknown>> = {},
+): Promise<void> {
   await page.route(`**/api/pipeline/runs/${run.id}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
   });
   await page.route(`**/api/pipeline/runs/${run.id}/artifacts/*`, async (route) => {
-    const artifactId = new URL(route.request().url()).pathname.split("/").at(-1);
-    if (artifactId === resumeDiffArtifactId) {
-      await route.fulfill({ contentType: "application/json", body: JSON.stringify(resumeDiff) });
+    const artifactId = new URL(route.request().url()).pathname.split("/").at(-1) ?? "";
+    if (artifactId === "resume-page-image") {
+      await route.fulfill({
+        contentType: "image/png",
+        body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+      });
       return;
     }
-    await route.fulfill({ contentType: "application/pdf", body: "%PDF-1.4\n%%EOF" });
+    if (Object.hasOwn(jsonArtifacts, artifactId)) {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(jsonArtifacts[artifactId]),
+      });
+      return;
+    }
+    await route.fulfill({
+      contentType: "application/pdf",
+      headers: { "content-disposition": 'inline; filename="keyword-map-pdf.pdf"' },
+      body: LANDSCAPE_PDF_FIXTURE,
+    });
   });
 }
 
@@ -520,8 +564,22 @@ test("switches between accessible resume and landscape keyword map tabs", async 
   await expect(keywordMapPanel).toBeHidden();
   await expect(viewer.getByText("Page 1 / 1", { exact: true })).toBeVisible();
   await expect(viewer.getByRole("button", { name: "Zoom in" })).toBeVisible();
-  await expect(viewer.getByRole("button", { name: "Fit page" })).toBeVisible();
   await expect(viewer.getByRole("link", { name: "Download current PDF" })).toBeVisible();
+
+  const [viewerBox, resumeTabBox, keywordMapTabBox, resumePanelBox] = await Promise.all([
+    viewer.boundingBox(),
+    resumeTab.boundingBox(),
+    keywordMapTab.boundingBox(),
+    resumePanel.boundingBox(),
+  ]);
+  if (!viewerBox || !resumeTabBox || !keywordMapTabBox || !resumePanelBox) {
+    throw new Error("Document tab-strip geometry is unavailable");
+  }
+  expect(Math.abs(resumeTabBox.x - viewerBox.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(resumeTabBox.y - viewerBox.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs((resumeTabBox.y + resumeTabBox.height) - resumePanelBox.y)).toBeLessThanOrEqual(1);
+  expect(resumeTabBox.height).toBe(51);
+  expect(Math.abs(keywordMapTabBox.x - (resumeTabBox.x + resumeTabBox.width))).toBeLessThanOrEqual(1);
 
   await resumeTab.focus();
   await resumeTab.press("ArrowRight");
@@ -535,30 +593,144 @@ test("switches between accessible resume and landscape keyword map tabs", async 
   await expect(keywordMapPanel).toHaveAttribute("role", "tabpanel");
   await expect(keywordMapPanel).toHaveAttribute("aria-labelledby", "keyword-map-document-tab");
   await expect(keywordMapPanel).toBeVisible();
-  await expect(viewer.getByText("Page 1 / 1", { exact: true })).toHaveCount(0);
-  await expect(viewer.getByRole("button", { name: "Zoom in" })).toHaveCount(0);
+  await expect(viewer.getByText("Page 1 / 1", { exact: true })).toBeVisible();
+  const keywordMapZoom = viewer.getByRole("spinbutton", { name: "Zoom percentage" });
+  await expect(keywordMapZoom).toHaveValue("100");
+  await expect(viewer.getByRole("button", { name: "Zoom in" })).toBeVisible();
+  await expect(viewer.getByRole("button", { name: "Enter fullscreen" })).toBeVisible();
 
   const keywordMapDownload = viewer.getByRole("link", { name: "Download keyword map PDF" });
   await expect(keywordMapDownload).toHaveAttribute("href", "/api/pipeline/runs/document-tabs/artifacts/keyword-map-pdf");
   await expect(keywordMapDownload).toHaveAttribute("download", "");
-  const keywordMapObject = keywordMapPanel.locator('object[aria-label^="Keyword map PDF"]');
-  await expect(keywordMapObject).toBeVisible();
-  const keywordMapBox = await keywordMapObject.boundingBox();
+  await expect(keywordMapPanel.locator("object")).toHaveCount(0);
+  const keywordMapPage = keywordMapPanel.getByRole("img", { name: "Keyword map page 1" });
+  await expect(keywordMapPage).toBeVisible();
+  const keywordMapBox = await keywordMapPage.boundingBox();
   if (!keywordMapBox) throw new Error("Keyword map viewer geometry is unavailable");
   expect(keywordMapBox.width).toBeGreaterThan(keywordMapBox.height);
 
+  await viewer.getByRole("button", { name: "Zoom in" }).click();
+  await expect(keywordMapZoom).toHaveValue("125");
   await keywordMapTab.press("Home");
   await expect(resumeTab).toBeFocused();
   await expect(resumePanel).toBeVisible();
-  await viewer.getByRole("button", { name: "Zoom in" }).click();
-  await expect(viewer.locator("output")).toHaveText("125%");
-  await viewer.getByRole("button", { name: "Fit page" }).click();
-  await expect(viewer.locator("output")).toHaveText("100%");
+});
+
+test("enters and exits fullscreen from the resume toolbar", async ({ page }) => {
+  const detailRun = documentViewerFixture("resume-fullscreen", false);
+  await interceptDocumentRun(page, detailRun);
+  await page.goto("/runs/resume-fullscreen");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  await viewer.getByRole("button", { name: "Enter fullscreen" }).click();
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement?.getAttribute("aria-label") ?? null)).toBe("Document viewer");
+
+  await viewer.getByRole("button", { name: "Exit fullscreen" }).click();
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement)).toBeNull();
+});
+
+test("uses the same compact download control in both document views", async ({ page }) => {
+  const detailRun = documentViewerFixture("matching-download-controls", true);
+  await interceptDocumentRun(page, detailRun);
+  await page.goto("/runs/matching-download-controls");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  const resumeDownload = viewer.getByRole("link", { name: "Download current PDF" });
+  const resumeDownloadBox = await resumeDownload.boundingBox();
+  if (!resumeDownloadBox) throw new Error("Resume download geometry is unavailable");
+
+  await viewer.getByRole("tab", { name: "Keyword map" }).click();
+  const keywordMapDownload = viewer.getByRole("link", { name: "Download keyword map PDF" });
+  await expect(keywordMapDownload).toHaveText("");
+  const keywordMapDownloadBox = await keywordMapDownload.boundingBox();
+  if (!keywordMapDownloadBox) throw new Error("Keyword map download geometry is unavailable");
+  expect(keywordMapDownloadBox.width).toBe(resumeDownloadBox.width);
+  expect(keywordMapDownloadBox.height).toBe(resumeDownloadBox.height);
+});
+
+test("zooms resume pages to 300% with horizontal scrolling", async ({ page }) => {
+  const detailRun = diffDocumentViewerFixture("resume-zoom");
+  await interceptDocumentRun(page, detailRun, { [resumeDiffArtifactId]: resumeDiff });
+  await page.setViewportSize({ width: 1_672, height: 941 });
+  await page.goto("/runs/resume-zoom");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  const resumePanel = viewer.getByRole("tabpanel", { name: "Resume" });
+  const zoomIn = viewer.getByRole("button", { name: "Zoom in" });
+  const zoomInput = viewer.getByRole("spinbutton", { name: "Zoom percentage" });
+
+  await zoomIn.click();
+  await expect(zoomInput).toHaveValue("125");
+  await zoomIn.click();
+  await expect(zoomInput).toHaveValue("150");
+  await expect(zoomIn).toBeEnabled();
+
+  for (const zoom of [175, 200, 225, 250, 275, 300]) {
+    await zoomIn.click();
+    await expect(zoomInput).toHaveValue(String(zoom));
+  }
+  await expect(zoomIn).toBeDisabled();
+  const resumeImage = resumePanel.getByRole("img", { name: /Rendered resume page/ });
+  const [panelBox, imageBox] = await Promise.all([
+    resumePanel.boundingBox(),
+    resumeImage.boundingBox(),
+  ]);
+  if (!panelBox || !imageBox) throw new Error("Zoomed resume geometry is unavailable");
+  expect(imageBox.x).toBeGreaterThanOrEqual(panelBox.x);
+
+  const overflow = await resumePanel.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }));
+  expect(overflow.scrollWidth).toBeGreaterThan(overflow.clientWidth);
+  await resumePanel.evaluate((element) => {
+    element.scrollLeft = element.scrollWidth;
+  });
+  await expect.poll(() => resumePanel.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+});
+
+test("accepts a typed resume zoom percentage", async ({ page }) => {
+  const detailRun = diffDocumentViewerFixture("typed-resume-zoom");
+  await interceptDocumentRun(page, detailRun, { [resumeDiffArtifactId]: resumeDiff });
+  await page.setViewportSize({ width: 1_672, height: 941 });
+  await page.goto("/runs/typed-resume-zoom");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  const resumeImage = viewer.getByRole("img", { name: /Rendered resume page/ });
+  const defaultImageBox = await resumeImage.boundingBox();
+  if (!defaultImageBox) throw new Error("Default resume geometry is unavailable");
+
+  const zoomInput = viewer.getByRole("spinbutton", { name: "Zoom percentage" });
+  await zoomInput.fill("237");
+  await zoomInput.press("Enter");
+  await expect(zoomInput).toHaveValue("237");
+  const typedImageBox = await resumeImage.boundingBox();
+  if (!typedImageBox) throw new Error("Typed zoom geometry is unavailable");
+  expect(typedImageBox.width / defaultImageBox.width).toBeCloseTo(2.37, 1);
+});
+
+test("fills the resume document viewport at the default zoom", async ({ page }) => {
+  const detailRun = diffDocumentViewerFixture("resume-default-fit");
+  await interceptDocumentRun(page, detailRun, { [resumeDiffArtifactId]: resumeDiff });
+  await page.setViewportSize({ width: 1_672, height: 941 });
+  await page.goto("/runs/resume-default-fit");
+
+  const viewer = page.getByRole("region", { name: "Document viewer" });
+  const resumePanel = viewer.getByRole("tabpanel", { name: "Resume" });
+  const resumeImage = resumePanel.getByRole("img", { name: /Rendered resume page/ });
+  await expect(viewer.getByRole("spinbutton", { name: "Zoom percentage" })).toHaveValue("100");
+  const [panelBox, imageBox] = await Promise.all([
+    resumePanel.boundingBox(),
+    resumeImage.boundingBox(),
+  ]);
+  if (!panelBox || !imageBox) throw new Error("Default resume geometry is unavailable");
+  expect(imageBox.width / panelBox.width).toBeGreaterThan(0.9);
+  expect(imageBox.width).toBeLessThanOrEqual(panelBox.width);
 });
 
 test("shows the canonical and current resumes in an accessible diff tab", async ({ page }) => {
   const detailRun = diffDocumentViewerFixture("resume-diff");
-  await interceptDiffDocumentRun(page, detailRun);
+  await interceptDocumentRun(page, detailRun, { [resumeDiffArtifactId]: resumeDiff });
   await page.goto("/runs/resume-diff");
 
   const viewer = page.getByRole("region", { name: "Document viewer" });

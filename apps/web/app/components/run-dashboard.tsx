@@ -13,6 +13,7 @@ const POLL_INTERVAL_MS = 3_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 const EMPTY_RUNS: RunDto[] = [];
 const ROW_INTERACTIVE_SELECTOR = "a, button, input, select, textarea, summary, [contenteditable='true']";
+const SELECTABLE_APPLICATION_STATUSES = APPLICATION_STATUSES.filter((status) => status !== "failed");
 
 
 const IS_TERMINAL_STATUS: Record<RunStatus, boolean> = {
@@ -27,19 +28,6 @@ const IS_TERMINAL_STATUS: Record<RunStatus, boolean> = {
   review: true,
   approved: true,
   failed: true,
-};
-const CAN_HAVE_JOB_METADATA: Record<RunStatus, boolean> = {
-  queued: false,
-  analyzing: false,
-  tailoring: false,
-  editing: false,
-  compiling: false,
-  repairing: false,
-  deterministic_qa: false,
-  visual_qa: false,
-  review: true,
-  approved: true,
-  failed: false,
 };
 const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   day: "numeric",
@@ -149,9 +137,7 @@ export function RunDashboard() {
   }, [hasActiveRuns, load]);
 
   useEffect(() => {
-    let current = true;
     const pending = runs.flatMap((run) => {
-      if (!CAN_HAVE_JOB_METADATA[run.status]) return [];
       const artifact = latestJobAnalysis(run);
       if (!artifact || requestedArtifacts.current.has(artifact.id)) return [];
       requestedArtifacts.current.add(artifact.id);
@@ -164,17 +150,13 @@ export function RunDashboard() {
       pending.map(async ({ artifact, runId }) => {
         try {
           const identity = parseJobIdentity(await readJsonArtifact(artifact));
-          if (!identity || !current) return;
+          if (!identity) return;
           setJobIdentities((existing) => ({ ...existing, [runId]: identity }));
         } catch {
-          // Job metadata is optional. The honest run label remains available.
+          // Job metadata is optional. The role remains empty without a valid identity.
         }
       }),
     );
-
-    return () => {
-      current = false;
-    };
   }, [runs, setJobIdentities]);
 
   const filteredRuns = useMemo(() => {
@@ -338,7 +320,7 @@ export function RunDashboard() {
                 <span>State</span>
                 <select aria-label="Filter applications by state" value={statusFilter} onChange={(event) => updateStatus(event.target.value as ApplicationStatus | "all")}>
                   <option value="all">All states</option>
-                  {APPLICATION_STATUSES.map((status) => <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>)}
+                  {SELECTABLE_APPLICATION_STATUSES.map((status) => <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>)}
                 </select>
               </label>
               <button
@@ -373,7 +355,7 @@ export function RunDashboard() {
               <table className="applications-table" aria-busy={isLoading}>
                 <thead>
                   <tr>
-                    <th scope="col">Target role</th>
+                    <th scope="col">Role</th>
                     <th scope="col">Organization</th>
                     <th scope="col">Updated</th>
                     <th scope="col">Status</th>
@@ -430,11 +412,11 @@ export function RunDashboard() {
                         }}
                       >
                         <td>
-                          <Link className="application-link" href={href} aria-label={`Open ${identity?.title ?? "tailoring run"} ${shortRunId(run.id)}`}>
-                            <span>{identity?.title ?? "Tailoring run"}</span>
+                          <Link className="application-link" href={href} aria-label={identity?.title ? `Open ${identity.title} ${shortRunId(run.id)}` : `Open application ${shortRunId(run.id)}`}>
+                            {identity?.title ? <span>{identity.title}</span> : <span className="table-placeholder-line" aria-hidden="true" />}
                           </Link>
                         </td>
-                        <td>{identity?.organization ? <span className="application-organization-name">{identity.organization}</span> : <span className="table-muted">Not available</span>}</td>
+                        <td>{identity?.organization ? <span className="application-organization-name">{identity.organization}</span> : <span className="table-placeholder-line table-placeholder-line--organization" role="img" aria-label="Unknown organization" />}</td>
                         <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
                         <td>
                           <select
@@ -446,7 +428,8 @@ export function RunDashboard() {
                               void changeApplicationStatus(run.id, event.target.value as ApplicationStatus);
                             }}
                           >
-                            {APPLICATION_STATUSES.map((status) => (
+                            {run.applicationStatus === "failed" ? <option value="failed" disabled>{APPLICATION_STATUS_LABELS.failed}</option> : null}
+                            {SELECTABLE_APPLICATION_STATUSES.map((status) => (
                               <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>
                             ))}
                           </select>

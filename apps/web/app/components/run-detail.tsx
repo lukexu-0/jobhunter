@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { Fragment, useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import type { PDFDocumentLoadingTask, RenderTask } from "pdfjs-dist";
 import {
   ResumeDiffSchema,
   type ArtifactDto,
@@ -97,12 +98,12 @@ interface OverlayRect {
   readonly height: number;
 }
 
-function Icon({ name }: { readonly name: "arrow-left" | "check" | "download" | "fit" | "minus" | "plus" | "refresh" }) {
+function Icon({ name }: { readonly name: "arrow-left" | "check" | "download" | "fullscreen" | "minus" | "plus" | "refresh" }) {
   const paths: Record<typeof name, ReactNode> = {
     "arrow-left": <path d="m15 18-6-6 6-6M9 12h10" />,
     check: <path d="m5 12 4 4L19 6" />,
     download: <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14" />,
-    fit: <path d="M8 3H3v5m13-5h5v5M8 21H3v-5m13 5h5v-5" />,
+    fullscreen: <path d="M8 3H3v5m13-5h5v5M8 21H3v-5m13 5h5v-5" />,
     minus: <path d="M5 12h14" />,
     plus: <path d="M12 5v14M5 12h14" />,
     refresh: <path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" />,
@@ -131,24 +132,12 @@ function stringValue(record: JsonRecord | null, key: string): string | undefined
 }
 
 
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    : [];
-}
-
-function humanize(value: string): string {
-  return value.replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (character) => character.toUpperCase());
-}
 
 
 function formatDate(timestamp: number): string {
   return DATE_TIME_FORMATTER.format(new Date(timestamp));
 }
 
-function shortHash(value: string | undefined): string {
-  return value ? `${value.slice(0, 10)}…${value.slice(-6)}` : "Not available";
-}
 
 
 function publicMessage(error: unknown, fallback: string): string {
@@ -184,7 +173,12 @@ function safeArtifactHref(artifact: ArtifactDto | undefined): string | null {
 function isDisplayedJsonArtifact(artifact: ArtifactDto): boolean {
   return artifact.public
     && artifact.mediaType.toLowerCase().startsWith("application/json")
-    && (artifact.kind === "job-analysis" || artifact.kind === "resume-diff" || artifact.kind === "visual-qa");
+    && (
+      artifact.kind === "job-analysis"
+      || artifact.kind === "ats-keyword-extraction"
+      || artifact.kind === "resume-diff"
+      || artifact.kind === "visual-qa"
+    );
 }
 
 function parseJobIdentity(value: unknown): JobIdentity | null {
@@ -221,29 +215,6 @@ function overlayRect(value: unknown): OverlayRect | null {
   return { top, left, width: right - left, height: bottom - top };
 }
 
-function IdentifierList({ value, ariaLabel, emptyLabel }: {
-  readonly value: unknown;
-  readonly ariaLabel: string;
-  readonly emptyLabel: string;
-}) {
-  const ids = stringArray(value);
-  if (ids.length === 0) return <span className={styles.absentInline}>{emptyLabel}</span>;
-  return (
-    <span className={styles.evidenceList} aria-label={ariaLabel}>
-      {ids.map((id) => <code key={id}>{id}</code>)}
-    </span>
-  );
-}
-
-function EvidenceIds({ value }: { readonly value: unknown }) {
-  return (
-    <IdentifierList
-      value={value}
-      ariaLabel="Evidence IDs"
-      emptyLabel="No evidence IDs reported"
-    />
-  );
-}
 
 function EmptyArtifact({ label }: { readonly label: string }) {
   return <p className={styles.absent}>No {label} artifact is available for this revision.</p>;
@@ -265,19 +236,37 @@ function ArtifactState({ artifact, error, loading, label, children }: {
 
 
 
-function AnalysisFacts({ rows }: {
-  readonly rows: ReadonlyArray<{ readonly label: string; readonly value: ReactNode }>;
-}) {
-  return (
-    <dl className={styles.compactFacts}>
-      {rows.map((row) => <div key={row.label}><dt>{row.label}</dt><dd>{row.value}</dd></div>)}
-    </dl>
-  );
+
+
+
+interface AnalysisContentProps {
+  readonly value: unknown;
+  readonly extraction?: unknown;
+  readonly extractionAvailable?: boolean;
 }
 
+interface KeywordPhrase {
+  readonly id: string;
+  readonly phrase: string;
+}
 
+function keywordPhrases(value: unknown): KeywordPhrase[] {
+  if (!Array.isArray(value)) return [];
+  const keywords: KeywordPhrase[] = [];
+  for (const candidate of value) {
+    const keyword = asRecord(candidate);
+    const id = stringValue(keyword, "id");
+    const phrase = stringValue(keyword, "phrase");
+    if (id && phrase) keywords.push({ id, phrase });
+  }
+  return keywords;
+}
 
-export function AnalysisContent({ value }: { readonly value: unknown }) {
+export function AnalysisContent({
+  value,
+  extraction,
+  extractionAvailable = false,
+}: AnalysisContentProps) {
   const analysis = asRecord(value);
   if (analysis?.schemaVersion !== 2) {
     return (
@@ -287,93 +276,50 @@ export function AnalysisContent({ value }: { readonly value: unknown }) {
     );
   }
 
-  const target = asRecord(analysis.target);
-  const keywords = recordArray(analysis.jdKeywords);
-  const exactEdits = recordArray(analysis.exactEdits);
+  const included = keywordPhrases(analysis.jdKeywords);
+  const includedIds = new Set(included.map((keyword) => keyword.id));
+  const extractionRecord = asRecord(extraction);
+  const hasExtraction = extractionAvailable
+    && extractionRecord?.schemaVersion === 1
+    && Array.isArray(extractionRecord.keywords);
+  const notIncluded = hasExtraction
+    ? keywordPhrases(extractionRecord.keywords).filter((keyword) => !includedIds.has(keyword.id))
+    : [];
 
   return (
-    <div className={styles.artifactSections}>
-      <AnalysisFacts rows={[
-        { label: "Schema version", value: <code>2</code> },
-        { label: "Analysis ID", value: <code>{stringValue(analysis, "id") ?? "Not reported"}</code> },
-        { label: "Target title", value: stringValue(target, "title") ?? "Not reported" },
-        { label: "Organization", value: stringValue(target, "organization") ?? "Not reported" },
-        { label: "Job description SHA-256", value: <code>{stringValue(analysis, "jobDescriptionSha256") ?? "Not reported"}</code> },
-        { label: "Analysis workflow SHA-256", value: <code>{stringValue(analysis, "analysisWorkflowSha256") ?? "Not reported"}</code> },
-        { label: "Baseline SHA-256", value: <code>{stringValue(analysis, "baselineSha256") ?? "Not reported"}</code> },
-      ]} />
-
-      <section>
-        <h4>JD keywords</h4>
-        {keywords.length ? (
-          <ul className={styles.findingList}>
-            {keywords.map((item, index) => {
-              const id = stringValue(item, "id") ?? `Keyword ${index + 1}`;
-              const phrase = stringValue(item, "phrase") ?? `Keyword ${index + 1}`;
-              return (
-                <li key={`${id}-${index}`}>
-                  <div className={styles.findingHeading}>
-                    <strong>{phrase}</strong>
-                    <span>{id}</span>
-                  </div>
-                  <blockquote>{stringValue(item, "jdQuote") ?? "Exact JD quote not reported"}</blockquote>
-                  <AnalysisFacts rows={[
-                    { label: "Evidence IDs", value: <EvidenceIds value={item.evidenceIds} /> },
-                  ]} />
-                </li>
-              );
-            })}
-          </ul>
-        ) : <p className={styles.absent}>No evidence-backed JD keywords were identified.</p>}
-      </section>
-
-      <section>
-        <h4>Exact resume edits</h4>
-        {exactEdits.length ? (
-          <ul className={styles.findingList}>
-            {exactEdits.map((item, index) => {
-              const id = stringValue(item, "id") ?? `Edit ${index + 1}`;
-              const kind = stringValue(item, "kind");
-              const skillEdit = kind === "skill";
-              const ownerLabel = skillEdit ? "Category" : "Entity";
-              const owner = stringValue(item, skillEdit ? "category" : "entityId") ?? "Not reported";
-              return (
-                <li key={`${id}-${index}`}>
-                  <div className={styles.findingHeading}>
-                    <strong>{id}</strong>
-                    <span>{kind ? humanize(kind) : "Kind not reported"}</span>
-                  </div>
-                  <AnalysisFacts rows={[
-                    { label: ownerLabel, value: owner },
-                    { label: "Baseline item ID", value: <code>{stringValue(item, "baselineItemId") ?? "Not reported"}</code> },
-                    { label: "Before", value: stringValue(item, "before") ?? "Not reported" },
-                    { label: "After", value: stringValue(item, "after") ?? "Not reported" },
-                    {
-                      label: "Keyword IDs",
-                      value: (
-                        <IdentifierList
-                          value={item.keywordIds}
-                          ariaLabel="Linked keyword IDs"
-                          emptyLabel="No linked keyword IDs reported"
-                        />
-                      ),
-                    },
-                    { label: "Evidence IDs", value: <EvidenceIds value={item.evidenceIds} /> },
-                  ]} />
-                </li>
-              );
-            })}
+    <div className={styles.keywordComparison}>
+      <section
+        aria-labelledby="keywords-included-heading"
+        className={styles.keywordBox}
+      >
+        <h2 id="keywords-included-heading">Keywords included</h2>
+        {included.length > 0 ? (
+          <ul className={styles.keywordPhraseList}>
+            {included.map((keyword) => <li key={keyword.id}>{keyword.phrase}</li>)}
           </ul>
         ) : (
-          <p className={styles.absent}>
-            No exact resume edits were requested; all baseline items are retained.
-          </p>
+          <p className={styles.keywordEmpty}>No keywords are included.</p>
+        )}
+      </section>
+
+      <section
+        aria-labelledby="keywords-not-included-heading"
+        className={styles.keywordBox}
+      >
+        <h2 id="keywords-not-included-heading">Keywords not included</h2>
+        {!hasExtraction ? (
+          <p className={styles.keywordEmpty}>Keyword extraction is unavailable.</p>
+        ) : notIncluded.length > 0 ? (
+          <ul className={styles.keywordPhraseList}>
+            {notIncluded.map((keyword) => <li key={keyword.id}>{keyword.phrase}</li>)}
+          </ul>
+        ) : (
+          <p className={styles.keywordEmpty}>All extracted keywords are included.</p>
         )}
       </section>
     </div>
   );
 }
-
 
 export function ResumeDiffContent({ diff }: { readonly diff: ResumeDiff }) {
   return (
@@ -424,6 +370,7 @@ export function ResumeDiffContent({ diff }: { readonly diff: ResumeDiff }) {
   );
 }
 
+
 function WorkflowProgress({ run }: { readonly run: RunDto }) {
   const activeIndex = activeWorkflowIndex(run);
   return (
@@ -442,6 +389,91 @@ function WorkflowProgress({ run }: { readonly run: RunDto }) {
   );
 }
 
+interface KeywordMapPagesProps {
+  readonly href: string;
+  readonly onPageCount: (count: number | null) => void;
+  readonly title: string;
+  readonly zoom: number;
+}
+
+function KeywordMapPages({ href, onPageCount, title, zoom }: KeywordMapPagesProps) {
+  const pageContainerRef = useRef<HTMLDivElement>(null);
+  const [renderState, setRenderState] = useState<"loading" | "ready" | "error">("loading");
+
+  useEffect(() => {
+    const pageContainer = pageContainerRef.current;
+    if (!pageContainer) return;
+
+    let active = true;
+    let loadingTask: PDFDocumentLoadingTask | undefined;
+    const renderTasks: RenderTask[] = [];
+    pageContainer.replaceChildren();
+    onPageCount(null);
+    setRenderState("loading");
+
+    void (async () => {
+      // PDF.js reads browser DOM globals at module load, so it must load after this client component mounts.
+      const pdfjs = await import("pdfjs-dist");
+      pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+        "pdfjs-dist/build/pdf.worker.min.mjs",
+        import.meta.url,
+      ).toString();
+      if (!active) return;
+
+      loadingTask = pdfjs.getDocument({ url: href });
+      const document = await loadingTask.promise;
+      if (!active) return;
+      onPageCount(document.numPages);
+
+      for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+        const page = await document.getPage(pageNumber);
+        if (!active) return;
+        const viewport = page.getViewport({ scale: 1.5 });
+        const canvas = window.document.createElement("canvas");
+        canvas.className = styles.keywordMapPage;
+        canvas.height = Math.ceil(viewport.height);
+        canvas.width = Math.ceil(viewport.width);
+        canvas.setAttribute("aria-label", `Keyword map page ${pageNumber} for ${title}`);
+        canvas.setAttribute("role", "img");
+        pageContainer.append(canvas);
+
+        const renderTask = page.render({ canvas, viewport });
+        renderTasks.push(renderTask);
+        await renderTask.promise;
+        page.cleanup();
+      }
+
+      if (active) setRenderState("ready");
+    })().catch(() => {
+      if (!active) return;
+      pageContainer.replaceChildren();
+      onPageCount(null);
+      setRenderState("error");
+    });
+
+    return () => {
+      active = false;
+      for (const renderTask of renderTasks) renderTask.cancel();
+      pageContainer.replaceChildren();
+      if (loadingTask) void loadingTask.destroy().catch(() => undefined);
+    };
+  }, [href, onPageCount, title]);
+
+  return (
+    <>
+      {renderState === "loading" ? <p className={styles.absent} role="status">Loading keyword map…</p> : null}
+      {renderState === "error" ? <p className={styles.panelError} role="alert">The keyword map preview could not be displayed. Use the download control to open the PDF.</p> : null}
+      <div
+        aria-label="Keyword map pages"
+        className={styles.keywordMapPages}
+        hidden={renderState !== "ready"}
+        ref={pageContainerRef}
+        style={{ justifySelf: zoom > 100 ? "start" : "center", width: `${zoom}%` }}
+      />
+    </>
+  );
+}
+
 
 export function RunDetail({ runId }: RunDetailProps) {
   const [run, setRun] = useState<RunDto | null>(null);
@@ -452,6 +484,9 @@ export function RunDetail({ runId }: RunDetailProps) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<BusyAction | null>(null);
   const [zoom, setZoom] = useState(100);
+  const [zoomInput, setZoomInput] = useState("100");
+  const [keywordMapPageCount, setKeywordMapPageCount] = useState<number | null>(null);
+  const [isViewerFullscreen, setIsViewerFullscreen] = useState(false);
   const [documentView, setDocumentView] = useState<DocumentView>("resume");
   const [artifactData, setArtifactData] = useState<Record<string, unknown>>({});
   const [artifactErrors, setArtifactErrors] = useState<Record<string, string>>({});
@@ -460,6 +495,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   const resumeTabRef = useRef<HTMLButtonElement>(null);
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
+  const viewerPaneRef = useRef<HTMLElement>(null);
 
   const loadRun = useCallback(async (initial = false) => {
     const request = ++requestVersion.current;
@@ -571,6 +607,15 @@ export function RunDetail({ runId }: RunDetailProps) {
   const analysisArtifact = artifactFor("job-analysis");
   const analysis = dataFor("job-analysis");
   const identity = parseJobIdentity(analysis);
+  const extractionArtifact = analysisArtifact && run
+    ? selectCurrentRevisionArtifact(
+      run.artifacts,
+      analysisArtifact.revision,
+      "ats-keyword-extraction",
+    )
+    : undefined;
+  const extraction = extractionArtifact ? artifactData[extractionArtifact.id] : undefined;
+  const extractionError = extractionArtifact ? artifactErrors[extractionArtifact.id] : undefined;
   const pdfArtifact = currentPdfArtifact(run);
   const pageImageArtifact = currentPageImage(run);
   const pdfHref = safeArtifactHref(pdfArtifact);
@@ -591,7 +636,45 @@ export function RunDetail({ runId }: RunDetailProps) {
   useEffect(() => {
     setDocumentView("resume");
     setZoom(100);
+    setZoomInput("100");
+    setKeywordMapPageCount(null);
   }, [documentSignature]);
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsViewerFullscreen(document.fullscreenElement === viewerPaneRef.current);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
+  const toggleViewerFullscreen = async () => {
+    const viewerPane = viewerPaneRef.current;
+    if (!viewerPane) return;
+    try {
+      if (document.fullscreenElement === viewerPane) {
+        await document.exitFullscreen();
+      } else {
+        await viewerPane.requestFullscreen();
+      }
+    } catch {
+      setIsViewerFullscreen(false);
+    }
+  };
+  const applyZoom = (nextZoom: number) => {
+    const normalizedZoom = Math.min(300, Math.max(75, Math.round(nextZoom)));
+    setZoom(normalizedZoom);
+    setZoomInput(String(normalizedZoom));
+  };
+  const handleZoomInputChange = (value: string) => {
+    setZoomInput(value);
+    const nextZoom = Number(value);
+    if (value.trim() !== "" && Number.isFinite(nextZoom) && nextZoom >= 75 && nextZoom <= 300) {
+      setZoom(Math.round(nextZoom));
+    }
+  };
+  const commitZoomInput = () => {
+    const nextZoom = Number(zoomInput);
+    applyZoom(zoomInput.trim() !== "" && Number.isFinite(nextZoom) ? nextZoom : zoom);
+  };
   const visualValue = dataFor("visual-qa");
   const visualFindings = recordArray(asRecord(visualValue)?.findings);
   const overlays = visualFindings.map((finding, index) => ({ finding, index, rect: overlayRect(finding.bbox) })).filter((item): item is { finding: JsonRecord; index: number; rect: OverlayRect } => item.rect !== null);
@@ -686,7 +769,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   }
 
   const title = identity?.title ?? "Application";
-  const subtitle = identity?.organization ?? `Revision ${run.revision} · ${humanize(run.origin)}`;
+  const subtitle = identity?.organization ?? "Organization unavailable";
 
   return (
     <main className={styles.detailShell} aria-busy={isRefreshing || busyAction !== null || isLoadingArtifacts}>
@@ -696,35 +779,34 @@ export function RunDetail({ runId }: RunDetailProps) {
       </header>
 
       <div className={styles.paneGrid}>
-        <aside className={`${styles.pane} ${styles.leftPane}`} aria-label="Run metadata and history">
+        <aside className={`${styles.pane} ${styles.leftPane}`} aria-label="Application summary and keyword comparison">
           <section className={styles.paneSection}>
-            <p className={styles.eyebrow}>Application details</p>
+            <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>
+              {APPLICATION_STATUS_LABELS[run.applicationStatus]}
+            </p>
             <h1 className={styles.runTitle}>{title}</h1>
             <p className={styles.runSubtitle}>{subtitle}</p>
             <dl className={styles.metadataGrid}>
-              <div><dt>Application status</dt><dd>{APPLICATION_STATUS_LABELS[run.applicationStatus]}</dd></div>
-              <div><dt>Pipeline status</dt><dd>{STATUS_LABELS[run.status]}</dd></div>
-              <div><dt>Revision</dt><dd>{run.revision}</dd></div>
-              <div><dt>Revision origin</dt><dd>{humanize(run.origin)}</dd></div>
               <div><dt>Created</dt><dd>{formatDate(run.createdAt)}</dd></div>
               <div><dt>Last updated</dt><dd>{formatDate(run.updatedAt)}</dd></div>
-              <div><dt>Current PDF</dt><dd><code>{shortHash(run.currentPdfSha256)}</code></dd></div>
-              <div><dt>Visual acknowledgement</dt><dd>{run.visualAcknowledgementRequired ? "Required" : "Not required"}</dd></div>
             </dl>
           </section>
-
-
-
-
-          <section className={styles.paneSection} aria-labelledby="analysis-heading">
-            <div className={styles.sectionHeading}><h2 id="analysis-heading">Job analysis</h2>{analysisArtifact ? <span>Revision {analysisArtifact.revision}</span> : null}</div>
+          <section className={styles.paneSection} aria-label="Keyword comparison">
             <ArtifactState artifact={analysisArtifact} error={errorFor("job-analysis")} loading={isLoadingArtifacts} label="job analysis">
-              <AnalysisContent value={analysis} />
+              <AnalysisContent
+                value={analysis}
+                extraction={extraction}
+                extractionAvailable={Boolean(extractionArtifact && !extractionError)}
+              />
             </ArtifactState>
           </section>
         </aside>
 
-        <section className={`${styles.pane} ${styles.viewerPane}`} aria-label="Document viewer">
+        <section
+          aria-label="Document viewer"
+          className={`${styles.pane} ${styles.viewerPane}`}
+          ref={viewerPaneRef}
+        >
           <header className={styles.viewerToolbar}>
             <div className={styles.viewerTabs} role="tablist" aria-label="Document views" aria-orientation="horizontal">
               <button
@@ -777,18 +859,61 @@ export function RunDetail({ runId }: RunDetailProps) {
             {selectedDocumentView === "resume" ? (
               <div className={styles.viewerControls} aria-label="Resume view controls">
                 <span>Page 1 / 1</span>
-                <button type="button" aria-label="Zoom out" disabled={actionsDisabled || zoom <= 75} onClick={() => setZoom((value) => Math.max(75, value - 25))}><Icon name="minus" /></button>
-                <output aria-live="polite">{zoom}%</output>
-                <button type="button" aria-label="Zoom in" disabled={actionsDisabled || zoom >= 150} onClick={() => setZoom((value) => Math.min(150, value + 25))}><Icon name="plus" /></button>
-                <button type="button" aria-label="Fit page" disabled={actionsDisabled} onClick={() => setZoom(100)}><Icon name="fit" /></button>
+                <button type="button" aria-label="Zoom out" disabled={actionsDisabled || zoom <= 75} onClick={() => applyZoom(zoom - 25)}><Icon name="minus" /></button>
+                <label className={styles.zoomControl}>
+                  <input
+                    aria-label="Zoom percentage"
+                    disabled={actionsDisabled}
+                    inputMode="numeric"
+                    max={300}
+                    min={75}
+                    onBlur={commitZoomInput}
+                    onChange={(event) => handleZoomInputChange(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter") return;
+                      commitZoomInput();
+                      event.currentTarget.blur();
+                    }}
+                    step={1}
+                    type="number"
+                    value={zoomInput}
+                  />
+                  <span aria-hidden="true">%</span>
+                </label>
+                <button type="button" aria-label="Zoom in" disabled={actionsDisabled || zoom >= 300} onClick={() => applyZoom(zoom + 25)}><Icon name="plus" /></button>
+                <button type="button" aria-label={isViewerFullscreen ? "Exit fullscreen" : "Enter fullscreen"} disabled={actionsDisabled} onClick={() => void toggleViewerFullscreen()}><Icon name="fullscreen" /></button>
                 {pdfHref && !actionsDisabled ? <a href={pdfHref} aria-label="Download current PDF" download><Icon name="download" /></a> : null}
               </div>
             ) : selectedDocumentView === "keyword-map" ? (
               <div className={styles.viewerControls} aria-label="Keyword map controls">
+                <span>{keywordMapPageCount === null ? "Loading…" : keywordMapPageCount === 1 ? "Page 1 / 1" : `${keywordMapPageCount} pages`}</span>
+                <button type="button" aria-label="Zoom out" disabled={actionsDisabled || zoom <= 75} onClick={() => applyZoom(zoom - 25)}><Icon name="minus" /></button>
+                <label className={styles.zoomControl}>
+                  <input
+                    aria-label="Zoom percentage"
+                    disabled={actionsDisabled}
+                    inputMode="numeric"
+                    max={300}
+                    min={75}
+                    onBlur={commitZoomInput}
+                    onChange={(event) => handleZoomInputChange(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter") return;
+                      commitZoomInput();
+                      event.currentTarget.blur();
+                    }}
+                    step={1}
+                    type="number"
+                    value={zoomInput}
+                  />
+                  <span aria-hidden="true">%</span>
+                </label>
+                <button type="button" aria-label="Zoom in" disabled={actionsDisabled || zoom >= 300} onClick={() => applyZoom(zoom + 25)}><Icon name="plus" /></button>
+                <button type="button" aria-label={isViewerFullscreen ? "Exit fullscreen" : "Enter fullscreen"} disabled={actionsDisabled} onClick={() => void toggleViewerFullscreen()}><Icon name="fullscreen" /></button>
                 {!actionsDisabled ? (
-                  <a className={styles.viewerDownload} href={keywordMapHref!} aria-label="Download keyword map PDF" download><Icon name="download" /><span>Download keyword map</span></a>
+                  <a href={keywordMapHref!} aria-label="Download keyword map PDF" download><Icon name="download" /></a>
                 ) : (
-                  <button className={styles.viewerDownload} type="button" disabled><Icon name="download" /><span>Download keyword map</span></button>
+                  <button type="button" aria-label="Download keyword map PDF" disabled><Icon name="download" /></button>
                 )}
               </div>
             ) : null}
@@ -802,7 +927,7 @@ export function RunDetail({ runId }: RunDetailProps) {
             tabIndex={0}
           >
             {pageImageHref ? (
-              <div className={styles.pageFrame} style={{ width: `${zoom * 0.64}%` }}>
+              <div className={styles.pageFrame} style={{ justifySelf: zoom > 100 ? "start" : "center", width: `${zoom}%` }}>
                 <img src={pageImageHref} alt={`Rendered resume page for ${title}`} />
                 {overlays.map(({ finding, index, rect }) => (
                   <span
@@ -837,9 +962,14 @@ export function RunDetail({ runId }: RunDetailProps) {
               role="tabpanel"
               tabIndex={0}
             >
-              <object className={`${styles.pdfObject} ${styles.keywordMapObject}`} data={keywordMapHref} type="application/pdf" aria-label={`Keyword map PDF for ${title}`}>
-                <p>The browser could not display this PDF. <a href={keywordMapHref} download>Download the keyword map</a>.</p>
-              </object>
+              {selectedDocumentView === "keyword-map" ? (
+                <KeywordMapPages
+                  href={keywordMapHref}
+                  onPageCount={setKeywordMapPageCount}
+                  title={title}
+                  zoom={zoom}
+                />
+              ) : null}
             </div>
           ) : null}
           {resumeDiff ? (

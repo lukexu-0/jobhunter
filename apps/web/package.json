@@ -14,6 +14,7 @@
     "@jobhunter/pipeline": "workspace:*",
     "lucide-react": "1.25.0",
     "next": "16.2.3",
+    "pdfjs-dist": "6.1.200",
     "react": "19.2.5",
     "react-dom": "19.2.5",
     "zod": "4.4.3"
