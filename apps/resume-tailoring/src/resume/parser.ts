@@ -101,7 +101,9 @@ function parseEntities(region: ResumeRegion): BaselineEntity[] {
     const chunk = region.body.slice(heading.end, next);
     const itemCalls = parseMacroCalls(chunk, "resumeItem", 1);
     const headingArgs = heading.args;
-    const entityId = section === "projects" ? plain(headingArgs[0] ?? "").split(/\s*\$\|\$\s*/)[0]!.trim() : plain(headingArgs[2] ?? "");
+    const entityId = section === "projects"
+      ? plain((headingArgs[0] ?? "").split(/\s*(?:\\enspace\s*)?(?:\$\|\$|\\textbar(?![A-Za-z@]))(?:\s*\\enspace)?\s*/)[0]!).trim()
+      : plain(headingArgs[2] ?? "");
     if (!entityId) throw new Error(`empty entity in ${section}`);
     const entityStableId = stableId("entity", section, entityId, headingArgs.join("\u0000"));
     const bullets = itemCalls.map((item, itemIndex) => {

@@ -364,7 +364,7 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
     instructions: TAILORING_INSTRUCTIONS,
     model: MODEL_NAME,
     modelSettings: {
-      reasoning: { effort: "medium" },
+      reasoning: { effort: "high" },
       parallelToolCalls: false,
       store: false,
       retry: { maxRetries: 0 },

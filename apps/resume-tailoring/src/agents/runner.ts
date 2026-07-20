@@ -1,6 +1,7 @@
 import { Runner, setTracingDisabled, type Agent, type ModelProvider } from "@openai/agents-core";
 import { OAuthCodexModelProvider } from "../models/oauth-codex-provider.ts";
 
+export const ATS_KEYWORD_EXTRACTION_DEADLINE_MS = 120_000;
 export const ANALYSIS_DEADLINE_MS = 10 * 60 * 1_000;
 export const REPAIR_DEADLINE_MS = 10 * 60 * 1_000;
 export const TAILORING_DEADLINE_MS = 15 * 60 * 1_000;

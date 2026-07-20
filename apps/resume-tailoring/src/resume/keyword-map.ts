@@ -22,6 +22,7 @@ const TEXT_BOTTOM = 24;
 const BBOX_OUTPUT_LIMIT = 4 * 1024 * 1024;
 const BBOX_TIMEOUT_MS = 30_000;
 const RED = rgb(0.85, 0.05, 0.05);
+const YELLOW = rgb(1, 0.85, 0);
 const LIGHT_GRAY = rgb(0.82, 0.82, 0.82);
 const ASCII_REPLACEMENTS: Readonly<Record<string, string>> = Object.freeze({
   "\u00a0": " ",
@@ -86,6 +87,11 @@ interface BoxRange {
 interface KeywordMatch {
   readonly resume: BoxRange;
   readonly job: BoxRange;
+}
+
+interface KeywordHighlights {
+  readonly matches: readonly KeywordMatch[];
+  readonly unmatchedJobBoxes: readonly BoxRange[];
 }
 
 interface ResumeLayout {
@@ -343,8 +349,9 @@ function keywordMatches(
   analysis: JobAnalysis,
   resumeBoxes: readonly WordBox[],
   jobBoxes: readonly WordBox[],
-): readonly KeywordMatch[] {
+): KeywordHighlights {
   const matches: KeywordMatch[] = [];
+  const unmatchedJobBoxes: BoxRange[] = [];
   for (const keyword of atsKeywordExtraction.keywords) {
     const evidenceBackedKeyword = analysis.jdKeywords.find((candidate) =>
       candidate.id === keyword.id
@@ -364,8 +371,9 @@ function keywordMatches(
       .map((candidate) => findPhrase(resumeBoxes, candidate))
       .find(Boolean);
     if (resume) matches.push({ resume, job });
+    else unmatchedJobBoxes.push(job);
   }
-  return matches;
+  return { matches, unmatchedJobBoxes };
 }
 
 function drawBox(page: PDFPage, box: BoxRange): void {
@@ -379,8 +387,22 @@ function drawBox(page: PDFPage, box: BoxRange): void {
   });
 }
 
-function drawPageMatches(page: PDFPage, matches: readonly KeywordMatch[], pageIndex: number): void {
-  for (const match of matches) {
+function drawUnmatchedJobBox(page: PDFPage, box: BoxRange): void {
+  page.drawRectangle({
+    x: box.x - 1.5,
+    y: box.y - 1.5,
+    width: box.width + 3,
+    height: box.height + 3,
+    color: YELLOW,
+    opacity: 0.28,
+  });
+}
+
+function drawPageMatches(page: PDFPage, highlights: KeywordHighlights, pageIndex: number): void {
+  for (const job of highlights.unmatchedJobBoxes) {
+    if (job.page === pageIndex) drawUnmatchedJobBox(page, job);
+  }
+  for (const match of highlights.matches) {
     if (match.job.page !== pageIndex) continue;
     drawBox(page, match.resume);
     drawBox(page, match.job);
@@ -521,13 +543,13 @@ export async function renderKeywordMapPdf(request: KeywordMapRequest): Promise<A
     pages.push(page);
   }
 
-  const matches = keywordMatches(
+  const highlights = keywordMatches(
     request.atsKeywordExtraction,
     request.analysis,
     resumeBoxes,
     jobBoxes,
   );
-  for (const [pageIndex, page] of pages.entries()) drawPageMatches(page, matches, pageIndex);
+  for (const [pageIndex, page] of pages.entries()) drawPageMatches(page, highlights, pageIndex);
   request.signal?.throwIfAborted();
   const bytes = await output.save({ useObjectStreams: false, addDefaultPage: false });
   request.signal?.throwIfAborted();

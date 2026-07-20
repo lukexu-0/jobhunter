@@ -149,7 +149,7 @@ describe("keyword map renderer", () => {
     expect(operators).toMatch(/\bm\b[\s\S]*\bl\b/);
   });
 
-  test("highlights supported and retained extracted phrases without marking an absent term", async () => {
+  test("red-boxes matched extracted phrases and yellow-highlights only the absent JD phrase", async () => {
     const resume = await compiledResume();
     const atsKeywordExtraction = atsKeywordExtractionFixture();
     const analysis = jobAnalysisFixture({
@@ -182,6 +182,7 @@ describe("keyword map renderer", () => {
       }
     }
     expect(operators.match(/0\.85 0\.05 0\.05 RG/g)).toHaveLength(6);
+    expect(operators.match(/1 0\.85 0 rg/g)).toHaveLength(1);
   });
 
   test("highlights complete keywords within punctuation-delimited PDF word boxes", async () => {

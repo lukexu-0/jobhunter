@@ -590,7 +590,13 @@ export class PipelineRepository {
     const seen = new Set<number>();
     while (!seen.has(current)) {
       seen.add(current);
-      const row = this.#db.query<ArtifactRow, [string, number, string]>("SELECT * FROM artifacts WHERE run_id=? AND revision=? AND kind=? ORDER BY created_at DESC LIMIT 1").get(runId, current, kind);
+      const row = this.#db.query<ArtifactRow, [string, number, string]>(`
+        SELECT *
+        FROM artifacts
+        WHERE run_id=? AND revision=? AND kind=?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+      `).get(runId, current, kind);
       if (row) {
         if (current === firstRevision?.revision || retryCutoff === null) return this.#publicArtifact(row);
         const artifactRank = artifactStageRank(row.stage);

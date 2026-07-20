@@ -12,6 +12,17 @@ export interface TerminalSubmission<T> {
   readonly requireExactlyOne: () => T;
 }
 
+class TerminalSubmissionValidationError extends Error {
+  readonly validationCause: unknown;
+
+  constructor(validationCause: unknown) {
+    super("terminal submission validation failed");
+    this.name = "TerminalSubmissionValidationError";
+    this.validationCause = validationCause;
+  }
+}
+
+
 export function createTerminalSubmission<S extends z.ZodObject>(options: {
   name: string;
   description: string;
@@ -21,18 +32,28 @@ export function createTerminalSubmission<S extends z.ZodObject>(options: {
   maxBytes?: number;
   assertActive?: () => void;
   validate?: (value: z.output<S>) => void;
+  formatValidationError?: (error: unknown) => string;
 }): TerminalSubmission<z.output<S>> {
   let calls = 0;
   let submittedValue: z.output<S> | undefined;
   const shared = options.sharedSubmitted ?? { value: false };
   const maxBytes = options.maxBytes ?? MAX_SUBMISSION_BYTES;
   const parameters: z.ZodObject = options.schema;
+  const formatValidationError = options.formatValidationError;
+  const validate = options.validate;
   const submitTool = tool({
     name: options.name,
     description: options.description,
     parameters,
     strict: true,
-    errorFunction: null,
+    errorFunction: formatValidationError === undefined
+      ? null
+      : (_context, error): string => {
+        const sdkInputValidationError = error && typeof error === "object" && "name" in error
+          && error.name === "InvalidToolInputError";
+        if (!(error instanceof TerminalSubmissionValidationError) && !sdkInputValidationError) throw error;
+        return formatValidationError(error);
+      },
     timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
     timeoutBehavior: "raise_exception",
     execute: (input: unknown): z.output<S> => {
@@ -41,8 +62,22 @@ export function createTerminalSubmission<S extends z.ZodObject>(options: {
       // Zod's generic parse result is widened through the SDK-compatible object constraint.
       const parsed = options.schema.parse(input) as unknown as z.output<S>;
       const serialized = JSON.stringify(parsed);
-      if (Buffer.byteLength(serialized) > maxBytes) throw new Error(`${options.name} submission exceeds ${maxBytes} bytes`);
-      options.validate?.(parsed);
+      if (Buffer.byteLength(serialized) > maxBytes) {
+        const sizeError = new Error(`${options.name} submission exceeds ${maxBytes} bytes`);
+        if (formatValidationError === undefined) throw sizeError;
+        throw new TerminalSubmissionValidationError(sizeError);
+      }
+      if (validate) {
+        if (formatValidationError === undefined) {
+          validate(parsed);
+        } else {
+          try {
+            validate(parsed);
+          } catch (error) {
+            throw new TerminalSubmissionValidationError(error);
+          }
+        }
+      }
       calls++;
       shared.value = true;
       submittedValue = parsed;

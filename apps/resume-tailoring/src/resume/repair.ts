@@ -12,7 +12,7 @@ const SHELL_PATTERN = /(?:--shell-escape|enable-write18|\\(?:pdf)?shellescape\b)
 const ALLOWED_BODY_COMMANDS: Record<string, true> = {
   resumeSubHeadingListStart: true, resumeSubHeadingListEnd: true, resumeSubheading: true, resumeProjectHeading: true,
   resumeItemListStart: true, resumeItemListEnd: true, resumeItem: true, begin: true, end: true, small: true, item: true,
-  textbf: true, emph: true, textbackslash: true, textasciitilde: true, textasciicircum: true, "\\": true,
+  textbf: true, emph: true, enspace: true, textbar: true, textbackslash: true, textasciitilde: true, textasciicircum: true, "\\": true,
 };
 
 export interface RepairValidation {

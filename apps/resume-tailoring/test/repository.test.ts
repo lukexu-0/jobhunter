@@ -164,6 +164,49 @@ describe("persisted workflow commands", () => {
     expect(serialized.toLowerCase()).not.toContain("claim_token");
   });
 
+  test("selects tied artifact timestamps by append-only insertion order", () => {
+    const { db, repo, now } = fixture({ now: 1_234 });
+    const run = repo.createRun("JD");
+    const claim = repo.acquire()!;
+    repo.transition(claim, "analyzing");
+
+    const firstAttempt = repo.startAttempt(claim, "analyzing");
+    const first = repo.finalizeArtifact(claim, {
+      attemptId: firstAttempt.id,
+      stage: "analyzing",
+      kind: "analysis",
+      sha256: "a".repeat(64),
+      path: "/tmp/first-analysis",
+      byteSize: 1,
+    });
+    repo.finishAttempt(claim, firstAttempt.id, "succeeded");
+
+    db.query(`
+      INSERT INTO artifacts(id, run_id, revision, attempt_id, stage, kind, sha256, path, byte_size, created_at)
+      VALUES (?, ?, 1, ?, 'analyzing', 'analysis', ?, ?, 1, ?)
+    `).run("eventless-artifact", run.id, "legacy-attempt", "b".repeat(64), "/tmp/eventless-analysis", now());
+    expect(repo.getArtifact(run.id, "analysis")?.id).toBe("eventless-artifact");
+
+    const secondAttempt = repo.startAttempt(claim, "analyzing");
+    const second = repo.finalizeArtifact(claim, {
+      attemptId: secondAttempt.id,
+      stage: "analyzing",
+      kind: "analysis",
+      sha256: "c".repeat(64),
+      path: "/tmp/second-analysis",
+      byteSize: 1,
+    });
+    repo.finishAttempt(claim, secondAttempt.id, "succeeded");
+
+    expect(secondAttempt.id).not.toBe(firstAttempt.id);
+    expect([first.createdAt, second.createdAt]).toEqual([now(), now()]);
+    expect(repo.getArtifact(run.id, "analysis")).toMatchObject({
+      id: second.id,
+      attemptId: secondAttempt.id,
+      sha256: "c".repeat(64),
+    });
+  });
+
   test("database enforces append-only events and immutable unique artifacts", () => {
     const { db, repo } = fixture();
     const run = repo.createRun("JD");
