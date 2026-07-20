@@ -186,7 +186,7 @@ describe("guarded agents", () => {
       "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills.",
     );
     expect(ANALYSIS_INSTRUCTIONS).toBe(
-      "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills. Use only the supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use evidence-backed keywords and edit bullets for truthful JD alignment. Use conventional terminology, do not use unconventional terms such as \"Agentic workflow systems\". Make every project's first bullet a description. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Copy supplied hashes and call submit_job_analysis once.",
+      "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills. Use only the supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use evidence-backed keywords and edit bullets for truthful JD alignment. Always preserve impact when performing edits. Avoid jargon and make the resume understandable by both a recruiter and technical staff member. Use conventional terminology, do not use unconventional terms such as \"Agentic workflow systems\". Make every project's first bullet a description. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Copy supplied hashes and call submit_job_analysis once.",
     );
     expect(ATS_KEYWORD_EXTRACTION_TASK).toBe(
       "Act as an ATS system and extract all relevant keywords from the supplied job description.",
@@ -212,7 +212,7 @@ describe("guarded agents", () => {
       createHash("sha256").update(`${TAILORING_TASK}\n${TAILORING_INSTRUCTIONS}`).digest("hex"),
     );
     expect(`${ANALYSIS_TASK} ${ANALYSIS_INSTRUCTIONS}`.trim().split(/\s+/).length)
-      .toBeLessThanOrEqual(100);
+      .toBeLessThanOrEqual(120);
     expect(`${TAILORING_TASK} ${TAILORING_INSTRUCTIONS}`.trim().split(/\s+/).length)
       .toBeLessThanOrEqual(50);
     expect(`${ATS_KEYWORD_EXTRACTION_TASK} ${ATS_KEYWORD_EXTRACTION_INSTRUCTIONS}`.trim().split(/\s+/).length)
