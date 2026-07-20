@@ -25,6 +25,7 @@ import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
+const KEYWORD_MAP_RENDER_SCALE = 3;
 const TERMINAL_STATUSES: Partial<Record<RunStatus, true>> = { review: true, approved: true, failed: true };
 const REVIEW_STATUSES: Partial<Record<RunStatus, true>> = { review: true, approved: true };
 
@@ -424,7 +425,7 @@ function KeywordMapPages({ href, onPageCount, title, zoom }: KeywordMapPagesProp
       for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
         const page = await document.getPage(pageNumber);
         if (!active) return;
-        const viewport = page.getViewport({ scale: 1.5 });
+        const viewport = page.getViewport({ scale: KEYWORD_MAP_RENDER_SCALE });
         const canvas = window.document.createElement("canvas");
         canvas.className = styles.keywordMapPage;
         canvas.height = Math.ceil(viewport.height);
@@ -936,9 +937,15 @@ export function RunDetail({ runId }: RunDetailProps) {
               </object>
             ) : (
               <div className={styles.viewerEmpty}>
-                <p className={styles.eyebrow}>Document unavailable</p>
-                <h3>{REVIEW_STATUSES[run.status] ? "No current preview is available" : STATUS_LABELS[run.status]}</h3>
-                <p>{REVIEW_STATUSES[run.status] ? "The pipeline did not publish a current page image or PDF artifact." : "A public document will appear only after compilation and quality review complete."}</p>
+                {run.status === "analyzing" ? (
+                  <p>Waiting on analysis</p>
+                ) : (
+                  <>
+                    <p className={styles.eyebrow}>Document unavailable</p>
+                    <h3>{REVIEW_STATUSES[run.status] ? "No current preview is available" : STATUS_LABELS[run.status]}</h3>
+                    <p>{REVIEW_STATUSES[run.status] ? "The pipeline did not publish a current page image or PDF artifact." : "A public document will appear only after compilation and quality review complete."}</p>
+                  </>
+                )}
                 {run.status === "failed" ? <button className={styles.primaryButton} type="button" disabled={actionsDisabled} onClick={() => void submitRetry()}><Icon name="refresh" />{busyAction === "retry" ? "Retrying…" : "Retry failed run"}</button> : null}
                 {actionError ? <p className={styles.panelError} role="alert">{actionError}</p> : null}
               </div>

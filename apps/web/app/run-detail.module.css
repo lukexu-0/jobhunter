@@ -179,7 +179,7 @@
 .paneGrid {
   display: grid;
   min-height: 0;
-  grid-template-columns: minmax(0, 26.5fr) minmax(0, 47fr) minmax(0, 26.5fr);
+  grid-template-columns: minmax(0, 19.875fr) minmax(0, 53.625fr) minmax(0, 26.5fr);
 }
 
 .pane {
@@ -469,16 +469,22 @@
 
 .zoomControl {
   display: inline-flex;
-  width: var(--space-12);
+  width: calc(var(--space-12) + var(--space-1));
   height: var(--space-8);
   align-items: center;
-  gap: var(--space-1);
-  padding-inline: var(--space-1);
+  justify-content: center;
+  gap: 0;
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding-inline: var(--space-2);
+  background: var(--color-border-strong);
+  color: var(--color-text);
 }
 
 .zoomControl input {
-  width: 100%;
+  width: 3ch;
   min-width: 0;
+  flex: 0 0 3ch;
   appearance: textfield;
   border: 0;
   padding: 0;

@@ -543,6 +543,14 @@ test("leaves the reserved review pane empty", async ({ page }) => {
   await expect(reviewPane).toBeEmpty();
   await expect(page.getByRole("button", { name: "Retry failed run" })).toHaveCount(1);
 });
+
+test("shows only waiting copy while analysis is active", async ({ page }) => {
+  const detailRun = runFixture("analysis-wait", "pending", "analyzing");
+  await interceptDocumentRun(page, detailRun);
+  await page.goto("/runs/analysis-wait");
+
+  await expect(page.locator("#resume-document-panel")).toHaveText("Waiting on analysis");
+});
 test("switches between accessible resume and landscape keyword map tabs", async ({ page }) => {
   const detailRun = documentViewerFixture("document-tabs", true);
   await interceptDocumentRun(page, detailRun);
@@ -615,6 +623,11 @@ test("switches between accessible resume and landscape keyword map tabs", async 
   const keywordMapBox = await keywordMapPage.boundingBox();
   if (!keywordMapBox) throw new Error("Keyword map viewer geometry is unavailable");
   expect(keywordMapBox.width).toBeGreaterThan(keywordMapBox.height);
+  const keywordMapPixels = await keywordMapPage.evaluate((element) => {
+    const canvas = element as HTMLCanvasElement;
+    return { width: canvas.width, height: canvas.height };
+  });
+  expect(keywordMapPixels).toEqual({ width: 2_376, height: 1_836 });
 
   await viewer.getByRole("button", { name: "Zoom in" }).click();
   await expect(keywordMapZoom).toHaveValue("125");
