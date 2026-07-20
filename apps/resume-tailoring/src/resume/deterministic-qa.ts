@@ -259,7 +259,7 @@ function boxesAreBounded(text: TextOutput, info: PdfInfo): boolean {
   const height = Math.min(text.pageHeight, info.mediaHeight, info.cropHeight);
   if (!approximately(text.pageWidth, info.cropWidth) || !approximately(text.pageHeight, info.cropHeight)) return false;
   return text.words.every(({ xMin, yMin, xMax, yMax }) =>
-    xMin >= 0 && yMin >= 0 && xMax >= xMin && yMax >= yMin && xMax <= width + POINT_TOLERANCE && yMax <= height + POINT_TOLERANCE);
+    xMin >= 0 && yMin >= 0 && xMax > xMin && yMax > yMin && xMax <= width + POINT_TOLERANCE && yMax <= height + POINT_TOLERANCE);
 }
 
 function boundedWarnings(log: string | Uint8Array | undefined): readonly string[] {

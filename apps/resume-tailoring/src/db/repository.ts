@@ -705,7 +705,7 @@ export class PipelineRepository {
       const pdf = this.getArtifact(run.id, "compiled-pdf", run.current_revision);
       if (!pdf || pdf.sha256 !== expectedPdfSha256) throw new RepositoryConflictError("review PDF hash is stale");
       if (run.visual_ack_required === 1 && !visualAcknowledged) throw new RepositoryConflictError("visual acknowledgement is required");
-      this.#db.query("UPDATE runs SET status='approved',approved_pdf_sha256=?,updated_at=? WHERE id=?").run(expectedPdfSha256, now, run.id);
+      this.#db.query("UPDATE runs SET status='approved',approved_pdf_sha256=?,visual_ack_required=0,updated_at=? WHERE id=?").run(expectedPdfSha256, now, run.id);
       this.#db.query("UPDATE revisions SET status='approved' WHERE run_id=? AND revision=?").run(run.id, run.current_revision);
       this.#event(run.id, run.current_revision, "run.approved", { pdfSha256: expectedPdfSha256, visualAcknowledged }, now);
       return publicRun(this.#run(run.id));

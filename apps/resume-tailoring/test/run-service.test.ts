@@ -503,6 +503,35 @@ describe("RunApplicationService", () => {
     });
   });
 
+  test("maps a retry event to the compiling status that starts the new revision", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    const claim = target.repository.acquire()!;
+    transition(target.repository, claim, ["analyzing", "tailoring", "compiling"]);
+    target.repository.transition(claim, "failed", { failedStage: "compiling" });
+    target.repository.release(claim);
+
+    const retried = await target.service.retryRun(run.id);
+    const finalTimelineEntry = retried.timeline.at(-1);
+
+    expect(finalTimelineEntry?.type).toBe("run.retried");
+    expect(finalTimelineEntry?.revision).toBe(2);
+    expect(finalTimelineEntry?.status).toBe("compiling");
+  });
+
+  test("maps an edit-request event to the editing status that starts the new revision", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    const pdf = await finalizeReviewPdf(target, run.id);
+
+    const edited = await target.service.editRun(run.id, "Shorten the opening paragraph.", pdf.sha256);
+    const finalTimelineEntry = edited.timeline.at(-1);
+
+    expect(finalTimelineEntry?.type).toBe("run.edit_requested");
+    expect(finalTimelineEntry?.revision).toBe(2);
+    expect(finalTimelineEntry?.status).toBe("editing");
+  });
+
   test("maps attempts, retry ancestry and inherited artifacts without exposing internal tokens, paths or logs", async () => {
     const target = fixture();
     const run = await target.service.createRun(JOB_URL);

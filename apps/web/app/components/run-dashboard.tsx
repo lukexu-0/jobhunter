@@ -160,6 +160,7 @@ export function RunDashboard() {
           if (!identity) return;
           setJobIdentities((existing) => ({ ...existing, [runId]: identity }));
         } catch {
+          requestedArtifacts.current.delete(artifact.id);
           // Job metadata is optional. The role remains empty without a valid identity.
         }
       }),
@@ -211,6 +212,7 @@ export function RunDashboard() {
     setStatusUpdateError(null);
     try {
       const updated = await updateApplicationStatus(runId, applicationStatus);
+      latestListRequest.current += 1;
       setRuns((current) => current?.map((run) => run.id === updated.id ? updated : run) ?? current);
       setStatusUpdateError(null);
     } catch {

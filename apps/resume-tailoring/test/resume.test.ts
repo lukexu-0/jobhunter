@@ -205,6 +205,67 @@ describe("strict resume contracts", () => {
     expect(again.bullets.map((item) => item.id)).toEqual(parsedBaseline.bullets.map((item) => item.id));
   });
 
+  test("ignores long comments between canonical entity headings and items without shifting parser offsets", () => {
+    const uncommented = String.raw`\begin{document}
+\section{Experience}
+\resumeSubheading
+  {Senior Engineer}
+  {Jan 2024 -- Present}
+  {Acme Systems}
+  {Remote}
+\resumeItem{Raised service availability to 99.9\% across critical workflows.}
+\resumeSubheading
+  {Software Engineer}
+  {Jan 2022 -- Dec 2023}
+  {Beta Labs}
+  {New York, NY}
+\resumeItem{Reduced deployment time by 40\% through automated releases.}
+\section{Projects}
+\section{Competitions \& Other}
+\section{Technical Skills}
+\end{document}`;
+    const commented = String.raw`\begin{document}
+\section{Experience}
+\resumeSubheading
+  {Senior Engineer}
+  {Jan 2024 -- Present}
+  {Acme Systems}
+  {Remote}
+% This intentionally long canonical-source comment sits between a heading and its item and must not move parser boundaries, reassign bullets, alter public entity data, or change stable IDs merely because ignored TeX text occupies many source characters.
+\resumeItem{Raised service availability to 99.9\% across critical workflows.}
+\resumeSubheading
+  {Software Engineer}
+  {Jan 2022 -- Dec 2023}
+  {Beta Labs}
+  {New York, NY}
+\resumeItem{Reduced deployment time by 40\% through automated releases.}
+\section{Projects}
+\section{Competitions \& Other}
+\section{Technical Skills}
+\end{document}`;
+
+    const expected = parseBaselineResume(uncommented);
+    const actual = parseBaselineResume(commented);
+
+    expect(expected.entities.map((entity) => ({
+      entityId: entity.entityId,
+      bullets: entity.bullets.map((bullet) => bullet.text),
+    }))).toEqual([
+      {
+        entityId: "Acme Systems",
+        bullets: ["Raised service availability to 99.9% across critical workflows."],
+      },
+      {
+        entityId: "Beta Labs",
+        bullets: ["Reduced deployment time by 40% through automated releases."],
+      },
+    ]);
+    expect(actual.entities).toEqual(expected.entities);
+    expect(actual.bullets.map((bullet) => ({ id: bullet.id, text: bullet.text }))).toEqual(
+      expected.bullets.map((bullet) => ({ id: bullet.id, text: bullet.text })),
+    );
+  });
+
   test("builds a complete canonical-to-current diff with aligned changes", () => {
     const { plan } = fixtures();
     const retained = plan.decisions.find((decision) => decision.section === "experience" && decision.action === "retain");

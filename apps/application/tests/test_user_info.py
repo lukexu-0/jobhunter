@@ -332,6 +332,21 @@ def test_startup_rejects_store_beneath_symlinked_parent(tmp_path: Path) -> None:
     assert not (actual_parent / "private" / "user-info.json").exists()
 
 
+def test_startup_rejects_store_beneath_world_writable_immediate_parent(
+    tmp_path: Path,
+) -> None:
+    unsafe_parent = tmp_path / "unsafe-parent"
+    unsafe_parent.mkdir()
+    unsafe_parent.chmod(0o777)
+    path = unsafe_parent / "user-info.json"
+
+    with pytest.raises(BrowserConfigurationError) as raised:
+        UserInfoStore(path)
+
+    assert str(raised.value) == "The user information store is invalid or unavailable"
+    assert not path.exists()
+
+
 def _compact_size(value: object) -> int:
     return len(
         json.dumps(

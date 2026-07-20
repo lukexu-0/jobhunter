@@ -171,6 +171,38 @@ describe("deterministic PDF QA", () => {
     expect(report.checks.find(({ id }) => id === "word-bounds")?.status).toBe("fail");
   });
 
+  test("QA-BOUNDS-001 rejects zero-area word boxes", async () => {
+    const { root, pdf } = await fixture();
+    const zeroAreaWords = [
+      `<?xml version="1.0" encoding="UTF-8"?>
+<doc><page width="612.000000" height="792.000000">
+<word xMin="72.000000" yMin="72.000000" xMax="72.000000" yMax="84.000000">Experience</word>
+<word xMin="72.000000" yMin="96.000000" xMax="220.000000" yMax="108.000000">Built reliable pipelines</word>
+<word xMin="72.000000" yMin="132.000000" xMax="125.000000" yMax="144.000000">Education</word>
+</page></doc>`,
+      `<?xml version="1.0" encoding="UTF-8"?>
+<doc><page width="612.000000" height="792.000000">
+<word xMin="72.000000" yMin="72.000000" xMax="130.000000" yMax="72.000000">Experience</word>
+<word xMin="72.000000" yMin="96.000000" xMax="220.000000" yMax="108.000000">Built reliable pipelines</word>
+<word xMin="72.000000" yMin="132.000000" xMax="125.000000" yMax="144.000000">Education</word>
+</page></doc>`,
+    ] as const;
+
+    for (const bbox of zeroAreaWords) {
+      const report = await runDeterministicPdfQa({
+        pdfPath: pdf,
+        cwd: root,
+        requiredHeadings: ["Experience", "Education"],
+        boundary: fakeBoundary([{ stdout: [PDFINFO] }, { stdout: [bbox] }, { stdout: [FONTS] }]),
+      });
+
+      expect(report.pass).toBe(false);
+      expect(report.checks.find(({ id }) => id === "text-output")?.status).toBe("pass");
+      expect(report.checks.find(({ id }) => id === "required-headings")?.status).toBe("pass");
+      expect(report.checks.find(({ id }) => id === "word-bounds")?.status).toBe("fail");
+    }
+  });
+
   test("rejects unembedded and Type 3 fonts while preserving parsed font status", async () => {
     const { root, pdf } = await fixture();
     for (const fonts of [

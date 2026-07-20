@@ -566,6 +566,38 @@ describe("HttpApplicationRuntimeClient", () => {
     expect(String(networkFailure)).not.toContain(TOKEN);
   });
 
+  test("maps a harness session timeout to the application model-timeout error", async () => {
+    let fetchCalls = 0;
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => {
+        fetchCalls += 1;
+        return jsonResponse(
+          { code: "session_timeout", message: "private harness timeout detail" },
+          { status: 504 },
+        );
+      },
+    );
+
+    let failure: unknown;
+    try {
+      await client.action(
+        { type: "report_application_mismatch" },
+        new AbortController().signal,
+        1_000,
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(ApplicationRuntimeError);
+    expect((failure as ApplicationRuntimeError).code).toBe("model_timeout");
+    expect((failure as Error).message).toBe("The model request timed out");
+    expect(fetchCalls).toBe(1);
+  });
+
   test("accepts only loopback HTTP origins, valid UUIDs, and sufficiently long bearers", async () => {
     const requestedUrls: string[] = [];
     for (const runtimeUrl of [
@@ -609,6 +641,37 @@ describe("HttpApplicationRuntimeClient", () => {
         () => new HttpApplicationRuntimeClient(...arguments_),
       ).toThrow(new ApplicationRuntimeError("model_failed"));
     }
+  });
+
+  test("rejects an out-of-range loopback IPv4 origin before fetching", async () => {
+    let fetchCalls = 0;
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async () => {
+        fetchCalls += 1;
+        return jsonResponse({ type: "continue" });
+      },
+    );
+
+    let failure: unknown;
+    try {
+      await client.action(
+        {
+          type: "request_origin_approval",
+          origin: "http://127.999.1.1",
+        },
+        new AbortController().signal,
+        1_000,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(ApplicationRuntimeError);
+    expect((failure as ApplicationRuntimeError).code).toBe("model_failed");
+    expect((failure as Error).message).toBe("The model request failed");
+    expect(fetchCalls).toBe(0);
   });
 
   test("rejects invalid timeout values before fetching", async () => {

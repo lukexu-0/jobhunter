@@ -295,6 +295,7 @@ export function mapPiAssistantMessage(message: AssistantMessage): ModelResponse 
     });
   }
   for (const part of message.content) {
+    if (part.type === "redactedThinking") continue;
     if (part.type === "thinking") {
       output.push({ type: "reasoning", ...(part.thinkingSignature ? { id: part.thinkingSignature } : {}), content: [{ type: "input_text", text: part.thinking }], rawContent: [{ type: "reasoning_text", text: part.thinking }] });
     } else if (part.type === "toolCall") {

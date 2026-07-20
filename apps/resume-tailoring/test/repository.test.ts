@@ -303,6 +303,7 @@ describe("persisted workflow commands", () => {
     const approved = repo.approve(runId, hash, true);
     expect(approved.status).toBe("approved");
     expect(approved.approvedPdfSha256).toBe(hash);
+    expect(approved.visualAcknowledgementRequired).toBe(false);
   });
 });
 

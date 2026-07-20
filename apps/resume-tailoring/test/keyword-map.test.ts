@@ -271,6 +271,55 @@ describe("keyword map renderer", () => {
     expect(operators.match(/0\.85 0\.05 0\.05 RG/g)).toHaveLength(3);
   });
 
+  test("KEYWORD-LINE-001 keeps a phrase split across separate resume bullets unmatched", async () => {
+    const jobDescription = "TypeScript services experience required.";
+    const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const atsKeywordExtraction = {
+      ...baseExtraction,
+      keywords: [{
+        id: "keyword-typescript-services",
+        phrase: "TypeScript services",
+        jdQuote: jobDescription,
+      }],
+    };
+    const analysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
+    const resume = await compiledResume("- TypeScript\n\n\n\n\n\n\n\n- services");
+    const bboxXml = [
+      '<doc><page width="612" height="792">',
+      '<word xMin="54" yMin="91" xMax="58" yMax="102">-</word>',
+      '<word xMin="62" yMin="91" xMax="118" yMax="102">TypeScript</word>',
+      '<word xMin="54" yMin="211" xMax="58" yMax="222">-</word>',
+      '<word xMin="62" yMin="211" xMax="104" yMax="222">services</word>',
+      "</page></doc>",
+    ].join("");
+
+    const rendered = await renderKeywordMapPdf({
+      ...resume,
+      jobDescription,
+      atsKeywordExtraction,
+      analysis,
+      processBoundary: boundary(bboxXml),
+    });
+    const document = await PDFDocument.load(
+      await resume.artifacts.read(rendered.path, ARTIFACT_LIMITS.pdf),
+    );
+    let operators = "";
+    for (const [, object] of document.context.enumerateIndirectObjects()) {
+      if (!(object instanceof PDFRawStream)) continue;
+      try {
+        operators += Buffer.from(decodePDFRawStream(object).decode()).toString("latin1");
+      } catch {
+        // Font and image streams are not content streams and need not be text-decodable.
+      }
+    }
+
+    expect(operators.match(/1 0\.85 0 rg/g)).toHaveLength(1);
+    expect(operators).not.toContain("0.85 0.05 0.05 RG");
+  });
+
   test("honors cancellation and surfaces pdftotext failures and malformed bbox output", async () => {
     const resume = await compiledResume();
     const analysis = jobAnalysisFixture();

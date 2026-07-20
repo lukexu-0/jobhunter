@@ -629,6 +629,10 @@ def _prepare_private_directory(path: Path, *, create: bool) -> None:
             previous_descriptor = descriptor
             descriptor = next_descriptor
             os.close(previous_descriptor)
+        if os.fstat(descriptor).st_mode & stat.S_IWOTH:
+            raise ValueError(
+                "user information store parent must not be world-writable"
+            )
     finally:
         os.close(descriptor)
 

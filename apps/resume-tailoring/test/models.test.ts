@@ -167,6 +167,37 @@ describe("OAuth Codex Agents model bridge", () => {
     expect(response.usage.outputTokensDetails).toEqual([{ reasoning_tokens: 2 }]);
   });
 
+  test("MODEL-MAP-001 safely ignores redacted thinking while preserving public output", async () => {
+    const message = assistantMessage([
+      { type: "redactedThinking", data: "opaque-private-reasoning-payload" },
+      { type: "text", text: "Public answer" },
+      { type: "toolCall", id: "call-redacted", name: "submit", arguments: { answer: "safe" } },
+    ]);
+
+    const response = await new OAuthCodexModel("attempt-redacted-thinking", {
+      transport: completedTransport(message),
+      resolverFactory: inertResolver,
+    }).getResponse(modelRequest());
+
+    expect(response.output).toEqual([
+      {
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        id: "response-1",
+        content: [{ type: "output_text", text: "Public answer" }],
+      },
+      {
+        type: "function_call",
+        callId: "call-redacted",
+        name: "submit",
+        arguments: "{\"answer\":\"safe\"}",
+        status: "completed",
+      },
+    ]);
+    expect(JSON.stringify(response.output)).not.toContain("opaque-private-reasoning-payload");
+  });
+
   test("round-trips signed assistant text into the next model request", async () => {
     const signedResponse = await new OAuthCodexModel("attempt-signed-response", {
       resolverFactory: inertResolver,

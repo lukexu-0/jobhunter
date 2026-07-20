@@ -31,10 +31,23 @@ function stableId(kind: string, ...parts: string[]): string {
 }
 
 function stripComments(value: string): string {
-  return value.split("\n").map((line) => {
-    for (let index = 0; index < line.length; index++) if (line[index] === "%" && line[index - 1] !== "\\") return line.slice(0, index);
-    return line;
-  }).join("\n");
+  let segments: string[] | undefined;
+  let copyStart = 0;
+  for (let index = 0; index < value.length; index++) {
+    if (value[index] !== "%") continue;
+    let precedingBackslashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor--) precedingBackslashes++;
+    if (precedingBackslashes % 2 === 1) continue;
+    let commentEnd = index + 1;
+    while (commentEnd < value.length && value[commentEnd] !== "\n" && value[commentEnd] !== "\r") commentEnd++;
+    segments ??= [];
+    segments.push(value.slice(copyStart, index), " ".repeat(commentEnd - index));
+    copyStart = commentEnd;
+    index = commentEnd - 1;
+  }
+  if (!segments) return value;
+  segments.push(value.slice(copyStart));
+  return segments.join("");
 }
 
 export function readBracedArgument(source: string, start: number): { value: string; end: number } {

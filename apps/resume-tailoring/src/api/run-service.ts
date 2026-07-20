@@ -66,6 +66,20 @@ const STAGE_TO_PUBLIC: Readonly<Record<ActiveStage, AttemptStage>> = Object.free
   visual_qa: "visual-qa",
 });
 
+function isRunStatus(value: unknown): value is RunStatus {
+  return value === "queued"
+    || value === "analyzing"
+    || value === "tailoring"
+    || value === "editing"
+    || value === "compiling"
+    || value === "repairing"
+    || value === "deterministic_qa"
+    || value === "visual_qa"
+    || value === "review"
+    || value === "approved"
+    || value === "failed";
+}
+
 export interface RunContextSnapshotService {
   createSnapshot(): ContextSnapshot | Promise<ContextSnapshot>;
 }
@@ -149,9 +163,12 @@ function timeline(events: readonly PublicEvent[], fallback: RunStatus): Timeline
   return events.map((event) => {
     const detail = safeDetail(event.payload);
     const candidate = detail?.to ?? detail?.status;
-    if (typeof candidate === "string" && ["queued", "analyzing", "tailoring", "editing", "compiling", "repairing", "deterministic_qa", "visual_qa", "review", "approved", "failed"].includes(candidate)) {
-      status = candidate as RunStatus;
-    } else if (event.kind === "run.approved") status = "approved";
+    if (isRunStatus(candidate)) {
+      status = candidate;
+    } else if (event.kind === "run.retried" && isRunStatus(detail?.failedStage)) {
+      status = detail.failedStage;
+    } else if (event.kind === "run.edit_requested") status = "editing";
+    else if (event.kind === "run.approved") status = "approved";
     return {
       id: event.sequence,
       type: event.kind,

@@ -24,6 +24,7 @@ import {
 } from "./application-history.ts";
 import {
   AgentDeadlineError,
+  assertBoundedTranscript,
   boundedJson,
   createAttemptRunner,
   runWithDeadline,
@@ -249,6 +250,11 @@ const ApplicationMismatchToolParameters = z.object({}).strict();
 function applicationTranscriptAssertion(result: unknown): void {
   if (!result || typeof result !== "object" || !("history" in result) || !Array.isArray(result.history)) {
     throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
+  }
+  try {
+    assertBoundedTranscript(result);
+  } catch {
+    throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
   }
   try {
     projectApplicationHistory(result.history as AgentInputItem[]);

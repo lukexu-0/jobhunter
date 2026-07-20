@@ -135,6 +135,39 @@ describe("application agent", () => {
     expect(() => ApplicationRunResultSchema.parse({ ...VALID_RESULT, extra: true })).toThrow();
   });
 
+  test("AGENT-TRANSCRIPT-001 rejects an oversized non-history transcript field", async () => {
+    const transcriptByteCap = 2 * 1024 * 1024;
+    const dependencies = dependenciesWith(
+      async (request) => {
+        expect(request).toEqual({ type: "request_human_review", result: VALID_RESULT });
+        return { type: "ready", result: VALID_RESULT };
+      },
+      async (agent, _input, options) => {
+        const runContext = new RunContext(options.context);
+        expect(await functionTool(agent, "request_human_review").invoke(
+          runContext,
+          JSON.stringify({ result: VALID_RESULT }),
+        )).toBe(JSON.stringify({ type: "ready", result: VALID_RESULT }));
+        expect(await functionTool(agent, "submit_application_result").invoke(
+          runContext,
+          JSON.stringify(VALID_RESULT),
+        )).toEqual(VALID_RESULT);
+        return {
+          history: [],
+          rawResponses: [],
+          newItems: [],
+          finalOutput: "x".repeat(transcriptByteCap + 1),
+        };
+      },
+    );
+
+    await expect(runApplicationAgent(
+      RUN_INPUT,
+      new AbortController().signal,
+      dependencies,
+    )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+  });
+
   test("enables structured additional information only after a completed browser action", async () => {
     const acceptedAnswers = [
       {

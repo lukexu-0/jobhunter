@@ -191,6 +191,7 @@ export class PipelineStageProcessor {
         const processStartToken = readProcessStartToken();
         if (processStartToken === undefined) throw new Error("worker process identity is unavailable");
         attempt = this.#repository.startAttempt(claim, stage, {
+          ...(stage === "repairing" ? { origin: "repair_loop" as const } : {}),
           processPid: process.pid,
           processStartToken,
         });

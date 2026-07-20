@@ -506,7 +506,7 @@ export function RunDetail({ runId }: RunDetailProps) {
       setIsFresh(true);
     } catch (error) {
       if (request !== requestVersion.current) return;
-      setRun(null);
+      if (initial) setRun(null);
       setLoadError(publicMessage(error, "This run could not be loaded. Try again."));
     } finally {
       if (request === requestVersion.current) {
@@ -767,6 +767,7 @@ export function RunDetail({ runId }: RunDetailProps) {
         <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to applications</Link>
         <WorkflowProgress run={run} />
       </header>
+      {loadError ? <p className={styles.panelError} role="alert">{loadError}</p> : null}
 
       <div className={styles.paneGrid}>
         <aside className={`${styles.pane} ${styles.leftPane}`} aria-label="Application summary and keyword comparison">
@@ -931,7 +932,7 @@ export function RunDetail({ runId }: RunDetailProps) {
               </div>
             ) : pdfHref ? (
               <object className={styles.pdfObject} data={pdfHref} type="application/pdf" aria-label={`Current resume PDF for ${title}`}>
-                <p>The browser could not display this PDF. <a href={pdfHref}>Download the current resume</a>.</p>
+                <p>The browser could not display this PDF. <a href={pdfHref} download>Download the current resume</a>.</p>
               </object>
             ) : (
               <div className={styles.viewerEmpty}>

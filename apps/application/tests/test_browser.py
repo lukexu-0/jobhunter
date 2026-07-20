@@ -140,6 +140,30 @@ def test_resolve_native_launch_rejects_symlinked_profile(
         )
 
 
+def test_resolve_native_launch_rejects_profile_beneath_symlinked_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = _make_executable(tmp_path / "chrome")
+    actual_parent = tmp_path / "actual-parent"
+    actual_parent.mkdir()
+    symlinked_parent = tmp_path / "symlinked-parent"
+    symlinked_parent.symlink_to(actual_parent, target_is_directory=True)
+    profile = symlinked_parent / "dedicated-profile"
+    monkeypatch.setattr(browser_module, "_default_profile_roots", lambda: ())
+    monkeypatch.setattr(browser_module, "_is_wsl", lambda: False)
+
+    with pytest.raises(BrowserConfigurationError, match="symbolic link"):
+        resolve_browser_launch(
+            BrowserLaunchConfig(
+                chrome_executable=executable,
+                chrome_user_data_dir=profile,
+            )
+        )
+
+    assert not (actual_parent / "dedicated-profile").exists()
+
+
 def test_wsl_never_auto_discovers_chrome(monkeypatch: pytest.MonkeyPatch) -> None:
     discovery_called = False
 
@@ -235,6 +259,39 @@ def test_create_browser_uses_exact_persistent_native_profile_without_copy_or_lau
     profile._copy_profile()
     assert copied is False
     assert profile.user_data_dir == user_data_dir
+
+
+def test_create_native_browser_rejects_downloads_beneath_symlinked_parent_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = _make_executable(tmp_path / "chrome")
+    profile = tmp_path / "dedicated-profile"
+    monkeypatch.setattr(browser_module, "_default_profile_roots", lambda: ())
+    monkeypatch.setattr(browser_module, "_is_wsl", lambda: False)
+    launch = resolve_browser_launch(
+        BrowserLaunchConfig(
+            chrome_executable=executable,
+            chrome_user_data_dir=profile,
+        )
+    )
+    actual_parent = tmp_path / "actual-parent"
+    actual_parent.mkdir()
+    symlinked_parent = tmp_path / "symlinked-parent"
+    symlinked_parent.symlink_to(actual_parent, target_is_directory=True)
+    downloads = symlinked_parent / "downloads"
+    _CapturingBrowser.calls = []
+    monkeypatch.setattr(browser_module, "Browser", _CapturingBrowser)
+
+    with pytest.raises(BrowserConfigurationError, match="symbolic link"):
+        create_browser(
+            launch,
+            ["https://jobs.example"],
+            downloads,
+        )
+
+    assert _CapturingBrowser.calls == []
+    assert not (actual_parent / "downloads").exists()
 
 
 

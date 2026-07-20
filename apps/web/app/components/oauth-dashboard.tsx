@@ -120,7 +120,6 @@ export function OAuthDashboard() {
       setAuthStatus(parsed.data);
       setStatusError(null);
     } catch (error) {
-      setAuthStatus(undefined);
       setStatusError(error instanceof Error ? redactPublicText(error.message) : "Connection status is unavailable.");
     } finally {
       if (showLoading) setIsLoadingStatus(false);

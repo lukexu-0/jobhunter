@@ -755,6 +755,24 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(harness.repository.getArtifact(harness.runId, "repair-report")).not.toBeNull();
   });
 
+  test("persists processor-created repairing attempts with the repair-loop origin", async () => {
+    const harness = await createHarness({
+      compileOutcomes: ["repairable", "success"],
+      repairAgent: async (attempt): Promise<RepairResult> => ({
+        status: "repaired",
+        tailoredTex: attempt.input.failedTex,
+        changes: [{ category: "escaping", summary: "Restored escaping" }],
+        remainingDiagnostics: [],
+      }),
+    });
+
+    await processToStop(harness);
+
+    const repairingAttempt = harness.repository.timeline(harness.runId).attempts
+      .find((attempt) => attempt.stage === "repairing");
+    expect(repairingAttempt?.origin).toBe("repair_loop");
+  });
+
   test("rejects a repair that would make the current resume diff stale", async () => {
     let candidateValidated = false;
     let candidateCompiled = false;

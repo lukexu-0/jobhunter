@@ -319,6 +319,14 @@ function range(boxes: readonly WordBox[]): BoxRange {
   return { page: boxes[0]!.page, x, y, width: right - x, height: top - y };
 }
 
+function sameVisualTextLine(left: WordBox, right: WordBox): boolean {
+  const verticalOverlap = Math.min(left.y + left.height, right.y + right.height)
+    - Math.max(left.y, right.y);
+  const baselineDistance = Math.abs(left.y - right.y);
+  return verticalOverlap >= Math.min(left.height, right.height) / 2
+    || baselineDistance <= Math.max(left.height, right.height) / 2;
+}
+
 function findPhrase(boxes: readonly WordBox[], phrase: string): BoxRange | undefined {
   const tokens = canonicalTokens(phrase);
   if (tokens.length === 0) return undefined;
@@ -330,7 +338,14 @@ function findPhrase(boxes: readonly WordBox[], phrase: string): BoxRange | undef
     let matches = true;
     for (let offset = 0; offset < tokens.length; offset++) {
       const indexedToken = indexedTokens[start + offset]!;
-      if (boxes[indexedToken.boxIndex]!.page !== page || indexedToken.token !== tokens[offset]) {
+      const box = boxes[indexedToken.boxIndex]!;
+      const previousToken = offset > 0 ? indexedTokens[start + offset - 1]! : undefined;
+      const previousBox = previousToken ? boxes[previousToken.boxIndex]! : undefined;
+      if (
+        box.page !== page
+        || indexedToken.token !== tokens[offset]
+        || (previousBox && !sameVisualTextLine(previousBox, box))
+      ) {
         matches = false;
         break;
       }

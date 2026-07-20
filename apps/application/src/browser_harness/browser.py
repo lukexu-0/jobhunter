@@ -114,11 +114,22 @@ def _resolve_executable(configured: Path | None) -> Path:
     return executable
 
 
+def _reject_symlink_components(path: Path, message: str) -> None:
+    absolute = path.absolute()
+    for component in (absolute, *absolute.parents):
+        try:
+            component_mode = component.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(component_mode):
+            raise BrowserConfigurationError(message)
+
+
 def _resolve_dedicated_profile(configured: Path) -> Path:
     expanded = configured.expanduser()
-    if expanded.is_symlink():
-        raise BrowserConfigurationError("The Chrome user-data directory must not be a symbolic link")
+    symlink_error = "The Chrome user-data directory must not be a symbolic link"
     try:
+        _reject_symlink_components(expanded, symlink_error)
         profile = expanded.resolve(strict=False)
         for default_root in _default_profile_roots():
             resolved_default = default_root.expanduser().resolve(strict=False)
@@ -163,9 +174,9 @@ def resolve_browser_launch(config: BrowserLaunchConfig) -> ResolvedBrowserLaunch
 
 def _prepare_downloads(path: Path) -> Path:
     expanded = path.expanduser()
-    if expanded.is_symlink():
-        raise BrowserConfigurationError("The downloads directory must not be a symbolic link")
+    symlink_error = "The downloads directory must not be a symbolic link"
     try:
+        _reject_symlink_components(expanded, symlink_error)
         resolved = expanded.resolve(strict=False)
         resolved.mkdir(mode=0o700, parents=False, exist_ok=True)
         if not resolved.is_dir() or resolved.is_symlink():
