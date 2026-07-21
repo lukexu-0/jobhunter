@@ -9,6 +9,7 @@ import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 from browser_use import Browser
@@ -19,6 +20,11 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from fixtures.local_application import LocalApplicationFixture
 from jobhunter_browser_harness.browser import ResolvedBrowserLaunch
 from jobhunter_browser_harness.models import (
+    AdditionalInfoBooleanCommandAnswer,
+    AdditionalInfoBooleanQuestion,
+    AdditionalInfoDeclinedCommandAnswer,
+    AdditionalInfoMultiSelectCommandAnswer,
+    AdditionalInfoMultiSelectQuestion,
     AdditionalInfoOption,
     AdditionalInfoRuntimeActionResponse,
     AdditionalInfoSingleSelectCommandAnswer,
@@ -53,6 +59,7 @@ _IRRELEVANT_FACT = "community garden fundraiser"
 _REVISION = "Human revision: emphasize careful incident ownership."
 _SUMMER_AVAILABILITY = "June through August 2027"
 _REFERRAL_SOURCE = "Employee referral"
+_CALLER_SESSION_ID = UUID("1f017bcb-f6cd-4329-a78a-6e920522ca9d")
 
 
 def _chromium_executable() -> Path:
@@ -397,6 +404,7 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
             _pdf_bytes("Seven years operating reliable deployment systems."),
         )
         created = await manager.create_session(
+            session_id=_CALLER_SESSION_ID,
             job_url=fixture.posting_url,
             allow_domains=[],
             max_steps=20,
@@ -413,11 +421,16 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
         )
 
         try:
+            assert created.session_id == _CALLER_SESSION_ID
             await _wait_for_state(manager, created.session_id, "running")
             await asyncio.wait_for(agent.started.wait(), timeout=5)
             record = manager._active
             assert record is not None and isinstance(record.browser, Browser)
             assert record.stored is not None
+            initial_snapshot = manager.get_snapshot(created.session_id)
+            assert (
+                initial_snapshot.expires_at - initial_snapshot.created_at
+            ).total_seconds() == 120
 
             posting = await manager.runtime_action(
                 created.session_id,
@@ -450,6 +463,12 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                 created.session_id,
                 "awaiting_origin_approval",
             )
+            origin_pending = manager.get_snapshot(created.session_id).pending_action
+            assert origin_pending is not None
+            assert origin_pending.model_dump(mode="json") == {
+                "type": "origin_approval",
+                "origin": fixture.form_origin,
+            }
             await manager.command(
                 created.session_id,
                 ApproveOriginCommand(
@@ -533,6 +552,41 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                                     ),
                                 ],
                             ),
+                            AdditionalInfoBooleanQuestion(
+                                id="relocation",
+                                key="relocation.willing",
+                                scope="global",
+                                question="Are you willing to relocate?",
+                                answer_type="boolean",
+                            ),
+                            AdditionalInfoMultiSelectQuestion(
+                                id="work_modes",
+                                key="preferences.work_modes",
+                                scope="application",
+                                question="Which work modes are acceptable?",
+                                answer_type="multi_select",
+                                options=[
+                                    AdditionalInfoOption(
+                                        id="remote",
+                                        label="Remote",
+                                    ),
+                                    AdditionalInfoOption(
+                                        id="hybrid",
+                                        label="Hybrid",
+                                    ),
+                                    AdditionalInfoOption(
+                                        id="office",
+                                        label="Office",
+                                    ),
+                                ],
+                            ),
+                            AdditionalInfoTextQuestion(
+                                id="compensation",
+                                key="compensation.expectation",
+                                scope="application",
+                                question="What compensation do you expect?",
+                                answer_type="text",
+                            ),
                         ],
                     ),
                 )
@@ -542,6 +596,23 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                 created.session_id,
                 "awaiting_additional_info",
             )
+            additional_pending = manager.get_snapshot(
+                created.session_id
+            ).pending_action
+            assert additional_pending is not None
+            additional_pending_json = additional_pending.model_dump(mode="json")
+            assert additional_pending_json["type"] == "additional_info"
+            assert [
+                question["answer_type"]
+                for question in additional_pending_json["questions"]
+            ] == [
+                "text",
+                "single_select",
+                "boolean",
+                "multi_select",
+                "text",
+            ]
+            assert "value" not in json.dumps(additional_pending_json)
             await manager.command(
                 created.session_id,
                 ProvideAdditionalInfoCommand(
@@ -557,6 +628,20 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                             status="answered",
                             option_id="employee_referral",
                         ),
+                        AdditionalInfoBooleanCommandAnswer(
+                            id="relocation",
+                            status="answered",
+                            value=False,
+                        ),
+                        AdditionalInfoMultiSelectCommandAnswer(
+                            id="work_modes",
+                            status="answered",
+                            option_ids=["remote", "hybrid"],
+                        ),
+                        AdditionalInfoDeclinedCommandAnswer(
+                            id="compensation",
+                            status="declined",
+                        ),
                     ],
                 ),
             )
@@ -565,7 +650,43 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
             assert [answer.value for answer in additional_info.answers] == [
                 _SUMMER_AVAILABILITY,
                 _REFERRAL_SOURCE,
+                False,
+                ["Remote", "Hybrid"],
+                None,
             ]
+            assert manager.get_snapshot(created.session_id).pending_action is None
+            stored_user_info = json.loads(
+                (tmp_path / "user-info.json").read_text(encoding="utf-8")
+            )
+            assert stored_user_info["version"] == 1
+            assert set(stored_user_info["global"]) == {
+                "availability.summer_2027",
+                "relocation.willing",
+            }
+            assert set(stored_user_info["applications"]) == {
+                fixture.posting_url,
+            }
+            application_facts = stored_user_info["applications"][
+                fixture.posting_url
+            ]
+            assert set(application_facts) == {
+                "referral.source",
+                "preferences.work_modes",
+                "compensation.expectation",
+            }
+            assert stored_user_info["global"]["availability.summer_2027"][
+                "value"
+            ] == _SUMMER_AVAILABILITY
+            assert stored_user_info["global"]["relocation.willing"]["value"] is False
+            assert application_facts["referral.source"]["value"] == _REFERRAL_SOURCE
+            assert application_facts["preferences.work_modes"]["value"] == [
+                "Remote",
+                "Hybrid",
+            ]
+            assert application_facts["compensation.expectation"][
+                "status"
+            ] == "declined"
+            assert "value" not in application_facts["compensation.expectation"]
 
             applied_info = await manager.runtime_action(
                 created.session_id,
@@ -601,6 +722,16 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                 created.session_id,
                 "awaiting_human_navigation",
             )
+            navigation_pending = manager.get_snapshot(
+                created.session_id
+            ).pending_action
+            assert navigation_pending is not None
+            assert navigation_pending.model_dump(mode="json") == {
+                "type": "human_navigation",
+                "instruction": (
+                    "Please inspect the completed first page and click Human Next."
+                ),
+            }
             await _human_click(record.browser, "human-next")
             await manager.command(
                 created.session_id,
@@ -624,6 +755,11 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                 created.session_id,
                 "awaiting_human_review",
             )
+            review_pending = manager.get_snapshot(created.session_id).pending_action
+            assert review_pending is not None
+            assert review_pending.model_dump(mode="json") == {
+                "type": "human_review",
+            }
             await manager.command(
                 created.session_id,
                 ReviseCommand(type="revise", context=_REVISION),
@@ -663,6 +799,9 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                 created.session_id,
                 "awaiting_human_review",
             )
+            assert manager.get_snapshot(
+                created.session_id
+            ).pending_action is not None
             await manager.command(created.session_id, ReadyCommand(type="ready"))
             ready = await ready_task
             assert isinstance(ready, ReadyRuntimeActionResponse)
@@ -674,6 +813,20 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                 created.session_id,
                 "ready_for_human_submit",
             )
+            ready_snapshot = manager.get_snapshot(created.session_id)
+            assert ready_snapshot.pending_action is None
+            assert ready_snapshot.expires_at == initial_snapshot.expires_at
+            public_session_data = json.dumps(
+                {
+                    "snapshot": ready_snapshot.model_dump(mode="json"),
+                    "events": [
+                        event.model_dump(mode="json")
+                        for event in record.events
+                    ],
+                }
+            )
+            assert _SUMMER_AVAILABILITY not in public_session_data
+            assert '"status": "answered"' not in public_session_data
 
             values = await _page_values(record.browser)
             assert values == before_human | {
