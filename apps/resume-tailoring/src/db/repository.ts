@@ -469,6 +469,14 @@ export class PipelineRepository {
     this.#immediate(() => {
       const now = this.#now();
       this.#assertCommandable(runId, now);
+      const activeAttempt = this.#db.query<{ active: number }, [string]>(`
+        SELECT EXISTS (
+          SELECT 1
+          FROM attempts
+          WHERE run_id = ? AND status IN ('running','cancel_requested')
+        ) AS active
+      `).get(runId)?.active === 1;
+      if (activeAttempt) throw new RepositoryConflictError("run has an active attempt");
       const pruning = this.#db.query<{ pruning: number }, [string]>(`
         SELECT EXISTS (
           SELECT 1

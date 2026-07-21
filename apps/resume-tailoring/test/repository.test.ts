@@ -169,6 +169,23 @@ describe("persisted workflow commands", () => {
 
     expect(() => repo.deleteRun(deleted.id)).toThrow(/live claim/);
     tick(60_001);
+    let deletionError: unknown;
+    try {
+      repo.deleteRun(deleted.id);
+    } catch (error) {
+      deletionError = error;
+    }
+    expect(deletionError).toBeInstanceOf(RepositoryConflictError);
+    expect((deletionError as Error).message).toBe("run has an active attempt");
+    expect(repo.getRun(deleted.id)?.status).toBe("analyzing");
+    expect(repo.listRuns().map(({ id }) => id)).toEqual([deleted.id, successor.id]);
+    expect(repo.timeline(deleted.id).attempts.find(({ id }) => id === attempt.id)?.status).toBe("running");
+
+    expect(repo.acquire()).toBeNull();
+    expect(repo.timeline(deleted.id).attempts.find(({ id }) => id === attempt.id)?.status).toBe("cancel_requested");
+    expect(() => repo.deleteRun(deleted.id)).toThrow(/active attempt/);
+    expect(repo.acknowledgeCancellation(attempt.id, claim.token)).toBeTrue();
+    expect(repo.timeline(deleted.id).attempts.find(({ id }) => id === attempt.id)?.status).toBe("cancelled");
     repo.deleteRun(deleted.id);
 
     expect(repo.getRun(deleted.id)).toBeNull();
