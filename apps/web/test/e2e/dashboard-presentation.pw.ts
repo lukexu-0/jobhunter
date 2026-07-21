@@ -402,6 +402,36 @@ test("uses the shared lifecycle order and exposes a square accessible row action
   await expect(menu).toHaveCount(0);
   await expect(trigger).toHaveAttribute("aria-expanded", "false");
   await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await expect(menu.getByRole("menuitem").first()).toBeFocused();
+  await page.evaluate(() => window.dispatchEvent(new Event("resize")));
+  await expect(menu).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await expect(menu.getByRole("menuitem").first()).toBeFocused();
+  await page.locator(".applications-table-scroll").evaluate((element) => {
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect(menu).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await expect(menu.getByRole("menuitem").first()).toBeFocused();
+  await filter.evaluate((element) => {
+    (element as HTMLSelectElement).value = "pending";
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect(trigger).toHaveCount(0);
+  await expect(menu).toHaveCount(0);
+  await page.evaluate(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
+  await filter.evaluate((element) => {
+    (element as HTMLSelectElement).value = "all";
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect(trigger).toBeVisible();
+  await expect(menu).toHaveCount(0);
 });
 
 test("keeps an existing Failed status visible but not selectable", async ({ page }) => {
@@ -478,6 +508,15 @@ test("keeps the action trigger inset and its menu and dialog usable at narrow wi
   expect(dialogBox.y + dialogBox.height).toBeLessThanOrEqual(640);
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await expect(menu).toBeVisible();
+  await menu.getByRole("menuitem", { name: "Edit organization" }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(trigger).toBeFocused();
 
   await trigger.click();
   await expect(menu).toBeVisible();
@@ -614,6 +653,7 @@ test("retains identity input on failure and updates the row only after a success
   await save.click();
   await expect(dialog).toHaveCount(0);
   await expect(row).toContainText("Final title");
+  await expect(row.locator(".run-action-trigger")).toBeFocused();
   expect(patchBodies).toEqual([
     { title: "New title" },
     { title: "Final title" },
@@ -656,8 +696,9 @@ test("requires delete confirmation and removes a run only after a successful bod
 
   const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
+  const trigger = row.getByRole("button", { name: "Actions for Delete candidate" });
   const openDeleteDialog = async () => {
-    await row.getByRole("button", { name: "Actions for Delete candidate" }).click();
+    await trigger.click();
     await page.getByRole("menuitem", { name: "Delete" }).click();
     return page.getByRole("dialog", { name: "Delete application?" });
   };
@@ -666,6 +707,7 @@ test("requires delete confirmation and removes a run only after a successful bod
   await expect(dialog).toContainText("Delete Delete candidate from the dashboard?");
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await expect(dialog).toHaveCount(0);
+  await expect(trigger).toBeFocused();
   expect(deleteBodies).toEqual([]);
   await expect(row).toBeVisible();
 
@@ -675,9 +717,16 @@ test("requires delete confirmation and removes a run only after a successful bod
   await expect(row).toBeVisible();
   expect(deleteBodies).toEqual([null]);
 
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  await expect(row).toBeVisible();
+
+  dialog = await openDeleteDialog();
   await dialog.getByRole("button", { name: "Delete application" }).click();
   await expect(dialog).toHaveCount(0);
   await expect(row).toHaveCount(0);
+  await expect(trigger).toHaveCount(0);
   await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.")).toBeVisible();
   expect(deleteBodies).toEqual([null, null]);
 });

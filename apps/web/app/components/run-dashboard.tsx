@@ -143,6 +143,9 @@ export function RunDashboard() {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
   const actionTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const restoreActionTriggerFocus = useCallback((runId: string) => {
+    window.requestAnimationFrame(() => actionTriggerRefs.current.get(runId)?.focus());
+  }, []);
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequest = useMemo(
@@ -246,9 +249,7 @@ export function RunDashboard() {
     });
     const dismiss = (restoreFocus = false) => {
       setActionMenu(null);
-      if (restoreFocus) {
-        window.requestAnimationFrame(() => actionTriggerRefs.current.get(runId)?.focus());
-      }
+      if (restoreFocus) restoreActionTriggerFocus(runId);
     };
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target;
@@ -267,7 +268,7 @@ export function RunDashboard() {
       event.preventDefault();
       dismiss(true);
     };
-    const dismissForViewportChange = () => dismiss();
+    const dismissForViewportChange = () => dismiss(true);
     document.addEventListener("pointerdown", handlePointerDown, true);
     document.addEventListener("focusin", handleFocusIn);
     document.addEventListener("keydown", handleKeyDown);
@@ -281,7 +282,7 @@ export function RunDashboard() {
       window.removeEventListener("resize", dismissForViewportChange);
       window.removeEventListener("scroll", dismissForViewportChange, true);
     };
-  }, [actionMenu]);
+  }, [actionMenu, restoreActionTriggerFocus]);
 
   useEffect(() => {
     if (!activeDialog) return;
@@ -330,8 +331,10 @@ export function RunDashboard() {
 
   const closeDialog = () => {
     if (activeDialog && busyRunIds.has(activeDialog.runId)) return;
+    const runId = activeDialog?.runId;
     setActiveDialog(null);
     setDialogError(null);
+    if (runId) restoreActionTriggerFocus(runId);
   };
 
   const setRunBusy = (runId: string, busy: boolean) => {
@@ -362,6 +365,7 @@ export function RunDashboard() {
       latestListRequest.current += 1;
       setRuns((current) => current?.map((run) => run.id === updated.id ? updated : run) ?? current);
       setActiveDialog(null);
+      restoreActionTriggerFocus(runId);
     } catch (error) {
       setDialogError(publicMessage(error, `${field === "title" ? "Title" : "Organization"} could not be updated. Try again.`));
     } finally {
@@ -460,10 +464,14 @@ export function RunDashboard() {
 
   const showFilteredEmpty = !isLoading && runs.length > 0 && filteredRuns.length === 0;
   const showInitialEmpty = !isLoading && !loadError && runs.length === 0;
-  const actionMenuRun = actionMenu ? runs.find((run) => run.id === actionMenu.runId) : undefined;
+  const actionMenuRun = actionMenu ? visibleRuns.find((run) => run.id === actionMenu.runId) : undefined;
   const actionMenuIdentity = actionMenuRun
     ? effectiveRunIdentity(actionMenuRun, jobIdentities[actionMenuRun.id])
     : undefined;
+
+  useEffect(() => {
+    if (actionMenu && !actionMenuRun) setActionMenu(null);
+  }, [actionMenu, actionMenuRun]);
   const normalizedEditValue = editValue.trim();
   const isEditValueValid = normalizedEditValue.length >= 1 && normalizedEditValue.length <= 200;
   const isDialogBusy = Boolean(activeDialog && busyRunIds.has(activeDialog.runId));
