@@ -716,6 +716,21 @@ export class PipelineRepository {
             WHERE attempts.run_id = runs.id
               AND attempts.status IN ('running','cancel_requested')
           )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM run_application_sessions
+            WHERE run_application_sessions.run_id = runs.id
+              AND run_application_sessions.bridge_state IN (
+                'reserved',
+                'starting',
+                'running',
+                'awaiting_human_navigation',
+                'awaiting_origin_approval',
+                'awaiting_additional_info',
+                'awaiting_human_review',
+                'ready_for_human_submit'
+              )
+          )
         ON CONFLICT(run_id) DO NOTHING
       `).run(this.#now(), retainCount);
       return this.#db.query<{ run_id: string }, []>(`
@@ -796,6 +811,26 @@ export class PipelineRepository {
         ) AS active
       `).get(runId)?.active === 1;
       if (activeAttempt) throw new RepositoryConflictError("run has an active attempt");
+      const activeApplicationSession = this.#db.query<{ active: number }, [string]>(`
+        SELECT EXISTS (
+          SELECT 1
+          FROM run_application_sessions
+          WHERE run_id = ?
+            AND bridge_state IN (
+              'reserved',
+              'starting',
+              'running',
+              'awaiting_human_navigation',
+              'awaiting_origin_approval',
+              'awaiting_additional_info',
+              'awaiting_human_review',
+              'ready_for_human_submit'
+            )
+        ) AS active
+      `).get(runId)?.active === 1;
+      if (activeApplicationSession) {
+        throw new RepositoryConflictError("close the browser session first");
+      }
       const pruning = this.#db.query<{ pruning: number }, [string]>(`
         SELECT EXISTS (
           SELECT 1

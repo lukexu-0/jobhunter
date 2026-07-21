@@ -548,6 +548,40 @@ describe("artifact retention reservations", () => {
     expect(() => repo.areRunArtifactsRetained("missing-run")).toThrow(RepositoryConflictError);
   });
 
+
+  test("live application sessions block deletion and pruning until terminal", () => {
+    const { repo } = fixture();
+    const hash = "2".repeat(64);
+    const ids = Array.from({ length: 12 }, (_, index) => `application-retention-${index}`);
+    for (const id of ids) {
+      createReview(repo, hash, false, id);
+      repo.approve(id, hash);
+    }
+    const firstSessionId = "77777777-7777-4777-8777-777777777777";
+    const secondSessionId = "88888888-8888-4888-8888-888888888888";
+    repo.reserveApplicationSession(ids[0]!, null, firstSessionId, hash);
+    repo.reserveApplicationSession(ids[1]!, null, secondSessionId, hash);
+
+    expect(() => repo.deleteRun(ids[1]!)).toThrow(/close the browser session first/);
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([]);
+
+    repo.recordApplicationSnapshot(ids[0]!, {
+      generation: 1,
+      sessionId: firstSessionId,
+      bridgeState: "cancelled",
+      publicSnapshot: { state: "cancelled" },
+    });
+    repo.recordApplicationSnapshot(ids[1]!, {
+      generation: 1,
+      sessionId: secondSessionId,
+      bridgeState: "closed",
+      publicSnapshot: { state: "closed" },
+    });
+    repo.deleteRun(ids[1]!);
+
+    expect(repo.getRun(ids[1]!)).toBeNull();
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[0]!]);
+  });
   test("excludes tombstoned runs from retention selection and reservations", () => {
     const { db, repo } = fixture();
     const ids = Array.from({ length: 13 }, (_, index) => `tombstone-retention-${index}`);
