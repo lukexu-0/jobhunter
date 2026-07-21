@@ -9,6 +9,26 @@ export type ApplicationStatus = (typeof APPLICATION_STATUSES)[number];
 export type ActiveStage = Exclude<RunStatus, "queued" | "review" | "approved" | "failed">;
 export type RevisionOrigin = "initial" | "retry" | "machine_regenerate" | "human_edit";
 export type AttemptOrigin = RevisionOrigin | "repair_loop";
+export const HARNESS_SESSION_STATES = [
+  "starting",
+  "running",
+  "awaiting_human_navigation",
+  "awaiting_origin_approval",
+  "awaiting_additional_info",
+  "awaiting_human_review",
+  "ready_for_human_submit",
+  "cancelled",
+  "failed",
+  "closed",
+] as const;
+export type HarnessSessionState = (typeof HARNESS_SESSION_STATES)[number];
+export type ApplicationSessionBridgeState = "reserved" | HarnessSessionState | "lost";
+const TERMINAL_APPLICATION_SESSION_STATES: Readonly<Partial<Record<ApplicationSessionBridgeState, true>>> = {
+  cancelled: true,
+  failed: true,
+  closed: true,
+  lost: true,
+};
 
 export class RepositoryConflictError extends Error {
   constructor(message: string) {
@@ -72,6 +92,19 @@ interface ArtifactRow {
 interface RevisionRow { run_id: string; revision: number; origin: RevisionOrigin; source_revision: number | null; retry_stage: ActiveStage | null; status: RunStatus; created_at: number }
 interface EventRow { sequence: number; run_id: string; revision: number | null; kind: string; payload_json: string; created_at: number }
 interface EditRequestRow { id: string; run_id: string; source_revision: number; target_revision: number; origin: "machine_regenerate" | "human_edit"; comments: string; expected_pdf_sha256: string; created_at: number }
+interface ApplicationSessionRow {
+  run_id: string;
+  generation: number;
+  session_id: string;
+  resume_revision: number;
+  pdf_sha256: string;
+  bridge_state: ApplicationSessionBridgeState;
+  public_snapshot_json: string | null;
+  last_upstream_event_id: number | null;
+  created_at: number;
+  updated_at: number;
+  terminal_at: number | null;
+}
 
 export interface PublicRun {
   readonly id: string;
@@ -120,6 +153,19 @@ export interface PublicEditRequest {
   readonly comments: string;
   readonly expectedPdfSha256: string;
   readonly createdAt: number;
+}
+export interface PublicApplicationSession {
+  readonly runId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly resumeRevision: number;
+  readonly pdfSha256: string;
+  readonly bridgeState: ApplicationSessionBridgeState;
+  readonly publicSnapshot: unknown | null;
+  readonly lastUpstreamEventId: number | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly terminalAt: number | null;
 }
 
 export interface RepositoryOptions {
@@ -187,6 +233,29 @@ function publicAttempt(row: AttemptRow): PublicAttempt {
     status: row.status, processPid: row.process_pid, toolCount: row.tool_count, compileCount: row.compile_count,
     startedAt: row.started_at, finishedAt: row.finished_at, cancellationAcknowledgedAt: row.cancellation_ack_at };
 }
+function publicApplicationSession(row: ApplicationSessionRow): PublicApplicationSession {
+  return {
+    runId: row.run_id,
+    generation: row.generation,
+    sessionId: row.session_id,
+    resumeRevision: row.resume_revision,
+    pdfSha256: row.pdf_sha256,
+    bridgeState: row.bridge_state,
+    publicSnapshot: row.public_snapshot_json === null ? null : JSON.parse(row.public_snapshot_json) as unknown,
+    lastUpstreamEventId: row.last_upstream_event_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    terminalAt: row.terminal_at,
+  };
+}
+function serializePublicApplicationSnapshot(snapshot: unknown): string {
+  if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new Error("application snapshot must be an object");
+  }
+  const serialized = JSON.stringify(snapshot);
+  if (typeof serialized !== "string") throw new Error("application snapshot is not serializable");
+  return serialized;
+}
 
 export class PipelineRepository {
   readonly #db: Database;
@@ -218,6 +287,29 @@ export class PipelineRepository {
     const row = this.#db.query<RunRow, [string]>("SELECT * FROM runs WHERE id=? AND deleted_at IS NULL").get(runId);
     if (!row) throw new RepositoryConflictError("run not found");
     return row;
+  }
+
+  #currentApplicationSession(
+    runId: string,
+    generation: number,
+    sessionId: string,
+  ): ApplicationSessionRow {
+    this.#run(runId);
+    const current = this.#db.query<ApplicationSessionRow, [string]>(`
+      SELECT *
+      FROM run_application_sessions
+      WHERE run_id = ?
+      ORDER BY generation DESC
+      LIMIT 1
+    `).get(runId);
+    if (
+      !current
+      || current.generation !== generation
+      || current.session_id !== sessionId
+    ) {
+      throw new RepositoryConflictError("application session is not the current generation");
+    }
+    return current;
   }
 
   #hasArtifactRetentionReservation(runId: string): boolean {
@@ -331,6 +423,209 @@ export class PipelineRepository {
 
   getRunJobUrl(runId: string): string | null {
     return this.#run(runId).job_url;
+  }
+
+  getLatestApplicationSession(runId: string): PublicApplicationSession | null {
+    this.#run(runId);
+    const row = this.#db.query<ApplicationSessionRow, [string]>(`
+      SELECT *
+      FROM run_application_sessions
+      WHERE run_id = ?
+      ORDER BY generation DESC
+      LIMIT 1
+    `).get(runId);
+    return row ? publicApplicationSession(row) : null;
+  }
+
+  reserveApplicationSession(
+    runId: string,
+    expectedSessionId: string | null,
+    sessionId: string,
+    expectedApprovedPdfSha256: string,
+  ): PublicApplicationSession {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(sessionId)) {
+      throw new Error("application session ID must be a UUID");
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedApprovedPdfSha256)) {
+      throw new Error("approved PDF hash must be a lowercase SHA-256 value");
+    }
+    return this.#immediate(() => {
+      const run = this.#run(runId);
+      this.#assertRunArtifactsRetained(runId);
+      if (run.status !== "approved" || run.approved_pdf_sha256 !== expectedApprovedPdfSha256) {
+        throw new RepositoryConflictError("approved PDF changed");
+      }
+      const revision = this.getRevision(runId, run.current_revision);
+      const pdf = this.getArtifact(runId, "compiled-pdf", run.current_revision);
+      if (revision?.status !== "approved" || pdf?.sha256 !== expectedApprovedPdfSha256) {
+        throw new RepositoryConflictError("approved PDF changed");
+      }
+      const latest = this.#db.query<ApplicationSessionRow, [string]>(`
+        SELECT *
+        FROM run_application_sessions
+        WHERE run_id = ?
+        ORDER BY generation DESC
+        LIMIT 1
+      `).get(runId);
+      if ((latest?.session_id ?? null) !== expectedSessionId) {
+        throw new RepositoryConflictError("application session changed");
+      }
+      if (latest && TERMINAL_APPLICATION_SESSION_STATES[latest.bridge_state] !== true) {
+        throw new RepositoryConflictError("application session is active");
+      }
+      const generation = (latest?.generation ?? 0) + 1;
+      const now = this.#now();
+      this.#db.query(`
+        INSERT INTO run_application_sessions(
+          run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
+          public_snapshot_json, last_upstream_event_id, created_at, updated_at, terminal_at
+        ) VALUES (?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?, ?, NULL)
+      `).run(
+        runId,
+        generation,
+        sessionId,
+        run.current_revision,
+        expectedApprovedPdfSha256,
+        now,
+        now,
+      );
+      const reserved = this.#db.query<ApplicationSessionRow, [string, number]>(
+        "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
+      ).get(runId, generation);
+      if (!reserved) throw new Error("application session reservation failed");
+      return publicApplicationSession(reserved);
+    });
+  }
+
+  recordApplicationSnapshot(
+    runId: string,
+    input: {
+      readonly generation: number;
+      readonly sessionId: string;
+      readonly bridgeState: HarnessSessionState;
+      readonly publicSnapshot: unknown;
+      readonly lastUpstreamEventId?: number;
+    },
+  ): PublicApplicationSession {
+    if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
+      throw new Error("application session generation must be positive");
+    }
+    if (
+      input.lastUpstreamEventId !== undefined
+      && (!Number.isSafeInteger(input.lastUpstreamEventId) || input.lastUpstreamEventId < 0)
+    ) {
+      throw new Error("application event cursor must be nonnegative");
+    }
+    const publicSnapshotJson = serializePublicApplicationSnapshot(input.publicSnapshot);
+    return this.#immediate(() => {
+      const current = this.#currentApplicationSession(runId, input.generation, input.sessionId);
+      if (
+        current.last_upstream_event_id !== null
+        && input.lastUpstreamEventId !== undefined
+        && input.lastUpstreamEventId < current.last_upstream_event_id
+      ) {
+        throw new RepositoryConflictError("application event cursor moved backwards");
+      }
+      if (
+        TERMINAL_APPLICATION_SESSION_STATES[current.bridge_state] === true
+        && current.bridge_state !== input.bridgeState
+      ) {
+        throw new RepositoryConflictError("application session is terminal");
+      }
+      const now = this.#now();
+      const terminalAt = TERMINAL_APPLICATION_SESSION_STATES[input.bridgeState] === true
+        ? (current.terminal_at ?? now)
+        : null;
+      const cursor = input.lastUpstreamEventId ?? current.last_upstream_event_id;
+      const result = this.#db.query(`
+        UPDATE run_application_sessions
+        SET bridge_state = ?, public_snapshot_json = ?, last_upstream_event_id = ?,
+            updated_at = ?, terminal_at = ?
+        WHERE run_id = ? AND generation = ? AND session_id = ?
+          AND generation = (
+            SELECT max(generation)
+            FROM run_application_sessions
+            WHERE run_id = ?
+          )
+      `).run(
+        input.bridgeState,
+        publicSnapshotJson,
+        cursor,
+        now,
+        terminalAt,
+        runId,
+        input.generation,
+        input.sessionId,
+        runId,
+      );
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("application session is not the current generation");
+      }
+      const recorded = this.#db.query<ApplicationSessionRow, [string, number]>(
+        "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
+      ).get(runId, input.generation);
+      if (!recorded) throw new Error("application session snapshot update failed");
+      return publicApplicationSession(recorded);
+    });
+  }
+
+  markApplicationSessionLost(
+    runId: string,
+    input: {
+      readonly generation: number;
+      readonly sessionId: string;
+      readonly publicSnapshot: unknown;
+    },
+  ): PublicApplicationSession {
+    const publicSnapshotJson = serializePublicApplicationSnapshot(input.publicSnapshot);
+    return this.#immediate(() => {
+      const current = this.#currentApplicationSession(runId, input.generation, input.sessionId);
+      if (
+        current.public_snapshot_json === null
+        || TERMINAL_APPLICATION_SESSION_STATES[current.bridge_state] === true
+      ) {
+        throw new RepositoryConflictError("application session was not observed live");
+      }
+      const now = this.#now();
+      this.#db.query(`
+        UPDATE run_application_sessions
+        SET bridge_state = 'lost', public_snapshot_json = ?, updated_at = ?, terminal_at = ?
+        WHERE run_id = ? AND generation = ? AND session_id = ?
+      `).run(publicSnapshotJson, now, now, runId, input.generation, input.sessionId);
+      const lost = this.#db.query<ApplicationSessionRow, [string, number]>(
+        "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
+      ).get(runId, input.generation);
+      if (!lost) throw new Error("application session lost transition failed");
+      return publicApplicationSession(lost);
+    });
+  }
+
+  closeLostApplicationSession(
+    runId: string,
+    input: {
+      readonly generation: number;
+      readonly sessionId: string;
+      readonly publicSnapshot: unknown;
+    },
+  ): PublicApplicationSession {
+    const publicSnapshotJson = serializePublicApplicationSnapshot(input.publicSnapshot);
+    return this.#immediate(() => {
+      const current = this.#currentApplicationSession(runId, input.generation, input.sessionId);
+      if (current.bridge_state !== "lost") {
+        throw new RepositoryConflictError("application session is not lost");
+      }
+      const now = this.#now();
+      this.#db.query(`
+        UPDATE run_application_sessions
+        SET bridge_state = 'closed', public_snapshot_json = ?, updated_at = ?
+        WHERE run_id = ? AND generation = ? AND session_id = ?
+      `).run(publicSnapshotJson, now, runId, input.generation, input.sessionId);
+      const closed = this.#db.query<ApplicationSessionRow, [string, number]>(
+        "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
+      ).get(runId, input.generation);
+      if (!closed) throw new Error("application session close transition failed");
+      return publicApplicationSession(closed);
+    });
   }
 
   attachSourceSnapshot(runId: string, snapshot: RunSourceSnapshotInput): PublicRunSourceSnapshot {

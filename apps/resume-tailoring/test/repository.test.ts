@@ -385,6 +385,153 @@ describe("persisted workflow commands", () => {
   });
 });
 
+describe("application session ledger", () => {
+  test("reserves the approved PDF revision with compare-and-swap generation ownership", () => {
+    const { repo } = fixture();
+    const hash = "7".repeat(64);
+    const runId = createReview(repo, hash);
+    repo.approve(runId, hash);
+
+    const reserved = repo.reserveApplicationSession(
+      runId,
+      null,
+      "11111111-1111-4111-8111-111111111111",
+      hash,
+    );
+
+    expect(reserved).toEqual({
+      runId,
+      generation: 1,
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      resumeRevision: 1,
+      pdfSha256: hash,
+      bridgeState: "reserved",
+      publicSnapshot: null,
+      lastUpstreamEventId: null,
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      terminalAt: null,
+    });
+    expect(repo.getLatestApplicationSession(runId)).toEqual(reserved);
+    expect(() => repo.reserveApplicationSession(
+      runId,
+      null,
+      "22222222-2222-4222-8222-222222222222",
+      hash,
+    )).toThrow(/changed/);
+  });
+
+  test("records projected snapshots and monotonic upstream cursors for only the current generation", () => {
+    const { repo, tick } = fixture();
+    const hash = "6".repeat(64);
+    const runId = createReview(repo, hash);
+    repo.approve(runId, hash);
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    tick(50);
+
+    const snapshot = {
+      state: "awaiting_human_navigation",
+      pendingAction: { type: "human_navigation", instruction: "Complete login" },
+    };
+    const recorded = repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "awaiting_human_navigation",
+      publicSnapshot: snapshot,
+      lastUpstreamEventId: 7,
+    });
+
+    expect(recorded).toMatchObject({
+      generation: 1,
+      bridgeState: "awaiting_human_navigation",
+      publicSnapshot: snapshot,
+      lastUpstreamEventId: 7,
+      updatedAt: 1_050,
+      terminalAt: null,
+    });
+    expect(() => repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "running",
+      publicSnapshot: { state: "running" },
+      lastUpstreamEventId: 6,
+    })).toThrow(/cursor/);
+  });
+
+  test("marks an observed current session lost, closes it locally, and preserves prior generations", () => {
+    const { db, repo, tick } = fixture();
+    const hash = "5".repeat(64);
+    const runId = createReview(repo, hash);
+    repo.approve(runId, hash);
+    const firstSessionId = "44444444-4444-4444-8444-444444444444";
+    repo.reserveApplicationSession(runId, null, firstSessionId, hash);
+    repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId: firstSessionId,
+      bridgeState: "running",
+      publicSnapshot: { state: "running" },
+      lastUpstreamEventId: 3,
+    });
+    tick(25);
+
+    const lost = repo.markApplicationSessionLost(runId, {
+      generation: 1,
+      sessionId: firstSessionId,
+      publicSnapshot: { state: "lost", warning: "Verify submission state before retrying" },
+    });
+    expect(lost).toMatchObject({ bridgeState: "lost", terminalAt: 1_025, updatedAt: 1_025 });
+    tick(25);
+    const closed = repo.closeLostApplicationSession(runId, {
+      generation: 1,
+      sessionId: firstSessionId,
+      publicSnapshot: { state: "closed" },
+    });
+    expect(closed).toMatchObject({ bridgeState: "closed", terminalAt: 1_025, updatedAt: 1_050 });
+
+    const second = repo.reserveApplicationSession(
+      runId,
+      firstSessionId,
+      "55555555-5555-4555-8555-555555555555",
+      hash,
+    );
+    expect(second).toMatchObject({ generation: 2, bridgeState: "reserved" });
+    expect(db.query<{ generation: number; bridge_state: string }, []>(
+      "SELECT generation,bridge_state FROM run_application_sessions ORDER BY generation",
+    ).all()).toEqual([
+      { generation: 1, bridge_state: "closed" },
+      { generation: 2, bridge_state: "reserved" },
+    ]);
+    expect(() => repo.closeLostApplicationSession(runId, {
+      generation: 1,
+      sessionId: firstSessionId,
+      publicSnapshot: { state: "closed" },
+    })).toThrow(/current generation/);
+  });
+
+  test("reserves only a retained approved current PDF with a matching caller hash", () => {
+    const { db, repo } = fixture();
+    const hash = "4".repeat(64);
+    const runId = createReview(repo, hash);
+    const sessionId = "66666666-6666-4666-8666-666666666666";
+
+    expect(() => repo.reserveApplicationSession(runId, null, sessionId, hash)).toThrow(/approved PDF changed/);
+    repo.approve(runId, hash);
+    expect(() => repo.reserveApplicationSession(
+      runId,
+      null,
+      sessionId,
+      "3".repeat(64),
+    )).toThrow(/approved PDF changed/);
+    db.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at)
+      VALUES (?, 'pruning', 1000)
+    `).run(runId);
+    expect(() => repo.reserveApplicationSession(runId, null, sessionId, hash)).toThrow(RunArtifactsPrunedError);
+    expect(repo.getLatestApplicationSession(runId)).toBeNull();
+  });
+});
+
 describe("artifact retention reservations", () => {
   test("reserves only inactive runs outside the newest ten by queue sequence", () => {
     const { repo } = fixture();
