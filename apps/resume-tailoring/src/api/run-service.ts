@@ -40,6 +40,7 @@ import { ArtifactStore } from "../system/artifacts.ts";
 
 const MAX_JOB_DESCRIPTION_BYTES = 200_000;
 const MAX_PUBLIC_METADATA_BYTES = 1024 * 1024;
+export const MAX_COMPILED_PDF_BYTES = 10 * 1024 * 1024;
 const PUBLIC_ARTIFACT_KINDS: Readonly<Record<string, ArtifactKind>> = Object.freeze({
   "job-analysis": "job-analysis",
   "ats-keyword-extraction": "ats-keyword-extraction",
@@ -134,7 +135,7 @@ function publicFilename(kind: ArtifactKind): string {
 }
 
 function publicArtifactLimit(kind: ArtifactKind): number {
-  if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return 10 * 1024 * 1024;
+  if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return MAX_COMPILED_PDF_BYTES;
   if (kind === "page-image") return 25 * 1024 * 1024;
   if (kind === "tailored-tex") return 256 * 1024;
   return MAX_PUBLIC_METADATA_BYTES;
@@ -197,6 +198,34 @@ function artifactDto(runId: string, artifact: PublicArtifact, attemptById: Reado
     public: true,
     createdAt: artifact.createdAt,
   };
+}
+
+export interface VerifiedArtifactBytes {
+  readonly bytes: Uint8Array;
+  readonly digestBase64: string;
+}
+
+export async function readVerifiedArtifactBytes(
+  artifacts: Pick<ArtifactStore, "read">,
+  artifact: Pick<PublicArtifact, "path" | "byteSize" | "sha256">,
+  maxBytes: number,
+): Promise<VerifiedArtifactBytes> {
+  if (artifact.byteSize > maxBytes) {
+    throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact exceeds its public size limit", 409);
+  }
+  const bytes = await artifacts.read(artifact.path, maxBytes);
+  if (bytes.byteLength !== artifact.byteSize) {
+    throw new RunServiceError(
+      "ARTIFACT_CORRUPT",
+      "Artifact metadata does not match stored content",
+      409,
+    );
+  }
+  const digest = createHash("sha256").update(bytes).digest();
+  if (digest.toString("hex") !== artifact.sha256) {
+    throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact hash verification failed", 409);
+  }
+  return { bytes, digestBase64: digest.toString("base64") };
 }
 
 export class RunApplicationService {
@@ -377,11 +406,13 @@ export class RunApplicationService {
     const isApprovedRevision = this.dependencies.repository.getRevisionStatus(runId, artifact.revision) === "approved";
     if (!isCurrentReviewArtifact && !isApprovedRevision) return undefined;
 
-    const limit = publicArtifactLimit(kind);
-    if (artifact.byteSize > limit) throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact exceeds its public size limit", 409);
-    let bytes: Uint8Array;
+    let verified: VerifiedArtifactBytes;
     try {
-      bytes = await this.dependencies.artifacts.read(artifact.path, limit);
+      verified = await readVerifiedArtifactBytes(
+        this.dependencies.artifacts,
+        artifact,
+        publicArtifactLimit(kind),
+      );
     } catch (error) {
       if (!this.dependencies.repository.areRunArtifactsRetained(runId)) {
         throw new RunServiceError(
@@ -392,9 +423,7 @@ export class RunApplicationService {
       }
       throw error;
     }
-    if (bytes.byteLength !== artifact.byteSize) throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact metadata does not match stored content", 409);
-    const digest = createHash("sha256").update(bytes).digest();
-    if (digest.toString("hex") !== artifact.sha256) throw new RunServiceError("ARTIFACT_CORRUPT", "Artifact hash verification failed", 409);
+    const { bytes, digestBase64 } = verified;
     const body = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(body).set(bytes);
     return new Response(body, {
@@ -404,7 +433,7 @@ export class RunApplicationService {
         "content-length": String(bytes.byteLength),
         "content-disposition": `${kind === "compiled-pdf" || kind === "keyword-map-pdf" ? "inline" : "attachment"}; filename="${publicFilename(kind)}"`,
         "etag": `"sha256-${artifact.sha256}"`,
-        "digest": `sha-256=${digest.toString("base64")}`,
+        "digest": `sha-256=${digestBase64}`,
         "x-content-sha256": artifact.sha256,
         "x-content-type-options": "nosniff",
       },
