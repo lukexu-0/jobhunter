@@ -1201,6 +1201,22 @@ async def test_event_buffer_replay_eviction_snapshot_and_monotonic_ids(tmp_path:
     await manager.delete(created.session_id)
 
 
+async def test_agent_step_uses_job_url_for_internal_browser_page(tmp_path: Path) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+
+    await manager._agent_step(record, 1, "chrome://newtab/")
+
+    event = record.events[-1]
+    assert event.event == "agent_step"
+    assert event.detail.step_number == 1  # type: ignore[union-attr]
+    assert event.detail.current_url == "https://jobs.example/openings/42"  # type: ignore[union-attr]
+    await manager.delete(created.session_id)
+
+
 async def test_sse_heartbeat_and_disconnect_do_not_cancel_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

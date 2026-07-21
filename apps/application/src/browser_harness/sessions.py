@@ -1359,19 +1359,21 @@ class ApplicationSessionManager:
             state="running",
             error=None,
         )
+        private_values = (
+            record.human_gate.redaction_values
+            if record.human_gate is not None
+            else ()
+        )
+        try:
+            public_current_url = redact_public_url(current_url, private_values)
+        except ValueError:
+            public_current_url = record.snapshot.job_url
         await self._publish_event(
             record,
             "agent_step",
             {
                 "step_number": step_number,
-                "current_url": redact_public_url(
-                    current_url,
-                    (
-                        record.human_gate.redaction_values
-                        if record.human_gate is not None
-                        else ()
-                    ),
-                ),
+                "current_url": public_current_url,
             },
         )
 
