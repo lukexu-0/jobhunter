@@ -8,7 +8,7 @@ import subprocess
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -201,6 +201,34 @@ def _sse_frame(event: HarnessEvent) -> str:
     )
 
 
+def _pending_action_for_state(
+    state: SessionState,
+    detail: dict[str, object] | Any,
+) -> dict[str, object] | None:
+    if state == "awaiting_human_navigation":
+        public_detail = HumanNavigationDetail.model_validate(detail)
+        return {
+            "type": "human_navigation",
+            **public_detail.model_dump(),
+        }
+    if state == "awaiting_origin_approval":
+        public_detail = OriginApprovalDetail.model_validate(detail)
+        return {
+            "type": "origin_approval",
+            **public_detail.model_dump(),
+        }
+    if state == "awaiting_additional_info":
+        public_detail = AdditionalInfoRequiredDetail.model_validate(detail)
+        return {
+            "type": "additional_info",
+            **public_detail.model_dump(),
+        }
+    if state == "awaiting_human_review":
+        EmptyEventDetail.model_validate(detail)
+        return {"type": "human_review"}
+    return None
+
+
 
 def _saved_private_values(snapshot: UserInfoSnapshot) -> frozenset[str]:
     values: set[str] = set()
@@ -350,6 +378,7 @@ class ApplicationSessionManager:
     async def create_session(
         self,
         *,
+        session_id: UUID | None = None,
         job_url: str,
         allow_domains: Sequence[str],
         max_steps: int,
@@ -371,7 +400,8 @@ class ApplicationSessionManager:
                 422, "invalid_request", "Request is invalid"
             ) from None
 
-        session_id = uuid4()
+        requested_session_id = session_id
+        session_id = session_id if session_id is not None else uuid4()
         created_at = _now()
         accepted_monotonic = asyncio.get_running_loop().time()
         record = _ApplicationSession(
@@ -381,6 +411,7 @@ class ApplicationSessionManager:
                 state="starting",
                 created_at=created_at,
                 updated_at=created_at,
+                expires_at=created_at + timedelta(seconds=self._config.session_timeout),
                 job_url=f"{origins[0]}/",
                 approved_origins=list(origins),
             ),
@@ -395,7 +426,31 @@ class ApplicationSessionManager:
                 raise HarnessServiceError(
                     503, "service_unavailable", "The browser harness is shutting down"
                 )
+            if (
+                requested_session_id is not None
+                and requested_session_id in self._tombstones
+            ):
+                raise HarnessServiceError(
+                    409,
+                    "session_terminal",
+                    "The application session has already ended",
+                )
             if self._active is not None:
+                if (
+                    requested_session_id is not None
+                    and self._active.session_id == requested_session_id
+                ):
+                    if self._active.snapshot.state in {
+                        "cancelled",
+                        "failed",
+                        "closed",
+                    }:
+                        raise HarnessServiceError(
+                            409,
+                            "session_terminal",
+                            "The application session has already ended",
+                        )
+                    return self._create_response(requested_session_id)
                 raise HarnessServiceError(
                     409,
                     "session_active",
@@ -612,6 +667,9 @@ class ApplicationSessionManager:
                 500, "internal_error", "Request failed"
             ) from None
 
+        return self._create_response(session_id)
+
+    def _create_response(self, session_id: UUID) -> SessionCreateResponse:
         base = f"http://127.0.0.1:{self._config.port}/v1/sessions/{session_id}"
         return SessionCreateResponse(
             session_id=session_id,
@@ -1340,6 +1398,7 @@ class ApplicationSessionManager:
         record.snapshot = self._updated_snapshot(
             record.snapshot,
             state=state,
+            pending_action=_pending_action_for_state(state, detail),
             approved_origins=approved,
             revision_count=(
                 record.human_gate.revision_count
@@ -1357,6 +1416,7 @@ class ApplicationSessionManager:
         record.snapshot = self._updated_snapshot(
             record.snapshot,
             state="running",
+            pending_action=None,
             error=None,
         )
         private_values = (
@@ -1416,6 +1476,7 @@ class ApplicationSessionManager:
         record.snapshot = self._updated_snapshot(
             record.snapshot,
             state=state,
+            pending_action=None,
             error=error,
             approved_origins=(
                 list(record.human_gate.approved_origins)

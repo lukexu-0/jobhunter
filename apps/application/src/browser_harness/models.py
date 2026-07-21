@@ -561,11 +561,48 @@ class SessionError(PublicModel):
         return self
 
 
+class HumanNavigationPendingAction(PublicModel):
+    type: Literal["human_navigation"]
+    instruction: Annotated[
+        str,
+        StringConstraints(strict=True, min_length=1, max_length=2_000),
+    ]
+
+
+class OriginApprovalPendingAction(PublicModel):
+    type: Literal["origin_approval"]
+    origin: StrictText
+
+    @field_validator("origin")
+    @classmethod
+    def _validate_origin(cls, value: str) -> str:
+        return validate_approved_origin(value)
+
+
+class AdditionalInfoPendingAction(PublicModel):
+    type: Literal["additional_info"]
+    questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
+
+
+class HumanReviewPendingAction(PublicModel):
+    type: Literal["human_review"]
+
+
+PendingAction: TypeAlias = Annotated[
+    HumanNavigationPendingAction
+    | OriginApprovalPendingAction
+    | AdditionalInfoPendingAction
+    | HumanReviewPendingAction,
+    Field(discriminator="type"),
+]
+
+
 class SessionSnapshot(PublicModel):
     session_id: UUID
     state: SessionState
     created_at: datetime
     updated_at: datetime
+    expires_at: datetime
     job_url: StrictText
     company: Annotated[str, StringConstraints(strict=True, max_length=500)] | None = None
     role: Annotated[str, StringConstraints(strict=True, max_length=500)] | None = None
@@ -577,6 +614,7 @@ class SessionSnapshot(PublicModel):
     files_attached: list[StrictText] = Field(default_factory=list, max_length=20)
     warnings: list[WarningText] = Field(default_factory=list, max_length=100)
     revision_count: int = Field(default=0, ge=0, le=100)
+    pending_action: PendingAction | None = None
     approved_origins: list[StrictText] = Field(default_factory=list, max_length=20)
     error: SessionError | None = None
 
@@ -599,13 +637,27 @@ class SessionSnapshot(PublicModel):
         return canonical
 
     @model_validator(mode="after")
-    def _validate_timestamps_and_error(self) -> SessionSnapshot:
+    def _validate_timestamps_error_and_pending_action(self) -> SessionSnapshot:
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not precede created_at")
+        if self.expires_at < self.created_at:
+            raise ValueError("expires_at must not precede created_at")
         if self.state == "failed" and self.error is None:
             raise ValueError("failed sessions require an error")
         if self.state != "failed" and self.error is not None:
             raise ValueError("only failed sessions may contain an error")
+        pending_types: dict[str, type[PublicModel]] = {
+            "awaiting_human_navigation": HumanNavigationPendingAction,
+            "awaiting_origin_approval": OriginApprovalPendingAction,
+            "awaiting_additional_info": AdditionalInfoPendingAction,
+            "awaiting_human_review": HumanReviewPendingAction,
+        }
+        expected_pending_type = pending_types.get(self.state)
+        if expected_pending_type is None:
+            if self.pending_action is not None:
+                raise ValueError("only awaiting sessions may contain a pending action")
+        elif not isinstance(self.pending_action, expected_pending_type):
+            raise ValueError("pending action does not match the awaiting session state")
         return self
 
 

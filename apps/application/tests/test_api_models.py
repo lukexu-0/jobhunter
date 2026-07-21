@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -67,6 +67,7 @@ def make_snapshot(**overrides: Any) -> SessionSnapshot:
         "state": "awaiting_human_review",
         "created_at": NOW,
         "updated_at": NOW,
+        "expires_at": NOW + timedelta(hours=1),
         "job_url": "https://jobs.example/apply?candidate=private#ignored",
         "company": "Example Corp",
         "role": "Engineer",
@@ -82,6 +83,7 @@ def make_snapshot(**overrides: Any) -> SessionSnapshot:
         "files_attached": ["resume.pdf"],
         "warnings": [],
         "revision_count": 0,
+        "pending_action": {"type": "human_review"},
         "approved_origins": ["https://jobs.example"],
         "error": None,
     }
@@ -110,6 +112,7 @@ class FakeSessionService:
     async def create_session(
         self,
         *,
+        session_id: UUID | None,
         job_url: str,
         allow_domains: Sequence[str],
         max_steps: int,
@@ -122,6 +125,7 @@ class FakeSessionService:
             raise self.create_error
         self.create_calls.append(
             {
+                "session_id": session_id,
                 "job_url": job_url,
                 "allow_domains": list(allow_domains),
                 "max_steps": max_steps,
@@ -202,6 +206,7 @@ def multipart_parts(
     contexts: int = 0,
     anecdotes: int = 0,
     max_steps: int | str = 100,
+    session_id: UUID | str | None = None,
 ) -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
     parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]] = [
         ("job_url", (None, "https://jobs.example/openings/42?source=board")),
@@ -212,6 +217,8 @@ def multipart_parts(
         ),
         ("resume", ("resume.pdf", b"%PDF-1.7 synthetic", "application/pdf")),
     ]
+    if session_id is not None:
+        parts.insert(0, ("session_id", (None, str(session_id))))
     parts.extend(("allow_domain", (None, domain)) for domain in domains)
     parts.extend(
         (
@@ -484,6 +491,70 @@ def test_session_errors_are_limited_to_the_fixed_catalog() -> None:
 
 
 @pytest.mark.parametrize(
+    ("state", "pending_action"),
+    [
+        (
+            "awaiting_human_navigation",
+            {
+                "type": "human_navigation",
+                "instruction": "Complete identity verification",
+            },
+        ),
+        (
+            "awaiting_origin_approval",
+            {
+                "type": "origin_approval",
+                "origin": "HTTPS://ATS.Example/",
+            },
+        ),
+        (
+            "awaiting_additional_info",
+            {
+                "type": "additional_info",
+                "questions": [
+                    {
+                        "id": "availability",
+                        "key": "availability.start_date",
+                        "scope": "global",
+                        "question": "When can you start?",
+                        "answer_type": "text",
+                    }
+                ],
+            },
+        ),
+        ("awaiting_human_review", {"type": "human_review"}),
+    ],
+)
+def test_pending_action_exactly_matches_awaiting_state(
+    state: str,
+    pending_action: dict[str, Any],
+) -> None:
+    snapshot = make_snapshot(state=state, pending_action=pending_action)
+
+    assert snapshot.pending_action is not None
+    dumped = snapshot.pending_action.model_dump(mode="json")
+    assert dumped["type"] == pending_action["type"]
+    if state == "awaiting_origin_approval":
+        assert dumped["origin"] == "https://ats.example"
+
+    with pytest.raises(ValidationError):
+        make_snapshot(state="running", pending_action=pending_action)
+    with pytest.raises(ValidationError):
+        make_snapshot(state=state, pending_action=None)
+
+
+def test_session_snapshot_requires_a_nonnegative_absolute_expiry() -> None:
+    assert make_snapshot().expires_at == NOW + timedelta(hours=1)
+
+    values = make_snapshot().model_dump()
+    del values["expires_at"]
+    with pytest.raises(ValidationError):
+        SessionSnapshot.model_validate(values)
+    with pytest.raises(ValidationError):
+        make_snapshot(expires_at=NOW - timedelta(microseconds=1))
+
+
+@pytest.mark.parametrize(
     ("payload", "command_type"),
     [
         ({"type": "continue"}, ContinueCommand),
@@ -623,6 +694,7 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
         "/v1/sessions",
         headers=AUTHORIZATION,
         files=multipart_parts(
+            session_id=SESSION_ID,
             domains=("https://jobs.example", "https://ats.example"),
             contexts=2,
             anecdotes=2,
@@ -639,6 +711,7 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
     }
     assert len(service.create_calls) == 1
     call = service.create_calls[0]
+    assert call["session_id"] == SESSION_ID
     assert call["job_url"] == "https://jobs.example/openings/42?source=board"
     assert call["allow_domains"] == ["https://jobs.example", "https://ats.example"]
     assert call["max_steps"] == 321
@@ -655,6 +728,40 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
         ("anecdote-0.txt", b"anecdote 0"),
         ("anecdote-1.txt", b"anecdote 1"),
     ]
+
+
+async def test_multipart_omits_optional_caller_session_id(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        "/v1/sessions",
+        headers=AUTHORIZATION,
+        files=multipart_parts(),
+    )
+
+    assert response.status_code == 202
+    assert service.create_calls[0]["session_id"] is None
+
+
+async def test_multipart_rejects_invalid_caller_session_id_before_dispatch(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        "/v1/sessions",
+        headers=AUTHORIZATION,
+        files=multipart_parts(session_id="not-a-uuid"),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.create_calls == []
 
 
 @pytest.mark.parametrize(

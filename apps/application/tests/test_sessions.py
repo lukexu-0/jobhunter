@@ -32,9 +32,13 @@ from jobhunter_browser_harness.browser import (
     ResolvedBrowserLaunch,
 )
 from jobhunter_browser_harness.models import (
+    AdditionalInfoBooleanCommandAnswer,
+    AdditionalInfoBooleanQuestion,
     AdditionalInfoOption,
     AdditionalInfoDeclinedCommandAnswer,
     AdditionalInfoRuntimeActionResponse,
+    AdditionalInfoMultiSelectCommandAnswer,
+    AdditionalInfoMultiSelectQuestion,
     AdditionalInfoSingleSelectCommandAnswer,
     AdditionalInfoSingleSelectQuestion,
     AdditionalInfoTextCommandAnswer,
@@ -519,9 +523,14 @@ def test_manager_rejects_unusable_bubblewrap_without_fallback(tmp_path: Path) ->
         )
 
 
-async def create_valid(manager: ApplicationSessionManager):
+async def create_valid(
+    manager: ApplicationSessionManager,
+    *,
+    session_id: UUID | None = None,
+):
     personal, resume = valid_uploads()
     return await manager.create_session(
+        session_id=session_id,
         job_url=JOB_URL,
         allow_domains=[],
         max_steps=100,
@@ -666,6 +675,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
     assert snapshot.state == "starting"
     assert snapshot.job_url == "https://jobs.example/[redacted]/42"
     assert snapshot.approved_origins == ["https://jobs.example"]
+    assert (snapshot.expires_at - snapshot.created_at).total_seconds() == 3600
 
     await asyncio.wait_for(runner_started.wait(), timeout=1)
     await wait_until(lambda: len(manager._active.events) >= 2)  # type: ignore[union-attr]
@@ -725,11 +735,141 @@ async def test_singleton_api_returns_exact_active_session_id(tmp_path: Path) -> 
     app = create_app(HarnessConfig(bearer_token=TOKEN), HarnessDependencies(sessions=manager))
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://harness.test") as client:
-        response = await client.post("/v1/sessions", files=multipart_parts(), headers=AUTHORIZATION)
+        response = await client.post(
+            "/v1/sessions",
+            files=[
+                ("session_id", (None, str(uuid4()))),
+                *multipart_parts(),
+            ],
+            headers=AUTHORIZATION,
+        )
 
     assert response.status_code == 409
     assert response.json() == {"code": "session_active", "session_id": str(first.session_id)}
     await manager.delete(first.session_id)
+
+
+async def test_omitted_session_id_uses_uuid4(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated = UUID("c92fc1d7-b6fc-45fd-a288-f2aa2572e5bb")
+    monkeypatch.setattr(sessions_module, "uuid4", lambda: generated)
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+
+    created = await create_valid(manager)
+
+    assert created.session_id == generated
+    await manager.delete(generated)
+
+
+async def test_same_active_caller_id_replays_create_without_uploads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = UUID("69a8263f-910a-46a0-8098-9c5975722e1c")
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    first = await create_valid(manager, session_id=requested)
+    await wait_state(manager, requested, "running")
+    storage_called = False
+
+    async def forbidden_storage(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal storage_called
+        storage_called = True
+        raise AssertionError("idempotent create must not reprocess uploads")
+
+    monkeypatch.setattr(sessions_module, "store_uploads", forbidden_storage)
+    replayed = await create_valid(manager, session_id=requested)
+
+    assert replayed == first
+    assert storage_called is False
+    await manager.delete(requested)
+
+
+async def test_same_starting_caller_id_replays_before_setup_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = UUID("ad6977a1-2a39-4437-af6e-1f168c82df5f")
+    release_preflight = asyncio.Event()
+    fakes = Fakes(check_blocker=release_preflight)
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=fakes,
+    )
+    first_task = asyncio.create_task(
+        create_valid(manager, session_id=requested)
+    )
+    await wait_until(lambda: len(fakes.models) == 1)
+    await asyncio.wait_for(fakes.models[0].check_started.wait(), timeout=1)
+    storage_called = False
+
+    async def forbidden_storage(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal storage_called
+        storage_called = True
+        raise AssertionError("idempotent create must not reprocess uploads")
+
+    monkeypatch.setattr(sessions_module, "store_uploads", forbidden_storage)
+    replayed = await create_valid(manager, session_id=requested)
+
+    assert replayed.session_id == requested
+    assert first_task.done() is False
+    assert storage_called is False
+    release_preflight.set()
+    assert await first_task == replayed
+    await manager.delete(requested)
+
+
+async def test_tombstoned_caller_id_is_a_distinct_conflict_without_uploads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = UUID("88b30bc7-53c6-4393-8c93-9efb99e156cf")
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_valid(manager, session_id=requested)
+    await manager.delete(requested)
+    storage_called = False
+
+    async def forbidden_storage(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal storage_called
+        storage_called = True
+        raise AssertionError("terminal create must not reprocess uploads")
+
+    monkeypatch.setattr(sessions_module, "store_uploads", forbidden_storage)
+    with pytest.raises(HarnessServiceError) as caught:
+        await create_valid(manager, session_id=requested)
+
+    assert_service_error(
+        caught.value,
+        409,
+        "session_terminal",
+        "The application session has already ended",
+    )
+    assert storage_called is False
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=manager),
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://harness.test",
+    ) as client:
+        response = await client.post(
+            "/v1/sessions",
+            files=[
+                ("session_id", (None, str(requested))),
+                *multipart_parts(),
+            ],
+            headers=AUTHORIZATION,
+        )
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": "session_terminal",
+        "message": "The application session has already ended",
+    }
+    assert storage_called is False
 
 
 async def test_navigation_origin_revision_ready_commands_and_resource_retention(
@@ -763,10 +903,32 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
     record = manager._active
     assert record is not None and record.browser is not None and record.human_gate is not None
+    navigation_snapshot = manager.get_snapshot(created.session_id)
+    assert navigation_snapshot.pending_action is not None
+    assert navigation_snapshot.pending_action.model_dump(mode="json") == {
+        "type": "human_navigation",
+        "instruction": "Complete verification for [redacted]",
+    }
+    assert manager._replay_events(
+        navigation_snapshot,
+        tuple(record.events),
+        999,
+    )[0].session.pending_action == navigation_snapshot.pending_action
     record.browser.current_url = "https://ats.example/application/42?token=private"
 
     await manager.command(created.session_id, ContinueCommand(type="continue"))
     await wait_state(manager, created.session_id, "awaiting_origin_approval")
+    origin_snapshot = manager.get_snapshot(created.session_id)
+    assert origin_snapshot.pending_action is not None
+    assert origin_snapshot.pending_action.model_dump(mode="json") == {
+        "type": "origin_approval",
+        "origin": "https://ats.example",
+    }
+    assert manager._replay_events(
+        origin_snapshot,
+        tuple(record.events),
+        999,
+    )[0].session.pending_action == origin_snapshot.pending_action
     with pytest.raises(HarnessServiceError) as wrong_origin:
         await manager.command(
             created.session_id,
@@ -783,6 +945,16 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
         ApproveOriginCommand(type="approve_origin", origin="https://ats.example"),
     )
     await wait_state(manager, created.session_id, "awaiting_human_review")
+    review_snapshot = manager.get_snapshot(created.session_id)
+    assert review_snapshot.pending_action is not None
+    assert review_snapshot.pending_action.model_dump(mode="json") == {
+        "type": "human_review",
+    }
+    assert manager._replay_events(
+        review_snapshot,
+        tuple(record.events),
+        999,
+    )[0].session.pending_action == review_snapshot.pending_action
     await manager.command(
         created.session_id,
         ReviseCommand(type="revise", context="  Use the corrected project example  "),
@@ -794,6 +966,17 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
     )
     await manager.command(created.session_id, ReadyCommand(type="ready"))
     await wait_state(manager, created.session_id, "ready_for_human_submit")
+    assert manager.get_snapshot(created.session_id).pending_action is None
+    assert all(
+        event.session.pending_action is None
+        for event in record.events
+        if event.event in {
+            "session_started",
+            "agent_step",
+            "revision_applied",
+            "ready_for_human_submit",
+        }
+    )
 
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.revision_count == 1
@@ -827,6 +1010,7 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
     assert any(root.iterdir())
 
     await manager.delete(created.session_id)
+    assert manager.get_snapshot(created.session_id).pending_action is None
 
 
 async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_release(
@@ -2276,6 +2460,32 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
                     AdditionalInfoOption(id="board", label="Job board"),
                 ],
             ),
+            AdditionalInfoBooleanQuestion(
+                id="sponsorship",
+                key="authorization.sponsorship_required",
+                scope="global",
+                question="Will you require sponsorship?",
+                answer_type="boolean",
+            ),
+            AdditionalInfoMultiSelectQuestion(
+                id="work_modes",
+                key="preferences.work_modes",
+                scope="application",
+                question="Which work modes are acceptable?",
+                answer_type="multi_select",
+                options=[
+                    AdditionalInfoOption(id="remote", label="Remote"),
+                    AdditionalInfoOption(id="hybrid", label="Hybrid"),
+                    AdditionalInfoOption(id="office", label="Office"),
+                ],
+            ),
+            AdditionalInfoTextQuestion(
+                id="salary",
+                key="compensation.minimum",
+                scope="application",
+                question="What minimum salary do you require?",
+                answer_type="text",
+            ),
         ],
     )
 
@@ -2302,7 +2512,25 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
     assert [question.id for question in required.detail.questions] == [
         "availability",
         "referral",
+        "sponsorship",
+        "work_modes",
+        "salary",
     ]
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.pending_action is not None
+    assert snapshot.pending_action.model_dump(mode="json") == {
+        "type": "additional_info",
+        "questions": [
+            question.model_dump(mode="json")
+            for question in required.detail.questions
+        ],
+    }
+    assert required.session.pending_action == snapshot.pending_action
+    assert manager._replay_events(
+        snapshot,
+        tuple(record.events),
+        999,
+    )[0].session.pending_action == snapshot.pending_action
     previous_store = (tmp_path / "user-info.json").read_bytes()
     with pytest.raises(HarnessServiceError) as partial:
         await manager.command(
@@ -2343,6 +2571,20 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
                     status="answered",
                     option_id="friend",
                 ),
+                AdditionalInfoBooleanCommandAnswer(
+                    id="sponsorship",
+                    status="answered",
+                    value=False,
+                ),
+                AdditionalInfoMultiSelectCommandAnswer(
+                    id="work_modes",
+                    status="answered",
+                    option_ids=["remote", "hybrid"],
+                ),
+                AdditionalInfoDeclinedCommandAnswer(
+                    id="salary",
+                    status="declined",
+                ),
             ],
         ),
     )
@@ -2355,15 +2597,34 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
     assert [answer.value for answer in response.answers] == [
         answer_value,
         "A friend",
+        False,
+        ["Remote", "Hybrid"],
+        None,
     ]
     assert manager.get_snapshot(created.session_id).state == "running"
+    assert manager.get_snapshot(created.session_id).pending_action is None
     saved = record.events[-1]
     assert saved.event == "additional_info_saved"
-    assert saved.detail.count == 2
-    assert answer_value not in saved.model_dump_json()
+    assert saved.detail.count == 5
+    public_data = json.dumps(
+        {
+            "snapshot": manager.get_snapshot(created.session_id).model_dump(mode="json"),
+            "events": [event.model_dump(mode="json") for event in record.events],
+        }
+    )
+    assert answer_value not in public_data
+    assert '"status": "answered"' not in public_data
     disk = json.loads((tmp_path / "user-info.json").read_text(encoding="utf-8"))
     assert disk["global"]["availability.summer_2027"]["value"] == answer_value
     assert disk["applications"][JOB_URL]["referral.source"]["value"] == "A friend"
+    assert disk["global"]["authorization.sponsorship_required"]["value"] is False
+    assert disk["applications"][JOB_URL]["preferences.work_modes"]["value"] == [
+        "Remote",
+        "Hybrid",
+    ]
+    declined = disk["applications"][JOB_URL]["compensation.minimum"]
+    assert declined["status"] == "declined"
+    assert "value" not in declined
 
     with pytest.raises(HarnessServiceError) as stale:
         await manager.command(

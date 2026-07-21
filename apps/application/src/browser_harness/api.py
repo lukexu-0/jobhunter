@@ -28,6 +28,7 @@ class HarnessSessionService(Protocol):
     async def create_session(
         self,
         *,
+        session_id: UUID | None,
         job_url: str,
         allow_domains: Sequence[str],
         max_steps: int,
@@ -128,6 +129,7 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         job_url: Annotated[str, Form()],
         personal_information: Annotated[UploadFile, File()],
         resume: Annotated[UploadFile, File()],
+        session_id: Annotated[UUID | None, Form()] = None,
         allow_domain: Annotated[list[str] | None, Form()] = None,
         max_steps: Annotated[int, Form(ge=1, le=500)] = 100,
         context: Annotated[list[UploadFile] | None, File()] = None,
@@ -139,6 +141,7 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         if len(allow_domains) > 20 or len(context_files) > 10 or len(anecdote_files) > 20:
             raise HarnessServiceError(422, "invalid_request", "Request is invalid")
         return await dependencies.sessions.create_session(
+            session_id=session_id,
             job_url=job_url,
             allow_domains=allow_domains,
             max_steps=max_steps,
