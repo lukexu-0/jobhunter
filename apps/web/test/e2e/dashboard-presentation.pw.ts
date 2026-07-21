@@ -426,12 +426,38 @@ test("uses the shared lifecycle order and exposes a square accessible row action
   await expect(trigger).toHaveCount(0);
   await expect(menu).toHaveCount(0);
   await page.evaluate(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
+  await expect(page.getByRole("searchbox", { name: "Search applications" })).toBeFocused();
   await filter.evaluate((element) => {
     (element as HTMLSelectElement).value = "all";
     element.dispatchEvent(new Event("change", { bubbles: true }));
   });
   await expect(trigger).toBeVisible();
   await expect(menu).toHaveCount(0);
+});
+
+test("closes a stale action dialog when polling removes its application", async ({ page }) => {
+  const run: RunDto = {
+    ...runFixture(),
+    status: "queued",
+    titleOverride: "Externally deleted",
+  };
+  let listRequests = 0;
+  await page.route("**/api/pipeline/runs", async (route) => {
+    listRequests += 1;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: listRequests === 1 ? [run] : [] }),
+    });
+  });
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Actions for Externally deleted" }).click();
+  await page.getByRole("menuitem", { name: "Delete" }).click();
+  const dialog = page.getByRole("dialog", { name: "Delete application?" });
+  await expect(dialog).toBeVisible();
+
+  await expect(dialog).toHaveCount(0, { timeout: 5_000 });
+  await expect(page.getByRole("searchbox", { name: "Search applications" })).toBeFocused();
 });
 
 test("keeps an existing Failed status visible but not selectable", async ({ page }) => {
@@ -522,6 +548,34 @@ test("keeps the action trigger inset and its menu and dialog usable at narrow wi
   await expect(menu).toBeVisible();
   await page.getByRole("heading", { name: "Applications" }).click();
   await expect(menu).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await expect(menu).toBeVisible();
+  const sortControl = page.getByRole("button", { name: /Sort by updated date/ });
+  await sortControl.click();
+  await expect(menu).toHaveCount(0);
+  await expect(sortControl).toBeFocused();
+
+});
+
+test("preserves focus transferred by the Search applications label while dismissing the action menu", async ({ page }) => {
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [{ ...runFixture(), titleOverride: "Focus target" }] }),
+    });
+  });
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Actions for Focus target" }).click();
+  const menu = page.getByRole("menu", { name: "Actions for Focus target" });
+  await expect(menu).toBeVisible();
+
+  const search = page.getByRole("searchbox", { name: "Search applications" });
+  await page.locator(".search-control svg").click();
+  await expect(menu).toHaveCount(0);
+  await expect(search).toBeFocused();
 });
 
 test("keeps the hollow action trigger fully visible while hovering a populated application", async ({ page }) => {
@@ -664,6 +718,22 @@ test("retains identity input on failure and updates the row only after a success
   await expect(row).toBeVisible();
   await search.fill("Original title");
   await expect(page.getByText("No applications match the current search and state.")).toBeVisible();
+
+  await search.fill("Final title");
+  const finalTrigger = row.getByRole("button", { name: "Actions for Final title" });
+  await finalTrigger.click();
+  await page.getByRole("menuitem", { name: "Edit title" }).click();
+  await input.fill("Renamed title");
+  await save.click();
+  await expect(dialog).toHaveCount(0);
+  await expect(row).toHaveCount(0);
+  await expect(search).toBeFocused();
+  await expect(page.getByText("No applications match the current search and state.")).toBeVisible();
+  expect(patchBodies).toEqual([
+    { title: "New title" },
+    { title: "Final title" },
+    { title: "Renamed title" },
+  ]);
 });
 
 test("requires delete confirmation and removes a run only after a successful bodyless response", async ({ page }) => {
@@ -727,6 +797,7 @@ test("requires delete confirmation and removes a run only after a successful bod
   await expect(dialog).toHaveCount(0);
   await expect(row).toHaveCount(0);
   await expect(trigger).toHaveCount(0);
+  await expect(page.getByRole("searchbox", { name: "Search applications" })).toBeFocused();
   await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.")).toBeVisible();
   expect(deleteBodies).toEqual([null, null]);
 });

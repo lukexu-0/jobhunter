@@ -14,6 +14,7 @@ const POLL_INTERVAL_MS = 3_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 const EMPTY_RUNS: RunDto[] = [];
 const ROW_INTERACTIVE_SELECTOR = "a, button, input, select, textarea, summary, [contenteditable='true']";
+const FOCUSABLE_INTERACTIVE_SELECTOR = "a[href], area[href], button:not(:disabled), input:not(:disabled):not([type='hidden']), select:not(:disabled), textarea:not(:disabled), summary, iframe, audio[controls], video[controls], [contenteditable]:not([contenteditable='false']), [tabindex]";
 const SELECTABLE_APPLICATION_STATUSES = APPLICATION_STATUSES.filter((status) => status !== "failed");
 
 
@@ -142,10 +143,30 @@ export function RunDashboard() {
   const actionMenuRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const actionTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
-  const restoreActionTriggerFocus = useCallback((runId: string) => {
-    window.requestAnimationFrame(() => actionTriggerRefs.current.get(runId)?.focus());
+  const scheduleFocusRestoration = useCallback((runId?: string) => {
+    window.requestAnimationFrame(() => {
+      const focusedElement = document.activeElement;
+      if (
+        focusedElement
+        && focusedElement !== document.body
+        && focusedElement.isConnected
+        && !actionMenuRef.current?.contains(focusedElement)
+        && !dialogRef.current?.contains(focusedElement)
+      ) return;
+      const target = runId
+        ? actionTriggerRefs.current.get(runId) ?? searchInputRef.current
+        : searchInputRef.current;
+      target?.focus();
+    });
   }, []);
+  const focusSearchApplications = useCallback(() => {
+    scheduleFocusRestoration();
+  }, [scheduleFocusRestoration]);
+  const restoreActionTriggerFocus = useCallback((runId: string) => {
+    scheduleFocusRestoration(runId);
+  }, [scheduleFocusRestoration]);
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequest = useMemo(
@@ -255,7 +276,8 @@ export function RunDashboard() {
       const target = event.target;
       if (!(target instanceof Node)) return;
       if (actionMenuRef.current?.contains(target) || actionTriggerRefs.current.get(runId)?.contains(target)) return;
-      dismiss();
+      const targetElement = target instanceof Element ? target : target.parentElement;
+      dismiss(!targetElement?.closest(FOCUSABLE_INTERACTIVE_SELECTOR));
     };
     const handleFocusIn = (event: FocusEvent) => {
       const target = event.target;
@@ -389,6 +411,7 @@ export function RunDashboard() {
         return next;
       });
       setActiveDialog(null);
+      focusSearchApplications();
     } catch (error) {
       setDialogError(publicMessage(error, "The application could not be deleted. Try again."));
     } finally {
@@ -470,8 +493,17 @@ export function RunDashboard() {
     : undefined;
 
   useEffect(() => {
-    if (actionMenu && !actionMenuRun) setActionMenu(null);
-  }, [actionMenu, actionMenuRun]);
+    if (!actionMenu || actionMenuRun) return;
+    const { runId } = actionMenu;
+    setActionMenu(null);
+    restoreActionTriggerFocus(runId);
+  }, [actionMenu, actionMenuRun, restoreActionTriggerFocus]);
+  useEffect(() => {
+    if (!activeDialog || runs.some((run) => run.id === activeDialog.runId)) return;
+    setActiveDialog(null);
+    setDialogError(null);
+    focusSearchApplications();
+  }, [activeDialog, focusSearchApplications, runs]);
   const normalizedEditValue = editValue.trim();
   const isEditValueValid = normalizedEditValue.length >= 1 && normalizedEditValue.length <= 200;
   const isDialogBusy = Boolean(activeDialog && busyRunIds.has(activeDialog.runId));
@@ -535,6 +567,7 @@ export function RunDashboard() {
                 <path d="m16 16 4 4" />
               </svg>
               <input
+                ref={searchInputRef}
                 type="search"
                 value={query}
                 placeholder="Search applications"
