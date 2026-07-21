@@ -995,12 +995,14 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
         "agent_step",
         "human_navigation_required",
         "origin_approval_required",
+        "snapshot",
         "review_required",
         "revision_applied",
         "review_required",
         "ready_for_human_submit",
     ]
-    assert [event.id for event in record.events] == list(range(1, 9))
+    assert [event.id for event in record.events] == list(range(1, 10))
+    assert record.events[4].session.pending_action is None
     public_events = json.dumps([event.model_dump(mode="json") for event in record.events])
     assert PROFILE_SECRET not in public_events
     assert "token=private" not in public_events

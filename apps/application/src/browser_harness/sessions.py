@@ -1395,20 +1395,31 @@ class ApplicationSessionManager:
             if record.human_gate is not None
             else record.snapshot.approved_origins
         )
+        revision_count = (
+            record.human_gate.revision_count
+            if record.human_gate is not None
+            else record.snapshot.revision_count
+        )
+        pending_action = _pending_action_for_state(state, detail)
+        snapshot_changed = (
+            record.snapshot.state != state
+            or record.snapshot.pending_action != pending_action
+            or record.snapshot.approved_origins != approved
+            or record.snapshot.revision_count != revision_count
+            or record.snapshot.error is not None
+        )
         record.snapshot = self._updated_snapshot(
             record.snapshot,
             state=state,
-            pending_action=_pending_action_for_state(state, detail),
+            pending_action=pending_action,
             approved_origins=approved,
-            revision_count=(
-                record.human_gate.revision_count
-                if record.human_gate is not None
-                else record.snapshot.revision_count
-            ),
+            revision_count=revision_count,
             error=None,
         )
         if event is not None:
             await self._publish_event(record, event, detail)
+        elif snapshot_changed:
+            await self._publish_event(record, "snapshot", {})
 
     async def _agent_step(
         self, record: _ApplicationSession, step_number: int, current_url: str
