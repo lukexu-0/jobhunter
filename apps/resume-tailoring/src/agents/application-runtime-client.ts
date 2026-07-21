@@ -1,4 +1,10 @@
 import { z } from "zod";
+import {
+  AdditionalInfoQuestionSchema,
+  AdditionalInfoQuestionIdSchema,
+  FieldResultSchema,
+  UserInfoKeySchema,
+} from "../contracts";
 
 function hasCodePointLength(
   value: string,
@@ -13,25 +19,6 @@ function hasCodePointLength(
   return length >= minimum;
 }
 
-export const FieldTypeSchema = z.enum([
-  "text",
-  "textarea",
-  "select",
-  "radio",
-  "checkbox",
-  "number",
-  "file",
-  "unknown",
-]);
-export type FieldType = z.infer<typeof FieldTypeSchema>;
-
-export const FieldResultSchema = z.object({
-  label: z.string().refine((value) => hasCodePointLength(value, 1, 500)),
-  field_type: FieldTypeSchema,
-  value_present: z.boolean(),
-  note: z.string().refine((value) => hasCodePointLength(value, 0, 1_000)).default(""),
-}).strict();
-export type FieldResult = z.infer<typeof FieldResultSchema>;
 
 export const ApplicationRunResultSchema = z.object({
   status: z.enum(["ready_for_human_submit", "cancelled"]),
@@ -70,52 +57,6 @@ export type RequestOriginApprovalRuntimeAction = z.infer<
   typeof RequestOriginApprovalRuntimeActionSchema
 >;
 
-const AdditionalInfoQuestionIdSchema = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/);
-const UserInfoKeySchema = z.string()
-  .refine((value) => hasCodePointLength(value, 1, 100))
-  .regex(/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/);
-const AdditionalInfoQuestionTextSchema = z.string().trim()
-  .refine((value) => hasCodePointLength(value, 1, 500));
-const AdditionalInfoOptionLabelSchema = z.string().trim()
-  .refine((value) => hasCodePointLength(value, 1, 200));
-const AdditionalInfoOptionSchema = z.object({
-  id: AdditionalInfoQuestionIdSchema,
-  label: AdditionalInfoOptionLabelSchema,
-}).strict();
-const AdditionalInfoQuestionBaseShape = {
-  id: AdditionalInfoQuestionIdSchema,
-  key: UserInfoKeySchema,
-  scope: z.enum(["global", "application"]),
-  question: AdditionalInfoQuestionTextSchema,
-};
-const AdditionalInfoOptionsSchema = z.array(AdditionalInfoOptionSchema).min(2).max(20)
-  .superRefine((options, context) => {
-    if (new Set(options.map((option) => option.id)).size !== options.length) {
-      context.addIssue({ code: "custom", message: "option ids must be unique" });
-    }
-  });
-
-export const AdditionalInfoQuestionSchema = z.discriminatedUnion("answer_type", [
-  z.object({
-    ...AdditionalInfoQuestionBaseShape,
-    answer_type: z.literal("text"),
-  }).strict(),
-  z.object({
-    ...AdditionalInfoQuestionBaseShape,
-    answer_type: z.literal("boolean"),
-  }).strict(),
-  z.object({
-    ...AdditionalInfoQuestionBaseShape,
-    answer_type: z.literal("single_select"),
-    options: AdditionalInfoOptionsSchema,
-  }).strict(),
-  z.object({
-    ...AdditionalInfoQuestionBaseShape,
-    answer_type: z.literal("multi_select"),
-    options: AdditionalInfoOptionsSchema,
-  }).strict(),
-]);
-export type AdditionalInfoQuestion = z.infer<typeof AdditionalInfoQuestionSchema>;
 
 export const RequestAdditionalInfoRuntimeActionSchema = z.object({
   type: z.literal("request_additional_info"),

@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   AdditionalInfoQuestionSchema,
+  ApplicationSessionCommandSchema,
+  ApplicationSessionEventDtoSchema,
+  ApplicationSessionSnapshotDtoSchema,
+  ApplicationSessionViewSchema,
+  type AdditionalInfoQuestion,
+} from "../src/contracts";
+import {
   AcceptedAdditionalInfoAnswerSchema,
   AdditionalInfoRuntimeActionResponseSchema,
   ApplicationRuntimeError,
@@ -8,7 +15,6 @@ import {
   RequestAdditionalInfoRuntimeActionSchema,
   RuntimeActionRequestSchema,
   RuntimeActionResponseSchema,
-  type AdditionalInfoQuestion,
   type RuntimeActionRequest,
   type RuntimeActionResponse,
 } from "../src/agents/application-runtime-client";
@@ -80,6 +86,123 @@ const ADDITIONAL_INFO_QUESTIONS: AdditionalInfoQuestion[] = [
     ],
   },
 ];
+
+const PUBLIC_APPLICATION_SNAPSHOT = {
+  generation: 2,
+  bridgeState: "awaiting_additional_info" as const,
+  harnessState: "awaiting_additional_info" as const,
+  createdAt: 1_720_000_000_000,
+  updatedAt: 1_720_000_001_000,
+  terminalAt: null,
+  expiresAt: 1_720_003_600_000,
+  company: "Example Corp",
+  role: "Software Engineer",
+  fieldsFilled: [
+    {
+      label: "Full name",
+      fieldType: "text" as const,
+      valuePresent: true,
+      note: "",
+    },
+  ],
+  fieldsNeedingHuman: [],
+  filesAttached: ["Alex_Example_Resume.pdf"],
+  warnings: ["Review the application before submitting."],
+  revisionCount: 1,
+  pendingAction: {
+    type: "additional_info" as const,
+    questions: [
+      {
+        id: "work_setting",
+        scope: "application" as const,
+        question: "Which work settings can you accept?",
+        answerType: "multi_select" as const,
+        options: [
+          { id: "remote", label: "Remote" },
+          { id: "onsite", label: "On-site" },
+        ],
+      },
+    ],
+  },
+  error: null,
+};
+
+test("strictly validates projected application snapshots and events", () => {
+  expect(ApplicationSessionSnapshotDtoSchema.parse(PUBLIC_APPLICATION_SNAPSHOT))
+    .toEqual(PUBLIC_APPLICATION_SNAPSHOT);
+  const required = {
+    generation: 2,
+    event: "additional_info_required" as const,
+    session: PUBLIC_APPLICATION_SNAPSHOT,
+    detail: {
+      questions: PUBLIC_APPLICATION_SNAPSHOT.pendingAction.questions,
+    },
+  };
+  expect(ApplicationSessionEventDtoSchema.parse(required)).toEqual(required);
+  expect(ApplicationSessionEventDtoSchema.safeParse({
+    ...required,
+    detail: { ...required.detail, currentUrl: "https://private.example/job" },
+  }).success).toBe(false);
+  expect(ApplicationSessionSnapshotDtoSchema.safeParse({
+    ...PUBLIC_APPLICATION_SNAPSHOT,
+    sessionId: SESSION_ID,
+  }).success).toBe(false);
+  expect(ApplicationSessionSnapshotDtoSchema.safeParse({
+    ...PUBLIC_APPLICATION_SNAPSHOT,
+    bridgeState: "running",
+  }).success).toBe(false);
+  expect(ApplicationSessionSnapshotDtoSchema.safeParse({
+    ...PUBLIC_APPLICATION_SNAPSHOT,
+    bridgeState: "failed",
+    harnessState: "failed",
+    terminalAt: PUBLIC_APPLICATION_SNAPSHOT.updatedAt,
+    pendingAction: null,
+    error: { code: "browser_failed", message: "raw browser exception" },
+  }).success).toBe(false);
+});
+
+test("strictly validates application commands and not-started views", () => {
+  const command = {
+    type: "provide_additional_info" as const,
+    answers: [
+      {
+        id: "summer_availability",
+        status: "answered" as const,
+        value: "June through August 2027",
+      },
+      {
+        id: "work_setting",
+        status: "answered" as const,
+        option_ids: ["remote", "onsite"],
+      },
+      {
+        id: "referral",
+        status: "declined" as const,
+      },
+    ],
+  };
+  expect(ApplicationSessionCommandSchema.parse(command)).toEqual(command);
+  expect(ApplicationSessionCommandSchema.safeParse({
+    ...command,
+    answers: [
+      {
+        id: "work_setting",
+        status: "answered",
+        option_ids: ["remote", "remote"],
+      },
+    ],
+  }).success).toBe(false);
+  const notStarted = {
+    state: "not_started" as const,
+    canStart: false,
+    canStartAfterApproval: true,
+  };
+  expect(ApplicationSessionViewSchema.parse(notStarted)).toEqual(notStarted);
+  expect(ApplicationSessionViewSchema.safeParse({
+    ...notStarted,
+    blockedReason: "harness_unconfigured",
+  }).success).toBe(false);
+});
 
 test("mirrors strict additional-information question and request constraints", () => {
   for (const question of ADDITIONAL_INFO_QUESTIONS) {

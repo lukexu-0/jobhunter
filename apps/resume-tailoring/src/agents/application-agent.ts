@@ -9,11 +9,11 @@ import {
   type ToolOptionsWithGuardrails,
 } from "@openai/agents-core";
 import { z } from "zod";
+import { AdditionalInfoQuestionSchema } from "../contracts";
 import { MODEL_NAME } from "../models/oauth-codex-model.ts";
 import {
   ApplicationRuntimeError,
   ApplicationRunResultSchema,
-  AdditionalInfoQuestionSchema,
   type ApplicationRunResult,
   type ApplicationRuntimeClient,
   type RuntimeActionResponse,

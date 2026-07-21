@@ -1,5 +1,60 @@
 import { z } from "zod";
 
+function hasCodePointLength(
+  value: string,
+  minimum: number,
+  maximum: number,
+): boolean {
+  let length = 0;
+  for (const _character of value) {
+    length += 1;
+    if (length > maximum) return false;
+  }
+  return length >= minimum;
+}
+
+function parsedHttpUrl(value: string): URL | undefined {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizedHostname(url: URL): string {
+  return url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "::1" || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+}
+
+function isApplicationOrigin(value: string): boolean {
+  const url = parsedHttpUrl(value);
+  if (
+    url === undefined
+    || url.hostname.includes("*")
+    || url.username !== ""
+    || url.password !== ""
+    || url.pathname !== "/"
+    || url.search !== ""
+    || url.hash !== ""
+  ) {
+    return false;
+  }
+  return url.protocol === "https:" || isLoopbackHostname(normalizedHostname(url));
+}
+
+function isSanitizedBasename(value: string): boolean {
+  return hasCodePointLength(value, 1, 255)
+    && value !== "."
+    && value !== ".."
+    && !value.includes("/")
+    && !value.includes("\\")
+    && !/[\u0000-\u001f]/.test(value);
+}
+
 export const HealthResponseSchema = z.object({
   status: z.literal("ok"),
 });
@@ -104,6 +159,73 @@ export const UpdateRunIdentityRequestSchema = z
 
 export const RevisionOriginSchema = z.enum(["initial", "machine-regeneration", "human-comments"]);
 export type RevisionOrigin = z.infer<typeof RevisionOriginSchema>;
+
+export const FieldTypeSchema = z.enum([
+  "text",
+  "textarea",
+  "select",
+  "radio",
+  "checkbox",
+  "number",
+  "file",
+  "unknown",
+]);
+export type FieldType = z.infer<typeof FieldTypeSchema>;
+
+export const FieldResultSchema = z.object({
+  label: z.string().refine((value) => hasCodePointLength(value, 1, 500)),
+  field_type: FieldTypeSchema,
+  value_present: z.boolean(),
+  note: z.string().refine((value) => hasCodePointLength(value, 0, 1_000)).default(""),
+}).strict();
+export type FieldResult = z.infer<typeof FieldResultSchema>;
+
+export const AdditionalInfoQuestionIdSchema = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/);
+export const UserInfoKeySchema = z.string()
+  .refine((value) => hasCodePointLength(value, 1, 100))
+  .regex(/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/);
+const AdditionalInfoQuestionTextSchema = z.string().trim()
+  .refine((value) => hasCodePointLength(value, 1, 500));
+const AdditionalInfoOptionLabelSchema = z.string().trim()
+  .refine((value) => hasCodePointLength(value, 1, 200));
+const AdditionalInfoOptionSchema = z.object({
+  id: AdditionalInfoQuestionIdSchema,
+  label: AdditionalInfoOptionLabelSchema,
+}).strict();
+const AdditionalInfoQuestionBaseShape = {
+  id: AdditionalInfoQuestionIdSchema,
+  key: UserInfoKeySchema,
+  scope: z.enum(["global", "application"]),
+  question: AdditionalInfoQuestionTextSchema,
+};
+const AdditionalInfoOptionsSchema = z.array(AdditionalInfoOptionSchema).min(2).max(20)
+  .superRefine((options, context) => {
+    if (new Set(options.map((option) => option.id)).size !== options.length) {
+      context.addIssue({ code: "custom", message: "option ids must be unique" });
+    }
+  });
+
+export const AdditionalInfoQuestionSchema = z.discriminatedUnion("answer_type", [
+  z.object({
+    ...AdditionalInfoQuestionBaseShape,
+    answer_type: z.literal("text"),
+  }).strict(),
+  z.object({
+    ...AdditionalInfoQuestionBaseShape,
+    answer_type: z.literal("boolean"),
+  }).strict(),
+  z.object({
+    ...AdditionalInfoQuestionBaseShape,
+    answer_type: z.literal("single_select"),
+    options: AdditionalInfoOptionsSchema,
+  }).strict(),
+  z.object({
+    ...AdditionalInfoQuestionBaseShape,
+    answer_type: z.literal("multi_select"),
+    options: AdditionalInfoOptionsSchema,
+  }).strict(),
+]);
+export type AdditionalInfoQuestion = z.infer<typeof AdditionalInfoQuestionSchema>;
 
 const ResumeDiffIdSchema = z.string().trim().min(1).max(200);
 const ResumeDiffTextSchema = z.string().trim().min(1).max(2_000);
@@ -250,6 +372,432 @@ export const RunDtoSchema = z
   })
   .strict();
 export type RunDto = z.infer<typeof RunDtoSchema>;
+
+export const HarnessSessionStateSchema = z.enum([
+  "starting",
+  "running",
+  "awaiting_human_navigation",
+  "awaiting_origin_approval",
+  "awaiting_additional_info",
+  "awaiting_human_review",
+  "ready_for_human_submit",
+  "cancelled",
+  "failed",
+  "closed",
+]);
+export type HarnessSessionState = z.infer<typeof HarnessSessionStateSchema>;
+
+export const ApplicationSessionBridgeStateSchema = z.enum([
+  "reserved",
+  ...HarnessSessionStateSchema.options,
+  "lost",
+]);
+export type ApplicationSessionBridgeState = z.infer<
+  typeof ApplicationSessionBridgeStateSchema
+>;
+
+export const ApplicationFieldResultSchema = z.object({
+  label: z.string().refine((value) => hasCodePointLength(value, 1, 500)),
+  fieldType: FieldTypeSchema,
+  valuePresent: z.boolean(),
+  note: z.string().refine((value) => hasCodePointLength(value, 0, 1_000)),
+}).strict();
+export type ApplicationFieldResult = z.infer<typeof ApplicationFieldResultSchema>;
+
+const ApplicationAdditionalInfoQuestionBaseShape = {
+  id: AdditionalInfoQuestionIdSchema,
+  scope: z.enum(["global", "application"]),
+  question: AdditionalInfoQuestionTextSchema,
+};
+
+export const ApplicationAdditionalInfoQuestionSchema = z.discriminatedUnion(
+  "answerType",
+  [
+    z.object({
+      ...ApplicationAdditionalInfoQuestionBaseShape,
+      answerType: z.literal("text"),
+    }).strict(),
+    z.object({
+      ...ApplicationAdditionalInfoQuestionBaseShape,
+      answerType: z.literal("boolean"),
+    }).strict(),
+    z.object({
+      ...ApplicationAdditionalInfoQuestionBaseShape,
+      answerType: z.literal("single_select"),
+      options: AdditionalInfoOptionsSchema,
+    }).strict(),
+    z.object({
+      ...ApplicationAdditionalInfoQuestionBaseShape,
+      answerType: z.literal("multi_select"),
+      options: AdditionalInfoOptionsSchema,
+    }).strict(),
+  ],
+);
+export type ApplicationAdditionalInfoQuestion = z.infer<
+  typeof ApplicationAdditionalInfoQuestionSchema
+>;
+
+export const ApplicationPendingActionSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("human_navigation"),
+    instruction: z.string().trim()
+      .refine((value) => hasCodePointLength(value, 1, 2_000)),
+  }).strict(),
+  z.object({
+    type: z.literal("origin_approval"),
+    origin: z.string().refine(isApplicationOrigin),
+  }).strict(),
+  z.object({
+    type: z.literal("additional_info"),
+    questions: z.array(ApplicationAdditionalInfoQuestionSchema).min(1).max(20),
+  }).strict().superRefine((value, context) => {
+    if (new Set(value.questions.map((question) => question.id)).size !== value.questions.length) {
+      context.addIssue({ code: "custom", message: "question ids must be unique" });
+    }
+  }),
+  z.object({
+    type: z.literal("human_review"),
+  }).strict(),
+]);
+export type ApplicationPendingAction = z.infer<typeof ApplicationPendingActionSchema>;
+
+const APPLICATION_SESSION_ERROR_MESSAGES = {
+  oauth_required: "Connect OpenAI Codex in Provider access",
+  pipeline_unavailable: "The local pipeline model service is unavailable",
+  model_timeout: "The model request timed out",
+  invalid_model_output: "The model returned invalid output",
+  model_failed: "The model request failed",
+  browser_failed: "The browser session failed",
+  application_mismatch: "The open page does not match the requested job",
+  step_limit: "The application step limit was reached",
+  session_timeout: "The application session expired",
+} as const;
+
+export const ApplicationSessionErrorSchema = z.discriminatedUnion("code", [
+  z.object({
+    code: z.literal("oauth_required"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.oauth_required),
+  }).strict(),
+  z.object({
+    code: z.literal("pipeline_unavailable"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.pipeline_unavailable),
+  }).strict(),
+  z.object({
+    code: z.literal("model_timeout"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.model_timeout),
+  }).strict(),
+  z.object({
+    code: z.literal("invalid_model_output"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.invalid_model_output),
+  }).strict(),
+  z.object({
+    code: z.literal("model_failed"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.model_failed),
+  }).strict(),
+  z.object({
+    code: z.literal("browser_failed"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.browser_failed),
+  }).strict(),
+  z.object({
+    code: z.literal("application_mismatch"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.application_mismatch),
+  }).strict(),
+  z.object({
+    code: z.literal("step_limit"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.step_limit),
+  }).strict(),
+  z.object({
+    code: z.literal("session_timeout"),
+    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.session_timeout),
+  }).strict(),
+]);
+export type ApplicationSessionError = z.infer<typeof ApplicationSessionErrorSchema>;
+
+const TERMINAL_APPLICATION_BRIDGE_STATES = new Set<ApplicationSessionBridgeState>([
+  "cancelled",
+  "failed",
+  "closed",
+  "lost",
+]);
+const PENDING_ACTION_BY_STATE: Readonly<
+  Partial<Record<ApplicationSessionBridgeState, ApplicationPendingAction["type"]>>
+> = {
+  awaiting_human_navigation: "human_navigation",
+  awaiting_origin_approval: "origin_approval",
+  awaiting_additional_info: "additional_info",
+  awaiting_human_review: "human_review",
+};
+
+export const ApplicationSessionSnapshotDtoSchema = z.object({
+  generation: z.number().int().positive(),
+  bridgeState: ApplicationSessionBridgeStateSchema,
+  harnessState: HarnessSessionStateSchema.nullable(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  terminalAt: z.number().int().nonnegative().nullable(),
+  expiresAt: z.number().int().nonnegative().nullable(),
+  company: z.string().refine((value) => hasCodePointLength(value, 0, 500)).nullable(),
+  role: z.string().refine((value) => hasCodePointLength(value, 0, 500)).nullable(),
+  fieldsFilled: z.array(ApplicationFieldResultSchema).max(500),
+  fieldsNeedingHuman: z.array(ApplicationFieldResultSchema).max(500),
+  filesAttached: z.array(z.string().refine(isSanitizedBasename)).max(20),
+  warnings: z.array(
+    z.string().refine((value) => hasCodePointLength(value, 1, 1_000)),
+  ).max(100),
+  revisionCount: z.number().int().min(0).max(100),
+  pendingAction: ApplicationPendingActionSchema.nullable(),
+  error: ApplicationSessionErrorSchema.nullable(),
+}).strict().superRefine((snapshot, context) => {
+  if (snapshot.updatedAt < snapshot.createdAt) {
+    context.addIssue({ code: "custom", path: ["updatedAt"], message: "updatedAt precedes createdAt" });
+  }
+  const terminal = TERMINAL_APPLICATION_BRIDGE_STATES.has(snapshot.bridgeState);
+  if (terminal !== (snapshot.terminalAt !== null)) {
+    context.addIssue({
+      code: "custom",
+      path: ["terminalAt"],
+      message: "terminalAt must match terminal bridge state",
+    });
+  }
+  if (snapshot.bridgeState === "reserved") {
+    if (snapshot.harnessState !== null || snapshot.expiresAt !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["harnessState"],
+        message: "reserved sessions have no harness state or expiry",
+      });
+    }
+  } else if (
+    snapshot.bridgeState !== "lost"
+    && !(snapshot.bridgeState === "closed" && snapshot.harnessState === null)
+    && snapshot.harnessState !== snapshot.bridgeState
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["harnessState"],
+      message: "harness state does not match bridge state",
+    });
+  }
+  const expectedPendingAction = PENDING_ACTION_BY_STATE[snapshot.bridgeState];
+  if (
+    (expectedPendingAction === undefined && snapshot.pendingAction !== null)
+    || (
+      expectedPendingAction !== undefined
+      && snapshot.pendingAction?.type !== expectedPendingAction
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["pendingAction"],
+      message: "pending action does not match bridge state",
+    });
+  }
+  if ((snapshot.bridgeState === "failed") !== (snapshot.error !== null)) {
+    context.addIssue({
+      code: "custom",
+      path: ["error"],
+      message: "error must match failed bridge state",
+    });
+  }
+});
+export type ApplicationSessionSnapshotDto = z.infer<
+  typeof ApplicationSessionSnapshotDtoSchema
+>;
+
+const EmptyApplicationEventDetailSchema = z.object({}).strict();
+const ApplicationEventBaseShape = {
+  generation: z.number().int().positive(),
+  session: ApplicationSessionSnapshotDtoSchema,
+};
+
+export const ApplicationSessionEventDtoSchema = z.discriminatedUnion("event", [
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("session_started"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("agent_step"),
+    detail: z.object({ stepNumber: z.number().int().min(1).max(500) }).strict(),
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("snapshot"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("human_navigation_required"),
+    detail: z.object({
+      instruction: z.string().trim()
+        .refine((value) => hasCodePointLength(value, 1, 2_000)),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("origin_approval_required"),
+    detail: z.object({ origin: z.string().refine(isApplicationOrigin) }).strict(),
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("additional_info_required"),
+    detail: z.object({
+      questions: z.array(ApplicationAdditionalInfoQuestionSchema).min(1).max(20),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("additional_info_saved"),
+    detail: z.object({ count: z.number().int().min(1).max(20) }).strict(),
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("review_required"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("revision_applied"),
+    detail: z.object({
+      revisionCount: z.number().int().min(1).max(100),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("ready_for_human_submit"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("cancelled"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("failed"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("closed"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+]).superRefine((event, context) => {
+  if (event.generation !== event.session.generation) {
+    context.addIssue({
+      code: "custom",
+      path: ["generation"],
+      message: "event and session generations do not match",
+    });
+  }
+});
+export type ApplicationSessionEventDto = z.infer<
+  typeof ApplicationSessionEventDtoSchema
+>;
+
+const AnsweredTextOrBooleanSchema = z.union([
+  z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
+  z.boolean(),
+]);
+const ApplicationSessionAnswerSchema = z.union([
+  z.object({
+    id: AdditionalInfoQuestionIdSchema,
+    status: z.literal("declined"),
+  }).strict(),
+  z.object({
+    id: AdditionalInfoQuestionIdSchema,
+    status: z.literal("answered"),
+    value: AnsweredTextOrBooleanSchema,
+  }).strict(),
+  z.object({
+    id: AdditionalInfoQuestionIdSchema,
+    status: z.literal("answered"),
+    option_id: AdditionalInfoQuestionIdSchema,
+  }).strict(),
+  z.object({
+    id: AdditionalInfoQuestionIdSchema,
+    status: z.literal("answered"),
+    option_ids: z.array(AdditionalInfoQuestionIdSchema).min(1).max(20)
+      .refine((values) => new Set(values).size === values.length, {
+        message: "option ids must be unique",
+      }),
+  }).strict(),
+]);
+
+export const ApplicationSessionCommandSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("continue") }).strict(),
+  z.object({
+    type: z.literal("approve_origin"),
+    origin: z.string().refine(isApplicationOrigin),
+  }).strict(),
+  z.object({
+    type: z.literal("provide_additional_info"),
+    answers: z.array(ApplicationSessionAnswerSchema).min(1).max(20),
+  }).strict().superRefine((command, context) => {
+    if (new Set(command.answers.map((answer) => answer.id)).size !== command.answers.length) {
+      context.addIssue({ code: "custom", message: "answer ids must be unique" });
+    }
+  }),
+  z.object({
+    type: z.literal("revise"),
+    context: z.string().trim()
+      .refine((value) => hasCodePointLength(value, 1, 20_000)),
+  }).strict(),
+  z.object({ type: z.literal("ready") }).strict(),
+  z.object({ type: z.literal("cancel") }).strict(),
+]);
+export type ApplicationSessionCommand = z.infer<typeof ApplicationSessionCommandSchema>;
+
+export const ApplicationStartBlockReasonSchema = z.enum([
+  "legacy_job_url_unavailable",
+  "job_url_requires_https",
+  "resume_not_approved",
+  "artifacts_pruned",
+  "harness_unconfigured",
+  "profile_unavailable",
+]);
+export type ApplicationStartBlockReason = z.infer<
+  typeof ApplicationStartBlockReasonSchema
+>;
+
+export const ApplicationSessionNotStartedSchema = z.object({
+  state: z.literal("not_started"),
+  canStart: z.boolean(),
+  canStartAfterApproval: z.boolean(),
+  blockedReason: ApplicationStartBlockReasonSchema.optional(),
+}).strict().superRefine((view, context) => {
+  if (view.canStart && view.canStartAfterApproval) {
+    context.addIssue({
+      code: "custom",
+      message: "application cannot start both before and after approval",
+    });
+  }
+  const available = view.canStart || view.canStartAfterApproval;
+  if (available === (view.blockedReason !== undefined)) {
+    context.addIssue({
+      code: "custom",
+      path: ["blockedReason"],
+      message: "blocked reason must match application availability",
+    });
+  }
+});
+export type ApplicationSessionNotStarted = z.infer<
+  typeof ApplicationSessionNotStartedSchema
+>;
+
+export const ApplicationSessionViewSchema = z.union([
+  ApplicationSessionSnapshotDtoSchema,
+  ApplicationSessionNotStartedSchema,
+]);
+export type ApplicationSessionView = z.infer<typeof ApplicationSessionViewSchema>;
+
+export const StartApplicationSessionRequestSchema = z.object({
+  expectedApprovedPdfSha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+export type StartApplicationSessionRequest = z.infer<
+  typeof StartApplicationSessionRequestSchema
+>;
 
 export const JOB_URL_MAX_CHARS = 2_048;
 export const JOB_DESCRIPTION_MIN_CHARS = 40;
