@@ -112,6 +112,7 @@ export function createRunRoutes(service: RunRouteService) {
       }
       if (request.method === "DELETE" && segments.length === 3) {
         await service.deleteRun(runId);
+        service.kick();
         return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
       }
       if (request.method === "GET" && segments[3] === "artifacts" && segments.length === 5) {

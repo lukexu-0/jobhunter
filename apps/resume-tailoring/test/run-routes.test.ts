@@ -213,7 +213,7 @@ describe("run HTTP routes", () => {
     expect(target.kickCount()).toBe(0);
   });
 
-  test("deletes bodylessly with 204 and maps live claims without waking the scheduler", async () => {
+  test("deletes bodylessly with 204, wakes the scheduler, and maps live claims without waking it", async () => {
     const deleted: string[] = [];
     const target = service({
       deleteRun: async (id) => {
@@ -229,16 +229,17 @@ describe("run HTTP routes", () => {
     expect(response.headers.get("content-type")).toBeNull();
     expect(await response.text()).toBe("");
     expect(deleted).toEqual(["run-1"]);
-    expect(target.kickCount()).toBe(0);
+    expect(target.kickCount()).toBe(1);
 
-    const claimed = await request(service({
+    const claimedTarget = service({
       deleteRun: async () => {
         throw Object.assign(new Error("run has a live claim"), {
           code: "RUN_CLAIMED",
           status: 409,
         });
       },
-    }), "/v1/runs/run-1", {
+    });
+    const claimed = await request(claimedTarget, "/v1/runs/run-1", {
       method: "DELETE",
       headers: { origin: ORIGIN },
     });
@@ -246,6 +247,7 @@ describe("run HTTP routes", () => {
     expect(await claimed.json()).toEqual({
       error: { code: "RUN_CLAIMED", message: "run has a live claim" },
     });
+    expect(claimedTarget.kickCount()).toBe(0);
   });
 
   test("rejects legacy, malformed, and unsupported create payloads without dispatch or scheduler effects", async () => {
