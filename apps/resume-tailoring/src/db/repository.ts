@@ -376,7 +376,14 @@ export class PipelineRepository {
         INSERT INTO run_artifact_retention(run_id, state, selected_at)
         SELECT runs.id, 'pruning', ?
         FROM runs
-        WHERE runs.id NOT IN (SELECT id FROM runs ORDER BY queue_sequence DESC LIMIT ?)
+        WHERE runs.deleted_at IS NULL
+          AND runs.id NOT IN (
+            SELECT id
+            FROM runs
+            WHERE deleted_at IS NULL
+            ORDER BY queue_sequence DESC
+            LIMIT ?
+          )
           AND runs.status IN ('review','approved','failed')
           AND NOT EXISTS (
             SELECT 1
@@ -397,6 +404,7 @@ export class PipelineRepository {
         FROM run_artifact_retention
         JOIN runs ON runs.id = run_artifact_retention.run_id
         WHERE run_artifact_retention.state = 'pruning'
+          AND runs.deleted_at IS NULL
         ORDER BY runs.queue_sequence
       `).all().map((row) => row.run_id);
     });
@@ -461,6 +469,14 @@ export class PipelineRepository {
     this.#immediate(() => {
       const now = this.#now();
       this.#assertCommandable(runId, now);
+      const pruning = this.#db.query<{ pruning: number }, [string]>(`
+        SELECT EXISTS (
+          SELECT 1
+          FROM run_artifact_retention
+          WHERE run_id = ? AND state = 'pruning'
+        ) AS pruning
+      `).get(runId)?.pruning === 1;
+      if (pruning) throw new RepositoryConflictError("run artifacts are being pruned");
       this.#db.query("UPDATE runs SET deleted_at=?, updated_at=? WHERE id=? AND deleted_at IS NULL")
         .run(now, now, runId);
     });

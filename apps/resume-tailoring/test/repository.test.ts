@@ -384,6 +384,24 @@ describe("artifact retention reservations", () => {
     expect(() => repo.areRunArtifactsRetained("missing-run")).toThrow(RepositoryConflictError);
   });
 
+  test("excludes tombstoned runs from retention selection and reservations", () => {
+    const { db, repo } = fixture();
+    const ids = Array.from({ length: 13 }, (_, index) => `tombstone-retention-${index}`);
+    for (const id of ids) createReview(repo, "a".repeat(64), false, id);
+    repo.deleteRun(ids[2]!);
+
+    expect(repo.reserveArtifactPruneCandidates(12)).toEqual([]);
+    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
+    expect(db.query<{ run_id: string; state: string }, []>(
+      "SELECT run_id,state FROM run_artifact_retention ORDER BY run_id",
+    ).all()).toEqual([
+      { run_id: ids[0]!, state: "pruning" },
+      { run_id: ids[1]!, state: "pruning" },
+    ]);
+    expect(() => repo.deleteRun(ids[0]!)).toThrow(/being pruned/);
+    expect(repo.getRun(ids[0]!)).not.toBeNull();
+  });
+
   test("retries pruning rows and defers queued, active, claimed, and active-attempt runs", () => {
     const { db, repo, tick } = fixture();
     const ids = Array.from({ length: 16 }, (_, index) => `retention-${index === 0 ? "z" : index}`);
