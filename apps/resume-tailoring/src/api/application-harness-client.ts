@@ -344,10 +344,17 @@ function codePointLength(value: string, minimum: number, maximum: number): boole
   return length >= minimum && length <= maximum;
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  return normalized === "localhost"
+    || normalized === "::1"
+    || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
 function isCanonicalHttpOrigin(value: string): boolean {
   try {
     const url = new URL(value);
-    return (url.protocol === "http:" || url.protocol === "https:")
+    return (url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHostname(url.hostname)))
       && url.username === ""
       && url.password === ""
       && url.pathname === "/"
@@ -419,6 +426,28 @@ function normalizeHarnessOrigin(value: string): string {
     throw new ApplicationHarnessError("invalid_response");
   }
   return url.origin;
+}
+
+function isExpectedCreateRoute(
+  value: string,
+  configuredOrigin: string,
+  sessionId: string,
+  operation: "events" | "commands",
+): boolean {
+  try {
+    const candidate = new URL(value);
+    const configured = new URL(configuredOrigin);
+    return candidate.protocol === "http:"
+      && isLoopbackHostname(candidate.hostname)
+      && candidate.port === configured.port
+      && candidate.username === ""
+      && candidate.password === ""
+      && candidate.pathname === `/v1/sessions/${sessionId}/${operation}`
+      && candidate.search === ""
+      && candidate.hash === "";
+  } catch {
+    return false;
+  }
 }
 
 function abortReason(signal: AbortSignal): unknown {
@@ -580,7 +609,7 @@ function projectEvent(event: RawEvent): ApplicationHarnessEvent {
 interface SseFrameAccumulator {
   id?: string;
   event?: string;
-  readonly data: string[];
+  data?: string;
   touched: boolean;
 }
 
@@ -600,7 +629,7 @@ function consumeSseLine(
   }
   if (line === "") {
     if (!frame.touched) return undefined;
-    if (frame.id === undefined || frame.event === undefined || frame.data.length === 0) {
+    if (frame.id === undefined || frame.event === undefined || frame.data === undefined) {
       throw new ApplicationHarnessError("invalid_response");
     }
     if (!/^(?:0|[1-9]\d*)$/.test(frame.id)) {
@@ -610,7 +639,7 @@ function consumeSseLine(
     if (!Number.isSafeInteger(frameId)) throw new ApplicationHarnessError("invalid_response");
     let body: unknown;
     try {
-      body = JSON.parse(frame.data.join("\n"));
+      body = JSON.parse(frame.data);
     } catch {
       throw new ApplicationHarnessError("invalid_response");
     }
@@ -640,7 +669,8 @@ function consumeSseLine(
     if (frame.event !== undefined) throw new ApplicationHarnessError("invalid_response");
     frame.event = value;
   } else if (field === "data") {
-    frame.data.push(value);
+    if (frame.data !== undefined) throw new ApplicationHarnessError("invalid_response");
+    frame.data = value;
   } else {
     throw new ApplicationHarnessError("invalid_response");
   }
@@ -654,21 +684,11 @@ async function* parseSseResponse(
 ): AsyncGenerator<ApplicationHarnessEvent> {
   const reader = response.body?.getReader();
   if (reader === undefined) throw new ApplicationHarnessError("invalid_response");
-  let frame: SseFrameAccumulator = { data: [], touched: false };
+  let frame: SseFrameAccumulator = { touched: false };
   let frameBytes = 0;
   let lineBytes = 0;
-  let lineParts: Uint8Array[] = [];
-  const completedLine = (): Uint8Array => {
-    if (lineParts.length === 0) return new Uint8Array();
-    if (lineParts.length === 1) return lineParts[0]!;
-    const line = new Uint8Array(lineBytes);
-    let offset = 0;
-    for (const part of lineParts) {
-      line.set(part, offset);
-      offset += part.byteLength;
-    }
-    return line;
-  };
+  const lineBuffer = new Uint8Array(MAX_SSE_FRAME_BYTES);
+  const completedLine = (): Uint8Array => lineBuffer.slice(0, lineBytes);
   try {
     while (true) {
       const item = await abortable(reader.read(), signal);
@@ -678,22 +698,26 @@ async function* parseSseResponse(
         const newline = item.value.indexOf(0x0a, offset);
         const end = newline === -1 ? item.value.byteLength : newline;
         const part = item.value.subarray(offset, end);
-        if (part.byteLength > 0) {
-          lineParts.push(part);
-          lineBytes += part.byteLength;
-        }
-        frameBytes += part.byteLength + (newline === -1 ? 0 : 1);
-        if (frameBytes > MAX_SSE_FRAME_BYTES || lineBytes > MAX_SSE_FRAME_BYTES) {
+        const nextLineBytes = lineBytes + part.byteLength;
+        const nextFrameBytes = frameBytes
+          + part.byteLength
+          + (newline === -1 ? 0 : 1);
+        if (
+          nextFrameBytes > MAX_SSE_FRAME_BYTES
+          || nextLineBytes > MAX_SSE_FRAME_BYTES
+        ) {
           throw new ApplicationHarnessError("invalid_response");
         }
+        lineBuffer.set(part, lineBytes);
+        lineBytes = nextLineBytes;
+        frameBytes = nextFrameBytes;
         if (newline === -1) break;
         const line = completedLine();
         const event = consumeSseLine(line, frame, expectedSessionId);
-        lineParts = [];
         lineBytes = 0;
         offset = newline + 1;
         if (line.byteLength === 0 || (line.byteLength === 1 && line[0] === 0x0d)) {
-          frame = { data: [], touched: false };
+          frame = { touched: false };
           frameBytes = 0;
         }
         if (event !== undefined) yield event;
@@ -825,8 +849,18 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     if (
       !created.success
       || created.data.session_id !== sessionId.data
-      || created.data.events_url !== `${this.#origin}/v1/sessions/${sessionId.data}/events`
-      || created.data.commands_url !== `${this.#origin}/v1/sessions/${sessionId.data}/commands`
+      || !isExpectedCreateRoute(
+        created.data.events_url,
+        this.#origin,
+        sessionId.data,
+        "events",
+      )
+      || !isExpectedCreateRoute(
+        created.data.commands_url,
+        this.#origin,
+        sessionId.data,
+        "commands",
+      )
     ) {
       throw new ApplicationHarnessError("invalid_response");
     }
@@ -857,7 +891,11 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     if (!snapshot.success || snapshot.data.session_id !== parsedSessionId.data) {
       throw new ApplicationHarnessError("invalid_response");
     }
-    return projectSnapshot(snapshot.data);
+    try {
+      return projectSnapshot(snapshot.data);
+    } catch {
+      throw new ApplicationHarnessError("invalid_response");
+    }
   }
 
   async *stream(

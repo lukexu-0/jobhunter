@@ -207,6 +207,25 @@ describe("HttpApplicationHarnessClient", () => {
     expect(capturedUrl).not.toContain(TOKEN);
     expect([...form.values()].map((part) => String(part)).join("|")).not.toContain(TOKEN);
   });
+  test("accepts fixed create routes advertised through an equivalent loopback alias", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: "http://localhost:8765",
+      token: TOKEN,
+      fetchImpl: async () => Response.json({
+        session_id: SESSION_ID,
+        state: "starting",
+        events_url: `http://127.0.0.1:8765/v1/sessions/${SESSION_ID}/events`,
+        commands_url: `http://127.0.0.1:8765/v1/sessions/${SESSION_ID}/commands`,
+      }, { status: 202 }),
+    });
+
+    await expect(client.create({
+      sessionId: SESSION_ID,
+      jobUrl: "https://jobs.private.example/roles/123",
+      personalInformationMarkdown: "# Applicant",
+      resumePdf: new TextEncoder().encode("%PDF-private"),
+    }, new AbortController().signal)).resolves.toBeUndefined();
+  });
   test("rejects mismatched caller IDs and non-strict create responses", async () => {
     const otherSessionId = "223e4567-e89b-42d3-a456-426614174000";
     const input = {
@@ -245,6 +264,14 @@ describe("HttpApplicationHarnessClient", () => {
     const invalidResponses = [
       Response.json(rawSnapshot({ session_id: otherSessionId })),
       Response.json(rawSnapshot({ current_url: "https://private.example/current" })),
+      Response.json(rawSnapshot({
+        state: "awaiting_origin_approval",
+        pending_action: {
+          type: "origin_approval",
+          origin: "http://remote.example",
+        },
+        approved_origins: ["http://remote.example"],
+      })),
       new Response("{", { headers: { "content-type": "application/json" } }),
       new Response(new Uint8Array([0xff]), {
         headers: { "content-type": "application/json" },
