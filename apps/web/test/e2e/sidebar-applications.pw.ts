@@ -335,14 +335,11 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
 
   const heading = page.getByRole("heading", { name: "Applications" });
   const initializer = page.getByRole("form", { name: "Initialize application" });
-  const keywordMap = initializer.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
   await expect(initializer).toBeVisible();
   await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
   await expect(initializer.getByLabel("Job posting URL")).toHaveAttribute("id", "job-url");
-  await expect(keywordMap).toBeEnabled();
-  await expect(keywordMap).toBeChecked();
-  await expect(keywordMap).not.toHaveAttribute("aria-describedby");
-  await expect(page.locator("#generate-keyword-map-help")).toHaveCount(0);
+  await expect(initializer.getByRole("checkbox")).toHaveCount(0);
+  await expect(initializer.getByText("Generate resume-to-job-description keyword map", { exact: true })).toHaveCount(0);
   await expect(initializer.getByRole("textbox")).toHaveCount(1);
   await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
   await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.", { exact: true })).toBeVisible();
@@ -361,7 +358,6 @@ test("uses shared request eligibility and remains usable without overflow", asyn
     const initializer = page.getByRole("form", { name: "Initialize application" });
     const input = initializer.getByRole("textbox", { name: "Job posting URL" });
     const initialize = initializer.getByRole("button", { name: "Initialize" });
-    const keywordMap = initializer.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
     await expect(input).toHaveAttribute("type", "url");
     await expect(input).toHaveAttribute("inputmode", "url");
     await expect(input).toHaveAttribute("autocapitalize", "none");
@@ -373,20 +369,14 @@ test("uses shared request eligibility and remains usable without overflow", asyn
       await input.fill(invalidUrl);
       await expect(initialize).toBeDisabled();
     }
-    await keywordMap.check();
-    await expect(initialize).toBeDisabled();
     await input.fill("https://jobs.example.test/roles/123");
     await expect(initialize).toBeEnabled();
 
     const formBox = await initializer.boundingBox();
     const inputBox = await input.boundingBox();
     const buttonBox = await initialize.boundingBox();
-    const optionBox = await keywordMap.locator("xpath=..").boundingBox();
-    if (!formBox || !inputBox || !buttonBox || !optionBox) throw new Error("Initializer geometry is unavailable");
+    if (!formBox || !inputBox || !buttonBox) throw new Error("Initializer geometry is unavailable");
     expect(inputBox.x).toBe(formBox.x);
-    expect(optionBox.x).toBe(formBox.x);
-    expect(optionBox.width).toBe(formBox.width);
-    expect(optionBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height);
     if (width > 560) {
       expect(buttonBox.x + buttonBox.width).toBe(formBox.x + formBox.width);
       expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(buttonBox.x);
@@ -394,14 +384,13 @@ test("uses shared request eligibility and remains usable without overflow", asyn
       expect(buttonBox.x).toBe(formBox.x);
       expect(buttonBox.width).toBe(formBox.width);
       expect(buttonBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height);
-      expect(buttonBox.y).toBeGreaterThanOrEqual(optionBox.y + optionBox.height);
     }
     await expectNoDocumentOverflow(page);
   }
 });
 
 
-test("posts the canonical URL and default keyword map, disables while pending, and navigates on success", async ({ page }) => {
+test("posts the canonical URL with keyword maps enabled, disables while pending, and navigates on success", async ({ page }) => {
   const initializedRun = runFixture("initialized-run", "applied", "failed");
   let postedBody: string | null = null;
   let pendingPost: Route | undefined;
@@ -435,9 +424,7 @@ test("posts the canonical URL and default keyword map, disables while pending, a
   const initializer = page.getByRole("form", { name: "Initialize application" });
   const input = initializer.getByRole("textbox", { name: "Job posting URL" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
-  const keywordMap = initializer.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
   await input.fill("HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description");
-  await expect(keywordMap).toBeChecked();
   await initialize.click();
   await postStarted;
 
@@ -446,7 +433,6 @@ test("posts the canonical URL and default keyword map, disables while pending, a
     generateKeywordMap: true,
   }));
   await expect(input).toBeDisabled();
-  await expect(keywordMap).toBeDisabled();
   await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
 
   if (!pendingPost) throw new Error("Initialize request was not intercepted");
@@ -460,8 +446,9 @@ test("posts the canonical URL and default keyword map, disables while pending, a
   await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
 });
 
-test("retains the URL and restores accessible controls after a fixed server failure", async ({ page }) => {
+test("retains the URL, clears the error on change, and retries with keyword maps enabled", async ({ page }) => {
   const submittedUrl = "https://jobs.example.test/unavailable#details";
+  const retryUrl = "https://jobs.example.test/another-role";
   let postCount = 0;
   await page.route("**/api/pipeline/runs", async (route) => {
     const request = route.request();
@@ -476,8 +463,8 @@ test("retains the URL and restores accessible controls after a fixed server fail
     expect(request.method()).toBe("POST");
     postCount += 1;
     expect(request.postDataJSON()).toEqual({
-      jobUrl: "https://jobs.example.test/unavailable",
-      generateKeywordMap: postCount === 1,
+      jobUrl: postCount === 1 ? "https://jobs.example.test/unavailable" : retryUrl,
+      generateKeywordMap: true,
     });
     await route.fulfill({
       status: 422,
@@ -505,23 +492,17 @@ test("retains the URL and restores accessible controls after a fixed server fail
   await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
 
-  const keywordMap = page.getByRole("checkbox", { name: "Generate resume-to-job-description keyword map", exact: true });
-  await expect(keywordMap).toBeChecked();
-  await keywordMap.uncheck();
+  await input.fill(retryUrl);
   await expect(alert).toHaveCount(0);
-  await expect(input).toHaveValue(submittedUrl);
+  await expect(input).toHaveValue(retryUrl);
   await expect(input).not.toHaveAttribute("aria-invalid");
   await expect(input).not.toHaveAttribute("aria-describedby");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
 
   await page.getByRole("button", { name: "Initialize" }).click();
-  await expect(alert).toBeVisible();
-  await expect(keywordMap).not.toBeChecked();
-
-  await input.fill("https://jobs.example.test/another-role");
-  await expect(alert).toHaveCount(0);
-  await expect(input).not.toHaveAttribute("aria-invalid");
-  await expect(input).not.toHaveAttribute("aria-describedby");
+  await expect(alert).toHaveText("The page does not contain a usable job description");
+  await expect(input).toHaveValue(retryUrl);
+  await expect(input).toBeEnabled();
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
   expect(postCount).toBe(2);
 });

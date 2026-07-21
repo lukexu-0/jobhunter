@@ -443,37 +443,6 @@ a {
   white-space: nowrap;
 }
 
-.run-initializer__option {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: start;
-  gap: var(--space-3);
-  padding-top: var(--space-1);
-}
-
-.run-initializer__option input {
-  width: var(--space-4);
-  height: var(--space-4);
-  margin: var(--space-1) 0 0;
-  accent-color: var(--color-accent);
-  cursor: pointer;
-}
-
-
-.run-initializer__option-label {
-  color: var(--color-text);
-  font-size: var(--font-size-sm);
-  font-weight: 700;
-  cursor: pointer;
-}
-
-
-.run-initializer__option input:disabled,
-.run-initializer__option input:disabled + .run-initializer__option-label {
-  cursor: not-allowed;
-  opacity: 0.62;
-}
 
 .run-initializer .dashboard-alert {
   grid-column: 1 / -1;

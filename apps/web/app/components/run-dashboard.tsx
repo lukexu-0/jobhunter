@@ -99,7 +99,6 @@ export function RunDashboard() {
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [jobUrl, setJobUrl] = useState("");
-  const [generateKeywordMap, setGenerateKeywordMap] = useState(true);
   const [createError, setCreateError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
@@ -107,8 +106,8 @@ export function RunDashboard() {
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequest = useMemo(
-    () => CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap }),
-    [generateKeywordMap, jobUrl],
+    () => CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap: true }),
+    [jobUrl],
   );
   const isCreateRequestValid = createRunRequest.success;
 
@@ -276,21 +275,6 @@ export function RunDashboard() {
               setCreateError(null);
             }}
           />
-        </div>
-        <div className="run-initializer__option">
-          <input
-            id="generate-keyword-map"
-            type="checkbox"
-            checked={generateKeywordMap}
-            disabled={isCreating}
-            onChange={(event) => {
-              setGenerateKeywordMap(event.target.checked);
-              setCreateError(null);
-            }}
-          />
-          <label className="run-initializer__option-label" htmlFor="generate-keyword-map">
-            Generate resume-to-job-description keyword map
-          </label>
         </div>
 
         <button

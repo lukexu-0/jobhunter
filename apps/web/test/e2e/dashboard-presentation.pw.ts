@@ -146,23 +146,13 @@ async function interceptAnalyzedRun(page: Page): Promise<void> {
   });
 }
 
-test("shows only the requested keyword-map option label", async ({ page }) => {
+test("does not show a keyword-map control", async ({ page }) => {
   await interceptEmptyRuns(page);
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize application" });
-  const option = initializer.locator(".run-initializer__option");
-  const checkbox = initializer.getByRole("checkbox", {
-    name: "Generate resume-to-job-description keyword map",
-    exact: true,
-  });
-
-  await expect(checkbox).toBeChecked();
-  await expect(checkbox).not.toHaveAttribute("aria-describedby", /.+/);
-  await expect(option).toHaveText("Generate resume-to-job-description keyword map");
-  await expect(page.getByText("Generate keyword map PDF", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Creates a side-by-side visualization of your resume and the full job description.", { exact: true })).toHaveCount(0);
-  await expect(option.locator("label")).toHaveCSS("color", "rgb(238, 241, 236)");
+  await expect(initializer.getByRole("checkbox")).toHaveCount(0);
+  await expect(initializer.getByText("Generate resume-to-job-description keyword map", { exact: true })).toHaveCount(0);
 });
 
 test("labels the first application column Role", async ({ page }) => {
