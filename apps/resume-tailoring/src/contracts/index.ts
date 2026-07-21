@@ -90,6 +90,18 @@ export type ApplicationStatus = z.infer<typeof ApplicationStatusSchema>;
 export const UpdateApplicationStatusRequestSchema =
   z.object({ applicationStatus: ApplicationStatusSchema }).strict();
 
+export const RunIdentityTextSchema = z.string().trim().min(1).max(200);
+export const UpdateRunIdentityRequestSchema = z
+  .object({
+    title: RunIdentityTextSchema.optional(),
+    organization: RunIdentityTextSchema.optional(),
+  })
+  .strict()
+  .refine(
+    ({ title, organization }) => title !== undefined || organization !== undefined,
+    { message: "Title or organization is required" },
+  );
+
 export const RevisionOriginSchema = z.enum(["initial", "machine-regeneration", "human-comments"]);
 export type RevisionOrigin = z.infer<typeof RevisionOriginSchema>;
 
@@ -221,6 +233,8 @@ export const RunDtoSchema = z
     id: z.string(),
     status: RunStatusSchema,
     applicationStatus: ApplicationStatusSchema,
+    titleOverride: RunIdentityTextSchema.optional(),
+    organizationOverride: RunIdentityTextSchema.optional(),
     generateKeywordMap: z.boolean(),
     queueSequence: z.number().int().positive(),
     revision: z.number().int().nonnegative(),

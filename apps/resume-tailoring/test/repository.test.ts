@@ -125,6 +125,67 @@ describe("persisted workflow commands", () => {
     expect(repo.timeline(created.id).events).toHaveLength(eventCount);
   });
 
+  test("persists partial run identity overrides and omits unset values", () => {
+    const { db, repo, tick, now } = fixture();
+    const created = repo.createRun("JD", "identity-run");
+    expect(created).not.toHaveProperty("titleOverride");
+    expect(created).not.toHaveProperty("organizationOverride");
+
+    tick(1_000);
+    const titled = repo.setIdentity(created.id, { title: "Staff Engineer" });
+    expect(titled).toMatchObject({ titleOverride: "Staff Engineer" });
+    expect(titled).not.toHaveProperty("organizationOverride");
+
+    tick(1_000);
+    const identified = repo.setIdentity(created.id, { organization: "Acme Corp" });
+    const secondRepo = new PipelineRepository(db, { now });
+    expect(identified).toMatchObject({
+      titleOverride: "Staff Engineer",
+      organizationOverride: "Acme Corp",
+    });
+    expect(secondRepo.getRun(created.id)).toMatchObject({
+      titleOverride: "Staff Engineer",
+      organizationOverride: "Acme Corp",
+    });
+    expect(() => repo.setIdentity(created.id, {})).toThrow(/required/);
+    expect(() => repo.setIdentity(created.id, { title: " padded " })).toThrow(/trimmed/);
+  });
+
+  test("soft deletion preserves history while hiding runs, artifacts, and scheduler candidates", () => {
+    const { db, repo, tick } = fixture();
+    const deleted = repo.createRun("deleted", "deleted-run");
+    const successor = repo.createRun("successor", "successor-run");
+    const claim = repo.acquire()!;
+    repo.transition(claim, "analyzing");
+    const attempt = repo.startAttempt(claim, "analyzing");
+    const artifact = repo.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "analyzing",
+      kind: "job-analysis",
+      sha256: "a".repeat(64),
+      path: "/tmp/deleted-analysis",
+      byteSize: 1,
+    });
+
+    expect(() => repo.deleteRun(deleted.id)).toThrow(/live claim/);
+    tick(60_001);
+    repo.deleteRun(deleted.id);
+
+    expect(repo.getRun(deleted.id)).toBeNull();
+    expect(repo.listRuns().map(({ id }) => id)).toEqual([successor.id]);
+    expect(repo.getArtifactById(deleted.id, artifact.id)).toBeNull();
+    expect(() => repo.getArtifact(deleted.id, "job-analysis")).toThrow(/run not found/);
+    expect(() => repo.setApplicationStatus(deleted.id, "accepted")).toThrow(/run not found/);
+    expect(() => repo.setIdentity(deleted.id, { title: "Hidden" })).toThrow(/run not found/);
+    expect(db.query<{ count: number }, []>(
+      "SELECT count(*) AS count FROM events WHERE run_id = 'deleted-run'",
+    ).get()?.count).toBeGreaterThan(0);
+    expect(db.query<{ count: number }, []>(
+      "SELECT count(*) AS count FROM artifacts WHERE run_id = 'deleted-run'",
+    ).get()?.count).toBe(1);
+    expect(repo.acquire()?.runId).toBe(successor.id);
+  });
+
   test("stores one immutable four-source snapshot and detects drift", () => {
     const { db, repo } = fixture();
     const run = repo.createRun("JD");

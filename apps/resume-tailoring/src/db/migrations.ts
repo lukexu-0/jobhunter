@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const PIPELINE_SCHEMA_VERSION = 8;
+export const PIPELINE_SCHEMA_VERSION = 9;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -151,6 +151,12 @@ ALTER TABLE runs ADD COLUMN generate_keyword_map INTEGER NOT NULL DEFAULT 0
   CHECK (generate_keyword_map IN (0,1));
 `;
 
+const migration9 = `
+ALTER TABLE runs ADD COLUMN title_override TEXT;
+ALTER TABLE runs ADD COLUMN organization_override TEXT;
+ALTER TABLE runs ADD COLUMN deleted_at INTEGER;
+`;
+
 const runsTableDeclaration = /^CREATE TABLE\s+(?:"runs"|runs)(?=\s*\()/i;
 
 function replaceRunsTable(db: Database, upgradedRunsSql: string): void {
@@ -254,6 +260,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 8) {
         migrateApplicationStatusDefaultPending(db);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(8, now);
+      }
+      if (version < 9) {
+        db.exec(migration9);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(9, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

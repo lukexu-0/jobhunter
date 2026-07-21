@@ -315,6 +315,17 @@ export class RunApplicationService {
     return await this.#command(() => this.dependencies.repository.setApplicationStatus(id, applicationStatus));
   }
 
+  async updateRunIdentity(
+    id: string,
+    identity: { readonly title?: string | undefined; readonly organization?: string | undefined },
+  ): Promise<RunDto> {
+    return await this.#command(() => this.dependencies.repository.setIdentity(id, identity));
+  }
+
+  async deleteRun(id: string): Promise<void> {
+    await this.#mutation(() => this.dependencies.repository.deleteRun(id));
+  }
+
   async retryRun(id: string): Promise<RunDto> {
     return await this.#command(async () => {
       this.#assertArtifactsRetained(id);
@@ -413,8 +424,12 @@ export class RunApplicationService {
   }
 
   async #command(command: () => PublicRun | Promise<PublicRun>): Promise<RunDto> {
+    return await this.#toDto(await this.#mutation(command));
+  }
+
+  async #mutation<T>(command: () => T | Promise<T>): Promise<T> {
     try {
-      return await this.#toDto(await command());
+      return await command();
     } catch (error) {
       if (error instanceof RunArtifactsPrunedError) {
         throw new RunServiceError(
@@ -462,6 +477,8 @@ export class RunApplicationService {
       id: run.id,
       status: run.status,
       applicationStatus: run.applicationStatus,
+      ...(run.titleOverride !== undefined ? { titleOverride: run.titleOverride } : {}),
+      ...(run.organizationOverride !== undefined ? { organizationOverride: run.organizationOverride } : {}),
       generateKeywordMap: run.generateKeywordMap,
       queueSequence: run.queueSequence,
       revision: run.currentRevision,

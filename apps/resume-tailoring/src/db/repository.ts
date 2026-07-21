@@ -46,6 +46,9 @@ interface RunRow {
   status: RunStatus;
   application_status: ApplicationStatus;
   generate_keyword_map: number;
+  title_override: string | null;
+  organization_override: string | null;
+  deleted_at: number | null;
   current_revision: number;
   failed_stage: ActiveStage | null;
   visual_ack_required: number;
@@ -74,6 +77,8 @@ export interface PublicRun {
   readonly jobDescription: string;
   readonly status: RunStatus;
   readonly applicationStatus: ApplicationStatus;
+  readonly titleOverride?: string;
+  readonly organizationOverride?: string;
   readonly generateKeywordMap: boolean;
   readonly queueSequence: number;
   readonly currentRevision: number;
@@ -159,11 +164,22 @@ function assertSafePayload(value: unknown): void {
   }
 }
 function publicRun(row: RunRow): PublicRun {
-  return { id: row.id, jobDescription: row.job_description, status: row.status,
-    applicationStatus: row.application_status, generateKeywordMap: row.generate_keyword_map === 1,
-    queueSequence: row.queue_sequence, currentRevision: row.current_revision, failedStage: row.failed_stage,
-    visualAcknowledgementRequired: row.visual_ack_required === 1, approvedPdfSha256: row.approved_pdf_sha256,
-    createdAt: row.created_at, updatedAt: row.updated_at };
+  return {
+    id: row.id,
+    jobDescription: row.job_description,
+    status: row.status,
+    applicationStatus: row.application_status,
+    ...(row.title_override !== null ? { titleOverride: row.title_override } : {}),
+    ...(row.organization_override !== null ? { organizationOverride: row.organization_override } : {}),
+    generateKeywordMap: row.generate_keyword_map === 1,
+    queueSequence: row.queue_sequence,
+    currentRevision: row.current_revision,
+    failedStage: row.failed_stage,
+    visualAcknowledgementRequired: row.visual_ack_required === 1,
+    approvedPdfSha256: row.approved_pdf_sha256,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 function publicAttempt(row: AttemptRow): PublicAttempt {
   return { id: row.id, attemptSessionId: row.attempt_session_id, revision: row.revision, stage: row.stage, attemptNo: row.attempt_no, origin: row.origin,
@@ -198,7 +214,7 @@ export class PipelineRepository {
   }
 
   #run(runId: string): RunRow {
-    const row = this.#db.query<RunRow, [string]>("SELECT * FROM runs WHERE id=?").get(runId);
+    const row = this.#db.query<RunRow, [string]>("SELECT * FROM runs WHERE id=? AND deleted_at IS NULL").get(runId);
     if (!row) throw new RepositoryConflictError("run not found");
     return row;
   }
@@ -345,12 +361,12 @@ export class PipelineRepository {
   }
 
   getRun(runId: string): PublicRun | null {
-    const row = this.#db.query<RunRow, [string]>("SELECT * FROM runs WHERE id=?").get(runId);
+    const row = this.#db.query<RunRow, [string]>("SELECT * FROM runs WHERE id=? AND deleted_at IS NULL").get(runId);
     return row ? publicRun(row) : null;
   }
 
   listRuns(limit = 100): PublicRun[] {
-    return this.#db.query<RunRow, [number]>("SELECT * FROM runs ORDER BY queue_sequence LIMIT ?").all(limit).map(publicRun);
+    return this.#db.query<RunRow, [number]>("SELECT * FROM runs WHERE deleted_at IS NULL ORDER BY queue_sequence LIMIT ?").all(limit).map(publicRun);
   }
 
   reserveArtifactPruneCandidates(retainCount: number): string[] {
@@ -410,6 +426,46 @@ export class PipelineRepository {
     });
   }
 
+  setIdentity(
+    runId: string,
+    identity: { readonly title?: string | undefined; readonly organization?: string | undefined },
+  ): PublicRun {
+    if (
+      (identity.title !== undefined
+        && (identity.title.trim() !== identity.title || identity.title.length < 1 || identity.title.length > 200))
+      || (identity.organization !== undefined
+        && (
+          identity.organization.trim() !== identity.organization
+          || identity.organization.length < 1
+          || identity.organization.length > 200
+        ))
+    ) {
+      throw new Error("run identity values must be trimmed and between 1 and 200 characters");
+    }
+    if (identity.title === undefined && identity.organization === undefined) {
+      throw new Error("title or organization is required");
+    }
+    return this.#immediate(() => {
+      const run = this.#run(runId);
+      const title = identity.title ?? run.title_override;
+      const organization = identity.organization ?? run.organization_override;
+      if (run.title_override === title && run.organization_override === organization) return publicRun(run);
+      this.#db.query(
+        "UPDATE runs SET title_override=?, organization_override=?, updated_at=? WHERE id=? AND deleted_at IS NULL",
+      ).run(title, organization, this.#now(), runId);
+      return publicRun(this.#run(runId));
+    });
+  }
+
+  deleteRun(runId: string): void {
+    this.#immediate(() => {
+      const now = this.#now();
+      this.#assertCommandable(runId, now);
+      this.#db.query("UPDATE runs SET deleted_at=?, updated_at=? WHERE id=? AND deleted_at IS NULL")
+        .run(now, now, runId);
+    });
+  }
+
   getRevision(runId: string, revision?: number): RevisionRow | null {
     const selected = revision ?? this.#run(runId).current_revision;
     return this.#db.query<RevisionRow, [string, number]>("SELECT * FROM revisions WHERE run_id=? AND revision=?").get(runId, selected) ?? null;
@@ -438,8 +494,14 @@ export class PipelineRepository {
 
       let candidate: RunRow | null = null;
       if (singleton.run_id) {
-        const interrupted = this.#run(singleton.run_id);
-        if (runnableStatuses.has(interrupted.status) && !this.#hasArtifactRetentionReservation(interrupted.id)) {
+        const interrupted = this.#db.query<RunRow, [string]>(
+          "SELECT * FROM runs WHERE id=? AND deleted_at IS NULL",
+        ).get(singleton.run_id);
+        if (
+          interrupted
+          && runnableStatuses.has(interrupted.status)
+          && !this.#hasArtifactRetentionReservation(interrupted.id)
+        ) {
           const active = this.#db.query<AttemptRow, [string]>("SELECT * FROM attempts WHERE run_id=? AND status IN ('running','cancel_requested') ORDER BY started_at DESC LIMIT 1").get(interrupted.id);
           if (active) {
             const knownDead = active.process_pid !== null && active.process_start_token !== null && !this.#isProcessAlive(active.process_pid, active.process_start_token);
@@ -458,6 +520,7 @@ export class PipelineRepository {
           SELECT *
           FROM runs
           WHERE status IN ('queued','analyzing','tailoring','editing','compiling','repairing','deterministic_qa','visual_qa')
+            AND deleted_at IS NULL
             AND NOT EXISTS (
               SELECT 1
               FROM run_artifact_retention
@@ -579,12 +642,18 @@ export class PipelineRepository {
       sha256: row.sha256, path: row.path, byteSize: row.byte_size, createdAt: row.created_at };
   }
   getArtifactById(runId: string, artifactId: string): PublicArtifact | null {
-    const row = this.#db.query<ArtifactRow, [string, string]>("SELECT * FROM artifacts WHERE run_id=? AND id=?").get(runId, artifactId);
+    const row = this.#db.query<ArtifactRow, [string, string]>(`
+      SELECT artifacts.*
+      FROM artifacts
+      JOIN runs ON runs.id = artifacts.run_id
+      WHERE artifacts.run_id=? AND artifacts.id=? AND runs.deleted_at IS NULL
+    `).get(runId, artifactId);
     return row ? this.#publicArtifact(row) : null;
   }
 
   getArtifact(runId: string, kind: string, revision?: number): PublicArtifact | null {
-    let current = revision ?? this.#run(runId).current_revision;
+    const run = this.#run(runId);
+    let current = revision ?? run.current_revision;
     const firstRevision = this.#db.query<RevisionRow, [string, number]>("SELECT * FROM revisions WHERE run_id=? AND revision=?").get(runId, current);
     const retryCutoff = firstRevision?.origin === "retry" && firstRevision.retry_stage ? stageRank[firstRevision.retry_stage] : null;
     const seen = new Set<number>();
@@ -609,7 +678,8 @@ export class PipelineRepository {
 
 
   listArtifacts(runId: string, revision?: number): PublicArtifact[] {
-    const selected = revision ?? this.#run(runId).current_revision;
+    const run = this.#run(runId);
+    const selected = revision ?? run.current_revision;
     return this.#db.query<ArtifactRow, [string, number]>("SELECT * FROM artifacts WHERE run_id=? AND revision=? ORDER BY created_at,id").all(runId, selected).map((row) => this.#publicArtifact(row));
   }
   listResolvedArtifacts(runId: string): PublicArtifact[] {

@@ -503,6 +503,44 @@ describe("RunApplicationService", () => {
     });
   });
 
+  test("returns durable identity overrides and maps soft deletion conflicts and visibility", async () => {
+    const target = fixture();
+    const created = await target.service.createRun(JOB_URL);
+    expect(created).not.toHaveProperty("titleOverride");
+    expect(created).not.toHaveProperty("organizationOverride");
+
+    const titled = await target.service.updateRunIdentity(created.id, { title: "Platform Engineer" });
+    expect(RunDtoSchema.parse(titled)).toMatchObject({ titleOverride: "Platform Engineer" });
+    expect(titled).not.toHaveProperty("organizationOverride");
+    const identified = await target.service.updateRunIdentity(created.id, { organization: "Example Labs" });
+    expect(identified).toMatchObject({
+      titleOverride: "Platform Engineer",
+      organizationOverride: "Example Labs",
+    });
+
+    const claim = target.repository.acquire()!;
+    await expect(target.service.deleteRun(created.id)).rejects.toMatchObject({
+      code: "RUN_CLAIMED",
+      status: 409,
+    });
+    target.repository.release(claim);
+    await target.service.deleteRun(created.id);
+
+    await expect(target.service.getRun(created.id)).resolves.toBeUndefined();
+    await expect(target.service.listRuns()).resolves.toEqual([]);
+    await expect(target.service.getArtifact(created.id, "any-artifact")).resolves.toBeUndefined();
+    await expect(target.service.updateApplicationStatus(created.id, "failed")).rejects.toMatchObject({
+      code: "RUN_NOT_FOUND",
+      status: 404,
+    });
+    await expect(
+      target.service.updateRunIdentity(created.id, { title: "Hidden" }),
+    ).rejects.toMatchObject({ code: "RUN_NOT_FOUND", status: 404 });
+    expect(target.pipelineDatabase.query<{ deleted_at: number | null }, [string]>(
+      "SELECT deleted_at FROM runs WHERE id = ?",
+    ).get(created.id)?.deleted_at).toBeNumber();
+  });
+
   test("maps a retry event to the compiling status that starts the new revision", async () => {
     const target = fixture();
     const run = await target.service.createRun(JOB_URL);

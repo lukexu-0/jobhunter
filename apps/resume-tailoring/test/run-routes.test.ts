@@ -28,6 +28,12 @@ function service(overrides: Partial<RunRouteService> = {}) {
     getRun: () => run,
     createRun: async () => run,
     updateApplicationStatus: async (_id, applicationStatus) => ({ ...run, applicationStatus }),
+    updateRunIdentity: async (_id, identity) => ({
+      ...run,
+      ...(identity.title !== undefined ? { titleOverride: identity.title } : {}),
+      ...(identity.organization !== undefined ? { organizationOverride: identity.organization } : {}),
+    }),
+    deleteRun: async () => {},
     retryRun: async () => run,
     regenerateRun: async () => ({ ...run, revision: 1, origin: "machine-regeneration", status: "editing" }),
     editRun: async () => ({ ...run, revision: 1, origin: "human-comments", status: "editing" }),
@@ -148,6 +154,98 @@ describe("run HTTP routes", () => {
 
     expect(received).toEqual([...applicationStatuses]);
     expect(target.kickCount()).toBe(0);
+  });
+
+  test("strictly validates identity overrides without waking the scheduler", async () => {
+    const received: Array<{
+      id: string;
+      identity: {
+        readonly title?: string | undefined;
+        readonly organization?: string | undefined;
+      };
+    }> = [];
+    const target = service({
+      updateRunIdentity: async (id, identity) => {
+        received.push({ id, identity });
+        return {
+          ...run,
+          ...(identity.title !== undefined ? { titleOverride: identity.title } : {}),
+          ...(identity.organization !== undefined ? { organizationOverride: identity.organization } : {}),
+        };
+      },
+    });
+
+    for (const body of [
+      { title: "" },
+      { organization: "   " },
+      { title: "x".repeat(201) },
+      { organization: "Acme", extra: true },
+      { title: "Engineer", applicationStatus: "applied" },
+    ]) {
+      const response = await request(target, "/v1/runs/run-1", patch(body));
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: { code: "INVALID_REQUEST", message: "Run identity is invalid" },
+      });
+    }
+    expect(received).toEqual([]);
+
+    const titleResponse = await request(
+      target,
+      "/v1/runs/run-1",
+      patch({ title: "  Staff Engineer  " }),
+    );
+    expect(titleResponse.status).toBe(200);
+    expect(await titleResponse.json()).toMatchObject({ titleOverride: "Staff Engineer" });
+    const organizationResponse = await request(
+      target,
+      "/v1/runs/run-1",
+      patch({ organization: "Example Labs" }),
+    );
+    expect(organizationResponse.status).toBe(200);
+    expect(await organizationResponse.json()).toMatchObject({
+      organizationOverride: "Example Labs",
+    });
+    expect(received).toEqual([
+      { id: "run-1", identity: { title: "Staff Engineer" } },
+      { id: "run-1", identity: { organization: "Example Labs" } },
+    ]);
+    expect(target.kickCount()).toBe(0);
+  });
+
+  test("deletes bodylessly with 204 and maps live claims without waking the scheduler", async () => {
+    const deleted: string[] = [];
+    const target = service({
+      deleteRun: async (id) => {
+        deleted.push(id);
+      },
+    });
+    const response = await request(target, "/v1/runs/run-1", {
+      method: "DELETE",
+      headers: { origin: ORIGIN },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("content-type")).toBeNull();
+    expect(await response.text()).toBe("");
+    expect(deleted).toEqual(["run-1"]);
+    expect(target.kickCount()).toBe(0);
+
+    const claimed = await request(service({
+      deleteRun: async () => {
+        throw Object.assign(new Error("run has a live claim"), {
+          code: "RUN_CLAIMED",
+          status: 409,
+        });
+      },
+    }), "/v1/runs/run-1", {
+      method: "DELETE",
+      headers: { origin: ORIGIN },
+    });
+    expect(claimed.status).toBe(409);
+    expect(await claimed.json()).toEqual({
+      error: { code: "RUN_CLAIMED", message: "run has a live claim" },
+    });
   });
 
   test("rejects legacy, malformed, and unsupported create payloads without dispatch or scheduler effects", async () => {

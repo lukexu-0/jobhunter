@@ -167,13 +167,24 @@ test("fresh databases default to pending while accepting applied", () => {
     ) VALUES ('default-run', 'default job description', 'queued', 2, 2000, 2000);
   `);
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(9);
   expect(db.query<{ application_status: string }, []>(
     "SELECT application_status FROM runs ORDER BY queue_sequence",
   ).all()).toEqual([
     { application_status: "applied" },
     { application_status: "pending" },
   ]);
+  expect(db.query<{
+    title_override: string | null;
+    organization_override: string | null;
+    deleted_at: number | null;
+  }, []>(
+    "SELECT title_override, organization_override, deleted_at FROM runs WHERE id = 'default-run'",
+  ).get()).toEqual({
+    title_override: null,
+    organization_override: null,
+    deleted_at: null,
+  });
   expect(() => db.query(
     "UPDATE runs SET application_status = 'queued' WHERE id = 'default-run'",
   ).run()).toThrow();
@@ -185,10 +196,10 @@ test("migrates version seven defaults without changing existing statuses", () =>
   migratePipelineDatabase(db, 2_000);
   db.exec("INSERT INTO runs(id) VALUES ('new-run')");
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(9);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -202,7 +213,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
 
   migratePipelineDatabase(db, 2_000);
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(9);
   expect(db.query<{ version: number; applied_at: number }, []>(
     "SELECT version, applied_at FROM schema_migrations ORDER BY version",
   ).all()).toEqual([
@@ -212,6 +223,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 6, applied_at: 1300 },
     { version: 7, applied_at: 2000 },
     { version: 8, applied_at: 2000 },
+    { version: 9, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -252,9 +264,23 @@ test("migrates existing runs to application status applied atomically", () => {
 
   migratePipelineDatabase(migrated, 2_000);
 
-  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8]);
-  expect(migrated.query<{ application_status: string; generate_keyword_map: number }, []>("SELECT application_status, generate_keyword_map FROM runs WHERE id = 'run-1'").get()).toEqual({ application_status: "applied", generate_keyword_map: 0 });
+  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(9);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9]);
+  expect(migrated.query<{
+    application_status: string;
+    generate_keyword_map: number;
+    title_override: string | null;
+    organization_override: string | null;
+    deleted_at: number | null;
+  }, []>(
+    "SELECT application_status, generate_keyword_map, title_override, organization_override, deleted_at FROM runs WHERE id = 'run-1'",
+  ).get()).toEqual({
+    application_status: "applied",
+    generate_keyword_map: 0,
+    title_override: null,
+    organization_override: null,
+    deleted_at: null,
+  });
 
   const rolledBack = versionOneDatabase({ includesApplicationStatus: true });
 
@@ -268,8 +294,8 @@ test("migrates version two retention state atomically without changing history",
 
   migratePipelineDatabase(migrated, 2_000);
 
-  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(8);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8]);
+  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(9);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

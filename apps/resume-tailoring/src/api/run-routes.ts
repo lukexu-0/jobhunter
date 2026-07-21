@@ -5,6 +5,7 @@ import {
   RegenerateRunRequestSchema,
   RunDtoSchema,
   UpdateApplicationStatusRequestSchema,
+  UpdateRunIdentityRequestSchema,
   type RunDto,
   type ApplicationStatus,
 } from "../contracts";
@@ -15,6 +16,11 @@ export interface RunRouteService {
   getRun(id: string): Promise<RunDto | undefined> | RunDto | undefined;
   createRun(jobUrl: string, generateKeywordMap: boolean, signal?: AbortSignal): Promise<RunDto>;
   updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto>;
+  updateRunIdentity(
+    id: string,
+    identity: { readonly title?: string | undefined; readonly organization?: string | undefined },
+  ): Promise<RunDto>;
+  deleteRun(id: string): Promise<void> | void;
   retryRun(id: string): Promise<RunDto>;
   regenerateRun(id: string, expectedPdfSha256: string): Promise<RunDto>;
   editRun(id: string, comments: string, expectedPdfSha256: string): Promise<RunDto>;
@@ -81,10 +87,32 @@ export function createRunRoutes(service: RunRouteService) {
         return run ? apiResponse.json(checkedRun(run)) : apiResponse.error("RUN_NOT_FOUND", "Run not found", 404);
       }
       if (request.method === "PATCH" && segments.length === 3) {
-        const body = UpdateApplicationStatusRequestSchema.safeParse(await parseBody(request));
-        if (!body.success) return apiResponse.error("INVALID_REQUEST", "Application status is invalid", 400);
-        const run = checkedRun(await service.updateApplicationStatus(runId, body.data.applicationStatus));
-        return apiResponse.json(run);
+        const rawBody = await parseBody(request);
+        const applicationStatus = UpdateApplicationStatusRequestSchema.safeParse(rawBody);
+        if (applicationStatus.success) {
+          const run = checkedRun(
+            await service.updateApplicationStatus(runId, applicationStatus.data.applicationStatus),
+          );
+          return apiResponse.json(run);
+        }
+        const identity = UpdateRunIdentityRequestSchema.safeParse(rawBody);
+        if (identity.success) {
+          const run = checkedRun(await service.updateRunIdentity(runId, identity.data));
+          return apiResponse.json(run);
+        }
+        const identityAttempt = rawBody !== null
+          && typeof rawBody === "object"
+          && !Array.isArray(rawBody)
+          && ("title" in rawBody || "organization" in rawBody);
+        return apiResponse.error(
+          "INVALID_REQUEST",
+          identityAttempt ? "Run identity is invalid" : "Application status is invalid",
+          400,
+        );
+      }
+      if (request.method === "DELETE" && segments.length === 3) {
+        await service.deleteRun(runId);
+        return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
       }
       if (request.method === "GET" && segments[3] === "artifacts" && segments.length === 5) {
         const artifactId = segments[4];
