@@ -51,7 +51,7 @@ async function persistedReviewWindow(ids: readonly string[]) {
     const queueSequence = repository.nextQueueSequence();
     const inputRoot = await artifacts.createRunInput({ run: queueSequence });
     const input = await artifacts.write(join(inputRoot, "job-description.txt"), `job:${id}`, 1024);
-    const run = repository.createQueuedRun(`job:${id}`, SOURCE_SNAPSHOT, {
+    const run = repository.createQueuedRun(`job:${id}`, `https://jobs.example.test/${id}`, SOURCE_SNAPSHOT, {
       sha256: input.sha256,
       path: input.path,
       byteSize: input.bytes,

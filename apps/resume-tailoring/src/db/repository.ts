@@ -43,6 +43,7 @@ export class RunArtifactsPrunedError extends RepositoryConflictError {
 interface RunRow {
   id: string;
   job_description: string;
+  job_url: string | null;
   status: RunStatus;
   application_status: ApplicationStatus;
   generate_keyword_map: number;
@@ -259,6 +260,7 @@ export class PipelineRepository {
 
   createQueuedRun(
     jobDescription: string,
+    jobUrl: string,
     snapshot: RunSourceSnapshotInput,
     input: QueuedInputArtifact,
     id = this.#idFactory(),
@@ -266,6 +268,24 @@ export class PipelineRepository {
     queueSequence?: number,
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
+    if (jobUrl.length < 1 || jobUrl.length > 2_048 || jobUrl.trim() !== jobUrl) {
+      throw new Error("job URL is invalid");
+    }
+    let parsedJobUrl: URL;
+    try {
+      parsedJobUrl = new URL(jobUrl);
+    } catch {
+      throw new Error("job URL is invalid");
+    }
+    if (
+      !["http:", "https:"].includes(parsedJobUrl.protocol)
+      || parsedJobUrl.username
+      || parsedJobUrl.password
+      || parsedJobUrl.hash
+      || parsedJobUrl.toString() !== jobUrl
+    ) {
+      throw new Error("job URL is invalid");
+    }
     if (!/^[a-f0-9]{64}$/.test(input.sha256) || !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || !input.path) {
       throw new Error("queued input artifact metadata is invalid");
     }
@@ -277,8 +297,8 @@ export class PipelineRepository {
     return this.#immediate(() => {
       const now = this.#now();
       const sequence = queueSequence ?? this.nextQueueSequence();
-      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, 'queued', ?, 1, ?, ?, ?)")
-        .run(id, jobDescription, generateKeywordMap ? 1 : 0, sequence, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, job_url, status, generate_keyword_map, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, 1, ?, ?, ?)")
+        .run(id, jobDescription, jobUrl, generateKeywordMap ? 1 : 0, sequence, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#db.query("INSERT INTO run_source_snapshots(run_id,manifest_sha256,baseline_sha256,source_hashes_json,created_at) VALUES (?,?,?,?,?)")
         .run(id, snapshot.manifestSha256, snapshot.baselineSha256, JSON.stringify(sourceHashes), now);
@@ -307,6 +327,10 @@ export class PipelineRepository {
       this.#event(id, 1, "run.created", { status: "queued", origin: "initial" }, now);
       return publicRun(this.#run(id));
     });
+  }
+
+  getRunJobUrl(runId: string): string | null {
+    return this.#run(runId).job_url;
   }
 
   attachSourceSnapshot(runId: string, snapshot: RunSourceSnapshotInput): PublicRunSourceSnapshot {

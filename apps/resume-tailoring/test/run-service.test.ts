@@ -212,6 +212,8 @@ describe("RunApplicationService", () => {
 
     expect(run).toMatchObject({ id: "run-1", status: "queued", revision: 1, origin: "initial" });
     expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(true);
+    expect(target.repository.getRunJobUrl(run.id)).toBe(JOB_URL);
+    expect(JSON.stringify(run)).not.toContain(JOB_URL);
     const disabled = await target.service.createRun(JOB_URL, false);
     expect(target.repository.getRun(disabled.id)?.generateKeywordMap).toBe(false);
     expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(4);

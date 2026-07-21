@@ -295,7 +295,7 @@ export class RunApplicationService {
         validated,
         MAX_JOB_DESCRIPTION_BYTES,
       );
-      run = this.dependencies.repository.createQueuedRun(validated, snapshot, {
+      run = this.dependencies.repository.createQueuedRun(validated, jobUrl, snapshot, {
         sha256: input.sha256,
         path: input.path,
         byteSize: input.bytes,

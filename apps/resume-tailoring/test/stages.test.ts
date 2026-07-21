@@ -209,7 +209,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const queueSequence = repository.nextQueueSequence();
   const inputRoot = await artifacts.createRunInput({ run: queueSequence });
   const input = await artifacts.write(join(inputRoot, "job-description.txt"), jobDescription, 1024 * 1024);
-  const run = repository.createQueuedRun(jobDescription, fixtures.snapshotInput, {
+  const run = repository.createQueuedRun(jobDescription, "https://jobs.example.test/stage-run", fixtures.snapshotInput, {
     sha256: input.sha256,
     path: input.path,
     byteSize: input.bytes,
