@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const PIPELINE_SCHEMA_VERSION = 9;
+export const PIPELINE_SCHEMA_VERSION = 10;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -157,6 +157,68 @@ ALTER TABLE runs ADD COLUMN organization_override TEXT;
 ALTER TABLE runs ADD COLUMN deleted_at INTEGER;
 `;
 
+const migration10 = `
+ALTER TABLE runs ADD COLUMN job_url TEXT
+  CHECK (job_url IS NULL OR length(job_url) BETWEEN 1 AND 2048);
+
+CREATE TABLE run_application_sessions (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  session_id TEXT NOT NULL UNIQUE CHECK (
+    length(session_id) = 36
+    AND substr(session_id, 9, 1) = '-'
+    AND substr(session_id, 14, 1) = '-'
+    AND substr(session_id, 19, 1) = '-'
+    AND substr(session_id, 24, 1) = '-'
+    AND replace(session_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+  ),
+  resume_revision INTEGER NOT NULL CHECK (resume_revision > 0),
+  pdf_sha256 TEXT NOT NULL CHECK (length(pdf_sha256) = 64),
+  bridge_state TEXT NOT NULL CHECK (
+    bridge_state IN (
+      'reserved',
+      'starting',
+      'running',
+      'awaiting_human_navigation',
+      'awaiting_origin_approval',
+      'awaiting_additional_info',
+      'awaiting_human_review',
+      'ready_for_human_submit',
+      'cancelled',
+      'failed',
+      'closed',
+      'lost'
+    )
+  ),
+  public_snapshot_json TEXT CHECK (
+    public_snapshot_json IS NULL OR json_valid(public_snapshot_json)
+  ),
+  last_upstream_event_id INTEGER CHECK (
+    last_upstream_event_id IS NULL OR last_upstream_event_id >= 0
+  ),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  terminal_at INTEGER,
+  PRIMARY KEY (run_id, generation),
+  FOREIGN KEY (run_id, resume_revision)
+    REFERENCES revisions(run_id, revision) ON DELETE RESTRICT,
+  CHECK (
+    (bridge_state IN ('cancelled','failed','closed','lost') AND terminal_at IS NOT NULL)
+    OR
+    (bridge_state NOT IN ('cancelled','failed','closed','lost') AND terminal_at IS NULL)
+  )
+) STRICT;
+
+CREATE INDEX run_application_sessions_latest
+  ON run_application_sessions(run_id, generation DESC);
+
+CREATE TRIGGER run_application_sessions_no_delete
+BEFORE DELETE ON run_application_sessions
+BEGIN
+  SELECT RAISE(ABORT, 'application session history cannot be deleted');
+END;
+`;
+
 const runsTableDeclaration = /^CREATE TABLE\s+(?:"runs"|runs)(?=\s*\()/i;
 
 function replaceRunsTable(db: Database, upgradedRunsSql: string): void {
@@ -264,6 +326,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 9) {
         db.exec(migration9);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(9, now);
+      }
+      if (version < 10) {
+        db.exec(migration10);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(10, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");
