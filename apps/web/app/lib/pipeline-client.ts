@@ -9,6 +9,7 @@ import {
   RunDtoSchema,
   RunListResponseSchema,
   UpdateApplicationStatusRequestSchema,
+  UpdateRunIdentityRequestSchema,
   type ArtifactDto,
   type ApplicationStatus,
   type RunDto,
@@ -169,6 +170,23 @@ export function updateApplicationStatus(
     headers: { "content-type": "application/json" },
     method: "PATCH",
   });
+}
+
+export function updateRunIdentity(
+  id: string,
+  identity: z.input<typeof UpdateRunIdentityRequestSchema>,
+): Promise<RunDto> {
+  const parsed = UpdateRunIdentityRequestSchema.safeParse(identity);
+  ensureValidRequest(parsed.success);
+  return requestRun(runPath(id), {
+    body: JSON.stringify(parsed.data),
+    headers: { "content-type": "application/json" },
+    method: "PATCH",
+  });
+}
+
+export async function deleteRun(id: string): Promise<void> {
+  await fetchPipeline(runPath(id), { method: "DELETE" });
 }
 
 export function createRun(jobUrl: string, generateKeywordMap = true): Promise<RunDto> {

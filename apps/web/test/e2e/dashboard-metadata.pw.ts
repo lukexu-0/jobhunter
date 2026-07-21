@@ -28,12 +28,12 @@ const reviewRun: RunDto = {
   timeline: [],
 };
 
-async function interceptReviewRun(page: Page): Promise<void> {
+async function interceptReviewRun(page: Page, listedRun: RunDto = reviewRun): Promise<void> {
   await page.route("**/api/pipeline/runs", async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify({ runs: [reviewRun] }),
+      body: JSON.stringify({ runs: [listedRun] }),
     });
   });
   await page.route("**/api/pipeline/runs/metadata-review-run/artifacts/initial-job-analysis", async (route) => {
@@ -68,6 +68,23 @@ test("loads application identity from the initial public job analysis", async ({
   await expect(applicationRow).toContainText("Acme Systems");
   await expect(applicationRow).not.toContainText(/Tailoring\s+run/);
   await expect(applicationRow).not.toContainText("Not available");
+});
+
+test("prefers durable identity overrides over public job-analysis values", async ({ page }) => {
+  await interceptReviewRun(page, {
+    ...reviewRun,
+    titleOverride: "Principal Platform Engineer",
+    organizationOverride: "Override Industries",
+  });
+  await page.goto("/");
+
+  const applicationRow = page.getByRole("row").filter({
+    has: page.getByRole("link", { name: "Open Principal Platform Engineer metadata…-run" }),
+  });
+  await expect(applicationRow).toContainText("Principal Platform Engineer");
+  await expect(applicationRow).toContainText("Override Industries");
+  await expect(applicationRow).not.toContainText("Staff AI Engineer");
+  await expect(applicationRow).not.toContainText("Acme Systems");
 });
 
 test("keeps loading a tailoring run artifact across polling and eventually shows its role", async ({ page }) => {

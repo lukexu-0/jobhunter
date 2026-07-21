@@ -5,6 +5,7 @@ import {
   approveRun,
   artifactHref,
   createRun,
+  deleteRun,
   editRun,
   getRun,
   listRuns,
@@ -12,6 +13,7 @@ import {
   regenerateRun,
   retryRun,
   updateApplicationStatus,
+  updateRunIdentity,
 } from "../app/lib/pipeline-client";
 
 const originalFetch = globalThis.fetch;
@@ -115,6 +117,69 @@ describe("pipeline run requests", () => {
         },
       },
     ]);
+  });
+
+  test("updates run identity and accepts a successful bodyless delete response", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const updated: RunDto = {
+      ...run(),
+      titleOverride: "Principal Engineer",
+      organizationOverride: "Example Labs",
+    };
+    setFetchMock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init });
+      return init?.method === "DELETE" ? new Response(null, { status: 204 }) : json(updated);
+    });
+
+    await expect(updateRunIdentity("run /1", { title: "  Principal Engineer  " })).resolves.toEqual(updated);
+    await expect(updateRunIdentity("run /1", { organization: "  Example Labs  " })).resolves.toEqual(updated);
+    await expect(deleteRun("run /1")).resolves.toBeUndefined();
+
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/runs/run%20%2F1",
+        init: {
+          body: JSON.stringify({ title: "Principal Engineer" }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "PATCH",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1",
+        init: {
+          body: JSON.stringify({ organization: "Example Labs" }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "PATCH",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1",
+        init: {
+          cache: "no-store",
+          method: "DELETE",
+        },
+      },
+    ]);
+  });
+
+  test("rejects invalid run identity updates locally without fetching", () => {
+    let fetchCalls = 0;
+    setFetchMock(async () => {
+      fetchCalls += 1;
+      return json(run());
+    });
+
+    for (const identity of [
+      {},
+      { title: " " },
+      { organization: "x".repeat(201) },
+      { title: "Valid", extra: "not allowed" },
+    ]) {
+      expect(() => updateRunIdentity("run-1", identity)).toThrow(PipelineClientError);
+    }
+    expect(fetchCalls).toBe(0);
   });
 
   test("encodes run IDs and sends each mutation's exact body", async () => {

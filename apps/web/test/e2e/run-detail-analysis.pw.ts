@@ -124,14 +124,14 @@ const extraction = {
   ],
 };
 
-async function interceptRunDetail(page: Page, includeExtraction = true): Promise<void> {
+async function interceptRunDetail(page: Page, includeExtraction = true, listedRun: RunDto = run): Promise<void> {
   await page.route(`**/api/pipeline/runs/${runId}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify(includeExtraction
-        ? run
-        : { ...run, artifacts: run.artifacts.filter((artifact) => artifact.kind !== "ats-keyword-extraction") }),
+        ? listedRun
+        : { ...listedRun, artifacts: listedRun.artifacts.filter((artifact) => artifact.kind !== "ats-keyword-extraction") }),
     });
   });
   await page.route(`**/api/pipeline/runs/${runId}/artifacts/${analysisArtifactId}`, async (route) => {
@@ -150,6 +150,20 @@ async function interceptRunDetail(page: Page, includeExtraction = true): Promise
     });
   });
 }
+
+test("prefers durable run identity overrides in the opened-run summary", async ({ page }) => {
+  await interceptRunDetail(page, true, {
+    ...run,
+    titleOverride: "Principal Platform Engineer",
+    organizationOverride: "Override Industries",
+  });
+  await page.goto(`/runs/${runId}`);
+
+  await expect(page.getByRole("heading", { level: 1, name: "Principal Platform Engineer" })).toBeVisible();
+  await expect(page.getByText("Override Industries", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Staff AI Engineer" })).toHaveCount(0);
+  await expect(page.getByText("Acme Systems", { exact: true })).toHaveCount(0);
+});
 
 const oldReportHeadings = [
   "Role summary",

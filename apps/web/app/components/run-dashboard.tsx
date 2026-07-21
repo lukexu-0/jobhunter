@@ -2,9 +2,10 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { createPortal } from "react-dom";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent } from "react";
 import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
-import { PipelineClientError, createRun, listRuns, readJsonArtifact, updateApplicationStatus } from "../lib/pipeline-client";
+import { PipelineClientError, createRun, deleteRun, listRuns, readJsonArtifact, updateApplicationStatus, updateRunIdentity } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
 
@@ -38,6 +39,30 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 
 type SortDirection = "newest" | "oldest";
+type IdentityField = "title" | "organization";
+
+interface EffectiveIdentity {
+  readonly title?: string;
+  readonly organization?: string;
+}
+
+interface ActionMenuState {
+  readonly runId: string;
+  readonly style: CSSProperties;
+}
+
+type RunDialog =
+  | {
+    readonly kind: "identity";
+    readonly runId: string;
+    readonly field: IdentityField;
+    readonly runName: string;
+  }
+  | {
+    readonly kind: "delete";
+    readonly runId: string;
+    readonly runName: string;
+  };
 
 function publicMessage(error: unknown, fallback: string): string {
   if (!(error instanceof PipelineClientError)) return fallback;
@@ -67,6 +92,13 @@ function latestJobAnalysis(run: RunDto): ArtifactDto | undefined {
   return run.artifacts
     .filter((artifact) => artifact.kind === "job-analysis" && artifact.public)
     .sort((left, right) => right.createdAt - left.createdAt)[0];
+}
+
+function effectiveRunIdentity(run: RunDto, artifactIdentity: JobIdentity | undefined): EffectiveIdentity {
+  return {
+    title: run.titleOverride ?? artifactIdentity?.title,
+    organization: run.organizationOverride ?? artifactIdentity?.organization,
+  };
 }
 
 function shortRunId(id: string): string {
@@ -103,6 +135,14 @@ export function RunDashboard() {
   const [isCreating, setIsCreating] = useState(false);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
   const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
+  const [actionMenu, setActionMenu] = useState<ActionMenuState | null>(null);
+  const [activeDialog, setActiveDialog] = useState<RunDialog | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [dialogError, setDialogError] = useState<string | null>(null);
+  const actionMenuRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const editInputRef = useRef<HTMLInputElement>(null);
+  const actionTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequest = useMemo(
@@ -166,14 +206,200 @@ export function RunDashboard() {
     );
   }, [runs, setJobIdentities]);
 
+  const toggleActionMenu = (runId: string, trigger: HTMLButtonElement) => {
+    if (actionMenu?.runId === runId) {
+      setActionMenu(null);
+      return;
+    }
+    const bounds = trigger.getBoundingClientRect();
+    const right = Math.max(0, window.innerWidth - bounds.right);
+    const opensUpward = window.innerHeight - bounds.bottom < bounds.top;
+    setActionMenu({
+      runId,
+      style: opensUpward
+        ? { right, bottom: window.innerHeight - bounds.top }
+        : { right, top: bounds.bottom },
+    });
+  };
+
+  const handleActionMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+    if (items.length === 0) return;
+    const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : event.key === "ArrowUp"
+          ? (currentIndex - 1 + items.length) % items.length
+          : (currentIndex + 1) % items.length;
+    event.preventDefault();
+    items[nextIndex]?.focus();
+  };
+
+  useEffect(() => {
+    if (!actionMenu) return;
+    const runId = actionMenu.runId;
+    const focusFrame = window.requestAnimationFrame(() => {
+      actionMenuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+    });
+    const dismiss = (restoreFocus = false) => {
+      setActionMenu(null);
+      if (restoreFocus) {
+        window.requestAnimationFrame(() => actionTriggerRefs.current.get(runId)?.focus());
+      }
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (actionMenuRef.current?.contains(target) || actionTriggerRefs.current.get(runId)?.contains(target)) return;
+      dismiss();
+    };
+    const handleFocusIn = (event: FocusEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (actionMenuRef.current?.contains(target) || actionTriggerRefs.current.get(runId)?.contains(target)) return;
+      dismiss();
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      dismiss(true);
+    };
+    const dismissForViewportChange = () => dismiss();
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("focusin", handleFocusIn);
+    document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", dismissForViewportChange);
+    window.addEventListener("scroll", dismissForViewportChange, true);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("focusin", handleFocusIn);
+      document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", dismissForViewportChange);
+      window.removeEventListener("scroll", dismissForViewportChange, true);
+    };
+  }, [actionMenu]);
+
+  useEffect(() => {
+    if (!activeDialog) return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (!dialog.open) dialog.showModal();
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (activeDialog.kind === "identity") {
+        editInputRef.current?.focus();
+        editInputRef.current?.select();
+      } else {
+        dialog.querySelector<HTMLButtonElement>("[data-dialog-cancel]")?.focus();
+      }
+    });
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      if (dialog.open) dialog.close();
+    };
+  }, [activeDialog]);
+
+  const openIdentityDialog = (
+    run: RunDto,
+    identity: EffectiveIdentity,
+    field: IdentityField,
+  ) => {
+    setActionMenu(null);
+    setDialogError(null);
+    setEditValue(identity[field] ?? "");
+    setActiveDialog({
+      kind: "identity",
+      runId: run.id,
+      field,
+      runName: identity.title ?? shortRunId(run.id),
+    });
+  };
+
+  const openDeleteDialog = (run: RunDto, identity: EffectiveIdentity) => {
+    setActionMenu(null);
+    setDialogError(null);
+    setActiveDialog({
+      kind: "delete",
+      runId: run.id,
+      runName: identity.title ?? shortRunId(run.id),
+    });
+  };
+
+  const closeDialog = () => {
+    if (activeDialog && busyRunIds.has(activeDialog.runId)) return;
+    setActiveDialog(null);
+    setDialogError(null);
+  };
+
+  const setRunBusy = (runId: string, busy: boolean) => {
+    setBusyRunIds((current) => {
+      const next = new Set(current);
+      if (busy) next.add(runId);
+      else next.delete(runId);
+      return next;
+    });
+  };
+
+  const submitIdentityUpdate = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (activeDialog?.kind !== "identity" || busyRunIds.has(activeDialog.runId)) return;
+    const value = editValue.trim();
+    if (value.length < 1 || value.length > 200) {
+      setDialogError("Enter 1 to 200 characters.");
+      return;
+    }
+    const { field, runId } = activeDialog;
+    setRunBusy(runId, true);
+    setDialogError(null);
+    try {
+      const updated = await updateRunIdentity(
+        runId,
+        field === "title" ? { title: value } : { organization: value },
+      );
+      latestListRequest.current += 1;
+      setRuns((current) => current?.map((run) => run.id === updated.id ? updated : run) ?? current);
+      setActiveDialog(null);
+    } catch (error) {
+      setDialogError(publicMessage(error, `${field === "title" ? "Title" : "Organization"} could not be updated. Try again.`));
+    } finally {
+      setRunBusy(runId, false);
+    }
+  };
+
+  const submitDelete = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (activeDialog?.kind !== "delete" || busyRunIds.has(activeDialog.runId)) return;
+    const { runId } = activeDialog;
+    setRunBusy(runId, true);
+    setDialogError(null);
+    try {
+      await deleteRun(runId);
+      latestListRequest.current += 1;
+      setRuns((current) => current?.filter((run) => run.id !== runId) ?? current);
+      setJobIdentities((current) => {
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
+      setActiveDialog(null);
+    } catch (error) {
+      setDialogError(publicMessage(error, "The application could not be deleted. Try again."));
+    } finally {
+      setRunBusy(runId, false);
+    }
+  };
+
   const filteredRuns = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return runs
       .filter((run) => statusFilter === "all" || run.applicationStatus === statusFilter)
       .filter((run) => {
         if (!normalizedQuery) return true;
-        const identity = jobIdentities[run.id];
-        return [run.id, APPLICATION_STATUS_LABELS[run.applicationStatus], identity?.title, identity?.organization]
+        const identity = effectiveRunIdentity(run, jobIdentities[run.id]);
+        return [run.id, APPLICATION_STATUS_LABELS[run.applicationStatus], identity.title, identity.organization]
           .filter((value): value is string => Boolean(value))
           .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
       })
@@ -203,11 +429,7 @@ export function RunDashboard() {
   };
 
   const changeApplicationStatus = async (runId: string, applicationStatus: ApplicationStatus) => {
-    setBusyRunIds((current) => {
-      const next = new Set(current);
-      next.add(runId);
-      return next;
-    });
+    setRunBusy(runId, true);
     setStatusUpdateError(null);
     try {
       const updated = await updateApplicationStatus(runId, applicationStatus);
@@ -217,11 +439,7 @@ export function RunDashboard() {
     } catch {
       setStatusUpdateError("Application state could not be updated. Try again.");
     } finally {
-      setBusyRunIds((current) => {
-        const next = new Set(current);
-        next.delete(runId);
-        return next;
-      });
+      setRunBusy(runId, false);
     }
   };
 
@@ -242,6 +460,13 @@ export function RunDashboard() {
 
   const showFilteredEmpty = !isLoading && runs.length > 0 && filteredRuns.length === 0;
   const showInitialEmpty = !isLoading && !loadError && runs.length === 0;
+  const actionMenuRun = actionMenu ? runs.find((run) => run.id === actionMenu.runId) : undefined;
+  const actionMenuIdentity = actionMenuRun
+    ? effectiveRunIdentity(actionMenuRun, jobIdentities[actionMenuRun.id])
+    : undefined;
+  const normalizedEditValue = editValue.trim();
+  const isEditValueValid = normalizedEditValue.length >= 1 && normalizedEditValue.length <= 200;
+  const isDialogBusy = Boolean(activeDialog && busyRunIds.has(activeDialog.runId));
 
   return (
     <main className="workspace">
@@ -352,7 +577,7 @@ export function RunDashboard() {
                     <th scope="col">Organization</th>
                     <th scope="col">Updated</th>
                     <th scope="col">Status</th>
-                    <th scope="col"><span className="visually-hidden">Open application</span></th>
+                    <th scope="col"><span className="visually-hidden">Application actions</span></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -393,7 +618,7 @@ export function RunDashboard() {
                     </tr>
                   ) : null}
                   {!isLoading ? visibleRuns.map((run) => {
-                    const identity = jobIdentities[run.id];
+                    const identity = effectiveRunIdentity(run, jobIdentities[run.id]);
                     const href = `/runs/${encodeURIComponent(run.id)}`;
                     return (
                       <tr
@@ -405,11 +630,11 @@ export function RunDashboard() {
                         }}
                       >
                         <td>
-                          <Link className="application-link" href={href} aria-label={identity?.title ? `Open ${identity.title} ${shortRunId(run.id)}` : `Open application ${shortRunId(run.id)}`}>
-                            {identity?.title ? <span>{identity.title}</span> : <span className="table-placeholder-line" aria-hidden="true" />}
+                          <Link className="application-link" href={href} aria-label={identity.title ? `Open ${identity.title} ${shortRunId(run.id)}` : `Open application ${shortRunId(run.id)}`}>
+                            {identity.title ? <span>{identity.title}</span> : <span className="table-placeholder-line" aria-hidden="true" />}
                           </Link>
                         </td>
-                        <td>{identity?.organization ? <span className="application-organization-name">{identity.organization}</span> : <span className="table-placeholder-line table-placeholder-line--organization" role="img" aria-label="Unknown organization" />}</td>
+                        <td>{identity.organization ? <span className="application-organization-name">{identity.organization}</span> : <span className="table-placeholder-line table-placeholder-line--organization" role="img" aria-label="Unknown organization" />}</td>
                         <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
                         <td>
                           <select
@@ -427,7 +652,31 @@ export function RunDashboard() {
                             ))}
                           </select>
                         </td>
-                        <td><span className="row-arrow" aria-hidden="true">→</span></td>
+                        <td>
+                          <button
+                            ref={(element) => {
+                              if (element) actionTriggerRefs.current.set(run.id, element);
+                              else actionTriggerRefs.current.delete(run.id);
+                            }}
+                            className="run-action-trigger"
+                            type="button"
+                            aria-label={`Actions for ${identity.title ?? shortRunId(run.id)}`}
+                            aria-haspopup="menu"
+                            aria-expanded={actionMenu?.runId === run.id}
+                            aria-controls={`run-actions-${encodeURIComponent(run.id)}`}
+                            disabled={busyRunIds.has(run.id)}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              toggleActionMenu(run.id, event.currentTarget);
+                            }}
+                          >
+                            <svg aria-hidden="true" viewBox="0 0 24 24">
+                              <circle cx="5" cy="12" r="1.5" />
+                              <circle cx="12" cy="12" r="1.5" />
+                              <circle cx="19" cy="12" r="1.5" />
+                            </svg>
+                          </button>
+                        </td>
                       </tr>
                     );
                   }) : null}
@@ -456,6 +705,117 @@ export function RunDashboard() {
             </nav>
           ) : null}
         </section>
+
+      {actionMenu && actionMenuRun && actionMenuIdentity && typeof document !== "undefined"
+        ? createPortal(
+          <div
+            ref={actionMenuRef}
+            className="run-action-menu"
+            id={`run-actions-${encodeURIComponent(actionMenuRun.id)}`}
+            role="menu"
+            aria-label={`Actions for ${actionMenuIdentity.title ?? shortRunId(actionMenuRun.id)}`}
+            style={actionMenu.style}
+            onKeyDown={handleActionMenuKeyDown}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => openIdentityDialog(actionMenuRun, actionMenuIdentity, "title")}
+            >
+              Edit title
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => openIdentityDialog(actionMenuRun, actionMenuIdentity, "organization")}
+            >
+              Edit organization
+            </button>
+            <button
+              className="run-action-menu__danger"
+              type="button"
+              role="menuitem"
+              onClick={() => openDeleteDialog(actionMenuRun, actionMenuIdentity)}
+            >
+              Delete
+            </button>
+          </div>,
+          document.body,
+        )
+        : null}
+
+      {activeDialog ? (
+        <dialog
+          ref={dialogRef}
+          className="run-action-dialog"
+          aria-labelledby="run-action-dialog-title"
+          aria-describedby={activeDialog.kind === "delete" ? "run-action-dialog-description" : undefined}
+          onCancel={(event) => {
+            event.preventDefault();
+            closeDialog();
+          }}
+        >
+          {activeDialog.kind === "identity" ? (
+            <form className="run-action-dialog__form" noValidate onSubmit={(event) => void submitIdentityUpdate(event)}>
+              <header className="run-action-dialog__header">
+                <p className="applications-label">Application identity</p>
+                <h2 id="run-action-dialog-title">Edit application {activeDialog.field}</h2>
+              </header>
+              <div className="run-action-dialog__body">
+                <label htmlFor="run-identity-value">
+                  {activeDialog.field === "title" ? "Title" : "Organization"}
+                </label>
+                <input
+                  ref={editInputRef}
+                  id="run-identity-value"
+                  type="text"
+                  value={editValue}
+                  minLength={1}
+                  maxLength={200}
+                  required
+                  autoComplete="off"
+                  disabled={isDialogBusy}
+                  aria-invalid={dialogError ? true : undefined}
+                  aria-describedby={dialogError ? "run-identity-hint run-action-dialog-error" : "run-identity-hint"}
+                  onChange={(event) => {
+                    setEditValue(event.target.value);
+                    setDialogError(null);
+                  }}
+                />
+                <p className="run-action-dialog__hint" id="run-identity-hint">
+                  1–200 characters. Leading and trailing spaces are removed.
+                </p>
+                {dialogError ? <p className="run-action-dialog__error" id="run-action-dialog-error" role="alert">{dialogError}</p> : null}
+              </div>
+              <footer className="run-action-dialog__actions">
+                <button className="square-control" data-dialog-cancel type="button" disabled={isDialogBusy} onClick={closeDialog}>Cancel</button>
+                <button className="square-control square-control--primary" type="submit" disabled={isDialogBusy || !isEditValueValid}>
+                  {isDialogBusy ? "Saving…" : "Save"}
+                </button>
+              </footer>
+            </form>
+          ) : (
+            <form className="run-action-dialog__form" onSubmit={(event) => void submitDelete(event)}>
+              <header className="run-action-dialog__header">
+                <p className="applications-label">Permanent dashboard action</p>
+                <h2 id="run-action-dialog-title">Delete application?</h2>
+              </header>
+              <div className="run-action-dialog__body">
+                <p id="run-action-dialog-description">
+                  Delete <strong>{activeDialog.runName}</strong> from the dashboard? Its immutable run history and artifacts are retained by the pipeline.
+                </p>
+                {dialogError ? <p className="run-action-dialog__error" id="run-action-dialog-error" role="alert">{dialogError}</p> : null}
+              </div>
+              <footer className="run-action-dialog__actions">
+                <button className="square-control" data-dialog-cancel type="button" disabled={isDialogBusy} onClick={closeDialog}>Cancel</button>
+                <button className="square-control square-control--danger" type="submit" disabled={isDialogBusy}>
+                  {isDialogBusy ? "Deleting…" : "Delete application"}
+                </button>
+              </footer>
+            </form>
+          )}
+        </dialog>
+      ) : null}
 
     </main>
   );

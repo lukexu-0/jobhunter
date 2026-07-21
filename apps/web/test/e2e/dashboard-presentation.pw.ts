@@ -362,7 +362,7 @@ test("scrolls the applications table locally only when five columns do not fit",
   );
 });
 
-test("uses the shared lifecycle order and presents one named row link with a visual-only arrow", async ({ page }) => {
+test("uses the shared lifecycle order and exposes a square accessible row action menu without an arrow", async ({ page }) => {
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -375,19 +375,33 @@ test("uses the shared lifecycle order and presents one named row link with a vis
   const filter = page.getByRole("combobox", { name: "Filter applications by state" });
   const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
-  const arrow = row.locator(".row-arrow");
+  const trigger = row.getByRole("button", { name: "Actions for presenta…-run" });
 
   await expect(filter.locator("option")).toHaveText(["All states", ...statusLabels]);
   await expect(rowStatus.locator("option")).toHaveText(statusLabels);
   await expect(row.getByRole("link", { name: "Open application presenta…-run" })).toHaveCount(1);
-  await expect(row.getByRole("link", { name: "Open application presenta…-run" })).toHaveText("");
-  await expect(row.getByRole("link")).toHaveCount(1);
-  await expect(arrow).toHaveAttribute("aria-hidden", "true");
-  expect(await arrow.evaluate((element) => element.tagName)).toBe("SPAN");
-  expect(await arrow.evaluate((element) => (element as HTMLElement).tabIndex)).toBe(-1);
-  await expect(arrow).toHaveCSS("border-top-width", "0px");
-  await expect(arrow).toHaveCSS("box-shadow", "none");
-  await expect(arrow).toHaveCSS("text-shadow", "none");
+  await expect(row.locator(".row-arrow")).toHaveCount(0);
+  await expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await expect(trigger).toHaveCSS("width", "44px");
+  await expect(trigger).toHaveCSS("height", "44px");
+  await expect(trigger).toHaveCSS("border-radius", "0px");
+  await expect(trigger).toHaveCSS("border-color", "rgb(210, 243, 76)");
+  await expect(trigger).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await trigger.hover();
+  await expect(trigger).toHaveCSS("background-color", "rgb(210, 243, 76)");
+  await expect(trigger).toHaveCSS("color", "rgb(5, 6, 6)");
+
+  await trigger.click();
+  expect(new URL(page.url()).pathname).toBe("/");
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
+  const menu = page.getByRole("menu", { name: "Actions for presenta…-run" });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("menuitem")).toHaveText(["Edit title", "Edit organization", "Delete"]);
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await expect(trigger).toBeFocused();
 });
 
 test("keeps an existing Failed status visible but not selectable", async ({ page }) => {
@@ -423,55 +437,72 @@ test("renders application status text with stronger contrast", async ({ page }) 
   await expect(rowStatus).toHaveCSS("font-size", "13px");
 });
 
-test("insets row arrows from the right table edge", async ({ page }) => {
+test("keeps the action trigger inset and its menu and dialog usable at narrow widths", async ({ page }) => {
+  const run = {
+    ...runFixture(),
+    titleOverride: "Platform Engineer",
+    organizationOverride: "Example Labs",
+  };
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify({ runs: [runFixture()] }),
+      body: JSON.stringify({ runs: [run] }),
     });
   });
+  await page.setViewportSize({ width: 320, height: 640 });
   await page.goto("/");
 
-  const table = page.getByRole("table");
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
-  const row = page.getByRole("row").filter({ has: rowStatus });
-  const arrow = row.locator(".row-arrow");
-  const arrowCell = row.getByRole("cell").last();
-  await expect(arrowCell).toHaveCSS("padding-right", "16px");
+  const trigger = page.getByRole("button", { name: "Actions for Platform Engineer" });
+  await trigger.scrollIntoViewIfNeeded();
+  const triggerCell = trigger.locator("..");
+  await expect(triggerCell).toHaveCSS("padding-right", "16px");
+  await trigger.click();
+  const menu = page.getByRole("menu", { name: "Actions for Platform Engineer" });
+  await expect(menu).toBeVisible();
+  const menuBox = await menu.boundingBox();
+  if (!menuBox) throw new Error("Action menu geometry is unavailable");
+  expect(menuBox.x).toBeGreaterThanOrEqual(0);
+  expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(320);
+  expect(menuBox.y).toBeGreaterThanOrEqual(0);
+  expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(640);
 
-  const tableBox = await table.boundingBox();
-  const arrowBox = await arrow.boundingBox();
-  if (!tableBox || !arrowBox) throw new Error("Application arrow geometry is unavailable");
-  expect(tableBox.x + tableBox.width - arrowBox.x - arrowBox.width).toBeCloseTo(16, 0);
+  await menu.getByRole("menuitem", { name: "Edit organization" }).click();
+  const dialog = page.getByRole("dialog", { name: "Edit application organization" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("textbox", { name: "Organization" })).toHaveValue("Example Labs");
+  const dialogBox = await dialog.boundingBox();
+  if (!dialogBox) throw new Error("Action dialog geometry is unavailable");
+  expect(dialogBox.x).toBeGreaterThanOrEqual(0);
+  expect(dialogBox.x + dialogBox.width).toBeLessThanOrEqual(320);
+  expect(dialogBox.y).toBeGreaterThanOrEqual(0);
+  expect(dialogBox.y + dialogBox.height).toBeLessThanOrEqual(640);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+
+  await trigger.click();
+  await expect(menu).toBeVisible();
+  await page.getByRole("heading", { name: "Applications" }).click();
+  await expect(menu).toHaveCount(0);
 });
 
-test("keeps the row arrow fully visible while hovering a populated application", async ({ page }) => {
+test("keeps the hollow action trigger fully visible while hovering a populated application", async ({ page }) => {
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify({ runs: [runFixture()] }),
+      body: JSON.stringify({ runs: [{ ...runFixture(), titleOverride: "Platform Engineer" }] }),
     });
   });
   await page.setViewportSize({ width: 1_280, height: 900 });
   await page.goto("/");
 
   const scroller = page.locator(".applications-table-scroll");
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
-  const row = page.getByRole("row").filter({ has: rowStatus });
-  const arrow = row.locator(".row-arrow");
-
-  await expect(row).toBeVisible();
-  await expect(arrow).toBeVisible();
-  await row.hover();
-  await arrow.evaluate(async (element) => {
-    await Promise.all(element.getAnimations().map((animation) => animation.finished));
-  });
+  const trigger = page.getByRole("button", { name: "Actions for Platform Engineer" });
+  await trigger.hover();
 
   const scrollerBox = await scroller.boundingBox();
-  const arrowBox = await arrow.boundingBox();
-  if (!scrollerBox || !arrowBox) throw new Error("Hovered application row geometry is unavailable");
-
-  expect(arrowBox.x + arrowBox.width, "Hovered row arrow should remain fully visible").toBeLessThanOrEqual(
+  const triggerBox = await trigger.boundingBox();
+  if (!scrollerBox || !triggerBox) throw new Error("Hovered application action geometry is unavailable");
+  expect(triggerBox.x + triggerBox.width, "Hovered row action should remain fully visible").toBeLessThanOrEqual(
     scrollerBox.x + scrollerBox.width + 1,
   );
 });
@@ -510,4 +541,143 @@ test("opens a run from a non-interactive cell without letting the status selecto
 
   await row.getByRole("cell").nth(1).click();
   await expect(page).toHaveURL(/\/runs\/presentation-run$/);
+});
+
+test("retains identity input on failure and updates the row only after a successful edit", async ({ page }) => {
+  const run: RunDto = {
+    ...runFixture(),
+    titleOverride: "Original title",
+    organizationOverride: "Original organization",
+  };
+  const patchBodies: unknown[] = [];
+  let releaseFirstPatch: () => void = () => {};
+  let markFirstPatchStarted: () => void = () => {};
+  const firstPatchGate = new Promise<void>((resolve) => {
+    releaseFirstPatch = resolve;
+  });
+  const firstPatchStarted = new Promise<void>((resolve) => {
+    markFirstPatchStarted = resolve;
+  });
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [run] }),
+    });
+  });
+  await page.route("**/api/pipeline/runs/presentation-run", async (route) => {
+    expect(route.request().method()).toBe("PATCH");
+    const body = route.request().postDataJSON() as { title: string };
+    patchBodies.push(body);
+    if (patchBodies.length === 1) {
+      markFirstPatchStarted();
+      await firstPatchGate;
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "IDENTITY_UPDATE_REJECTED", message: "Identity update was rejected." } }),
+      });
+      return;
+    }
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ ...run, titleOverride: body.title }),
+    });
+  });
+  await page.goto("/");
+
+  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const row = page.getByRole("row").filter({ has: rowStatus });
+  const trigger = row.getByRole("button", { name: "Actions for Original title" });
+  await trigger.click();
+  await page.getByRole("menuitem", { name: "Edit title" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Edit application title" });
+  const input = dialog.getByRole("textbox", { name: "Title" });
+  const save = dialog.getByRole("button", { name: "Save" });
+  await expect(input).toHaveValue("Original title");
+  await input.fill("  New title  ");
+  await save.click();
+  await firstPatchStarted;
+  await expect(input).toBeDisabled();
+  await expect(rowStatus).toBeDisabled();
+  await expect(trigger).toBeDisabled();
+  await expect(row).toContainText("Original title");
+  releaseFirstPatch();
+
+  await expect(dialog.getByRole("alert")).toHaveText("Identity update was rejected.");
+  await expect(input).toHaveValue("  New title  ");
+  await expect(row).toContainText("Original title");
+  await expect(row).not.toContainText("New title");
+
+  await input.fill("  Final title  ");
+  await save.click();
+  await expect(dialog).toHaveCount(0);
+  await expect(row).toContainText("Final title");
+  expect(patchBodies).toEqual([
+    { title: "New title" },
+    { title: "Final title" },
+  ]);
+
+  const search = page.getByRole("searchbox", { name: "Search applications" });
+  await search.fill("Final title");
+  await expect(row).toBeVisible();
+  await search.fill("Original title");
+  await expect(page.getByText("No applications match the current search and state.")).toBeVisible();
+});
+
+test("requires delete confirmation and removes a run only after a successful bodyless response", async ({ page }) => {
+  const run: RunDto = {
+    ...runFixture(),
+    titleOverride: "Delete candidate",
+    organizationOverride: "Example Labs",
+  };
+  const deleteBodies: Array<string | null> = [];
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [run] }),
+    });
+  });
+  await page.route("**/api/pipeline/runs/presentation-run", async (route) => {
+    expect(route.request().method()).toBe("DELETE");
+    deleteBodies.push(route.request().postData());
+    if (deleteBodies.length === 1) {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "RUN_BUSY", message: "Deletion is temporarily blocked." } }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 204 });
+  });
+  await page.goto("/");
+
+  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const row = page.getByRole("row").filter({ has: rowStatus });
+  const openDeleteDialog = async () => {
+    await row.getByRole("button", { name: "Actions for Delete candidate" }).click();
+    await page.getByRole("menuitem", { name: "Delete" }).click();
+    return page.getByRole("dialog", { name: "Delete application?" });
+  };
+
+  let dialog = await openDeleteDialog();
+  await expect(dialog).toContainText("Delete Delete candidate from the dashboard?");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(deleteBodies).toEqual([]);
+  await expect(row).toBeVisible();
+
+  dialog = await openDeleteDialog();
+  await dialog.getByRole("button", { name: "Delete application" }).click();
+  await expect(dialog.getByRole("alert")).toHaveText("Deletion is temporarily blocked.");
+  await expect(row).toBeVisible();
+  expect(deleteBodies).toEqual([null]);
+
+  await dialog.getByRole("button", { name: "Delete application" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(row).toHaveCount(0);
+  await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.")).toBeVisible();
+  expect(deleteBodies).toEqual([null, null]);
 });

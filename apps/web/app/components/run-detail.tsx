@@ -759,8 +759,8 @@ export function RunDetail({ runId }: RunDetailProps) {
     );
   }
 
-  const title = identity?.title ?? "Application";
-  const subtitle = identity?.organization ?? "Organization unavailable";
+  const title = run.titleOverride ?? identity?.title ?? "Application";
+  const subtitle = run.organizationOverride ?? identity?.organization ?? "Organization unavailable";
 
   return (
     <main className={styles.detailShell} aria-busy={isRefreshing || busyAction !== null || isLoadingArtifacts}>
