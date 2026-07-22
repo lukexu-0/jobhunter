@@ -551,7 +551,11 @@ describe("application session service", () => {
       detail: { stepNumber: 3 },
     }];
 
-    const iterator = target.service.events(target.runId, 5, signal())[Symbol.asyncIterator]();
+    const iterator = target.service.events(
+      target.runId,
+      { generation: 1, upstreamEventId: 5 },
+      signal(),
+    )[Symbol.asyncIterator]();
     const item = await iterator.next();
 
     expect(target.harness!.streamCalls).toEqual([{
@@ -560,14 +564,17 @@ describe("application session service", () => {
     }]);
     expect(item.done).toBeFalse();
     expect(item.value).toEqual({
-      generation: 1,
-      event: "agent_step",
-      session: expect.objectContaining({
+      id: "1:7",
+      event: {
         generation: 1,
-        bridgeState: "running",
-        warnings: ["Review the highlighted field"],
-      }),
-      detail: { stepNumber: 3 },
+        event: "agent_step",
+        session: expect.objectContaining({
+          generation: 1,
+          bridgeState: "running",
+          warnings: ["Review the highlighted field"],
+        }),
+        detail: { stepNumber: 3 },
+      },
     });
     expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
       generation: 1,
@@ -582,6 +589,17 @@ describe("application session service", () => {
     expect(serialized).not.toContain(FIRST_SESSION_ID);
     expect(serialized).not.toContain(JOB_URL);
     expect(serialized).not.toContain(PROFILE);
+    const nextGeneration = target.service.events(
+      target.runId,
+      { generation: 2, upstreamEventId: 99 },
+      signal(),
+    )[Symbol.asyncIterator]();
+    await nextGeneration.next();
+    expect(target.harness!.streamCalls[1]).toEqual({
+      sessionId: FIRST_SESSION_ID,
+      lastEventId: undefined,
+    });
+    await nextGeneration.return?.(undefined);
   });
 
   test("forwards live commands without persistence and closes active, reserved, and lost sessions", async () => {

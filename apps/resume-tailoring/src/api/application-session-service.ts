@@ -102,6 +102,16 @@ export interface ApplicationSessionServiceDependencies {
   readonly profileReader?: ApplicantProfileReader;
 }
 
+export interface ApplicationSessionEventCursor {
+  readonly generation: number;
+  readonly upstreamEventId: number;
+}
+
+export interface ApplicationSessionStreamItem {
+  readonly id: string;
+  readonly event: ApplicationSessionEventDto;
+}
+
 function isContained(root: string, candidate: string): boolean {
   const path = relative(root, candidate);
   return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
@@ -377,12 +387,17 @@ export class ApplicationSessionService {
 
   async *events(
     runId: string,
-    lastUpstreamEventId: number | undefined,
+    cursor: ApplicationSessionEventCursor | undefined,
     signal: AbortSignal,
-  ): AsyncGenerator<ApplicationSessionEventDto> {
+  ): AsyncGenerator<ApplicationSessionStreamItem> {
     if (
-      lastUpstreamEventId !== undefined
-      && (!Number.isSafeInteger(lastUpstreamEventId) || lastUpstreamEventId < 0)
+      cursor !== undefined
+      && (
+        !Number.isSafeInteger(cursor.generation)
+        || cursor.generation < 1
+        || !Number.isSafeInteger(cursor.upstreamEventId)
+        || cursor.upstreamEventId < 0
+      )
     ) {
       throw new RunServiceError("INVALID_REQUEST", "Application event cursor is invalid", 400);
     }
@@ -398,6 +413,9 @@ export class ApplicationSessionService {
     }
     const harness = this.dependencies.harness;
     if (!harness) throw applicationHarnessUnavailable();
+    const lastUpstreamEventId = cursor?.generation === session.generation
+      ? cursor.upstreamEventId
+      : undefined;
 
     try {
       for await (const event of harness.stream(
@@ -429,7 +447,10 @@ export class ApplicationSessionService {
           throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
         }
         session = recorded;
-        yield projected;
+        yield {
+          id: `${session.generation}:${event.id}`,
+          event: projected,
+        };
       }
     } catch (error) {
       if (signal.aborted) signal.throwIfAborted();
