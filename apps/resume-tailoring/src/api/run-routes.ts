@@ -3,10 +3,12 @@ import {
   CreateRunRequestSchema,
   EditRunRequestSchema,
   RegenerateRunRequestSchema,
+  ResumeIterationListResponseSchema,
   RunDtoSchema,
   UpdateApplicationStatusRequestSchema,
   UpdateRunIdentityRequestSchema,
   type RunDto,
+  type ResumeIterationListResponse,
   type ApplicationStatus,
 } from "../contracts";
 import { apiResponse } from "./handler";
@@ -25,6 +27,14 @@ export interface RunRouteService {
   regenerateRun(id: string, expectedPdfSha256: string): Promise<RunDto>;
   editRun(id: string, comments: string, expectedPdfSha256: string): Promise<RunDto>;
   approveRun(id: string, expectedPdfSha256: string, acknowledgeVisualIssues: boolean): Promise<RunDto>;
+  listResumeIterations(
+    id: string,
+  ): Promise<ResumeIterationListResponse> | ResumeIterationListResponse;
+  getResumeIterationArtifact(
+    runId: string,
+    revision: number,
+    artifactId: string,
+  ): Promise<Response | undefined> | Response | undefined;
   getArtifact(runId: string, artifactId: string): Promise<Response | undefined> | Response | undefined;
   kick(): void;
 }
@@ -58,6 +68,12 @@ async function parseBody(request: Request): Promise<unknown> {
 
 function checkedRun(run: RunDto): RunDto {
   return RunDtoSchema.parse(run);
+}
+
+function parseResumeIterationRevision(value: string | undefined): number | undefined {
+  if (!value || !/^[1-9]\d*$/.test(value)) return undefined;
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) ? revision : undefined;
 }
 
 export function createRunRoutes(service: RunRouteService) {
@@ -114,6 +130,40 @@ export function createRunRoutes(service: RunRouteService) {
         await service.deleteRun(runId);
         service.kick();
         return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+      }
+      if (request.method === "GET" && segments[3] === "iterations" && segments.length === 4) {
+        return apiResponse.json(
+          ResumeIterationListResponseSchema.parse(
+            await service.listResumeIterations(runId),
+          ),
+        );
+      }
+      if (
+        request.method === "GET"
+        && segments[3] === "iterations"
+        && segments[5] === "artifacts"
+        && segments.length === 7
+      ) {
+        const revision = parseResumeIterationRevision(segments[4]);
+        if (revision === undefined) {
+          return apiResponse.error(
+            "INVALID_REQUEST",
+            "Resume iteration revision is invalid",
+            400,
+          );
+        }
+        const artifactId = segments[6];
+        if (!artifactId) return null;
+        const response = await service.getResumeIterationArtifact(
+          runId,
+          revision,
+          artifactId,
+        );
+        if (!response) {
+          return apiResponse.error("ARTIFACT_NOT_FOUND", "Artifact not found", 404);
+        }
+        response.headers.set("cache-control", "no-store");
+        return response;
       }
       if (request.method === "GET" && segments[3] === "artifacts" && segments.length === 5) {
         const artifactId = segments[4];

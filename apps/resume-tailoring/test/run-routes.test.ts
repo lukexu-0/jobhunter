@@ -14,6 +14,7 @@ import type {
   ApplicationSessionEventDto,
   ApplicationSessionSnapshotDto,
   ApplicationSessionView,
+  ResumeIterationListResponse,
   RunDto,
 } from "../src/contracts";
 
@@ -52,6 +53,9 @@ function service(overrides: Partial<RunRouteService> = {}) {
     regenerateRun: async () => ({ ...run, revision: 1, origin: "machine-regeneration", status: "editing" }),
     editRun: async () => ({ ...run, revision: 1, origin: "human-comments", status: "editing" }),
     approveRun: async () => ({ ...run, status: "approved" }),
+    listResumeIterations: async () => ({ artifactState: "retained", iterations: [] }),
+    getResumeIterationArtifact: () =>
+      new Response("iteration-artifact", { headers: { "content-type": "application/pdf" } }),
     getArtifact: () => new Response("artifact", { headers: { "content-type": "text/plain" } }),
     kick: () => { kicks += 1; },
     kickCount: () => kicks,
@@ -415,6 +419,76 @@ describe("run HTTP routes", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.text()).toBe("artifact");
+  });
+
+  test("lists strict iterations and serves only a canonical selected revision artifact", async () => {
+    const iterations: ResumeIterationListResponse = {
+      artifactState: "retained",
+      iterations: [{
+        revision: 2,
+        origin: "human-comments",
+        status: "review",
+        createdAt: 2,
+        pdfSha256: PDF_HASH,
+        artifacts: [],
+      }],
+    };
+    const artifactCalls: Array<{ runId: string; revision: number; artifactId: string }> = [];
+    const target = service({
+      listResumeIterations: async (runId) => {
+        expect(runId).toBe("run-1");
+        return iterations;
+      },
+      getResumeIterationArtifact: async (runId, revision, artifactId) => {
+        artifactCalls.push({ runId, revision, artifactId });
+        return new Response("historical-pdf", {
+          headers: { "content-type": "application/pdf" },
+        });
+      },
+    });
+
+    const listed = await request(target, "/v1/runs/run-1/iterations");
+    expect(listed.status).toBe(200);
+    expect(listed.headers.get("cache-control")).toBe("no-store");
+    expect(await listed.json()).toEqual(iterations);
+
+    const artifact = await request(
+      target,
+      "/v1/runs/run-1/iterations/2/artifacts/artifact-2",
+    );
+    expect(artifact.status).toBe(200);
+    expect(artifact.headers.get("cache-control")).toBe("no-store");
+    expect(artifact.headers.get("content-type")).toBe("application/pdf");
+    expect(await artifact.text()).toBe("historical-pdf");
+    expect(artifactCalls).toEqual([{
+      runId: "run-1",
+      revision: 2,
+      artifactId: "artifact-2",
+    }]);
+
+    for (const revision of ["0", "02", "9007199254740992", "nope"]) {
+      const invalid = await request(
+        target,
+        `/v1/runs/run-1/iterations/${revision}/artifacts/artifact-2`,
+      );
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toEqual({
+        error: {
+          code: "INVALID_REQUEST",
+          message: "Resume iteration revision is invalid",
+        },
+      });
+    }
+    expect(artifactCalls).toHaveLength(1);
+
+    const missing = await request(
+      service({ getResumeIterationArtifact: async () => undefined }),
+      "/v1/runs/run-1/iterations/1/artifacts/missing",
+    );
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({
+      error: { code: "ARTIFACT_NOT_FOUND", message: "Artifact not found" },
+    });
   });
 });
 

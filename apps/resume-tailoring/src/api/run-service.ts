@@ -8,6 +8,7 @@ import {
   type AttemptDto,
   type AttemptStage,
   type RevisionOrigin as PublicRevisionOrigin,
+  type ResumeIterationListResponse,
   type RunDto,
   type RunStatus,
   type TimelineEvent,
@@ -181,7 +182,12 @@ function timeline(events: readonly PublicEvent[], fallback: RunStatus): Timeline
   });
 }
 
-function artifactDto(runId: string, artifact: PublicArtifact, attemptById: ReadonlyMap<string, number>): ArtifactDto | null {
+function artifactDto(
+  runId: string,
+  artifact: PublicArtifact,
+  attemptById: ReadonlyMap<string, number>,
+  selectedRevision?: number,
+): ArtifactDto | null {
   const kind = PUBLIC_ARTIFACT_KINDS[artifact.kind];
   if (!kind || !artifact.attemptId) return null;
   const attempt = attemptById.get(artifact.attemptId);
@@ -194,7 +200,9 @@ function artifactDto(runId: string, artifact: PublicArtifact, attemptById: Reado
     sha256: artifact.sha256,
     bytes: artifact.byteSize,
     mediaType: mediaType(kind),
-    href: `/v1/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifact.id)}`,
+    href: selectedRevision === undefined
+      ? `/v1/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifact.id)}`
+      : `/v1/runs/${encodeURIComponent(runId)}/iterations/${selectedRevision}/artifacts/${encodeURIComponent(artifact.id)}`,
     public: true,
     createdAt: artifact.createdAt,
   };
@@ -387,6 +395,66 @@ export class RunApplicationService {
     });
   }
 
+  async listResumeIterations(runId: string): Promise<ResumeIterationListResponse> {
+    const repository = this.dependencies.repository;
+    const run = repository.getRun(runId);
+    if (!run) throw new RunServiceError("RUN_NOT_FOUND", "Run not found", 404);
+    const reviewable = repository.listReviewableRevisions(runId);
+    const retained = repository.areRunArtifactsRetained(runId);
+    const attemptById = retained
+      ? new Map(
+          repository.timeline(runId).attempts.map((attempt) => [attempt.id, attempt.attemptNo]),
+        )
+      : new Map<string, number>();
+
+    return {
+      artifactState: retained ? "retained" : "pruned",
+      iterations: reviewable.map((revision) => ({
+        revision: revision.revision,
+        origin: publicOrigin(repository.resolveRevisionOrigin(runId, revision.revision)),
+        status: revision.status,
+        createdAt: revision.createdAt,
+        pdfSha256: revision.pdfSha256,
+        artifacts: retained
+          ? repository
+              .listResolvedArtifacts(runId, revision.revision)
+              .map((artifact) =>
+                artifactDto(runId, artifact, attemptById, revision.revision)
+              )
+              .filter((artifact): artifact is ArtifactDto => artifact !== null)
+          : [],
+      })),
+    };
+  }
+
+  async getResumeIterationArtifact(
+    runId: string,
+    revision: number,
+    artifactId: string,
+  ): Promise<Response | undefined> {
+    const repository = this.dependencies.repository;
+    const run = repository.getRun(runId);
+    if (!run || !Number.isSafeInteger(revision) || revision < 1) return undefined;
+    if (!repository.areRunArtifactsRetained(runId)) {
+      throw new RunServiceError(
+        "RUN_ARTIFACTS_PRUNED",
+        "Run artifacts were removed by the ten-run retention policy",
+        410,
+      );
+    }
+    const revisionStatus = repository.getRevisionStatus(runId, revision);
+    if (revisionStatus !== "review" && revisionStatus !== "approved") return undefined;
+    const artifact = repository.getArtifactById(runId, artifactId);
+    if (!artifact) return undefined;
+    const kind = PUBLIC_ARTIFACT_KINDS[artifact.kind];
+    if (!kind) return undefined;
+    const isResolved = repository
+      .listResolvedArtifacts(runId, revision)
+      .some((candidate) => candidate.id === artifact.id);
+    if (!isResolved) return undefined;
+    return await this.#verifiedArtifactResponse(runId, artifact, kind);
+  }
+
   async getArtifact(runId: string, artifactId: string): Promise<Response | undefined> {
     const run = this.dependencies.repository.getRun(runId);
     if (!run) return undefined;
@@ -406,6 +474,14 @@ export class RunApplicationService {
     const isApprovedRevision = this.dependencies.repository.getRevisionStatus(runId, artifact.revision) === "approved";
     if (!isCurrentReviewArtifact && !isApprovedRevision) return undefined;
 
+    return await this.#verifiedArtifactResponse(runId, artifact, kind);
+  }
+
+  async #verifiedArtifactResponse(
+    runId: string,
+    artifact: PublicArtifact,
+    kind: ArtifactKind,
+  ): Promise<Response> {
     let verified: VerifiedArtifactBytes;
     try {
       verified = await readVerifiedArtifactBytes(

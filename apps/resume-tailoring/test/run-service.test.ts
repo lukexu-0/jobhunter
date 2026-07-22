@@ -725,6 +725,86 @@ describe("RunApplicationService", () => {
     });
   });
 
+  test("lists retained historical iterations and authorizes exact revision artifacts", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    const first = await finalizeReviewPdf(
+      target,
+      run.id,
+      "%PDF-1.7\niteration-one",
+      false,
+      undefined,
+      "\\documentclass{article}\\begin{document}One\\end{document}",
+    );
+
+    await target.service.editRun(run.id, "Emphasize platform ownership", first.sha256);
+    const whileEditing = ResumeIterationListResponseSchema.parse(
+      await target.service.listResumeIterations(run.id),
+    );
+    expect(whileEditing.iterations).toHaveLength(1);
+    expect(whileEditing.iterations[0]).toMatchObject({
+      revision: 1,
+      origin: "initial",
+      status: "review",
+      pdfSha256: first.sha256,
+    });
+    expect(await target.service.getResumeIterationArtifact(run.id, 2, first.id))
+      .toBeUndefined();
+
+    const second = await finalizeReviewPdf(
+      target,
+      run.id,
+      "%PDF-1.7\niteration-two",
+    );
+    const listed = ResumeIterationListResponseSchema.parse(
+      await target.service.listResumeIterations(run.id),
+    );
+
+    expect(listed.artifactState).toBe("retained");
+    expect(listed.iterations.map((iteration) => ({
+      revision: iteration.revision,
+      origin: iteration.origin,
+      status: iteration.status,
+      pdfSha256: iteration.pdfSha256,
+    }))).toEqual([
+      { revision: 1, origin: "initial", status: "review", pdfSha256: first.sha256 },
+      { revision: 2, origin: "human-comments", status: "review", pdfSha256: second.sha256 },
+    ]);
+    expect(
+      listed.iterations[0]?.artifacts.find((artifact) => artifact.id === first.id)?.href,
+    ).toBe(`/v1/runs/${run.id}/iterations/1/artifacts/${first.id}`);
+    expect(
+      listed.iterations[1]?.artifacts.find((artifact) => artifact.id === second.id)?.href,
+    ).toBe(`/v1/runs/${run.id}/iterations/2/artifacts/${second.id}`);
+    const historical = await target.service.getResumeIterationArtifact(run.id, 1, first.id);
+    expect(historical?.status).toBe(200);
+    expect(await historical?.text()).toBe("%PDF-1.7\niteration-one");
+    expect(await target.service.getResumeIterationArtifact(run.id, 2, first.id))
+      .toBeUndefined();
+    const input = target.repository.getArtifact(run.id, "job-description")!;
+    expect(await target.service.getResumeIterationArtifact(run.id, 1, input.id))
+      .toBeUndefined();
+
+    target.pipelineDatabase.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at)
+      VALUES (?, 'pruning', 100)
+    `).run(run.id);
+    const pruned = ResumeIterationListResponseSchema.parse(
+      await target.service.listResumeIterations(run.id),
+    );
+    expect(pruned.artifactState).toBe("pruned");
+    expect(pruned.iterations.map(({ revision, pdfSha256, artifacts }) => ({
+      revision,
+      pdfSha256,
+      artifacts,
+    }))).toEqual([
+      { revision: 1, pdfSha256: first.sha256, artifacts: [] },
+      { revision: 2, pdfSha256: second.sha256, artifacts: [] },
+    ]);
+    await expect(
+      target.service.getResumeIterationArtifact(run.id, 1, first.id),
+    ).rejects.toMatchObject({ code: "RUN_ARTIFACTS_PRUNED", status: 410 });
+  });
 
   test("serves public resume and JSON artifacts with their public media metadata", async () => {
     const target = fixture();
