@@ -529,6 +529,10 @@ export class PipelineRepository {
       if (
         TERMINAL_APPLICATION_SESSION_STATES[current.bridge_state] === true
         && current.bridge_state !== input.bridgeState
+        && !(
+          input.bridgeState === "closed"
+          && (current.bridge_state === "cancelled" || current.bridge_state === "failed")
+        )
       ) {
         throw new RepositoryConflictError("application session is terminal");
       }

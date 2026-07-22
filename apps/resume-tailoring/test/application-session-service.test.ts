@@ -514,6 +514,30 @@ describe("application session service", () => {
       .toMatchObject({ generation: 2 });
   });
 
+
+  test("returns an existing terminal snapshot before source and configuration checks", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessSnapshot("cancelled");
+    const target = await createTarget({ harness });
+    const terminal = await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.database.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at)
+      VALUES (?, 'pruning', 1000)
+    `).run(target.runId);
+    const recovery = new ApplicationSessionService({
+      repository: target.repository,
+      artifacts: target.artifacts,
+      profileReader: () => {
+        throw new Error("profile unavailable");
+      },
+    });
+    const getCalls = harness.getCalls.length;
+
+    expect(await recovery.start(target.runId, target.pdf.sha256, signal())).toEqual(terminal);
+    expect(harness.getCalls).toHaveLength(getCalls);
+    expect(target.repository.getLatestApplicationSession(target.runId)?.generation).toBe(1);
+  });
+
   test("persists each upstream cursor and projected snapshot before yielding its generation event", async () => {
     const target = await createTarget();
     await target.service.start(target.runId, target.pdf.sha256, signal());
@@ -643,5 +667,35 @@ describe("application session service", () => {
         harnessState: null,
       }),
     });
+
+    for (const [state, snapshot] of [
+      ["cancelled", harnessSnapshot("cancelled")],
+      ["failed", {
+        ...harnessSnapshot("failed"),
+        error: {
+          code: "browser_failed",
+          message: "The browser session failed",
+        },
+      }],
+    ] as const) {
+      const terminalHarness = new FakeHarness();
+      terminalHarness.snapshotAfterCreate = snapshot;
+      const terminal = await createTarget({ harness: terminalHarness });
+      expect(await terminal.service.start(terminal.runId, terminal.pdf.sha256, signal()))
+        .toMatchObject({ bridgeState: state });
+      await terminal.service.close(terminal.runId, signal());
+      expect(terminalHarness.deleteCalls).toEqual([FIRST_SESSION_ID]);
+      expect(terminal.repository.getLatestApplicationSession(terminal.runId)).toMatchObject({
+        bridgeState: "closed",
+        publicSnapshot: expect.objectContaining({
+          bridgeState: "closed",
+          harnessState: "closed",
+          error: null,
+        }),
+      });
+      expect(JSON.stringify(
+        terminal.repository.getLatestApplicationSession(terminal.runId)?.publicSnapshot,
+      )).not.toContain(FIRST_SESSION_ID);
+    }
   });
 });

@@ -509,6 +509,46 @@ describe("application session ledger", () => {
     })).toThrow(/current generation/);
   });
 
+
+  test("allows only explicit cancelled or failed cleanup to transition terminal sessions to closed", () => {
+    const { repo, tick } = fixture();
+    const hash = "9".repeat(64);
+    for (const [index, bridgeState] of (["cancelled", "failed"] as const).entries()) {
+      const runId = createReview(repo, hash, false, `terminal-close-${bridgeState}`);
+      repo.approve(runId, hash);
+      const sessionId = index === 0
+        ? "77777777-7777-4777-8777-777777777777"
+        : "88888888-8888-4888-8888-888888888888";
+      repo.reserveApplicationSession(runId, null, sessionId, hash);
+      const terminal = repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState,
+        publicSnapshot: { state: bridgeState },
+      });
+      tick(10);
+
+      const closed = repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: "closed",
+        publicSnapshot: { state: "closed" },
+      });
+
+      expect(closed).toMatchObject({
+        bridgeState: "closed",
+        terminalAt: terminal.terminalAt,
+      });
+      expect(closed.updatedAt).toBeGreaterThan(terminal.updatedAt);
+      expect(() => repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: "running",
+        publicSnapshot: { state: "running" },
+      })).toThrow(/terminal/);
+      tick(10);
+    }
+  });
   test("reserves only a retained approved current PDF with a matching caller hash", () => {
     const { db, repo } = fixture();
     const hash = "4".repeat(64);

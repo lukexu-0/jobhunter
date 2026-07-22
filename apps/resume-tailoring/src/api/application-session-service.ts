@@ -289,7 +289,6 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    const prepared = await this.#prepareStart(runId, expectedApprovedPdfSha256, signal);
     let latest: PublicApplicationSession | null;
     try {
       latest = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -301,9 +300,15 @@ export class ApplicationSessionService {
         throw new RunServiceError("STALE_PDF", "approved PDF hash is stale", 409);
       }
       if (isTerminal(latest)) return this.#storedView(latest);
-      return await this.#resume(runId, latest, prepared, signal);
+      return await this.#resume(
+        runId,
+        latest,
+        () => this.#prepareStart(runId, expectedApprovedPdfSha256, signal),
+        signal,
+      );
     }
 
+    const prepared = await this.#prepareStart(runId, expectedApprovedPdfSha256, signal);
     const sessionId = this.#uuidFactory();
     let reserved: PublicApplicationSession;
     try {
@@ -502,7 +507,7 @@ export class ApplicationSessionService {
       }
       return;
     }
-    if (isTerminal(session)) return;
+    if (session.bridgeState === "closed") return;
 
     const harness = this.dependencies.harness;
     if (!harness) throw applicationHarnessUnavailable();
@@ -511,7 +516,11 @@ export class ApplicationSessionService {
     } catch (error) {
       if (signal.aborted) signal.throwIfAborted();
       if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
-        if (session.publicSnapshot === null) {
+        if (
+          session.publicSnapshot === null
+          || session.bridgeState === "cancelled"
+          || session.bridgeState === "failed"
+        ) {
           this.#recordLocalClosed(runId, session);
         } else {
           this.#markLost(runId, session);
@@ -576,7 +585,7 @@ export class ApplicationSessionService {
   async #resume(
     runId: string,
     session: PublicApplicationSession,
-    prepared: PreparedStart,
+    preparedInput: PreparedStart | (() => Promise<PreparedStart>),
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     const harness = this.dependencies.harness;
@@ -592,6 +601,9 @@ export class ApplicationSessionService {
     }
 
     if (session.publicSnapshot !== null) return this.#markLost(runId, session);
+    const prepared = typeof preparedInput === "function"
+      ? await preparedInput()
+      : preparedInput;
 
     let resumePdf: Uint8Array;
     try {
