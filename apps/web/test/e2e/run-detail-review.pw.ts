@@ -27,6 +27,7 @@ import {
 
 const runId = "run-detail-review-workspace";
 const pipelineRunPath = `/api/pipeline/runs/${runId}`;
+const nativeSsePort = Number(process.env.JOBHUNTER_E2E_PIPELINE_PORT ?? "3467");
 const createdAt = 1_700_000_000_000;
 const expiresAt = 1_700_086_400_000;
 const pdfHash1 = "1".repeat(64);
@@ -52,6 +53,7 @@ interface QueuedReply {
   readonly status: number;
   readonly body?: unknown;
   readonly before?: () => void;
+  readonly waitFor?: Promise<void>;
 }
 
 interface SseReply {
@@ -94,16 +96,18 @@ interface MockPipeline {
 
 interface NativeSseScenario {
   readonly headers: Array<string | null>;
+  readonly servedBodies: string[];
   readonly initialBody: string;
   readonly resumedBody: string;
   readonly onResume: () => void;
+  readonly waitForResume: Promise<void>;
 }
 
 let nativeSseScenario: NativeSseScenario | null = null;
 let nativeSseServer: Server;
 
 test.beforeAll(async () => {
-  nativeSseServer = createServer((request, response) => {
+  nativeSseServer = createServer(async (request, response) => {
     if (
       request.method !== "GET"
       || request.url !== `/v1/runs/${runId}/application/events`
@@ -113,20 +117,29 @@ test.beforeAll(async () => {
       return;
     }
     const rawCursor = request.headers["last-event-id"];
+    if (!request.headers.accept?.includes("text/event-stream")) {
+      response.writeHead(406).end();
+      return;
+    }
     const cursor = Array.isArray(rawCursor) ? rawCursor[0] ?? null : rawCursor ?? null;
     nativeSseScenario.headers.push(cursor);
     const resumed = cursor === "2:7";
-    if (resumed) nativeSseScenario.onResume();
+    if (resumed) {
+      await nativeSseScenario.waitForResume;
+      nativeSseScenario.onResume();
+    }
     response.writeHead(200, {
       "cache-control": "no-store",
       "content-type": "text/event-stream",
       connection: "close",
     });
-    response.end(resumed ? nativeSseScenario.resumedBody : nativeSseScenario.initialBody);
+    const body = resumed ? nativeSseScenario.resumedBody : nativeSseScenario.initialBody;
+    nativeSseScenario.servedBodies.push(body);
+    response.end(body);
   });
   await new Promise<void>((resolve, reject) => {
     nativeSseServer.once("error", reject);
-    nativeSseServer.listen(3457, "127.0.0.1", () => {
+    nativeSseServer.listen(nativeSsePort, "127.0.0.1", () => {
       nativeSseServer.off("error", reject);
       resolve();
     });
@@ -138,6 +151,7 @@ test.afterEach(() => {
 });
 
 test.afterAll(async () => {
+  if (!nativeSseServer.listening) return;
   await new Promise<void>((resolve, reject) => {
     nativeSseServer.close((error) => error ? reject(error) : resolve());
   });
@@ -593,7 +607,7 @@ async function installPipeline(
 
     if (path === `${pipelineRunPath}/application/events` && method === "GET") {
       if (mock.useNativeSse) {
-        await route.fallback();
+        await route.continue();
         return;
       }
       const requestHeaders = await request.allHeaders();
@@ -631,6 +645,7 @@ async function installPipeline(
       const parsed = requestBody as ApplicationSessionCommand;
       mock.commands.push(parsed);
       const reply = mock.commandReplies.shift() ?? { status: 202 };
+      await reply.waitFor;
       reply.before?.();
       if (reply.status === 202) {
         await route.fulfill({ status: 202 });
@@ -669,6 +684,8 @@ async function installPipeline(
       return;
     }
     if (path === `${pipelineRunPath}/application` && method === "DELETE") {
+      expect(request.postData()).toBeNull();
+      expect((await request.allHeaders())["content-type"]).toBeUndefined();
       mock.deleteCount += 1;
       mock.onDelete?.();
       await route.fulfill({ status: 204 });
@@ -891,6 +908,57 @@ test("failed application start keeps approval and adopts the authoritative block
   await expect(page.getByText("Pending", { exact: true })).toBeVisible();
 });
 
+test("an accepted live projection clears a stale application load failure", async ({ page }) => {
+  const running = snapshotFixture({
+    bridgeState: "running",
+    updatedAt: createdAt + 100,
+  });
+  const failed = snapshotFixture({
+    bridgeState: "failed",
+    updatedAt: createdAt + 200,
+  });
+  const failedFrame = deferred();
+  const mock = await installPipeline(page, {
+    application: running,
+  });
+  mock.approveReply = approvedRun();
+  queueSse(mock, eventFixture("failed", failed, {}), 2, failedFrame.promise);
+  let failedApplicationReads = 0;
+  await page.route(`**${pipelineRunPath}/application`, async (route) => {
+    if (
+      route.request().method() === "GET"
+      && mock.run.status === "approved"
+    ) {
+      failedApplicationReads += 1;
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify(apiError(
+          "APPLICATION_HARNESS_UNAVAILABLE",
+          "Temporary application read failure",
+        )),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  mock.iterations = approvedIterations();
+  await page.getByRole("button", { name: "Approve resume" }).click();
+  const loadFailure = page.getByRole("alert").filter({
+    hasText: "The local application service is unavailable",
+  });
+  await expect.poll(() => failedApplicationReads).toBeGreaterThan(0);
+  await expect(loadFailure).toBeVisible();
+
+  failedFrame.resolve();
+  await expect(page.getByRole("status").filter({ hasText: "Failed" })).toBeVisible();
+  await expect(loadFailure).toHaveCount(0);
+  mock.application = failed;
+});
+
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
   const questions = questionFixtures();
   const initial = snapshotFixture({
@@ -994,10 +1062,10 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(nameQuestion.getByRole("textbox", { name: "Answer", exact: true }))
     .toHaveValue("  Ada Public  ");
 
-  mock.application = progressed;
   progressFrame.resolve();
   await expect(page.getByRole("heading", { name: "Additional information needed" })).toHaveCount(0);
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  mock.application = progressed;
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
 });
 
@@ -1006,6 +1074,12 @@ test("navigation, origin approval, human review, ready, and close use exact publ
     bridgeState: "awaiting_human_navigation",
     pendingAction: { type: "human_navigation", instruction: "Complete the public sign-in checkpoint." },
     updatedAt: createdAt + 100,
+  });
+  const unrelatedNavigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    pendingAction: { type: "human_navigation", instruction: "Complete the public sign-in checkpoint." },
+    updatedAt: createdAt + 150,
+    company: "Unrelated progress company",
   });
   const origin = snapshotFixture({
     bridgeState: "awaiting_origin_approval",
@@ -1047,7 +1121,10 @@ test("navigation, origin approval, human review, ready, and close use exact publ
     updatedAt: createdAt + 600,
     revisionCount: 1,
   });
+  const unrelatedFrame = deferred();
   const continueFrame = deferred();
+  const continueResponse = deferred();
+  const originResponse = deferred();
   const originFrame = deferred();
   const reviseFrame = deferred();
   const readyFrame = deferred();
@@ -1057,13 +1134,18 @@ test("navigation, origin approval, human review, ready, and close use exact publ
     iterations: approvedIterations(),
     application: navigation,
   });
+  mock.commandReplies.push(
+    { status: 202, waitFor: continueResponse.promise },
+    { status: 202, waitFor: originResponse.promise },
+  );
+  queueSse(mock, eventFixture("snapshot", unrelatedNavigation, {}), 2, unrelatedFrame.promise);
   queueSse(mock, eventFixture("origin_approval_required", origin, {
     origin: "https://accounts.example.test",
-  }), 2, continueFrame.promise);
-  queueSse(mock, eventFixture("review_required", review, {}), 3, originFrame.promise);
-  queueSse(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), 4, reviseFrame.promise);
-  queueSse(mock, eventFixture("ready_for_human_submit", ready, {}), 5, readyFrame.promise);
-  queueSse(mock, eventFixture("closed", closed, {}), 6, closeFrame.promise);
+  }), 3, continueFrame.promise);
+  queueSse(mock, eventFixture("review_required", review, {}), 4, originFrame.promise);
+  queueSse(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), 5, reviseFrame.promise);
+  queueSse(mock, eventFixture("ready_for_human_submit", ready, {}), 6, readyFrame.promise);
+  queueSse(mock, eventFixture("closed", closed, {}), 7, closeFrame.promise);
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByText("Complete the public sign-in checkpoint.")).toBeVisible();
@@ -1071,10 +1153,26 @@ test("navigation, origin approval, human review, ready, and close use exact publ
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands[0]).toEqual({ type: "continue" });
   await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
-  mock.application = origin;
+  unrelatedFrame.resolve();
+  await expect(page.getByText("Unrelated progress company", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
+  const continueAccepted = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === `${pipelineRunPath}/application/commands`
+    && response.request().method() === "POST"
+    && response.status() === 202
+  );
+  continueResponse.resolve();
+  await continueAccepted;
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+  }));
+  await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
   continueFrame.resolve();
 
   await expect(page.getByText("https://accounts.example.test", { exact: true })).toBeVisible();
+  const approveOriginButton = page.getByRole("button", { name: "Approve origin" });
+  mock.application = origin;
+  await expect(approveOriginButton).toBeEnabled();
   await page.getByRole("button", { name: "Approve origin" }).click();
   await expect.poll(() => mock.commands.length).toBe(2);
   expect(mock.commands[1]).toEqual({
@@ -1082,13 +1180,28 @@ test("navigation, origin approval, human review, ready, and close use exact publ
     origin: "https://accounts.example.test",
   });
   await expect(page.getByRole("button", { name: "Approving…" })).toBeDisabled();
-  mock.application = review;
   originFrame.resolve();
 
   await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
   await expect(page.getByText("Email", { exact: true })).toBeVisible();
   await expect(page.getByText("Salary expectation", { exact: true })).toBeVisible();
   await expect(page.getByText("Confirm the public salary range.", { exact: true })).toBeVisible();
+  const requestRevisionButton = page.getByRole("button", { name: "Request application revision" });
+  const readyButton = page.getByRole("button", { name: "Ready for human submit" });
+  await expect(requestRevisionButton).toBeDisabled();
+  await expect(readyButton).toBeDisabled();
+  const originAccepted = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === `${pipelineRunPath}/application/commands`
+    && response.request().method() === "POST"
+    && response.status() === 202
+  );
+  originResponse.resolve();
+  await originAccepted;
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+  }));
+  await expect(readyButton).toBeEnabled();
+  mock.application = review;
   await page.getByLabel("Revision instructions").fill("  Correct the public salary field.  ");
   await page.getByRole("button", { name: "Request application revision" }).click();
   await expect.poll(() => mock.commands.length).toBe(3);
@@ -1097,20 +1210,20 @@ test("navigation, origin approval, human review, ready, and close use exact publ
     context: "Correct the public salary field.",
   });
   await expect(page.getByRole("button", { name: "Requesting revision…" })).toBeDisabled();
-  mock.application = revised;
   reviseFrame.resolve();
   await expect(page.getByText("Application revisions", { exact: true })).toBeVisible();
   await expect(page.getByText("1", { exact: true })).toBeVisible();
+  mock.application = revised;
 
   await page.getByRole("button", { name: "Ready for human submit" }).click();
   await expect.poll(() => mock.commands.length).toBe(4);
   expect(mock.commands[3]).toEqual({ type: "ready" });
   await expect(page.getByRole("button", { name: "Marking ready…" })).toBeDisabled();
-  mock.application = ready;
   readyFrame.resolve();
 
   await expect(page.getByRole("status").filter({ hasText: "Ready for human submission" })).toBeVisible();
   await expect(page.getByText(/Headed Chrome stays open until .* so you can inspect and submit/)).toBeVisible();
+  mock.application = ready;
   await expect(page.getByRole("button", { name: "Cancel application" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Close browser" })).toBeVisible();
   await expect(page.getByText("Pending", { exact: true })).toBeVisible();
@@ -1155,9 +1268,9 @@ test("a reserved generation resumes with the approved hash and running cancel is
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands[0]).toEqual({ type: "cancel" });
   await expect(page.getByRole("button", { name: "Cancelling…" })).toBeDisabled();
-  mock.application = cancelled;
   cancelFrame.resolve();
   await expect(page.getByRole("status").filter({ hasText: "Cancelled" })).toBeVisible();
+  mock.application = cancelled;
   await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
   expect(mock.deleteCount).toBe(0);
 });
@@ -1211,16 +1324,16 @@ test("lost, failed, and closed generations retry with the approved hash and fres
   await expect(page.getByText("Before retrying, verify whether the application was submitted.", { exact: false })).toBeVisible();
   await page.getByRole("button", { name: "Retry applying" }).click();
   await expect.poll(() => mock.retryBodies.length).toBe(1);
-  mock.application = failed3;
   failedFrame.resolve();
   await expect(page.getByRole("status").filter({ hasText: "Failed" })).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: "The browser session failed" })).toBeVisible();
+  mock.application = failed3;
 
   await page.getByRole("button", { name: "Retry applying" }).click();
   await expect.poll(() => mock.retryBodies.length).toBe(2);
-  mock.application = closed4;
   closedFrame.resolve();
   await expect(page.getByRole("status").filter({ hasText: "Closed" })).toBeVisible();
+  mock.application = closed4;
 
   await page.getByRole("button", { name: "Retry applying" }).click();
   await expect.poll(() => mock.retryBodies.length).toBe(3);
@@ -1259,10 +1372,11 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
     generation: 2,
     updatedAt: createdAt + 300,
   });
+  const resumeFrame = deferred();
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
-    application: currentOrigin,
+    application: olderNavigation,
     useNativeSse: true,
   });
   const replayEvents = [
@@ -1276,14 +1390,12 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
   const staleEvent = eventFixture("human_navigation_required", staleGeneration, {
     instruction: "Generation one must stay stale.",
   });
-  mock.publicResponseBodies.push(
-    ...replayEvents.map((event) => JSON.stringify(event)),
-    JSON.stringify(staleEvent),
-  );
   nativeSseScenario = {
     headers: mock.sseHeaders,
+    servedBodies: mock.publicResponseBodies,
     initialBody: `retry: 25\n${eventBlock(replayEvents[0], 6)}${eventBlock(replayEvents[1], 7)}`,
     resumedBody: `retry: 60000\n${eventBlock(staleEvent, 99)}`,
+    waitForResume: resumeFrame.promise,
     onResume: () => {
       mock.application = lost;
     },
@@ -1295,6 +1407,7 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
   await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(2);
   expect(mock.sseHeaders[0]).toBeNull();
   await expect.poll(() => JSON.stringify(mock.sseHeaders)).toContain("2:7");
+  resumeFrame.resolve();
 
   await expect(page.getByRole("status").filter({ hasText: "Connection lost" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
@@ -1303,6 +1416,99 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
   expect(mock.applicationGetCount).toBeGreaterThanOrEqual(3);
   expect(mock.runGetCount).toBe(1);
   await assertNoPrivateHarnessDetails(page, mock);
+});
+
+test("an invalid live frame reconnects before a later gate command can wedge", async ({ page }) => {
+  const navigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 2,
+    pendingAction: { type: "human_navigation", instruction: "Use the public navigation step." },
+    updatedAt: createdAt + 100,
+  });
+  const origin = snapshotFixture({
+    bridgeState: "awaiting_origin_approval",
+    generation: 2,
+    pendingAction: { type: "origin_approval", origin: "https://recovered.example.test" },
+    updatedAt: createdAt + 200,
+  });
+  const recoveredEvent = eventFixture("origin_approval_required", origin, {
+    origin: "https://recovered.example.test",
+  });
+  await page.addInitScript(() => {
+    const instances: EventTarget[] = [];
+    class ControlledEventSource extends EventTarget {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 2;
+      readonly url: string;
+      readonly withCredentials = false;
+      readyState = ControlledEventSource.OPEN;
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+
+      constructor(url: string | URL) {
+        super();
+        this.url = String(url);
+        instances.push(this);
+        window.setTimeout(() => this.onopen?.(new Event("open")), 0);
+      }
+
+      close(): void {
+        this.readyState = ControlledEventSource.CLOSED;
+      }
+    }
+    Object.defineProperty(window, "EventSource", {
+      configurable: true,
+      value: ControlledEventSource,
+    });
+    Object.defineProperty(window, "__applicationEventSources", {
+      configurable: true,
+      value: instances,
+    });
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: navigation,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByText("Use the public navigation step.", { exact: true })).toBeVisible();
+  const initialSourceCount = await page.evaluate(() => (
+    window as typeof window & { __applicationEventSources: EventTarget[] }
+  ).__applicationEventSources.length);
+  await page.evaluate(() => {
+    const sources = (
+      window as typeof window & { __applicationEventSources: EventTarget[] }
+    ).__applicationEventSources;
+    sources.at(-1)?.dispatchEvent(new MessageEvent("snapshot", {
+      data: "not-json",
+      lastEventId: "2:8",
+    }));
+  });
+
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application service returned an invalid live update.",
+  })).toBeVisible();
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => page.evaluate(() => (
+    window as typeof window & { __applicationEventSources: EventTarget[] }
+  ).__applicationEventSources.length)).toBeGreaterThan(initialSourceCount);
+  await page.evaluate(({ data }) => {
+    const sources = (
+      window as typeof window & { __applicationEventSources: EventTarget[] }
+    ).__applicationEventSources;
+    sources.at(-1)?.dispatchEvent(new MessageEvent("origin_approval_required", {
+      data,
+      lastEventId: "2:9",
+    }));
+  }, { data: JSON.stringify(recoveredEvent) });
+
+  await expect(page.getByText("https://recovered.example.test", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application service returned an invalid live update.",
+  })).toHaveCount(0);
 });
 
 test("an invalid SSE frame reconciles through authoritative GET and does not render its private payload", async ({ page }) => {
@@ -1315,8 +1521,13 @@ test("an invalid SSE frame reconciles through authoritative GET and does not ren
   });
   const malformedSession = {
     ...running,
+    harnessBaseUrl: privateHarnessValues[0],
     harnessSessionId: privateHarnessValues[1],
+    authorization: privateHarnessValues[2],
     jobUrl: privateHarnessValues[3],
+    approvedOrigins: [privateHarnessValues[4]],
+    profilePath: privateHarnessValues[5],
+    acceptedAnswers: [privateHarnessValues[6]],
   };
   queueMalformedSse(
     mock,
@@ -1334,8 +1545,9 @@ test("an invalid SSE frame reconciles through authoritative GET and does not ren
   await page.goto(`/runs/${runId}`);
   await expect(page.getByRole("status").filter({ hasText: "Connection lost" })).toBeVisible();
   expect(mock.applicationGetCount).toBeGreaterThanOrEqual(2);
-  await expect(page.getByText(privateHarnessValues[1], { exact: false })).toHaveCount(0);
-  await expect(page.getByText(privateHarnessValues[3], { exact: false })).toHaveCount(0);
+  for (const privateValue of privateHarnessValues) {
+    await expect(page.getByText(privateValue, { exact: false })).toHaveCount(0);
+  }
 });
 
 test("390px workspace has no overflow, announces application state, and restores edit-dialog focus", async ({ page }) => {

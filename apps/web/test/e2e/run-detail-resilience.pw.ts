@@ -128,6 +128,14 @@ async function interceptReviewRun(page: Page): Promise<void> {
     `**/api/pipeline/runs/${runId}/iterations/${reviewRun.revision}/artifacts/*`,
     async (route) => {
       expect(route.request().method()).toBe("GET");
+      const url = new URL(route.request().url());
+      expect(url.search).toBe("");
+      const artifactId = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+      const artifact = reviewIterations.iterations[0]?.artifacts.find(
+        (candidate) => candidate.id === artifactId,
+      );
+      expect(artifact, `authorized inherited artifact ${artifactId}`).toBeDefined();
+      expect(["compiled-pdf", "keyword-map-pdf"]).toContain(artifact?.kind);
       await route.fulfill({
         contentType: "application/pdf",
         body: Buffer.from("%PDF-1.4\n% inherited artifact fixture\n%%EOF\n"),

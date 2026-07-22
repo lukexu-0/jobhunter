@@ -42,6 +42,11 @@ const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 type ReviewDialog = "edit" | "regenerate" | null;
 type ReviewBusyAction = "retry" | "edit" | "regenerate" | "approve" | null;
 type ApplicationStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "invalid";
+interface ApplicationActionLatch {
+  requestPending: boolean;
+  projectionAccepted: boolean;
+  readonly acceptsProjection: (view: ApplicationSessionView) => boolean;
+}
 
 export interface RunReviewWorkspaceProps {
   readonly run: RunDto;
@@ -102,6 +107,66 @@ function applicationSnapshot(
   return view && !("state" in view) ? view : null;
 }
 
+function isTerminalApplicationSnapshot(snapshot: ApplicationSessionSnapshotDto): boolean {
+  return snapshot.bridgeState === "cancelled"
+    || snapshot.bridgeState === "failed"
+    || snapshot.bridgeState === "closed"
+    || snapshot.bridgeState === "lost";
+}
+
+function commandProjectionMatcher(
+  command: ApplicationSessionCommand,
+  baseline: ApplicationSessionSnapshotDto,
+): (view: ApplicationSessionView) => boolean {
+  const navigationInstruction = baseline.pendingAction?.type === "human_navigation"
+    ? baseline.pendingAction.instruction
+    : null;
+  const additionalInfoQuestions = baseline.pendingAction?.type === "additional_info"
+    ? JSON.stringify(baseline.pendingAction.questions)
+    : null;
+  return (view) => {
+    const next = applicationSnapshot(view);
+    if (!next) return false;
+    if (next.generation !== baseline.generation) {
+      return next.generation > baseline.generation;
+    }
+    switch (command.type) {
+      case "continue":
+        return next.pendingAction?.type !== "human_navigation"
+          || next.pendingAction.instruction !== navigationInstruction;
+      case "approve_origin":
+        return next.pendingAction?.type !== "origin_approval"
+          || next.pendingAction.origin !== command.origin;
+      case "provide_additional_info":
+        return next.pendingAction?.type !== "additional_info"
+          || JSON.stringify(next.pendingAction.questions) !== additionalInfoQuestions;
+      case "revise":
+        return next.pendingAction?.type !== "human_review"
+          || next.revisionCount > baseline.revisionCount;
+      case "ready":
+        return next.pendingAction?.type !== "human_review";
+      case "cancel":
+        return isTerminalApplicationSnapshot(next);
+    }
+  };
+}
+
+function lifecycleProjectionMatcher(
+  action: "cancel" | "close" | "retry",
+  baseline: ApplicationSessionSnapshotDto,
+): (view: ApplicationSessionView) => boolean {
+  return (view) => {
+    const next = applicationSnapshot(view);
+    if (!next) return false;
+    if (next.generation !== baseline.generation) {
+      return next.generation > baseline.generation;
+    }
+    if (action === "retry") return false;
+    if (action === "cancel") return isTerminalApplicationSnapshot(next);
+    return next.bridgeState === "closed" || next.bridgeState === "lost";
+  };
+}
+
 
 export function RunReviewWorkspace({
   run,
@@ -136,19 +201,38 @@ export function RunReviewWorkspace({
     useState<ApplicationSessionCommand["type"] | null>(null);
   const [applicationStreamState, setApplicationStreamState] =
     useState<ApplicationStreamState>("idle");
+  const [applicationStreamRecovery, setApplicationStreamRecovery] = useState(0);
   const applicationRequestVersion = useRef(0);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const commentsRef = useRef<HTMLTextAreaElement>(null);
   const dialogTriggerRef = useRef<HTMLButtonElement | null>(null);
   const applicationViewRef = useRef<ApplicationSessionView | null>(null);
   const activeRunIdRef = useRef(run.id);
+  const applicationLifecycleLatchRef = useRef<ApplicationActionLatch | null>(null);
+  const applicationCommandLatchRef = useRef<ApplicationActionLatch | null>(null);
   activeRunIdRef.current = run.id;
   const installApplicationView = useCallback((next: ApplicationSessionView): boolean => {
     if (activeRunIdRef.current !== run.id) return false;
     if (!shouldAcceptApplicationView(applicationViewRef.current, next)) return false;
     applicationViewRef.current = next;
-    setApplicationLifecycleAction(null);
-    setApplicationCommandAction(null);
+    setApplicationLoadError(null);
+    setApplicationStreamError(null);
+    const lifecycleLatch = applicationLifecycleLatchRef.current;
+    if (lifecycleLatch && lifecycleLatch.acceptsProjection(next)) {
+      lifecycleLatch.projectionAccepted = true;
+      if (!lifecycleLatch.requestPending) {
+        applicationLifecycleLatchRef.current = null;
+        setApplicationLifecycleAction(null);
+      }
+    }
+    const commandLatch = applicationCommandLatchRef.current;
+    if (commandLatch && commandLatch.acceptsProjection(next)) {
+      commandLatch.projectionAccepted = true;
+      if (!commandLatch.requestPending) {
+        applicationCommandLatchRef.current = null;
+        setApplicationCommandAction(null);
+      }
+    }
     setApplicationView(next);
     return true;
   }, [run.id]);
@@ -190,6 +274,11 @@ export function RunReviewWorkspace({
     setApplicationView(null);
     setApplicationStreamError(null);
     setApplicationLoadError(null);
+    applicationLifecycleLatchRef.current = null;
+    applicationCommandLatchRef.current = null;
+    setApplicationLifecycleAction(null);
+    setApplicationCommandAction(null);
+    setApplicationError(null);
   }, [run.id]);
 
   useEffect(() => {
@@ -228,16 +317,29 @@ export function RunReviewWorkspace({
 
     let source: EventSource;
     let disposed = false;
+    let mounted = true;
     let refreshInFlight = false;
+    let recoveryTimer: number | null = null;
+    const scheduleRecovery = (message: string) => {
+      setApplicationStreamState("invalid");
+      setApplicationStreamError(message);
+      void refreshApplicationView().catch(() => {
+        // Retain the latest confirmed projection and the fixed public stream failure.
+      }).finally(() => {
+        if (!mounted) return;
+        recoveryTimer = window.setTimeout(() => {
+          if (mounted) setApplicationStreamRecovery((current) => current + 1);
+        }, 1_000);
+      });
+    };
     try {
       source = new EventSource(applicationEventsHref(run.id));
     } catch {
-      setApplicationStreamState("invalid");
-      setApplicationStreamError("Live application updates could not be opened.");
-      void refreshApplicationView().catch(() => {
-        // Retain the latest confirmed projection and the fixed public stream failure.
-      });
-      return;
+      scheduleRecovery("Live application updates could not be opened.");
+      return () => {
+        mounted = false;
+        if (recoveryTimer !== null) window.clearTimeout(recoveryTimer);
+      };
     }
     setApplicationStreamState("connecting");
 
@@ -245,11 +347,7 @@ export function RunReviewWorkspace({
       if (disposed) return;
       disposed = true;
       source.close();
-      setApplicationStreamState("invalid");
-      setApplicationStreamError("The application service returned an invalid live update.");
-      void refreshApplicationView().catch(() => {
-        // Retain the latest confirmed projection and the fixed public stream failure.
-      });
+      scheduleRecovery("The application service returned an invalid live update.");
     };
     const acceptEvent = (nativeEvent: Event) => {
       if (disposed) return;
@@ -283,6 +381,7 @@ export function RunReviewWorkspace({
         || current.generation !== liveGeneration
         || !isStreamableApplicationSnapshot(current)
       ) {
+        disposed = true;
         source.close();
         setApplicationStreamState("idle");
         return;
@@ -302,6 +401,7 @@ export function RunReviewWorkspace({
           || current.generation !== liveGeneration
           || !isStreamableApplicationSnapshot(current)
         ) {
+          disposed = true;
           source.close();
           setApplicationStreamState("idle");
         }
@@ -312,10 +412,18 @@ export function RunReviewWorkspace({
       });
     };
     return () => {
+      mounted = false;
       disposed = true;
+      if (recoveryTimer !== null) window.clearTimeout(recoveryTimer);
       source.close();
     };
-  }, [installApplicationView, liveGeneration, refreshApplicationView, run.id]);
+  }, [
+    applicationStreamRecovery,
+    installApplicationView,
+    liveGeneration,
+    refreshApplicationView,
+    run.id,
+  ]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -402,26 +510,65 @@ export function RunReviewWorkspace({
     await startApplication(run.currentPdfSha256);
   };
 
+  const settleApplicationLifecycleRequest = (latch: ApplicationActionLatch) => {
+    latch.requestPending = false;
+    if (
+      applicationLifecycleLatchRef.current === latch
+      && latch.projectionAccepted
+    ) {
+      applicationLifecycleLatchRef.current = null;
+      setApplicationLifecycleAction(null);
+    }
+  };
+
+  const settleApplicationCommandRequest = (latch: ApplicationActionLatch) => {
+    latch.requestPending = false;
+    if (
+      applicationCommandLatchRef.current === latch
+      && latch.projectionAccepted
+    ) {
+      applicationCommandLatchRef.current = null;
+      setApplicationCommandAction(null);
+    }
+  };
+
   const retryApplication = async () => {
     if (!run.currentPdfSha256) {
       setApplicationError("The approved resume is no longer available for retry.");
       return;
     }
+    if (!snapshot || applicationLifecycleLatchRef.current) return;
+    const latch: ApplicationActionLatch = {
+      requestPending: true,
+      projectionAccepted: false,
+      acceptsProjection: lifecycleProjectionMatcher("retry", snapshot),
+    };
+    applicationLifecycleLatchRef.current = latch;
     setApplicationLifecycleAction("retry");
     setApplicationError(null);
     try {
       installApplicationView(await retryApplicationSession(run.id, run.currentPdfSha256));
+      settleApplicationLifecycleRequest(latch);
     } catch (error) {
       await refreshAfterApplicationFailure(
         error,
         "The application assistant could not be retried.",
       );
-      setApplicationLifecycleAction(null);
+      if (applicationLifecycleLatchRef.current === latch) {
+        applicationLifecycleLatchRef.current = null;
+        setApplicationLifecycleAction(null);
+      }
     }
   };
 
   const cancelApplication = async () => {
-    if (!snapshot) return;
+    if (!snapshot || applicationLifecycleLatchRef.current) return;
+    const latch: ApplicationActionLatch = {
+      requestPending: true,
+      projectionAccepted: false,
+      acceptsProjection: lifecycleProjectionMatcher("cancel", snapshot),
+    };
+    applicationLifecycleLatchRef.current = latch;
     setApplicationLifecycleAction("cancel");
     setApplicationError(null);
     try {
@@ -431,38 +578,64 @@ export function RunReviewWorkspace({
       } else {
         await sendApplicationCommand(run.id, { type: "cancel" });
       }
+      settleApplicationLifecycleRequest(latch);
     } catch (error) {
       await refreshAfterApplicationFailure(
         error,
         "The application assistant could not be cancelled.",
       );
-      setApplicationLifecycleAction(null);
+      if (applicationLifecycleLatchRef.current === latch) {
+        applicationLifecycleLatchRef.current = null;
+        setApplicationLifecycleAction(null);
+      }
     }
   };
 
   const closeApplication = async () => {
+    if (!snapshot || applicationLifecycleLatchRef.current) return;
+    const latch: ApplicationActionLatch = {
+      requestPending: true,
+      projectionAccepted: false,
+      acceptsProjection: lifecycleProjectionMatcher("close", snapshot),
+    };
+    applicationLifecycleLatchRef.current = latch;
     setApplicationLifecycleAction("close");
     setApplicationError(null);
     try {
       await closeApplicationSession(run.id);
       await refreshApplicationView();
+      settleApplicationLifecycleRequest(latch);
     } catch (error) {
       await refreshAfterApplicationFailure(error, "The browser could not be closed.");
-      setApplicationLifecycleAction(null);
+      if (applicationLifecycleLatchRef.current === latch) {
+        applicationLifecycleLatchRef.current = null;
+        setApplicationLifecycleAction(null);
+      }
     }
   };
 
   const submitApplicationCommand = async (command: ApplicationSessionCommand) => {
+    if (!snapshot || applicationCommandLatchRef.current) return;
+    const latch: ApplicationActionLatch = {
+      requestPending: true,
+      projectionAccepted: false,
+      acceptsProjection: commandProjectionMatcher(command, snapshot),
+    };
+    applicationCommandLatchRef.current = latch;
     setApplicationCommandAction(command.type);
     setApplicationError(null);
     try {
       await sendApplicationCommand(run.id, command);
+      settleApplicationCommandRequest(latch);
     } catch (error) {
       await refreshAfterApplicationFailure(
         error,
         "The application command could not be accepted.",
       );
-      setApplicationCommandAction(null);
+      if (applicationCommandLatchRef.current === latch) {
+        applicationCommandLatchRef.current = null;
+        setApplicationCommandAction(null);
+      }
     }
   };
 

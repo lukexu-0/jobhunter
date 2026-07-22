@@ -1,15 +1,21 @@
 import { defineConfig } from "@playwright/test";
 
+const webPort = Number(process.env.JOBHUNTER_E2E_WEB_PORT ?? "3466");
+const pipelinePort = Number(process.env.JOBHUNTER_E2E_PIPELINE_PORT ?? "3467");
+
 export default defineConfig({
   testDir: "./test/e2e",
   testMatch: "**/*.pw.ts",
   workers: 1,
   use: {
-    baseURL: "http://127.0.0.1:3456",
+    baseURL: `http://127.0.0.1:${webPort}`,
   },
   webServer: {
-    command: "bun run dev",
-    url: "http://127.0.0.1:3456",
-    reuseExistingServer: true,
+    command: `bunx next dev --hostname 127.0.0.1 --port ${webPort}`,
+    url: `http://127.0.0.1:${webPort}`,
+    reuseExistingServer: false,
+    env: {
+      JOBHUNTER_PIPELINE_ORIGIN: `http://127.0.0.1:${pipelinePort}`,
+    },
   },
 });

@@ -225,6 +225,13 @@ async function interceptDocumentRun(
   run: RunDto,
   jsonArtifacts: Readonly<Record<string, unknown>> = {},
 ): Promise<void> {
+  const iterationResponse = resumeIterationFixture(run);
+  const artifactsById = new Map(
+    [
+      ...run.artifacts,
+      ...iterationResponse.iterations.flatMap((iteration) => iteration.artifacts),
+    ].map((artifact) => [artifact.id, artifact] as const),
+  );
   await page.route(`**/api/pipeline/runs/${run.id}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
@@ -233,7 +240,7 @@ async function interceptDocumentRun(
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify(resumeIterationFixture(run)),
+      body: JSON.stringify(iterationResponse),
     });
   });
   await page.route(`**/api/pipeline/runs/${run.id}/application`, async (route) => {
@@ -246,6 +253,8 @@ async function interceptDocumentRun(
   const fulfillArtifact = async (route: Route): Promise<void> => {
     expect(route.request().method()).toBe("GET");
     const artifactId = new URL(route.request().url()).pathname.split("/").at(-1) ?? "";
+    const artifact = artifactsById.get(artifactId);
+    if (!artifact) throw new Error(`Unexpected artifact request: ${artifactId}`);
     if (artifactId === "resume-page-image") {
       await route.fulfill({
         contentType: "image/png",
@@ -260,9 +269,12 @@ async function interceptDocumentRun(
       });
       return;
     }
+    if (artifact.kind !== "compiled-pdf" && artifact.kind !== "keyword-map-pdf") {
+      throw new Error(`No fixture for ${artifact.kind} artifact ${artifactId}`);
+    }
     await route.fulfill({
       contentType: "application/pdf",
-      headers: { "content-disposition": 'inline; filename="keyword-map-pdf.pdf"' },
+      headers: { "content-disposition": `inline; filename="${artifact.kind}.pdf"` },
       body: LANDSCAPE_PDF_FIXTURE,
     });
   };
