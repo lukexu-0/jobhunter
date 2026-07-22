@@ -64,16 +64,13 @@ describe("RunReviewWorkspace", () => {
         iterations={iterations}
         onApprove={async () => ({ ...run, status: "approved" })}
         onEdit={async () => run}
-        onRegenerate={async () => run}
         onSelectIteration={() => {}}
-        onViewLatest={() => {}}
         run={run}
         selectedIteration={iterations[0]}
-        selection={{ mode: "pinned", selectedRevision: 1 }}
       />,
     );
 
-    expect(markup).toContain("Resume iteration");
+    expect(markup).toContain("Displayed resume");
     expect(markup).toContain("Iteration 1");
     expect(markup).toContain("Iteration 2");
     expect(markup).toContain("Iteration 3 — Latest");
@@ -81,11 +78,14 @@ describe("RunReviewWorkspace", () => {
     expect(markup).toContain('<option value="3" selected="">Iteration 1</option>');
     expect(markup).toContain('<option value="5">Iteration 2</option>');
     expect(markup).toContain('<option value="8">Iteration 3 — Latest</option>');
-    expect(markup).toContain("View latest");
-    expect(markup).toContain("Historical iterations are view-only");
+    expect(markup).not.toContain("View latest");
+    expect(markup).not.toContain("Historical iterations are view-only");
     expect(markup).toContain("Resume files were removed by retention");
     expect(markup).not.toContain("/tmp/");
     expect(markup).not.toContain("sessionId");
+    expect(markup).not.toContain("Review workspace");
+    expect(markup).not.toContain("Current run");
+    expect(markup).not.toContain("Resume review");
 
     const currentMarkup = renderToStaticMarkup(
       <RunReviewWorkspace
@@ -97,17 +97,16 @@ describe("RunReviewWorkspace", () => {
         iterations={iterations}
         onApprove={async () => ({ ...run, status: "approved" })}
         onEdit={async () => run}
-        onRegenerate={async () => run}
         onSelectIteration={() => {}}
-        onViewLatest={() => {}}
         run={run}
         selectedIteration={iterations[2]}
-        selection={{ mode: "follow-latest", selectedRevision: 8 }}
       />,
     );
-    expect(currentMarkup).toContain("Request edit");
-    expect(currentMarkup).toContain("Regenerate");
-    expect(currentMarkup).toContain("Approve resume");
-    expect(markup).not.toContain("Request edit");
+    expect(currentMarkup).toContain("Edit instructions");
+    expect(currentMarkup).toContain("Request edits");
+    expect(currentMarkup).toContain("Approve and apply");
+    expect(currentMarkup).not.toContain("Regenerate");
+    expect(currentMarkup).not.toContain("View latest");
+    expect(markup).not.toContain("Edit instructions");
   });
 });

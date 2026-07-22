@@ -466,42 +466,6 @@
   font-size: var(--font-size-sm);
 }
 
-.reviewDialog {
-  width: min(34rem, calc(100vw - var(--space-8)));
-  max-width: calc(100vw - var(--space-8));
-  max-height: calc(100svh - var(--space-8));
-  margin: auto;
-  border: var(--border-width) solid var(--color-border-strong);
-  border-radius: var(--radius-control);
-  padding: 0;
-  overflow: auto;
-  background: var(--color-surface);
-  color: var(--color-text);
-}
-
-.reviewDialog::backdrop {
-  background: rgb(0 0 0 / 72%);
-}
-
-.reviewDialogBody {
-  display: grid;
-  gap: var(--space-4);
-  padding: var(--space-5);
-}
-
-.reviewDialogBody h2,
-.reviewDialogBody p {
-  margin: 0;
-}
-
-.reviewDialogActions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: var(--space-2);
-  border-top: var(--border-width) solid var(--color-border);
-  padding: var(--space-4) var(--space-5);
-}
 
 .applicationBadge {
   --application-badge-color: var(--color-muted);
@@ -1061,14 +1025,10 @@
     padding-inline: var(--space-4);
   }
 
-  .workspaceSection,
-  .reviewDialogBody {
+  .workspaceSection {
     padding-inline: var(--space-4);
   }
 
-  .reviewDialogActions {
-    padding-inline: var(--space-4);
-  }
 
   .viewerToolbar {
     align-items: flex-start;

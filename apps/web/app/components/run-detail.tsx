@@ -21,7 +21,6 @@ import {
   artifactHref,
   getRun,
   listResumeIterations,
-  regenerateRun,
   readJsonArtifact,
   retryRun,
 } from "../lib/pipeline-client";
@@ -81,7 +80,7 @@ const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 
 type JsonRecord = Record<string, unknown>;
-type BusyAction = "retry" | "edit" | "regenerate" | "approve";
+type BusyAction = "retry" | "edit" | "approve";
 type DocumentView = "resume" | "keyword-map" | "diff";
 
 const RESUME_TAB_ID = "resume-document-tab";
@@ -861,13 +860,6 @@ export function RunDetail({ runId }: RunDetailProps) {
     );
   };
 
-  const submitRegeneration = async (): Promise<RunDto> => {
-    const expectedPdfSha256 = currentReviewPdfHash();
-    return await submitRunMutation(
-      "regenerate",
-      () => regenerateRun(runId, expectedPdfSha256),
-    );
-  };
 
   const submitApproval = async (acknowledgeVisualIssues: boolean): Promise<RunDto> => {
     const expectedPdfSha256 = currentReviewPdfHash();
@@ -878,17 +870,12 @@ export function RunDetail({ runId }: RunDetailProps) {
   };
 
   const selectIteration = (revision: number) => {
-    if (!iterationList?.iterations.some((iteration) => iteration.revision === revision)) return;
-    setIterationSelection({ mode: "pinned", selectedRevision: revision });
-  };
-
-  const viewLatestIteration = () => {
-    setIterationSelection((previous) =>
-      reconcileResumeIterationSelection(
-        { ...previous, mode: "follow-latest" },
-        iterationList?.iterations ?? [],
-      )
-    );
+    const iterations = iterationList?.iterations;
+    if (!iterations?.some((iteration) => iteration.revision === revision)) return;
+    setIterationSelection({
+      mode: revision === iterations.at(-1)?.revision ? "follow-latest" : "pinned",
+      selectedRevision: revision,
+    });
   };
 
 
@@ -1172,12 +1159,9 @@ export function RunDetail({ runId }: RunDetailProps) {
             iterations={iterationList?.iterations ?? []}
             onApprove={submitApproval}
             onEdit={submitEdit}
-            onRegenerate={submitRegeneration}
             onSelectIteration={selectIteration}
-            onViewLatest={viewLatestIteration}
             run={run}
             selectedIteration={selectedIteration}
-            selection={iterationSelection}
           />
         </aside>
       </div>

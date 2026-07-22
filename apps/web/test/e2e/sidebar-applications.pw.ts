@@ -605,15 +605,9 @@ test("shows the visible review and application workspace", async ({ page }) => {
     name: "Review and application workspace",
   });
   await expect(reviewPane).toBeVisible();
-  await expect(reviewPane.getByRole("heading")).toHaveText([
-    "Resume iteration",
-    "Resume review",
-  ]);
+  await expect(reviewPane.getByRole("heading")).toHaveText(["Displayed resume"]);
   await expect(
     reviewPane.getByText("No reviewed resume iteration is available yet.", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    reviewPane.getByText("Review actions become available when the current resume reaches review.", { exact: true }),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry failed run" })).toHaveCount(1);
 });

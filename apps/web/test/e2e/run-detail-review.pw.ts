@@ -74,6 +74,7 @@ interface MockPipeline {
   iterations: ResumeIterationListResponse;
   application: ApplicationSessionView;
   editReply: RunDto | null;
+  readonly editReplies: QueuedReply[];
   regenerateReply: RunDto | null;
   approveReply: RunDto | null;
   readonly startReplies: QueuedReply[];
@@ -282,6 +283,14 @@ function notStartedAfterApproval(): ApplicationSessionView {
     state: "not_started",
     canStart: false,
     canStartAfterApproval: true,
+  });
+}
+
+function notStartedApproved(): ApplicationSessionView {
+  return ApplicationSessionViewSchema.parse({
+    state: "not_started",
+    canStart: true,
+    canStartAfterApproval: false,
   });
 }
 
@@ -509,6 +518,7 @@ async function installPipeline(
     ),
     application: options.application ?? notStartedAfterApproval(),
     editReply: null,
+    editReplies: [],
     regenerateReply: null,
     approveReply: null,
     startReplies: [],
@@ -587,6 +597,15 @@ async function installPipeline(
     }
 
     if (path === `${pipelineRunPath}/edit` && method === "POST") {
+      const queuedReply = mock.editReplies.shift();
+      if (queuedReply) {
+        await queuedReply.waitFor;
+        queuedReply.before?.();
+        if (queuedReply.status !== 200) {
+          await fulfillJson(route, mock, queuedReply.body, queuedReply.status);
+          return;
+        }
+      }
       if (!mock.editReply) throw new Error("Unexpected edit request without a queued run reply");
       mock.run = RunDtoSchema.parse(mock.editReply);
       await fulfillJson(route, mock, mock.run);
@@ -771,8 +790,8 @@ test("selects an historical iteration through revision-scoped documents and retu
     "href",
     `${pipelineRunPath}/iterations/1/artifacts/resume-r1`,
   );
-  await expect(page.getByText("Historical iterations are view-only.", { exact: false })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Request edit" })).toHaveCount(0);
+  await expect(page.getByLabel("Edit instructions")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Request edits" })).toHaveCount(0);
 
   await page.getByRole("tab", { name: "Keyword map" }).click();
   await expect(page.getByRole("link", { name: "Download keyword map PDF" })).toHaveAttribute(
@@ -784,35 +803,48 @@ test("selects an historical iteration through revision-scoped documents and retu
     "Current public resume line for revision 1.",
   );
 
-  await page.getByRole("button", { name: "View latest" }).click();
+  await iterationSelect.selectOption("2");
   await expect(iterationSelect).toHaveValue("2");
   await expect(page.getByRole("tab", { name: "Resume" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByLabel("Selected resume PDF for Public Role 2")).toHaveAttribute(
     "data",
     `${pipelineRunPath}/iterations/2/artifacts/resume-r2`,
   );
-  await expect(page.getByRole("button", { name: "Request edit" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Request edits" })).toBeEnabled();
   await expect.poll(() => mock.artifactRequests.some((path) => path.endsWith("/iterations/1/artifacts/analysis-r1"))).toBe(true);
   expect(mock.artifactRequests.every((path) => path.includes(`${pipelineRunPath}/iterations/`))).toBe(true);
 });
 
-test("request edit and regenerate use current hashes while follow-latest advances", async ({ page }) => {
+test("direct edit requests retain failed input and follow the latest reviewed revision", async ({ page }) => {
   const mock = await installPipeline(page);
   const editingRun = runFixture({ status: "editing", revision: 3, origin: "human-comments", pdfSha256: null });
   const editedIteration = iteration(3, "human-comments", pdfHash3);
   const editedRun = runFixture({ status: "review", revision: 3, origin: "human-comments", pdfSha256: pdfHash3 });
-  const regeneratedIteration = iteration(4, "machine-regeneration", pdfHash4);
-  const regeneratedRun = runFixture({ status: "review", revision: 4, origin: "machine-regeneration", pdfSha256: pdfHash4 });
+  mock.editReplies.push({
+    status: 409,
+    body: apiError("STALE_PDF", "The resume changed; review the latest version"),
+  });
   mock.editReply = editingRun;
 
   await page.goto(`/runs/${runId}`);
-  await page.getByRole("button", { name: "Request edit" }).click();
-  const editDialog = page.getByRole("dialog", { name: "Describe the resume changes" });
-  await editDialog.getByLabel("Edit instructions").fill("  Emphasize launch ownership.  ");
+  const iterationSelect = page.getByLabel("Displayed resume");
+  await iterationSelect.selectOption("1");
+  await expect(page.getByLabel("Edit instructions")).toHaveCount(0);
+  await iterationSelect.selectOption("2");
+  await expect(iterationSelect).toHaveValue("2");
+  const editInstructions = page.getByLabel("Edit instructions");
+  const requestEdits = page.getByRole("button", { name: "Request edits" });
+  await editInstructions.fill("  Emphasize launch ownership.  ");
   mock.application = notStartedBlocked("resume_not_approved");
-  await editDialog.getByRole("button", { name: "Request edit" }).click();
+  await requestEdits.click();
+  await expect(page.getByRole("alert").filter({
+    hasText: "The resume changed; review the latest version",
+  })).toBeVisible();
+  await expect(editInstructions).toHaveValue("  Emphasize launch ownership.  ");
+  await expect(requestEdits).toBeEnabled();
+  await requestEdits.click();
 
-  await expect.poll(() => mock.requests.filter((request) => request.path.endsWith("/edit")).length).toBe(1);
+  await expect.poll(() => mock.requests.filter((request) => request.path.endsWith("/edit")).length).toBe(2);
   expect(mock.requests.find((request) => request.path.endsWith("/edit"))?.body).toEqual({
     comments: "Emphasize launch ownership.",
     expectedPdfSha256: pdfHash2,
@@ -833,57 +865,36 @@ test("request edit and regenerate use current hashes while follow-latest advance
   await page.waitForTimeout(2_600);
   await expect(page.getByLabel("Displayed resume")).toHaveValue("3");
   await expect(page.getByLabel("Displayed resume").getByRole("option", { selected: true })).toHaveText(
-    "Iteration 3 — Requested edit",
+    "Iteration 3 — Latest",
   );
   await expect(page.getByLabel("Selected resume PDF for Public Role 3")).toHaveAttribute(
     "data",
     `${pipelineRunPath}/iterations/3/artifacts/resume-r3`,
   );
 
-  mock.regenerateReply = regeneratedRun;
-  mock.iterations = iterationList(
-    iteration(1, "initial", pdfHash1),
-    iteration(2, "human-comments", pdfHash2),
-    editedIteration,
-    regeneratedIteration,
-  );
-  await page.getByRole("button", { name: "Regenerate" }).click();
-  const regenerateDialog = page.getByRole("dialog", { name: "Regenerate this resume?" });
-  await regenerateDialog.getByRole("button", { name: "Regenerate" }).click();
-
-  await expect.poll(() => mock.requests.filter((request) => request.path.endsWith("/regenerate")).length).toBe(1);
-  expect(mock.requests.find((request) => request.path.endsWith("/regenerate"))?.body).toEqual({
-    expectedPdfSha256: pdfHash3,
-  });
-  await expect(page.getByLabel("Displayed resume")).toHaveValue("4");
-  await expect(page.getByLabel("Displayed resume").getByRole("option", { selected: true })).toHaveText(
-    "Iteration 4 — Regenerated",
-  );
-  await expect(page.getByLabel("Selected resume PDF for Public Role 4")).toHaveAttribute(
-    "data",
-    `${pipelineRunPath}/iterations/4/artifacts/resume-r4`,
-  );
 });
 
-test("failed application start keeps approval and adopts the authoritative blocker", async ({ page }) => {
+test("failed application start keeps approval and exposes a standalone Apply retry", async ({ page }) => {
   const reviewRun = runFixture({ visualAcknowledgementRequired: true });
   const approved = approvedRun();
+  const starting = snapshotFixture({ bridgeState: "starting", updatedAt: createdAt + 500 });
   const mock = await installPipeline(page, { run: reviewRun });
   mock.approveReply = approved;
   mock.startReplies.push({
     status: 503,
     body: apiError("APPLICATION_HARNESS_UNAVAILABLE", "The local application service is unavailable"),
     before: () => {
-      mock.application = notStartedBlocked("harness_unconfigured");
+      mock.application = notStartedApproved();
     },
   });
+  mock.startReplies.push({ status: 202, body: starting });
 
   await page.goto(`/runs/${runId}`);
   await page.getByRole("checkbox", {
     name: "I reviewed the reported visual QA issues and accept them.",
   }).check();
   mock.iterations = approvedIterations();
-  await page.getByRole("button", { name: "Approve & apply" }).click();
+  await page.getByRole("button", { name: "Approve and apply" }).click();
 
   await expect.poll(() => mock.startBodies.length).toBe(1);
   expect(mock.requests.filter((request) => request.method === "POST").map((request) => request.path)).toEqual([
@@ -896,15 +907,21 @@ test("failed application start keeps approval and adopts the authoritative block
   });
   expect(mock.startBodies).toEqual([{ expectedApprovedPdfSha256: pdfHash2 }]);
   await expect.poll(() => mock.applicationGetCount).toBeGreaterThanOrEqual(2);
-  await expect(page.getByText("The current resume is approved. Resume editing and regeneration are closed.")).toBeVisible();
-  await expect(page.getByText("The local browser application service is not configured.")).toBeVisible();
   await expect(page.getByRole("alert").filter({
     hasText: "The local application service is unavailable",
   })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Request edit" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Request edits" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Regenerate" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Approve resume" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Start applying" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Approve and apply" })).toHaveCount(0);
+  const apply = page.getByRole("button", { name: "Apply", exact: true });
+  await expect(apply).toBeVisible();
+  await apply.click();
+  await expect.poll(() => mock.startBodies.length).toBe(2);
+  expect(mock.startBodies).toEqual([
+    { expectedApprovedPdfSha256: pdfHash2 },
+    { expectedApprovedPdfSha256: pdfHash2 },
+  ]);
+  await expect(page.getByRole("status").filter({ hasText: "Starting browser" })).toBeVisible();
   await expect(page.getByText("Pending", { exact: true })).toBeVisible();
 });
 
@@ -1550,21 +1567,19 @@ test("an invalid SSE frame reconciles through authoritative GET and does not ren
   }
 });
 
-test("390px workspace has no overflow, announces application state, and restores edit-dialog focus", async ({ page }) => {
+test("390px workspace has no overflow, exposes keyboard review controls, and announces application state", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const mock = await installPipeline(page);
   await page.goto(`/runs/${runId}`);
 
   await expect(page.getByRole("complementary", { name: "Review and application workspace" })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  const requestEdit = page.getByRole("button", { name: "Request edit" });
-  await requestEdit.click();
-  const editDialog = page.getByRole("dialog", { name: "Describe the resume changes" });
-  const editInstructions = editDialog.getByLabel("Edit instructions");
+  const editInstructions = page.getByLabel("Edit instructions");
+  const requestEdits = page.getByRole("button", { name: "Request edits" });
+  await editInstructions.focus();
   await expect(editInstructions).toBeFocused();
-  await editInstructions.press("Escape");
-  await expect(editDialog).not.toBeVisible();
-  await expect(requestEdit).toBeFocused();
+  await editInstructions.press("Tab");
+  await expect(requestEdits).toBeFocused();
 
   mock.run = approvedRun();
   mock.iterations = approvedIterations();

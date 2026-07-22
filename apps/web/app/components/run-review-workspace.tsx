@@ -6,7 +6,6 @@ import {
   useRef,
   useState,
   type FormEvent,
-  type MouseEvent,
 } from "react";
 import type {
   ApplicationSessionView,
@@ -34,13 +33,11 @@ import {
   sendApplicationCommand,
   startApplicationSession,
 } from "../lib/pipeline-client";
-import type { ResumeIterationSelection } from "../lib/run-detail-artifacts";
 import styles from "../run-detail.module.css";
 
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 
-type ReviewDialog = "edit" | "regenerate" | null;
-type ReviewBusyAction = "retry" | "edit" | "regenerate" | "approve" | null;
+type ReviewBusyAction = "retry" | "edit" | "approve" | null;
 type ApplicationStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "invalid";
 interface ApplicationActionLatch {
   requestPending: boolean;
@@ -53,15 +50,12 @@ export interface RunReviewWorkspaceProps {
   readonly artifactState: "retained" | "pruned";
   readonly iterations: readonly ResumeIterationDto[];
   readonly selectedIteration: ResumeIterationDto | undefined;
-  readonly selection: ResumeIterationSelection;
   readonly isLoadingIterations: boolean;
   readonly iterationError: string | null;
   readonly isFresh: boolean;
   readonly busyAction: ReviewBusyAction;
   readonly onSelectIteration: (revision: number) => void;
-  readonly onViewLatest: () => void;
   readonly onEdit: (comments: string) => Promise<RunDto>;
-  readonly onRegenerate: () => Promise<RunDto>;
   readonly onApprove: (acknowledgeVisualIssues: boolean) => Promise<RunDto>;
 }
 
@@ -168,20 +162,16 @@ export function RunReviewWorkspace({
   artifactState,
   iterations,
   selectedIteration,
-  selection,
   isLoadingIterations,
   iterationError,
   isFresh,
   busyAction,
   onSelectIteration,
-  onViewLatest,
   onEdit,
-  onRegenerate,
   onApprove,
 }: RunReviewWorkspaceProps) {
-  const [reviewDialog, setReviewDialog] = useState<ReviewDialog>(null);
   const [editComments, setEditComments] = useState("");
-  const [dialogError, setDialogError] = useState<string | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [acknowledgeVisualIssues, setAcknowledgeVisualIssues] = useState(false);
   const [applicationView, setApplicationView] = useState<ApplicationSessionView | null>(null);
@@ -198,9 +188,6 @@ export function RunReviewWorkspace({
     useState<ApplicationStreamState>("idle");
   const [applicationStreamRecovery, setApplicationStreamRecovery] = useState(0);
   const applicationRequestVersion = useRef(0);
-  const dialogRef = useRef<HTMLDialogElement>(null);
-  const commentsRef = useRef<HTMLTextAreaElement>(null);
-  const dialogTriggerRef = useRef<HTMLButtonElement | null>(null);
   const applicationViewRef = useRef<ApplicationSessionView | null>(null);
   const activeRunIdRef = useRef(run.id);
   const applicationLifecycleLatchRef = useRef<ApplicationActionLatch | null>(null);
@@ -420,65 +407,21 @@ export function RunReviewWorkspace({
     run.id,
   ]);
 
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog || reviewDialog === null) return;
-    if (!dialog.open) dialog.showModal();
-    const frame = window.requestAnimationFrame(() => {
-      if (reviewDialog === "edit") {
-        commentsRef.current?.focus();
-      } else {
-        dialog.querySelector<HTMLButtonElement>("[data-dialog-cancel]")?.focus();
-      }
-    });
-    return () => {
-      window.cancelAnimationFrame(frame);
-      if (dialog.open) dialog.close();
-    };
-  }, [reviewDialog]);
-
-  const closeDialog = () => {
-    if (busyAction !== null) return;
-    setReviewDialog(null);
-    setDialogError(null);
-    const trigger = dialogTriggerRef.current;
-    dialogTriggerRef.current = null;
-    window.requestAnimationFrame(() => trigger?.focus());
-  };
-
-  const openDialog = (
-    dialog: Exclude<ReviewDialog, null>,
-    event: MouseEvent<HTMLButtonElement>,
-  ) => {
-    dialogTriggerRef.current = event.currentTarget;
-    setDialogError(null);
-    setReviewDialog(dialog);
-  };
 
   const submitEdit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (actionsDisabled) return;
     const comments = editComments.trim();
     if (comments.length < 1 || comments.length > 8_000) {
-      setDialogError("Enter edit instructions between 1 and 8,000 characters.");
+      setEditError("Enter edit instructions between 1 and 8,000 characters.");
       return;
     }
-    setDialogError(null);
+    setEditError(null);
     try {
       await onEdit(comments);
       setEditComments("");
-      closeDialog();
     } catch (error) {
-      setDialogError(publicMessage(error, "The edit request could not be saved."));
-    }
-  };
-
-  const submitRegeneration = async () => {
-    setDialogError(null);
-    try {
-      await onRegenerate();
-      closeDialog();
-    } catch (error) {
-      setDialogError(publicMessage(error, "The resume could not be regenerated."));
+      setEditError(publicMessage(error, "The edit request could not be saved."));
     }
   };
 
@@ -635,13 +578,19 @@ export function RunReviewWorkspace({
   };
 
   const submitApproval = async () => {
-    if (run.visualAcknowledgementRequired && !acknowledgeVisualIssues) return;
+    if (
+      actionsDisabled
+      || !canStartAfterApproval
+      || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues)
+    ) return;
     setActionError(null);
     try {
       const approved = await onApprove(acknowledgeVisualIssues);
-      if (canStartAfterApproval && approved.currentPdfSha256) {
-        await startApplication(approved.currentPdfSha256);
+      if (!approved.currentPdfSha256) {
+        setActionError("The resume was approved, but its PDF is unavailable to apply.");
+        return;
       }
+      await startApplication(approved.currentPdfSha256);
     } catch (error) {
       setActionError(publicMessage(error, "The resume could not be approved."));
     }
@@ -649,13 +598,12 @@ export function RunReviewWorkspace({
 
   return (
     <div className={styles.reviewWorkspace}>
-      <section className={styles.workspaceSection} aria-labelledby="resume-iteration-heading">
-        <p className={styles.eyebrow}>Review workspace</p>
-        <h2 id="resume-iteration-heading">Resume iteration</h2>
+      <section className={styles.workspaceSection}>
+        <h2 id="displayed-resume-heading">Displayed resume</h2>
         {iterations.length > 0 ? (
-          <label className={styles.workspaceField}>
-            <span>Displayed resume</span>
+          <div className={styles.workspaceField}>
             <select
+              aria-labelledby="displayed-resume-heading"
               onChange={(event) => onSelectIteration(Number(event.currentTarget.value))}
               value={selectedIteration?.revision ?? ""}
             >
@@ -665,120 +613,96 @@ export function RunReviewWorkspace({
                 </option>
               ))}
             </select>
-          </label>
+          </div>
         ) : isLoadingIterations ? (
           <p role="status">Loading resume history…</p>
         ) : (
           <p>No reviewed resume iteration is available yet.</p>
         )}
-        {selection.mode === "pinned" ? (
-          <button className={styles.secondaryButton} type="button" onClick={onViewLatest}>
-            View latest
-          </button>
-        ) : null}
-        {selectedIteration ? (
-          <p className={styles.workspaceNotice}>
-            {selectedIsCurrent
-              ? `Showing the current ${selectedIteration.status} revision.`
-              : "Historical iterations are view-only. Current-run actions stay tied to the latest reviewed revision."}
-          </p>
-        ) : null}
         {artifactState === "pruned" && iterations.length > 0 ? (
           <p className={styles.workspaceNotice} role="status">
             Resume files were removed by retention; iteration labels and PDF hashes remain available.
           </p>
         ) : null}
         {iterationError ? <p className={styles.panelError} role="alert">{iterationError}</p> : null}
-      </section>
 
-      <section className={styles.workspaceSection} aria-labelledby="resume-review-actions-heading">
-        <p className={styles.eyebrow}>Current run</p>
-        <h2 id="resume-review-actions-heading">Resume review</h2>
         {canReview ? (
           <>
+            <form
+              className={styles.workspaceActions}
+              noValidate
+              onSubmit={(event) => void submitEdit(event)}
+            >
+              <label className={styles.workspaceField}>
+                <span>Edit instructions</span>
+                <textarea
+                  aria-describedby={editError ? "resume-edit-error" : undefined}
+                  aria-invalid={editError ? true : undefined}
+                  disabled={actionsDisabled}
+                  maxLength={8_000}
+                  onChange={(event) => setEditComments(event.currentTarget.value)}
+                  required
+                  value={editComments}
+                />
+              </label>
+              {editError ? (
+                <p className={styles.panelError} id="resume-edit-error" role="alert">
+                  {editError}
+                </p>
+              ) : null}
+              <button className={styles.secondaryButton} disabled={actionsDisabled} type="submit">
+                {busyAction === "edit" ? "Requesting…" : "Request edits"}
+              </button>
+            </form>
             {run.visualAcknowledgementRequired ? (
               <label className={styles.workspaceCheck}>
                 <input
                   checked={acknowledgeVisualIssues}
+                  disabled={actionsDisabled || isStartingApplication}
                   onChange={(event) => setAcknowledgeVisualIssues(event.currentTarget.checked)}
                   type="checkbox"
                 />
                 <span>I reviewed the reported visual QA issues and accept them.</span>
               </label>
             ) : null}
-            <div className={styles.workspaceActions}>
-              <button
-                className={styles.secondaryButton}
-                disabled={actionsDisabled}
-                onClick={(event) => openDialog("edit", event)}
-                type="button"
-              >
-                Request edit
-              </button>
-              <button
-                className={styles.secondaryButton}
-                disabled={actionsDisabled}
-                onClick={(event) => openDialog("regenerate", event)}
-                type="button"
-              >
-                Regenerate
-              </button>
-              <button
-                className={styles.primaryButton}
-                disabled={
-                  actionsDisabled
-                  || isLoadingApplication
-                  || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues)
-                  || isStartingApplication
-                }
-                onClick={() => void submitApproval()}
-                type="button"
-              >
-                {busyAction === "approve"
-                  ? "Approving…"
-                  : canStartAfterApproval
-                    ? "Approve & apply"
-                    : "Approve resume"}
-              </button>
-            </div>
-            {canStartAfterApproval ? (
-              <p className={styles.workspaceNotice}>
-                Approves this resume and starts the application assistant. You still submit the final form.
-              </p>
-            ) : blockedReason ? (
+            <button
+              className={styles.primaryButton}
+              disabled={
+                actionsDisabled
+                || isLoadingApplication
+                || !canStartAfterApproval
+                || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues)
+                || isStartingApplication
+              }
+              onClick={() => void submitApproval()}
+              type="button"
+            >
+              {busyAction === "approve" ? "Approving…" : "Approve and apply"}
+            </button>
+            {!canStartAfterApproval && blockedReason ? (
               <p className={styles.workspaceNotice}>{blockedReason}</p>
             ) : null}
           </>
-        ) : selectedIteration && !selectedIsCurrent ? (
-          <p>Choose the latest reviewed iteration to edit, regenerate, or approve it.</p>
-        ) : run.status === "approved" ? (
-          <p>The current resume is approved. Resume editing and regeneration are closed.</p>
-        ) : (
-          <p>Review actions become available when the current resume reaches review.</p>
-        )}
-        {actionError ? <p className={styles.panelError} role="alert">{actionError}</p> : null}
-      </section>
-
-      {run.status === "approved" && notStarted ? (
-        <section className={styles.workspaceSection} aria-labelledby="approved-application-heading">
-          <p className={styles.eyebrow}>Application</p>
-          <h2 id="approved-application-heading">Application assistant</h2>
-          {notStarted.canStart && run.currentPdfSha256 ? (
+        ) : null}
+        {run.status === "approved" && notStarted ? (
+          notStarted.canStart && run.currentPdfSha256 ? (
             <button
               className={styles.primaryButton}
               disabled={isStartingApplication}
               onClick={() => void startApplication(run.currentPdfSha256!)}
               type="button"
             >
-              {isStartingApplication ? "Starting…" : "Start applying"}
+              {isStartingApplication ? "Starting…" : "Apply"}
             </button>
           ) : (
             <p className={styles.workspaceNotice}>
               {blockedReason ?? "Automatic application is not available for this approved run."}
             </p>
-          )}
-        </section>
-      ) : null}
+          )
+        ) : null}
+        {actionError ? <p className={styles.panelError} role="alert">{actionError}</p> : null}
+      </section>
+
       {snapshot ? (
         <ApplicationSessionPanel
           actionBusy={
@@ -813,83 +737,6 @@ export function RunReviewWorkspace({
         </p>
       ) : null}
 
-      <dialog
-        aria-labelledby="review-action-dialog-title"
-        className={styles.reviewDialog}
-        onCancel={(event) => {
-          event.preventDefault();
-          closeDialog();
-        }}
-        ref={dialogRef}
-      >
-        {reviewDialog === "edit" ? (
-          <form noValidate onSubmit={(event) => void submitEdit(event)}>
-            <div className={styles.reviewDialogBody}>
-              <p className={styles.eyebrow}>Request edit</p>
-              <h2 id="review-action-dialog-title">Describe the resume changes</h2>
-              <label className={styles.workspaceField}>
-                <span>Edit instructions</span>
-                <textarea
-                  aria-describedby={dialogError ? "review-action-dialog-error" : undefined}
-                  aria-invalid={dialogError ? true : undefined}
-                  maxLength={8_000}
-                  onChange={(event) => setEditComments(event.currentTarget.value)}
-                  ref={commentsRef}
-                  required
-                  value={editComments}
-                />
-              </label>
-              {dialogError ? (
-                <p className={styles.panelError} id="review-action-dialog-error" role="alert">
-                  {dialogError}
-                </p>
-              ) : null}
-            </div>
-            <div className={styles.reviewDialogActions}>
-              <button
-                className={styles.secondaryButton}
-                data-dialog-cancel
-                disabled={busyAction !== null}
-                onClick={closeDialog}
-                type="button"
-              >
-                Cancel
-              </button>
-              <button className={styles.primaryButton} disabled={busyAction !== null} type="submit">
-                {busyAction === "edit" ? "Requesting…" : "Request edit"}
-              </button>
-            </div>
-          </form>
-        ) : reviewDialog === "regenerate" ? (
-          <div>
-            <div className={styles.reviewDialogBody}>
-              <p className={styles.eyebrow}>Regenerate</p>
-              <h2 id="review-action-dialog-title">Regenerate this resume?</h2>
-              <p>The pipeline will create a new review iteration from the same approved evidence.</p>
-              {dialogError ? <p className={styles.panelError} role="alert">{dialogError}</p> : null}
-            </div>
-            <div className={styles.reviewDialogActions}>
-              <button
-                className={styles.secondaryButton}
-                data-dialog-cancel
-                disabled={busyAction !== null}
-                onClick={closeDialog}
-                type="button"
-              >
-                Cancel
-              </button>
-              <button
-                className={styles.primaryButton}
-                disabled={busyAction !== null}
-                onClick={() => void submitRegeneration()}
-                type="button"
-              >
-                {busyAction === "regenerate" ? "Regenerating…" : "Regenerate"}
-              </button>
-            </div>
-          </div>
-        ) : null}
-      </dialog>
     </div>
   );
 }
