@@ -315,7 +315,7 @@ export interface ApplicationHarnessClient {
     sessionId: string,
     lastEventId: number | undefined,
     signal: AbortSignal,
-  ): AsyncIterable<ApplicationHarnessEvent>;
+  ): Promise<AsyncIterable<ApplicationHarnessEvent>>;
   command(
     sessionId: string,
     command: ApplicationSessionCommand,
@@ -898,11 +898,11 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     }
   }
 
-  async *stream(
+  async stream(
     sessionId: string,
     lastEventId: number | undefined,
     signal: AbortSignal,
-  ): AsyncGenerator<ApplicationHarnessEvent> {
+  ): Promise<AsyncIterable<ApplicationHarnessEvent>> {
     const parsedSessionId = UUIDSchema.safeParse(sessionId);
     if (
       !parsedSessionId.success
@@ -926,7 +926,7 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
       await cancelResponse(response);
       throw new ApplicationHarnessError("invalid_response");
     }
-    yield* parseSseResponse(response, parsedSessionId.data, signal);
+    return parseSseResponse(response, parsedSessionId.data, signal);
   }
 
   async command(

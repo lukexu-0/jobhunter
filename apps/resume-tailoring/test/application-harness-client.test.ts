@@ -479,7 +479,7 @@ describe("HttpApplicationHarnessClient", () => {
 
     const events = [];
     for await (
-      const event of client.stream(SESSION_ID, 7, new AbortController().signal)
+      const event of await client.stream(SESSION_ID, 7, new AbortController().signal)
     ) events.push(event);
 
     expect(request).toMatchObject({
@@ -555,6 +555,26 @@ describe("HttpApplicationHarnessClient", () => {
       "availability.start",
     ]) expect(serialized).not.toContain(secret);
   });
+  test("opens and validates the upstream SSE response before exposing its iterator", async () => {
+    let requests = 0;
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => {
+        requests += 1;
+        return new Response("", {
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+
+    const opening = client.stream(SESSION_ID, undefined, new AbortController().signal);
+    await Promise.resolve();
+
+    expect(requests).toBe(1);
+    const events = await opening;
+    expect(events[Symbol.asyncIterator]).toBeFunction();
+  });
   test("rejects wrong media, malformed UTF-8, mismatched, nonnumeric, and oversized SSE frames", async () => {
     const session = rawSnapshot({ state: "running", pending_action: null });
     const eventJson = JSON.stringify({
@@ -593,7 +613,7 @@ describe("HttpApplicationHarnessClient", () => {
       });
       const consume = async (): Promise<void> => {
         for await (
-          const _event of client.stream(
+          const _event of await client.stream(
             SESSION_ID,
             undefined,
             new AbortController().signal,

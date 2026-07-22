@@ -65,6 +65,7 @@ class FakeHarness implements ApplicationHarnessClient {
   createError: ApplicationHarnessError | null = null;
   commandError: ApplicationHarnessError | null = null;
   deleteError: ApplicationHarnessError | null = null;
+  streamError: ApplicationHarnessError | null = null;
   snapshotAfterCreate = harnessSnapshot();
   storeSnapshotBeforeCreateError = false;
 
@@ -89,12 +90,18 @@ class FakeHarness implements ApplicationHarnessClient {
     return snapshot;
   }
 
-  async *stream(
+  async stream(
     sessionId: string,
     lastEventId: number | undefined,
-  ): AsyncIterable<ApplicationHarnessEvent> {
+  ): Promise<AsyncIterable<ApplicationHarnessEvent>> {
     this.streamCalls.push({ sessionId, lastEventId });
-    for (const event of this.events) yield event;
+    if (this.streamError) throw this.streamError;
+    const events = this.events;
+    return {
+      async *[Symbol.asyncIterator]() {
+        yield* events;
+      },
+    };
   }
 
   async command(sessionId: string, command: ApplicationSessionCommand): Promise<void> {
@@ -600,6 +607,21 @@ describe("application session service", () => {
       lastEventId: undefined,
     });
     await nextGeneration.return?.(undefined);
+  });
+
+  test("maps an upstream SSE open failure before exposing an event iterator", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.harness!.streamError = new ApplicationHarnessError("unavailable");
+
+    await expect(target.service.events(
+      target.runId,
+      undefined,
+      signal(),
+    )).rejects.toMatchObject({
+      code: "APPLICATION_HARNESS_UNAVAILABLE",
+      status: 503,
+    });
   });
 
   test("forwards live commands without persistence and closes active, reserved, and lost sessions", async () => {

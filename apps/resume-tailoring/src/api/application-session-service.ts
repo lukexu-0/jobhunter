@@ -23,6 +23,7 @@ import type { ArtifactStore } from "../system/artifacts.ts";
 import {
   ApplicationHarnessError,
   type ApplicationHarnessClient,
+  type ApplicationHarnessEvent,
   type ApplicationHarnessSnapshot,
 } from "./application-harness-client.ts";
 import {
@@ -416,24 +417,39 @@ export class ApplicationSessionService {
     const lastUpstreamEventId = cursor?.generation === session.generation
       ? cursor.upstreamEventId
       : undefined;
+    let upstreamEvents: AsyncIterable<ApplicationHarnessEvent>;
+    try {
+      upstreamEvents = await harness.stream(
+        session.sessionId,
+        lastUpstreamEventId,
+        signal,
+      );
+    } catch (error) {
+      if (signal.aborted) signal.throwIfAborted();
+      if (
+        error instanceof ApplicationHarnessError
+        && error.code === "session_not_found"
+        && session.publicSnapshot !== null
+        && isLive(session)
+      ) {
+        this.#markLost(runId, session);
+        throw new RunServiceError("RUN_CONFLICT", "application session is not live", 409);
+      }
+      this.#throwHarnessError(error);
+    }
 
-    return this.#streamEvents(runId, session, harness, lastUpstreamEventId, signal);
+    return this.#streamEvents(runId, session, upstreamEvents, signal);
   }
 
   async *#streamEvents(
     runId: string,
     initialSession: PublicApplicationSession,
-    harness: ApplicationHarnessClient,
-    lastUpstreamEventId: number | undefined,
+    upstreamEvents: AsyncIterable<ApplicationHarnessEvent>,
     signal: AbortSignal,
   ): AsyncGenerator<ApplicationSessionStreamItem> {
     let session = initialSession;
     try {
-      for await (const event of harness.stream(
-        session.sessionId,
-        lastUpstreamEventId,
-        signal,
-      )) {
+      for await (const event of upstreamEvents) {
         signal.throwIfAborted();
         if (
           session.lastUpstreamEventId !== null
