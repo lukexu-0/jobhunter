@@ -32,7 +32,11 @@ import { openPipelineDatabase } from "../src/db/database.ts";
 import { PipelineRepository, type ActiveStage } from "../src/db/repository.ts";
 import type { LoadedContextManifest } from "../src/context/manifest.ts";
 import { ArtifactStore } from "../src/system/artifacts.ts";
-import { RunDtoSchema } from "../src/contracts/index.ts";
+import {
+  ResumeIterationDtoSchema,
+  ResumeIterationListResponseSchema,
+  RunDtoSchema,
+} from "../src/contracts/index.ts";
 
 const ORIGIN = "http://127.0.0.1:3456";
 const JOB_URL = "https://jobs.example.test/role";
@@ -205,6 +209,30 @@ function post(body: unknown): RequestInit {
 }
 
 describe("RunApplicationService", () => {
+  test("defines strict reviewable resume iteration projections", () => {
+    const iteration = {
+      revision: 2,
+      origin: "human-comments" as const,
+      status: "review" as const,
+      createdAt: 123,
+      pdfSha256: "a".repeat(64),
+      artifacts: [],
+    };
+
+    expect(ResumeIterationDtoSchema.parse(iteration)).toEqual(iteration);
+    expect(ResumeIterationListResponseSchema.parse({
+      artifactState: "pruned",
+      iterations: [iteration],
+    })).toEqual({
+      artifactState: "pruned",
+      iterations: [iteration],
+    });
+    expect(ResumeIterationDtoSchema.safeParse({ ...iteration, status: "queued" }).success).toBeFalse();
+    expect(ResumeIterationListResponseSchema.safeParse({
+      artifactState: "retained",
+      iterations: [{ ...iteration, privatePath: "/tmp/resume.pdf" }],
+    }).success).toBeFalse();
+  });
   test("creates a runnable run with one atomic four-source snapshot and immutable queued input", async () => {
     const target = fixture();
     const jobDescription = JOB_DESCRIPTION;

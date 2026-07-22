@@ -320,6 +320,26 @@ export const ArtifactDtoSchema = z
   .strict();
 export type ArtifactDto = z.infer<typeof ArtifactDtoSchema>;
 
+export const ResumeIterationDtoSchema = z
+  .object({
+    revision: z.number().int().positive(),
+    origin: RevisionOriginSchema,
+    status: z.enum(["review", "approved"]),
+    createdAt: z.number().int(),
+    pdfSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    artifacts: z.array(ArtifactDtoSchema),
+  })
+  .strict();
+export type ResumeIterationDto = z.infer<typeof ResumeIterationDtoSchema>;
+
+export const ResumeIterationListResponseSchema = z
+  .object({
+    artifactState: z.enum(["retained", "pruned"]),
+    iterations: z.array(ResumeIterationDtoSchema),
+  })
+  .strict();
+export type ResumeIterationListResponse = z.infer<typeof ResumeIterationListResponseSchema>;
+
 export const AttemptDtoSchema = z
   .object({
     id: z.string(),
