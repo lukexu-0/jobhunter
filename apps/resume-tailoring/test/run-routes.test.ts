@@ -707,6 +707,26 @@ describe("application session HTTP routes", () => {
     });
   });
 
+  test("maps event preflight failures before committing stream headers", async () => {
+    const response = await applicationRequest(
+      applicationService({
+        events: async () => {
+          throw new ApplicationSessionServiceError("APPLICATION_HARNESS_UNAVAILABLE");
+        },
+      }),
+      "/v1/runs/run-1/application/events",
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(await response.json()).toEqual({
+      error: {
+        code: "APPLICATION_HARNESS_UNAVAILABLE",
+        message: "The local application service is unavailable",
+      },
+    });
+  });
+
   test("accepts only canonical generation-qualified cursors and streams one exact event", async () => {
     let received:
       | { runId: string; cursor: { generation: number; upstreamEventId: number } | undefined; signal: AbortSignal }

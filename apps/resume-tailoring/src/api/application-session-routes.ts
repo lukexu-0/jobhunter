@@ -32,7 +32,7 @@ export interface ApplicationSessionRouteService {
     runId: string,
     cursor: ApplicationSessionEventCursor | undefined,
     signal: AbortSignal,
-  ): AsyncIterable<ApplicationSessionStreamItem>;
+  ): Promise<AsyncIterable<ApplicationSessionStreamItem>> | AsyncIterable<ApplicationSessionStreamItem>;
   command(
     runId: string,
     command: ApplicationSessionCommand,
@@ -215,7 +215,8 @@ export function createApplicationSessionRoutes(service: ApplicationSessionRouteS
             400,
           );
         }
-        return eventStreamResponse(service.events(runId, cursor, request.signal), request.signal);
+        const events = await service.events(runId, cursor, request.signal);
+        return eventStreamResponse(events, request.signal);
       }
       if (
         request.method === "POST"

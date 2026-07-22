@@ -385,11 +385,11 @@ export class ApplicationSessionService {
     return await this.#resume(runId, reserved, prepared, signal);
   }
 
-  async *events(
+  async events(
     runId: string,
     cursor: ApplicationSessionEventCursor | undefined,
     signal: AbortSignal,
-  ): AsyncGenerator<ApplicationSessionStreamItem> {
+  ): Promise<AsyncIterable<ApplicationSessionStreamItem>> {
     if (
       cursor !== undefined
       && (
@@ -417,6 +417,17 @@ export class ApplicationSessionService {
       ? cursor.upstreamEventId
       : undefined;
 
+    return this.#streamEvents(runId, session, harness, lastUpstreamEventId, signal);
+  }
+
+  async *#streamEvents(
+    runId: string,
+    initialSession: PublicApplicationSession,
+    harness: ApplicationHarnessClient,
+    lastUpstreamEventId: number | undefined,
+    signal: AbortSignal,
+  ): AsyncGenerator<ApplicationSessionStreamItem> {
+    let session = initialSession;
     try {
       for await (const event of harness.stream(
         session.sessionId,

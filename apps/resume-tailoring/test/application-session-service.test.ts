@@ -551,11 +551,11 @@ describe("application session service", () => {
       detail: { stepNumber: 3 },
     }];
 
-    const iterator = target.service.events(
+    const iterator = (await target.service.events(
       target.runId,
       { generation: 1, upstreamEventId: 5 },
       signal(),
-    )[Symbol.asyncIterator]();
+    ))[Symbol.asyncIterator]();
     const item = await iterator.next();
 
     expect(target.harness!.streamCalls).toEqual([{
@@ -589,11 +589,11 @@ describe("application session service", () => {
     expect(serialized).not.toContain(FIRST_SESSION_ID);
     expect(serialized).not.toContain(JOB_URL);
     expect(serialized).not.toContain(PROFILE);
-    const nextGeneration = target.service.events(
+    const nextGeneration = (await target.service.events(
       target.runId,
       { generation: 2, upstreamEventId: 99 },
       signal(),
-    )[Symbol.asyncIterator]();
+    ))[Symbol.asyncIterator]();
     await nextGeneration.next();
     expect(target.harness!.streamCalls[1]).toEqual({
       sessionId: FIRST_SESSION_ID,
