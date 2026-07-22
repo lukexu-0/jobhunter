@@ -65,23 +65,23 @@ describe("run-detail artifact selection", () => {
   test("follows new reviewed iterations while preserving an explicit pinned revision", () => {
     const initial = reconcileResumeIterationSelection(
       { mode: "follow-latest", selectedRevision: null },
-      [iteration(1), iteration(2)],
+      [iteration(3), iteration(5)],
     );
-    expect(initial).toEqual({ mode: "follow-latest", selectedRevision: 2 });
+    expect(initial).toEqual({ mode: "follow-latest", selectedRevision: 5 });
     expect(reconcileResumeIterationSelection(initial, [
-      iteration(1),
-      iteration(2),
       iteration(3),
-    ])).toEqual({ mode: "follow-latest", selectedRevision: 3 });
+      iteration(5),
+      iteration(8),
+    ])).toEqual({ mode: "follow-latest", selectedRevision: 8 });
 
-    const pinned: ResumeIterationSelection = { mode: "pinned", selectedRevision: 1 };
+    const pinned: ResumeIterationSelection = { mode: "pinned", selectedRevision: 3 };
     expect(reconcileResumeIterationSelection(pinned, [
-      iteration(1),
-      iteration(2),
       iteration(3),
+      iteration(5),
+      iteration(8),
     ])).toEqual(pinned);
-    expect(reconcileResumeIterationSelection(pinned, [iteration(2), iteration(3)]))
-      .toEqual({ mode: "follow-latest", selectedRevision: 3 });
+    expect(reconcileResumeIterationSelection(pinned, [iteration(5), iteration(8)]))
+      .toEqual({ mode: "follow-latest", selectedRevision: 8 });
     expect(reconcileResumeIterationSelection(pinned, []))
       .toEqual({ mode: "follow-latest", selectedRevision: null });
   });

@@ -65,13 +65,8 @@ export interface RunReviewWorkspaceProps {
   readonly onApprove: (acknowledgeVisualIssues: boolean) => Promise<RunDto>;
 }
 
-export function resumeIterationLabel(iteration: ResumeIterationDto): string {
-  const origin = iteration.origin === "initial"
-    ? "Initial"
-    : iteration.origin === "machine-regeneration"
-      ? "Regenerated"
-      : "Requested edit";
-  return `Iteration ${iteration.revision} — ${origin}`;
+export function resumeIterationLabel(displayNumber: number, isLatest: boolean): string {
+  return `Iteration ${displayNumber}${isLatest ? " — Latest" : ""}`;
 }
 
 function publicMessage(error: unknown, fallback: string): string {
@@ -664,9 +659,9 @@ export function RunReviewWorkspace({
               onChange={(event) => onSelectIteration(Number(event.currentTarget.value))}
               value={selectedIteration?.revision ?? ""}
             >
-              {iterations.map((iteration) => (
+              {iterations.map((iteration, index) => (
                 <option key={iteration.revision} value={iteration.revision}>
-                  {resumeIterationLabel(iteration)}
+                  {resumeIterationLabel(index + 1, index === iterations.length - 1)}
                 </option>
               ))}
             </select>
