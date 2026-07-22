@@ -1086,6 +1086,8 @@ test("uses the simplified opened-run header workflow layout", async ({ page }) =
     /Deterministic QA$/,
     /Visual QA$/,
     /Review$/,
+    /Applying$/,
+    /Applied$/,
   ]);
 
   await expect(page.getByText(/Workflow stage · revision 3/)).toBeHidden();
@@ -1117,8 +1119,8 @@ test("uses the simplified opened-run header workflow layout", async ({ page }) =
   });
 
   const reviewLineDelta = await stages.evaluateAll((elements) => {
-    const visualQa = elements.at(-2);
-    const reviewMarker = elements.at(-1)?.firstElementChild;
+    const visualQa = elements[5];
+    const reviewMarker = elements[6]?.firstElementChild;
     if (!visualQa || !reviewMarker) throw new Error("Review connector geometry is unavailable");
     const visualQaBox = visualQa.getBoundingClientRect();
     const connectorStyle = getComputedStyle(visualQa, "::after");

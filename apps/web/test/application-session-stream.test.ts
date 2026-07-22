@@ -14,6 +14,7 @@ const event: ApplicationSessionEventDto = {
     generation: 2,
     bridgeState: "running",
     harnessState: "running",
+    submissionPhase: "not_attempted",
     createdAt: 1,
     updatedAt: 2,
     terminalAt: null,
@@ -35,6 +36,10 @@ describe("application session SSE projection", () => {
   test("accepts only strict generation-qualified projected frames", () => {
     expect(APPLICATION_SESSION_EVENT_NAMES).toContain("snapshot");
     expect(APPLICATION_SESSION_EVENT_NAMES).toContain("additional_info_required");
+    expect(APPLICATION_SESSION_EVENT_NAMES).toContain("submission_started");
+    expect(APPLICATION_SESSION_EVENT_NAMES).toContain("application_submitted");
+    expect(APPLICATION_SESSION_EVENT_NAMES).toContain("submission_uncertain");
+    expect(APPLICATION_SESSION_EVENT_NAMES).not.toContain("ready_for_human_submit");
     expect(parseApplicationSessionStreamEvent(
       JSON.stringify(event),
       "2:7",
@@ -57,6 +62,47 @@ describe("application session SSE projection", () => {
     )).toEqual({ status: "stale" });
     expect(parseApplicationSessionStreamEvent("not-json", "2:8", 2))
       .toEqual({ status: "invalid" });
+  });
+
+  test("accepts each submission transition with its strict projected state", () => {
+    const transitions = [
+      {
+        name: "submission_started",
+        state: "submitting",
+        phase: "attempting",
+      },
+      {
+        name: "application_submitted",
+        state: "submitted",
+        phase: "submitted",
+      },
+      {
+        name: "submission_uncertain",
+        state: "submission_uncertain",
+        phase: "uncertain",
+      },
+    ] as const;
+
+    for (const [index, transition] of transitions.entries()) {
+      const nextEvent: ApplicationSessionEventDto = {
+        ...event,
+        event: transition.name,
+        session: {
+          ...event.session,
+          bridgeState: transition.state,
+          harnessState: transition.state,
+          submissionPhase: transition.phase,
+          updatedAt: event.session.updatedAt + index + 1,
+        },
+      };
+      expect(parseApplicationSessionStreamEvent(
+        JSON.stringify(nextEvent),
+        `2:${index + 8}`,
+        2,
+        transition.name,
+      )).toEqual({ status: "accepted", event: nextEvent });
+      expect(isStreamableApplicationSnapshot(nextEvent.session)).toBeTrue();
+    }
   });
 
   test("streams only harness-backed live states and rejects stale reconciliations", () => {

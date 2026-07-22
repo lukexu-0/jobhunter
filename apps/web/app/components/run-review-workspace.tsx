@@ -39,7 +39,7 @@ const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 
 type ReviewBusyAction = "retry" | "edit" | "approve" | null;
 type ApplicationStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "invalid";
-interface ApplicationActionLatch {
+export interface ApplicationActionLatch {
   requestPending: boolean;
   projectionAccepted: boolean;
   readonly acceptsProjection: (view: ApplicationSessionView) => boolean;
@@ -57,6 +57,7 @@ export interface RunReviewWorkspaceProps {
   readonly onSelectIteration: (revision: number) => void;
   readonly onEdit: (comments: string) => Promise<RunDto>;
   readonly onApprove: (acknowledgeVisualIssues: boolean) => Promise<RunDto>;
+  readonly onApplicationView: (view: ApplicationSessionView | null) => void;
 }
 
 export function resumeIterationLabel(displayNumber: number, isLatest: boolean): string {
@@ -116,6 +117,17 @@ function commandProjectionMatcher(
   return (view) => {
     const next = applicationSnapshot(view);
     if (!next) return false;
+    if (command.type === "submit") {
+      return baseline.bridgeState === "awaiting_human_review"
+        && baseline.pendingAction?.type === "human_review"
+        && next.generation === baseline.generation
+        && next.updatedAt > baseline.updatedAt
+        && (
+          next.bridgeState === "submitting"
+          || next.bridgeState === "submitted"
+          || next.bridgeState === "submission_uncertain"
+        );
+    }
     if (next.generation !== baseline.generation) {
       return next.generation > baseline.generation;
     }
@@ -132,12 +144,42 @@ function commandProjectionMatcher(
       case "revise":
         return next.pendingAction?.type !== "human_review"
           || next.revisionCount > baseline.revisionCount;
-      case "ready":
-        return next.pendingAction?.type !== "human_review";
       case "cancel":
         return isTerminalApplicationSnapshot(next);
     }
   };
+}
+
+export function createApplicationCommandLatch(
+  command: ApplicationSessionCommand,
+  baseline: ApplicationSessionSnapshotDto,
+): ApplicationActionLatch {
+  return {
+    requestPending: true,
+    projectionAccepted: false,
+    acceptsProjection: commandProjectionMatcher(command, baseline),
+  };
+}
+
+export function acceptApplicationActionProjection(
+  latch: ApplicationActionLatch,
+  view: ApplicationSessionView,
+): boolean {
+  if (latch.acceptsProjection(view)) latch.projectionAccepted = true;
+  return !latch.requestPending && latch.projectionAccepted;
+}
+
+export function settleApplicationActionRequest(
+  latch: ApplicationActionLatch,
+): boolean {
+  latch.requestPending = false;
+  return latch.projectionAccepted;
+}
+
+export function isApplicationActionLatchBusy(
+  latch: ApplicationActionLatch,
+): boolean {
+  return latch.requestPending || !latch.projectionAccepted;
 }
 
 function lifecycleProjectionMatcher(
@@ -166,6 +208,7 @@ export function RunReviewWorkspace({
   iterationError,
   isFresh,
   busyAction,
+  onApplicationView,
   onSelectIteration,
   onEdit,
   onApprove,
@@ -200,24 +243,19 @@ export function RunReviewWorkspace({
     setApplicationLoadError(null);
     setApplicationStreamError(null);
     const lifecycleLatch = applicationLifecycleLatchRef.current;
-    if (lifecycleLatch && lifecycleLatch.acceptsProjection(next)) {
-      lifecycleLatch.projectionAccepted = true;
-      if (!lifecycleLatch.requestPending) {
-        applicationLifecycleLatchRef.current = null;
-        setApplicationLifecycleAction(null);
-      }
+    if (lifecycleLatch && acceptApplicationActionProjection(lifecycleLatch, next)) {
+      applicationLifecycleLatchRef.current = null;
+      setApplicationLifecycleAction(null);
     }
     const commandLatch = applicationCommandLatchRef.current;
-    if (commandLatch && commandLatch.acceptsProjection(next)) {
-      commandLatch.projectionAccepted = true;
-      if (!commandLatch.requestPending) {
-        applicationCommandLatchRef.current = null;
-        setApplicationCommandAction(null);
-      }
+    if (commandLatch && acceptApplicationActionProjection(commandLatch, next)) {
+      applicationCommandLatchRef.current = null;
+      setApplicationCommandAction(null);
     }
+    onApplicationView(next);
     setApplicationView(next);
     return true;
-  }, [run.id]);
+  }, [onApplicationView, run.id]);
   const refreshApplicationView = useCallback(async (): Promise<boolean> => {
     return installApplicationView(await getApplicationSession(run.id));
   }, [installApplicationView, run.id]);
@@ -253,6 +291,7 @@ export function RunReviewWorkspace({
 
   useEffect(() => {
     applicationViewRef.current = null;
+    onApplicationView(null);
     setApplicationView(null);
     setApplicationStreamError(null);
     setApplicationLoadError(null);
@@ -261,7 +300,7 @@ export function RunReviewWorkspace({
     setApplicationLifecycleAction(null);
     setApplicationCommandAction(null);
     setApplicationError(null);
-  }, [run.id]);
+  }, [onApplicationView, run.id]);
 
   useEffect(() => {
     setAcknowledgeVisualIssues(false);
@@ -449,10 +488,9 @@ export function RunReviewWorkspace({
   };
 
   const settleApplicationLifecycleRequest = (latch: ApplicationActionLatch) => {
-    latch.requestPending = false;
     if (
       applicationLifecycleLatchRef.current === latch
-      && latch.projectionAccepted
+      && settleApplicationActionRequest(latch)
     ) {
       applicationLifecycleLatchRef.current = null;
       setApplicationLifecycleAction(null);
@@ -460,10 +498,9 @@ export function RunReviewWorkspace({
   };
 
   const settleApplicationCommandRequest = (latch: ApplicationActionLatch) => {
-    latch.requestPending = false;
     if (
       applicationCommandLatchRef.current === latch
-      && latch.projectionAccepted
+      && settleApplicationActionRequest(latch)
     ) {
       applicationCommandLatchRef.current = null;
       setApplicationCommandAction(null);
@@ -554,11 +591,7 @@ export function RunReviewWorkspace({
 
   const submitApplicationCommand = async (command: ApplicationSessionCommand) => {
     if (!snapshot || applicationCommandLatchRef.current) return;
-    const latch: ApplicationActionLatch = {
-      requestPending: true,
-      projectionAccepted: false,
-      acceptsProjection: commandProjectionMatcher(command, snapshot),
-    };
+    const latch = createApplicationCommandLatch(command, snapshot);
     applicationCommandLatchRef.current = latch;
     setApplicationCommandAction(command.type);
     setApplicationError(null);
@@ -566,11 +599,15 @@ export function RunReviewWorkspace({
       await sendApplicationCommand(run.id, command);
       settleApplicationCommandRequest(latch);
     } catch (error) {
+      if (command.type === "submit") settleApplicationCommandRequest(latch);
       await refreshAfterApplicationFailure(
         error,
         "The application command could not be accepted.",
       );
-      if (applicationCommandLatchRef.current === latch) {
+      if (
+        command.type !== "submit"
+        && applicationCommandLatchRef.current === latch
+      ) {
         applicationCommandLatchRef.current = null;
         setApplicationCommandAction(null);
       }

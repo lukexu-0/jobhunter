@@ -6,6 +6,7 @@ import type { PDFDocumentLoadingTask, RenderTask } from "pdfjs-dist";
 import {
   ResumeDiffSchema,
   type ArtifactDto,
+  type ApplicationSessionView,
   type ArtifactKind,
   type AttemptDto,
   type ResumeDiff,
@@ -53,15 +54,26 @@ const STATUS_LABELS: Record<RunStatus, string> = {
   failed: "Failed",
 };
 
+type WorkflowStageKey = RunStatus | "applying" | "applied";
+
 const WORKFLOW_STAGES = [
-  { status: "analyzing", label: "Analysis" },
-  { status: "tailoring", label: "Tailoring" },
-  { status: "editing", label: "Editing" },
-  { status: "compiling", label: "Compile" },
-  { status: "deterministic_qa", label: "Deterministic QA" },
-  { status: "visual_qa", label: "Visual QA" },
-  { status: "review", label: "Review" },
-] as const satisfies ReadonlyArray<{ status: RunStatus; label: string }>;
+  { key: "analyzing", label: "Analysis" },
+  { key: "tailoring", label: "Tailoring" },
+  { key: "editing", label: "Editing" },
+  { key: "compiling", label: "Compile" },
+  { key: "deterministic_qa", label: "Deterministic QA" },
+  { key: "visual_qa", label: "Visual QA" },
+  { key: "review", label: "Review" },
+  { key: "applying", label: "Applying" },
+  { key: "applied", label: "Applied" },
+] as const satisfies ReadonlyArray<{ key: WorkflowStageKey; label: string }>;
+
+const VERIFIED_APPLICATION_STATUSES: Partial<Record<RunDto["applicationStatus"], true>> = {
+  applied: true,
+  rejected: true,
+  interview: true,
+  accepted: true,
+};
 
 const ATTEMPT_TO_STATUS: Record<AttemptDto["stage"], RunStatus> = {
   analysis: "analyzing",
@@ -199,14 +211,26 @@ function parseJobIdentity(value: unknown): JobIdentity | null {
   return organization ? { title, organization } : { title };
 }
 
-function activeWorkflowIndex(run: RunDto): number {
-  if (run.status === "approved") return WORKFLOW_STAGES.length;
+function activeWorkflowIndex(
+  run: RunDto,
+  applicationView: ApplicationSessionView | null,
+): number {
   if (run.status === "failed") {
     const lastAttempt = [...run.attempts].sort((left, right) => right.startedAt - left.startedAt)[0];
-    return lastAttempt ? WORKFLOW_STAGES.findIndex((stage) => stage.status === ATTEMPT_TO_STATUS[lastAttempt.stage]) : -1;
+    return lastAttempt
+      ? WORKFLOW_STAGES.findIndex((stage) => stage.key === ATTEMPT_TO_STATUS[lastAttempt.stage])
+      : -1;
+  }
+  if (run.status === "approved") {
+    const durableSubmissionVerified = applicationView !== null
+      && !("state" in applicationView)
+      && applicationView.submissionPhase === "submitted";
+    return VERIFIED_APPLICATION_STATUSES[run.applicationStatus] || durableSubmissionVerified
+      ? WORKFLOW_STAGES.length
+      : WORKFLOW_STAGES.findIndex((stage) => stage.key === "applying");
   }
   const visibleStatus = run.status === "repairing" ? "compiling" : run.status;
-  return WORKFLOW_STAGES.findIndex((stage) => stage.status === visibleStatus);
+  return WORKFLOW_STAGES.findIndex((stage) => stage.key === visibleStatus);
 }
 
 
@@ -379,15 +403,21 @@ export function ResumeDiffContent({ diff }: { readonly diff: ResumeDiff }) {
 }
 
 
-function WorkflowProgress({ run }: { readonly run: RunDto }) {
-  const activeIndex = activeWorkflowIndex(run);
+function WorkflowProgress({
+  applicationView,
+  run,
+}: {
+  readonly applicationView: ApplicationSessionView | null;
+  readonly run: RunDto;
+}) {
+  const activeIndex = activeWorkflowIndex(run, applicationView);
   return (
     <ol className={styles.stageList} aria-label="Workflow progress">
       {WORKFLOW_STAGES.map((stage, index) => {
-        const completed = run.status === "approved" || index < activeIndex;
+        const completed = index < activeIndex;
         const current = index === activeIndex;
         return (
-          <li className={`${styles.stageItem} ${completed ? styles.stageComplete : ""} ${current ? styles.stageCurrent : ""}`} key={stage.status} aria-current={current ? "step" : undefined}>
+          <li className={`${styles.stageItem} ${completed ? styles.stageComplete : ""} ${current ? styles.stageCurrent : ""}`} key={stage.key} aria-current={current ? "step" : undefined}>
             <span className={styles.stageMarker}>{completed ? <Icon name="check" /> : index + 1}</span>
             <span>{stage.label}</span>
           </li>
@@ -506,8 +536,14 @@ export function RunDetail({ runId }: RunDetailProps) {
   const [artifactData, setArtifactData] = useState<Record<string, unknown>>({});
   const [artifactErrors, setArtifactErrors] = useState<Record<string, string>>({});
   const [isLoadingArtifacts, setIsLoadingArtifacts] = useState(false);
+  const [applicationView, setApplicationView] = useState<ApplicationSessionView | null>(null);
+  const [applicationStatusRefreshError, setApplicationStatusRefreshError] =
+    useState<string | null>(null);
+  const [isRefreshingApplicationStatus, setIsRefreshingApplicationStatus] = useState(false);
   const requestVersion = useRef(0);
   const iterationRequestVersion = useRef(0);
+  const applicationStatusRefreshVersion = useRef(0);
+  const submittedRefreshRunRef = useRef<string | null>(null);
   const resumeTabRef = useRef<HTMLButtonElement>(null);
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
@@ -536,6 +572,42 @@ export function RunDetail({ runId }: RunDetailProps) {
     }
   }, [runId]);
 
+  const refreshSubmittedRun = useCallback(async (): Promise<void> => {
+    const request = ++applicationStatusRefreshVersion.current;
+    setIsRefreshingApplicationStatus(true);
+    try {
+      const nextRun = await getRun(runId);
+      if (request !== applicationStatusRefreshVersion.current) return;
+      setRun(nextRun);
+      setApplicationStatusRefreshError(null);
+      setIsFresh(true);
+    } catch (error) {
+      if (request !== applicationStatusRefreshVersion.current) return;
+      setApplicationStatusRefreshError(publicMessage(
+        error,
+        "The submitted application status could not be refreshed. Try again.",
+      ));
+    } finally {
+      if (request === applicationStatusRefreshVersion.current) {
+        setIsRefreshingApplicationStatus(false);
+      }
+    }
+  }, [runId]);
+
+  const reportApplicationView = useCallback((next: ApplicationSessionView | null): void => {
+    setApplicationView(next);
+    if (
+      next === null
+      || "state" in next
+      || next.bridgeState !== "submitted"
+      || submittedRefreshRunRef.current === runId
+    ) {
+      return;
+    }
+    submittedRefreshRunRef.current = runId;
+    void refreshSubmittedRun();
+  }, [refreshSubmittedRun, runId]);
+
   useEffect(() => {
     setRun(null);
     setIterationList(null);
@@ -547,10 +619,16 @@ export function RunDetail({ runId }: RunDetailProps) {
     setLoadError(null);
     setActionError(null);
     setBusyAction(null);
+    setApplicationView(null);
+    setApplicationStatusRefreshError(null);
+    setIsRefreshingApplicationStatus(false);
+    submittedRefreshRunRef.current = null;
+    applicationStatusRefreshVersion.current += 1;
     void loadRun(true);
     return () => {
       requestVersion.current += 1;
       iterationRequestVersion.current += 1;
+      applicationStatusRefreshVersion.current += 1;
     };
   }, [loadRun]);
 
@@ -905,6 +983,7 @@ export function RunDetail({ runId }: RunDetailProps) {
       className={styles.detailShell}
       aria-busy={
         isRefreshing
+        || isRefreshingApplicationStatus
         || busyAction !== null
         || isLoadingArtifacts
         || isLoadingIterations
@@ -912,9 +991,25 @@ export function RunDetail({ runId }: RunDetailProps) {
     >
       <header className={styles.topBar}>
         <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to applications</Link>
-        <WorkflowProgress run={run} />
+        <WorkflowProgress applicationView={applicationView} run={run} />
       </header>
-      {loadError ? <p className={styles.panelError} role="alert">{loadError}</p> : null}
+      <div className={styles.topAlerts}>
+        {loadError ? <p className={styles.panelError} role="alert">{loadError}</p> : null}
+        {applicationStatusRefreshError ? (
+          <div className={`${styles.panelError} ${styles.statusRefreshError}`} role="alert">
+            <p>{applicationStatusRefreshError}</p>
+            <button
+              className={styles.secondaryButton}
+              disabled={isRefreshingApplicationStatus}
+              onClick={() => void refreshSubmittedRun()}
+              type="button"
+            >
+              <Icon name="refresh" />
+              {isRefreshingApplicationStatus ? "Refreshing status…" : "Retry status refresh"}
+            </button>
+          </div>
+        ) : null}
+      </div>
 
       <div className={styles.paneGrid}>
         <aside className={`${styles.pane} ${styles.leftPane}`} aria-label="Application summary and keyword comparison">
@@ -1157,6 +1252,7 @@ export function RunDetail({ runId }: RunDetailProps) {
             isFresh={isFresh && !isRefreshing}
             iterationError={iterationError}
             iterations={iterationList?.iterations ?? []}
+            onApplicationView={reportApplicationView}
             onApprove={submitApproval}
             onEdit={submitEdit}
             onSelectIteration={selectIteration}

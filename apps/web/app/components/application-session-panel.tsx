@@ -39,7 +39,9 @@ const STATE_LABELS: Readonly<Record<ApplicationSessionBridgeState, string>> = {
   awaiting_origin_approval: "Waiting for origin approval",
   awaiting_additional_info: "Waiting for additional information",
   awaiting_human_review: "Waiting for application review",
-  ready_for_human_submit: "Ready for human submission",
+  submitting: "Submitting application",
+  submitted: "Application submitted",
+  submission_uncertain: "Submission could not be verified",
   cancelled: "Cancelled",
   failed: "Failed",
   closed: "Closed",
@@ -55,7 +57,7 @@ const ACTION_STATUS_LABELS: Readonly<Record<ApplicationPanelAction, string>> = {
   approve_origin: "Approving origin",
   provide_additional_info: "Answering questions",
   revise: "Requesting application revision",
-  ready: "Marking application ready",
+  submit: "Approving submission",
 };
 
 const TERMINAL_STATES = new Set<ApplicationSessionBridgeState>([
@@ -110,7 +112,12 @@ export function ApplicationSessionPanel({
   onCommand,
 }: ApplicationSessionPanelProps) {
   const terminal = TERMINAL_STATES.has(snapshot.bridgeState);
-  const ready = snapshot.bridgeState === "ready_for_human_submit";
+  const finalSubmission = snapshot.submissionPhase === "submitted"
+    || snapshot.submissionPhase === "uncertain";
+  const parked = snapshot.bridgeState === "submitted"
+    || snapshot.bridgeState === "submission_uncertain";
+  const submitting = snapshot.bridgeState === "submitting";
+  const retryableTerminal = terminal && !finalSubmission;
   const busy = actionBusy !== null;
   const pendingAction = snapshot.pendingAction;
   const commandBusy =
@@ -230,16 +237,34 @@ export function ApplicationSessionPanel({
           The browser connection was lost. Before retrying, verify whether the application was submitted.
         </p>
       ) : null}
-      {ready ? (
+      {parked ? (
         <p className={styles.workspaceNotice}>
           Headed Chrome stays open until {snapshot.expiresAt === null
             ? "the browser session expires"
-            : formatTimestamp(snapshot.expiresAt)} so you can inspect and submit the application yourself.
+            : formatTimestamp(snapshot.expiresAt)} so you can inspect the final application state.
         </p>
       ) : null}
 
       <div className={styles.workspaceActions}>
-        {!terminal && !ready ? (
+        {parked ? (
+          <button
+            className={styles.secondaryButton}
+            disabled={busy}
+            onClick={() => void onClose()}
+            type="button"
+          >
+            {actionBusy === "close" ? "Closing…" : "Close browser"}
+          </button>
+        ) : retryableTerminal ? (
+          <button
+            className={styles.primaryButton}
+            disabled={busy}
+            onClick={() => void onRetry()}
+            type="button"
+          >
+            {actionBusy === "retry" ? "Retrying…" : "Retry applying"}
+          </button>
+        ) : !terminal && !submitting ? (
           <>
             {snapshot.bridgeState === "reserved" ? (
               <button
@@ -260,25 +285,7 @@ export function ApplicationSessionPanel({
               {actionBusy === "cancel" ? "Cancelling…" : "Cancel application"}
             </button>
           </>
-        ) : terminal ? (
-          <button
-            className={styles.primaryButton}
-            disabled={busy}
-            onClick={() => void onRetry()}
-            type="button"
-          >
-            {actionBusy === "retry" ? "Retrying…" : "Retry applying"}
-          </button>
-        ) : (
-          <button
-            className={styles.secondaryButton}
-            disabled={busy}
-            onClick={() => void onClose()}
-            type="button"
-          >
-            {actionBusy === "close" ? "Closing…" : "Close browser"}
-          </button>
-        )}
+        ) : null}
       </div>
     </section>
   );

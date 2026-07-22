@@ -13,6 +13,7 @@ function snapshot(
     generation: 2,
     bridgeState: "running",
     harnessState: "running",
+    submissionPhase: "not_attempted",
     createdAt: 1,
     updatedAt: 2,
     terminalAt: null,
@@ -88,19 +89,69 @@ describe("ApplicationSessionPanel", () => {
     expect(lost).toContain("verify whether the application was submitted");
     expect(lost).not.toContain("Cancel application");
 
-    const ready = renderToStaticMarkup(
+    const submitting = renderToStaticMarkup(
       <ApplicationSessionPanel
         {...callbacks}
         snapshot={snapshot({
-          bridgeState: "ready_for_human_submit",
-          harnessState: "ready_for_human_submit",
+          bridgeState: "submitting",
+          harnessState: "submitting",
+          submissionPhase: "attempting",
         })}
       />,
     );
-    expect(ready).toContain("Close browser");
-    expect(ready).toContain("stays open until");
-    expect(ready).not.toContain("Cancel application");
-    expect(ready).not.toContain("Retry applying");
+    expect(submitting).toContain("Submitting application");
+    expect(submitting).not.toContain("Cancel application");
+    expect(submitting).not.toContain("Retry applying");
+    expect(submitting).not.toContain("Close browser");
+
+    const submitted = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "submitted",
+          harnessState: "submitted",
+          submissionPhase: "submitted",
+        })}
+      />,
+    );
+    expect(submitted).toContain("Application submitted");
+    expect(submitted).toContain("Close browser");
+    expect(submitted).toContain("stays open until");
+    expect(submitted).not.toContain("Cancel application");
+    expect(submitted).not.toContain("Retry applying");
+
+    const uncertain = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "submission_uncertain",
+          harnessState: "submission_uncertain",
+          submissionPhase: "uncertain",
+          warnings: [
+            "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
+          ],
+        })}
+      />,
+    );
+    expect(uncertain).toContain("Submission could not be verified");
+    expect(uncertain).toContain("Close browser");
+    expect(uncertain).not.toContain("Cancel application");
+    expect(uncertain).not.toContain("Retry applying");
+
+    const closedSubmitted = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "closed",
+          harnessState: "closed",
+          submissionPhase: "submitted",
+          terminalAt: 3,
+          expiresAt: null,
+        })}
+      />,
+    );
+    expect(closedSubmitted).not.toContain("Retry applying");
+    expect(closedSubmitted).not.toContain("Close browser");
   });
 
   test("renders navigation and exact canonical origin gates", () => {
@@ -204,7 +255,7 @@ describe("ApplicationSessionPanel", () => {
     expect(markup).toContain('disabled="" type="submit">Answer questions');
   });
 
-  test("renders transient revision guidance and an explicit ready action", () => {
+  test("renders transient revision guidance and the submission confirmation", () => {
     const markup = renderToStaticMarkup(
       <ApplicationSessionPanel
         {...callbacks}
@@ -218,8 +269,11 @@ describe("ApplicationSessionPanel", () => {
 
     expect(markup).toContain("Review the application");
     expect(markup).toContain("Request application revision");
-    expect(markup).toContain("Ready for human submit");
+    expect(markup).toContain("Approve and submit");
+    expect(markup).toContain("Submit this application?");
+    expect(markup).toContain("This action is irreversible.");
     expect(markup).toContain("not saved as profile facts");
     expect(markup).toContain("Cancel application");
+    expect(markup).not.toContain("Ready for human submit");
   });
 });

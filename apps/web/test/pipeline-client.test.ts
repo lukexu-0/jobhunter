@@ -84,6 +84,7 @@ const applicationSnapshot: ApplicationSessionSnapshotDto = {
   generation: 2,
   bridgeState: "running",
   harnessState: "running",
+  submissionPhase: "not_attempted",
   createdAt: 1,
   updatedAt: 2,
   terminalAt: null,
@@ -504,6 +505,7 @@ describe("pipeline application session requests", () => {
       type: "approve_origin",
       origin: "https://apply.example.test",
     })).resolves.toBeUndefined();
+    await expect(sendApplicationCommand(id, { type: "submit" })).resolves.toBeUndefined();
     await expect(closeApplicationSession(id)).resolves.toBeUndefined();
     expect(applicationEventsHref(id)).toBe(
       "/api/pipeline/runs/run%20%2F1%3F/application/events",
@@ -539,6 +541,15 @@ describe("pipeline application session requests", () => {
             type: "approve_origin",
             origin: "https://apply.example.test",
           }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/commands",
+        init: {
+          body: JSON.stringify({ type: "submit" }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
           method: "POST",

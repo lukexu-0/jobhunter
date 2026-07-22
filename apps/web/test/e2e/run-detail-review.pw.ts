@@ -74,6 +74,7 @@ interface MockPipeline {
   iterations: ResumeIterationListResponse;
   application: ApplicationSessionView;
   editReply: RunDto | null;
+  readonly runReplies: QueuedReply[];
   readonly editReplies: QueuedReply[];
   regenerateReply: RunDto | null;
   approveReply: RunDto | null;
@@ -311,6 +312,7 @@ function snapshotFixture(options: {
   readonly updatedAt?: number;
   readonly harnessState?: HarnessSessionState | null;
   readonly pendingAction?: ApplicationPendingAction | null;
+  readonly submissionPhase?: ApplicationSessionSnapshotDto["submissionPhase"];
   readonly revisionCount?: number;
   readonly company?: string;
   readonly role?: string;
@@ -333,6 +335,14 @@ function snapshotFixture(options: {
     generation,
     bridgeState: options.bridgeState,
     harnessState,
+    submissionPhase: options.submissionPhase
+      ?? (options.bridgeState === "submitting"
+        ? "attempting"
+        : options.bridgeState === "submitted"
+          ? "submitted"
+          : options.bridgeState === "submission_uncertain"
+            ? "uncertain"
+            : "not_attempted"),
     createdAt,
     updatedAt,
     terminalAt: terminal ? updatedAt : null,
@@ -517,6 +527,7 @@ async function installPipeline(
       iteration(2, "human-comments", pdfHash2),
     ),
     application: options.application ?? notStartedAfterApproval(),
+    runReplies: [],
     editReply: null,
     editReplies: [],
     regenerateReply: null,
@@ -550,6 +561,16 @@ async function installPipeline(
 
     if (path === pipelineRunPath && method === "GET") {
       mock.runGetCount += 1;
+      const queuedReply = mock.runReplies.shift();
+      if (queuedReply) {
+        await queuedReply.waitFor;
+        queuedReply.before?.();
+        if (queuedReply.status !== 200) {
+          await fulfillJson(route, mock, queuedReply.body, queuedReply.status);
+          return;
+        }
+        mock.run = RunDtoSchema.parse(queuedReply.body ?? mock.run);
+      }
       await fulfillJson(route, mock, RunDtoSchema.parse(mock.run));
       return;
     }
@@ -938,13 +959,18 @@ test("an accepted live projection clears a stale application load failure", asyn
   const mock = await installPipeline(page, {
     application: running,
   });
-  mock.approveReply = approvedRun();
+  mock.editReply = runFixture({
+    status: "editing",
+    revision: 3,
+    origin: "human-comments",
+    pdfSha256: null,
+  });
   queueSse(mock, eventFixture("failed", failed, {}), 2, failedFrame.promise);
   let failedApplicationReads = 0;
   await page.route(`**${pipelineRunPath}/application`, async (route) => {
     if (
       route.request().method() === "GET"
-      && mock.run.status === "approved"
+      && mock.run.revision === 3
     ) {
       failedApplicationReads += 1;
       await route.fulfill({
@@ -962,8 +988,8 @@ test("an accepted live projection clears a stale application load failure", asyn
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
-  mock.iterations = approvedIterations();
-  await page.getByRole("button", { name: "Approve resume" }).click();
+  await page.getByLabel("Edit instructions").fill("Refresh the opening sentence.");
+  await page.getByRole("button", { name: "Request edits" }).click();
   const loadFailure = page.getByRole("alert").filter({
     hasText: "The local application service is unavailable",
   });
@@ -1086,7 +1112,7 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
 });
 
-test("navigation, origin approval, human review, ready, and close use exact public commands", async ({ page }) => {
+test("navigation, origin approval, human review, submit approval, and close use exact public commands", async ({ page }) => {
   const navigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
     pendingAction: { type: "human_navigation", instruction: "Complete the public sign-in checkpoint." },
@@ -1128,13 +1154,14 @@ test("navigation, origin approval, human review, ready, and close use exact publ
     revisionCount: 1,
     warnings: ["Confirm the public salary range."],
   });
-  const ready = snapshotFixture({
-    bridgeState: "ready_for_human_submit",
+  const submitted = snapshotFixture({
+    bridgeState: "submitted",
     updatedAt: createdAt + 500,
     revisionCount: 1,
   });
   const closed = snapshotFixture({
     bridgeState: "closed",
+    submissionPhase: "submitted",
     updatedAt: createdAt + 600,
     revisionCount: 1,
   });
@@ -1144,7 +1171,7 @@ test("navigation, origin approval, human review, ready, and close use exact publ
   const originResponse = deferred();
   const originFrame = deferred();
   const reviseFrame = deferred();
-  const readyFrame = deferred();
+  const submittedFrame = deferred();
   const closeFrame = deferred();
   const mock = await installPipeline(page, {
     run: approvedRun(),
@@ -1161,10 +1188,15 @@ test("navigation, origin approval, human review, ready, and close use exact publ
   }), 3, continueFrame.promise);
   queueSse(mock, eventFixture("review_required", review, {}), 4, originFrame.promise);
   queueSse(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), 5, reviseFrame.promise);
-  queueSse(mock, eventFixture("ready_for_human_submit", ready, {}), 6, readyFrame.promise);
+  queueSse(mock, eventFixture("application_submitted", submitted, {}), 6, submittedFrame.promise);
   queueSse(mock, eventFixture("closed", closed, {}), 7, closeFrame.promise);
 
   await page.goto(`/runs/${runId}`);
+  const workflow = page.getByRole("list", { name: "Workflow progress" });
+  const applyingStage = workflow.getByRole("listitem").filter({ hasText: "Applying" });
+  const appliedStage = workflow.getByRole("listitem").filter({ hasText: "Applied" });
+  await expect(applyingStage).toHaveAttribute("aria-current", "step");
+  await expect(appliedStage).not.toHaveAttribute("aria-current", "step");
   await expect(page.getByText("Complete the public sign-in checkpoint.")).toBeVisible();
   await page.getByRole("button", { name: "Continue application" }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
@@ -1200,13 +1232,15 @@ test("navigation, origin approval, human review, ready, and close use exact publ
   originFrame.resolve();
 
   await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
+  await expect(applyingStage).toHaveAttribute("aria-current", "step");
+  await expect(appliedStage.locator("svg")).toHaveCount(0);
   await expect(page.getByText("Email", { exact: true })).toBeVisible();
   await expect(page.getByText("Salary expectation", { exact: true })).toBeVisible();
   await expect(page.getByText("Confirm the public salary range.", { exact: true })).toBeVisible();
   const requestRevisionButton = page.getByRole("button", { name: "Request application revision" });
-  const readyButton = page.getByRole("button", { name: "Ready for human submit" });
+  const submitButton = page.getByRole("button", { name: "Approve and submit" }).first();
   await expect(requestRevisionButton).toBeDisabled();
-  await expect(readyButton).toBeDisabled();
+  await expect(submitButton).toBeDisabled();
   const originAccepted = page.waitForResponse((response) =>
     new URL(response.url()).pathname === `${pipelineRunPath}/application/commands`
     && response.request().method() === "POST"
@@ -1217,7 +1251,7 @@ test("navigation, origin approval, human review, ready, and close use exact publ
   await page.evaluate(() => new Promise<void>((resolve) => {
     window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
   }));
-  await expect(readyButton).toBeEnabled();
+  await expect(submitButton).toBeEnabled();
   mock.application = review;
   await page.getByLabel("Revision instructions").fill("  Correct the public salary field.  ");
   await page.getByRole("button", { name: "Request application revision" }).click();
@@ -1232,18 +1266,33 @@ test("navigation, origin approval, human review, ready, and close use exact publ
   await expect(page.getByText("1", { exact: true })).toBeVisible();
   mock.application = revised;
 
-  await page.getByRole("button", { name: "Ready for human submit" }).click();
+  await submitButton.click();
+  const submitDialog = page.getByRole("dialog", { name: "Submit this application?" });
+  await expect(submitDialog).toBeVisible();
+  await expect(submitDialog).toContainText(
+    "This action is irreversible. The application assistant will submit the completed application in the headed browser. Continue only after you have reviewed every field and warning.",
+  );
+  await submitDialog.getByRole("button", { name: "Approve and submit" }).click();
   await expect.poll(() => mock.commands.length).toBe(4);
-  expect(mock.commands[3]).toEqual({ type: "ready" });
-  await expect(page.getByRole("button", { name: "Marking ready…" })).toBeDisabled();
-  readyFrame.resolve();
+  expect(mock.commands[3]).toEqual({ type: "submit" });
+  await expect(page.getByRole("button", { name: "Approving submission…" })).toBeDisabled();
+  mock.run = {
+    ...mock.run,
+    applicationStatus: "applied",
+    updatedAt: mock.run.updatedAt + 1,
+  };
+  submittedFrame.resolve();
 
-  await expect(page.getByRole("status").filter({ hasText: "Ready for human submission" })).toBeVisible();
-  await expect(page.getByText(/Headed Chrome stays open until .* so you can inspect and submit/)).toBeVisible();
-  mock.application = ready;
+  await expect(page.getByRole("status").filter({ hasText: "Application submitted" })).toBeVisible();
+  await expect(page.getByText(/Headed Chrome stays open until .* so you can inspect the final application state/)).toBeVisible();
+  await expect.poll(() => mock.runGetCount).toBe(2);
+  await expect(applyingStage).not.toHaveAttribute("aria-current", "step");
+  await expect(applyingStage.locator("svg")).toHaveCount(1);
+  await expect(appliedStage.locator("svg")).toHaveCount(1);
+  mock.application = submitted;
   await expect(page.getByRole("button", { name: "Cancel application" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Close browser" })).toBeVisible();
-  await expect(page.getByText("Pending", { exact: true })).toBeVisible();
+  await expect(page.getByText("Applied", { exact: true }).first()).toBeVisible();
 
   mock.onDelete = () => {
     mock.application = closed;
@@ -1252,13 +1301,96 @@ test("navigation, origin approval, human review, ready, and close use exact publ
   await page.getByRole("button", { name: "Close browser" }).click();
   await expect.poll(() => mock.deleteCount).toBe(1);
   await expect(page.getByRole("status").filter({ hasText: "Closed" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry applying" })).toHaveCount(0);
   expect(mock.commands).toEqual([
     { type: "continue" },
     { type: "approve_origin", origin: "https://accounts.example.test" },
     { type: "revise", context: "Correct the public salary field." },
-    { type: "ready" },
+    { type: "submit" },
   ]);
+});
+
+test("submission uncertainty keeps Applying current and never offers Retry", async ({ page }) => {
+  const uncertain = snapshotFixture({
+    bridgeState: "submission_uncertain",
+    submissionPhase: "uncertain",
+    updatedAt: createdAt + 500,
+    warnings: [
+      "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
+    ],
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: uncertain,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const workflow = page.getByRole("list", { name: "Workflow progress" });
+  const applyingStage = workflow.getByRole("listitem").filter({ hasText: "Applying" });
+  const appliedStage = workflow.getByRole("listitem").filter({ hasText: "Applied" });
+  await expect(applyingStage).toHaveAttribute("aria-current", "step");
+  await expect(appliedStage).not.toHaveAttribute("aria-current", "step");
+  await expect(appliedStage.locator("svg")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Close browser" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry applying" })).toHaveCount(0);
+  await expect(page.getByText("The application submission could not be verified.", {
+    exact: false,
+  })).toBeVisible();
+  expect(mock.runGetCount).toBe(1);
+});
+
+test("a failed submitted-run refresh is retryable without resubmitting", async ({ page }) => {
+  const initialRun = approvedRun();
+  const appliedRun: RunDto = {
+    ...initialRun,
+    applicationStatus: "applied",
+    updatedAt: initialRun.updatedAt + 1,
+  };
+  const submitted = snapshotFixture({
+    bridgeState: "submitted",
+    updatedAt: createdAt + 500,
+  });
+  const mock = await installPipeline(page, {
+    run: initialRun,
+    iterations: approvedIterations(),
+    application: submitted,
+  });
+  mock.runReplies.push(
+    { status: 200, body: initialRun },
+    {
+      status: 503,
+      body: {
+        error: {
+          code: "HARNESS_UNAVAILABLE",
+          message: "Run refresh unavailable",
+        },
+      },
+    },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  await expect.poll(() => mock.runGetCount).toBe(2);
+  const refreshAlert = page.getByRole("alert").filter({ hasText: "The pipeline request failed." });
+  await expect(refreshAlert).toBeVisible();
+  await expect(
+    page.getByRole("complementary", { name: "Application summary and keyword comparison" })
+      .getByText("Pending", { exact: true }),
+  ).toBeVisible();
+  const appliedStage = page.getByRole("list", { name: "Workflow progress" })
+    .getByRole("listitem")
+    .filter({ hasText: "Applied" });
+  await expect(appliedStage.locator("svg")).toHaveCount(1);
+
+  mock.runReplies.push({ status: 200, body: appliedRun });
+  await refreshAlert.getByRole("button", { name: "Retry status refresh" }).click();
+  await expect.poll(() => mock.runGetCount).toBe(3);
+  await expect(refreshAlert).toHaveCount(0);
+  await expect(
+    page.getByRole("complementary", { name: "Application summary and keyword comparison" })
+      .getByText("Applied", { exact: true }),
+  ).toBeVisible();
+  expect(mock.commands).toEqual([]);
 });
 
 test("a reserved generation resumes with the approved hash and running cancel is a command", async ({ page }) => {

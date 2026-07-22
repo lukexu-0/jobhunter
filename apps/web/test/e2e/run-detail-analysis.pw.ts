@@ -249,7 +249,9 @@ test("shows the minimal summary and phrase-only keyword comparison", async ({ pa
   await page.goto(`/runs/${runId}`);
 
   const title = page.getByRole("heading", { level: 1, name: "Staff AI Engineer" });
-  const lifecycleBadge = page.getByText("Applied", { exact: true });
+  const lifecycleBadge = page
+    .getByRole("complementary", { name: "Application summary and keyword comparison" })
+    .getByText("Applied", { exact: true });
   await expect(title).toBeVisible();
   await expect(lifecycleBadge).toBeVisible();
   await expect(page.getByText("Acme Systems", { exact: true }).first()).toBeVisible();

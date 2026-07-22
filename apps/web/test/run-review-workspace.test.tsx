@@ -1,9 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import type { ResumeIterationDto, RunDto } from "@jobhunter/pipeline/contracts";
+import type {
+  ApplicationSessionSnapshotDto,
+  ResumeIterationDto,
+  RunDto,
+} from "@jobhunter/pipeline/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
+  acceptApplicationActionProjection,
+  createApplicationCommandLatch,
+  isApplicationActionLatchBusy,
   RunReviewWorkspace,
   resumeIterationLabel,
+  settleApplicationActionRequest,
 } from "../app/components/run-review-workspace";
 
 const PDF_HASH = "a".repeat(64);
@@ -39,6 +47,31 @@ const run: RunDto = {
   timeline: [],
 };
 
+function reviewSnapshot(
+  overrides: Partial<ApplicationSessionSnapshotDto> = {},
+): ApplicationSessionSnapshotDto {
+  return {
+    generation: 4,
+    bridgeState: "awaiting_human_review",
+    harnessState: "awaiting_human_review",
+    submissionPhase: "not_attempted",
+    createdAt: 10,
+    updatedAt: 20,
+    terminalAt: null,
+    expiresAt: 100,
+    company: "Example Corp",
+    role: "Engineer",
+    fieldsFilled: [],
+    fieldsNeedingHuman: [],
+    filesAttached: ["resume.pdf"],
+    warnings: [],
+    revisionCount: 1,
+    pendingAction: { type: "human_review" },
+    error: null,
+    ...overrides,
+  } as ApplicationSessionSnapshotDto;
+}
+
 describe("RunReviewWorkspace", () => {
   test("numbers displayed iterations independently of internal revisions", () => {
     const iterations = [
@@ -62,6 +95,7 @@ describe("RunReviewWorkspace", () => {
         isLoadingIterations={false}
         iterationError={null}
         iterations={iterations}
+        onApplicationView={() => {}}
         onApprove={async () => ({ ...run, status: "approved" })}
         onEdit={async () => run}
         onSelectIteration={() => {}}
@@ -95,6 +129,7 @@ describe("RunReviewWorkspace", () => {
         isLoadingIterations={false}
         iterationError={null}
         iterations={iterations}
+        onApplicationView={() => {}}
         onApprove={async () => ({ ...run, status: "approved" })}
         onEdit={async () => run}
         onSelectIteration={() => {}}
@@ -108,5 +143,80 @@ describe("RunReviewWorkspace", () => {
     expect(currentMarkup).not.toContain("Regenerate");
     expect(currentMarkup).not.toContain("View latest");
     expect(markup).not.toContain("Edit instructions");
+  });
+
+  test("keeps submit busy until request settlement and a newer submission projection", () => {
+    const baseline = reviewSnapshot();
+    const latch = createApplicationCommandLatch({ type: "submit" }, baseline);
+
+    expect(settleApplicationActionRequest(latch)).toBeFalse();
+    expect(isApplicationActionLatchBusy(latch)).toBeTrue();
+    expect(acceptApplicationActionProjection(latch, baseline)).toBeFalse();
+    expect(acceptApplicationActionProjection(latch, reviewSnapshot({
+      updatedAt: 21,
+      revisionCount: 2,
+    }))).toBeFalse();
+    expect(acceptApplicationActionProjection(latch, reviewSnapshot({
+      generation: 5,
+      bridgeState: "submitting",
+      harnessState: "submitting",
+      submissionPhase: "attempting",
+      updatedAt: 21,
+      pendingAction: null,
+    }))).toBeFalse();
+    expect(acceptApplicationActionProjection(latch, reviewSnapshot({
+      bridgeState: "submitting",
+      harnessState: "submitting",
+      submissionPhase: "attempting",
+      pendingAction: null,
+    }))).toBeFalse();
+    expect(isApplicationActionLatchBusy(latch)).toBeTrue();
+
+    expect(acceptApplicationActionProjection(latch, reviewSnapshot({
+      bridgeState: "submitting",
+      harnessState: "submitting",
+      submissionPhase: "attempting",
+      updatedAt: 22,
+      pendingAction: null,
+    }))).toBeTrue();
+    expect(isApplicationActionLatchBusy(latch)).toBeFalse();
+  });
+
+  test("does not release submit when the projection arrives before the POST settles", () => {
+    const latch = createApplicationCommandLatch({ type: "submit" }, reviewSnapshot());
+    const submitted = reviewSnapshot({
+      bridgeState: "submitted",
+      harnessState: "submitted",
+      submissionPhase: "submitted",
+      updatedAt: 21,
+      pendingAction: null,
+    });
+
+    expect(acceptApplicationActionProjection(latch, submitted)).toBeFalse();
+    expect(isApplicationActionLatchBusy(latch)).toBeTrue();
+    expect(settleApplicationActionRequest(latch)).toBeTrue();
+    expect(isApplicationActionLatchBusy(latch)).toBeFalse();
+  });
+
+  test("keeps a failed submit request latched across replay and reconnect", () => {
+    const baseline = reviewSnapshot();
+    const latch = createApplicationCommandLatch({ type: "submit" }, baseline);
+
+    expect(settleApplicationActionRequest(latch)).toBeFalse();
+    expect(acceptApplicationActionProjection(latch, baseline)).toBeFalse();
+    expect(acceptApplicationActionProjection(latch, reviewSnapshot({
+      updatedAt: 21,
+      company: "Reconnected Example Corp",
+    }))).toBeFalse();
+    expect(isApplicationActionLatchBusy(latch)).toBeTrue();
+
+    expect(acceptApplicationActionProjection(latch, reviewSnapshot({
+      bridgeState: "submission_uncertain",
+      harnessState: "submission_uncertain",
+      submissionPhase: "uncertain",
+      updatedAt: 22,
+      pendingAction: null,
+    }))).toBeTrue();
+    expect(isApplicationActionLatchBusy(latch)).toBeFalse();
   });
 });
