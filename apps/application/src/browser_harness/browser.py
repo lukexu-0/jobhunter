@@ -221,6 +221,10 @@ def create_browser(
         profile_directory="Default",
         headless=False,
         keep_alive=True,
+        args=[
+            "--disable-window-activation",
+            "--disable-focus-on-load",
+        ],
         allowed_domains=allowed_domains,
         downloads_path=downloads,
         disable_security=False,

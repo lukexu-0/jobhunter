@@ -246,6 +246,20 @@ def test_create_browser_uses_exact_persistent_native_profile_without_copy_or_lau
     assert profile.profile_directory == "Default"
     assert profile.headless is False
     assert profile.keep_alive is True
+    assert profile.args == [
+        "--disable-window-activation",
+        "--disable-focus-on-load",
+    ]
+    effective_args = profile.get_args()
+    assert effective_args.count("--disable-window-activation") == 1
+    assert effective_args.count("--disable-focus-on-load") == 1
+    assert not any(
+        arg == "--headless"
+        or arg.startswith("--headless=")
+        or arg == "--start-minimized"
+        or arg == "--no-startup-window"
+        for arg in effective_args
+    )
     assert profile.disable_security is False
     assert profile.chromium_sandbox is True
     assert profile.enable_default_extensions is False
@@ -349,6 +363,7 @@ def test_create_browser_uses_only_cdp_connection_settings(
             "downloads_path": downloads.resolve(),
         }
     ]
+    assert "args" not in _CapturingBrowser.calls[0]
     assert stat.S_IMODE(downloads.stat().st_mode) == 0o700
 
 
