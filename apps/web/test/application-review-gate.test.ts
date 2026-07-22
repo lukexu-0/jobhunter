@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildApplicationRevisionCommand } from "../app/lib/application-review-gate";
+import { clipTextToCodePoints } from "../app/lib/application-text";
 
 describe("buildApplicationRevisionCommand", () => {
   test("trims review guidance into the exact revise command", () => {
@@ -24,5 +25,11 @@ describe("buildApplicationRevisionCommand", () => {
       success: false,
       message: "Enter revision instructions between 1 and 20,000 characters.",
     });
+  });
+
+  test("clips input by Unicode code points without splitting astral characters", () => {
+    expect(clipTextToCodePoints(`a${"𐐀".repeat(2_000)}b`, 2_001))
+      .toBe(`a${"𐐀".repeat(2_000)}`);
+    expect(clipTextToCodePoints("short", 20_000)).toBe("short");
   });
 });

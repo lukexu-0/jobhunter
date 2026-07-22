@@ -1603,7 +1603,10 @@ class ApplicationSessionManager:
     ) -> SessionSnapshot:
         values = snapshot.model_dump()
         values.update(updates)
-        values["updated_at"] = _now()
+        values["updated_at"] = max(
+            _now(),
+            snapshot.updated_at + timedelta(milliseconds=1),
+        )
         return SessionSnapshot.model_validate(values)
 
     def _not_found(self) -> HarnessServiceError:

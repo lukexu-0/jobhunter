@@ -3,6 +3,7 @@ import {
   type ApplicationAdditionalInfoQuestion,
   type ApplicationSessionCommand,
 } from "@jobhunter/pipeline/contracts";
+import { hasCodePointLength } from "./application-text";
 
 export type AdditionalInfoDraft =
   | { readonly status: "declined" }
@@ -30,10 +31,6 @@ function failure(questionId: string, message: string): AdditionalInfoBuildResult
   return { success: false, questionId, message };
 }
 
-function hasCodePointLength(value: string, minimum: number, maximum: number): boolean {
-  const length = Array.from(value).length;
-  return length >= minimum && length <= maximum;
-}
 
 export function buildAdditionalInfoCommand(
   questions: readonly ApplicationAdditionalInfoQuestion[],

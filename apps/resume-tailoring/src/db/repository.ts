@@ -542,11 +542,18 @@ export class PipelineRepository {
       ) {
         throw new RepositoryConflictError("application session is terminal");
       }
-      const now = this.#now();
+      const updatedAt = Math.max(current.updated_at + 1, this.#now());
       const terminalAt = TERMINAL_APPLICATION_SESSION_STATES[input.bridgeState] === true
-        ? (current.terminal_at ?? now)
+        ? (current.terminal_at ?? updatedAt)
         : null;
       const cursor = input.lastUpstreamEventId ?? current.last_upstream_event_id;
+      if (
+        current.bridge_state === input.bridgeState
+        && current.public_snapshot_json === publicSnapshotJson
+        && current.last_upstream_event_id === cursor
+      ) {
+        return publicApplicationSession(current);
+      }
       const result = this.#db.query(`
         UPDATE run_application_sessions
         SET bridge_state = ?, public_snapshot_json = ?, last_upstream_event_id = ?,
@@ -561,7 +568,7 @@ export class PipelineRepository {
         input.bridgeState,
         publicSnapshotJson,
         cursor,
-        now,
+        updatedAt,
         terminalAt,
         runId,
         input.generation,
@@ -596,12 +603,12 @@ export class PipelineRepository {
       ) {
         throw new RepositoryConflictError("application session was not observed live");
       }
-      const now = this.#now();
+      const updatedAt = Math.max(current.updated_at + 1, this.#now());
       this.#db.query(`
         UPDATE run_application_sessions
         SET bridge_state = 'lost', public_snapshot_json = ?, updated_at = ?, terminal_at = ?
         WHERE run_id = ? AND generation = ? AND session_id = ?
-      `).run(publicSnapshotJson, now, now, runId, input.generation, input.sessionId);
+      `).run(publicSnapshotJson, updatedAt, updatedAt, runId, input.generation, input.sessionId);
       const lost = this.#db.query<ApplicationSessionRow, [string, number]>(
         "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
       ).get(runId, input.generation);
@@ -624,12 +631,12 @@ export class PipelineRepository {
       if (current.bridge_state !== "lost") {
         throw new RepositoryConflictError("application session is not lost");
       }
-      const now = this.#now();
+      const updatedAt = Math.max(current.updated_at + 1, this.#now());
       this.#db.query(`
         UPDATE run_application_sessions
         SET bridge_state = 'closed', public_snapshot_json = ?, updated_at = ?
         WHERE run_id = ? AND generation = ? AND session_id = ?
-      `).run(publicSnapshotJson, now, runId, input.generation, input.sessionId);
+      `).run(publicSnapshotJson, updatedAt, runId, input.generation, input.sessionId);
       const closed = this.#db.query<ApplicationSessionRow, [string, number]>(
         "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
       ).get(runId, input.generation);

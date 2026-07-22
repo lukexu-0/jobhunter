@@ -448,12 +448,25 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): AsyncGenerator<ApplicationSessionStreamItem> {
     let session = initialSession;
+    const replaySnapshot = session.publicSnapshot === null
+      ? null
+      : ApplicationSessionSnapshotDtoSchema.safeParse(session.publicSnapshot);
+    if (replaySnapshot !== null && !replaySnapshot.success) {
+      throw applicationHarnessUnavailable();
+    }
+    const replayUpdatedAtFloor = replaySnapshot?.data.updatedAt ?? null;
     try {
       for await (const event of upstreamEvents) {
         signal.throwIfAborted();
         if (
-          session.lastUpstreamEventId !== null
-          && event.id < session.lastUpstreamEventId
+          (
+            session.lastUpstreamEventId !== null
+            && event.id <= session.lastUpstreamEventId
+          )
+          || (
+            replayUpdatedAtFloor !== null
+            && event.session.updatedAt <= replayUpdatedAtFloor
+          )
         ) {
           continue;
         }
@@ -728,7 +741,7 @@ export class ApplicationSessionService {
     snapshot: ApplicationHarnessSnapshot,
     lastUpstreamEventId?: number,
   ): ApplicationSessionSnapshotDto {
-    const updatedAt = Math.max(session.updatedAt, this.#now());
+    const updatedAt = snapshot.updatedAt;
     const terminalAt = TERMINAL_APPLICATION_STATES[snapshot.state] === true
       ? (session.terminalAt ?? updatedAt)
       : null;
@@ -751,17 +764,17 @@ export class ApplicationSessionService {
       error: snapshot.error,
     });
     try {
-      this.dependencies.repository.recordApplicationSnapshot(runId, {
+      const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
         generation: session.generation,
         sessionId: session.sessionId,
         bridgeState: snapshot.state,
         publicSnapshot: projected,
         ...(lastUpstreamEventId !== undefined ? { lastUpstreamEventId } : {}),
       });
+      return this.#storedView(recorded);
     } catch (error) {
       mapRepositoryError(error);
     }
-    return projected;
   }
 
   #markLost(
@@ -769,7 +782,7 @@ export class ApplicationSessionService {
     session: PublicApplicationSession,
   ): ApplicationSessionSnapshotDto {
     const previous = this.#storedView(session);
-    const updatedAt = Math.max(session.updatedAt, this.#now());
+    const updatedAt = Math.max(previous.updatedAt + 1, this.#now());
     const lost = ApplicationSessionSnapshotDtoSchema.parse({
       ...previous,
       generation: session.generation,
@@ -784,15 +797,15 @@ export class ApplicationSessionService {
         : [...previous.warnings, LOST_WARNING],
     });
     try {
-      this.dependencies.repository.markApplicationSessionLost(runId, {
+      const recorded = this.dependencies.repository.markApplicationSessionLost(runId, {
         generation: session.generation,
         sessionId: session.sessionId,
         publicSnapshot: lost,
       });
+      return this.#storedView(recorded);
     } catch (error) {
       mapRepositoryError(error);
     }
-    return lost;
   }
 
   #closedProjection(
@@ -800,7 +813,7 @@ export class ApplicationSessionService {
     harnessState: "closed" | null,
   ): ApplicationSessionSnapshotDto {
     const previous = this.#storedView(session);
-    const updatedAt = Math.max(session.updatedAt, this.#now());
+    const updatedAt = Math.max(previous.updatedAt + 1, this.#now());
     return ApplicationSessionSnapshotDtoSchema.parse({
       ...previous,
       generation: session.generation,

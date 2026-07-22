@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -20,7 +21,9 @@ import {
 } from "./application-session-panel";
 import {
   APPLICATION_SESSION_EVENT_NAMES,
+  isStreamableApplicationSnapshot,
   parseApplicationSessionStreamEvent,
+  shouldAcceptApplicationView,
 } from "../lib/application-session-stream";
 import {
   PipelineClientError,
@@ -99,12 +102,6 @@ function applicationSnapshot(
   return view && !("state" in view) ? view : null;
 }
 
-function isLiveApplicationSnapshot(snapshot: ApplicationSessionSnapshotDto): boolean {
-  return snapshot.bridgeState !== "cancelled"
-    && snapshot.bridgeState !== "failed"
-    && snapshot.bridgeState !== "closed"
-    && snapshot.bridgeState !== "lost";
-}
 
 export function RunReviewWorkspace({
   run,
@@ -131,6 +128,8 @@ export function RunReviewWorkspace({
   const [isLoadingApplication, setIsLoadingApplication] = useState(true);
   const [isStartingApplication, setIsStartingApplication] = useState(false);
   const [applicationError, setApplicationError] = useState<string | null>(null);
+  const [applicationLoadError, setApplicationLoadError] = useState<string | null>(null);
+  const [applicationStreamError, setApplicationStreamError] = useState<string | null>(null);
   const [applicationLifecycleAction, setApplicationLifecycleAction] =
     useState<ApplicationLifecycleAction | null>(null);
   const [applicationCommandAction, setApplicationCommandAction] =
@@ -141,6 +140,34 @@ export function RunReviewWorkspace({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const commentsRef = useRef<HTMLTextAreaElement>(null);
   const dialogTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const applicationViewRef = useRef<ApplicationSessionView | null>(null);
+  const activeRunIdRef = useRef(run.id);
+  activeRunIdRef.current = run.id;
+  const installApplicationView = useCallback((next: ApplicationSessionView): boolean => {
+    if (activeRunIdRef.current !== run.id) return false;
+    if (!shouldAcceptApplicationView(applicationViewRef.current, next)) return false;
+    applicationViewRef.current = next;
+    setApplicationLifecycleAction(null);
+    setApplicationCommandAction(null);
+    setApplicationView(next);
+    return true;
+  }, [run.id]);
+  const refreshApplicationView = useCallback(async (): Promise<boolean> => {
+    return installApplicationView(await getApplicationSession(run.id));
+  }, [installApplicationView, run.id]);
+  const refreshAfterApplicationFailure = useCallback(async (
+    error: unknown,
+    fallback: string,
+  ): Promise<void> => {
+    const message = publicMessage(error, fallback);
+    setApplicationError(message);
+    try {
+      await refreshApplicationView();
+    } catch {
+      // Retain the latest confirmed projection and the fixed public failure.
+    }
+    setApplicationError(message);
+  }, [refreshApplicationView]);
 
   const selectedIsCurrent = selectedIteration?.revision === run.revision;
   const canReview = run.status === "review"
@@ -154,9 +181,16 @@ export function RunReviewWorkspace({
   const canStartAfterApproval = notStarted?.canStartAfterApproval === true;
   const blockedReason = blockedReasonMessage(notStarted?.blockedReason);
   const snapshot = applicationSnapshot(applicationView);
-  const liveGeneration = snapshot && isLiveApplicationSnapshot(snapshot)
+  const liveGeneration = snapshot && isStreamableApplicationSnapshot(snapshot)
     ? snapshot.generation
     : null;
+
+  useEffect(() => {
+    applicationViewRef.current = null;
+    setApplicationView(null);
+    setApplicationStreamError(null);
+    setApplicationLoadError(null);
+  }, [run.id]);
 
   useEffect(() => {
     setAcknowledgeVisualIssues(false);
@@ -168,11 +202,11 @@ export function RunReviewWorkspace({
     setIsLoadingApplication(true);
     void getApplicationSession(run.id).then((view) => {
       if (request !== applicationRequestVersion.current) return;
-      setApplicationView(view);
-      setApplicationError(null);
+      installApplicationView(view);
+      setApplicationLoadError(null);
     }).catch((error: unknown) => {
       if (request !== applicationRequestVersion.current) return;
-      setApplicationError(publicMessage(
+      setApplicationLoadError(publicMessage(
         error,
         "Application availability could not be loaded. The resume can still be approved.",
       ));
@@ -193,20 +227,34 @@ export function RunReviewWorkspace({
     }
 
     let source: EventSource;
+    let disposed = false;
+    let refreshInFlight = false;
     try {
       source = new EventSource(applicationEventsHref(run.id));
     } catch {
       setApplicationStreamState("invalid");
-      setApplicationError("Live application updates could not be opened.");
+      setApplicationStreamError("Live application updates could not be opened.");
+      void refreshApplicationView().catch(() => {
+        // Retain the latest confirmed projection and the fixed public stream failure.
+      });
       return;
     }
     setApplicationStreamState("connecting");
 
+    const invalidate = () => {
+      if (disposed) return;
+      disposed = true;
+      source.close();
+      setApplicationStreamState("invalid");
+      setApplicationStreamError("The application service returned an invalid live update.");
+      void refreshApplicationView().catch(() => {
+        // Retain the latest confirmed projection and the fixed public stream failure.
+      });
+    };
     const acceptEvent = (nativeEvent: Event) => {
+      if (disposed) return;
       if (!(nativeEvent instanceof MessageEvent) || typeof nativeEvent.data !== "string") {
-        source.close();
-        setApplicationStreamState("invalid");
-        setApplicationError("The application service returned an invalid live update.");
+        invalidate();
         return;
       }
       const projection = parseApplicationSessionStreamEvent(
@@ -217,43 +265,57 @@ export function RunReviewWorkspace({
       );
       if (projection.status === "stale") return;
       if (projection.status === "invalid") {
-        source.close();
-        setApplicationStreamState("invalid");
-        setApplicationError("The application service returned an invalid live update.");
+        invalidate();
         return;
       }
-      setApplicationView((current) => {
-        const currentSnapshot = applicationSnapshot(current);
-        if (
-          currentSnapshot
-          && (
-            projection.event.generation < currentSnapshot.generation
-            || (
-              projection.event.generation === currentSnapshot.generation
-              && projection.event.session.updatedAt < currentSnapshot.updatedAt
-            )
-          )
-        ) {
-          return current;
-        }
-        return projection.event.session;
-      });
-      setApplicationError(null);
+      if (!installApplicationView(projection.event.session)) return;
+      setApplicationStreamError(null);
       setApplicationStreamState("connected");
     };
     for (const eventName of APPLICATION_SESSION_EVENT_NAMES) {
       source.addEventListener(eventName, acceptEvent);
     }
     source.onopen = () => {
+      if (disposed) return;
+      const current = applicationSnapshot(applicationViewRef.current);
+      if (
+        !current
+        || current.generation !== liveGeneration
+        || !isStreamableApplicationSnapshot(current)
+      ) {
+        source.close();
+        setApplicationStreamState("idle");
+        return;
+      }
       setApplicationStreamState("connected");
     };
     source.onerror = () => {
+      if (disposed) return;
       setApplicationStreamState("reconnecting");
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      void refreshApplicationView().then(() => {
+        if (disposed) return;
+        const current = applicationSnapshot(applicationViewRef.current);
+        if (
+          !current
+          || current.generation !== liveGeneration
+          || !isStreamableApplicationSnapshot(current)
+        ) {
+          source.close();
+          setApplicationStreamState("idle");
+        }
+      }).catch(() => {
+        // Native EventSource retries transient failures while confirmed content remains visible.
+      }).finally(() => {
+        refreshInFlight = false;
+      });
     };
     return () => {
+      disposed = true;
       source.close();
     };
-  }, [liveGeneration, run.id]);
+  }, [installApplicationView, liveGeneration, refreshApplicationView, run.id]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -292,13 +354,14 @@ export function RunReviewWorkspace({
 
   const submitEdit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (editComments.trim().length < 1 || editComments.length > 8_000) {
+    const comments = editComments.trim();
+    if (comments.length < 1 || comments.length > 8_000) {
       setDialogError("Enter edit instructions between 1 and 8,000 characters.");
       return;
     }
     setDialogError(null);
     try {
-      await onEdit(editComments);
+      await onEdit(comments);
       setEditComments("");
       closeDialog();
     } catch (error) {
@@ -320,21 +383,23 @@ export function RunReviewWorkspace({
     setIsStartingApplication(true);
     setApplicationError(null);
     try {
-      const snapshot = await startApplicationSession(run.id, pdfSha256);
-      setApplicationView(snapshot);
+      installApplicationView(await startApplicationSession(run.id, pdfSha256));
     } catch (error) {
-      setApplicationError(publicMessage(
+      await refreshAfterApplicationFailure(
         error,
         "The resume is approved, but the application assistant could not start.",
-      ));
-      try {
-        setApplicationView(await getApplicationSession(run.id));
-      } catch {
-        // Keep the approved run and the fixed public start failure above.
-      }
+      );
     } finally {
       setIsStartingApplication(false);
     }
+  };
+
+  const resumeReservedApplication = async () => {
+    if (!run.currentPdfSha256) {
+      setApplicationError("The approved resume is no longer available to resume.");
+      return;
+    }
+    await startApplication(run.currentPdfSha256);
   };
 
   const retryApplication = async () => {
@@ -345,10 +410,12 @@ export function RunReviewWorkspace({
     setApplicationLifecycleAction("retry");
     setApplicationError(null);
     try {
-      setApplicationView(await retryApplicationSession(run.id, run.currentPdfSha256));
+      installApplicationView(await retryApplicationSession(run.id, run.currentPdfSha256));
     } catch (error) {
-      setApplicationError(publicMessage(error, "The application assistant could not be retried."));
-    } finally {
+      await refreshAfterApplicationFailure(
+        error,
+        "The application assistant could not be retried.",
+      );
       setApplicationLifecycleAction(null);
     }
   };
@@ -360,13 +427,15 @@ export function RunReviewWorkspace({
     try {
       if (snapshot.bridgeState === "reserved") {
         await closeApplicationSession(run.id);
-        setApplicationView(await getApplicationSession(run.id));
+        await refreshApplicationView();
       } else {
         await sendApplicationCommand(run.id, { type: "cancel" });
       }
     } catch (error) {
-      setApplicationError(publicMessage(error, "The application assistant could not be cancelled."));
-    } finally {
+      await refreshAfterApplicationFailure(
+        error,
+        "The application assistant could not be cancelled.",
+      );
       setApplicationLifecycleAction(null);
     }
   };
@@ -376,10 +445,9 @@ export function RunReviewWorkspace({
     setApplicationError(null);
     try {
       await closeApplicationSession(run.id);
-      setApplicationView(await getApplicationSession(run.id));
+      await refreshApplicationView();
     } catch (error) {
-      setApplicationError(publicMessage(error, "The browser could not be closed."));
-    } finally {
+      await refreshAfterApplicationFailure(error, "The browser could not be closed.");
       setApplicationLifecycleAction(null);
     }
   };
@@ -390,8 +458,10 @@ export function RunReviewWorkspace({
     try {
       await sendApplicationCommand(run.id, command);
     } catch (error) {
-      setApplicationError(publicMessage(error, "The application command could not be accepted."));
-    } finally {
+      await refreshAfterApplicationFailure(
+        error,
+        "The application command could not be accepted.",
+      );
       setApplicationCommandAction(null);
     }
   };
@@ -521,26 +591,37 @@ export function RunReviewWorkspace({
         {actionError ? <p className={styles.panelError} role="alert">{actionError}</p> : null}
       </section>
 
-      {run.status === "approved" && notStarted?.canStart && run.currentPdfSha256 ? (
+      {run.status === "approved" && notStarted ? (
         <section className={styles.workspaceSection} aria-labelledby="approved-application-heading">
           <p className={styles.eyebrow}>Application</p>
-          <h2 id="approved-application-heading">Approved resume</h2>
-          <button
-            className={styles.primaryButton}
-            disabled={isStartingApplication}
-            onClick={() => void startApplication(run.currentPdfSha256!)}
-            type="button"
-          >
-            {isStartingApplication ? "Starting…" : "Start applying"}
-          </button>
+          <h2 id="approved-application-heading">Application assistant</h2>
+          {notStarted.canStart && run.currentPdfSha256 ? (
+            <button
+              className={styles.primaryButton}
+              disabled={isStartingApplication}
+              onClick={() => void startApplication(run.currentPdfSha256!)}
+              type="button"
+            >
+              {isStartingApplication ? "Starting…" : "Start applying"}
+            </button>
+          ) : (
+            <p className={styles.workspaceNotice}>
+              {blockedReason ?? "Automatic application is not available for this approved run."}
+            </p>
+          )}
         </section>
       ) : null}
       {snapshot ? (
         <ApplicationSessionPanel
-          actionBusy={applicationCommandAction ?? applicationLifecycleAction}
+          actionBusy={
+            isStartingApplication
+              ? "resume"
+              : applicationCommandAction ?? applicationLifecycleAction
+          }
           onCancel={cancelApplication}
           onClose={closeApplication}
           onCommand={submitApplicationCommand}
+          onResume={resumeReservedApplication}
           onRetry={retryApplication}
           snapshot={snapshot}
         />
@@ -558,9 +639,9 @@ export function RunReviewWorkspace({
             : "Connecting to live application updates…"}
         </p>
       ) : null}
-      {applicationError ? (
+      {applicationError ?? applicationLoadError ?? applicationStreamError ? (
         <p className={`${styles.panelError} ${styles.workspaceStandaloneError}`} role="alert">
-          {applicationError}
+          {applicationError ?? applicationLoadError ?? applicationStreamError}
         </p>
       ) : null}
 

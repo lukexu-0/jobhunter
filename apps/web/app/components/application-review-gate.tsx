@@ -3,6 +3,7 @@
 import { useState, type FormEvent } from "react";
 import type { ApplicationSessionCommand } from "@jobhunter/pipeline/contracts";
 import { buildApplicationRevisionCommand } from "../lib/application-review-gate";
+import { clipTextToCodePoints } from "../lib/application-text";
 import styles from "../run-detail.module.css";
 
 interface ApplicationReviewGateProps {
@@ -44,9 +45,8 @@ export function ApplicationReviewGate({
             aria-describedby="application-revision-guidance"
             aria-invalid={validationError ? true : undefined}
             disabled={busy}
-            maxLength={40_000}
             onChange={(event) => {
-              setRevisionContext(event.currentTarget.value);
+              setRevisionContext(clipTextToCodePoints(event.currentTarget.value, 20_000));
               setValidationError(null);
             }}
             value={revisionContext}

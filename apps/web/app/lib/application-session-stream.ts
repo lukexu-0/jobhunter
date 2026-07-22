@@ -1,6 +1,8 @@
 import {
   ApplicationSessionEventDtoSchema,
   type ApplicationSessionEventDto,
+  type ApplicationSessionSnapshotDto,
+  type ApplicationSessionView,
 } from "@jobhunter/pipeline/contracts";
 
 export const APPLICATION_SESSION_EVENT_NAMES = [
@@ -25,6 +27,46 @@ export type ApplicationSessionStreamProjection =
   | { readonly status: "invalid" };
 
 const EVENT_ID = /^([1-9]\d*):(0|[1-9]\d*)$/;
+
+const TERMINAL_BRIDGE_STATES = new Set<ApplicationSessionSnapshotDto["bridgeState"]>([
+  "cancelled",
+  "failed",
+  "closed",
+  "lost",
+]);
+
+function snapshotFromView(
+  view: ApplicationSessionView | null,
+): ApplicationSessionSnapshotDto | null {
+  return view && !("state" in view) ? view : null;
+}
+
+export function isStreamableApplicationSnapshot(
+  snapshot: ApplicationSessionSnapshotDto,
+): boolean {
+  return snapshot.bridgeState !== "reserved"
+    && !TERMINAL_BRIDGE_STATES.has(snapshot.bridgeState);
+}
+
+export function shouldAcceptApplicationView(
+  current: ApplicationSessionView | null,
+  next: ApplicationSessionView,
+): boolean {
+  const currentSnapshot = snapshotFromView(current);
+  const nextSnapshot = snapshotFromView(next);
+  if (!nextSnapshot) return currentSnapshot === null;
+  if (!currentSnapshot) return true;
+  if (nextSnapshot.generation !== currentSnapshot.generation) {
+    return nextSnapshot.generation > currentSnapshot.generation;
+  }
+  if (
+    TERMINAL_BRIDGE_STATES.has(currentSnapshot.bridgeState)
+    && !TERMINAL_BRIDGE_STATES.has(nextSnapshot.bridgeState)
+  ) {
+    return false;
+  }
+  return nextSnapshot.updatedAt > currentSnapshot.updatedAt;
+}
 
 export function parseApplicationSessionStreamEvent(
   data: string,

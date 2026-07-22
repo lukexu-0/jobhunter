@@ -366,7 +366,7 @@ describe("application session service", () => {
     expect(closed).toMatchObject({
       generation: 1,
       bridgeState: "closed",
-      terminalAt: 1_000,
+      terminalAt: 1_001,
     });
     expect(closed?.publicSnapshot).toMatchObject({
       generation: 1,
@@ -557,12 +557,18 @@ describe("application session service", () => {
 
   test("persists each upstream cursor and projected snapshot before yielding its generation event", async () => {
     const target = await createTarget();
-    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const started = await target.service.start(target.runId, target.pdf.sha256, signal());
     target.harness!.events = [{
+      id: 6,
+      event: "snapshot",
+      session: harnessSnapshot("starting"),
+      detail: {},
+    }, {
       id: 7,
       event: "agent_step",
       session: {
         ...harnessSnapshot("running"),
+        updatedAt: harnessSnapshot().updatedAt + 1,
         warnings: ["Review the highlighted field"],
       },
       detail: { stepNumber: 3 },
@@ -593,6 +599,7 @@ describe("application session service", () => {
         detail: { stepNumber: 3 },
       },
     });
+    expect(item.value?.event.session.updatedAt).toBeGreaterThan(started.updatedAt);
     expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
       generation: 1,
       bridgeState: "running",

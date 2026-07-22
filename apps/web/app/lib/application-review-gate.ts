@@ -2,6 +2,7 @@ import {
   ApplicationSessionCommandSchema,
   type ApplicationSessionCommand,
 } from "@jobhunter/pipeline/contracts";
+import { hasCodePointLength } from "./application-text";
 
 type ReviseCommand = Extract<
   ApplicationSessionCommand,
@@ -19,8 +20,7 @@ export function buildApplicationRevisionCommand(
   context: string,
 ): ApplicationRevisionBuildResult {
   const trimmed = context.trim();
-  const length = Array.from(trimmed).length;
-  if (length < 1 || length > 20_000) {
+  if (!hasCodePointLength(trimmed, 1, 20_000)) {
     return { success: false, message: INVALID_REVISION_MESSAGE };
   }
   const parsed = ApplicationSessionCommandSchema.safeParse({

@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  useEffect,
   useState,
   type FormEvent,
 } from "react";
@@ -14,6 +13,7 @@ import {
   type AdditionalInfoDraft,
   type AdditionalInfoDrafts,
 } from "../lib/application-additional-info";
+import { clipTextToCodePoints } from "../lib/application-text";
 import styles from "../run-detail.module.css";
 
 interface ApplicationAdditionalInfoFormProps {
@@ -42,13 +42,8 @@ export function ApplicationAdditionalInfoForm({
 }: ApplicationAdditionalInfoFormProps) {
   const [drafts, setDrafts] = useState<AdditionalInfoDrafts>({});
   const [validationError, setValidationError] = useState<ValidationError | null>(null);
-  const questionSignature = JSON.stringify(questions);
   const formComplete = buildAdditionalInfoCommand(questions, drafts).success;
 
-  useEffect(() => {
-    setDrafts({});
-    setValidationError(null);
-  }, [questionSignature]);
 
   const updateDraft = (id: string, draft: AdditionalInfoDraft) => {
     setDrafts((current) => ({ ...current, [id]: draft }));
@@ -107,10 +102,9 @@ export function ApplicationAdditionalInfoForm({
                   <textarea
                     aria-invalid={hasError || undefined}
                     disabled={declined || busy}
-                    maxLength={2_000}
                     onChange={(event) => updateDraft(question.id, {
                       status: "answered",
-                      value: event.currentTarget.value,
+                      value: clipTextToCodePoints(event.currentTarget.value, 2_000),
                     })}
                     value={typeof value === "string" ? value : ""}
                   />

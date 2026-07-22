@@ -5,6 +5,7 @@ import json
 import stat
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -629,8 +630,11 @@ async def test_invalid_create_values_fail_before_storage(
 
 async def test_preflight_completes_before_browser_and_create_contract_is_public_safe(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
+    frozen_now = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(sessions_module, "_now", lambda: frozen_now)
     runner_started = asyncio.Event()
 
     async def runner(
@@ -686,6 +690,11 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
         "agent_step",
     ]
     assert [event.id for event in record.events] == list(range(1, len(record.events) + 1))
+    events = tuple(record.events)
+    assert all(
+        previous.session.updated_at < current.session.updated_at
+        for previous, current in zip(events, events[1:])
+    )
     public = json.dumps(
         {
             "snapshot": manager.get_snapshot(response.session_id).model_dump(mode="json"),

@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import type { ApplicationSessionEventDto } from "@jobhunter/pipeline/contracts";
 import {
   APPLICATION_SESSION_EVENT_NAMES,
+  isStreamableApplicationSnapshot,
   parseApplicationSessionStreamEvent,
+  shouldAcceptApplicationView,
 } from "../app/lib/application-session-stream";
 
 const event: ApplicationSessionEventDto = {
@@ -55,5 +57,39 @@ describe("application session SSE projection", () => {
     )).toEqual({ status: "stale" });
     expect(parseApplicationSessionStreamEvent("not-json", "2:8", 2))
       .toEqual({ status: "invalid" });
+  });
+
+  test("streams only harness-backed live states and rejects stale reconciliations", () => {
+    expect(isStreamableApplicationSnapshot(event.session)).toBeTrue();
+    expect(isStreamableApplicationSnapshot({
+      ...event.session,
+      bridgeState: "reserved",
+      harnessState: null,
+      expiresAt: null,
+    })).toBeFalse();
+    expect(isStreamableApplicationSnapshot({
+      ...event.session,
+      bridgeState: "lost",
+      harnessState: null,
+      terminalAt: 3,
+      expiresAt: null,
+    })).toBeFalse();
+
+    expect(shouldAcceptApplicationView(
+      { ...event.session, generation: 3 },
+      event.session,
+    )).toBeFalse();
+    expect(shouldAcceptApplicationView(
+      { ...event.session, updatedAt: 3 },
+      event.session,
+    )).toBeFalse();
+    expect(shouldAcceptApplicationView(
+      { ...event.session, bridgeState: "running" },
+      { ...event.session, bridgeState: "starting" },
+    )).toBeFalse();
+    expect(shouldAcceptApplicationView(
+      event.session,
+      { ...event.session, updatedAt: 3 },
+    )).toBeTrue();
   });
 });

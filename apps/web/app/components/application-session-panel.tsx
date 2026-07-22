@@ -11,7 +11,7 @@ import { ApplicationAdditionalInfoForm } from "./application-additional-info-for
 import { ApplicationReviewGate } from "./application-review-gate";
 import styles from "../run-detail.module.css";
 
-export type ApplicationLifecycleAction = "cancel" | "close" | "retry";
+export type ApplicationLifecycleAction = "cancel" | "close" | "resume" | "retry";
 export type ApplicationPanelAction =
   | ApplicationLifecycleAction
   | ApplicationSessionCommand["type"];
@@ -27,6 +27,7 @@ export interface ApplicationSessionPanelProps {
   readonly onCancel: () => Promise<void>;
   readonly onClose: () => Promise<void>;
   readonly onRetry: () => Promise<void>;
+  readonly onResume: () => Promise<void>;
   readonly onCommand: (command: ApplicationSessionCommand) => Promise<void>;
 }
 
@@ -43,6 +44,18 @@ const STATE_LABELS: Readonly<Record<ApplicationSessionBridgeState, string>> = {
   failed: "Failed",
   closed: "Closed",
   lost: "Connection lost",
+};
+
+const ACTION_STATUS_LABELS: Readonly<Record<ApplicationPanelAction, string>> = {
+  resume: "Starting application",
+  retry: "Retrying application",
+  cancel: "Cancelling application",
+  close: "Closing browser",
+  continue: "Continuing application",
+  approve_origin: "Approving origin",
+  provide_additional_info: "Answering questions",
+  revise: "Requesting application revision",
+  ready: "Marking application ready",
 };
 
 const TERMINAL_STATES = new Set<ApplicationSessionBridgeState>([
@@ -93,21 +106,33 @@ export function ApplicationSessionPanel({
   onCancel,
   onClose,
   onRetry,
+  onResume,
   onCommand,
 }: ApplicationSessionPanelProps) {
   const terminal = TERMINAL_STATES.has(snapshot.bridgeState);
   const ready = snapshot.bridgeState === "ready_for_human_submit";
   const busy = actionBusy !== null;
   const pendingAction = snapshot.pendingAction;
-  const commandBusy = actionBusy === "close" || actionBusy === "retry"
-    ? null
-    : actionBusy;
+  const commandBusy =
+    actionBusy === "close" || actionBusy === "resume" || actionBusy === "retry"
+      ? null
+      : actionBusy;
+  const stateLabel = actionBusy
+    ? `${STATE_LABELS[snapshot.bridgeState]} — ${ACTION_STATUS_LABELS[actionBusy]}`
+    : STATE_LABELS[snapshot.bridgeState];
 
   return (
     <section className={styles.workspaceSection} aria-labelledby="application-session-heading">
       <p className={styles.eyebrow}>Application</p>
       <h2 id="application-session-heading">Application assistant</h2>
-      <p className={styles.applicationSessionState}>{STATE_LABELS[snapshot.bridgeState]}</p>
+      <p
+        aria-atomic="true"
+        aria-live="polite"
+        className={styles.applicationSessionState}
+        role="status"
+      >
+        {stateLabel}
+      </p>
 
       <dl className={styles.metadataGrid}>
         <div>
@@ -186,6 +211,7 @@ export function ApplicationSessionPanel({
         </div>
       ) : pendingAction?.type === "additional_info" ? (
         <ApplicationAdditionalInfoForm
+          key={`${snapshot.generation}:${JSON.stringify(pendingAction.questions)}`}
           busy={busy}
           onSubmit={onCommand}
           questions={pendingAction.questions}
@@ -214,14 +240,26 @@ export function ApplicationSessionPanel({
 
       <div className={styles.workspaceActions}>
         {!terminal && !ready ? (
-          <button
-            className={styles.secondaryButton}
-            disabled={busy}
-            onClick={() => void onCancel()}
-            type="button"
-          >
-            {actionBusy === "cancel" ? "Cancelling…" : "Cancel application"}
-          </button>
+          <>
+            {snapshot.bridgeState === "reserved" ? (
+              <button
+                className={styles.primaryButton}
+                disabled={busy}
+                onClick={() => void onResume()}
+                type="button"
+              >
+                {actionBusy === "resume" ? "Starting…" : "Start applying"}
+              </button>
+            ) : null}
+            <button
+              className={styles.secondaryButton}
+              disabled={busy}
+              onClick={() => void onCancel()}
+              type="button"
+            >
+              {actionBusy === "cancel" ? "Cancelling…" : "Cancel application"}
+            </button>
+          </>
         ) : terminal ? (
           <button
             className={styles.primaryButton}

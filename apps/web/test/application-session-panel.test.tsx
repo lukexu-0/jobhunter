@@ -40,6 +40,7 @@ const callbacks = {
   onCancel: async () => {},
   onClose: async () => {},
   onRetry: async () => {},
+  onResume: async () => {},
   onCommand: async () => {},
 };
 
@@ -56,6 +57,20 @@ describe("ApplicationSessionPanel", () => {
     expect(running).toContain("Application revisions");
     expect(running).toContain("Cancel application");
     expect(running).not.toContain("Retry applying");
+    expect(running).toContain('role="status"');
+
+    const reserved = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "reserved",
+          harnessState: null,
+          expiresAt: null,
+        })}
+      />,
+    );
+    expect(reserved).toContain("Start applying");
+    expect(reserved).toContain("Cancel application");
 
     const lost = renderToStaticMarkup(
       <ApplicationSessionPanel
