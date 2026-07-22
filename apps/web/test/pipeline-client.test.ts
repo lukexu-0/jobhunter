@@ -4,6 +4,7 @@ import {
   type ApplicationSessionView,
   type ArtifactDto,
   type RunDto,
+  type ResumeIterationListResponse,
   type RunStatus,
 } from "@jobhunter/pipeline/contracts";
 import {
@@ -18,6 +19,7 @@ import {
   getApplicationSession,
   getRun,
   listRuns,
+  listResumeIterations,
   readJsonArtifact,
   regenerateRun,
   retryApplicationSession,
@@ -135,6 +137,39 @@ describe("pipeline run requests", () => {
     expect(requests).toEqual([
       { input: "/api/pipeline/runs", init: { cache: "no-store", method: "GET" } },
     ]);
+  });
+
+  test("lists strict resume iterations on the encoded run path", async () => {
+    const response: ResumeIterationListResponse = {
+      artifactState: "retained",
+      iterations: [{
+        revision: 2,
+        origin: "human-comments",
+        status: "review",
+        createdAt: 3,
+        pdfSha256: sha256,
+        artifacts: [artifact({
+          revision: 2,
+          href: "/v1/runs/run%20%2F1/iterations/2/artifacts/artifact-1",
+        })],
+      }],
+    };
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(json(response), requests);
+
+    await expect(listResumeIterations("run /1")).resolves.toEqual(response);
+    expect(requests).toEqual([{
+      input: "/api/pipeline/runs/run%20%2F1/iterations",
+      init: { cache: "no-store", method: "GET" },
+    }]);
+
+    setFetchMock(async () => json({
+      ...response,
+      iterations: [{ ...response.iterations[0], privatePath: "/tmp/resume.pdf" }],
+    }));
+    await expect(listResumeIterations("run /1")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
   });
 
   test("updates the user-managed application status", async () => {
@@ -596,7 +631,9 @@ describe("pipeline artifacts", () => {
     expect(artifactHref("/v1/runs/run%201/artifacts/artifact-1")).toBe(
       "/api/pipeline/runs/run%201/artifacts/artifact-1",
     );
-
+    expect(artifactHref("/v1/runs/run%201/iterations/2/artifacts/artifact-1")).toBe(
+      "/api/pipeline/runs/run%201/iterations/2/artifacts/artifact-1",
+    );
     for (const href of [
       "https://attacker.invalid/v1/runs/a/artifacts/b",
       "//attacker.invalid/v1/runs/a/artifacts/b",

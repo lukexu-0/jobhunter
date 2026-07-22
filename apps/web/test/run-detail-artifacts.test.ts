@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import type { ArtifactDto } from "@jobhunter/pipeline/contracts";
+import type { ArtifactDto, ResumeIterationDto } from "@jobhunter/pipeline/contracts";
 import {
   publicArtifacts,
+  reconcileResumeIterationSelection,
   selectCurrentRevisionArtifact,
   selectReusableJobAnalysis,
+  type ResumeIterationSelection,
 } from "../app/lib/run-detail-artifacts";
 
 const sha256 = "a".repeat(64);
@@ -21,6 +23,17 @@ function artifact(overrides: Partial<ArtifactDto> = {}): ArtifactDto {
     public: true,
     createdAt: 3,
     ...overrides,
+  };
+}
+
+function iteration(revision: number): ResumeIterationDto {
+  return {
+    revision,
+    origin: revision === 1 ? "initial" : "human-comments",
+    status: "review",
+    createdAt: revision,
+    pdfSha256: sha256,
+    artifacts: [],
   };
 }
 
@@ -47,5 +60,29 @@ describe("run-detail artifact selection", () => {
     const privateArtifact = artifact({ id: "private", public: false });
 
     expect(publicArtifacts([privateArtifact, visible])).toEqual([visible]);
+  });
+
+  test("follows new reviewed iterations while preserving an explicit pinned revision", () => {
+    const initial = reconcileResumeIterationSelection(
+      { mode: "follow-latest", selectedRevision: null },
+      [iteration(1), iteration(2)],
+    );
+    expect(initial).toEqual({ mode: "follow-latest", selectedRevision: 2 });
+    expect(reconcileResumeIterationSelection(initial, [
+      iteration(1),
+      iteration(2),
+      iteration(3),
+    ])).toEqual({ mode: "follow-latest", selectedRevision: 3 });
+
+    const pinned: ResumeIterationSelection = { mode: "pinned", selectedRevision: 1 };
+    expect(reconcileResumeIterationSelection(pinned, [
+      iteration(1),
+      iteration(2),
+      iteration(3),
+    ])).toEqual(pinned);
+    expect(reconcileResumeIterationSelection(pinned, [iteration(2), iteration(3)]))
+      .toEqual({ mode: "follow-latest", selectedRevision: 3 });
+    expect(reconcileResumeIterationSelection(pinned, []))
+      .toEqual({ mode: "follow-latest", selectedRevision: null });
   });
 });

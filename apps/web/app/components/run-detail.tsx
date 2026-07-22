@@ -9,18 +9,29 @@ import {
   type ArtifactKind,
   type AttemptDto,
   type ResumeDiff,
+  type ResumeIterationDto,
+  type ResumeIterationListResponse,
   type RunDto,
   type RunStatus,
 } from "@jobhunter/pipeline/contracts";
 import {
   PipelineClientError,
+  approveRun,
+  editRun,
   artifactHref,
   getRun,
+  listResumeIterations,
+  regenerateRun,
   readJsonArtifact,
   retryRun,
 } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
-import { selectResolvedArtifact } from "../lib/run-detail-artifacts";
+import {
+  reconcileResumeIterationSelection,
+  selectResolvedArtifact,
+  type ResumeIterationSelection,
+} from "../lib/run-detail-artifacts";
+import { RunReviewWorkspace } from "./run-review-workspace";
 import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
@@ -70,7 +81,7 @@ const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 
 type JsonRecord = Record<string, unknown>;
-type BusyAction = "retry";
+type BusyAction = "retry" | "edit" | "regenerate" | "approve";
 type DocumentView = "resume" | "keyword-map" | "diff";
 
 const RESUME_TAB_ID = "resume-document-tab";
@@ -144,18 +155,19 @@ function publicMessage(error: unknown, fallback: string): string {
 }
 
 
-function currentPdfArtifact(run: RunDto | null): ArtifactDto | undefined {
-  if (!run || !REVIEW_STATUSES[run.status] || !run.currentPdfSha256) return undefined;
-  return run.artifacts.find(
+function selectedPdfArtifact(iteration: ResumeIterationDto | undefined): ArtifactDto | undefined {
+  if (!iteration) return undefined;
+  return iteration.artifacts.find(
     (artifact) => artifact.public
       && artifact.kind === "compiled-pdf"
-      && artifact.sha256 === run.currentPdfSha256,
+      && artifact.sha256 === iteration.pdfSha256,
   );
 }
 
-function currentPageImage(run: RunDto | null): ArtifactDto | undefined {
-  if (!run || !REVIEW_STATUSES[run.status]) return undefined;
-  return selectResolvedArtifact(run.artifacts, "page-image");
+function selectedPageImage(iteration: ResumeIterationDto | undefined): ArtifactDto | undefined {
+  return iteration
+    ? selectResolvedArtifact(iteration.artifacts, "page-image")
+    : undefined;
 }
 
 function safeArtifactHref(artifact: ArtifactDto | undefined): string | null {
@@ -474,6 +486,13 @@ function KeywordMapPages({ href, onPageCount, title, zoom }: KeywordMapPagesProp
 
 export function RunDetail({ runId }: RunDetailProps) {
   const [run, setRun] = useState<RunDto | null>(null);
+  const [iterationList, setIterationList] = useState<ResumeIterationListResponse | null>(null);
+  const [iterationSelection, setIterationSelection] = useState<ResumeIterationSelection>({
+    mode: "follow-latest",
+    selectedRevision: null,
+  });
+  const [isLoadingIterations, setIsLoadingIterations] = useState(true);
+  const [iterationError, setIterationError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isFresh, setIsFresh] = useState(false);
@@ -489,6 +508,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   const [artifactErrors, setArtifactErrors] = useState<Record<string, string>>({});
   const [isLoadingArtifacts, setIsLoadingArtifacts] = useState(false);
   const requestVersion = useRef(0);
+  const iterationRequestVersion = useRef(0);
   const resumeTabRef = useRef<HTMLButtonElement>(null);
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
@@ -519,6 +539,10 @@ export function RunDetail({ runId }: RunDetailProps) {
 
   useEffect(() => {
     setRun(null);
+    setIterationList(null);
+    setIterationSelection({ mode: "follow-latest", selectedRevision: null });
+    setIsLoadingIterations(true);
+    setIterationError(null);
     setArtifactData({});
     setArtifactErrors({});
     setLoadError(null);
@@ -527,6 +551,7 @@ export function RunDetail({ runId }: RunDetailProps) {
     void loadRun(true);
     return () => {
       requestVersion.current += 1;
+      iterationRequestVersion.current += 1;
     };
   }, [loadRun]);
 
@@ -546,19 +571,53 @@ export function RunDetail({ runId }: RunDetailProps) {
     };
   }, [isActive, loadRun]);
 
-  const artifactSignature = run
-    ? `${run.id}:${run.status}:${run.revision}:${run.artifacts.filter(isDisplayedJsonArtifact).map((artifact) => `${artifact.id}:${artifact.sha256}`).join("|")}`
+  const iterationRefreshKey = run ? `${run.revision}:${run.status}` : "none";
+  useEffect(() => {
+    if (!run) return;
+    const request = ++iterationRequestVersion.current;
+    setIsLoadingIterations(true);
+    void listResumeIterations(runId).then((nextList) => {
+      if (request !== iterationRequestVersion.current) return;
+      setIterationList(nextList);
+      setIterationSelection((previous) =>
+        reconcileResumeIterationSelection(previous, nextList.iterations)
+      );
+      setIterationError(null);
+    }).catch((error: unknown) => {
+      if (request !== iterationRequestVersion.current) return;
+      setIterationError(publicMessage(
+        error,
+        "Resume iteration history could not be loaded.",
+      ));
+    }).finally(() => {
+      if (request === iterationRequestVersion.current) setIsLoadingIterations(false);
+    });
+    return () => {
+      if (request === iterationRequestVersion.current) {
+        iterationRequestVersion.current += 1;
+      }
+    };
+  }, [iterationRefreshKey, runId]);
+
+  const selectedIteration = iterationList?.iterations.find(
+    (iteration) => iteration.revision === iterationSelection.selectedRevision,
+  );
+  const artifactSignature = selectedIteration
+    ? `${selectedIteration.revision}:${selectedIteration.pdfSha256}:${selectedIteration.artifacts
+        .filter(isDisplayedJsonArtifact)
+        .map((artifact) => `${artifact.id}:${artifact.sha256}`)
+        .join("|")}`
     : "none";
 
   useEffect(() => {
     let current = true;
     setArtifactData({});
     setArtifactErrors({});
-    if (!run || !REVIEW_STATUSES[run.status]) {
+    if (!selectedIteration) {
       setIsLoadingArtifacts(false);
       return () => { current = false; };
     }
-    const jsonArtifacts = run.artifacts.filter(isDisplayedJsonArtifact);
+    const jsonArtifacts = selectedIteration.artifacts.filter(isDisplayedJsonArtifact);
     if (!jsonArtifacts.length) {
       setIsLoadingArtifacts(false);
       return () => { current = false; };
@@ -583,13 +642,12 @@ export function RunDetail({ runId }: RunDetailProps) {
       setIsLoadingArtifacts(false);
     });
     return () => { current = false; };
-  }, [artifactSignature, run]);
-
+  }, [artifactSignature]);
 
   const artifactFor = useCallback((kind: ArtifactKind) => {
-    if (!run) return undefined;
-    return selectResolvedArtifact(run.artifacts, kind);
-  }, [run]);
+    if (!selectedIteration) return undefined;
+    return selectResolvedArtifact(selectedIteration.artifacts, kind);
+  }, [selectedIteration]);
   const dataFor = useCallback((kind: ArtifactKind): unknown => {
     const artifact = artifactFor(kind);
     return artifact ? artifactData[artifact.id] : undefined;
@@ -607,8 +665,8 @@ export function RunDetail({ runId }: RunDetailProps) {
     : undefined;
   const extraction = extractionArtifact ? artifactData[extractionArtifact.id] : undefined;
   const extractionError = extractionArtifact ? artifactErrors[extractionArtifact.id] : undefined;
-  const pdfArtifact = currentPdfArtifact(run);
-  const pageImageArtifact = currentPageImage(run);
+  const pdfArtifact = selectedPdfArtifact(selectedIteration);
+  const pageImageArtifact = selectedPageImage(selectedIteration);
   const pdfHref = safeArtifactHref(pdfArtifact);
   const pageImageHref = safeArtifactHref(pageImageArtifact);
   const keywordMapArtifact = artifactFor("keyword-map-pdf");
@@ -621,8 +679,8 @@ export function RunDetail({ runId }: RunDetailProps) {
     : documentView === "keyword-map" && keywordMapHref
       ? "keyword-map"
       : "resume";
-  const documentSignature = run
-    ? `${run.id}:${run.revision}:${pdfArtifact?.id ?? ""}:${pageImageArtifact?.id ?? ""}:${keywordMapArtifact?.id ?? ""}:${keywordMapHref ?? ""}:${resumeDiffArtifact?.id ?? ""}:${resumeDiffArtifact?.sha256 ?? ""}`
+  const documentSignature = selectedIteration
+    ? `${runId}:${selectedIteration.revision}:${pdfArtifact?.id ?? ""}:${pageImageArtifact?.id ?? ""}:${keywordMapArtifact?.id ?? ""}:${keywordMapHref ?? ""}:${resumeDiffArtifact?.id ?? ""}:${resumeDiffArtifact?.sha256 ?? ""}`
     : "none";
   useEffect(() => {
     setDocumentView("resume");
@@ -740,6 +798,99 @@ export function RunDetail({ runId }: RunDetailProps) {
     }
   };
 
+  const currentReviewPdfHash = (): string => {
+    if (
+      run?.status !== "review"
+      || !run.currentPdfSha256
+      || selectedIteration?.revision !== run.revision
+      || selectedIteration.pdfSha256 !== run.currentPdfSha256
+      || iterationList?.artifactState !== "retained"
+    ) {
+      throw new PipelineClientError(
+        "Review actions require the current retained resume iteration.",
+        "STALE_RUN",
+        409,
+      );
+    }
+    return run.currentPdfSha256;
+  };
+
+  const submitRunMutation = async (
+    action: Exclude<BusyAction, "retry">,
+    operation: () => Promise<RunDto>,
+  ): Promise<RunDto> => {
+    if (actionsDisabled) {
+      throw new PipelineClientError(
+        "The run state changed; review the latest iteration.",
+        "STALE_RUN",
+        409,
+      );
+    }
+    const request = ++requestVersion.current;
+    setBusyAction(action);
+    setIsFresh(false);
+    setActionError(null);
+    try {
+      const nextRun = await operation();
+      if (request !== requestVersion.current) {
+        throw new PipelineClientError(
+          "The run state changed; review the latest iteration.",
+          "STALE_RUN",
+          409,
+        );
+      }
+      setRun(nextRun);
+      setLoadError(null);
+      setIsFresh(true);
+      return nextRun;
+    } catch (error) {
+      if (request === requestVersion.current) {
+        await refreshAfterActionFailure(request);
+      }
+      throw error;
+    } finally {
+      if (request === requestVersion.current) setBusyAction(null);
+    }
+  };
+
+  const submitEdit = async (comments: string): Promise<RunDto> => {
+    const expectedPdfSha256 = currentReviewPdfHash();
+    return await submitRunMutation(
+      "edit",
+      () => editRun(runId, comments, expectedPdfSha256),
+    );
+  };
+
+  const submitRegeneration = async (): Promise<RunDto> => {
+    const expectedPdfSha256 = currentReviewPdfHash();
+    return await submitRunMutation(
+      "regenerate",
+      () => regenerateRun(runId, expectedPdfSha256),
+    );
+  };
+
+  const submitApproval = async (acknowledgeVisualIssues: boolean): Promise<RunDto> => {
+    const expectedPdfSha256 = currentReviewPdfHash();
+    return await submitRunMutation(
+      "approve",
+      () => approveRun(runId, expectedPdfSha256, acknowledgeVisualIssues),
+    );
+  };
+
+  const selectIteration = (revision: number) => {
+    if (!iterationList?.iterations.some((iteration) => iteration.revision === revision)) return;
+    setIterationSelection({ mode: "pinned", selectedRevision: revision });
+  };
+
+  const viewLatestIteration = () => {
+    setIterationSelection((previous) =>
+      reconcileResumeIterationSelection(
+        { ...previous, mode: "follow-latest" },
+        iterationList?.iterations ?? [],
+      )
+    );
+  };
+
 
   if (isLoading && !run) {
     return (
@@ -763,7 +914,15 @@ export function RunDetail({ runId }: RunDetailProps) {
   const subtitle = run.organizationOverride ?? identity?.organization ?? "Organization unavailable";
 
   return (
-    <main className={styles.detailShell} aria-busy={isRefreshing || busyAction !== null || isLoadingArtifacts}>
+    <main
+      className={styles.detailShell}
+      aria-busy={
+        isRefreshing
+        || busyAction !== null
+        || isLoadingArtifacts
+        || isLoadingIterations
+      }
+    >
       <header className={styles.topBar}>
         <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to applications</Link>
         <WorkflowProgress run={run} />
@@ -874,7 +1033,7 @@ export function RunDetail({ runId }: RunDetailProps) {
                 </label>
                 <button type="button" aria-label="Zoom in" disabled={actionsDisabled || zoom >= 300} onClick={() => applyZoom(zoom + 25)}><Icon name="plus" /></button>
                 <button type="button" aria-label={isViewerFullscreen ? "Exit fullscreen" : "Enter fullscreen"} disabled={actionsDisabled} onClick={() => void toggleViewerFullscreen()}><Icon name="fullscreen" /></button>
-                {pdfHref && !actionsDisabled ? <a href={pdfHref} aria-label="Download current PDF" download><Icon name="download" /></a> : null}
+                {pdfHref && !actionsDisabled ? <a href={pdfHref} aria-label="Download selected PDF" download><Icon name="download" /></a> : null}
               </div>
             ) : selectedDocumentView === "keyword-map" ? (
               <div className={styles.viewerControls} aria-label="Keyword map controls">
@@ -932,8 +1091,8 @@ export function RunDetail({ runId }: RunDetailProps) {
                 ))}
               </div>
             ) : pdfHref ? (
-              <object className={styles.pdfObject} data={pdfHref} type="application/pdf" aria-label={`Current resume PDF for ${title}`}>
-                <p>The browser could not display this PDF. <a href={pdfHref} download>Download the current resume</a>.</p>
+              <object className={styles.pdfObject} data={pdfHref} type="application/pdf" aria-label={`Selected resume PDF for ${title}`}>
+                <p>The browser could not display this PDF. <a href={pdfHref} download>Download the selected resume</a>.</p>
               </object>
             ) : (
               <div className={styles.viewerEmpty}>
@@ -942,8 +1101,24 @@ export function RunDetail({ runId }: RunDetailProps) {
                 ) : (
                   <>
                     <p className={styles.eyebrow}>Document unavailable</p>
-                    <h3>{REVIEW_STATUSES[run.status] ? "No current preview is available" : STATUS_LABELS[run.status]}</h3>
-                    <p>{REVIEW_STATUSES[run.status] ? "The pipeline did not publish a current page image or PDF artifact." : "A public document will appear only after compilation and quality review complete."}</p>
+                    <h3>{
+                      selectedIteration
+                        ? iterationList?.artifactState === "pruned"
+                          ? "Resume files were removed"
+                          : "No preview is available for this iteration"
+                        : REVIEW_STATUSES[run.status]
+                          ? "Loading reviewed resume history"
+                          : STATUS_LABELS[run.status]
+                    }</h3>
+                    <p>{
+                      selectedIteration
+                        ? iterationList?.artifactState === "pruned"
+                          ? "Retention preserved this iteration’s label and PDF hash, but its document files are no longer available."
+                          : "The pipeline did not publish a page image or PDF artifact for this iteration."
+                        : REVIEW_STATUSES[run.status]
+                          ? "The reviewed iteration list is still loading or unavailable."
+                          : "A public document will appear only after compilation and quality review complete."
+                    }</p>
                   </>
                 )}
                 {run.status === "failed" ? <button className={styles.primaryButton} type="button" disabled={actionsDisabled} onClick={() => void submitRetry()}><Icon name="refresh" />{busyAction === "retry" ? "Retrying…" : "Retry failed run"}</button> : null}
@@ -984,7 +1159,27 @@ export function RunDetail({ runId }: RunDetailProps) {
           ) : null}
         </section>
 
-        <aside className={`${styles.pane} ${styles.rightPane}`} aria-label="Reserved review workspace" />
+        <aside
+          className={`${styles.pane} ${styles.rightPane}`}
+          aria-label="Review and application workspace"
+        >
+          <RunReviewWorkspace
+            artifactState={iterationList?.artifactState ?? "retained"}
+            busyAction={busyAction}
+            isLoadingIterations={isLoadingIterations}
+            isFresh={isFresh && !isRefreshing}
+            iterationError={iterationError}
+            iterations={iterationList?.iterations ?? []}
+            onApprove={submitApproval}
+            onEdit={submitEdit}
+            onRegenerate={submitRegeneration}
+            onSelectIteration={selectIteration}
+            onViewLatest={viewLatestIteration}
+            run={run}
+            selectedIteration={selectedIteration}
+            selection={iterationSelection}
+          />
+        </aside>
       </div>
     </main>
   );

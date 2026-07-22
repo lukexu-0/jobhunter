@@ -38,7 +38,8 @@
 }
 
 .backLink,
-.primaryButton {
+.primaryButton,
+.secondaryButton {
   display: inline-flex;
   min-height: var(--control-height);
   align-items: center;
@@ -88,6 +89,20 @@
 .primaryButton:disabled {
   border-color: var(--color-border);
   background: var(--color-surface-raised);
+  color: var(--color-faint);
+}
+
+.secondaryButton {
+  border-color: var(--color-border-strong);
+}
+
+.secondaryButton:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.secondaryButton:disabled {
+  border-color: var(--color-border);
   color: var(--color-faint);
 }
 
@@ -182,10 +197,16 @@
   grid-template-columns: minmax(0, 19.875fr) minmax(0, 53.625fr) minmax(0, 26.5fr);
 }
 
+
 .pane {
   min-width: 0;
   overflow: auto;
   scrollbar-color: var(--color-border-strong) var(--color-surface);
+}
+
+.rightPane {
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .leftPane,
@@ -204,6 +225,150 @@
 
 .paneSection + .paneSection {
   border-top: var(--border-width) solid var(--color-border);
+}
+
+.reviewWorkspace {
+  display: grid;
+  min-width: 0;
+}
+
+.workspaceSection {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  overflow-wrap: anywhere;
+}
+
+.workspaceSection + .workspaceSection {
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.workspaceSection h2,
+.workspaceSection h3,
+.workspaceSection p {
+  margin: 0;
+}
+
+.workspaceSection h2 {
+  font-size: var(--font-size-lg);
+  line-height: var(--line-tight);
+}
+
+.workspaceSection h3 {
+  font-size: var(--font-size-md);
+  line-height: var(--line-tight);
+}
+
+.workspaceField {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: var(--tracking-label);
+  line-height: var(--line-tight);
+  text-transform: uppercase;
+}
+
+.workspaceField select,
+.workspaceField input,
+.workspaceField textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--control-height);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font: inherit;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.workspaceField textarea {
+  min-height: calc(var(--control-height) * 3);
+  resize: vertical;
+}
+
+.workspaceNotice {
+  border-left: var(--border-width) solid var(--color-accent);
+  padding: var(--space-3);
+  background: var(--color-surface-raised);
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-normal);
+}
+
+.workspaceCheck {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-normal);
+}
+
+.workspaceCheck input {
+  width: var(--space-5);
+  height: var(--space-5);
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.workspaceActions {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.workspaceActions > * {
+  width: 100%;
+}
+
+.workspaceStandaloneError {
+  margin: var(--space-4) var(--space-5);
+}
+
+.reviewDialog {
+  width: min(34rem, calc(100vw - var(--space-8)));
+  max-width: calc(100vw - var(--space-8));
+  max-height: calc(100svh - var(--space-8));
+  margin: auto;
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: 0;
+  overflow: auto;
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.reviewDialog::backdrop {
+  background: rgb(0 0 0 / 72%);
+}
+
+.reviewDialogBody {
+  display: grid;
+  gap: var(--space-4);
+  padding: var(--space-5);
+}
+
+.reviewDialogBody h2,
+.reviewDialogBody p {
+  margin: 0;
+}
+
+.reviewDialogActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  border-top: var(--border-width) solid var(--color-border);
+  padding: var(--space-4) var(--space-5);
 }
 
 .applicationBadge {
@@ -764,6 +929,15 @@
     padding-inline: var(--space-4);
   }
 
+  .workspaceSection,
+  .reviewDialogBody {
+    padding-inline: var(--space-4);
+  }
+
+  .reviewDialogActions {
+    padding-inline: var(--space-4);
+  }
+
   .viewerToolbar {
     align-items: flex-start;
     flex-direction: column;
@@ -806,6 +980,7 @@
 @media (prefers-reduced-motion: reduce) {
   .backLink,
   .primaryButton,
+  .secondaryButton,
   .viewerTab {
     transition-duration: 0ms;
   }

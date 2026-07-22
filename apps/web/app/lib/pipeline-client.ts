@@ -9,6 +9,7 @@ import {
   CreateRunRequestSchema,
   EditRunRequestSchema,
   RegenerateRunRequestSchema,
+  ResumeIterationListResponseSchema,
   RunDtoSchema,
   RunListResponseSchema,
   StartApplicationSessionRequestSchema,
@@ -16,6 +17,7 @@ import {
   UpdateRunIdentityRequestSchema,
   type ArtifactDto,
   type ApplicationStatus,
+  type ResumeIterationListResponse,
   type RunDto,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
@@ -26,7 +28,7 @@ const PIPELINE_ROOT = "/api/pipeline";
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 const MAX_JSON_ARTIFACT_BYTES = 1024 * 1024;
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
-const ARTIFACT_PATH = /^\/v1\/runs\/[^/?#]+\/artifacts\/[^/?#]+$/;
+const ARTIFACT_PATH = /^\/v1\/runs\/[^/?#]+\/(?:artifacts\/[^/?#]+|iterations\/[1-9]\d*\/artifacts\/[^/?#]+)$/;
 const PUBLIC_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   APPLICATION_HARNESS_UNAVAILABLE: "The local application service is unavailable",
@@ -204,6 +206,15 @@ export async function listRuns(): Promise<RunDto[]> {
 
 export function getRun(id: string): Promise<RunDto> {
   return requestRun(runPath(id), { method: "GET" });
+}
+
+export function listResumeIterations(id: string): Promise<ResumeIterationListResponse> {
+  return requestApplicationResponse(
+    `${runPath(id)}/iterations`,
+    { method: "GET" },
+    200,
+    ResumeIterationListResponseSchema,
+  );
 }
 
 export function updateApplicationStatus(

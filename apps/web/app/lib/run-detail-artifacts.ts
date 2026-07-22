@@ -1,4 +1,31 @@
-import type { ArtifactDto, ArtifactKind } from "@jobhunter/pipeline/contracts";
+import type {
+  ArtifactDto,
+  ArtifactKind,
+  ResumeIterationDto,
+} from "@jobhunter/pipeline/contracts";
+
+export interface ResumeIterationSelection {
+  readonly mode: "follow-latest" | "pinned";
+  readonly selectedRevision: number | null;
+}
+
+export function reconcileResumeIterationSelection(
+  previous: ResumeIterationSelection,
+  iterations: readonly ResumeIterationDto[],
+): ResumeIterationSelection {
+  let latestRevision: number | null = null;
+  let pinnedRevisionExists = false;
+  for (const iteration of iterations) {
+    if (latestRevision === null || iteration.revision > latestRevision) {
+      latestRevision = iteration.revision;
+    }
+    if (iteration.revision === previous.selectedRevision) {
+      pinnedRevisionExists = true;
+    }
+  }
+  if (previous.mode === "pinned" && pinnedRevisionExists) return previous;
+  return { mode: "follow-latest", selectedRevision: latestRevision };
+}
 
 function isNewer(left: ArtifactDto, right: ArtifactDto): boolean {
   return left.revision > right.revision
