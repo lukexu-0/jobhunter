@@ -32,6 +32,8 @@ from jobhunter_browser_harness.models import (
     AdditionalInfoTextCommandAnswer,
     AdditionalInfoTextQuestion,
     ApplicationRunResult,
+    ReviewApplicationResult,
+    SubmittedApplicationResult,
     ApproveOriginCommand,
     ApproveRuntimeActionResponse,
     BrowserUseResultRuntimeActionResponse,
@@ -40,8 +42,10 @@ from jobhunter_browser_harness.models import (
     ContinueRuntimeActionResponse,
     HarnessConfig,
     ProvideAdditionalInfoCommand,
-    ReadyCommand,
-    ReadyRuntimeActionResponse,
+    SubmitCommand,
+    SubmitRuntimeActionResponse,
+    SubmitApplicationRuntimeAction,
+    SubmitApplicationResultRuntimeActionResponse,
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
@@ -242,7 +246,7 @@ def _review_result(
     resume_name: str,
     *,
     revision_count: int,
-) -> ApplicationRunResult:
+) -> ReviewApplicationResult:
     field_types = (
         ("Full name", "text"),
         ("Email", "text"),
@@ -257,8 +261,8 @@ def _review_result(
         ("Custom widget", "unknown"),
         ("Review emphasis", "textarea"),
     )
-    return ApplicationRunResult(
-        status="ready_for_human_submit",
+    return ReviewApplicationResult(
+        status="ready_for_submission",
         company="Example Systems",
         role="Reliability Engineer",
         job_url=fixture.posting_url,
@@ -359,12 +363,23 @@ def _set_review_code(value: str) -> str:
     return f"js({script!r})\nprint(page_info())"
 
 
+def _submit_application_code() -> str:
+    return (
+        "box = js(\"(() => { const rect = document.getElementById('final-submit')"
+        ".getBoundingClientRect(); return {x: rect.x + rect.width / 2, "
+        "y: rect.y + rect.height / 2}; })()\")\n"
+        "click_at_xy(box['x'], box['y'])\n"
+        "js(\"new Promise(resolve => setTimeout(resolve, 250))\")\n"
+        "print(page_info())"
+    )
+
+
 @pytest.mark.skipif(
     sys.platform != "linux",
     reason="Bubblewrap namespace execution requires Linux",
 )
 @pytest.mark.asyncio
-async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
+async def test_real_fixture_submits_once_after_human_approval(
     tmp_path: Path,
 ) -> None:
     executable = _chromium_executable()
@@ -781,7 +796,7 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
             assert isinstance(revision, BrowserUseResultRuntimeActionResponse)
             assert revision.exit_code == 0, revision.stderr
 
-            ready_task = asyncio.create_task(
+            submit_gate_task = asyncio.create_task(
                 manager.runtime_action(
                     created.session_id,
                     RequestHumanReviewRuntimeAction(
@@ -791,7 +806,7 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                             "resume.pdf",
                             revision_count=1,
                         ),
-                    ),
+                    )
                 )
             )
             await _wait_for_state(
@@ -802,29 +817,61 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
             assert manager.get_snapshot(
                 created.session_id
             ).pending_action is not None
-            await manager.command(created.session_id, ReadyCommand(type="ready"))
-            ready = await ready_task
-            assert isinstance(ready, ReadyRuntimeActionResponse)
-            assert ready.result.revision_count == 1
-            assert ready.result.submit_attempted is False
-            agent.finish(ready.result)
+            assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
+            await manager.command(created.session_id, SubmitCommand(type="submit"))
+            approved = await submit_gate_task
+            assert isinstance(approved, SubmitRuntimeActionResponse)
+            assert approved.result.revision_count == 1
+            assert approved.result.submit_attempted is False
+            assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
+
+            submission = await manager.runtime_action(
+                created.session_id,
+                SubmitApplicationRuntimeAction(
+                    type="submit_application",
+                    code=_submit_application_code(),
+                ),
+            )
+            assert isinstance(
+                submission,
+                SubmitApplicationResultRuntimeActionResponse,
+            )
+            assert submission.exit_code == 0, submission.stderr
+            assert submission.timed_out is False
+            assert submission.observation.url == fixture.form_url
+            assert "Submitted 1 time(s)" in submission.observation.dom
+            agent.finish(
+                SubmittedApplicationResult.model_validate(
+                    {
+                        **approved.result.model_dump(),
+                        "status": "submitted",
+                        "final_url": submission.observation.url,
+                        "submit_attempted": True,
+                        "submission_confirmation": {
+                            "type": "post_submit_confirmation",
+                            "text": "Submitted 1 time(s)",
+                        },
+                    }
+                )
+            )
             await _wait_for_state(
                 manager,
                 created.session_id,
-                "ready_for_human_submit",
+                "submitted",
             )
-            ready_snapshot = manager.get_snapshot(created.session_id)
-            assert ready_snapshot.pending_action is None
-            assert ready_snapshot.expires_at == initial_snapshot.expires_at
+            submitted_snapshot = manager.get_snapshot(created.session_id)
+            assert submitted_snapshot.pending_action is None
+            assert submitted_snapshot.expires_at == initial_snapshot.expires_at
             public_session_data = json.dumps(
                 {
-                    "snapshot": ready_snapshot.model_dump(mode="json"),
+                    "snapshot": submitted_snapshot.model_dump(mode="json"),
                     "events": [
                         event.model_dump(mode="json")
                         for event in record.events
                     ],
                 }
             )
+            assert "Submitted 1 time(s)" not in public_session_data
             assert _SUMMER_AVAILABILITY not in public_session_data
             assert '"status": "answered"' not in public_session_data
 
@@ -835,15 +882,8 @@ async def test_real_fixture_uses_runtime_actions_and_stops_for_human_submit(
                 "reviewVisible": True,
             }
             assert _IRRELEVANT_FACT not in str(values)
-            assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
-
-            await _human_click(record.browser, "final-submit")
-            async with asyncio.timeout(5):
-                while True:
-                    submitted = await asyncio.to_thread(fixture.submit_snapshot)
-                    if submitted["submit_count"] == 1:
-                        break
-                    await asyncio.sleep(0.05)
+            submitted = await asyncio.to_thread(fixture.submit_snapshot)
+            assert submitted["submit_count"] == 1
             assert submitted["last_submission"]["incident_answer"] == _RELEVANT_ANSWER
             assert submitted["last_submission"]["review_answer"] == _REVISION
             assert submitted["last_submission"]["resume"] == "resume.pdf"

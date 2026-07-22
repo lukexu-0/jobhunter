@@ -17,9 +17,11 @@ from jobhunter_browser_harness.models import (
     SESSION_ERROR_MESSAGES,
     AdditionalInfoRuntimeActionResponse,
     ApplicationRunResult,
+    ReviewApplicationResult,
     ApproveRuntimeActionResponse,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
+    CancelledApplicationResult,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     ProvideAdditionalInfoCommand,
@@ -30,18 +32,23 @@ from jobhunter_browser_harness.models import (
     FieldResult,
     HarnessConfig,
     HarnessServiceError,
-    ReadyRuntimeActionResponse,
+    SubmitApplicationResultRuntimeActionResponse,
+    SubmitApplicationRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
     RequestOriginApprovalRuntimeAction,
     ReportApplicationMismatchRuntimeAction,
+    PostSubmitConfirmation,
     ReviseRuntimeActionResponse,
     RuntimeActionRequest,
     RuntimeActionResponse,
-    ReadyCommand,
+    SubmitRuntimeActionResponse,
+    SubmitCommand,
     ReviseCommand,
     SessionCommand,
+    SubmittedApplicationResult,
+    SubmissionUncertainApplicationResult,
     SessionCreateResponse,
     SessionError,
     SessionSnapshot,
@@ -377,9 +384,9 @@ def test_field_result_enforces_bounds_and_never_contains_a_value() -> None:
             FieldResult.model_validate(values)
 
 
-def test_application_result_sanitizes_urls_and_forces_submit_false() -> None:
-    result = ApplicationRunResult(
-        status="ready_for_human_submit",
+def test_review_application_result_sanitizes_urls_and_forces_submit_false() -> None:
+    result = ReviewApplicationResult(
+        status="ready_for_submission",
         company="C" * 500,
         role="R" * 500,
         job_url="https://user:secret@jobs.example/apply?candidate=private#fragment",
@@ -406,12 +413,89 @@ def test_application_result_sanitizes_urls_and_forces_submit_false() -> None:
         assert private not in serialized
 
     with pytest.raises(ValidationError):
-        ApplicationRunResult.model_validate(
+        ReviewApplicationResult.model_validate(
             {
                 **dumped,
                 "submit_attempted": True,
             }
         )
+
+
+def test_terminal_application_results_have_strict_submission_evidence() -> None:
+    base = {
+        **ReviewApplicationResult(
+            status="ready_for_submission",
+            company="Example Corp",
+            role="Engineer",
+            job_url="https://jobs.example/openings/42",
+            final_url="https://ats.example/application/42",
+            files_attached=["resume.pdf"],
+            revision_count=2,
+        ).model_dump(),
+        "status": "submitted",
+        "submit_attempted": True,
+        "submission_confirmation": {
+            "type": "post_submit_confirmation",
+            "text": "  Application received.  ",
+        },
+    }
+    submitted = SubmittedApplicationResult.model_validate(base)
+
+    assert submitted.submission_confirmation == PostSubmitConfirmation(
+        type="post_submit_confirmation",
+        text="Application received.",
+    )
+    assert TypeAdapter(ApplicationRunResult).validate_python(base) == submitted
+
+    uncertain = SubmissionUncertainApplicationResult.model_validate(
+        {
+            **base,
+            "status": "submission_uncertain",
+            "submission_confirmation": None,
+        }
+    )
+    assert uncertain.submit_attempted is True
+    assert uncertain.submission_confirmation is None
+
+    cancelled = CancelledApplicationResult.model_validate(
+        {
+            **base,
+            "status": "cancelled",
+            "submit_attempted": False,
+            "submission_confirmation": None,
+        }
+    )
+    assert cancelled.submit_attempted is False
+
+    for invalid_text in ("   ", "x" * 1_001):
+        with pytest.raises(ValidationError):
+            SubmittedApplicationResult.model_validate(
+                {
+                    **base,
+                    "submission_confirmation": {
+                        "type": "post_submit_confirmation",
+                        "text": invalid_text,
+                    },
+                }
+            )
+
+    for invalid in (
+        {**base, "submit_attempted": False},
+        {**base, "submission_confirmation": None},
+        {
+            **base,
+            "status": "submission_uncertain",
+            "submission_confirmation": base["submission_confirmation"],
+        },
+        {
+            **base,
+            "status": "cancelled",
+            "submit_attempted": True,
+            "submission_confirmation": None,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            TypeAdapter(ApplicationRunResult).validate_python(invalid)
 
 
 @pytest.mark.parametrize(
@@ -455,10 +539,11 @@ def test_application_result_rejects_public_bounds(field: str, invalid_value: Any
         "job_url": "https://jobs.example/posting",
         "final_url": "https://jobs.example/posting",
         "submit_attempted": False,
+        "submission_confirmation": None,
         field: invalid_value,
     }
     with pytest.raises(ValidationError):
-        ApplicationRunResult.model_validate(values)
+        TypeAdapter(ApplicationRunResult).validate_python(values)
 
 
 def test_session_errors_are_limited_to_the_fixed_catalog() -> None:
@@ -543,6 +628,20 @@ def test_pending_action_exactly_matches_awaiting_state(
         make_snapshot(state=state, pending_action=None)
 
 
+@pytest.mark.parametrize(
+    "state",
+    ["submitting", "submitted", "submission_uncertain"],
+)
+def test_submission_session_states_are_strict_and_have_no_pending_action(
+    state: str,
+) -> None:
+    snapshot = make_snapshot(state=state, pending_action=None)
+
+    assert snapshot.state == state
+    assert snapshot.pending_action is None
+    assert snapshot.error is None
+
+
 def test_session_snapshot_requires_a_nonnegative_absolute_expiry() -> None:
     assert make_snapshot().expires_at == NOW + timedelta(hours=1)
 
@@ -560,7 +659,7 @@ def test_session_snapshot_requires_a_nonnegative_absolute_expiry() -> None:
         ({"type": "continue"}, ContinueCommand),
         ({"type": "approve_origin", "origin": "HTTPS://ATS.Example/"}, ApproveOriginCommand),
         ({"type": "revise", "context": "  Correct this field.  "}, ReviseCommand),
-        ({"type": "ready"}, ReadyCommand),
+        ({"type": "submit"}, SubmitCommand),
         ({"type": "cancel"}, CancelCommand),
         (
             {
@@ -608,7 +707,8 @@ def test_revision_command_accepts_twenty_thousand_trimmed_characters() -> None:
         {},
         {"type": "unknown"},
         {"type": "continue", "extra": "rejected"},
-        {"type": "ready", "context": "not allowed"},
+        {"type": "submit", "context": "not allowed"},
+        {"type": "ready"},
         {"type": "approve_origin"},
         {"type": "approve_origin", "origin": "https://ats.example/path"},
         {"type": "revise"},
@@ -886,7 +986,7 @@ async def test_sse_rejects_invalid_or_negative_last_event_id(
         ({"type": "continue"}, ContinueCommand),
         ({"type": "approve_origin", "origin": "https://ats.example"}, ApproveOriginCommand),
         ({"type": "revise", "context": "  use corrected fact  "}, ReviseCommand),
-        ({"type": "ready"}, ReadyCommand),
+        ({"type": "submit"}, SubmitCommand),
         ({"type": "cancel"}, CancelCommand),
     ],
 )
@@ -933,7 +1033,7 @@ async def test_command_endpoint_rejects_bad_discriminator_without_dispatch(
 
 
 def _application_result_payload(
-    status: str = "ready_for_human_submit",
+    status: str = "ready_for_submission",
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -947,6 +1047,7 @@ def _application_result_payload(
         "warnings": [],
         "revision_count": 1,
         "submit_attempted": False,
+        **({"submission_confirmation": None} if status == "cancelled" else {}),
     }
 
 
@@ -1081,6 +1182,39 @@ async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
     assert service.runtime_action_calls == []
 
 
+def test_submit_application_runtime_action_enforces_utf8_bytes_and_round_trips() -> None:
+    action = RUNTIME_ACTION_ADAPTER.validate_python(
+        {"type": "submit_application", "code": "é" * 32_768}
+    )
+    assert isinstance(action, SubmitApplicationRuntimeAction)
+
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_ADAPTER.validate_python(
+            {"type": "submit_application", "code": "é" * 32_769}
+        )
+
+    result = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {
+            "type": "submit_application_result",
+            "exit_code": 0,
+            "timed_out": False,
+            "stdout": "",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "observation": {
+                "url": "https://ats.example/confirmation",
+                "title": "Application received",
+                "tabs": [],
+                "dom": "Application received",
+                "page_info": None,
+                "screenshot": None,
+            },
+        }
+    )
+    assert isinstance(result, SubmitApplicationResultRuntimeActionResponse)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1121,7 +1255,7 @@ async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
             ],
         },
         {"type": "revise", "context": "Use the corrected date.", "revision_count": 1},
-        {"type": "ready", "result": _application_result_payload()},
+        {"type": "submit", "result": _application_result_payload()},
         {"type": "cancel", "result": _application_result_payload("cancelled")},
         {"type": "application_mismatch"},
         {

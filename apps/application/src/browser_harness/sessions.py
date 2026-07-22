@@ -39,6 +39,10 @@ from .models import (
     AdditionalInfoSavedDetail,
     AgentStepDetail,
     ApplicationRunResult,
+    CancelledApplicationResult,
+    ReviewApplicationResult,
+    SubmittedApplicationResult,
+    SubmissionUncertainApplicationResult,
     ApplicationMismatchRuntimeActionResponse,
     ApproveRuntimeActionResponse,
     ApproveOriginCommand,
@@ -55,13 +59,15 @@ from .models import (
     HarnessServiceError,
     HumanNavigationDetail,
     OriginApprovalDetail,
-    ReadyCommand,
+    SubmitCommand,
     ReviseCommand,
-    ReadyRuntimeActionResponse,
+    SubmitRuntimeActionResponse,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
+    SubmitApplicationRuntimeAction,
+    SubmitApplicationResultRuntimeActionResponse,
     RequestOriginApprovalRuntimeAction,
     ReviseRuntimeActionResponse,
     RuntimeActionRequest,
@@ -89,9 +95,7 @@ from .skill_runtime import (
 )
 from .tools import (
     HumanGate,
-    redact_public_text,
     redact_public_url,
-    sanitize_application_result,
 )
 from .user_info import UserInfoSnapshot, UserInfoStore
 
@@ -101,6 +105,10 @@ _EVENT_LIMIT = 256
 _TOMBSTONE_LIMIT = 32
 _HEARTBEAT_SECONDS = 15.0
 _CLEANUP_RETRY_MAX_SECONDS = 5.0
+_SUBMISSION_UNCERTAIN_WARNING = (
+    "The application submission could not be verified. Check the headed browser "
+    "if it is still available, then close this session."
+)
 _MAX_APPLICATION_TASK_BYTES = 1024 * 1024
 
 ModelFactory = Callable[[UUID, str, str], PipelineApplicationAgentClient]
@@ -143,6 +151,7 @@ class _ApplicationSession:
     runtime_action_pending: bool = False
     browser_action_count: int = 0
     additional_info_question_count: int = 0
+    submission_action_started: bool = False
     setup_task: asyncio.Task[Any] | None = None
     context_process: CandidateContextProcess | None = None
     resume_path_task: asyncio.Task[str] | None = None
@@ -564,7 +573,7 @@ class ApplicationSessionManager:
             ) -> None:
                 await self._publish_gate(record, state, event, detail)
 
-            async def review_snapshot(result: ApplicationRunResult) -> None:
+            async def review_snapshot(result: ReviewApplicationResult) -> None:
                 self._apply_result(record, result)
 
             record.human_gate = HumanGate(
@@ -713,7 +722,16 @@ class ApplicationSessionManager:
                 )
             raise self._not_found()
 
+        if record.snapshot.state in {"submitted", "submission_uncertain"}:
+            raise HarnessServiceError(
+                409,
+                "command_conflict",
+                "Only closing the browser is allowed after a submission outcome",
+            )
         if isinstance(command, CancelCommand):
+            if record.submission_action_started:
+                await self._park_submission_uncertain(record)
+                return
             await self._request_terminal(
                 record,
                 _TerminalRequest("cancelled", "cancelled"),
@@ -738,8 +756,8 @@ class ApplicationSessionManager:
                 await gate.approve_origin(command.origin)
             elif isinstance(command, ReviseCommand):
                 await gate.revise(command.context)
-            elif isinstance(command, ReadyCommand):
-                await gate.ready()
+            elif isinstance(command, SubmitCommand):
+                await gate.submit()
             elif isinstance(command, ProvideAdditionalInfoCommand):
                 await gate.provide_additional_info(command.answers)
             else:
@@ -759,47 +777,82 @@ class ApplicationSessionManager:
                 )
             raise self._not_found()
 
-        async with record.request_lock:
-            if record.finalized or record.final_request is not None:
-                raise HarnessServiceError(
-                    409, "command_conflict", "The session is terminal"
-                )
-            if (
-                record.snapshot.state == "ready_for_human_submit"
-                or (
-                    record.human_gate is not None
-                    and record.human_gate.ready_accepted
-                )
-            ):
-                raise HarnessServiceError(
-                    409,
-                    "command_conflict",
-                    "The application is already ready for human submission",
-                )
-            if (
-                record.snapshot.state == "starting"
-                or record.skill_runtime is None
-                or record.human_gate is None
-                or record.browser is None
-                or record.request is None
-            ):
-                raise HarnessServiceError(
-                    409, "command_conflict", "The session is still starting"
-                )
-            if record.runtime_action_pending:
-                raise HarnessServiceError(
-                    409,
-                    "command_conflict",
-                    "A runtime action is already pending",
-                )
-            record.runtime_action_pending = True
-
+        owns_pending = False
+        submission_action_accepted = False
         try:
+            async with record.request_lock:
+                if record.finalized or record.final_request is not None:
+                    raise HarnessServiceError(
+                        409, "command_conflict", "The session is terminal"
+                    )
+                if record.snapshot.state in {"submitted", "submission_uncertain"}:
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "Only closing the browser is allowed after a submission outcome",
+                    )
+                if (
+                    record.snapshot.state == "starting"
+                    or record.skill_runtime is None
+                    or record.human_gate is None
+                    or record.browser is None
+                    or record.request is None
+                ):
+                    raise HarnessServiceError(
+                        409, "command_conflict", "The session is still starting"
+                    )
+                gate = record.human_gate
+                if gate.submission_approved:
+                    if not isinstance(action, SubmitApplicationRuntimeAction):
+                        raise HarnessServiceError(
+                            409,
+                            "command_conflict",
+                            "Only the approved submission action may run",
+                        )
+                    if record.submission_action_started:
+                        raise HarnessServiceError(
+                            409,
+                            "command_conflict",
+                            "The submission action was already started",
+                        )
+                elif isinstance(action, SubmitApplicationRuntimeAction):
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "Final submission has not been approved",
+                    )
+                if record.runtime_action_pending:
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "A runtime action is already pending",
+                    )
+                record.runtime_action_pending = True
+                owns_pending = True
+                if isinstance(action, SubmitApplicationRuntimeAction):
+                    record.submission_action_started = True
+                    submission_action_accepted = True
+                    await self._set_state_and_event(
+                        record,
+                        "submitting",
+                        "submission_started",
+                        {},
+                    )
+
             async with record.runtime_lock:
                 return await self._dispatch_runtime_action(record, action)
+        except asyncio.CancelledError:
+            if submission_action_accepted:
+                await self._park_submission_uncertain(record)
+            raise
+        except Exception:
+            if submission_action_accepted:
+                await self._park_submission_uncertain(record)
+            raise
         finally:
-            async with record.request_lock:
-                record.runtime_action_pending = False
+            if owns_pending:
+                async with record.request_lock:
+                    record.runtime_action_pending = False
 
     async def _dispatch_runtime_action(
         self,
@@ -845,6 +898,21 @@ class ApplicationSessionManager:
                     type="browser_use_result",
                     **result.model_dump(),
                 )
+
+        if isinstance(action, SubmitApplicationRuntimeAction):
+            try:
+                result = await runtime.execute(action.code)
+            except BrowserSkillRuntimeError as error:
+                public = session_error(error.code)
+                raise HarnessServiceError(
+                    504 if error.code == "session_timeout" else 502,
+                    public.code,
+                    public.message,
+                ) from None
+            return SubmitApplicationResultRuntimeActionResponse(
+                type="submit_application_result",
+                **result.model_dump(),
+            )
 
         if isinstance(action, RequestHumanNavigationRuntimeAction):
             before = gate.approved_origins
@@ -925,6 +993,22 @@ class ApplicationSessionManager:
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
                 return terminal
+            if gate.submission_approved:
+                try:
+                    approved_result = ReviewApplicationResult.model_validate_json(
+                        gate_result.extracted_content
+                    )
+                except (TypeError, ValidationError):
+                    public = session_error("browser_failed")
+                    raise HarnessServiceError(
+                        502,
+                        public.code,
+                        public.message,
+                    ) from None
+                return SubmitRuntimeActionResponse(
+                    type="submit",
+                    result=approved_result,
+                )
             return ReviseRuntimeActionResponse(
                 type="revise",
                 context=gate_result.long_term_memory,
@@ -941,11 +1025,11 @@ class ApplicationSessionManager:
     @staticmethod
     def _runtime_gate_terminal_response(
         gate_result: Any,
-    ) -> ReadyRuntimeActionResponse | CancelRuntimeActionResponse | None:
+    ) -> CancelRuntimeActionResponse | None:
         if not gate_result.is_done:
             return None
         try:
-            result = ApplicationRunResult.model_validate_json(
+            result = CancelledApplicationResult.model_validate_json(
                 gate_result.extracted_content
             )
         except (TypeError, ValidationError):
@@ -955,9 +1039,7 @@ class ApplicationSessionManager:
                 public.code,
                 public.message,
             ) from None
-        if gate_result.success and result.status == "ready_for_human_submit":
-            return ReadyRuntimeActionResponse(type="ready", result=result)
-        if not gate_result.success and result.status == "cancelled":
+        if not gate_result.success:
             return CancelRuntimeActionResponse(type="cancel", result=result)
         public = session_error("browser_failed")
         raise HarnessServiceError(
@@ -1084,57 +1166,74 @@ class ApplicationSessionManager:
                     gate,
                     lambda step, url: self._agent_step(record, step, url),
                 )
-            if self._application_runner is None:
-                if result.job_url != sanitize_public_url(request.job_url):
-                    raise PipelineApplicationAgentError(
-                        "application_mismatch",
-                        SESSION_ERROR_MESSAGES["application_mismatch"],
-                    )
-                if (
-                    result.status == "ready_for_human_submit"
-                    and not gate.ready_accepted
-                ):
+
+            if result.job_url != sanitize_public_url(request.job_url):
+                raise PipelineApplicationAgentError(
+                    "application_mismatch",
+                    SESSION_ERROR_MESSAGES["application_mismatch"],
+                )
+            if isinstance(
+                result,
+                (SubmittedApplicationResult, SubmissionUncertainApplicationResult),
+            ):
+                if not gate.submission_approved or not record.submission_action_started:
                     raise PipelineApplicationAgentError(
                         "invalid_model_output",
                         SESSION_ERROR_MESSAGES["invalid_model_output"],
                     )
             if record.final_request is not None:
                 return
-            if result.status == "cancelled":
+            if isinstance(result, CancelledApplicationResult):
                 record.agent_task = None
-                await self._begin_finalization(
+                if record.submission_action_started:
+                    await self._park_submission_uncertain(record)
+                else:
+                    await self._begin_finalization(
+                        record,
+                        _TerminalRequest("cancelled", "cancelled"),
+                        duplicate_ok=True,
+                    )
+                return
+            if isinstance(result, SubmissionUncertainApplicationResult):
+                record.agent_task = None
+                await self._park_submission_uncertain(record)
+                return
+            if isinstance(result, SubmittedApplicationResult):
+                record.agent_task = None
+                if record.snapshot.state == "submission_uncertain":
+                    return
+                await self._set_state_and_event(
                     record,
-                    _TerminalRequest("cancelled", "cancelled"),
-                    duplicate_ok=True,
+                    "submitted",
+                    "application_submitted",
+                    {},
                 )
                 return
-            sanitized = sanitize_application_result(
-                result,
-                gate.redaction_values,
-                gate.revision_count,
-            )
-            self._apply_result(record, sanitized)
-            await self._set_state_and_event(
-                record,
-                "ready_for_human_submit",
-                "ready_for_human_submit",
-                {},
+            raise PipelineApplicationAgentError(
+                "invalid_model_output",
+                SESSION_ERROR_MESSAGES["invalid_model_output"],
             )
         except asyncio.CancelledError:
             if record.final_request is None:
                 record.agent_task = None
-                await self._begin_finalization(
-                    record,
-                    _TerminalRequest("cancelled", "cancelled"),
-                    duplicate_ok=True,
-                )
+                if record.submission_action_started:
+                    await self._park_submission_uncertain(record)
+                else:
+                    await self._begin_finalization(
+                        record,
+                        _TerminalRequest("cancelled", "cancelled"),
+                        duplicate_ok=True,
+                    )
         except PipelineApplicationAgentError as error:
+            record.agent_task = None
+            if record.submission_action_started:
+                await self._park_submission_uncertain(record)
+                return
             error_code = (
                 "invalid_model_output"
                 if error.code == "invalid_request"
                 else error.code
             )
-            record.agent_task = None
             await self._begin_finalization(
                 record,
                 _TerminalRequest("failed", "failed", error_code),
@@ -1142,11 +1241,39 @@ class ApplicationSessionManager:
             )
         except Exception:
             record.agent_task = None
+            if record.submission_action_started:
+                await self._park_submission_uncertain(record)
+                return
             await self._begin_finalization(
                 record,
                 _TerminalRequest("failed", "failed", "browser_failed"),
                 duplicate_ok=True,
             )
+
+    async def _park_submission_uncertain(
+        self,
+        record: _ApplicationSession,
+    ) -> None:
+        warnings = [
+            warning
+            for warning in record.snapshot.warnings
+            if warning != _SUBMISSION_UNCERTAIN_WARNING
+        ][:99]
+        warnings.append(_SUBMISSION_UNCERTAIN_WARNING)
+        record.snapshot = self._updated_snapshot(
+            record.snapshot,
+            warnings=warnings,
+            pending_action=None,
+            error=None,
+        )
+        if record.snapshot.state == "submission_uncertain":
+            return
+        await self._set_state_and_event(
+            record,
+            "submission_uncertain",
+            "submission_uncertain",
+            {},
+        )
 
     async def _expire_session(self, record: _ApplicationSession) -> None:
         delay = max(
@@ -1155,9 +1282,19 @@ class ApplicationSessionManager:
         )
         try:
             await asyncio.sleep(delay)
+            if record.submission_action_started and record.snapshot.state not in {
+                "submitted",
+                "submission_uncertain",
+            }:
+                await self._park_submission_uncertain(record)
+            terminal = (
+                _TerminalRequest("closed", "closed")
+                if record.snapshot.state in {"submitted", "submission_uncertain"}
+                else _TerminalRequest("failed", "failed", "session_timeout")
+            )
             await self._request_terminal(
                 record,
-                _TerminalRequest("failed", "failed", "session_timeout"),
+                terminal,
                 wait=False,
                 duplicate_ok=True,
             )
@@ -1172,8 +1309,12 @@ class ApplicationSessionManager:
         wait: bool,
         duplicate_ok: bool,
     ) -> None:
-        await self._begin_finalization(record, request, duplicate_ok=duplicate_ok)
-        if wait:
+        finalizing = await self._begin_finalization(
+            record,
+            request,
+            duplicate_ok=duplicate_ok,
+        )
+        if wait and finalizing:
             await self._join_finalizer(record)
 
     async def _begin_finalization(
@@ -1182,14 +1323,20 @@ class ApplicationSessionManager:
         request: _TerminalRequest,
         *,
         duplicate_ok: bool,
-    ) -> None:
+    ) -> bool:
         async with record.request_lock:
+            if record.submission_action_started and request.state != "closed":
+                await self._park_submission_uncertain(record)
+                if request.error_code == "session_timeout":
+                    request = _TerminalRequest("closed", "closed")
+                else:
+                    return False
             if record.finalized:
                 if not duplicate_ok:
                     raise HarnessServiceError(
                         409, "command_conflict", "The session is terminal"
                     )
-                return
+                return False
             if record.final_request is None:
                 record.final_request = request
             elif request.state == "closed":
@@ -1203,6 +1350,7 @@ class ApplicationSessionManager:
                     self._finalize_record(record),
                     name=f"browser-harness-finalizer-{record.session_id}",
                 )
+            return True
 
     async def _join_finalizer(self, record: _ApplicationSession) -> None:
         task = record.finalizer_task
@@ -1449,7 +1597,7 @@ class ApplicationSessionManager:
         )
 
     def _apply_result(
-        self, record: _ApplicationSession, result: ApplicationRunResult
+        self, record: _ApplicationSession, result: ReviewApplicationResult
     ) -> None:
         record.snapshot = self._updated_snapshot(
             record.snapshot,

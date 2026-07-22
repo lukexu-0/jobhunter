@@ -40,7 +40,7 @@ def _status_payload(**overrides: Any) -> dict[str, Any]:
 
 def _result_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "status": "ready_for_human_submit",
+        "status": "submitted",
         "company": "Example Corp",
         "role": "Engineer",
         "job_url": "https://jobs.example.test/42",
@@ -57,7 +57,11 @@ def _result_payload(**overrides: Any) -> dict[str, Any]:
         "files_attached": ["resume.pdf"],
         "warnings": [],
         "revision_count": 1,
-        "submit_attempted": False,
+        "submit_attempted": True,
+        "submission_confirmation": {
+            "type": "post_submit_confirmation",
+            "text": "Application received.",
+        },
     }
     payload.update(overrides)
     return payload
@@ -319,7 +323,7 @@ async def test_check_ready_only_exposes_the_oauth_status_error(
         _success_payload(model="other"),
         _success_payload(reasoning="medium"),
         {**_success_payload(), "extra": True},
-        _success_payload(result=_result_payload(status="submitted")),
+        _success_payload(result=_result_payload(status="ready_for_submission")),
         _success_payload(result={**_result_payload(), "providerSecret": "hidden"}),
     ],
 )

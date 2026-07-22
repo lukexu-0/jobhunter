@@ -21,7 +21,8 @@ from jobhunter_browser_harness.models import (
     AdditionalInfoSingleSelectQuestion,
     AdditionalInfoTextCommandAnswer,
     AdditionalInfoTextQuestion,
-    ApplicationRunResult,
+    CancelledApplicationResult,
+    ReviewApplicationResult,
     HarnessServiceError,
     SessionCreateRequest,
     UploadedArtifacts,
@@ -168,7 +169,7 @@ def test_public_redaction_and_result_sanitization_remove_direct_values() -> None
         == "Candidate [redacted] uses [redacted]"
     )
 
-    result = ApplicationRunResult.model_validate(
+    result = ReviewApplicationResult.model_validate(
         {
             **make_result().model_dump(),
             "company": "Ada Secret-Value",
@@ -200,7 +201,7 @@ def test_public_redaction_and_result_sanitization_remove_direct_values() -> None
         revision_count=4,
     )
 
-    assert sanitized.status == "ready_for_human_submit"
+    assert sanitized.status == "ready_for_submission"
     assert sanitized.company == "[redacted]"
     assert sanitized.role == "[redacted]"
     assert sanitized.job_url == "https://jobs.example/[redacted]/42"
@@ -217,11 +218,11 @@ def test_public_redaction_and_result_sanitization_remove_direct_values() -> None
 
 def make_result(
     *,
-    status: str = "cancelled",
+    status: str = "ready_for_submission",
     job_url: str = JOB_URL,
     final_url: str = JOB_URL,
-) -> ApplicationRunResult:
-    return ApplicationRunResult.model_validate(
+) -> ReviewApplicationResult:
+    return ReviewApplicationResult.model_validate(
         {
             "status": status,
             "company": "Example Corp",
@@ -321,7 +322,7 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
     await publisher.next_event()
     await gate.cancel()
     cancelled = await pending
-    payload = ApplicationRunResult.model_validate_json(cancelled.extracted_content)
+    payload = CancelledApplicationResult.model_validate_json(cancelled.extracted_content)
 
     assert cancelled.is_done is True
     assert cancelled.success is False
@@ -335,7 +336,9 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
 
     timeout_gate, timeout_publisher = make_gate(action_timeout=0.001)
     timed_out = await timeout_gate.request_human_navigation("Wait for human.", browser)
-    timeout_payload = ApplicationRunResult.model_validate_json(timed_out.extracted_content)
+    timeout_payload = CancelledApplicationResult.model_validate_json(
+        timed_out.extracted_content
+    )
     assert timeout_publisher.events[0][0] == "awaiting_human_navigation"
     assert timed_out.is_done is True
     assert timed_out.success is False
@@ -450,7 +453,7 @@ async def test_origin_cap_existing_origin_and_cancel_are_deterministic() -> None
     assert existing.is_done is False
     assert existing.extracted_content == "Origin is already approved."
     capped = await gate.request_origin_approval("https://twenty-first.example", browser)
-    payload = ApplicationRunResult.model_validate_json(capped.extracted_content)
+    payload = CancelledApplicationResult.model_validate_json(capped.extracted_content)
     assert capped.is_done is True
     assert capped.success is False
     assert payload.status == "cancelled"
@@ -468,7 +471,7 @@ async def test_duplicate_and_wrong_state_commands_conflict_without_changing_gate
         gate.continue_navigation,
         lambda: gate.approve_origin(ATS_ORIGIN),
         lambda: gate.revise("correction"),
-        gate.ready,
+        gate.submit,
     ):
         with pytest.raises(HarnessServiceError) as error:
             await command()
@@ -540,21 +543,29 @@ async def test_revision_trims_context_counts_events_and_resolves_concurrent_race
 
 
 @pytest.mark.asyncio
-async def test_ready_and_cancellation_return_terminal_validated_json() -> None:
+async def test_submit_approval_is_one_way_and_cancellation_is_terminal_json() -> None:
     gate, publisher = make_gate()
     browser = FakeBrowserSession("https://jobs.example/apply?secret=yes")
     review = asyncio.create_task(gate.request_human_review(make_result(), browser))
     await publisher.next_event()
-    await gate.ready()
-    ready = await review
-    ready_payload = ApplicationRunResult.model_validate_json(ready.extracted_content)
+    await gate.submit()
+    approved = await review
+    approved_payload = ReviewApplicationResult.model_validate_json(
+        approved.extracted_content
+    )
 
-    assert ready.is_done is True
-    assert ready.success is True
-    assert ready_payload.status == "ready_for_human_submit"
-    assert ready_payload.submit_attempted is False
-    assert ready_payload.revision_count == 0
-    assert gate.ready_accepted is True
+    assert approved.is_done is False
+    assert approved_payload.status == "ready_for_submission"
+    assert approved_payload.submit_attempted is False
+    assert approved_payload.revision_count == 0
+    assert gate.submission_approved is True
+
+    with pytest.raises(HarnessServiceError) as replay:
+        await gate.submit()
+    assert_conflict(replay.value)
+    with pytest.raises(HarnessServiceError) as post_approval_gate:
+        await gate.request_human_navigation("Do not reopen a gate.", browser)
+    assert_conflict(post_approval_gate.value)
 
     cancelled_gate, cancelled_publisher = make_gate()
     cancelled_review = asyncio.create_task(
@@ -563,7 +574,7 @@ async def test_ready_and_cancellation_return_terminal_validated_json() -> None:
     await cancelled_publisher.next_event()
     await cancelled_gate.cancel()
     cancelled = await cancelled_review
-    cancelled_payload = ApplicationRunResult.model_validate_json(
+    cancelled_payload = CancelledApplicationResult.model_validate_json(
         cancelled.extracted_content
     )
     assert cancelled.is_done is True
@@ -571,6 +582,7 @@ async def test_ready_and_cancellation_return_terminal_validated_json() -> None:
     assert cancelled_payload.status == "cancelled"
     assert cancelled_payload.final_url == "https://jobs.example/apply"
     assert cancelled_payload.submit_attempted is False
+    assert cancelled_payload.submission_confirmation is None
 
 
 

@@ -22,7 +22,8 @@ from .models import (
     AdditionalInfoSingleSelectQuestion,
     AdditionalInfoTextCommandAnswer,
     AdditionalInfoTextQuestion,
-    ApplicationRunResult,
+    CancelledApplicationResult,
+    ReviewApplicationResult,
     FieldResult,
     HarnessServiceError,
     SessionState,
@@ -39,14 +40,14 @@ MAX_APPROVED_ORIGINS = 20
 GateEventPublisher = Callable[
     [SessionState, str | None, Mapping[str, object]], Awaitable[None]
 ]
-ReviewSnapshotSink = Callable[[ApplicationRunResult], Awaitable[None]]
+ReviewSnapshotSink = Callable[[ReviewApplicationResult], Awaitable[None]]
 GateKind = Literal["navigation", "origin", "additional_info", "review"]
 DecisionKind = Literal[
     "continue",
     "approve",
     "additional_info",
     "revise",
-    "ready",
+    "submit",
     "cancel",
 ]
 GatePayload: TypeAlias = str | tuple[AcceptedAdditionalInfoAnswer, ...] | None
@@ -125,10 +126,10 @@ def redact_public_url(value: str, private_values: Iterable[str]) -> str:
 
 
 def sanitize_application_result(
-    result: ApplicationRunResult,
+    result: ReviewApplicationResult,
     private_values: Iterable[str],
     revision_count: int,
-) -> ApplicationRunResult:
+) -> ReviewApplicationResult:
     redaction_values = tuple(private_values)
 
     def safe_field(field: FieldResult) -> FieldResult:
@@ -145,8 +146,8 @@ def sanitize_application_result(
         if result.warnings
         else []
     )
-    return ApplicationRunResult(
-        status="ready_for_human_submit",
+    return ReviewApplicationResult(
+        status="ready_for_submission",
         company=redact_public_text(result.company, redaction_values),
         role=redact_public_text(result.role, redaction_values),
         job_url=redact_public_url(result.job_url, redaction_values),
@@ -334,7 +335,7 @@ class HumanGate:
         self._pending: _PendingGate | None = None
         self._cancelled = False
         self._revision_count = 0
-        self._ready_accepted = False
+        self._submission_approved = False
 
     @property
     def approved_origins(self) -> tuple[str, ...]:
@@ -349,8 +350,8 @@ class HumanGate:
         return self._revision_count
 
     @property
-    def ready_accepted(self) -> bool:
-        return self._ready_accepted
+    def submission_approved(self) -> bool:
+        return self._submission_approved
 
     @property
     def pending_kind(self) -> GateKind | None:
@@ -461,7 +462,7 @@ class HumanGate:
 
     async def request_human_review(
         self,
-        result: ApplicationRunResult,
+        result: ReviewApplicationResult,
         browser_session: BrowserSession,
     ) -> ActionResult:
         review_result = sanitize_application_result(
@@ -484,13 +485,12 @@ class HumanGate:
                 long_term_memory=context,
                 metadata={"revision_count": self._revision_count},
             )
-        if decision == "ready":
-            ready_result = review_result
+        if decision == "submit":
             return ActionResult(
-                is_done=True,
-                success=True,
-                extracted_content=ready_result.model_dump_json(),
-                long_term_memory="Application is ready for the human to review and submit.",
+                extracted_content=review_result.model_dump_json(),
+                long_term_memory=(
+                    "Final submission was approved. Use submit_application exactly once."
+                ),
             )
         return await self._cancelled_result(browser_session, review_result)
 
@@ -556,11 +556,11 @@ class HumanGate:
             )
             pending.future.set_result(("revise", trimmed))
 
-    async def ready(self) -> None:
+    async def submit(self) -> None:
         async with self._lock:
             pending = self._require_pending("review")
-            self._ready_accepted = True
-            pending.future.set_result(("ready", None))
+            self._submission_approved = True
+            pending.future.set_result(("submit", None))
 
     async def cancel(self) -> None:
         async with self._lock:
@@ -582,6 +582,8 @@ class HumanGate:
         storage_questions: tuple[AdditionalInfoQuestion, ...] = (),
     ) -> GateDecision:
         async with self._lock:
+            if self._submission_approved:
+                raise self._conflict("Final submission was already approved")
             if self._cancelled:
                 return "cancel", None
             if self._pending is not None and not self._pending.future.done():
@@ -624,7 +626,7 @@ class HumanGate:
     async def _cancelled_result(
         self,
         browser_session: BrowserSession,
-        result: ApplicationRunResult | None = None,
+        result: ReviewApplicationResult | None = None,
     ) -> ActionResult:
         try:
             current_url = redact_public_url(
@@ -634,17 +636,18 @@ class HumanGate:
         except Exception:
             current_url = redact_public_url(self._job_url, self._redaction_values)
         if result is not None:
-            cancelled = ApplicationRunResult.model_validate(
+            cancelled = CancelledApplicationResult.model_validate(
                 {
                     **result.model_dump(),
                     "status": "cancelled",
                     "final_url": current_url,
                     "revision_count": self._revision_count,
                     "submit_attempted": False,
+                    "submission_confirmation": None,
                 }
             )
         else:
-            cancelled = ApplicationRunResult(
+            cancelled = CancelledApplicationResult(
                 status="cancelled",
                 company=None,
                 role=None,
@@ -652,6 +655,7 @@ class HumanGate:
                 final_url=current_url,
                 revision_count=self._revision_count,
                 submit_attempted=False,
+                submission_confirmation=None,
             )
         return ActionResult(
             is_done=True,

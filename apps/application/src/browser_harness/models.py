@@ -30,7 +30,9 @@ SessionState: TypeAlias = Literal[
     "awaiting_origin_approval",
     "awaiting_additional_info",
     "awaiting_human_review",
-    "ready_for_human_submit",
+    "submitting",
+    "submitted",
+    "submission_uncertain",
     "cancelled",
     "failed",
     "closed",
@@ -722,7 +724,9 @@ HarnessEventType: TypeAlias = Literal[
     "revision_applied",
     "additional_info_required",
     "additional_info_saved",
-    "ready_for_human_submit",
+    "submission_started",
+    "application_submitted",
+    "submission_uncertain",
     "cancelled",
     "failed",
     "closed",
@@ -784,8 +788,8 @@ class ReviseCommand(PublicModel):
     ]
 
 
-class ReadyCommand(PublicModel):
-    type: Literal["ready"]
+class SubmitCommand(PublicModel):
+    type: Literal["submit"]
 
 
 class CancelCommand(PublicModel):
@@ -810,7 +814,7 @@ SessionCommand: TypeAlias = Annotated[
     ContinueCommand
     | ApproveOriginCommand
     | ReviseCommand
-    | ReadyCommand
+    | SubmitCommand
     | CancelCommand
     | ProvideAdditionalInfoCommand,
     Field(discriminator="type"),
@@ -865,8 +869,7 @@ class BrowserUseExecutionResult(PublicModel):
     observation: BrowserObservation
 
 
-class ApplicationRunResult(PublicModel):
-    status: Literal["ready_for_human_submit", "cancelled"]
+class ApplicationResultBase(PublicModel):
     company: Annotated[str, StringConstraints(strict=True, max_length=500)] | None = None
     role: Annotated[str, StringConstraints(strict=True, max_length=500)] | None = None
     job_url: StrictText
@@ -876,7 +879,6 @@ class ApplicationRunResult(PublicModel):
     files_attached: list[StrictText] = Field(default_factory=list, max_length=20)
     warnings: list[WarningText] = Field(default_factory=list, max_length=100)
     revision_count: int = Field(default=0, ge=0, le=100)
-    submit_attempted: Literal[False] = False
 
     @field_validator("job_url", "final_url")
     @classmethod
@@ -889,12 +891,78 @@ class ApplicationRunResult(PublicModel):
         return [validate_sanitized_basename(value) for value in values]
 
 
+class ReviewApplicationResult(ApplicationResultBase):
+    status: Literal["ready_for_submission"]
+    submit_attempted: Literal[False] = False
+
+
+class PostSubmitConfirmation(PublicModel):
+    type: Literal["post_submit_confirmation"]
+    text: Annotated[
+        str,
+        StringConstraints(
+            strict=True,
+            strip_whitespace=True,
+            min_length=1,
+            max_length=1_000,
+        ),
+    ]
+
+
+class SubmittedApplicationResult(ApplicationResultBase):
+    status: Literal["submitted"]
+    submit_attempted: Literal[True]
+    submission_confirmation: PostSubmitConfirmation
+
+
+class SubmissionUncertainApplicationResult(ApplicationResultBase):
+    status: Literal["submission_uncertain"]
+    submit_attempted: Literal[True]
+    submission_confirmation: None
+
+
+class CancelledApplicationResult(ApplicationResultBase):
+    status: Literal["cancelled"]
+    submit_attempted: Literal[False]
+    submission_confirmation: None
+
+
+ApplicationRunResult: TypeAlias = Annotated[
+    SubmittedApplicationResult
+    | SubmissionUncertainApplicationResult
+    | CancelledApplicationResult,
+    Field(discriminator="status"),
+]
+
+
 class BrowserUseRuntimeAction(PublicModel):
     type: Literal["browser_use"]
     code: Annotated[
         str,
         StringConstraints(strict=True, max_length=65_536),
     ]
+
+    @field_validator("code")
+    @classmethod
+    def _validate_code_size(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 65_536:
+            raise ValueError("code must be at most 65,536 UTF-8 bytes")
+        return value
+
+
+class SubmitApplicationRuntimeAction(PublicModel):
+    type: Literal["submit_application"]
+    code: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=65_536),
+    ]
+
+    @field_validator("code")
+    @classmethod
+    def _validate_code_size(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 65_536:
+            raise ValueError("code must be at most 65,536 UTF-8 bytes")
+        return value
 
 
 class RequestHumanNavigationRuntimeAction(PublicModel):
@@ -920,8 +988,6 @@ class RequestOriginApprovalRuntimeAction(PublicModel):
         return validate_approved_origin(value)
 
 
-
-
 class RequestAdditionalInfoRuntimeAction(PublicModel):
     type: Literal["request_additional_info"]
     questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
@@ -941,7 +1007,7 @@ class RequestAdditionalInfoRuntimeAction(PublicModel):
 
 class RequestHumanReviewRuntimeAction(PublicModel):
     type: Literal["request_human_review"]
-    result: ApplicationRunResult
+    result: ReviewApplicationResult
 
 
 class ReportApplicationMismatchRuntimeAction(PublicModel):
@@ -950,6 +1016,7 @@ class ReportApplicationMismatchRuntimeAction(PublicModel):
 
 RuntimeActionRequest: TypeAlias = Annotated[
     BrowserUseRuntimeAction
+    | SubmitApplicationRuntimeAction
     | RequestHumanNavigationRuntimeAction
     | RequestOriginApprovalRuntimeAction
     | RequestAdditionalInfoRuntimeAction
@@ -961,6 +1028,10 @@ RuntimeActionRequest: TypeAlias = Annotated[
 
 class BrowserUseResultRuntimeActionResponse(BrowserUseExecutionResult):
     type: Literal["browser_use_result"]
+
+
+class SubmitApplicationResultRuntimeActionResponse(BrowserUseExecutionResult):
+    type: Literal["submit_application_result"]
 
 
 class ContinueRuntimeActionResponse(PublicModel):
@@ -1006,26 +1077,14 @@ class ReviseRuntimeActionResponse(PublicModel):
     revision_count: int = Field(ge=1, le=100)
 
 
-class ReadyRuntimeActionResponse(PublicModel):
-    type: Literal["ready"]
-    result: ApplicationRunResult
-
-    @model_validator(mode="after")
-    def _validate_ready_result(self) -> ReadyRuntimeActionResponse:
-        if self.result.status != "ready_for_human_submit":
-            raise ValueError("ready response requires a ready result")
-        return self
+class SubmitRuntimeActionResponse(PublicModel):
+    type: Literal["submit"]
+    result: ReviewApplicationResult
 
 
 class CancelRuntimeActionResponse(PublicModel):
     type: Literal["cancel"]
-    result: ApplicationRunResult
-
-    @model_validator(mode="after")
-    def _validate_cancel_result(self) -> CancelRuntimeActionResponse:
-        if self.result.status != "cancelled":
-            raise ValueError("cancel response requires a cancelled result")
-        return self
+    result: CancelledApplicationResult
 
 
 class AdditionalInfoRuntimeActionResponse(PublicModel):
@@ -1039,10 +1098,11 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 
 RuntimeActionResponse: TypeAlias = Annotated[
     BrowserUseResultRuntimeActionResponse
+    | SubmitApplicationResultRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | ApproveRuntimeActionResponse
     | ReviseRuntimeActionResponse
-    | ReadyRuntimeActionResponse
+    | SubmitRuntimeActionResponse
     | CancelRuntimeActionResponse
     | AdditionalInfoRuntimeActionResponse
     | ApplicationMismatchRuntimeActionResponse,

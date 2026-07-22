@@ -3,8 +3,8 @@
 
 This script intentionally requires a running pipeline, a connected OpenAI Codex
 OAuth account, and a running headed browser-harness service. It drives only the
-loopback fixture and harness APIs; the two explicitly labelled browser clicks
-remain manual.
+loopback fixture and harness APIs; the explicitly labelled Human Next browser click
+remains manual.
 """
 
 from __future__ import annotations
@@ -610,7 +610,7 @@ def assert_subsequence(actual: list[str], expected: list[str]) -> None:
     for value in actual:
         if cursor < len(expected) and value == expected[cursor]:
             cursor += 1
-    require(cursor == len(expected), "Harness events did not follow the required gate/revision/ready sequence")
+    require(cursor == len(expected), "Harness events did not follow the required gate/revision/submission sequence")
 
 
 def assert_snapshot(
@@ -619,7 +619,7 @@ def assert_snapshot(
     fixture: LocalApplicationFixture,
 ) -> None:
     require(snapshot.get("session_id") == session_id, "Final snapshot returned the wrong session id")
-    require(snapshot.get("state") == "ready_for_human_submit", "Session did not reach ready_for_human_submit")
+    require(snapshot.get("state") == "submitted", "Session did not reach submitted")
     require(snapshot.get("model_provider") == MODEL_PROVIDER, "Snapshot used the wrong provider")
     require(snapshot.get("model") == MODEL_NAME, "Snapshot used the wrong model")
     require(snapshot.get("reasoning") == MODEL_REASONING, "Snapshot used the wrong reasoning level")
@@ -649,7 +649,7 @@ def assert_snapshot(
         <= {field.get("field_type") for field in fields},
         "Snapshot did not cover every fixture field type",
     )
-    require(snapshot.get("error") is None, "Ready snapshot unexpectedly contained an error")
+    require(snapshot.get("error") is None, "Submitted snapshot unexpectedly contained an error")
 
 
 async def wait_fixture_progress(fixture: LocalApplicationFixture) -> dict[str, Any]:
@@ -706,18 +706,18 @@ async def wait_for_one_submit(fixture: LocalApplicationFixture) -> None:
         if count == 1:
             submission = snapshot.get("last_submission")
             require(isinstance(submission, dict), "Fixture did not retain the single submission")
-            require(submission.get("full_name") == FULL_NAME, "Submitted fixture name changed after ready")
-            require(submission.get("email") == EMAIL, "Submitted fixture email changed after ready")
-            require(submission.get("review_answer") == REVISION_VALUE, "Submitted fixture revision changed after ready")
+            require(submission.get("full_name") == FULL_NAME, "Submitted fixture name changed after approval")
+            require(submission.get("email") == EMAIL, "Submitted fixture email changed after approval")
+            require(submission.get("review_answer") == REVISION_VALUE, "Submitted fixture revision changed after approval")
             require(
                 submission.get("summer_availability") == SUMMER_AVAILABILITY,
-                "Submitted fixture global answer changed after ready",
+                "Submitted fixture global answer changed after approval",
             )
             require(
                 submission.get("referral_source") == REFERRAL_SOURCE,
-                "Submitted fixture application answer changed after ready",
+                "Submitted fixture application answer changed after approval",
             )
-            require(submission.get("resume") == RESUME_NAME, "Submitted fixture resume changed after ready")
+            require(submission.get("resume") == RESUME_NAME, "Submitted fixture resume changed after approval")
             serialized = json.dumps(submission, sort_keys=True).lower()
             require(
                 "orchid" not in serialized and "community garden" not in serialized and "fundraiser" not in serialized,
@@ -725,7 +725,7 @@ async def wait_for_one_submit(fixture: LocalApplicationFixture) -> None:
             )
             return
         await asyncio.sleep(0.1)
-    raise SmokeFailure("Timed out waiting for the one manual final Submit click")
+    raise SmokeFailure("Timed out waiting for the agent's one final submission")
 
 
 def inspect_json_privacy(value: Any) -> None:
@@ -984,17 +984,33 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             second_review = await event_stream.wait_for(
                 "review_required", after_id=int(revision["id"])
             )
+            progress = await wait_fixture_progress(fixture)
+            assert_fixture_progress(progress)
+            before_submit = await asyncio.to_thread(fixture.submit_snapshot)
+            require(
+                before_submit.get("submit_count") == 0,
+                "Configured workflow submitted before final human approval",
+            )
+            require(
+                before_submit.get("last_submission") is None,
+                "Fixture retained a submission before final human approval",
+            )
+
             await post_command(
                 client,
                 capture,
                 commands_url,
                 headers,
-                {"type": "ready"},
-                "Harness rejected ready on the second review",
+                {"type": "submit"},
+                "Harness rejected submit approval on the second review",
             )
-            ready = await event_stream.wait_for(
-                "ready_for_human_submit", after_id=int(second_review["id"])
+            submission_started = await event_stream.wait_for(
+                "submission_started", after_id=int(second_review["id"])
             )
+            submitted = await event_stream.wait_for(
+                "application_submitted", after_id=int(submission_started["id"])
+            )
+            await wait_for_one_submit(fixture)
 
             event_names = [event["event"] for event in event_stream.events]
             assert_subsequence(
@@ -1008,7 +1024,8 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                     "review_required",
                     "revision_applied",
                     "review_required",
-                    "ready_for_human_submit",
+                    "submission_started",
+                    "application_submitted",
                 ],
             )
             expected_states = {
@@ -1019,7 +1036,8 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 "human_navigation_required": "awaiting_human_navigation",
                 "review_required": "awaiting_human_review",
                 "revision_applied": "running",
-                "ready_for_human_submit": "ready_for_human_submit",
+                "submission_started": "submitting",
+                "application_submitted": "submitted",
             }
             for event in event_stream.events:
                 expected_state = expected_states.get(event.get("event"))
@@ -1035,25 +1053,18 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             snapshot = response_json_object(capture, snapshot_response, "Final snapshot was not JSON")
             require_status(snapshot_response, 200, "Final session snapshot was unavailable")
             assert_snapshot(snapshot, active_session_id, fixture)
-            require(ready.get("session") == snapshot, "Ready SSE snapshot disagreed with the GET snapshot")
-
-            progress = await wait_fixture_progress(fixture)
-            assert_fixture_progress(progress)
-            before_submit = await asyncio.to_thread(fixture.submit_snapshot)
-            require(before_submit.get("submit_count") == 0, "Configured workflow submitted before human handoff")
-            require(before_submit.get("last_submission") is None, "Fixture retained a submission before human handoff")
-
-            print('In headed Chrome, inspect the form and click "Submit application" exactly once, then press Enter here.')
-            await asyncio.to_thread(input)
-            await wait_for_one_submit(fixture)
+            require(
+                submitted.get("session") == snapshot,
+                "Submitted SSE snapshot disagreed with the GET snapshot",
+            )
 
             delete_response = await client.delete(
                 f"{args.harness_url}/v1/sessions/{active_session_id}", headers=headers
             )
             capture.response(delete_response)
-            require_status(delete_response, 204, "DELETE did not close and clean the ready session")
+            require_status(delete_response, 204, "DELETE did not close and clean the submitted session")
             require(delete_response.content == b"", "DELETE 204 unexpectedly contained a body")
-            await event_stream.wait_for("closed", after_id=int(ready["id"]), timeout=60)
+            await event_stream.wait_for("closed", after_id=int(submitted["id"]), timeout=60)
 
             closed_response = await client.get(
                 f"{args.harness_url}/v1/sessions/{active_session_id}", headers=headers
@@ -1210,7 +1221,7 @@ def main(argv: list[str] | None = None) -> int:
     except SmokeFailure as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("Live headed browser-harness smoke passed; OAuth/model/API/gates/manual submit/cleanup verified.")
+    print("Live headed browser-harness smoke passed; OAuth/model/API/gates/approved agent submission/cleanup verified.")
     return 0
 
 
