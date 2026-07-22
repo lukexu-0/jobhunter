@@ -469,10 +469,11 @@ export class RunApplicationService {
     if (!artifact) return undefined;
     const kind = PUBLIC_ARTIFACT_KINDS[artifact.kind];
     if (!kind) return undefined;
-    const isCurrentReviewArtifact = (run.status === "review" || run.status === "approved")
-      && this.dependencies.repository.listResolvedArtifacts(runId).some((candidate) => candidate.id === artifact.id);
-    const isApprovedRevision = this.dependencies.repository.getRevisionStatus(runId, artifact.revision) === "approved";
-    if (!isCurrentReviewArtifact && !isApprovedRevision) return undefined;
+    const isCurrentResolvedArtifact = (run.status === "review" || run.status === "approved")
+      && this.dependencies.repository
+        .listResolvedArtifacts(runId)
+        .some((candidate) => candidate.id === artifact.id);
+    if (!isCurrentResolvedArtifact) return undefined;
 
     return await this.#verifiedArtifactResponse(runId, artifact, kind);
   }

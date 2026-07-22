@@ -835,6 +835,24 @@ describe("RunApplicationService", () => {
       byteSize: storedExtraction.bytes,
     });
     target.repository.finishAttempt(claim, analysisAttempt.id, "succeeded");
+    const latestAnalysisAttempt = target.repository.startAttempt(claim, "analyzing");
+    const latestExtractionBody = JSON.stringify({
+      keywords: [{ id: "keyword-platform", phrase: "Platform", jdQuote: "Platform" }],
+    });
+    const storedLatestExtraction = await target.artifacts.write(
+      join(analysisRoot, "ats-keyword-extraction-latest.json"),
+      latestExtractionBody,
+      1024 * 1024,
+    );
+    const latestExtraction = target.repository.finalizeArtifact(claim, {
+      attemptId: latestAnalysisAttempt.id,
+      stage: "analyzing",
+      kind: "ats-keyword-extraction",
+      sha256: storedLatestExtraction.sha256,
+      path: storedLatestExtraction.path,
+      byteSize: storedLatestExtraction.bytes,
+    });
+    target.repository.finishAttempt(claim, latestAnalysisAttempt.id, "succeeded");
     transition(target.repository, claim, ["tailoring", "compiling", "deterministic_qa", "visual_qa"]);
     target.repository.release(claim);
     const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nreview", false, "%PDF-1.7\nkeyword-map", "\\documentclass{article}");
@@ -864,15 +882,17 @@ describe("RunApplicationService", () => {
       mediaType: "application/pdf",
       public: true,
     });
-    expect(dto.artifacts.find((artifact) => artifact.id === extraction.id)).toMatchObject({
+    expect(dto.artifacts.find((artifact) => artifact.id === latestExtraction.id)).toMatchObject({
       kind: "ats-keyword-extraction",
       mediaType: "application/json; charset=utf-8",
       public: true,
     });
-    const extractionResponse = await target.service.getArtifact(run.id, extraction.id);
+    const extractionResponse = await target.service.getArtifact(run.id, latestExtraction.id);
     expect(extractionResponse?.status).toBe(200);
     expect(extractionResponse?.headers.get("content-type")).toBe("application/json; charset=utf-8");
-    expect(await extractionResponse?.text()).toBe(extractionBody);
+    expect(await extractionResponse?.text()).toBe(latestExtractionBody);
+    await target.service.approveRun(run.id, pdf.sha256, false);
+    expect(await target.service.getArtifact(run.id, extraction.id)).toBeUndefined();
     const input = target.repository.getArtifact(run.id, "job-description")!;
     expect(await target.service.getArtifact(run.id, input.id)).toBeUndefined();
   });
