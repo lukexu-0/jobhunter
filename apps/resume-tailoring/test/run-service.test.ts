@@ -626,6 +626,17 @@ describe("RunApplicationService", () => {
     const retried = await target.service.retryRun(run.id);
     expect(retried).toMatchObject({ revision: 2, status: "compiling", origin: "initial" });
     const pdf = await finalizeReviewPdf(target, run.id);
+    const retryIterations = await target.service.listResumeIterations(run.id);
+    expect(retryIterations.iterations).toHaveLength(1);
+    expect(retryIterations.iterations[0]).toMatchObject({
+      revision: 2,
+      origin: "initial",
+      status: "review",
+      artifacts: expect.arrayContaining([
+        expect.objectContaining({ id: analysisArtifact.id }),
+        expect.objectContaining({ id: pdf.id }),
+      ]),
+    });
     const dto = await target.service.getRun(run.id);
     expect(dto?.attempts.map((attempt) => attempt.stage)).toEqual(["analysis", "compile", "visual-qa"]);
     expect(dto?.artifacts.map((artifact) => artifact.id)).toEqual(expect.arrayContaining([analysisArtifact.id, pdf.id]));
@@ -756,6 +767,13 @@ describe("RunApplicationService", () => {
       run.id,
       "%PDF-1.7\niteration-two",
     );
+    await target.service.regenerateRun(run.id, second.sha256);
+    const third = await finalizeReviewPdf(
+      target,
+      run.id,
+      "%PDF-1.7\niteration-three",
+    );
+    await target.service.approveRun(run.id, third.sha256, false);
     const listed = ResumeIterationListResponseSchema.parse(
       await target.service.listResumeIterations(run.id),
     );
@@ -769,6 +787,7 @@ describe("RunApplicationService", () => {
     }))).toEqual([
       { revision: 1, origin: "initial", status: "review", pdfSha256: first.sha256 },
       { revision: 2, origin: "human-comments", status: "review", pdfSha256: second.sha256 },
+      { revision: 3, origin: "machine-regeneration", status: "approved", pdfSha256: third.sha256 },
     ]);
     expect(
       listed.iterations[0]?.artifacts.find((artifact) => artifact.id === first.id)?.href,
@@ -776,6 +795,9 @@ describe("RunApplicationService", () => {
     expect(
       listed.iterations[1]?.artifacts.find((artifact) => artifact.id === second.id)?.href,
     ).toBe(`/v1/runs/${run.id}/iterations/2/artifacts/${second.id}`);
+    expect(
+      listed.iterations[2]?.artifacts.find((artifact) => artifact.id === third.id)?.href,
+    ).toBe(`/v1/runs/${run.id}/iterations/3/artifacts/${third.id}`);
     const historical = await target.service.getResumeIterationArtifact(run.id, 1, first.id);
     expect(historical?.status).toBe(200);
     expect(await historical?.text()).toBe("%PDF-1.7\niteration-one");
@@ -800,6 +822,7 @@ describe("RunApplicationService", () => {
     }))).toEqual([
       { revision: 1, pdfSha256: first.sha256, artifacts: [] },
       { revision: 2, pdfSha256: second.sha256, artifacts: [] },
+      { revision: 3, pdfSha256: third.sha256, artifacts: [] },
     ]);
     await expect(
       target.service.getResumeIterationArtifact(run.id, 1, first.id),

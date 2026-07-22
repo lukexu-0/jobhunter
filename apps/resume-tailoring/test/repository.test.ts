@@ -609,38 +609,111 @@ describe("artifact retention reservations", () => {
   });
 
 
-  test("live application sessions block deletion and pruning until terminal", () => {
-    const { repo } = fixture();
+  test("every live application state blocks deletion and pruning until every terminal state unblocks", () => {
+    const liveStates = [
+      "reserved",
+      "starting",
+      "running",
+      "awaiting_human_navigation",
+      "awaiting_origin_approval",
+      "awaiting_additional_info",
+      "awaiting_human_review",
+      "ready_for_human_submit",
+    ] as const;
+    const terminalStates = ["cancelled", "failed", "closed", "lost"] as const;
     const hash = "2".repeat(64);
-    const ids = Array.from({ length: 12 }, (_, index) => `application-retention-${index}`);
-    for (const id of ids) {
-      createReview(repo, hash, false, id);
-      repo.approve(id, hash);
+    const sessionId = (index: number) =>
+      `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+
+    const live = fixture().repo;
+    const liveRunIds = Array.from(
+      { length: liveStates.length + 10 },
+      (_, index) => `live-application-retention-${index}`,
+    );
+    for (const id of liveRunIds) {
+      createReview(live, hash, false, id);
+      live.approve(id, hash);
     }
-    const firstSessionId = "77777777-7777-4777-8777-777777777777";
-    const secondSessionId = "88888888-8888-4888-8888-888888888888";
-    repo.reserveApplicationSession(ids[0]!, null, firstSessionId, hash);
-    repo.reserveApplicationSession(ids[1]!, null, secondSessionId, hash);
+    for (const [index, bridgeState] of liveStates.entries()) {
+      const runId = liveRunIds[index]!;
+      live.reserveApplicationSession(runId, null, sessionId(index), hash);
+      if (bridgeState !== "reserved") {
+        live.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId: sessionId(index),
+          bridgeState,
+          publicSnapshot: { state: bridgeState },
+        });
+      }
+      expect(() => live.deleteRun(runId)).toThrow(/close the browser session first/);
+    }
+    expect(live.reserveArtifactPruneCandidates(10)).toEqual([]);
 
-    expect(() => repo.deleteRun(ids[1]!)).toThrow(/close the browser session first/);
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([]);
+    for (const [index, bridgeState] of terminalStates.entries()) {
+      const terminal = fixture().repo;
+      const runId = createReview(terminal, hash, false, `terminal-delete-${bridgeState}`);
+      terminal.approve(runId, hash);
+      terminal.reserveApplicationSession(runId, null, sessionId(20 + index), hash);
+      if (bridgeState === "lost") {
+        terminal.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId: sessionId(20 + index),
+          bridgeState: "running",
+          publicSnapshot: { state: "running" },
+        });
+        terminal.markApplicationSessionLost(runId, {
+          generation: 1,
+          sessionId: sessionId(20 + index),
+          publicSnapshot: { state: bridgeState },
+        });
+      } else {
+        terminal.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId: sessionId(20 + index),
+          bridgeState,
+          publicSnapshot: { state: bridgeState },
+        });
+      }
+      terminal.deleteRun(runId);
+      expect(terminal.getRun(runId)).toBeNull();
+    }
 
-    repo.recordApplicationSnapshot(ids[0]!, {
-      generation: 1,
-      sessionId: firstSessionId,
-      bridgeState: "cancelled",
-      publicSnapshot: { state: "cancelled" },
-    });
-    repo.recordApplicationSnapshot(ids[1]!, {
-      generation: 1,
-      sessionId: secondSessionId,
-      bridgeState: "closed",
-      publicSnapshot: { state: "closed" },
-    });
-    repo.deleteRun(ids[1]!);
-
-    expect(repo.getRun(ids[1]!)).toBeNull();
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[0]!]);
+    const terminal = fixture().repo;
+    const terminalRunIds = Array.from(
+      { length: terminalStates.length + 10 },
+      (_, index) => `terminal-application-retention-${index}`,
+    );
+    for (const id of terminalRunIds) {
+      createReview(terminal, hash, false, id);
+      terminal.approve(id, hash);
+    }
+    for (const [index, bridgeState] of terminalStates.entries()) {
+      const runId = terminalRunIds[index]!;
+      terminal.reserveApplicationSession(runId, null, sessionId(30 + index), hash);
+      if (bridgeState === "lost") {
+        terminal.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId: sessionId(30 + index),
+          bridgeState: "running",
+          publicSnapshot: { state: "running" },
+        });
+        terminal.markApplicationSessionLost(runId, {
+          generation: 1,
+          sessionId: sessionId(30 + index),
+          publicSnapshot: { state: bridgeState },
+        });
+      } else {
+        terminal.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId: sessionId(30 + index),
+          bridgeState,
+          publicSnapshot: { state: bridgeState },
+        });
+      }
+    }
+    expect(terminal.reserveArtifactPruneCandidates(10)).toEqual(
+      terminalRunIds.slice(0, terminalStates.length),
+    );
   });
   test("excludes tombstoned runs from retention selection and reservations", () => {
     const { db, repo } = fixture();

@@ -220,12 +220,44 @@ test("migration ten preserves version nine runs and creates the durable applicat
     ) VALUES (?, 1, ?, 2, ?, 'reserved', NULL, NULL, 2000, 2000, NULL)
   `).run("existing-run", "11111111-1111-4111-8111-111111111111", "a".repeat(64));
 
-  expect(() => db.query(`
+  const insertSession = db.query(`
     INSERT INTO run_application_sessions(
       run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
       public_snapshot_json, last_upstream_event_id, created_at, updated_at, terminal_at
-    ) VALUES (?, 2, ?, 2, ?, 'running', '{}', -1, 2000, 2000, NULL)
-  `).run("existing-run", "22222222-2222-4222-8222-222222222222", "a".repeat(64))).toThrow();
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  expect(() => insertSession.run(
+    "existing-run", 2, "11111111-1111-4111-8111-111111111111", 2,
+    "a".repeat(64), "running", "{}", 0, 2000, 2000, null,
+  )).toThrow();
+  expect(() => insertSession.run(
+    "existing-run", 2, "not-a-uuid", 2,
+    "a".repeat(64), "running", "{}", 0, 2000, 2000, null,
+  )).toThrow();
+  expect(() => insertSession.run(
+    "existing-run", 2, "22222222-2222-4222-8222-222222222222", 3,
+    "a".repeat(64), "running", "{}", 0, 2000, 2000, null,
+  )).toThrow();
+  expect(() => insertSession.run(
+    "existing-run", 2, "22222222-2222-4222-8222-222222222222", 2,
+    "short", "running", "{}", 0, 2000, 2000, null,
+  )).toThrow();
+  expect(() => insertSession.run(
+    "existing-run", 2, "22222222-2222-4222-8222-222222222222", 2,
+    "a".repeat(64), "running", "{", 0, 2000, 2000, null,
+  )).toThrow();
+  expect(() => insertSession.run(
+    "existing-run", 2, "22222222-2222-4222-8222-222222222222", 2,
+    "a".repeat(64), "running", "{}", -1, 2000, 2000, null,
+  )).toThrow();
+  expect(() => insertSession.run(
+    "existing-run", 2, "22222222-2222-4222-8222-222222222222", 2,
+    "a".repeat(64), "running", "{}", 0, 2000, 2000, 2000,
+  )).toThrow();
+  expect(() => insertSession.run(
+    "existing-run", 2, "22222222-2222-4222-8222-222222222222", 2,
+    "a".repeat(64), "failed", "{}", 0, 2000, 2000, null,
+  )).toThrow();
   expect(() => db.query(
     "DELETE FROM run_application_sessions WHERE run_id = 'existing-run' AND generation = 1",
   ).run()).toThrow(/history/i);

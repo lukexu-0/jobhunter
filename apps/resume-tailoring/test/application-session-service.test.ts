@@ -512,13 +512,23 @@ describe("application session service", () => {
       active.service.retry(active.runId, active.pdf.sha256, signal()),
     ).rejects.toMatchObject({ code: "RUN_CONFLICT", status: 409 });
 
-    const terminalHarness = new FakeHarness();
-    terminalHarness.snapshotAfterCreate = harnessSnapshot("cancelled");
-    const terminal = await createTarget({ harness: terminalHarness });
-    expect(await terminal.service.start(terminal.runId, terminal.pdf.sha256, signal()))
-      .toMatchObject({ generation: 1, bridgeState: "cancelled" });
-    expect(await terminal.service.retry(terminal.runId, terminal.pdf.sha256, signal()))
-      .toMatchObject({ generation: 2 });
+    for (const bridgeState of ["cancelled", "failed", "closed"] as const) {
+      const terminalHarness = new FakeHarness();
+      terminalHarness.snapshotAfterCreate = bridgeState === "failed"
+        ? {
+          ...harnessSnapshot("failed"),
+          error: { code: "browser_failed", message: "The browser session failed" },
+        }
+        : harnessSnapshot(bridgeState);
+      const terminal = await createTarget({
+        harness: terminalHarness,
+        sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+      });
+      expect(await terminal.service.start(terminal.runId, terminal.pdf.sha256, signal()))
+        .toMatchObject({ generation: 1, bridgeState });
+      expect(await terminal.service.retry(terminal.runId, terminal.pdf.sha256, signal()))
+        .toMatchObject({ generation: 2, bridgeState });
+    }
   });
 
 
