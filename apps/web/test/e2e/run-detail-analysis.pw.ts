@@ -6,6 +6,7 @@ import {
 } from "@jobhunter/pipeline/contracts";
 
 const runId = "run-detail-analysis-v2";
+const jobUrl = "https://jobs.example.test/openings/staff-ai?gh_jid=123&source=viewer";
 const analysisArtifactId = "job-analysis-v2";
 const extractionArtifactId = "ats-keyword-extraction-v1";
 const resumeArtifactId = "compiled-resume-pdf-v2";
@@ -14,6 +15,7 @@ const resumePdf = Buffer.from("%PDF-1.4\n% analysis fixture\n%%EOF\n");
 
 const run: RunDto = {
   id: runId,
+  jobUrl,
   status: "approved",
   applicationStatus: "applied",
   queueSequence: 1,
@@ -230,6 +232,29 @@ test("prefers durable run identity overrides in the opened-run summary", async (
   await expect(page.getByText("Override Industries", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { level: 1, name: "Staff AI Engineer" })).toHaveCount(0);
   await expect(page.getByText("Acme Systems", { exact: true })).toHaveCount(0);
+});
+
+test("links the canonical job posting directly above run metadata", async ({ page }) => {
+  await interceptRunDetail(page);
+  await page.goto(`/runs/${runId}`);
+
+  const link = page.getByRole("link", { name: "View job posting", exact: true });
+  await expect(link).toHaveAttribute("href", jobUrl);
+  await expect(link).toHaveAttribute("target", "_blank");
+  await expect(link).toHaveAttribute("rel", "noreferrer");
+  expect(await link.evaluate((element) => {
+    const metadata = element.nextElementSibling;
+    return metadata?.tagName === "DL"
+      && metadata.querySelector("dt")?.textContent === "Created";
+  })).toBe(true);
+});
+
+test("omits the job posting link for a legacy run", async ({ page }) => {
+  const { jobUrl: _omitted, ...legacyRun } = run;
+  await interceptRunDetail(page, true, legacyRun);
+  await page.goto(`/runs/${runId}`);
+
+  await expect(page.getByRole("link", { name: "View job posting", exact: true })).toHaveCount(0);
 });
 
 const oldReportHeadings = [

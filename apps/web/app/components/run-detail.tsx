@@ -1019,6 +1019,16 @@ export function RunDetail({ runId }: RunDetailProps) {
             </p>
             <h1 className={styles.runTitle}>{title}</h1>
             <p className={styles.runSubtitle}>{subtitle}</p>
+            {run.jobUrl ? (
+              <a
+                className={styles.jobPostingLink}
+                href={run.jobUrl}
+                rel="noreferrer"
+                target="_blank"
+              >
+                View job posting <span aria-hidden="true">↗</span>
+              </a>
+            ) : null}
             <dl className={styles.metadataGrid}>
               <div><dt>Created</dt><dd>{formatDate(run.createdAt)}</dd></div>
               <div><dt>Last updated</dt><dd>{formatDate(run.updatedAt)}</dd></div>
