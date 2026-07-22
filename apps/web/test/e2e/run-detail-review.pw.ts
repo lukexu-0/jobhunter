@@ -1,0 +1,1366 @@
+import { createServer, type Server } from "node:http";
+import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+  ApiErrorSchema,
+  ApplicationSessionEventDtoSchema,
+  ApplicationSessionSnapshotDtoSchema,
+  ApplicationSessionViewSchema,
+  ArtifactDtoSchema,
+  ResumeIterationListResponseSchema,
+  RunDtoSchema,
+  type ApiError,
+  type ApplicationAdditionalInfoQuestion,
+  type ApplicationPendingAction,
+  type ApplicationSessionBridgeState,
+  type ApplicationSessionCommand,
+  type ApplicationSessionEventDto,
+  type ApplicationSessionSnapshotDto,
+  type ApplicationSessionView,
+  type ArtifactDto,
+  type HarnessSessionState,
+  type ResumeIterationDto,
+  type ResumeIterationListResponse,
+  type RevisionOrigin,
+  type RunDto,
+  type RunStatus,
+} from "@jobhunter/pipeline/contracts";
+
+const runId = "run-detail-review-workspace";
+const pipelineRunPath = `/api/pipeline/runs/${runId}`;
+const createdAt = 1_700_000_000_000;
+const expiresAt = 1_700_086_400_000;
+const pdfHash1 = "1".repeat(64);
+const pdfHash2 = "2".repeat(64);
+const pdfHash3 = "3".repeat(64);
+const pdfHash4 = "4".repeat(64);
+const privateHarnessValues = [
+  "http://127.0.0.1:8765",
+  "e8bd7e20-f9b7-46ad-974f-80703b09b554",
+  "Bearer private-harness-token",
+  "https://jobs.private.example.test/staff-engineer",
+  "https://previous-approved-origin.private.example.test",
+  "/home/private/applicant-profile.md",
+  "private-returned-answer",
+] as const;
+
+interface Deferred {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+}
+
+interface QueuedReply {
+  readonly status: number;
+  readonly body?: unknown;
+  readonly before?: () => void;
+}
+
+interface SseReply {
+  readonly body: string;
+  readonly publicEvents: readonly ApplicationSessionEventDto[];
+  readonly waitFor: Promise<void>;
+  readonly before?: () => void;
+}
+
+interface RequestRecord {
+  readonly method: string;
+  readonly path: string;
+  readonly body?: unknown;
+}
+
+interface MockPipeline {
+  run: RunDto;
+  iterations: ResumeIterationListResponse;
+  application: ApplicationSessionView;
+  editReply: RunDto | null;
+  regenerateReply: RunDto | null;
+  approveReply: RunDto | null;
+  readonly startReplies: QueuedReply[];
+  readonly retryReplies: QueuedReply[];
+  readonly commandReplies: QueuedReply[];
+  readonly sseReplies: SseReply[];
+  readonly useNativeSse: boolean;
+  onDelete: (() => void) | null;
+  readonly requests: RequestRecord[];
+  readonly commands: ApplicationSessionCommand[];
+  readonly startBodies: unknown[];
+  readonly retryBodies: unknown[];
+  readonly sseHeaders: Array<string | null>;
+  readonly artifactRequests: string[];
+  readonly publicResponseBodies: string[];
+  runGetCount: number;
+  applicationGetCount: number;
+  deleteCount: number;
+}
+
+interface NativeSseScenario {
+  readonly headers: Array<string | null>;
+  readonly initialBody: string;
+  readonly resumedBody: string;
+  readonly onResume: () => void;
+}
+
+let nativeSseScenario: NativeSseScenario | null = null;
+let nativeSseServer: Server;
+
+test.beforeAll(async () => {
+  nativeSseServer = createServer((request, response) => {
+    if (
+      request.method !== "GET"
+      || request.url !== `/v1/runs/${runId}/application/events`
+      || nativeSseScenario === null
+    ) {
+      response.writeHead(404).end();
+      return;
+    }
+    const rawCursor = request.headers["last-event-id"];
+    const cursor = Array.isArray(rawCursor) ? rawCursor[0] ?? null : rawCursor ?? null;
+    nativeSseScenario.headers.push(cursor);
+    const resumed = cursor === "2:7";
+    if (resumed) nativeSseScenario.onResume();
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-type": "text/event-stream",
+      connection: "close",
+    });
+    response.end(resumed ? nativeSseScenario.resumedBody : nativeSseScenario.initialBody);
+  });
+  await new Promise<void>((resolve, reject) => {
+    nativeSseServer.once("error", reject);
+    nativeSseServer.listen(3457, "127.0.0.1", () => {
+      nativeSseServer.off("error", reject);
+      resolve();
+    });
+  });
+});
+
+test.afterEach(() => {
+  nativeSseScenario = null;
+});
+
+test.afterAll(async () => {
+  await new Promise<void>((resolve, reject) => {
+    nativeSseServer.close((error) => error ? reject(error) : resolve());
+  });
+});
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function onePagePdfFixture(): Buffer {
+  const stream = "BT /F1 24 Tf 72 540 Td (Review workspace fixture) Tj ET";
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+  ];
+  let body = "%PDF-1.4\n";
+  const offsets: number[] = [];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(body));
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  body += offsets.map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(body);
+}
+
+const pdfFixture = onePagePdfFixture();
+
+function artifact(
+  revision: number,
+  kind: ArtifactDto["kind"],
+  id: string,
+  sha256: string,
+  mediaType: string,
+): ArtifactDto {
+  return ArtifactDtoSchema.parse({
+    id,
+    kind,
+    revision,
+    attempt: 1,
+    sha256,
+    bytes: kind.endsWith("pdf") || kind === "compiled-pdf" ? pdfFixture.byteLength : 1_024,
+    mediaType,
+    href: `/v1/runs/${runId}/iterations/${revision}/artifacts/${id}`,
+    public: true,
+    createdAt: createdAt + revision * 1_000,
+  });
+}
+
+function revisionArtifacts(revision: number, pdfSha256: string): ArtifactDto[] {
+  return [
+    artifact(revision, "job-analysis", `analysis-r${revision}`, "a".repeat(64), "application/json"),
+    artifact(revision, "ats-keyword-extraction", `extraction-r${revision}`, "b".repeat(64), "application/json; charset=utf-8"),
+    artifact(revision, "compiled-pdf", `resume-r${revision}`, pdfSha256, "application/pdf"),
+    artifact(revision, "keyword-map-pdf", `keyword-map-r${revision}`, "c".repeat(64), "application/pdf"),
+    artifact(revision, "resume-diff", `diff-r${revision}`, "d".repeat(64), "application/json"),
+  ];
+}
+
+function iteration(
+  revision: number,
+  origin: RevisionOrigin,
+  pdfSha256: string,
+  status: ResumeIterationDto["status"] = "review",
+): ResumeIterationDto {
+  return {
+    revision,
+    origin,
+    status,
+    createdAt: createdAt + revision * 10_000,
+    pdfSha256,
+    artifacts: revisionArtifacts(revision, pdfSha256),
+  } satisfies ResumeIterationDto;
+}
+
+function iterationList(...iterations: ResumeIterationDto[]): ResumeIterationListResponse {
+  return ResumeIterationListResponseSchema.parse({
+    artifactState: "retained",
+    iterations,
+  });
+}
+
+function currentRunArtifacts(revision: number, pdfSha256: string): ArtifactDto[] {
+  return revisionArtifacts(revision, pdfSha256).map((candidate) => ArtifactDtoSchema.parse({
+    ...candidate,
+    href: `/v1/runs/${runId}/artifacts/${candidate.id}`,
+  }));
+}
+
+function runFixture(options: {
+  readonly status?: RunStatus;
+  readonly revision?: number;
+  readonly origin?: RevisionOrigin;
+  readonly pdfSha256?: string | null;
+  readonly visualAcknowledgementRequired?: boolean;
+} = {}): RunDto {
+  const revision = options.revision ?? 2;
+  const pdfSha256 = options.pdfSha256 === undefined ? pdfHash2 : options.pdfSha256;
+  return RunDtoSchema.parse({
+    id: runId,
+    status: options.status ?? "review",
+    applicationStatus: "pending",
+    generateKeywordMap: true,
+    queueSequence: 1,
+    revision,
+    origin: options.origin ?? "human-comments",
+    createdAt,
+    updatedAt: createdAt + revision * 10_000,
+    ...(pdfSha256 === null ? {} : { currentPdfSha256: pdfSha256 }),
+    visualAcknowledgementRequired: options.visualAcknowledgementRequired ?? false,
+    attempts: [],
+    artifacts: pdfSha256 === null ? [] : currentRunArtifacts(revision, pdfSha256),
+    timeline: [],
+  });
+}
+
+function notStartedAfterApproval(): ApplicationSessionView {
+  return ApplicationSessionViewSchema.parse({
+    state: "not_started",
+    canStart: false,
+    canStartAfterApproval: true,
+  });
+}
+
+function notStartedBlocked(
+  blockedReason: "legacy_job_url_unavailable" | "job_url_requires_https" | "resume_not_approved" | "artifacts_pruned" | "harness_unconfigured" | "profile_unavailable",
+): ApplicationSessionView {
+  return ApplicationSessionViewSchema.parse({
+    state: "not_started",
+    canStart: false,
+    canStartAfterApproval: false,
+    blockedReason,
+  });
+}
+
+function snapshotFixture(options: {
+  readonly bridgeState: ApplicationSessionBridgeState;
+  readonly generation?: number;
+  readonly updatedAt?: number;
+  readonly harnessState?: HarnessSessionState | null;
+  readonly pendingAction?: ApplicationPendingAction | null;
+  readonly revisionCount?: number;
+  readonly company?: string;
+  readonly role?: string;
+  readonly fieldsFilled?: ApplicationSessionSnapshotDto["fieldsFilled"];
+  readonly fieldsNeedingHuman?: ApplicationSessionSnapshotDto["fieldsNeedingHuman"];
+  readonly filesAttached?: readonly string[];
+  readonly warnings?: readonly string[];
+}): ApplicationSessionSnapshotDto {
+  const generation = options.generation ?? 1;
+  const updatedAt = options.updatedAt ?? createdAt + generation * 100;
+  const terminal = ["cancelled", "failed", "closed", "lost"].includes(options.bridgeState);
+  const harnessState = options.harnessState !== undefined
+    ? options.harnessState
+    : options.bridgeState === "reserved"
+      ? null
+      : options.bridgeState === "lost"
+        ? "running"
+        : options.bridgeState;
+  return ApplicationSessionSnapshotDtoSchema.parse({
+    generation,
+    bridgeState: options.bridgeState,
+    harnessState,
+    createdAt,
+    updatedAt,
+    terminalAt: terminal ? updatedAt : null,
+    expiresAt: options.bridgeState === "reserved" ? null : expiresAt,
+    company: options.company ?? "Public Example Company",
+    role: options.role ?? "Public Staff Engineer",
+    fieldsFilled: options.fieldsFilled ?? [{
+      label: "Legal name",
+      fieldType: "text",
+      valuePresent: true,
+      note: "Filled from the applicant profile",
+    }],
+    fieldsNeedingHuman: options.fieldsNeedingHuman ?? [],
+    filesAttached: options.filesAttached ?? ["tailored-resume.pdf"],
+    warnings: options.warnings ?? [],
+    revisionCount: options.revisionCount ?? 0,
+    pendingAction: options.pendingAction ?? null,
+    error: options.bridgeState === "failed"
+      ? { code: "browser_failed", message: "The browser session failed" }
+      : null,
+  });
+}
+
+function apiError(code: string, message: string): ApiError {
+  return ApiErrorSchema.parse({ error: { code, message } });
+}
+
+function eventFixture(
+  event: ApplicationSessionEventDto["event"],
+  session: ApplicationSessionSnapshotDto,
+  detail: unknown,
+): ApplicationSessionEventDto {
+  return ApplicationSessionEventDtoSchema.parse({
+    generation: session.generation,
+    event,
+    session,
+    detail,
+  });
+}
+
+function eventBlock(event: ApplicationSessionEventDto, cursor: number): string {
+  return `id: ${event.generation}:${cursor}\nevent: ${event.event}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+function queueSse(
+  mock: MockPipeline,
+  event: ApplicationSessionEventDto,
+  cursor: number,
+  waitFor: Promise<void> = Promise.resolve(),
+  before?: () => void,
+): void {
+  mock.sseReplies.push({
+    body: `retry: 25\n${eventBlock(event, cursor)}`,
+    publicEvents: [event],
+    waitFor,
+    before,
+  });
+}
+
+function queueSseBatch(
+  mock: MockPipeline,
+  events: ReadonlyArray<{ readonly event: ApplicationSessionEventDto; readonly cursor: number }>,
+  waitFor: Promise<void> = Promise.resolve(),
+  before?: () => void,
+): void {
+  mock.sseReplies.push({
+    body: `retry: 100\n${events.map(({ event, cursor }) => eventBlock(event, cursor)).join("")}`,
+    publicEvents: events.map(({ event }) => event),
+    waitFor,
+    before,
+  });
+}
+
+function queueMalformedSse(
+  mock: MockPipeline,
+  body: string,
+  before?: () => void,
+): void {
+  mock.sseReplies.push({
+    body,
+    publicEvents: [],
+    waitFor: Promise.resolve(),
+    before,
+  });
+}
+
+function analysisPayload(revision: number): unknown {
+  return {
+    schemaVersion: 2,
+    id: `analysis-public-r${revision}`,
+    jobDescriptionSha256: "e".repeat(64),
+    analysisWorkflowSha256: "f".repeat(64),
+    baselineSha256: "0".repeat(64),
+    target: {
+      title: `Public Role ${revision}`,
+      organization: `Public Organization ${revision}`,
+    },
+    jdKeywords: [{
+      id: `included-r${revision}`,
+      phrase: `Revision ${revision} orchestration`,
+      jdQuote: `Revision ${revision} orchestration is required.`,
+      evidenceIds: [`evidence-r${revision}`],
+    }],
+    exactEdits: [],
+  };
+}
+
+function extractionPayload(revision: number): unknown {
+  return {
+    schemaVersion: 1,
+    jobDescriptionSha256: "e".repeat(64),
+    keywordExtractionWorkflowSha256: "f".repeat(64),
+    keywords: [
+      {
+        id: `included-r${revision}`,
+        phrase: `Revision ${revision} orchestration`,
+        jdQuote: `Revision ${revision} orchestration is required.`,
+      },
+      {
+        id: `missing-r${revision}`,
+        phrase: `Revision ${revision} missing phrase`,
+        jdQuote: `Revision ${revision} missing phrase is useful.`,
+      },
+    ],
+  };
+}
+
+function diffPayload(revision: number): unknown {
+  return {
+    schemaVersion: 1,
+    baselineSha256: "0".repeat(64),
+    planId: `plan-r${revision}`,
+    sections: [{
+      id: "experience",
+      label: "Experience",
+      groups: [{
+        id: "public-company",
+        label: "Public Company",
+        rows: [{
+          id: `row-r${revision}`,
+          kind: "bullet",
+          change: "edited",
+          before: "Canonical public resume line.",
+          after: `Current public resume line for revision ${revision}.`,
+        }],
+      }],
+    }],
+  };
+}
+
+async function fulfillJson(
+  route: Route,
+  mock: MockPipeline,
+  body: unknown,
+  status = 200,
+): Promise<void> {
+  const serialized = JSON.stringify(body);
+  mock.publicResponseBodies.push(serialized);
+  await route.fulfill({
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+    },
+    body: serialized,
+  });
+}
+
+async function installPipeline(
+  page: Page,
+  options: {
+    readonly run?: RunDto;
+    readonly iterations?: ResumeIterationListResponse;
+    readonly application?: ApplicationSessionView;
+    readonly useNativeSse?: boolean;
+  } = {},
+): Promise<MockPipeline> {
+  const mock: MockPipeline = {
+    run: options.run ?? runFixture(),
+    iterations: options.iterations ?? iterationList(
+      iteration(1, "initial", pdfHash1),
+      iteration(2, "human-comments", pdfHash2),
+    ),
+    application: options.application ?? notStartedAfterApproval(),
+    editReply: null,
+    regenerateReply: null,
+    approveReply: null,
+    startReplies: [],
+    retryReplies: [],
+    commandReplies: [],
+    sseReplies: [],
+    useNativeSse: options.useNativeSse ?? false,
+    onDelete: null,
+    requests: [],
+    commands: [],
+    startBodies: [],
+    retryBodies: [],
+    sseHeaders: [],
+    artifactRequests: [],
+    publicResponseBodies: [],
+    runGetCount: 0,
+    applicationGetCount: 0,
+    deleteCount: 0,
+  };
+
+  await page.route("**/api/pipeline/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    const method = request.method();
+    expect(url.search).toBe("");
+    const requestBody = method === "POST" ? request.postDataJSON() as unknown : undefined;
+    mock.requests.push({ method, path, ...(requestBody === undefined ? {} : { body: requestBody }) });
+
+    if (path === pipelineRunPath && method === "GET") {
+      mock.runGetCount += 1;
+      await fulfillJson(route, mock, RunDtoSchema.parse(mock.run));
+      return;
+    }
+    if (path === `${pipelineRunPath}/iterations` && method === "GET") {
+      await fulfillJson(route, mock, ResumeIterationListResponseSchema.parse(mock.iterations));
+      return;
+    }
+
+    const artifactPrefix = `${pipelineRunPath}/iterations/`;
+    if (path.startsWith(artifactPrefix) && method === "GET") {
+      const segments = path.slice(pipelineRunPath.length + 1).split("/");
+      expect(segments).toHaveLength(4);
+      expect(segments[0]).toBe("iterations");
+      expect(segments[2]).toBe("artifacts");
+      const revision = Number(segments[1]);
+      const artifactId = decodeURIComponent(segments[3]!);
+      const selectedIteration = mock.iterations.iterations.find((candidate) => candidate.revision === revision);
+      const selectedArtifact = selectedIteration?.artifacts.find((candidate) => candidate.id === artifactId);
+      expect(selectedArtifact, `authorized artifact ${revision}/${artifactId}`).toBeDefined();
+      mock.artifactRequests.push(path);
+      if (selectedArtifact?.kind === "job-analysis") {
+        await fulfillJson(route, mock, analysisPayload(revision));
+        return;
+      }
+      if (selectedArtifact?.kind === "ats-keyword-extraction") {
+        await fulfillJson(route, mock, extractionPayload(revision));
+        return;
+      }
+      if (selectedArtifact?.kind === "resume-diff") {
+        await fulfillJson(route, mock, diffPayload(revision));
+        return;
+      }
+      if (selectedArtifact?.kind === "compiled-pdf" || selectedArtifact?.kind === "keyword-map-pdf") {
+        await route.fulfill({
+          status: 200,
+          headers: {
+            "cache-control": "no-store",
+            "content-type": "application/pdf",
+          },
+          body: pdfFixture,
+        });
+        return;
+      }
+      throw new Error(`No public artifact fixture for ${revision}/${artifactId}`);
+    }
+
+    if (path === `${pipelineRunPath}/edit` && method === "POST") {
+      if (!mock.editReply) throw new Error("Unexpected edit request without a queued run reply");
+      mock.run = RunDtoSchema.parse(mock.editReply);
+      await fulfillJson(route, mock, mock.run);
+      return;
+    }
+    if (path === `${pipelineRunPath}/regenerate` && method === "POST") {
+      if (!mock.regenerateReply) throw new Error("Unexpected regeneration request without a queued run reply");
+      mock.run = RunDtoSchema.parse(mock.regenerateReply);
+      await fulfillJson(route, mock, mock.run);
+      return;
+    }
+    if (path === `${pipelineRunPath}/approve` && method === "POST") {
+      if (!mock.approveReply) throw new Error("Unexpected approval request without a queued run reply");
+      mock.run = RunDtoSchema.parse(mock.approveReply);
+      await fulfillJson(route, mock, mock.run);
+      return;
+    }
+
+    if (path === `${pipelineRunPath}/application/events` && method === "GET") {
+      if (mock.useNativeSse) {
+        await route.fallback();
+        return;
+      }
+      const requestHeaders = await request.allHeaders();
+      expect(requestHeaders.accept).toContain("text/event-stream");
+      mock.sseHeaders.push(requestHeaders["last-event-id"] ?? null);
+      const reply = mock.sseReplies.shift();
+      if (!reply) {
+        await route.fulfill({
+          status: 200,
+          headers: {
+            "cache-control": "no-store",
+            "content-type": "text/event-stream",
+          },
+          body: "retry: 60000\n\n",
+        });
+        return;
+      }
+      await reply.waitFor;
+      reply.before?.();
+      for (const event of reply.publicEvents) {
+        mock.publicResponseBodies.push(JSON.stringify(event));
+      }
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "cache-control": "no-store",
+          "content-type": "text/event-stream",
+        },
+        body: reply.body,
+      });
+      return;
+    }
+
+    if (path === `${pipelineRunPath}/application/commands` && method === "POST") {
+      const parsed = requestBody as ApplicationSessionCommand;
+      mock.commands.push(parsed);
+      const reply = mock.commandReplies.shift() ?? { status: 202 };
+      reply.before?.();
+      if (reply.status === 202) {
+        await route.fulfill({ status: 202 });
+      } else {
+        await fulfillJson(route, mock, reply.body, reply.status);
+      }
+      return;
+    }
+
+    if (path === `${pipelineRunPath}/application/retry` && method === "POST") {
+      mock.retryBodies.push(requestBody);
+      const reply = mock.retryReplies.shift();
+      if (!reply) throw new Error("Unexpected application retry without a queued reply");
+      reply.before?.();
+      if (reply.status === 202) {
+        mock.application = ApplicationSessionSnapshotDtoSchema.parse(reply.body);
+      }
+      await fulfillJson(route, mock, reply.body, reply.status);
+      return;
+    }
+
+    if (path === `${pipelineRunPath}/application` && method === "GET") {
+      mock.applicationGetCount += 1;
+      await fulfillJson(route, mock, ApplicationSessionViewSchema.parse(mock.application));
+      return;
+    }
+    if (path === `${pipelineRunPath}/application` && method === "POST") {
+      mock.startBodies.push(requestBody);
+      const reply = mock.startReplies.shift();
+      if (!reply) throw new Error("Unexpected application start without a queued reply");
+      reply.before?.();
+      if (reply.status === 202) {
+        mock.application = ApplicationSessionSnapshotDtoSchema.parse(reply.body);
+      }
+      await fulfillJson(route, mock, reply.body, reply.status);
+      return;
+    }
+    if (path === `${pipelineRunPath}/application` && method === "DELETE") {
+      mock.deleteCount += 1;
+      mock.onDelete?.();
+      await route.fulfill({ status: 204 });
+      return;
+    }
+
+    throw new Error(`Unhandled pipeline request: ${method} ${path}`);
+  });
+
+  return mock;
+}
+
+function questionFixtures(): ApplicationAdditionalInfoQuestion[] {
+  return [
+    { id: "legal_name", scope: "global", question: "What name should appear?", answerType: "text" },
+    { id: "work_authorized", scope: "global", question: "Are you authorized to work?", answerType: "boolean" },
+    {
+      id: "preferred_office",
+      scope: "application",
+      question: "Which office do you prefer?",
+      answerType: "single_select",
+      options: [
+        { id: "remote", label: "Remote" },
+        { id: "hybrid", label: "Hybrid" },
+      ],
+    },
+    {
+      id: "available_shifts",
+      scope: "application",
+      question: "Which shifts are available?",
+      answerType: "multi_select",
+      options: [
+        { id: "day", label: "Day" },
+        { id: "evening", label: "Evening" },
+        { id: "weekend", label: "Weekend" },
+      ],
+    },
+    { id: "portfolio_note", scope: "application", question: "Optional portfolio note?", answerType: "text" },
+  ];
+}
+
+function approvedRun(): RunDto {
+  return runFixture({ status: "approved", revision: 2, origin: "human-comments", pdfSha256: pdfHash2 });
+}
+
+function approvedIterations(): ResumeIterationListResponse {
+  return iterationList(
+    iteration(1, "initial", pdfHash1),
+    iteration(2, "human-comments", pdfHash2, "approved"),
+  );
+}
+
+async function assertNoPrivateHarnessDetails(page: Page, mock: MockPipeline): Promise<void> {
+  const serializedResponses = mock.publicResponseBodies.join("\n");
+  for (const privateValue of privateHarnessValues) {
+    expect(serializedResponses).not.toContain(privateValue);
+    await expect(page.getByRole("main")).not.toContainText(privateValue);
+  }
+}
+
+test("selects an historical iteration through revision-scoped documents and returns to latest", async ({ page }) => {
+  const mock = await installPipeline(page);
+  await page.goto(`/runs/${runId}`);
+
+  const iterationSelect = page.getByLabel("Displayed resume");
+  await expect(iterationSelect).toHaveValue("2");
+  await expect(page.getByRole("heading", { level: 1, name: "Public Role 2" })).toBeVisible();
+  await expect(page.getByText("Revision 2 orchestration", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Selected resume PDF for Public Role 2")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/2/artifacts/resume-r2`,
+  );
+
+  await iterationSelect.selectOption("1");
+  await expect(iterationSelect).toHaveValue("1");
+  await expect(page.getByRole("heading", { level: 1, name: "Public Role 1" })).toBeVisible();
+  await expect(page.getByText("Revision 1 orchestration", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Selected resume PDF for Public Role 1")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/1/artifacts/resume-r1`,
+  );
+  await expect(page.getByRole("link", { name: "Download selected PDF" })).toHaveAttribute(
+    "href",
+    `${pipelineRunPath}/iterations/1/artifacts/resume-r1`,
+  );
+  await expect(page.getByText("Historical iterations are view-only.", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Request edit" })).toHaveCount(0);
+
+  await page.getByRole("tab", { name: "Keyword map" }).click();
+  await expect(page.getByRole("link", { name: "Download keyword map PDF" })).toHaveAttribute(
+    "href",
+    `${pipelineRunPath}/iterations/1/artifacts/keyword-map-r1`,
+  );
+  await page.getByRole("tab", { name: "Diff" }).click();
+  await expect(page.getByRole("table", { name: "Canonical and current resume comparison" })).toContainText(
+    "Current public resume line for revision 1.",
+  );
+
+  await page.getByRole("button", { name: "View latest" }).click();
+  await expect(iterationSelect).toHaveValue("2");
+  await expect(page.getByRole("tab", { name: "Resume" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByLabel("Selected resume PDF for Public Role 2")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/2/artifacts/resume-r2`,
+  );
+  await expect(page.getByRole("button", { name: "Request edit" })).toBeEnabled();
+  await expect.poll(() => mock.artifactRequests.some((path) => path.endsWith("/iterations/1/artifacts/analysis-r1"))).toBe(true);
+  expect(mock.artifactRequests.every((path) => path.includes(`${pipelineRunPath}/iterations/`))).toBe(true);
+});
+
+test("request edit and regenerate use current hashes while follow-latest advances", async ({ page }) => {
+  const mock = await installPipeline(page);
+  const editingRun = runFixture({ status: "editing", revision: 3, origin: "human-comments", pdfSha256: null });
+  const editedIteration = iteration(3, "human-comments", pdfHash3);
+  const editedRun = runFixture({ status: "review", revision: 3, origin: "human-comments", pdfSha256: pdfHash3 });
+  const regeneratedIteration = iteration(4, "machine-regeneration", pdfHash4);
+  const regeneratedRun = runFixture({ status: "review", revision: 4, origin: "machine-regeneration", pdfSha256: pdfHash4 });
+  mock.editReply = editingRun;
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByRole("button", { name: "Request edit" }).click();
+  const editDialog = page.getByRole("dialog", { name: "Describe the resume changes" });
+  await editDialog.getByLabel("Edit instructions").fill("  Emphasize launch ownership.  ");
+  mock.application = notStartedBlocked("resume_not_approved");
+  await editDialog.getByRole("button", { name: "Request edit" }).click();
+
+  await expect.poll(() => mock.requests.filter((request) => request.path.endsWith("/edit")).length).toBe(1);
+  expect(mock.requests.find((request) => request.path.endsWith("/edit"))?.body).toEqual({
+    comments: "Emphasize launch ownership.",
+    expectedPdfSha256: pdfHash2,
+  });
+  await expect(page.getByLabel("Displayed resume")).toHaveValue("2");
+  await expect(page.getByLabel("Selected resume PDF for Public Role 2")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/2/artifacts/resume-r2`,
+  );
+
+  mock.run = editedRun;
+  mock.iterations = iterationList(
+    iteration(1, "initial", pdfHash1),
+    iteration(2, "human-comments", pdfHash2),
+    editedIteration,
+  );
+  mock.application = notStartedAfterApproval();
+  await page.waitForTimeout(2_600);
+  await expect(page.getByLabel("Displayed resume")).toHaveValue("3");
+  await expect(page.getByLabel("Displayed resume").getByRole("option", { selected: true })).toHaveText(
+    "Iteration 3 — Requested edit",
+  );
+  await expect(page.getByLabel("Selected resume PDF for Public Role 3")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/3/artifacts/resume-r3`,
+  );
+
+  mock.regenerateReply = regeneratedRun;
+  mock.iterations = iterationList(
+    iteration(1, "initial", pdfHash1),
+    iteration(2, "human-comments", pdfHash2),
+    editedIteration,
+    regeneratedIteration,
+  );
+  await page.getByRole("button", { name: "Regenerate" }).click();
+  const regenerateDialog = page.getByRole("dialog", { name: "Regenerate this resume?" });
+  await regenerateDialog.getByRole("button", { name: "Regenerate" }).click();
+
+  await expect.poll(() => mock.requests.filter((request) => request.path.endsWith("/regenerate")).length).toBe(1);
+  expect(mock.requests.find((request) => request.path.endsWith("/regenerate"))?.body).toEqual({
+    expectedPdfSha256: pdfHash3,
+  });
+  await expect(page.getByLabel("Displayed resume")).toHaveValue("4");
+  await expect(page.getByLabel("Displayed resume").getByRole("option", { selected: true })).toHaveText(
+    "Iteration 4 — Regenerated",
+  );
+  await expect(page.getByLabel("Selected resume PDF for Public Role 4")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/4/artifacts/resume-r4`,
+  );
+});
+
+test("failed application start keeps approval and adopts the authoritative blocker", async ({ page }) => {
+  const reviewRun = runFixture({ visualAcknowledgementRequired: true });
+  const approved = approvedRun();
+  const mock = await installPipeline(page, { run: reviewRun });
+  mock.approveReply = approved;
+  mock.startReplies.push({
+    status: 503,
+    body: apiError("APPLICATION_HARNESS_UNAVAILABLE", "The local application service is unavailable"),
+    before: () => {
+      mock.application = notStartedBlocked("harness_unconfigured");
+    },
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByRole("checkbox", {
+    name: "I reviewed the reported visual QA issues and accept them.",
+  }).check();
+  mock.iterations = approvedIterations();
+  await page.getByRole("button", { name: "Approve & apply" }).click();
+
+  await expect.poll(() => mock.startBodies.length).toBe(1);
+  expect(mock.requests.filter((request) => request.method === "POST").map((request) => request.path)).toEqual([
+    `${pipelineRunPath}/approve`,
+    `${pipelineRunPath}/application`,
+  ]);
+  expect(mock.requests.find((request) => request.path.endsWith("/approve"))?.body).toEqual({
+    expectedPdfSha256: pdfHash2,
+    acknowledgeVisualIssues: true,
+  });
+  expect(mock.startBodies).toEqual([{ expectedApprovedPdfSha256: pdfHash2 }]);
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThanOrEqual(2);
+  await expect(page.getByText("The current resume is approved. Resume editing and regeneration are closed.")).toBeVisible();
+  await expect(page.getByText("The local browser application service is not configured.")).toBeVisible();
+  await expect(page.getByRole("alert").filter({
+    hasText: "The local application service is unavailable",
+  })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Request edit" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Regenerate" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Approve resume" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Start applying" })).toHaveCount(0);
+  await expect(page.getByText("Pending", { exact: true })).toBeVisible();
+});
+
+test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
+  const questions = questionFixtures();
+  const initial = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions },
+    updatedAt: createdAt + 100,
+  });
+  const authoritativeQuestions = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions },
+    updatedAt: createdAt + 200,
+  });
+  const progressed = snapshotFixture({
+    bridgeState: "running",
+    updatedAt: createdAt + 300,
+  });
+  const conflictFrame = deferred();
+  const progressFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: initial,
+  });
+  mock.commandReplies.push({
+    status: 409,
+    body: apiError(
+      "APPLICATION_COMMAND_CONFLICT",
+      "The application state changed; review the latest session state",
+    ),
+    before: () => {
+      mock.application = authoritativeQuestions;
+    },
+  });
+  mock.commandReplies.push({ status: 202 });
+  queueSse(
+    mock,
+    eventFixture("snapshot", authoritativeQuestions, {}),
+    2,
+    conflictFrame.promise,
+  );
+  queueSse(
+    mock,
+    eventFixture("additional_info_saved", progressed, { count: questions.length }),
+    3,
+    progressFrame.promise,
+  );
+
+  await page.goto(`/runs/${runId}`);
+  const nameQuestion = page.getByRole("group", { name: "What name should appear?" });
+  const authorizationQuestion = page.getByRole("group", { name: "Are you authorized to work?" });
+  const officeQuestion = page.getByRole("group", { name: "Which office do you prefer?" });
+  const shiftsQuestion = page.getByRole("group", { name: "Which shifts are available?" });
+  const declineQuestion = page.getByRole("group", { name: "Optional portfolio note?" });
+  await expect(page.getByText("Saved for future applications", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("Used for this job only", { exact: true })).toHaveCount(3);
+
+  await nameQuestion.getByRole("textbox", { name: "Answer", exact: true }).fill("  Ada Public  ");
+  await authorizationQuestion.getByRole("radio", { name: "No" }).check();
+  await officeQuestion.getByRole("radio", { name: "Hybrid" }).check();
+  await shiftsQuestion.getByRole("checkbox", { name: "Day" }).check();
+  await shiftsQuestion.getByRole("checkbox", { name: "Weekend" }).check();
+  await declineQuestion.getByRole("checkbox", { name: "Decline to answer" }).check();
+
+  const expectedCommand: ApplicationSessionCommand = {
+    type: "provide_additional_info",
+    answers: [
+      { id: "legal_name", status: "answered", value: "Ada Public" },
+      { id: "work_authorized", status: "answered", value: false },
+      { id: "preferred_office", status: "answered", option_id: "hybrid" },
+      { id: "available_shifts", status: "answered", option_ids: ["day", "weekend"] },
+      { id: "portfolio_note", status: "declined" },
+    ],
+  };
+  await page.getByRole("button", { name: "Answer questions" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual(expectedCommand);
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application state changed; review the latest session state",
+  })).toBeVisible();
+  await expect(nameQuestion.getByRole("textbox", { name: "Answer", exact: true }))
+    .toHaveValue("  Ada Public  ");
+  await expect(authorizationQuestion.getByRole("radio", { name: "No" })).toBeChecked();
+  await expect(officeQuestion.getByRole("radio", { name: "Hybrid" })).toBeChecked();
+  await expect(shiftsQuestion.getByRole("checkbox", { name: "Day" })).toBeChecked();
+  await expect(shiftsQuestion.getByRole("checkbox", { name: "Weekend" })).toBeChecked();
+  await expect(declineQuestion.getByRole("checkbox", { name: "Decline to answer" })).toBeChecked();
+
+  conflictFrame.resolve();
+  await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(1);
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application state changed; review the latest session state",
+  })).toBeVisible();
+  await expect(nameQuestion.getByRole("textbox", { name: "Answer", exact: true }))
+    .toHaveValue("  Ada Public  ");
+
+  await page.getByRole("button", { name: "Answer questions" }).click();
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands[1]).toEqual(expectedCommand);
+  await expect(page.getByRole("button", { name: "Answering…" })).toBeDisabled();
+  await expect(page.getByRole("heading", { name: "Additional information needed" })).toBeVisible();
+  await expect(nameQuestion.getByRole("textbox", { name: "Answer", exact: true }))
+    .toHaveValue("  Ada Public  ");
+
+  mock.application = progressed;
+  progressFrame.resolve();
+  await expect(page.getByRole("heading", { name: "Additional information needed" })).toHaveCount(0);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
+});
+
+test("navigation, origin approval, human review, ready, and close use exact public commands", async ({ page }) => {
+  const navigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    pendingAction: { type: "human_navigation", instruction: "Complete the public sign-in checkpoint." },
+    updatedAt: createdAt + 100,
+  });
+  const origin = snapshotFixture({
+    bridgeState: "awaiting_origin_approval",
+    pendingAction: { type: "origin_approval", origin: "https://accounts.example.test" },
+    updatedAt: createdAt + 200,
+  });
+  const review = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    pendingAction: { type: "human_review" },
+    updatedAt: createdAt + 300,
+    fieldsFilled: [{
+      label: "Email",
+      fieldType: "text",
+      valuePresent: true,
+      note: "Filled",
+    }],
+    fieldsNeedingHuman: [{
+      label: "Salary expectation",
+      fieldType: "text",
+      valuePresent: false,
+      note: "Review in Chrome",
+    }],
+    warnings: ["Confirm the public salary range."],
+  });
+  const revised = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    pendingAction: { type: "human_review" },
+    updatedAt: createdAt + 400,
+    revisionCount: 1,
+    warnings: ["Confirm the public salary range."],
+  });
+  const ready = snapshotFixture({
+    bridgeState: "ready_for_human_submit",
+    updatedAt: createdAt + 500,
+    revisionCount: 1,
+  });
+  const closed = snapshotFixture({
+    bridgeState: "closed",
+    updatedAt: createdAt + 600,
+    revisionCount: 1,
+  });
+  const continueFrame = deferred();
+  const originFrame = deferred();
+  const reviseFrame = deferred();
+  const readyFrame = deferred();
+  const closeFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: navigation,
+  });
+  queueSse(mock, eventFixture("origin_approval_required", origin, {
+    origin: "https://accounts.example.test",
+  }), 2, continueFrame.promise);
+  queueSse(mock, eventFixture("review_required", review, {}), 3, originFrame.promise);
+  queueSse(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), 4, reviseFrame.promise);
+  queueSse(mock, eventFixture("ready_for_human_submit", ready, {}), 5, readyFrame.promise);
+  queueSse(mock, eventFixture("closed", closed, {}), 6, closeFrame.promise);
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByText("Complete the public sign-in checkpoint.")).toBeVisible();
+  await page.getByRole("button", { name: "Continue application" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({ type: "continue" });
+  await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
+  mock.application = origin;
+  continueFrame.resolve();
+
+  await expect(page.getByText("https://accounts.example.test", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Approve origin" }).click();
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands[1]).toEqual({
+    type: "approve_origin",
+    origin: "https://accounts.example.test",
+  });
+  await expect(page.getByRole("button", { name: "Approving…" })).toBeDisabled();
+  mock.application = review;
+  originFrame.resolve();
+
+  await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
+  await expect(page.getByText("Email", { exact: true })).toBeVisible();
+  await expect(page.getByText("Salary expectation", { exact: true })).toBeVisible();
+  await expect(page.getByText("Confirm the public salary range.", { exact: true })).toBeVisible();
+  await page.getByLabel("Revision instructions").fill("  Correct the public salary field.  ");
+  await page.getByRole("button", { name: "Request application revision" }).click();
+  await expect.poll(() => mock.commands.length).toBe(3);
+  expect(mock.commands[2]).toEqual({
+    type: "revise",
+    context: "Correct the public salary field.",
+  });
+  await expect(page.getByRole("button", { name: "Requesting revision…" })).toBeDisabled();
+  mock.application = revised;
+  reviseFrame.resolve();
+  await expect(page.getByText("Application revisions", { exact: true })).toBeVisible();
+  await expect(page.getByText("1", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Ready for human submit" }).click();
+  await expect.poll(() => mock.commands.length).toBe(4);
+  expect(mock.commands[3]).toEqual({ type: "ready" });
+  await expect(page.getByRole("button", { name: "Marking ready…" })).toBeDisabled();
+  mock.application = ready;
+  readyFrame.resolve();
+
+  await expect(page.getByRole("status").filter({ hasText: "Ready for human submission" })).toBeVisible();
+  await expect(page.getByText(/Headed Chrome stays open until .* so you can inspect and submit/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cancel application" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Close browser" })).toBeVisible();
+  await expect(page.getByText("Pending", { exact: true })).toBeVisible();
+
+  mock.onDelete = () => {
+    mock.application = closed;
+    closeFrame.resolve();
+  };
+  await page.getByRole("button", { name: "Close browser" }).click();
+  await expect.poll(() => mock.deleteCount).toBe(1);
+  await expect(page.getByRole("status").filter({ hasText: "Closed" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
+  expect(mock.commands).toEqual([
+    { type: "continue" },
+    { type: "approve_origin", origin: "https://accounts.example.test" },
+    { type: "revise", context: "Correct the public salary field." },
+    { type: "ready" },
+  ]);
+});
+
+test("a reserved generation resumes with the approved hash and running cancel is a command", async ({ page }) => {
+  const reserved = snapshotFixture({ bridgeState: "reserved" });
+  const running = snapshotFixture({ bridgeState: "running", updatedAt: createdAt + 200 });
+  const cancelled = snapshotFixture({ bridgeState: "cancelled", updatedAt: createdAt + 300 });
+  const cancelFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: reserved,
+  });
+  mock.startReplies.push({ status: 202, body: running });
+  queueSse(mock, eventFixture("cancelled", cancelled, {}), 2, cancelFrame.promise);
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByRole("status").filter({ hasText: "Preparing browser" })).toBeVisible();
+  await page.getByRole("button", { name: "Start applying" }).click();
+  await expect.poll(() => mock.startBodies.length).toBe(1);
+  expect(mock.startBodies[0]).toEqual({ expectedApprovedPdfSha256: pdfHash2 });
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Cancel application" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({ type: "cancel" });
+  await expect(page.getByRole("button", { name: "Cancelling…" })).toBeDisabled();
+  mock.application = cancelled;
+  cancelFrame.resolve();
+  await expect(page.getByRole("status").filter({ hasText: "Cancelled" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
+  expect(mock.deleteCount).toBe(0);
+});
+
+test("a not-yet-created reserved generation cancels locally with DELETE", async ({ page }) => {
+  const reserved = snapshotFixture({ bridgeState: "reserved" });
+  const closed = snapshotFixture({
+    bridgeState: "closed",
+    harnessState: null,
+    updatedAt: createdAt + 200,
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: reserved,
+  });
+  mock.onDelete = () => {
+    mock.application = closed;
+  };
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByRole("button", { name: "Cancel application" }).click();
+  await expect.poll(() => mock.deleteCount).toBe(1);
+  expect(mock.commands).toEqual([]);
+  await expect(page.getByRole("status").filter({ hasText: "Closed" })).toBeVisible();
+});
+
+test("lost, failed, and closed generations retry with the approved hash and fresh stream cursors", async ({ page }) => {
+  const lost = snapshotFixture({ bridgeState: "lost", generation: 2, updatedAt: createdAt + 200 });
+  const running3 = snapshotFixture({ bridgeState: "running", generation: 3, updatedAt: createdAt + 300 });
+  const failed3 = snapshotFixture({ bridgeState: "failed", generation: 3, updatedAt: createdAt + 400 });
+  const running4 = snapshotFixture({ bridgeState: "running", generation: 4, updatedAt: createdAt + 500 });
+  const closed4 = snapshotFixture({ bridgeState: "closed", generation: 4, updatedAt: createdAt + 600 });
+  const reserved5 = snapshotFixture({ bridgeState: "reserved", generation: 5, updatedAt: createdAt + 700 });
+  const failedFrame = deferred();
+  const closedFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: lost,
+  });
+  mock.retryReplies.push(
+    { status: 202, body: running3 },
+    { status: 202, body: running4 },
+    { status: 202, body: reserved5 },
+  );
+  queueSse(mock, eventFixture("failed", failed3, {}), 1, failedFrame.promise);
+  queueSse(mock, eventFixture("closed", closed4, {}), 1, closedFrame.promise);
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByText("Before retrying, verify whether the application was submitted.", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Retry applying" }).click();
+  await expect.poll(() => mock.retryBodies.length).toBe(1);
+  mock.application = failed3;
+  failedFrame.resolve();
+  await expect(page.getByRole("status").filter({ hasText: "Failed" })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "The browser session failed" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Retry applying" }).click();
+  await expect.poll(() => mock.retryBodies.length).toBe(2);
+  mock.application = closed4;
+  closedFrame.resolve();
+  await expect(page.getByRole("status").filter({ hasText: "Closed" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Retry applying" }).click();
+  await expect.poll(() => mock.retryBodies.length).toBe(3);
+  await expect(page.getByRole("status").filter({ hasText: "Preparing browser" })).toBeVisible();
+  expect(mock.retryBodies).toEqual([
+    { expectedApprovedPdfSha256: pdfHash2 },
+    { expectedApprovedPdfSha256: pdfHash2 },
+    { expectedApprovedPdfSha256: pdfHash2 },
+  ]);
+  expect(mock.sseHeaders.slice(0, 2)).toEqual([null, null]);
+});
+
+test("finite SSE replay preserves the current gate, reconnects with its qualified cursor, and reconciles lost", async ({ page }) => {
+  const olderNavigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 2,
+    pendingAction: { type: "human_navigation", instruction: "Stale navigation instruction." },
+    updatedAt: createdAt + 100,
+    company: "Stale Regression Company",
+  });
+  const currentOrigin = snapshotFixture({
+    bridgeState: "awaiting_origin_approval",
+    generation: 2,
+    pendingAction: { type: "origin_approval", origin: "https://current.example.test" },
+    updatedAt: createdAt + 200,
+  });
+  const staleGeneration = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 1,
+    pendingAction: { type: "human_navigation", instruction: "Generation one must stay stale." },
+    updatedAt: createdAt + 900,
+    company: "Stale Generation Company",
+  });
+  const lost = snapshotFixture({
+    bridgeState: "lost",
+    generation: 2,
+    updatedAt: createdAt + 300,
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: currentOrigin,
+    useNativeSse: true,
+  });
+  const replayEvents = [
+    eventFixture("human_navigation_required", olderNavigation, {
+      instruction: "Stale navigation instruction.",
+    }),
+    eventFixture("origin_approval_required", currentOrigin, {
+      origin: "https://current.example.test",
+    }),
+  ] as const;
+  const staleEvent = eventFixture("human_navigation_required", staleGeneration, {
+    instruction: "Generation one must stay stale.",
+  });
+  mock.publicResponseBodies.push(
+    ...replayEvents.map((event) => JSON.stringify(event)),
+    JSON.stringify(staleEvent),
+  );
+  nativeSseScenario = {
+    headers: mock.sseHeaders,
+    initialBody: `retry: 25\n${eventBlock(replayEvents[0], 6)}${eventBlock(replayEvents[1], 7)}`,
+    resumedBody: `retry: 60000\n${eventBlock(staleEvent, 99)}`,
+    onResume: () => {
+      mock.application = lost;
+    },
+  };
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByText("https://current.example.test", { exact: true })).toBeVisible();
+  await expect(page.getByText("Stale navigation instruction.", { exact: true })).toHaveCount(0);
+  await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(2);
+  expect(mock.sseHeaders[0]).toBeNull();
+  await expect.poll(() => JSON.stringify(mock.sseHeaders)).toContain("2:7");
+
+  await expect(page.getByRole("status").filter({ hasText: "Connection lost" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
+  await expect(page.getByText("Generation one must stay stale.", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Stale Generation Company", { exact: true })).toHaveCount(0);
+  expect(mock.applicationGetCount).toBeGreaterThanOrEqual(3);
+  expect(mock.runGetCount).toBe(1);
+  await assertNoPrivateHarnessDetails(page, mock);
+});
+
+test("an invalid SSE frame reconciles through authoritative GET and does not render its private payload", async ({ page }) => {
+  const running = snapshotFixture({ bridgeState: "running", generation: 2, updatedAt: createdAt + 100 });
+  const lost = snapshotFixture({ bridgeState: "lost", generation: 2, updatedAt: createdAt + 200 });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: running,
+  });
+  const malformedSession = {
+    ...running,
+    harnessSessionId: privateHarnessValues[1],
+    jobUrl: privateHarnessValues[3],
+  };
+  queueMalformedSse(
+    mock,
+    `retry: 25\nid: 2:8\nevent: snapshot\ndata: ${JSON.stringify({
+      generation: 2,
+      event: "snapshot",
+      session: malformedSession,
+      detail: {},
+    })}\n\n`,
+    () => {
+      mock.application = lost;
+    },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByRole("status").filter({ hasText: "Connection lost" })).toBeVisible();
+  expect(mock.applicationGetCount).toBeGreaterThanOrEqual(2);
+  await expect(page.getByText(privateHarnessValues[1], { exact: false })).toHaveCount(0);
+  await expect(page.getByText(privateHarnessValues[3], { exact: false })).toHaveCount(0);
+});
+
+test("390px workspace has no overflow, announces application state, and restores edit-dialog focus", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const mock = await installPipeline(page);
+  await page.goto(`/runs/${runId}`);
+
+  await expect(page.getByRole("complementary", { name: "Review and application workspace" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const requestEdit = page.getByRole("button", { name: "Request edit" });
+  await requestEdit.click();
+  const editDialog = page.getByRole("dialog", { name: "Describe the resume changes" });
+  const editInstructions = editDialog.getByLabel("Edit instructions");
+  await expect(editInstructions).toBeFocused();
+  await editInstructions.press("Escape");
+  await expect(editDialog).not.toBeVisible();
+  await expect(requestEdit).toBeFocused();
+
+  mock.run = approvedRun();
+  mock.iterations = approvedIterations();
+  mock.application = snapshotFixture({ bridgeState: "failed", updatedAt: createdAt + 200 });
+  await page.reload();
+  const liveState = page.getByRole("status").filter({ hasText: "Failed" });
+  await expect(liveState).toBeVisible();
+  await expect(liveState).toHaveAttribute("aria-live", "polite");
+  await expect(liveState).toHaveAttribute("aria-atomic", "true");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});

@@ -1,5 +1,9 @@
 import { expect, test, type Page } from "@playwright/test";
-import { type RunDto } from "@jobhunter/pipeline/contracts";
+import {
+  type ApplicationSessionView,
+  type ResumeIterationListResponse,
+  type RunDto,
+} from "@jobhunter/pipeline/contracts";
 
 const runId = "inherited-resolved-artifacts";
 const resumeArtifactId = "compiled-pdf-revision-1";
@@ -50,6 +54,33 @@ const reviewRun: RunDto = {
   timeline: [],
 };
 
+const reviewIterations: ResumeIterationListResponse = {
+  artifactState: "retained",
+  iterations: [{
+    revision: reviewRun.revision,
+    origin: reviewRun.origin,
+    status: "review",
+    createdAt: reviewRun.updatedAt,
+    pdfSha256: inheritedPdfSha256,
+    artifacts: reviewRun.artifacts.map((artifact) => ({
+      ...artifact,
+      href: `/v1/runs/${runId}/iterations/${reviewRun.revision}/artifacts/${artifact.id}`,
+    })),
+  }],
+};
+
+const emptyIterations: ResumeIterationListResponse = {
+  artifactState: "retained",
+  iterations: [],
+};
+
+const unavailableApplication: ApplicationSessionView = {
+  state: "not_started",
+  canStart: false,
+  canStartAfterApproval: false,
+  blockedReason: "harness_unconfigured",
+};
+
 const activeRun: RunDto = {
   ...reviewRun,
   id: activeRunId,
@@ -62,7 +93,30 @@ const activeRun: RunDto = {
   })),
 };
 
+async function interceptRunDetailDefaults(
+  page: Page,
+  targetRunId: string,
+  iterations: ResumeIterationListResponse = emptyIterations,
+  application: ApplicationSessionView = unavailableApplication,
+): Promise<void> {
+  await page.route(`**/api/pipeline/runs/${targetRunId}/iterations`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(iterations),
+    });
+  });
+  await page.route(`**/api/pipeline/runs/${targetRunId}/application`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(application),
+    });
+  });
+}
+
 async function interceptReviewRun(page: Page): Promise<void> {
+  await interceptRunDetailDefaults(page, runId, reviewIterations);
   await page.route(`**/api/pipeline/runs/${runId}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
@@ -70,16 +124,20 @@ async function interceptReviewRun(page: Page): Promise<void> {
       body: JSON.stringify(reviewRun),
     });
   });
-  await page.route(`**/api/pipeline/runs/${runId}/artifacts/*`, async (route) => {
-    expect(route.request().method()).toBe("GET");
-    await route.fulfill({
-      contentType: "application/pdf",
-      body: Buffer.from("%PDF-1.4\n% inherited artifact fixture\n%%EOF\n"),
-    });
-  });
+  await page.route(
+    `**/api/pipeline/runs/${runId}/iterations/${reviewRun.revision}/artifacts/*`,
+    async (route) => {
+      expect(route.request().method()).toBe("GET");
+      await route.fulfill({
+        contentType: "application/pdf",
+        body: Buffer.from("%PDF-1.4\n% inherited artifact fixture\n%%EOF\n"),
+      });
+    },
+  );
 }
 
 test("WEB-RETRY-001 keeps the last successful active-run detail visible when polling fails", async ({ page }) => {
+  await interceptRunDetailDefaults(page, activeRunId);
   let runRequests = 0;
   await page.route(`**/api/pipeline/runs/${activeRunId}`, async (route) => {
     expect(route.request().method()).toBe("GET");
@@ -128,26 +186,35 @@ test("keeps inherited resolved documents visible after a late-stage revision", a
   const resumeTab = tablist.getByRole("tab", { name: "Resume" });
   const keywordMapTab = tablist.getByRole("tab", { name: "Keyword map" });
   const resumePanel = viewer.locator("#resume-document-panel");
-  const resumeHref = `/api/pipeline/runs/${runId}/artifacts/${resumeArtifactId}`;
+  const resumeHref =
+    `/api/pipeline/runs/${runId}/iterations/${reviewRun.revision}/artifacts/${resumeArtifactId}`;
 
+  const keywordMapHref =
+    `/api/pipeline/runs/${runId}/iterations/${reviewRun.revision}/artifacts/${keywordMapArtifactId}`;
   await expect(tablist.getByRole("tab")).toHaveText(["Resume", "Keyword map"]);
   await expect(resumeTab).toHaveAttribute("aria-controls", "resume-document-panel");
   await expect(resumePanel).toBeVisible();
   await expect(resumePanel.locator('object[type="application/pdf"]')).toHaveAttribute("data", resumeHref);
-  await expect(viewer.getByRole("link", { name: "Download current PDF" })).toHaveAttribute("href", resumeHref);
+  await expect(viewer.getByRole("link", { name: "Download selected PDF" })).toHaveAttribute("href", resumeHref);
   await expect(keywordMapTab).toHaveAttribute("aria-controls", "keyword-map-document-panel");
+  await keywordMapTab.click();
+  await expect(viewer.getByRole("link", { name: "Download keyword map PDF" })).toHaveAttribute(
+    "href",
+    keywordMapHref,
+  );
 });
 
 test("WEB-DOWNLOAD-001 makes the PDF object fallback download the current resume", async ({ page }) => {
   await interceptReviewRun(page);
   await page.goto(`/runs/${runId}`);
 
-  const resumeHref = `/api/pipeline/runs/${runId}/artifacts/${resumeArtifactId}`;
+  const resumeHref =
+    `/api/pipeline/runs/${runId}/iterations/${reviewRun.revision}/artifacts/${resumeArtifactId}`;
   const pdfObject = page.locator("#resume-document-panel").locator('object[type="application/pdf"]');
-  const fallbackDownload = pdfObject.locator("a", { hasText: "Download the current resume" });
+  const fallbackDownload = pdfObject.locator("a", { hasText: "Download the selected resume" });
 
   await expect(pdfObject).toHaveAttribute("data", resumeHref);
-  await expect(fallbackDownload).toHaveText("Download the current resume");
+  await expect(fallbackDownload).toHaveText("Download the selected resume");
   await expect(fallbackDownload).toHaveAttribute("href", resumeHref);
   await expect(fallbackDownload).toHaveAttribute("download", "");
 });

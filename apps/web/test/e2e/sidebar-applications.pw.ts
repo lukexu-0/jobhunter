@@ -1,5 +1,12 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { type ApplicationStatus, type ArtifactKind, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
+import {
+  type ApplicationSessionView,
+  type ApplicationStatus,
+  type ArtifactKind,
+  type ResumeIterationListResponse,
+  type RunDto,
+  type RunStatus,
+} from "@jobhunter/pipeline/contracts";
 
 function runFixture(id: string, applicationStatus: ApplicationStatus, status: RunStatus): RunDto {
   return {
@@ -162,6 +169,57 @@ function landscapePdfFixture(): Buffer {
 
 const LANDSCAPE_PDF_FIXTURE = landscapePdfFixture();
 
+function resumeIterationFixture(run: RunDto): ResumeIterationListResponse {
+  const currentPdf = run.currentPdfSha256
+    ? run.artifacts.find(
+        (artifact) => artifact.kind === "compiled-pdf"
+          && artifact.sha256 === run.currentPdfSha256,
+      )
+    : undefined;
+  if ((run.status !== "review" && run.status !== "approved") || !currentPdf) {
+    return { artifactState: "retained", iterations: [] };
+  }
+
+  return {
+    artifactState: "retained",
+    iterations: [{
+      revision: run.revision,
+      origin: run.origin,
+      status: run.status,
+      createdAt: currentPdf.createdAt,
+      pdfSha256: currentPdf.sha256,
+      artifacts: run.artifacts.map((artifact) => ({
+        ...artifact,
+        href: `/v1/runs/${run.id}/iterations/${run.revision}/artifacts/${artifact.id}`,
+      })),
+    }],
+  };
+}
+
+function applicationViewFixture(run: RunDto): ApplicationSessionView {
+  if (run.status === "approved") {
+    const hasRetainedApprovedPdf = resumeIterationFixture(run).iterations.length === 1;
+    return hasRetainedApprovedPdf
+      ? {
+          state: "not_started",
+          canStart: true,
+          canStartAfterApproval: false,
+        }
+      : {
+          state: "not_started",
+          canStart: false,
+          canStartAfterApproval: false,
+          blockedReason: "artifacts_pruned",
+        };
+  }
+  return {
+    state: "not_started",
+    canStart: false,
+    canStartAfterApproval: false,
+    blockedReason: "resume_not_approved",
+  };
+}
+
 async function interceptDocumentRun(
   page: Page,
   run: RunDto,
@@ -171,7 +229,22 @@ async function interceptDocumentRun(
     expect(route.request().method()).toBe("GET");
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
   });
-  await page.route(`**/api/pipeline/runs/${run.id}/artifacts/*`, async (route) => {
+  await page.route(`**/api/pipeline/runs/${run.id}/iterations`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(resumeIterationFixture(run)),
+    });
+  });
+  await page.route(`**/api/pipeline/runs/${run.id}/application`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(applicationViewFixture(run)),
+    });
+  });
+  const fulfillArtifact = async (route: Route): Promise<void> => {
+    expect(route.request().method()).toBe("GET");
     const artifactId = new URL(route.request().url()).pathname.split("/").at(-1) ?? "";
     if (artifactId === "resume-page-image") {
       await route.fulfill({
@@ -192,7 +265,12 @@ async function interceptDocumentRun(
       headers: { "content-disposition": 'inline; filename="keyword-map-pdf.pdf"' },
       body: LANDSCAPE_PDF_FIXTURE,
     });
-  });
+  };
+  await page.route(`**/api/pipeline/runs/${run.id}/artifacts/*`, fulfillArtifact);
+  await page.route(
+    `**/api/pipeline/runs/${run.id}/iterations/${run.revision}/artifacts/*`,
+    fulfillArtifact,
+  );
 }
 
 
@@ -412,13 +490,7 @@ test("posts the canonical URL with keyword maps enabled, disables while pending,
     pendingPost = route;
     markPostStarted();
   });
-  await page.route("**/api/pipeline/runs/initialized-run", async (route) => {
-    expect(route.request().method()).toBe("GET");
-    await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify(initializedRun),
-    });
-  });
+  await interceptDocumentRun(page, initializedRun);
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize application" });
@@ -507,21 +579,30 @@ test("retains the URL, clears the error on change, and retries with keyword maps
   expect(postCount).toBe(2);
 });
 
-test("leaves the reserved review pane empty", async ({ page }) => {
+test("shows the visible review and application workspace", async ({ page }) => {
   const detailRun: RunDto = {
-    ...runFixture("empty-review-pane", "applied", "failed"),
+    ...runFixture("visible-review-workspace", "applied", "failed"),
     revision: 3,
     failureCode: "compiling",
   };
-  await page.route("**/api/pipeline/runs/empty-review-pane", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
+  await interceptDocumentRun(page, detailRun);
+
+  await page.goto("/runs/visible-review-workspace");
+
+  const reviewPane = page.getByRole("complementary", {
+    name: "Review and application workspace",
   });
-
-  await page.goto("/runs/empty-review-pane");
-
-  const reviewPane = page.getByRole("complementary", { name: "Reserved review workspace" });
   await expect(reviewPane).toBeVisible();
-  await expect(reviewPane).toBeEmpty();
+  await expect(reviewPane.getByRole("heading")).toHaveText([
+    "Resume iteration",
+    "Resume review",
+  ]);
+  await expect(
+    reviewPane.getByText("No reviewed resume iteration is available yet.", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    reviewPane.getByText("Review actions become available when the current resume reaches review.", { exact: true }),
+  ).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry failed run" })).toHaveCount(1);
 });
 
@@ -560,7 +641,7 @@ test("switches between accessible resume and landscape keyword map tabs", async 
   await expect(keywordMapPanel).toBeHidden();
   await expect(viewer.getByText("Page 1 / 1", { exact: true })).toBeVisible();
   await expect(viewer.getByRole("button", { name: "Zoom in" })).toBeVisible();
-  await expect(viewer.getByRole("link", { name: "Download current PDF" })).toBeVisible();
+  await expect(viewer.getByRole("link", { name: "Download selected PDF" })).toBeVisible();
 
   const [viewerBox, resumeTabBox, keywordMapTabBox, resumePanelBox] = await Promise.all([
     viewer.boundingBox(),
@@ -596,7 +677,7 @@ test("switches between accessible resume and landscape keyword map tabs", async 
   await expect(viewer.getByRole("button", { name: "Enter fullscreen" })).toBeVisible();
 
   const keywordMapDownload = viewer.getByRole("link", { name: "Download keyword map PDF" });
-  await expect(keywordMapDownload).toHaveAttribute("href", "/api/pipeline/runs/document-tabs/artifacts/keyword-map-pdf");
+  await expect(keywordMapDownload).toHaveAttribute("href", "/api/pipeline/runs/document-tabs/iterations/4/artifacts/keyword-map-pdf");
   await expect(keywordMapDownload).toHaveAttribute("download", "");
   await expect(keywordMapPanel.locator("object")).toHaveCount(0);
   const keywordMapPage = keywordMapPanel.getByRole("img", { name: "Keyword map page 1" });
@@ -636,7 +717,7 @@ test("uses the same compact download control in both document views", async ({ p
   await page.goto("/runs/matching-download-controls");
 
   const viewer = page.getByRole("region", { name: "Document viewer" });
-  const resumeDownload = viewer.getByRole("link", { name: "Download current PDF" });
+  const resumeDownload = viewer.getByRole("link", { name: "Download selected PDF" });
   const resumeDownloadBox = await resumeDownload.boundingBox();
   if (!resumeDownloadBox) throw new Error("Resume download geometry is unavailable");
 
@@ -788,7 +869,7 @@ test("shows only the Resume tab when the revision has no keyword map", async ({ 
   await expect(viewer.getByRole("tab", { name: "Keyword map" })).toHaveCount(0);
   await expect(viewer.locator("#keyword-map-document-panel")).toHaveCount(0);
   await expect(viewer.locator("#resume-document-panel")).toBeVisible();
-  await expect(viewer.getByRole("link", { name: "Download current PDF" })).toBeVisible();
+  await expect(viewer.getByRole("link", { name: "Download selected PDF" })).toBeVisible();
 });
 
 
@@ -874,13 +955,7 @@ test("retains application state when an update fails", async ({ page }) => {
 
 test("shows application lifecycle and pipeline progress separately without legacy metadata", async ({ page }) => {
   const detailRun = runFixture("lifecycle-detail", "rejected", "review");
-  await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
-    expect(route.request().method()).toBe("GET");
-    await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify(detailRun),
-    });
-  });
+  await interceptDocumentRun(page, detailRun);
   await page.goto("/runs/lifecycle-detail");
 
   const applicationSummary = page.getByRole("complementary", { name: "Application summary and keyword comparison" });
@@ -894,9 +969,7 @@ test("shows application lifecycle and pipeline progress separately without legac
 
 test("removes primary navigation and gives run details the full viewport", async ({ page }) => {
   const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
-  await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
-  });
+  await interceptDocumentRun(page, detailRun);
 
   for (const width of [1_672, 320]) {
     await page.setViewportSize({ width, height: 941 });
@@ -951,9 +1024,7 @@ test("hides internal run and attempt metadata from the viewer", async ({ page })
       },
     ],
   };
-  await page.route("**/api/pipeline/runs/run-id-must-be-hidden", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
-  });
+  await interceptDocumentRun(page, detailRun);
 
   await page.goto("/runs/run-id-must-be-hidden");
   await expect(page.getByRole("complementary", { name: "Application summary and keyword comparison" })).toBeVisible();
@@ -992,9 +1063,7 @@ test("uses the simplified opened-run header workflow layout", async ({ page }) =
       },
     ],
   };
-  await page.route("**/api/pipeline/runs/workflow-visual", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
-  });
+  await interceptDocumentRun(page, detailRun);
 
   await page.goto("/runs/workflow-visual");
 
@@ -1174,9 +1243,7 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
   test.setTimeout(60_000);
   await interceptRuns(page);
   const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
-  await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
-  });
+  await interceptDocumentRun(page, detailRun);
   await page.route("**/api/pipeline/auth", async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -1319,9 +1386,7 @@ test("uses the original dark palette across surfaces and states", async ({ page 
 
 test("uses route-workspace breakpoints for detail panes", async ({ page }) => {
   const detailRun = runFixture("lifecycle-detail", "rejected", "failed");
-  await page.route("**/api/pipeline/runs/lifecycle-detail", async (route) => {
-    await route.fulfill({ contentType: "application/json", body: JSON.stringify(detailRun) });
-  });
+  await interceptDocumentRun(page, detailRun);
 
   await page.setViewportSize({ width: 1_672, height: 941 });
   await page.goto("/runs/lifecycle-detail");

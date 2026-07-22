@@ -1,9 +1,16 @@
 import { expect, test, type Page } from "@playwright/test";
-import { type RunDto } from "@jobhunter/pipeline/contracts";
+import {
+  type ApplicationSessionView,
+  type ResumeIterationListResponse,
+  type RunDto,
+} from "@jobhunter/pipeline/contracts";
 
 const runId = "run-detail-analysis-v2";
 const analysisArtifactId = "job-analysis-v2";
 const extractionArtifactId = "ats-keyword-extraction-v1";
+const resumeArtifactId = "compiled-resume-pdf-v2";
+const resumePdfSha256 = "9".repeat(64);
+const resumePdf = Buffer.from("%PDF-1.4\n% analysis fixture\n%%EOF\n");
 
 const run: RunDto = {
   id: runId,
@@ -15,6 +22,7 @@ const run: RunDto = {
   origin: "initial",
   createdAt: 1_700_000_000_000,
   updatedAt: 1_700_000_000_000,
+  currentPdfSha256: resumePdfSha256,
   visualAcknowledgementRequired: false,
   attempts: [],
   artifacts: [
@@ -41,6 +49,18 @@ const run: RunDto = {
       href: `/v1/runs/${runId}/artifacts/${extractionArtifactId}`,
       public: true,
       createdAt: 1_700_000_000_090,
+    },
+    {
+      id: resumeArtifactId,
+      kind: "compiled-pdf",
+      revision: 2,
+      attempt: 1,
+      sha256: resumePdfSha256,
+      bytes: resumePdf.byteLength,
+      mediaType: "application/pdf",
+      href: `/v1/runs/${runId}/artifacts/${resumeArtifactId}`,
+      public: true,
+      createdAt: 1_700_000_000_110,
     },
   ],
   timeline: [],
@@ -125,28 +145,75 @@ const extraction = {
 };
 
 async function interceptRunDetail(page: Page, includeExtraction = true, listedRun: RunDto = run): Promise<void> {
+  const listedArtifacts = includeExtraction
+    ? listedRun.artifacts
+    : listedRun.artifacts.filter((artifact) => artifact.kind !== "ats-keyword-extraction");
+  const iterationArtifactPath = `/api/pipeline/runs/${runId}/iterations/${listedRun.revision}/artifacts`;
+  const iterations: ResumeIterationListResponse = {
+    artifactState: "retained",
+    iterations: [
+      {
+        revision: listedRun.revision,
+        origin: listedRun.origin,
+        status: "approved",
+        createdAt: listedRun.updatedAt,
+        pdfSha256: resumePdfSha256,
+        artifacts: listedArtifacts.map((artifact) => ({
+          ...artifact,
+          href: `/v1/runs/${runId}/iterations/${listedRun.revision}/artifacts/${artifact.id}`,
+        })),
+      },
+    ],
+  };
+  const application: ApplicationSessionView = {
+    state: "not_started",
+    canStart: false,
+    canStartAfterApproval: false,
+    blockedReason: "legacy_job_url_unavailable",
+  };
+
   await page.route(`**/api/pipeline/runs/${runId}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify(includeExtraction
-        ? listedRun
-        : { ...listedRun, artifacts: listedRun.artifacts.filter((artifact) => artifact.kind !== "ats-keyword-extraction") }),
+      body: JSON.stringify({ ...listedRun, artifacts: listedArtifacts }),
     });
   });
-  await page.route(`**/api/pipeline/runs/${runId}/artifacts/${analysisArtifactId}`, async (route) => {
+  await page.route(`**/api/pipeline/runs/${runId}/iterations`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(iterations),
+    });
+  });
+  await page.route(`**/api/pipeline/runs/${runId}/application`, async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(application),
+    });
+  });
+  await page.route(`**${iterationArtifactPath}/${analysisArtifactId}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify(analysis),
     });
   });
-  if (!includeExtraction) return;
-  await page.route(`**/api/pipeline/runs/${runId}/artifacts/${extractionArtifactId}`, async (route) => {
+  if (includeExtraction) {
+    await page.route(`**${iterationArtifactPath}/${extractionArtifactId}`, async (route) => {
+      expect(route.request().method()).toBe("GET");
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(extraction),
+      });
+    });
+  }
+  await page.route(`**${iterationArtifactPath}/${resumeArtifactId}`, async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify(extraction),
+      contentType: "application/pdf",
+      body: resumePdf,
     });
   });
 }
