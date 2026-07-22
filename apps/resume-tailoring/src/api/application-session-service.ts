@@ -438,12 +438,19 @@ export class ApplicationSessionService {
       this.#throwHarnessError(error);
     }
 
-    return this.#streamEvents(runId, session, upstreamEvents, signal);
+    return this.#streamEvents(
+      runId,
+      session,
+      lastUpstreamEventId,
+      upstreamEvents,
+      signal,
+    );
   }
 
   async *#streamEvents(
     runId: string,
     initialSession: PublicApplicationSession,
+    clientUpstreamEventId: number | undefined,
     upstreamEvents: AsyncIterable<ApplicationHarnessEvent>,
     signal: AbortSignal,
   ): AsyncGenerator<ApplicationSessionStreamItem> {
@@ -455,6 +462,24 @@ export class ApplicationSessionService {
       throw applicationHarnessUnavailable();
     }
     const replayUpdatedAtFloor = replaySnapshot?.data.updatedAt ?? null;
+    if (
+      session.lastUpstreamEventId !== null
+      && (
+        clientUpstreamEventId === undefined
+        || clientUpstreamEventId < session.lastUpstreamEventId
+      )
+      && session.publicSnapshot !== null
+    ) {
+      yield {
+        id: `${session.generation}:${session.lastUpstreamEventId}`,
+        event: ApplicationSessionEventDtoSchema.parse({
+          generation: session.generation,
+          event: "snapshot",
+          session: this.#storedView(session),
+          detail: {},
+        }),
+      };
+    }
     try {
       for await (const event of upstreamEvents) {
         signal.throwIfAborted();
@@ -569,6 +594,10 @@ export class ApplicationSessionService {
       return;
     }
     if (session.bridgeState === "closed") return;
+    if (session.bridgeState === "reserved") {
+      this.#recordLocalClosed(runId, session);
+      return;
+    }
 
     const harness = this.dependencies.harness;
     if (!harness) throw applicationHarnessUnavailable();
@@ -777,12 +806,18 @@ export class ApplicationSessionService {
     }
   }
 
+  #nextProjectionUpdatedAt(session: PublicApplicationSession): number {
+    const parsed = ApplicationSessionSnapshotDtoSchema.safeParse(session.publicSnapshot);
+    const snapshotUpdatedAt = parsed.success ? parsed.data.updatedAt : 0;
+    return Math.max(session.updatedAt + 1, snapshotUpdatedAt + 1, this.#now());
+  }
+
   #markLost(
     runId: string,
     session: PublicApplicationSession,
   ): ApplicationSessionSnapshotDto {
     const previous = this.#storedView(session);
-    const updatedAt = Math.max(previous.updatedAt + 1, this.#now());
+    const updatedAt = this.#nextProjectionUpdatedAt(session);
     const lost = ApplicationSessionSnapshotDtoSchema.parse({
       ...previous,
       generation: session.generation,
@@ -813,7 +848,7 @@ export class ApplicationSessionService {
     harnessState: "closed" | null,
   ): ApplicationSessionSnapshotDto {
     const previous = this.#storedView(session);
-    const updatedAt = Math.max(previous.updatedAt + 1, this.#now());
+    const updatedAt = this.#nextProjectionUpdatedAt(session);
     return ApplicationSessionSnapshotDtoSchema.parse({
       ...previous,
       generation: session.generation,

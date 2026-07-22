@@ -62,6 +62,7 @@ class FakeHarness implements ApplicationHarnessClient {
   readonly deleteCalls: string[] = [];
   readonly snapshots = new Map<string, ApplicationHarnessSnapshot>();
   events: ApplicationHarnessEvent[] = [];
+  readonly getReplies: Array<Promise<ApplicationHarnessSnapshot>> = [];
   createError: ApplicationHarnessError | null = null;
   commandError: ApplicationHarnessError | null = null;
   deleteError: ApplicationHarnessError | null = null;
@@ -85,6 +86,8 @@ class FakeHarness implements ApplicationHarnessClient {
 
   async get(sessionId: string): Promise<ApplicationHarnessSnapshot> {
     this.getCalls.push(sessionId);
+    const queued = this.getReplies.shift();
+    if (queued) return await queued;
     const snapshot = this.snapshots.get(sessionId);
     if (!snapshot) throw new ApplicationHarnessError("session_not_found");
     return snapshot;
@@ -197,6 +200,17 @@ async function createTarget(options: {
 }
 
 const signal = () => new AbortController().signal;
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
 
 async function createProfileRoot(): Promise<{ root: string; profilePath: string }> {
   const root = await mkdtemp(join(tmpdir(), "application-profile-reader-"));
@@ -414,6 +428,52 @@ describe("application session service", () => {
     expect(JSON.stringify(firstView)).not.toContain(SECOND_SESSION_ID);
   });
 
+  test("keeps the newest harness snapshot when concurrent resumes finish out of order", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const newerReply = deferred<ApplicationHarnessSnapshot>();
+    const olderReply = deferred<ApplicationHarnessSnapshot>();
+    target.harness!.getReplies.push(newerReply.promise, olderReply.promise);
+    const newerSnapshot = {
+      ...harnessSnapshot("awaiting_origin_approval"),
+      updatedAt: 10_300,
+      role: "Newest public role",
+      pendingAction: {
+        type: "origin_approval" as const,
+        origin: "https://newest.example.test",
+      },
+    };
+    const olderSnapshot = {
+      ...harnessSnapshot("running"),
+      updatedAt: 10_200,
+      role: "Stale public role",
+    };
+
+    const newerStart = target.service.start(target.runId, target.pdf.sha256, signal());
+    const olderStart = target.service.start(target.runId, target.pdf.sha256, signal());
+    newerReply.resolve(newerSnapshot);
+    const newerView = await newerStart;
+    olderReply.resolve(olderSnapshot);
+    const convergedView = await olderStart;
+
+    expect(newerView).toMatchObject({
+      bridgeState: "awaiting_origin_approval",
+      role: "Newest public role",
+      pendingAction: {
+        type: "origin_approval",
+        origin: "https://newest.example.test",
+      },
+    });
+    expect(convergedView).toEqual(newerView);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "awaiting_origin_approval",
+      publicSnapshot: expect.objectContaining({
+        updatedAt: 10_300,
+        role: "Newest public role",
+      }),
+    });
+  });
+
   test("recovers a timed-out or same-ID create and rejects an unrelated singleton", async () => {
     const timedOutHarness = new FakeHarness();
     timedOutHarness.createError = new ApplicationHarnessError("unavailable");
@@ -626,6 +686,59 @@ describe("application session service", () => {
     await nextGeneration.return?.(undefined);
   });
 
+  test("replays the persisted projection when a connecting browser is behind the durable cursor", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const gateEvent: ApplicationHarnessEvent = {
+      id: 7,
+      event: "origin_approval_required",
+      session: {
+        ...harnessSnapshot("awaiting_origin_approval"),
+        updatedAt: 10_200,
+        pendingAction: {
+          type: "origin_approval",
+          origin: "https://approval.example.test",
+        },
+      },
+      detail: { origin: "https://approval.example.test" },
+    };
+    target.harness!.events = [gateEvent];
+    const persisting = (await target.service.events(
+      target.runId,
+      { generation: 1, upstreamEventId: 6 },
+      signal(),
+    ))[Symbol.asyncIterator]();
+    expect((await persisting.next()).value?.id).toBe("1:7");
+    await persisting.return?.(undefined);
+
+    target.harness!.events = [gateEvent];
+    const behind = (await target.service.events(
+      target.runId,
+      undefined,
+      signal(),
+    ))[Symbol.asyncIterator]();
+    const replayed = await behind.next();
+
+    expect(replayed.done).toBeFalse();
+    expect(replayed.value).toEqual({
+      id: "1:7",
+      event: {
+        generation: 1,
+        event: "snapshot",
+        session: expect.objectContaining({
+          generation: 1,
+          bridgeState: "awaiting_origin_approval",
+          pendingAction: {
+            type: "origin_approval",
+            origin: "https://approval.example.test",
+          },
+        }),
+        detail: {},
+      },
+    });
+    await behind.return?.(undefined);
+  });
+
   test("maps an upstream SSE open failure before exposing an event iterator", async () => {
     const target = await createTarget();
     await target.service.start(target.runId, target.pdf.sha256, signal());
@@ -700,8 +813,15 @@ describe("application session service", () => {
     await expect(
       reserved.service.start(reserved.runId, reserved.pdf.sha256, signal()),
     ).rejects.toMatchObject({ code: "APPLICATION_HARNESS_UNAVAILABLE" });
-    reservedHarness.deleteError = new ApplicationHarnessError("session_not_found");
-    await reserved.service.close(reserved.runId, signal());
+    const restartedWithoutHarness = new ApplicationSessionService({
+      repository: reserved.repository,
+      artifacts: reserved.artifacts,
+      uuidFactory: () => SECOND_SESSION_ID,
+      now: () => 1_000,
+      profileReader: () => PROFILE,
+    });
+    await restartedWithoutHarness.close(reserved.runId, signal());
+    expect(reservedHarness.deleteCalls).toHaveLength(0);
     expect(reserved.repository.getLatestApplicationSession(reserved.runId)).toMatchObject({
       bridgeState: "closed",
       publicSnapshot: expect.objectContaining({

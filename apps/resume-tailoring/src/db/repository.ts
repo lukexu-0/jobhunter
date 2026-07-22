@@ -263,6 +263,14 @@ function serializePublicApplicationSnapshot(snapshot: unknown): string {
   return serialized;
 }
 
+function publicApplicationSnapshotUpdatedAt(snapshot: unknown): number | null {
+  if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
+  const updatedAt = Reflect.get(snapshot, "updatedAt");
+  return Number.isSafeInteger(updatedAt) && (updatedAt as number) >= 0
+    ? updatedAt as number
+    : null;
+}
+
 export class PipelineRepository {
   readonly #db: Database;
   readonly #now: () => number;
@@ -523,8 +531,26 @@ export class PipelineRepository {
       throw new Error("application event cursor must be nonnegative");
     }
     const publicSnapshotJson = serializePublicApplicationSnapshot(input.publicSnapshot);
+    const snapshotUpdatedAt = publicApplicationSnapshotUpdatedAt(input.publicSnapshot);
     return this.#immediate(() => {
       const current = this.#currentApplicationSession(runId, input.generation, input.sessionId);
+      const currentSnapshot = current.public_snapshot_json === null
+        ? null
+        : JSON.parse(current.public_snapshot_json) as unknown;
+      const currentSnapshotUpdatedAt = publicApplicationSnapshotUpdatedAt(currentSnapshot);
+      if (
+        snapshotUpdatedAt !== null
+        && currentSnapshotUpdatedAt !== null
+        && (
+          snapshotUpdatedAt < currentSnapshotUpdatedAt
+          || (
+            snapshotUpdatedAt === currentSnapshotUpdatedAt
+            && publicSnapshotJson !== current.public_snapshot_json
+          )
+        )
+      ) {
+        return publicApplicationSession(current);
+      }
       if (
         current.last_upstream_event_id !== null
         && input.lastUpstreamEventId !== undefined
