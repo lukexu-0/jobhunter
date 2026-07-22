@@ -1,17 +1,29 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
+import {
+  type ApplicationSessionSnapshotDto,
+  type ApplicationSessionView,
+  type ArtifactDto,
+  type RunDto,
+  type RunStatus,
+} from "@jobhunter/pipeline/contracts";
 import {
   PipelineClientError,
+  applicationEventsHref,
   approveRun,
   artifactHref,
+  closeApplicationSession,
   createRun,
   deleteRun,
   editRun,
+  getApplicationSession,
   getRun,
   listRuns,
   readJsonArtifact,
   regenerateRun,
+  retryApplicationSession,
   retryRun,
+  sendApplicationCommand,
+  startApplicationSession,
   updateApplicationStatus,
   updateRunIdentity,
 } from "../app/lib/pipeline-client";
@@ -65,6 +77,31 @@ function artifact(overrides: Partial<ArtifactDto> = {}): ArtifactDto {
     ...overrides,
   };
 }
+
+const applicationSnapshot: ApplicationSessionSnapshotDto = {
+  generation: 2,
+  bridgeState: "running",
+  harnessState: "running",
+  createdAt: 1,
+  updatedAt: 2,
+  terminalAt: null,
+  expiresAt: 60_001,
+  company: "Example Corp",
+  role: "Staff Engineer",
+  fieldsFilled: [],
+  fieldsNeedingHuman: [],
+  filesAttached: ["resume.pdf"],
+  warnings: [],
+  revisionCount: 0,
+  pendingAction: null,
+  error: null,
+};
+
+const applicationView: ApplicationSessionView = {
+  state: "not_started",
+  canStart: true,
+  canStartAfterApproval: false,
+};
 
 function json(value: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers);
@@ -410,6 +447,148 @@ describe("pipeline run requests", () => {
     expect(cancelled).toBe(true);
   });
 
+});
+
+describe("pipeline application session requests", () => {
+  test("uses only same-origin run-scoped paths with exact methods and bodies", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    setFetchMock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init });
+      const path = String(input);
+      if (init?.method === "GET") return json(applicationView);
+      if (path.endsWith("/commands")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      return json(applicationSnapshot, { status: 202 });
+    });
+
+    const id = "run /1?";
+    await expect(getApplicationSession(id)).resolves.toEqual(applicationView);
+    await expect(startApplicationSession(id, sha256)).resolves.toEqual(applicationSnapshot);
+    await expect(retryApplicationSession(id, sha256)).resolves.toEqual(applicationSnapshot);
+    await expect(sendApplicationCommand(id, {
+      type: "approve_origin",
+      origin: "https://apply.example.test",
+    })).resolves.toBeUndefined();
+    await expect(closeApplicationSession(id)).resolves.toBeUndefined();
+    expect(applicationEventsHref(id)).toBe(
+      "/api/pipeline/runs/run%20%2F1%3F/application/events",
+    );
+
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application",
+        init: { cache: "no-store", method: "GET" },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application",
+        init: {
+          body: JSON.stringify({ expectedApprovedPdfSha256: sha256 }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/retry",
+        init: {
+          body: JSON.stringify({ expectedApprovedPdfSha256: sha256 }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/commands",
+        init: {
+          body: JSON.stringify({
+            type: "approve_origin",
+            origin: "https://apply.example.test",
+          }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application",
+        init: { cache: "no-store", method: "DELETE" },
+      },
+    ]);
+    expect(JSON.stringify(requests)).not.toContain("127.0.0.1:8765");
+    expect(JSON.stringify(requests)).not.toContain("authorization");
+    expect(JSON.stringify(requests)).not.toContain("JOBHUNTER_HARNESS_TOKEN");
+  });
+
+  test("rejects malformed application requests locally and strict private responses", async () => {
+    let fetchCalls = 0;
+    setFetchMock(async () => {
+      fetchCalls += 1;
+      return json(applicationSnapshot);
+    });
+    expect(() => startApplicationSession("run-1", sha256.toUpperCase())).toThrow(
+      PipelineClientError,
+    );
+    expect(() => retryApplicationSession("run-1", "short")).toThrow(
+      PipelineClientError,
+    );
+    expect(() => sendApplicationCommand(
+      "run-1",
+      { type: "continue", answer: "private" } as never,
+    )).toThrow(PipelineClientError);
+    expect(fetchCalls).toBe(0);
+
+    setFetchMock(async () => json({
+      ...applicationSnapshot,
+      sessionId: "6984d92f-fef5-4a75-8fb5-bb8d6316bb14",
+      jobUrl: "https://private.example.test/jobs/1",
+      profilePath: "/home/user/applicant-profile.md",
+    }));
+    await expect(getApplicationSession("run-1")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+      message: "The pipeline returned an invalid response.",
+    });
+
+    setFetchMock(async () => json({
+      ...applicationView,
+      harnessOrigin: "http://127.0.0.1:8765",
+      bearer: "private-token",
+    }));
+    await expect(getApplicationSession("run-1")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
+  test("requires exact application response statuses and empty command bodies", async () => {
+    setFetchMock(async () => json(applicationSnapshot));
+    await expect(startApplicationSession("run-1", sha256)).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+
+    setFetchMock(async () => new Response("saved answer", { status: 202 }));
+    await expect(sendApplicationCommand("run-1", { type: "continue" })).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+
+    setFetchMock(async () => new Response(null, { status: 200 }));
+    await expect(closeApplicationSession("run-1")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
+  test("uses the fixed public harness-unavailable message without exposing server details", async () => {
+    setFetchMock(async () => json({
+      error: {
+        code: "APPLICATION_HARNESS_UNAVAILABLE",
+        message: "Bearer private-token at /home/user/harness",
+      },
+    }, { status: 503 }));
+
+    await expect(getApplicationSession("run-1")).rejects.toMatchObject({
+      code: "APPLICATION_HARNESS_UNAVAILABLE",
+      status: 503,
+      message: "The local application service is unavailable",
+    });
+  });
 });
 
 describe("pipeline artifacts", () => {

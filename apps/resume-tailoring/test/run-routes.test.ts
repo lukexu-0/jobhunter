@@ -1,7 +1,21 @@
 import { describe, expect, test } from "bun:test";
+import {
+  createApplicationSessionRoutes,
+  type ApplicationSessionRouteService,
+} from "../src/api/application-session-routes";
+import {
+  ApplicationSessionServiceError,
+  type ApplicationSessionStreamItem,
+} from "../src/api/application-session-service";
 import { createApiHandler } from "../src/api/handler";
 import { createRunRoutes, type RunRouteService } from "../src/api/run-routes";
-import type { RunDto } from "../src/contracts";
+import { RunServiceError } from "../src/api/run-service";
+import type {
+  ApplicationSessionEventDto,
+  ApplicationSessionSnapshotDto,
+  ApplicationSessionView,
+  RunDto,
+} from "../src/contracts";
 
 const ORIGIN = "http://127.0.0.1:3456";
 const PDF_HASH = "a".repeat(64);
@@ -401,5 +415,483 @@ describe("run HTTP routes", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.text()).toBe("artifact");
+  });
+});
+
+const applicationSnapshot: ApplicationSessionSnapshotDto = {
+  generation: 2,
+  bridgeState: "running",
+  harnessState: "running",
+  createdAt: 1,
+  updatedAt: 2,
+  terminalAt: null,
+  expiresAt: 60_001,
+  company: "Example Corp",
+  role: "Staff Engineer",
+  fieldsFilled: [],
+  fieldsNeedingHuman: [],
+  filesAttached: ["resume.pdf"],
+  warnings: [],
+  revisionCount: 0,
+  pendingAction: null,
+  error: null,
+};
+
+const applicationEvent: ApplicationSessionEventDto = {
+  generation: 2,
+  event: "snapshot",
+  session: applicationSnapshot,
+  detail: {},
+};
+
+const applicationView: ApplicationSessionView = {
+  state: "not_started",
+  canStart: true,
+  canStartAfterApproval: false,
+};
+
+function applicationService(
+  overrides: Partial<ApplicationSessionRouteService> = {},
+): ApplicationSessionRouteService {
+  return {
+    get: async () => applicationView,
+    start: async () => applicationSnapshot,
+    retry: async () => applicationSnapshot,
+    events: async function* (): AsyncGenerator<ApplicationSessionStreamItem> {},
+    command: async () => {},
+    close: async () => {},
+    ...overrides,
+  };
+}
+
+async function applicationRequest(
+  routeService: ApplicationSessionRouteService,
+  path: string,
+  init?: RequestInit,
+): Promise<Response> {
+  return createApiHandler({
+    webOrigin: ORIGIN,
+    route: createApplicationSessionRoutes(routeService),
+  })(new Request(`http://127.0.0.1:3457${path}`, init));
+}
+
+describe("application session HTTP routes", () => {
+  test("gets a validated view and starts with the exact approved hash", async () => {
+    let received:
+      | { runId: string; expectedApprovedPdfSha256: string; signal: AbortSignal }
+      | undefined;
+    const target = applicationService({
+      start: async (runId, expectedApprovedPdfSha256, signal) => {
+        received = { runId, expectedApprovedPdfSha256, signal };
+        return applicationSnapshot;
+      },
+    });
+
+    const view = await applicationRequest(target, "/v1/runs/run-1/application");
+    expect(view.status).toBe(200);
+    expect(view.headers.get("cache-control")).toBe("no-store");
+    expect(await view.json()).toEqual(applicationView);
+
+    const started = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application",
+      post({ expectedApprovedPdfSha256: PDF_HASH }),
+    );
+    expect(started.status).toBe(202);
+    expect(started.headers.get("cache-control")).toBe("no-store");
+    expect(await started.json()).toEqual(applicationSnapshot);
+    expect(received).toEqual({
+      runId: "run-1",
+      expectedApprovedPdfSha256: PDF_HASH,
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  test("retries, sends a validated command, and closes with empty no-store responses", async () => {
+    const calls: string[] = [];
+    const target = applicationService({
+      retry: async (runId, expectedApprovedPdfSha256, signal) => {
+        expect(signal).toBeInstanceOf(AbortSignal);
+        calls.push(`retry:${runId}:${expectedApprovedPdfSha256}`);
+        return applicationSnapshot;
+      },
+      command: async (runId, command, signal) => {
+        expect(signal).toBeInstanceOf(AbortSignal);
+        calls.push(`command:${runId}:${JSON.stringify(command)}`);
+      },
+      close: async (runId, signal) => {
+        expect(signal).toBeInstanceOf(AbortSignal);
+        calls.push(`close:${runId}`);
+      },
+    });
+
+    const retried = await applicationRequest(
+      target,
+      "/v1/runs/run%20one/application/retry",
+      post({ expectedApprovedPdfSha256: PDF_HASH }),
+    );
+    expect(retried.status).toBe(202);
+    expect(await retried.json()).toEqual(applicationSnapshot);
+
+    const commanded = await applicationRequest(
+      target,
+      "/v1/runs/run%20one/application/commands",
+      post({ type: "revise", context: "  Emphasize the platform work.  " }),
+    );
+    expect(commanded.status).toBe(202);
+    expect(commanded.headers.get("cache-control")).toBe("no-store");
+    expect(await commanded.text()).toBe("");
+
+    const closed = await applicationRequest(
+      target,
+      "/v1/runs/run%20one/application",
+      { method: "DELETE", headers: { origin: ORIGIN } },
+    );
+    expect(closed.status).toBe(204);
+    expect(closed.headers.get("cache-control")).toBe("no-store");
+    expect(await closed.text()).toBe("");
+    expect(calls).toEqual([
+      `retry:run%20one:${PDF_HASH}`,
+      "command:run%20one:{\"type\":\"revise\",\"context\":\"Emphasize the platform work.\"}",
+      "close:run%20one",
+    ]);
+  });
+
+  test("rejects malformed requests through the public Origin and JSON boundary", async () => {
+    let starts = 0;
+    let commands = 0;
+    let closes = 0;
+    const target = applicationService({
+      start: async () => {
+        starts += 1;
+        return applicationSnapshot;
+      },
+      command: async () => {
+        commands += 1;
+      },
+      close: async () => {
+        closes += 1;
+      },
+    });
+
+    const missingOrigin = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedApprovedPdfSha256: PDF_HASH }),
+      },
+    );
+    expect(missingOrigin.status).toBe(403);
+    expect(await missingOrigin.json()).toEqual({
+      error: { code: "ORIGIN_REJECTED", message: "Mutation origin is not allowed" },
+    });
+
+    const wrongMediaType = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application",
+      {
+        method: "POST",
+        headers: { origin: ORIGIN, "content-type": "text/plain" },
+        body: JSON.stringify({ expectedApprovedPdfSha256: PDF_HASH }),
+      },
+    );
+    expect(wrongMediaType.status).toBe(415);
+
+    const invalidJson = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application",
+      {
+        method: "POST",
+        headers: { origin: ORIGIN, "content-type": "application/json" },
+        body: "{",
+      },
+    );
+    expect(invalidJson.status).toBe(400);
+    expect(await invalidJson.json()).toEqual({
+      error: { code: "INVALID_JSON", message: "Request body is not valid JSON" },
+    });
+
+    for (const body of [
+      {},
+      { expectedApprovedPdfSha256: PDF_HASH.toUpperCase() },
+      { expectedApprovedPdfSha256: PDF_HASH, extra: true },
+    ]) {
+      const response = await applicationRequest(
+        target,
+        "/v1/runs/run-1/application",
+        post(body),
+      );
+      expect(response.status).toBe(400);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+    }
+
+    for (const command of [
+      {},
+      { type: "continue", extra: true },
+      { type: "approve_origin", origin: "https://example.test/path" },
+      { type: "provide_additional_info", answers: [] },
+      { type: "ready", answer: "private" },
+    ]) {
+      const response = await applicationRequest(
+        target,
+        "/v1/runs/run-1/application/commands",
+        post(command),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: { code: "INVALID_REQUEST", message: "Application command is invalid" },
+      });
+    }
+
+    const closeWithBody = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application",
+      { ...post({}), method: "DELETE" },
+    );
+    expect(closeWithBody.status).toBe(400);
+    expect(await closeWithBody.json()).toEqual({
+      error: {
+        code: "INVALID_REQUEST",
+        message: "Application close request must be bodyless",
+      },
+    });
+    expect({ starts, commands, closes }).toEqual({ starts: 0, commands: 0, closes: 0 });
+  });
+
+  test("preserves stable service errors and fixes unexpected failures", async () => {
+    const unavailable = await applicationRequest(
+      applicationService({
+        start: async () => {
+          throw new ApplicationSessionServiceError("APPLICATION_HARNESS_UNAVAILABLE");
+        },
+      }),
+      "/v1/runs/run-1/application",
+      post({ expectedApprovedPdfSha256: PDF_HASH }),
+    );
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toEqual({
+      error: {
+        code: "APPLICATION_HARNESS_UNAVAILABLE",
+        message: "The local application service is unavailable",
+      },
+    });
+
+    const conflict = await applicationRequest(
+      applicationService({
+        command: async () => {
+          throw new RunServiceError("RUN_CONFLICT", "application session is not live", 409);
+        },
+      }),
+      "/v1/runs/run-1/application/commands",
+      post({ type: "continue" }),
+    );
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({
+      error: { code: "RUN_CONFLICT", message: "application session is not live" },
+    });
+
+    const unexpected = await applicationRequest(
+      applicationService({
+        get: async () => {
+          throw new Error("Bearer private-token at /home/user/profile.md");
+        },
+      }),
+      "/v1/runs/run-1/application",
+    );
+    expect(unexpected.status).toBe(500);
+    expect(unexpected.headers.get("cache-control")).toBe("no-store");
+    expect(await unexpected.json()).toEqual({
+      error: { code: "INTERNAL_ERROR", message: "Request failed" },
+    });
+  });
+
+  test("accepts only canonical generation-qualified cursors and streams one exact event", async () => {
+    let received:
+      | { runId: string; cursor: { generation: number; upstreamEventId: number } | undefined; signal: AbortSignal }
+      | undefined;
+    let nextCalls = 0;
+    const target = applicationService({
+      events: (runId, cursor, signal) => {
+        received = { runId, cursor, signal };
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              async next(): Promise<IteratorResult<ApplicationSessionStreamItem>> {
+                nextCalls += 1;
+                return nextCalls === 1
+                  ? { done: false, value: { id: "2:7", event: applicationEvent } }
+                  : { done: true, value: undefined };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    const response = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/events",
+      { headers: { "last-event-id": "2:6" } },
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
+    expect(response.headers.get("x-accel-buffering")).toBe("no");
+    expect(nextCalls).toBe(0);
+    expect(received).toEqual({
+      runId: "run-1",
+      cursor: { generation: 2, upstreamEventId: 6 },
+      signal: expect.any(AbortSignal),
+    });
+    expect(await response.text()).toBe(
+      "id: 2:7\n"
+      + "event: snapshot\n"
+      + "data: {\"generation\":2,\"session\":{\"generation\":2,\"bridgeState\":\"running\",\"harnessState\":\"running\",\"createdAt\":1,\"updatedAt\":2,\"terminalAt\":null,\"expiresAt\":60001,\"company\":\"Example Corp\",\"role\":\"Staff Engineer\",\"fieldsFilled\":[],\"fieldsNeedingHuman\":[],\"filesAttached\":[\"resume.pdf\"],\"warnings\":[],\"revisionCount\":0,\"pendingAction\":null,\"error\":null},\"event\":\"snapshot\",\"detail\":{}}\n\n",
+    );
+  });
+
+  test("rejects ambiguous or unsafe Last-Event-ID values before opening a stream", async () => {
+    let calls = 0;
+    const target = applicationService({
+      events: () => {
+        calls += 1;
+        return {
+          async *[Symbol.asyncIterator](): AsyncGenerator<ApplicationSessionStreamItem> {},
+        };
+      },
+    });
+
+    for (const cursor of [
+      "",
+      "2 :7",
+      "2: 7",
+      "02:7",
+      "2:07",
+      "+2:7",
+      "2:+7",
+      "0:0",
+      "2:-1",
+      "2",
+      "2:",
+      "2:9007199254740992",
+      "9007199254740992:1",
+    ]) {
+      const response = await applicationRequest(
+        target,
+        "/v1/runs/run-1/application/events",
+        { headers: { "last-event-id": cursor } },
+      );
+      expect(response.status).toBe(400);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toEqual({
+        error: {
+          code: "INVALID_REQUEST",
+          message: "Application event cursor is invalid",
+        },
+      });
+    }
+    expect(calls).toBe(0);
+
+    const absent = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/events",
+    );
+    expect(absent.status).toBe(200);
+    expect(calls).toBe(1);
+  });
+
+  test("propagates request aborts and reader cancellation through iterator return", async () => {
+    const createTarget = () => {
+      let signal: AbortSignal | undefined;
+      let returns = 0;
+      const target = applicationService({
+        events: (_runId, _cursor, requestSignal) => {
+          signal = requestSignal;
+          let emitted = false;
+          return {
+            [Symbol.asyncIterator]() {
+              return {
+                async next(): Promise<IteratorResult<ApplicationSessionStreamItem>> {
+                  if (!emitted) {
+                    emitted = true;
+                    return { done: false, value: { id: "2:7", event: applicationEvent } };
+                  }
+                  return Promise.withResolvers<IteratorResult<ApplicationSessionStreamItem>>().promise;
+                },
+                async return(): Promise<IteratorResult<ApplicationSessionStreamItem>> {
+                  returns += 1;
+                  return { done: true, value: undefined };
+                },
+              };
+            },
+          };
+        },
+      });
+      return {
+        target,
+        signal: () => signal,
+        returns: () => returns,
+      };
+    };
+
+    const abortedTarget = createTarget();
+    const abortController = new AbortController();
+    const abortedResponse = await applicationRequest(
+      abortedTarget.target,
+      "/v1/runs/run-1/application/events",
+      { signal: abortController.signal },
+    );
+    const abortedReader = abortedResponse.body!.getReader();
+    expect((await abortedReader.read()).done).toBe(false);
+    abortController.abort(new DOMException("Client disconnected", "AbortError"));
+    await expect(abortedReader.read()).rejects.toThrow("Client disconnected");
+    expect(abortedTarget.signal()?.aborted).toBe(true);
+    expect(abortedTarget.returns()).toBe(1);
+
+    const cancelledTarget = createTarget();
+    const cancelledResponse = await applicationRequest(
+      cancelledTarget.target,
+      "/v1/runs/run-1/application/events",
+    );
+    const cancelledReader = cancelledResponse.body!.getReader();
+    expect((await cancelledReader.read()).done).toBe(false);
+    await cancelledReader.cancel("view closed");
+    expect(cancelledTarget.returns()).toBe(1);
+  });
+
+  test("refuses to stream service events containing private fields", async () => {
+    let returns = 0;
+    const privateEvent = {
+      ...applicationEvent,
+      session: {
+        ...applicationSnapshot,
+        sessionId: "6984d92f-fef5-4a75-8fb5-bb8d6316bb14",
+        jobUrl: "https://private.example.test/jobs/1",
+        bearer: "private-token",
+      },
+    } as unknown as ApplicationSessionEventDto;
+    const target = applicationService({
+      events: () => ({
+        [Symbol.asyncIterator]() {
+          return {
+            async next(): Promise<IteratorResult<ApplicationSessionStreamItem>> {
+              return { done: false, value: { id: "2:7", event: privateEvent } };
+            },
+            async return(): Promise<IteratorResult<ApplicationSessionStreamItem>> {
+              returns += 1;
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      }),
+    });
+    const response = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/events",
+    );
+    await expect(response.text()).rejects.toThrow();
+    expect(returns).toBe(1);
   });
 });

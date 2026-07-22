@@ -1,6 +1,9 @@
 import { z } from "zod";
 import {
   ApiErrorSchema,
+  ApplicationSessionCommandSchema,
+  ApplicationSessionSnapshotDtoSchema,
+  ApplicationSessionViewSchema,
   ApproveRunRequestSchema,
   ArtifactDtoSchema,
   CreateRunRequestSchema,
@@ -8,11 +11,15 @@ import {
   RegenerateRunRequestSchema,
   RunDtoSchema,
   RunListResponseSchema,
+  StartApplicationSessionRequestSchema,
   UpdateApplicationStatusRequestSchema,
   UpdateRunIdentityRequestSchema,
   type ArtifactDto,
   type ApplicationStatus,
   type RunDto,
+  type ApplicationSessionCommand,
+  type ApplicationSessionSnapshotDto,
+  type ApplicationSessionView,
 } from "@jobhunter/pipeline/contracts";
 
 const PIPELINE_ROOT = "/api/pipeline";
@@ -22,6 +29,7 @@ const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const ARTIFACT_PATH = /^\/v1\/runs\/[^/?#]+\/artifacts\/[^/?#]+$/;
 const PUBLIC_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  APPLICATION_HARNESS_UNAVAILABLE: "The local application service is unavailable",
   JOB_EXTRACTION_UNAVAILABLE: "Job description extraction failed",
   JOB_EXTRACTION_TIMEOUT: "Job description extraction timed out",
 });
@@ -135,9 +143,48 @@ function jsonPost(body: unknown): RequestInit {
 function runPath(id: string): string {
   return `/runs/${encodeURIComponent(id)}`;
 }
+
+function applicationPath(id: string): string {
+  return `${runPath(id)}/application`;
+}
 function ensureValidRequest(valid: boolean): void {
   if (!valid) {
     throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
+  }
+}
+
+async function requestApplicationResponse<T>(
+  path: string,
+  init: RequestInit,
+  expectedStatus: number,
+  schema: z.ZodType<T>,
+): Promise<T> {
+  const response = await fetchPipeline(path, init);
+  if (response.status !== expectedStatus) throw invalidResponse();
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw invalidResponse();
+  }
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) throw invalidResponse();
+  return parsed.data;
+}
+
+async function requestEmptyApplicationResponse(
+  path: string,
+  init: RequestInit,
+  expectedStatus: number,
+): Promise<void> {
+  const response = await fetchPipeline(path, init);
+  if (response.status !== expectedStatus) throw invalidResponse();
+  if (response.body === null) return;
+  try {
+    if (await readBoundedText(response, 1) !== "") throw invalidResponse();
+  } catch (error) {
+    if (error instanceof PipelineClientError) throw error;
+    throw invalidResponse();
   }
 }
 
@@ -228,6 +275,72 @@ export function approveRun(
       && ApproveRunRequestSchema.safeParse(body).success,
   );
   return requestRun(`${runPath(id)}/approve`, jsonPost(body));
+}
+
+export function getApplicationSession(id: string): Promise<ApplicationSessionView> {
+  return requestApplicationResponse(
+    applicationPath(id),
+    { method: "GET" },
+    200,
+    ApplicationSessionViewSchema,
+  );
+}
+
+export function startApplicationSession(
+  id: string,
+  expectedApprovedPdfSha256: string,
+): Promise<ApplicationSessionSnapshotDto> {
+  const parsed = StartApplicationSessionRequestSchema.safeParse({
+    expectedApprovedPdfSha256,
+  });
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    applicationPath(id),
+    jsonPost(parsed.data),
+    202,
+    ApplicationSessionSnapshotDtoSchema,
+  );
+}
+
+export function retryApplicationSession(
+  id: string,
+  expectedApprovedPdfSha256: string,
+): Promise<ApplicationSessionSnapshotDto> {
+  const parsed = StartApplicationSessionRequestSchema.safeParse({
+    expectedApprovedPdfSha256,
+  });
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    `${applicationPath(id)}/retry`,
+    jsonPost(parsed.data),
+    202,
+    ApplicationSessionSnapshotDtoSchema,
+  );
+}
+
+export function sendApplicationCommand(
+  id: string,
+  command: ApplicationSessionCommand,
+): Promise<void> {
+  const parsed = ApplicationSessionCommandSchema.safeParse(command);
+  ensureValidRequest(parsed.success);
+  return requestEmptyApplicationResponse(
+    `${applicationPath(id)}/commands`,
+    jsonPost(parsed.data),
+    202,
+  );
+}
+
+export function closeApplicationSession(id: string): Promise<void> {
+  return requestEmptyApplicationResponse(
+    applicationPath(id),
+    { method: "DELETE" },
+    204,
+  );
+}
+
+export function applicationEventsHref(id: string): string {
+  return `${PIPELINE_ROOT}${applicationPath(id)}/events`;
 }
 
 export function artifactHref(href: string): string {
