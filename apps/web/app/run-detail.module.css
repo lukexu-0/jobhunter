@@ -334,6 +334,138 @@
   margin: var(--space-4) var(--space-5);
 }
 
+.applicationSessionState {
+  width: fit-content;
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+}
+
+.applicationSummary {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.applicationSummary > div {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.applicationList {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding-left: var(--space-5);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+}
+
+.applicationListNote {
+  color: var(--color-muted);
+}
+
+.applicationGate {
+  display: grid;
+  gap: var(--space-3);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-4);
+  background: var(--color-surface-raised);
+}
+
+.applicationGate code {
+  overflow-wrap: anywhere;
+  color: var(--color-accent);
+  font-size: var(--font-size-sm);
+}
+
+.applicationGate button {
+  width: 100%;
+}
+
+.applicationAdditionalInfoForm {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.applicationAdditionalInfoForm > div:first-child {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.applicationQuestion {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+  margin: 0;
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-4);
+}
+
+.applicationQuestion:focus {
+  outline: var(--border-width) solid var(--color-accent);
+  outline-offset: var(--space-1);
+}
+
+.applicationQuestion legend {
+  padding: 0 var(--space-2);
+  font-weight: 700;
+  line-height: var(--line-normal);
+}
+
+.applicationQuestionScope {
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+}
+
+.applicationQuestionChoices {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.applicationAdditionalInfoForm > button {
+  width: 100%;
+}
+
+.applicationReviewGate {
+  display: grid;
+  gap: var(--space-4);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-4);
+  background: var(--color-surface-raised);
+}
+
+.applicationReviewGate > div,
+.applicationReviewGate form {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.applicationReviewGate button {
+  width: 100%;
+}
+
+.applicationReadyAction {
+  border-top: var(--border-width) solid var(--color-border);
+  padding-top: var(--space-4);
+}
+
+.applicationReadyAction p {
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+}
+
 .reviewDialog {
   width: min(34rem, calc(100vw - var(--space-8)));
   max-width: calc(100vw - var(--space-8));

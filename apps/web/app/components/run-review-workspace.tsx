@@ -9,12 +9,26 @@ import {
 } from "react";
 import type {
   ApplicationSessionView,
+  ApplicationSessionCommand,
+  ApplicationSessionSnapshotDto,
   ResumeIterationDto,
   RunDto,
 } from "@jobhunter/pipeline/contracts";
 import {
+  ApplicationSessionPanel,
+  type ApplicationLifecycleAction,
+} from "./application-session-panel";
+import {
+  APPLICATION_SESSION_EVENT_NAMES,
+  parseApplicationSessionStreamEvent,
+} from "../lib/application-session-stream";
+import {
   PipelineClientError,
+  applicationEventsHref,
+  closeApplicationSession,
   getApplicationSession,
+  retryApplicationSession,
+  sendApplicationCommand,
   startApplicationSession,
 } from "../lib/pipeline-client";
 import type { ResumeIterationSelection } from "../lib/run-detail-artifacts";
@@ -24,6 +38,7 @@ const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 
 type ReviewDialog = "edit" | "regenerate" | null;
 type ReviewBusyAction = "retry" | "edit" | "regenerate" | "approve" | null;
+type ApplicationStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "invalid";
 
 export interface RunReviewWorkspaceProps {
   readonly run: RunDto;
@@ -78,6 +93,19 @@ function blockedReasonMessage(reason: string | undefined): string | null {
   return null;
 }
 
+function applicationSnapshot(
+  view: ApplicationSessionView | null,
+): ApplicationSessionSnapshotDto | null {
+  return view && !("state" in view) ? view : null;
+}
+
+function isLiveApplicationSnapshot(snapshot: ApplicationSessionSnapshotDto): boolean {
+  return snapshot.bridgeState !== "cancelled"
+    && snapshot.bridgeState !== "failed"
+    && snapshot.bridgeState !== "closed"
+    && snapshot.bridgeState !== "lost";
+}
+
 export function RunReviewWorkspace({
   run,
   artifactState,
@@ -103,6 +131,12 @@ export function RunReviewWorkspace({
   const [isLoadingApplication, setIsLoadingApplication] = useState(true);
   const [isStartingApplication, setIsStartingApplication] = useState(false);
   const [applicationError, setApplicationError] = useState<string | null>(null);
+  const [applicationLifecycleAction, setApplicationLifecycleAction] =
+    useState<ApplicationLifecycleAction | null>(null);
+  const [applicationCommandAction, setApplicationCommandAction] =
+    useState<ApplicationSessionCommand["type"] | null>(null);
+  const [applicationStreamState, setApplicationStreamState] =
+    useState<ApplicationStreamState>("idle");
   const applicationRequestVersion = useRef(0);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const commentsRef = useRef<HTMLTextAreaElement>(null);
@@ -119,6 +153,10 @@ export function RunReviewWorkspace({
     : null;
   const canStartAfterApproval = notStarted?.canStartAfterApproval === true;
   const blockedReason = blockedReasonMessage(notStarted?.blockedReason);
+  const snapshot = applicationSnapshot(applicationView);
+  const liveGeneration = snapshot && isLiveApplicationSnapshot(snapshot)
+    ? snapshot.generation
+    : null;
 
   useEffect(() => {
     setAcknowledgeVisualIssues(false);
@@ -147,6 +185,75 @@ export function RunReviewWorkspace({
       }
     };
   }, [run.id, run.revision, run.status]);
+
+  useEffect(() => {
+    if (liveGeneration === null) {
+      setApplicationStreamState("idle");
+      return;
+    }
+
+    let source: EventSource;
+    try {
+      source = new EventSource(applicationEventsHref(run.id));
+    } catch {
+      setApplicationStreamState("invalid");
+      setApplicationError("Live application updates could not be opened.");
+      return;
+    }
+    setApplicationStreamState("connecting");
+
+    const acceptEvent = (nativeEvent: Event) => {
+      if (!(nativeEvent instanceof MessageEvent) || typeof nativeEvent.data !== "string") {
+        source.close();
+        setApplicationStreamState("invalid");
+        setApplicationError("The application service returned an invalid live update.");
+        return;
+      }
+      const projection = parseApplicationSessionStreamEvent(
+        nativeEvent.data,
+        nativeEvent.lastEventId,
+        liveGeneration,
+        nativeEvent.type,
+      );
+      if (projection.status === "stale") return;
+      if (projection.status === "invalid") {
+        source.close();
+        setApplicationStreamState("invalid");
+        setApplicationError("The application service returned an invalid live update.");
+        return;
+      }
+      setApplicationView((current) => {
+        const currentSnapshot = applicationSnapshot(current);
+        if (
+          currentSnapshot
+          && (
+            projection.event.generation < currentSnapshot.generation
+            || (
+              projection.event.generation === currentSnapshot.generation
+              && projection.event.session.updatedAt < currentSnapshot.updatedAt
+            )
+          )
+        ) {
+          return current;
+        }
+        return projection.event.session;
+      });
+      setApplicationError(null);
+      setApplicationStreamState("connected");
+    };
+    for (const eventName of APPLICATION_SESSION_EVENT_NAMES) {
+      source.addEventListener(eventName, acceptEvent);
+    }
+    source.onopen = () => {
+      setApplicationStreamState("connected");
+    };
+    source.onerror = () => {
+      setApplicationStreamState("reconnecting");
+    };
+    return () => {
+      source.close();
+    };
+  }, [liveGeneration, run.id]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -227,6 +334,65 @@ export function RunReviewWorkspace({
       }
     } finally {
       setIsStartingApplication(false);
+    }
+  };
+
+  const retryApplication = async () => {
+    if (!run.currentPdfSha256) {
+      setApplicationError("The approved resume is no longer available for retry.");
+      return;
+    }
+    setApplicationLifecycleAction("retry");
+    setApplicationError(null);
+    try {
+      setApplicationView(await retryApplicationSession(run.id, run.currentPdfSha256));
+    } catch (error) {
+      setApplicationError(publicMessage(error, "The application assistant could not be retried."));
+    } finally {
+      setApplicationLifecycleAction(null);
+    }
+  };
+
+  const cancelApplication = async () => {
+    if (!snapshot) return;
+    setApplicationLifecycleAction("cancel");
+    setApplicationError(null);
+    try {
+      if (snapshot.bridgeState === "reserved") {
+        await closeApplicationSession(run.id);
+        setApplicationView(await getApplicationSession(run.id));
+      } else {
+        await sendApplicationCommand(run.id, { type: "cancel" });
+      }
+    } catch (error) {
+      setApplicationError(publicMessage(error, "The application assistant could not be cancelled."));
+    } finally {
+      setApplicationLifecycleAction(null);
+    }
+  };
+
+  const closeApplication = async () => {
+    setApplicationLifecycleAction("close");
+    setApplicationError(null);
+    try {
+      await closeApplicationSession(run.id);
+      setApplicationView(await getApplicationSession(run.id));
+    } catch (error) {
+      setApplicationError(publicMessage(error, "The browser could not be closed."));
+    } finally {
+      setApplicationLifecycleAction(null);
+    }
+  };
+
+  const submitApplicationCommand = async (command: ApplicationSessionCommand) => {
+    setApplicationCommandAction(command.type);
+    setApplicationError(null);
+    try {
+      await sendApplicationCommand(run.id, command);
+    } catch (error) {
+      setApplicationError(publicMessage(error, "The application command could not be accepted."));
+    } finally {
+      setApplicationCommandAction(null);
     }
   };
 
@@ -368,6 +534,29 @@ export function RunReviewWorkspace({
             {isStartingApplication ? "Starting…" : "Start applying"}
           </button>
         </section>
+      ) : null}
+      {snapshot ? (
+        <ApplicationSessionPanel
+          actionBusy={applicationCommandAction ?? applicationLifecycleAction}
+          onCancel={cancelApplication}
+          onClose={closeApplication}
+          onCommand={submitApplicationCommand}
+          onRetry={retryApplication}
+          snapshot={snapshot}
+        />
+      ) : null}
+      {snapshot && (
+        applicationStreamState === "connecting"
+        || applicationStreamState === "reconnecting"
+      ) ? (
+        <p
+          className={`${styles.workspaceNotice} ${styles.workspaceStandaloneError}`}
+          role="status"
+        >
+          {applicationStreamState === "reconnecting"
+            ? "Reconnecting to live application updates. The latest confirmed state remains visible."
+            : "Connecting to live application updates…"}
+        </p>
       ) : null}
       {applicationError ? (
         <p className={`${styles.panelError} ${styles.workspaceStandaloneError}`} role="alert">
