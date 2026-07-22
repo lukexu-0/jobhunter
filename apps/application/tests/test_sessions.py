@@ -909,11 +909,13 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
         "type": "human_navigation",
         "instruction": "Complete verification for [redacted]",
     }
-    assert manager._replay_events(
+    navigation_replay = manager._replay_events(
         navigation_snapshot,
         tuple(record.events),
         999,
-    )[0].session.pending_action == navigation_snapshot.pending_action
+    )[0].session
+    assert navigation_replay.pending_action == navigation_snapshot.pending_action
+    assert navigation_replay.expires_at == navigation_snapshot.expires_at
     record.browser.current_url = "https://ats.example/application/42?token=private"
 
     await manager.command(created.session_id, ContinueCommand(type="continue"))
@@ -924,11 +926,13 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
         "type": "origin_approval",
         "origin": "https://ats.example",
     }
-    assert manager._replay_events(
+    origin_replay = manager._replay_events(
         origin_snapshot,
         tuple(record.events),
         999,
-    )[0].session.pending_action == origin_snapshot.pending_action
+    )[0].session
+    assert origin_replay.pending_action == origin_snapshot.pending_action
+    assert origin_replay.expires_at == origin_snapshot.expires_at
     with pytest.raises(HarnessServiceError) as wrong_origin:
         await manager.command(
             created.session_id,
@@ -950,11 +954,13 @@ async def test_navigation_origin_revision_ready_commands_and_resource_retention(
     assert review_snapshot.pending_action.model_dump(mode="json") == {
         "type": "human_review",
     }
-    assert manager._replay_events(
+    review_replay = manager._replay_events(
         review_snapshot,
         tuple(record.events),
         999,
-    )[0].session.pending_action == review_snapshot.pending_action
+    )[0].session
+    assert review_replay.pending_action == review_snapshot.pending_action
+    assert review_replay.expires_at == review_snapshot.expires_at
     await manager.command(
         created.session_id,
         ReviseCommand(type="revise", context="  Use the corrected project example  "),
@@ -2528,11 +2534,13 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
         ],
     }
     assert required.session.pending_action == snapshot.pending_action
-    assert manager._replay_events(
+    additional_info_replay = manager._replay_events(
         snapshot,
         tuple(record.events),
         999,
-    )[0].session.pending_action == snapshot.pending_action
+    )[0].session
+    assert additional_info_replay.pending_action == snapshot.pending_action
+    assert additional_info_replay.expires_at == snapshot.expires_at
     previous_store = (tmp_path / "user-info.json").read_bytes()
     with pytest.raises(HarnessServiceError) as partial:
         await manager.command(
@@ -2557,6 +2565,7 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
     assert (tmp_path / "user-info.json").read_bytes() == previous_store
     assert record.human_gate.pending_kind == "additional_info"
 
+    events_before_answers = len(record.events)
     answer_value = "June through August 2027"
     await manager.command(
         created.session_id,
@@ -2616,7 +2625,38 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
     )
     assert answer_value not in public_data
     assert '"status": "answered"' not in public_data
+    post_answer_public_data = json.dumps(
+        {
+            "snapshot": manager.get_snapshot(created.session_id).model_dump(mode="json"),
+            "events": [
+                event.model_dump(mode="json")
+                for event in tuple(record.events)[events_before_answers:]
+            ],
+        }
+    )
+    for accepted_private_value in (
+        answer_value,
+        "A friend",
+        "Remote",
+        "Hybrid",
+        '"option_id"',
+        '"option_ids"',
+        '"answers"',
+    ):
+        assert accepted_private_value not in post_answer_public_data
     disk = json.loads((tmp_path / "user-info.json").read_text(encoding="utf-8"))
+    assert set(disk) == {"version", "global", "applications"}
+    assert disk["version"] == 1
+    assert set(disk["global"]) == {
+        "availability.summer_2027",
+        "authorization.sponsorship_required",
+    }
+    assert set(disk["applications"]) == {JOB_URL}
+    assert set(disk["applications"][JOB_URL]) == {
+        "referral.source",
+        "preferences.work_modes",
+        "compensation.minimum",
+    }
     assert disk["global"]["availability.summer_2027"]["value"] == answer_value
     assert disk["applications"][JOB_URL]["referral.source"]["value"] == "A friend"
     assert disk["global"]["authorization.sponsorship_required"]["value"] is False
