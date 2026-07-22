@@ -202,11 +202,24 @@ describe("pipeline application bootstrap", () => {
     expect(listed.runs).toHaveLength(1);
     expect(listed.runs[0].id).toBe(created.id);
 
+    const applicationResponse = await fixture.app.fetch(new Request(
+      `http://127.0.0.1:3457/v1/runs/${created.id}/application`,
+    ));
+    expect(applicationResponse.status).toBe(200);
+    const application = await applicationResponse.json();
+    expect(application).toEqual({
+      state: "not_started",
+      canStart: false,
+      canStartAfterApproval: false,
+      blockedReason: "resume_not_approved",
+    });
+
     const publicBodies = JSON.stringify([
       await authResponse.clone().json(),
       await fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/context")).then((response) => response.json()),
       created,
       listed,
+      application,
     ]);
     expect(publicBodies).not.toContain(fixture.artifactRoot);
     expect(publicBodies).not.toContain("secret-value");

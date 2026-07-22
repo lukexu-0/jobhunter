@@ -3,6 +3,13 @@ import {
   createApplicationAgentRoutes,
   type ApplicationAgentRouteService,
 } from "./api/application-agent-routes.ts";
+import {
+  createApplicationSessionRoutes,
+  type ApplicationSessionRouteService,
+} from "./api/application-session-routes.ts";
+import type { ApplicationHarnessClient } from "./api/application-harness-client.ts";
+import { HttpApplicationHarnessClient } from "./api/application-harness-client.ts";
+import { ApplicationSessionService } from "./api/application-session-service.ts";
 import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
 import { createApiHandler } from "./api/handler.ts";
@@ -57,6 +64,9 @@ export interface PipelineApplicationOptions {
   readonly closeAuth?: () => void | Promise<void>;
   readonly browserHarnessToken?: string;
   readonly applicationAgent?: ApplicationAgentRouteService;
+  readonly applicationHarnessOrigin?: string;
+  readonly applicationHarness?: ApplicationHarnessClient;
+  readonly applicationSessions?: ApplicationSessionRouteService;
 }
 
 /** Internal handles are exposed for typed integration tests, not serialized by any route. */
@@ -69,6 +79,7 @@ export interface PipelineApplicationServices {
   readonly worker: PipelineWorkerHandle;
   readonly runs: RunApplicationService;
   readonly auth: ClosableAuthRouteService;
+  readonly applicationSessions: ApplicationSessionRouteService;
 }
 
 export interface PipelineApplication {
@@ -133,6 +144,23 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       : new ApplicationAgentService(browserHarnessToken, {
           authStatusReader: () => auth.getAuthStatus(),
         }));
+  const applicationHarnessOrigin = options.applicationHarnessOrigin ?? process.env.JOBHUNTER_HARNESS_URL;
+  const applicationSessions = options.applicationSessions ?? new ApplicationSessionService({
+    repository,
+    artifacts,
+    ...(
+      options.applicationHarness
+        ? { harness: options.applicationHarness }
+        : browserHarnessToken === undefined
+          ? {}
+          : {
+              harness: new HttpApplicationHarnessClient({
+                token: browserHarnessToken,
+                ...(applicationHarnessOrigin ? { origin: applicationHarnessOrigin } : {}),
+              }),
+            }
+    ),
+  });
   const routeApplicationAgent = createApplicationAgentRoutes(
     applicationAgent,
     browserHarnessToken,
@@ -143,12 +171,14 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeAuth = createAuthRoutes(auth);
   const routeContext = createContextRoutes(context);
   const routeRuns = createRunRoutes(runs);
+  const routeApplicationSessions = createApplicationSessionRoutes(applicationSessions);
   const fetch = createApiHandler({
     internalRoute: routeApplicationAgent,
     webOrigin: options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
     route: async (request, url) =>
       (await routeAuth(request, url))
       ?? (await routeContext(request, url))
+      ?? (await routeApplicationSessions(request, url))
       ?? (await routeRuns(request, url)),
   });
   const services = Object.freeze({
@@ -160,6 +190,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     worker,
     runs,
     auth,
+    applicationSessions,
   });
   let closePromise: Promise<void> | undefined;
 
