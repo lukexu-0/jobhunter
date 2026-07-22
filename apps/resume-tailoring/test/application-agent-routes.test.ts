@@ -18,17 +18,21 @@ const INPUT = {
   deadlineMs: 60_000,
 };
 const RESULT = {
-  status: "ready_for_human_submit" as const,
+  status: "submitted" as const,
   company: "Example Co",
   role: "Engineer",
   job_url: "https://jobs.example.test/role",
-  final_url: "https://apply.example.test/form",
+  final_url: "https://apply.example.test/confirmation",
   fields_filled: [],
   fields_needing_human: [],
   files_attached: ["resume.pdf"],
   warnings: [],
   revision_count: 0,
-  submit_attempted: false as const,
+  submit_attempted: true as const,
+  submission_confirmation: {
+    type: "post_submit_confirmation" as const,
+    text: "Application received",
+  },
 };
 const SUCCESS = {
   modelProvider: "openai-codex" as const,

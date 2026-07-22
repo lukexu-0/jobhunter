@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
 import { openPipelineDatabase } from "../src/db/database.ts";
-import { ClaimRejectedError, PipelineRepository, RepositoryConflictError, RunArtifactsPrunedError, SourceDriftError, type ActiveStage } from "../src/db/repository.ts";
+import { ApplicationSubmissionFinalError, ClaimRejectedError, PipelineRepository, RepositoryConflictError, RunArtifactsPrunedError, SourceDriftError, type ActiveStage } from "../src/db/repository.ts";
 import { isProcessIdentityAlive, readProcessStartToken } from "../src/worker/claims.ts";
+import { ApplicationSessionSnapshotDtoSchema } from "../src/contracts/index.ts";
 
 const databases: Database[] = [];
+const SUBMISSION_UNCERTAIN_WARNING =
+  "The application submission could not be verified. Check the headed browser if it is still available, then close this session.";
 afterEach(() => { while (databases.length) databases.pop()?.close(); });
 
 function fixture(options: { now?: number; alive?: boolean } = {}) {
@@ -37,6 +40,19 @@ function createReview(repo: PipelineRepository, hash = "a".repeat(64), visualAck
   repo.transition(claim, "review", { visualAcknowledgementRequired: visualAck });
   repo.release(claim);
   return run.id;
+}
+
+function recordApplicationReview(
+  repo: PipelineRepository,
+  runId: string,
+  sessionId: string,
+): void {
+  repo.recordApplicationSnapshot(runId, {
+    generation: 1,
+    sessionId,
+    bridgeState: "awaiting_human_review",
+    publicSnapshot: { state: "awaiting_human_review" },
+  });
 }
 
 describe("pipeline repository claims", () => {
@@ -149,6 +165,37 @@ describe("persisted workflow commands", () => {
     });
     expect(() => repo.setIdentity(created.id, {})).toThrow(/required/);
     expect(() => repo.setIdentity(created.id, { title: " padded " })).toThrow(/trimmed/);
+  });
+
+  test("projects canonical job URLs and omits legacy null values", () => {
+    const { repo } = fixture();
+    const legacy = repo.createRun("Legacy JD", "legacy-job-url");
+    const jobUrl = "https://jobs.example.test/role?gh_jid=123&source=repository";
+    const canonical = repo.createQueuedRun(
+      "Canonical JD",
+      jobUrl,
+      {
+        manifestSha256: "1".repeat(64),
+        baselineSha256: "2".repeat(64),
+        sourceHashes: {
+          baseline: "2".repeat(64),
+          automated: "3".repeat(64),
+          scheduler: "4".repeat(64),
+          sampleProject: "5".repeat(64),
+        },
+      },
+      {
+        sha256: "6".repeat(64),
+        path: "/tmp/canonical-job-description.txt",
+        byteSize: 12,
+      },
+      "canonical-job-url",
+    );
+
+    expect(canonical.jobUrl).toBe(jobUrl);
+    expect(repo.getRun(canonical.id)?.jobUrl).toBe(jobUrl);
+    expect(legacy).not.toHaveProperty("jobUrl");
+    expect(repo.getRun(legacy.id)).not.toHaveProperty("jobUrl");
   });
 
   test("soft deletion preserves history while hiding runs, artifacts, and scheduler candidates", () => {
@@ -426,6 +473,7 @@ describe("application session ledger", () => {
       resumeRevision: 1,
       pdfSha256: hash,
       bridgeState: "reserved",
+      submissionPhase: "not_attempted",
       publicSnapshot: null,
       lastUpstreamEventId: null,
       createdAt: 1_000,
@@ -439,6 +487,297 @@ describe("application session ledger", () => {
       "22222222-2222-4222-8222-222222222222",
       hash,
     )).toThrow(/changed/);
+  });
+
+  test("claims before submission and finalizes one durable outcome atomically", () => {
+    const { db, repo, tick } = fixture();
+    const hash = "8".repeat(64);
+    const runId = createReview(repo, hash);
+    repo.approve(runId, hash);
+    const sessionId = "22222222-2222-4222-8222-222222222222";
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "awaiting_human_review",
+      publicSnapshot: { state: "awaiting_human_review" },
+    });
+
+    repo.claimApplicationSubmission(sessionId);
+
+    expect(db.query<{
+      bridge_state: string;
+      submission_phase: string;
+      submission_attempted_at: number | null;
+      submission_confirmed_at: number | null;
+    }, [string]>(`
+      SELECT bridge_state, submission_phase, submission_attempted_at,
+             submission_confirmed_at
+      FROM run_application_sessions
+      WHERE session_id = ?
+    `).get(sessionId)).toEqual({
+      bridge_state: "awaiting_human_review",
+      submission_phase: "attempting",
+      submission_attempted_at: 1_000,
+      submission_confirmed_at: null,
+    });
+    expect(() => repo.claimApplicationSubmission(sessionId)).toThrow(/already claimed/);
+    tick(25);
+
+    repo.finalizeApplicationSubmission(sessionId, "submitted");
+
+    const finalized = db.query<{
+      submission_phase: string;
+      submission_attempted_at: number;
+      submission_confirmed_at: number | null;
+    }, [string]>(`
+      SELECT submission_phase, submission_attempted_at, submission_confirmed_at
+      FROM run_application_sessions
+      WHERE session_id = ?
+    `).get(sessionId);
+    expect(finalized).toEqual({
+      submission_phase: "submitted",
+      submission_attempted_at: 1_000,
+      submission_confirmed_at: 1_025,
+    });
+    expect(repo.getRun(runId)?.applicationStatus).toBe("applied");
+    repo.finalizeApplicationSubmission(sessionId, "submitted");
+    expect(db.query<{
+      submission_confirmed_at: number;
+    }, [string]>(
+      "SELECT submission_confirmed_at FROM run_application_sessions WHERE session_id = ?",
+    ).get(sessionId)?.submission_confirmed_at).toBe(1_025);
+    expect(() => repo.finalizeApplicationSubmission(sessionId, "uncertain"))
+      .toThrow(/conflicting submission outcome/);
+  });
+
+  test("claims only the current session awaiting human review", () => {
+    const { repo } = fixture();
+    const hash = "d".repeat(64);
+    const states = ["running", "cancelled"] as const;
+    for (const [index, bridgeState] of states.entries()) {
+      const runId = createReview(repo, hash, false, `claim-state-${bridgeState}`);
+      repo.approve(runId, hash);
+      const sessionId =
+        `50505050-5050-4050-8050-${String(index + 1).padStart(12, "0")}`;
+      repo.reserveApplicationSession(runId, null, sessionId, hash);
+      repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState,
+        publicSnapshot: { state: bridgeState },
+      });
+
+      expect(() => repo.claimApplicationSubmission(sessionId))
+        .toThrow(/not awaiting human review/);
+      expect(repo.getLatestApplicationSession(runId)).toMatchObject({
+        bridgeState,
+        submissionPhase: "not_attempted",
+      });
+    }
+  });
+
+  test("submitted finalization preserves downstream lifecycles while uncertainty never applies", () => {
+    const { repo } = fixture();
+    const hash = "c".repeat(64);
+    const cases = [
+      ["failed", "submitted", "applied"],
+      ["rejected", "submitted", "rejected"],
+      ["interview", "submitted", "interview"],
+      ["accepted", "submitted", "accepted"],
+      ["pending", "uncertain", "pending"],
+    ] as const;
+    for (const [index, [before, outcome, expected]] of cases.entries()) {
+      const runId = createReview(repo, hash, false, `final-status-${index}`);
+      repo.approve(runId, hash);
+      repo.setApplicationStatus(runId, before);
+      const sessionId =
+        `60606060-6060-4060-8060-${String(index + 1).padStart(12, "0")}`;
+      repo.reserveApplicationSession(runId, null, sessionId, hash);
+      recordApplicationReview(repo, runId, sessionId);
+      repo.claimApplicationSubmission(sessionId);
+      repo.finalizeApplicationSubmission(sessionId, outcome);
+      expect(repo.getRun(runId)?.applicationStatus).toBe(expected);
+    }
+  });
+
+  test("final submission phases reject regression but permit explicit browser close", () => {
+    const { repo } = fixture();
+    const hash = "e".repeat(64);
+    for (const [index, outcome] of (["submitted", "uncertain"] as const).entries()) {
+      const runId = createReview(repo, hash, false, `final-regression-${outcome}`);
+      repo.approve(runId, hash);
+      const sessionId =
+        `70707070-7070-4070-8070-${String(index + 1).padStart(12, "0")}`;
+      repo.reserveApplicationSession(runId, null, sessionId, hash);
+      recordApplicationReview(repo, runId, sessionId);
+      repo.claimApplicationSubmission(sessionId);
+      repo.finalizeApplicationSubmission(sessionId, outcome);
+      const finalState = outcome === "submitted" ? "submitted" : "submission_uncertain";
+      repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: finalState,
+        publicSnapshot: { state: finalState },
+      });
+
+      expect(() => repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: "running",
+        publicSnapshot: { state: "running" },
+      })).toThrow(/submission phase/);
+      const closed = repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: "closed",
+        publicSnapshot: { state: "closed" },
+      });
+      expect(closed).toMatchObject({
+        bridgeState: "closed",
+        submissionPhase: outcome,
+      });
+    }
+  });
+
+  test("reconciles every interrupted attempt to retained uncertainty before retry", () => {
+    const { db, repo, tick } = fixture();
+    const hash = "b".repeat(64);
+    const sessionIds = [
+      "90909090-9090-4090-8090-909090909090",
+      "91919191-9191-4191-8191-919191919191",
+    ] as const;
+    for (const [index, sessionId] of sessionIds.entries()) {
+      const runId = createReview(repo, hash, false, `reconcile-${index}`);
+      repo.approve(runId, hash);
+      repo.reserveApplicationSession(runId, null, sessionId, hash);
+      if (index === 0) {
+        repo.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId,
+          bridgeState: "awaiting_human_review",
+          publicSnapshot: {
+            generation: 1,
+            bridgeState: "awaiting_human_review",
+            harnessState: "awaiting_human_review",
+            submissionPhase: "not_attempted",
+            createdAt: 1_000,
+            updatedAt: 1_001,
+            terminalAt: null,
+            expiresAt: 9_000,
+            company: "Example",
+            role: "Engineer",
+            fieldsFilled: [],
+            fieldsNeedingHuman: [],
+            filesAttached: ["resume.pdf"],
+            warnings: [SUBMISSION_UNCERTAIN_WARNING, "Review changed"],
+            revisionCount: 1,
+            pendingAction: { type: "human_review" },
+            error: null,
+          },
+        });
+      } else {
+        recordApplicationReview(repo, runId, sessionId);
+      }
+      repo.claimApplicationSubmission(sessionId);
+      if (index === 1) {
+        db.query(
+          "UPDATE run_application_sessions SET public_snapshot_json = NULL WHERE session_id = ?",
+        ).run(sessionId);
+      }
+    }
+    tick(25);
+
+    expect(repo.reconcileAttemptingApplicationSubmissions()).toBe(2);
+    expect(repo.reconcileAttemptingApplicationSubmissions()).toBe(0);
+
+    for (const [index, sessionId] of sessionIds.entries()) {
+      const runId = `reconcile-${index}`;
+      const reconciled = repo.getLatestApplicationSession(runId);
+      expect(reconciled).toMatchObject({
+        bridgeState: "submission_uncertain",
+        submissionPhase: "uncertain",
+        terminalAt: null,
+      });
+      const projection = ApplicationSessionSnapshotDtoSchema.parse(reconciled?.publicSnapshot);
+      expect(projection).toMatchObject({
+        bridgeState: "submission_uncertain",
+        harnessState: "submission_uncertain",
+        submissionPhase: "uncertain",
+        pendingAction: null,
+        terminalAt: null,
+        error: null,
+      });
+      expect(projection.warnings.at(-1)).toBe(SUBMISSION_UNCERTAIN_WARNING);
+      expect(projection.warnings.filter((warning) => warning === SUBMISSION_UNCERTAIN_WARNING))
+        .toHaveLength(1);
+      if (index === 0) {
+        expect(projection.warnings).toEqual(["Review changed", SUBMISSION_UNCERTAIN_WARNING]);
+        expect(projection.company).toBe("Example");
+      } else {
+        expect(projection.company).toBeNull();
+      }
+      repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: "closed",
+        publicSnapshot: {
+          ...projection,
+          bridgeState: "closed",
+          harnessState: "closed",
+          updatedAt: projection.updatedAt + 1,
+          terminalAt: 1_025,
+        },
+      });
+      expect(repo.getLatestApplicationSession(runId)?.submissionPhase).toBe("uncertain");
+      expect(() => repo.reserveApplicationSession(
+        runId,
+        sessionId,
+        index === 0
+          ? "92929292-9292-4292-8292-929292929292"
+          : "93939393-9393-4393-8393-939393939393",
+        hash,
+      )).toThrow(ApplicationSubmissionFinalError);
+    }
+  });
+
+  test("reconciliation preserves an already closed browser while retaining uncertainty", () => {
+    const { db, repo, tick } = fixture();
+    const hash = "f".repeat(64);
+    const runId = createReview(repo, hash, false, "reconcile-closed");
+    repo.approve(runId, hash);
+    const sessionId = "94949494-9494-4494-8494-949494949494";
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    recordApplicationReview(repo, runId, sessionId);
+    repo.claimApplicationSubmission(sessionId);
+    db.query(`
+      UPDATE run_application_sessions
+      SET bridge_state = 'closed', terminal_at = 1010, public_snapshot_json = NULL
+      WHERE session_id = ?
+    `).run(sessionId);
+    tick(25);
+
+    expect(repo.reconcileAttemptingApplicationSubmissions()).toBe(1);
+
+    const reconciled = repo.getLatestApplicationSession(runId);
+    expect(reconciled).toMatchObject({
+      bridgeState: "closed",
+      submissionPhase: "uncertain",
+      terminalAt: 1_010,
+    });
+    expect(ApplicationSessionSnapshotDtoSchema.parse(reconciled?.publicSnapshot)).toMatchObject({
+      bridgeState: "closed",
+      harnessState: null,
+      submissionPhase: "uncertain",
+      terminalAt: 1_010,
+      warnings: [SUBMISSION_UNCERTAIN_WARNING],
+    });
+    expect(() => repo.reserveApplicationSession(
+      runId,
+      sessionId,
+      "95959595-9595-4595-8595-959595959595",
+      hash,
+    )).toThrow(ApplicationSubmissionFinalError);
   });
 
   test("records projected snapshots and monotonic upstream cursors for only the current generation", () => {
@@ -618,7 +957,9 @@ describe("artifact retention reservations", () => {
       "awaiting_origin_approval",
       "awaiting_additional_info",
       "awaiting_human_review",
-      "ready_for_human_submit",
+      "submitting",
+      "submitted",
+      "submission_uncertain",
     ] as const;
     const terminalStates = ["cancelled", "failed", "closed", "lost"] as const;
     const hash = "2".repeat(64);
@@ -636,11 +977,27 @@ describe("artifact retention reservations", () => {
     }
     for (const [index, bridgeState] of liveStates.entries()) {
       const runId = liveRunIds[index]!;
-      live.reserveApplicationSession(runId, null, sessionId(index), hash);
-      if (bridgeState !== "reserved") {
+      const currentSessionId = sessionId(index);
+      live.reserveApplicationSession(runId, null, currentSessionId, hash);
+      if (bridgeState === "submitting" || bridgeState === "submitted" || bridgeState === "submission_uncertain") {
+        recordApplicationReview(live, runId, currentSessionId);
+        live.claimApplicationSubmission(currentSessionId);
+        if (bridgeState !== "submitting") {
+          live.finalizeApplicationSubmission(
+            currentSessionId,
+            bridgeState === "submitted" ? "submitted" : "uncertain",
+          );
+        }
         live.recordApplicationSnapshot(runId, {
           generation: 1,
-          sessionId: sessionId(index),
+          sessionId: currentSessionId,
+          bridgeState,
+          publicSnapshot: { state: bridgeState },
+        });
+      } else if (bridgeState !== "reserved") {
+        live.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId: currentSessionId,
           bridgeState,
           publicSnapshot: { state: bridgeState },
         });

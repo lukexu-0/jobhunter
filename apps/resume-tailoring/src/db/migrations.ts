@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const PIPELINE_SCHEMA_VERSION = 10;
+export const PIPELINE_SCHEMA_VERSION = 11;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -219,6 +219,209 @@ BEGIN
 END;
 `;
 
+const SUBMISSION_UNCERTAIN_WARNING =
+  "The application submission could not be verified. Check the headed browser if it is still available, then close this session.";
+
+const migration11ApplicationSessionsTable = `
+CREATE TABLE run_application_sessions_pending_migration (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  session_id TEXT NOT NULL UNIQUE CHECK (
+    length(session_id) = 36
+    AND substr(session_id, 9, 1) = '-'
+    AND substr(session_id, 14, 1) = '-'
+    AND substr(session_id, 19, 1) = '-'
+    AND substr(session_id, 24, 1) = '-'
+    AND replace(session_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+  ),
+  resume_revision INTEGER NOT NULL CHECK (resume_revision > 0),
+  pdf_sha256 TEXT NOT NULL CHECK (length(pdf_sha256) = 64),
+  bridge_state TEXT NOT NULL CHECK (
+    bridge_state IN (
+      'reserved',
+      'starting',
+      'running',
+      'awaiting_human_navigation',
+      'awaiting_origin_approval',
+      'awaiting_additional_info',
+      'awaiting_human_review',
+      'submitting',
+      'submitted',
+      'submission_uncertain',
+      'cancelled',
+      'failed',
+      'closed',
+      'lost'
+    )
+  ),
+  submission_phase TEXT NOT NULL DEFAULT 'not_attempted' CHECK (
+    submission_phase IN ('not_attempted','attempting','submitted','uncertain')
+  ),
+  submission_attempted_at INTEGER,
+  submission_confirmed_at INTEGER,
+  public_snapshot_json TEXT CHECK (
+    public_snapshot_json IS NULL OR json_valid(public_snapshot_json)
+  ),
+  last_upstream_event_id INTEGER CHECK (
+    last_upstream_event_id IS NULL OR last_upstream_event_id >= 0
+  ),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  terminal_at INTEGER,
+  PRIMARY KEY (run_id, generation),
+  FOREIGN KEY (run_id, resume_revision)
+    REFERENCES revisions(run_id, revision) ON DELETE RESTRICT,
+  CHECK (
+    (bridge_state IN ('cancelled','failed','closed','lost') AND terminal_at IS NOT NULL)
+    OR
+    (bridge_state NOT IN ('cancelled','failed','closed','lost') AND terminal_at IS NULL)
+  ),
+  CHECK (
+    (
+      submission_phase = 'not_attempted'
+      AND submission_attempted_at IS NULL
+      AND submission_confirmed_at IS NULL
+    )
+    OR
+    (
+      submission_phase = 'attempting'
+      AND submission_attempted_at IS NOT NULL
+      AND submission_confirmed_at IS NULL
+    )
+    OR
+    (
+      submission_phase = 'submitted'
+      AND submission_attempted_at IS NOT NULL
+      AND submission_confirmed_at IS NOT NULL
+    )
+    OR
+    (
+      submission_phase = 'uncertain'
+      AND submission_attempted_at IS NOT NULL
+      AND submission_confirmed_at IS NULL
+    )
+  )
+) STRICT;
+`;
+
+interface LegacyApplicationSessionMigrationRow {
+  run_id: string;
+  generation: number;
+  session_id: string;
+  resume_revision: number;
+  pdf_sha256: string;
+  bridge_state: string;
+  public_snapshot_json: string | null;
+  last_upstream_event_id: number | null;
+  created_at: number;
+  updated_at: number;
+  terminal_at: number | null;
+}
+
+function migratedApplicationSnapshot(
+  row: LegacyApplicationSessionMigrationRow,
+  now: number,
+): { readonly json: string | null; readonly updatedAt: number } {
+  if (row.public_snapshot_json === null) {
+    return {
+      json: null,
+      updatedAt: row.bridge_state === "ready_for_human_submit"
+        ? Math.max(row.updated_at + 1, now)
+        : row.updated_at,
+    };
+  }
+  const parsed = JSON.parse(row.public_snapshot_json) as unknown;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("application session snapshot is not an object");
+  }
+  const snapshot = parsed as Record<string, unknown>;
+  if (row.bridge_state !== "ready_for_human_submit") {
+    return {
+      json: JSON.stringify({ ...snapshot, submissionPhase: "not_attempted" }),
+      updatedAt: row.updated_at,
+    };
+  }
+
+  const snapshotUpdatedAt = Number.isSafeInteger(snapshot.updatedAt)
+    && (snapshot.updatedAt as number) >= 0
+    ? snapshot.updatedAt as number
+    : row.updated_at;
+  const updatedAt = Math.max(row.updated_at + 1, snapshotUpdatedAt + 1, now);
+  const warnings = Array.isArray(snapshot.warnings)
+    ? snapshot.warnings.filter(
+      (warning): warning is string => typeof warning === "string"
+        && warning !== SUBMISSION_UNCERTAIN_WARNING,
+    ).slice(0, 99)
+    : [];
+  return {
+    json: JSON.stringify({
+      ...snapshot,
+      bridgeState: "submission_uncertain",
+      harnessState: "submission_uncertain",
+      submissionPhase: "uncertain",
+      pendingAction: null,
+      terminalAt: null,
+      error: null,
+      updatedAt,
+      warnings: [...warnings, SUBMISSION_UNCERTAIN_WARNING],
+    }),
+    updatedAt,
+  };
+}
+
+function migrateApplicationSubmissionLedger(db: Database, now: number): void {
+  const rows = db.query<LegacyApplicationSessionMigrationRow, []>(
+    "SELECT * FROM run_application_sessions ORDER BY run_id, generation",
+  ).all();
+  db.exec(migration11ApplicationSessionsTable);
+  const insert = db.query(`
+    INSERT INTO run_application_sessions_pending_migration(
+      run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
+      submission_phase, submission_attempted_at, submission_confirmed_at,
+      public_snapshot_json, last_upstream_event_id, created_at, updated_at, terminal_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of rows) {
+    const legacyReady = row.bridge_state === "ready_for_human_submit";
+    const snapshot = migratedApplicationSnapshot(row, now);
+    insert.run(
+      row.run_id,
+      row.generation,
+      row.session_id,
+      row.resume_revision,
+      row.pdf_sha256,
+      legacyReady ? "submission_uncertain" : row.bridge_state,
+      legacyReady ? "uncertain" : "not_attempted",
+      legacyReady ? row.updated_at : null,
+      null,
+      snapshot.json,
+      row.last_upstream_event_id,
+      row.created_at,
+      snapshot.updatedAt,
+      legacyReady ? null : row.terminal_at,
+    );
+  }
+  db.exec("DROP TABLE run_application_sessions");
+  db.exec(
+    "ALTER TABLE run_application_sessions_pending_migration RENAME TO run_application_sessions",
+  );
+  db.exec(`
+    CREATE INDEX run_application_sessions_latest
+      ON run_application_sessions(run_id, generation DESC);
+    CREATE TRIGGER run_application_sessions_no_delete
+    BEFORE DELETE ON run_application_sessions
+    BEGIN
+      SELECT RAISE(ABORT, 'application session history cannot be deleted');
+    END;
+  `);
+  const foreignKeyFailures = db.query<{ table: string }, []>(
+    "PRAGMA foreign_key_check",
+  ).all();
+  if (foreignKeyFailures.length > 0) {
+    throw new Error("foreign key integrity check failed after application session migration");
+  }
+}
+
 const runsTableDeclaration = /^CREATE TABLE\s+(?:"runs"|runs)(?=\s*\()/i;
 
 function replaceRunsTable(db: Database, upgradedRunsSql: string): void {
@@ -330,6 +533,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 10) {
         db.exec(migration10);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(10, now);
+      }
+      if (version < 11) {
+        migrateApplicationSubmissionLedger(db, now);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(11, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

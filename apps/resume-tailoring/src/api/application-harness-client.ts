@@ -236,7 +236,17 @@ const RawEventSchema = z.discriminatedUnion("event", [
   }).strict(),
   z.object({
     ...RawEventBaseShape,
-    event: z.literal("ready_for_human_submit"),
+    event: z.literal("submission_started"),
+    detail: EmptyEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...RawEventBaseShape,
+    event: z.literal("application_submitted"),
+    detail: EmptyEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...RawEventBaseShape,
+    event: z.literal("submission_uncertain"),
     detail: EmptyEventDetailSchema,
   }).strict(),
   z.object({
@@ -264,7 +274,9 @@ export type ApplicationHarnessEvent =
       | "session_started"
       | "snapshot"
       | "review_required"
-      | "ready_for_human_submit"
+      | "submission_started"
+      | "application_submitted"
+      | "submission_uncertain"
       | "cancelled"
       | "failed"
       | "closed";

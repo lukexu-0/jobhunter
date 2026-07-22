@@ -206,6 +206,45 @@ test("prunes only the two oldest inactive run trees while preserving all SQLite 
   });
 });
 
+test("parks submitted artifacts until browser close, then releases only liveness", async () => {
+  const ids = Array.from({ length: 12 }, (_, index) => `submitted-${index}`);
+  const { artifacts, records, repository } = await persistedReviewWindow(ids);
+  const runId = ids[0]!;
+  const pdf = repository.getArtifact(runId, "compiled-pdf", 1);
+  if (!pdf) throw new Error("compiled PDF missing");
+  repository.approve(runId, pdf.sha256);
+  const sessionId = "70707070-7070-4070-8070-707070707070";
+  repository.reserveApplicationSession(runId, null, sessionId, pdf.sha256);
+  repository.recordApplicationSnapshot(runId, {
+    generation: 1,
+    sessionId,
+    bridgeState: "awaiting_human_review",
+    publicSnapshot: { state: "awaiting_human_review" },
+  });
+  repository.claimApplicationSubmission(sessionId);
+  repository.finalizeApplicationSubmission(sessionId, "submitted");
+  repository.recordApplicationSnapshot(runId, {
+    generation: 1,
+    sessionId,
+    bridgeState: "submitted",
+    publicSnapshot: { state: "submitted" },
+  });
+
+  await expect(enforceRunArtifactRetention(repository, artifacts)).resolves.toBe(1);
+  expect(existsSync(join(artifacts.root, String(records[0]!.queueSequence)))).toBeTrue();
+  expect(existsSync(join(artifacts.root, String(records[1]!.queueSequence)))).toBeFalse();
+
+  repository.recordApplicationSnapshot(runId, {
+    generation: 1,
+    sessionId,
+    bridgeState: "closed",
+    publicSnapshot: { state: "closed" },
+  });
+  expect(repository.getLatestApplicationSession(runId)?.submissionPhase).toBe("submitted");
+  await expect(enforceRunArtifactRetention(repository, artifacts)).resolves.toBe(1);
+  expect(existsSync(join(artifacts.root, String(records[0]!.queueSequence)))).toBeFalse();
+});
+
 test("temporarily keeps an old active run and prunes it after it becomes inactive", async () => {
   const ids = Array.from({ length: 12 }, (_, index) => `active-${index === 0 ? "z" : index}`);
   const { artifacts, db, repository } = await persistedReviewWindow(ids);

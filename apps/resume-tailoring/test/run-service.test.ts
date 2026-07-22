@@ -39,7 +39,7 @@ import {
 } from "../src/contracts/index.ts";
 
 const ORIGIN = "http://127.0.0.1:3456";
-const JOB_URL = "https://jobs.example.test/role";
+const JOB_URL = "https://jobs.example.test/role?gh_jid=123&source=service";
 const JOB_DESCRIPTION = "A detailed role requiring TypeScript systems work, careful testing, ownership, and reliable delivery.";
 const fixtures: string[] = [];
 const databases: Database[] = [];
@@ -241,7 +241,7 @@ describe("RunApplicationService", () => {
     expect(run).toMatchObject({ id: "run-1", status: "queued", revision: 1, origin: "initial" });
     expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(true);
     expect(target.repository.getRunJobUrl(run.id)).toBe(JOB_URL);
-    expect(JSON.stringify(run)).not.toContain(JOB_URL);
+    expect(run.jobUrl).toBe(JOB_URL);
     const disabled = await target.service.createRun(JOB_URL, false);
     expect(target.repository.getRun(disabled.id)?.generateKeywordMap).toBe(false);
     expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(4);
@@ -250,16 +250,23 @@ describe("RunApplicationService", () => {
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
     expect(target.repository.acquire()?.runId).toBe(run.id);
   });
-  test("exposes durable queue settings on created, listed, and retrieved run DTOs", async () => {
+  test("exposes durable queue settings and canonical job URLs on created, listed, and retrieved run DTOs", async () => {
     const target = fixture();
     const created = await target.service.createRun(JOB_URL, false);
     const listed = await target.service.listRuns();
     const retrieved = await target.service.getRun(created.id);
 
-    expect(created).toMatchObject({ queueSequence: 1, generateKeywordMap: false });
+    expect(created).toMatchObject({ queueSequence: 1, generateKeywordMap: false, jobUrl: JOB_URL });
     expect(listed).toHaveLength(1);
-    expect(listed[0]).toMatchObject({ queueSequence: 1, generateKeywordMap: false });
-    expect(retrieved).toMatchObject({ queueSequence: 1, generateKeywordMap: false });
+    expect(listed[0]).toMatchObject({ queueSequence: 1, generateKeywordMap: false, jobUrl: JOB_URL });
+    expect(retrieved).toMatchObject({ queueSequence: 1, generateKeywordMap: false, jobUrl: JOB_URL });
+  });
+  test("omits the job URL for legacy runs", async () => {
+    const target = fixture();
+    const legacy = target.repository.createRun(JOB_DESCRIPTION, "legacy-run");
+
+    expect(legacy).not.toHaveProperty("jobUrl");
+    expect(await target.service.getRun(legacy.id)).not.toHaveProperty("jobUrl");
   });
   test("uses sanitized fallback lines and persists only the exact reconstructed description", async () => {
     const controller = new AbortController();
@@ -295,7 +302,7 @@ describe("RunApplicationService", () => {
     expect(target.pipelineDatabase.query<{ job_description: string }, [string]>(
       "SELECT job_description FROM runs WHERE id = ?",
     ).get(run.id)?.job_description).toBe(selected);
-    expect(JSON.stringify(run)).not.toContain(JOB_URL);
+    expect(run.jobUrl).toBe(JOB_URL);
   });
 
   test("bubbles loader failures and maps only fixed fallback failures before persistence", async () => {

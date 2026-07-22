@@ -369,10 +369,37 @@ export const TimelineEventSchema = z
   .strict();
 export type TimelineEvent = z.infer<typeof TimelineEventSchema>;
 
+export const JOB_URL_MAX_CHARS = 2_048;
+export const JobUrlSchema = z.string().trim().transform((value, ctx) => {
+  try {
+    if (value.length > JOB_URL_MAX_CHARS) throw new Error("Job URL exceeds the input limit");
+
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error("Job URL uses an unsupported protocol");
+    }
+    if (url.username || url.password) throw new Error("Job URL contains credentials");
+
+    url.hash = "";
+    const canonicalUrl = url.href;
+    if (canonicalUrl.length > JOB_URL_MAX_CHARS) {
+      throw new Error("Canonical job URL exceeds the input limit");
+    }
+    return canonicalUrl;
+  } catch {
+    ctx.addIssue({
+      code: "custom",
+      message: "Job URL must be a valid HTTP(S) URL",
+    });
+    return z.NEVER;
+  }
+});
+
 
 export const RunDtoSchema = z
   .object({
     id: z.string(),
+    jobUrl: JobUrlSchema.optional(),
     status: RunStatusSchema,
     applicationStatus: ApplicationStatusSchema,
     titleOverride: RunIdentityTextSchema.optional(),
@@ -400,7 +427,9 @@ export const HarnessSessionStateSchema = z.enum([
   "awaiting_origin_approval",
   "awaiting_additional_info",
   "awaiting_human_review",
-  "ready_for_human_submit",
+  "submitting",
+  "submitted",
+  "submission_uncertain",
   "cancelled",
   "failed",
   "closed",
@@ -414,6 +443,16 @@ export const ApplicationSessionBridgeStateSchema = z.enum([
 ]);
 export type ApplicationSessionBridgeState = z.infer<
   typeof ApplicationSessionBridgeStateSchema
+>;
+
+export const ApplicationSubmissionPhaseSchema = z.enum([
+  "not_attempted",
+  "attempting",
+  "submitted",
+  "uncertain",
+]);
+export type ApplicationSubmissionPhase = z.infer<
+  typeof ApplicationSubmissionPhaseSchema
 >;
 
 export const ApplicationFieldResultSchema = z.object({
@@ -552,6 +591,7 @@ export const ApplicationSessionSnapshotDtoSchema = z.object({
   generation: z.number().int().positive(),
   bridgeState: ApplicationSessionBridgeStateSchema,
   harnessState: HarnessSessionStateSchema.nullable(),
+  submissionPhase: ApplicationSubmissionPhaseSchema,
   createdAt: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
   terminalAt: z.number().int().nonnegative().nullable(),
@@ -596,6 +636,30 @@ export const ApplicationSessionSnapshotDtoSchema = z.object({
       code: "custom",
       path: ["harnessState"],
       message: "harness state does not match bridge state",
+    });
+  }
+  if (
+    (snapshot.bridgeState === "submitting" && snapshot.submissionPhase !== "attempting")
+    || (snapshot.bridgeState === "submitted" && snapshot.submissionPhase !== "submitted")
+    || (
+      snapshot.bridgeState === "submission_uncertain"
+      && snapshot.submissionPhase !== "uncertain"
+    )
+    || (
+      snapshot.submissionPhase === "submitted"
+      && snapshot.bridgeState !== "submitted"
+      && snapshot.bridgeState !== "closed"
+    )
+    || (
+      snapshot.submissionPhase === "uncertain"
+      && snapshot.bridgeState !== "submission_uncertain"
+      && snapshot.bridgeState !== "closed"
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["submissionPhase"],
+      message: "submission phase does not match bridge state",
     });
   }
   const expectedPendingAction = PENDING_ACTION_BY_STATE[snapshot.bridgeState];
@@ -685,7 +749,17 @@ export const ApplicationSessionEventDtoSchema = z.discriminatedUnion("event", [
   }).strict(),
   z.object({
     ...ApplicationEventBaseShape,
-    event: z.literal("ready_for_human_submit"),
+    event: z.literal("submission_started"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("application_submitted"),
+    detail: EmptyApplicationEventDetailSchema,
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("submission_uncertain"),
     detail: EmptyApplicationEventDetailSchema,
   }).strict(),
   z.object({
@@ -764,7 +838,7 @@ export const ApplicationSessionCommandSchema = z.discriminatedUnion("type", [
     context: z.string().trim()
       .refine((value) => hasCodePointLength(value, 1, 20_000)),
   }).strict(),
-  z.object({ type: z.literal("ready") }).strict(),
+  z.object({ type: z.literal("submit") }).strict(),
   z.object({ type: z.literal("cancel") }).strict(),
 ]);
 export type ApplicationSessionCommand = z.infer<typeof ApplicationSessionCommandSchema>;
@@ -819,7 +893,6 @@ export type StartApplicationSessionRequest = z.infer<
   typeof StartApplicationSessionRequestSchema
 >;
 
-export const JOB_URL_MAX_CHARS = 2_048;
 export const JOB_DESCRIPTION_MIN_CHARS = 40;
 export const JOB_DESCRIPTION_MAX_CHARS = 50_000;
 
@@ -829,30 +902,6 @@ export const JobDescriptionSchema = z
   .min(JOB_DESCRIPTION_MIN_CHARS)
   .max(JOB_DESCRIPTION_MAX_CHARS);
 
-export const JobUrlSchema = z.string().trim().transform((value, ctx) => {
-  try {
-    if (value.length > JOB_URL_MAX_CHARS) throw new Error("Job URL exceeds the input limit");
-
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("Job URL uses an unsupported protocol");
-    }
-    if (url.username || url.password) throw new Error("Job URL contains credentials");
-
-    url.hash = "";
-    const canonicalUrl = url.href;
-    if (canonicalUrl.length > JOB_URL_MAX_CHARS) {
-      throw new Error("Canonical job URL exceeds the input limit");
-    }
-    return canonicalUrl;
-  } catch {
-    ctx.addIssue({
-      code: "custom",
-      message: "Job URL must be a valid HTTP(S) URL",
-    });
-    return z.NEVER;
-  }
-});
 
 export const RunListResponseSchema = z.object({ runs: z.array(RunDtoSchema) }).strict();
 export const CreateRunRequestSchema = z.object({

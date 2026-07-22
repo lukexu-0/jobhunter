@@ -31,11 +31,12 @@ export function createTerminalSubmission<S extends z.ZodObject>(options: {
   timeoutMs?: number;
   maxBytes?: number;
   assertActive?: () => void;
-  validate?: (value: z.output<S>) => void;
+  validate?: (value: z.output<S>) => void | Promise<void>;
   formatValidationError?: (error: unknown) => string;
 }): TerminalSubmission<z.output<S>> {
   let calls = 0;
   let submittedValue: z.output<S> | undefined;
+  let validationInFlight = false;
   const shared = options.sharedSubmitted ?? { value: false };
   const maxBytes = options.maxBytes ?? MAX_SUBMISSION_BYTES;
   const parameters: z.ZodObject = options.schema;
@@ -56,9 +57,11 @@ export function createTerminalSubmission<S extends z.ZodObject>(options: {
       },
     timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
     timeoutBehavior: "raise_exception",
-    execute: (input: unknown): z.output<S> => {
+    execute: async (input: unknown): Promise<z.output<S>> => {
       options.assertActive?.();
-      if (shared.value || calls !== 0) throw new Error(`${options.name} may be called exactly once`);
+      if (shared.value || calls !== 0 || validationInFlight) {
+        throw new Error(`${options.name} may be called exactly once`);
+      }
       // Zod's generic parse result is widened through the SDK-compatible object constraint.
       const parsed = options.schema.parse(input) as unknown as z.output<S>;
       const serialized = JSON.stringify(parsed);
@@ -67,20 +70,18 @@ export function createTerminalSubmission<S extends z.ZodObject>(options: {
         if (formatValidationError === undefined) throw sizeError;
         throw new TerminalSubmissionValidationError(sizeError);
       }
-      if (validate) {
-        if (formatValidationError === undefined) {
-          validate(parsed);
-        } else {
-          try {
-            validate(parsed);
-          } catch (error) {
-            throw new TerminalSubmissionValidationError(error);
-          }
-        }
+      validationInFlight = true;
+      try {
+        await validate?.(parsed);
+      } catch (error) {
+        validationInFlight = false;
+        if (formatValidationError === undefined) throw error;
+        throw new TerminalSubmissionValidationError(error);
       }
       calls++;
       shared.value = true;
       submittedValue = parsed;
+      validationInFlight = false;
       return parsed;
     },
   });

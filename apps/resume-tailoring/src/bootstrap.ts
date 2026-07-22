@@ -113,6 +113,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     migrateRunOutputLayout(pipelineDatabase, { outputRoot: artifacts.root });
   }
   const repository = options.repository ?? new PipelineRepository(pipelineDatabase!);
+  repository.reconcileAttemptingApplicationSubmissions();
   const contextDatabase = options.contextDatabase ?? (options.context ? undefined : openContextDatabase());
   const context = options.context ?? createContextApplicationService({ database: contextDatabase! });
   const schedulerOptions = options.workerOptions?.scheduler;
@@ -143,6 +144,11 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       ? undefined
       : new ApplicationAgentService(browserHarnessToken, {
           authStatusReader: () => auth.getAuthStatus(),
+          submissionGuardFactory: (sessionId) => ({
+            claim: async () => repository.claimApplicationSubmission(sessionId),
+            finalize: async (outcome) =>
+              repository.finalizeApplicationSubmission(sessionId, outcome),
+          }),
         }));
   const applicationHarnessOrigin = options.applicationHarnessOrigin ?? process.env.JOBHUNTER_HARNESS_URL;
   const applicationSessions = options.applicationSessions ?? new ApplicationSessionService({

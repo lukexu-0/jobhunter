@@ -13,9 +13,12 @@ import {
 } from "../contracts/index.ts";
 import { REPOSITORY_ROOT } from "../context/manifest.ts";
 import {
+  APPLICATION_SUBMISSION_UNCERTAIN_WARNING,
+  ApplicationSubmissionFinalError,
   PipelineRepository,
   RepositoryConflictError,
   RunArtifactsPrunedError,
+  type ApplicationSessionBridgeState,
   type PublicApplicationSession,
   type PublicArtifact,
 } from "../db/repository.ts";
@@ -44,7 +47,9 @@ const LIVE_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
   awaiting_origin_approval: true,
   awaiting_additional_info: true,
   awaiting_human_review: true,
-  ready_for_human_submit: true,
+  submitting: true,
+  submitted: true,
+  submission_uncertain: true,
 });
 
 const TERMINAL_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
@@ -58,7 +63,8 @@ export type ApplicationSessionServiceErrorCode =
   | "APPLICATION_HARNESS_UNAVAILABLE"
   | "APPLICATION_SOURCE_UNAVAILABLE"
   | "APPLICATION_SESSION_BUSY"
-  | "APPLICATION_COMMAND_CONFLICT";
+  | "APPLICATION_COMMAND_CONFLICT"
+  | "APPLICATION_SUBMISSION_FINAL";
 
 const SERVICE_ERRORS: Readonly<
   Record<ApplicationSessionServiceErrorCode, { readonly message: string; readonly status: 409 | 503 }>
@@ -77,6 +83,10 @@ const SERVICE_ERRORS: Readonly<
   },
   APPLICATION_COMMAND_CONFLICT: {
     message: "The application state changed; review the latest session state",
+    status: 409,
+  },
+  APPLICATION_SUBMISSION_FINAL: {
+    message: "The application submission cannot be retried",
     status: 409,
   },
 });
@@ -206,6 +216,9 @@ function runArtifactsPruned(): RunServiceError {
 }
 
 function mapRepositoryError(error: unknown): never {
+  if (error instanceof ApplicationSubmissionFinalError) {
+    throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
+  }
   if (error instanceof RunArtifactsPrunedError) throw runArtifactsPruned();
   if (error instanceof RepositoryConflictError) {
     const code = error.message === "run not found"
@@ -228,6 +241,31 @@ function isTerminal(session: PublicApplicationSession): boolean {
   return TERMINAL_APPLICATION_STATES[session.bridgeState] === true;
 }
 
+function retainedSubmissionFinal(session: PublicApplicationSession): boolean {
+  return session.submissionPhase === "submitted" || session.submissionPhase === "uncertain";
+}
+
+function submissionCannotRetry(session: PublicApplicationSession): boolean {
+  return session.submissionPhase === "attempting" || retainedSubmissionFinal(session);
+}
+
+function durableBridgeState(
+  session: PublicApplicationSession,
+  harnessState?: ApplicationHarnessSnapshot["state"],
+): ApplicationSessionBridgeState {
+  const closed = session.bridgeState === "closed" || harnessState === "closed";
+  switch (session.submissionPhase) {
+    case "attempting":
+      return closed ? "closed" : "submitting";
+    case "submitted":
+      return closed ? "closed" : "submitted";
+    case "uncertain":
+      return closed ? "closed" : "submission_uncertain";
+    case "not_attempted":
+      return harnessState ?? session.bridgeState;
+  }
+}
+
 interface PreparedStart {
   readonly jobUrl: string;
   readonly profile: string;
@@ -238,6 +276,10 @@ export class ApplicationSessionService {
   readonly #uuidFactory: () => string;
   readonly #now: () => number;
   readonly #profileReader: ApplicantProfileReader;
+  readonly #pendingResumes = new Map<
+    string,
+    Set<Promise<ApplicationSessionSnapshotDto>>
+  >();
 
   constructor(private readonly dependencies: ApplicationSessionServiceDependencies) {
     this.#uuidFactory = dependencies.uuidFactory ?? randomUUID;
@@ -307,6 +349,9 @@ export class ApplicationSessionService {
       mapRepositoryError(error);
     }
     if (latest) {
+      if (submissionCannotRetry(latest)) {
+        throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
+      }
       if (latest.pdfSha256 !== expectedApprovedPdfSha256) {
         throw new RunServiceError("STALE_PDF", "approved PDF hash is stale", 409);
       }
@@ -331,6 +376,9 @@ export class ApplicationSessionService {
       );
     } catch (error) {
       const concurrent = this.dependencies.repository.getLatestApplicationSession(runId);
+      if (concurrent && submissionCannotRetry(concurrent)) {
+        throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
+      }
       if (
         concurrent
         && concurrent.pdfSha256 === expectedApprovedPdfSha256
@@ -349,12 +397,14 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    const prepared = await this.#prepareStart(runId, expectedApprovedPdfSha256, signal);
     let previous: PublicApplicationSession | null;
     try {
       previous = this.dependencies.repository.getLatestApplicationSession(runId);
     } catch (error) {
       mapRepositoryError(error);
+    }
+    if (previous && submissionCannotRetry(previous)) {
+      throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
     }
     if (!previous || !isTerminal(previous)) {
       throw new RunServiceError("RUN_CONFLICT", "application session is not terminal", 409);
@@ -362,6 +412,7 @@ export class ApplicationSessionService {
     if (previous.pdfSha256 !== expectedApprovedPdfSha256) {
       throw new RunServiceError("STALE_PDF", "approved PDF hash is stale", 409);
     }
+    const prepared = await this.#prepareStart(runId, expectedApprovedPdfSha256, signal);
 
     let reserved: PublicApplicationSession;
     try {
@@ -495,23 +546,24 @@ export class ApplicationSessionService {
         ) {
           continue;
         }
-        const snapshot = this.#recordHarnessSnapshot(
+        this.#recordHarnessSnapshot(
           runId,
           session,
           event.session,
           event.id,
         );
-        const projected = ApplicationSessionEventDtoSchema.parse({
-          generation: session.generation,
-          event: event.event,
-          session: snapshot,
-          detail: event.detail,
-        });
         const recorded = this.dependencies.repository.getLatestApplicationSession(runId);
         if (!recorded || recorded.generation !== session.generation) {
           throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
         }
         session = recorded;
+        if (recorded.lastUpstreamEventId !== event.id) continue;
+        const projected = ApplicationSessionEventDtoSchema.parse({
+          generation: session.generation,
+          event: event.event,
+          session: this.#storedView(recorded),
+          detail: event.detail,
+        });
         yield {
           id: `${session.generation}:${event.id}`,
           event: projected,
@@ -544,7 +596,15 @@ export class ApplicationSessionService {
     } catch (error) {
       mapRepositoryError(error);
     }
-    if (!session || !isLive(session) || session.bridgeState === "reserved") {
+    if (session && retainedSubmissionFinal(session)) {
+      throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
+    }
+    if (
+      !session
+      || !isLive(session)
+      || session.bridgeState === "reserved"
+      || session.submissionPhase === "attempting"
+    ) {
       throw new ApplicationSessionServiceError("APPLICATION_COMMAND_CONFLICT");
     }
     const harness = this.dependencies.harness;
@@ -580,6 +640,44 @@ export class ApplicationSessionService {
       mapRepositoryError(error);
     }
     if (!session) return;
+    let waitedForResume = false;
+    const pendingResumes = this.#pendingResumes.get(session.sessionId);
+    if (pendingResumes) {
+      waitedForResume = true;
+      await Promise.allSettled([...pendingResumes]);
+      signal.throwIfAborted();
+      session = this.dependencies.repository.getLatestApplicationSession(runId);
+      if (!session) return;
+    }
+    if (session.submissionPhase === "attempting") {
+      try {
+        this.dependencies.repository.finalizeApplicationSubmission(
+          session.sessionId,
+          "uncertain",
+        );
+        const finalized = this.dependencies.repository.getLatestApplicationSession(runId);
+        if (
+          !finalized
+          || finalized.generation !== session.generation
+          || finalized.sessionId !== session.sessionId
+        ) {
+          throw new RepositoryConflictError("application session changed");
+        }
+        session = finalized;
+      } catch (error) {
+        const finalized = this.dependencies.repository.getLatestApplicationSession(runId);
+        if (
+          finalized
+          && finalized.generation === session.generation
+          && finalized.sessionId === session.sessionId
+          && retainedSubmissionFinal(finalized)
+        ) {
+          session = finalized;
+        } else {
+          mapRepositoryError(error);
+        }
+      }
+    }
     if (session.bridgeState === "lost") {
       const closed = this.#closedProjection(session, null);
       try {
@@ -594,7 +692,7 @@ export class ApplicationSessionService {
       return;
     }
     if (session.bridgeState === "closed") return;
-    if (session.bridgeState === "reserved") {
+    if (session.bridgeState === "reserved" && !waitedForResume) {
       this.#recordLocalClosed(runId, session);
       return;
     }
@@ -606,6 +704,10 @@ export class ApplicationSessionService {
     } catch (error) {
       if (signal.aborted) signal.throwIfAborted();
       if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
+        if (retainedSubmissionFinal(session)) {
+          this.#recordLocalClosed(runId, session);
+          return;
+        }
         if (
           session.publicSnapshot === null
           || session.bridgeState === "cancelled"
@@ -672,7 +774,25 @@ export class ApplicationSessionService {
     return { jobUrl, profile, pdf };
   }
 
-  async #resume(
+  #resume(
+    runId: string,
+    session: PublicApplicationSession,
+    preparedInput: PreparedStart | (() => Promise<PreparedStart>),
+    signal: AbortSignal,
+  ): Promise<ApplicationSessionSnapshotDto> {
+    const pending = this.#resumeOnce(runId, session, preparedInput, signal);
+    const resumes = this.#pendingResumes.get(session.sessionId) ?? new Set();
+    resumes.add(pending);
+    this.#pendingResumes.set(session.sessionId, resumes);
+    const cleanup = () => {
+      resumes.delete(pending);
+      if (resumes.size === 0) this.#pendingResumes.delete(session.sessionId);
+    };
+    void pending.then(cleanup, cleanup);
+    return pending;
+  }
+
+  async #resumeOnce(
     runId: string,
     session: PublicApplicationSession,
     preparedInput: PreparedStart | (() => Promise<PreparedStart>),
@@ -770,15 +890,52 @@ export class ApplicationSessionService {
     snapshot: ApplicationHarnessSnapshot,
     lastUpstreamEventId?: number,
   ): ApplicationSessionSnapshotDto {
-    const updatedAt = snapshot.updatedAt;
-    const terminalAt = TERMINAL_APPLICATION_STATES[snapshot.state] === true
-      ? (session.terminalAt ?? updatedAt)
+    let current = this.dependencies.repository.getLatestApplicationSession(runId);
+    if (
+      !current
+      || current.generation !== session.generation
+      || current.sessionId !== session.sessionId
+    ) {
+      throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
+    }
+    if (
+      current.submissionPhase === "attempting"
+      && (
+        snapshot.state === "submitted"
+        || snapshot.state === "submission_uncertain"
+        || TERMINAL_APPLICATION_STATES[snapshot.state] === true
+      )
+    ) {
+      this.dependencies.repository.finalizeApplicationSubmission(
+        current.sessionId,
+        "uncertain",
+      );
+      current = this.dependencies.repository.getLatestApplicationSession(runId);
+      if (
+        !current
+        || current.generation !== session.generation
+        || current.sessionId !== session.sessionId
+      ) {
+        throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
+      }
+    }
+    const bridgeState = durableBridgeState(current, snapshot.state);
+    if (bridgeState === "reserved" || bridgeState === "lost") {
+      throw applicationHarnessUnavailable();
+    }
+    const updatedAt = Math.max(snapshot.updatedAt, current.updatedAt);
+    const terminalAt = TERMINAL_APPLICATION_STATES[bridgeState] === true
+      ? (current.terminalAt ?? updatedAt)
       : null;
+    const uncertainWarnings = snapshot.warnings.filter(
+      (warning) => warning !== APPLICATION_SUBMISSION_UNCERTAIN_WARNING,
+    ).slice(0, 99);
     const projected = ApplicationSessionSnapshotDtoSchema.parse({
-      generation: session.generation,
-      bridgeState: snapshot.state,
-      harnessState: snapshot.state,
-      createdAt: session.createdAt,
+      generation: current.generation,
+      bridgeState,
+      harnessState: bridgeState,
+      submissionPhase: current.submissionPhase,
+      createdAt: current.createdAt,
       updatedAt,
       terminalAt,
       expiresAt: snapshot.expiresAt,
@@ -787,16 +944,18 @@ export class ApplicationSessionService {
       fieldsFilled: snapshot.fieldsFilled,
       fieldsNeedingHuman: snapshot.fieldsNeedingHuman,
       filesAttached: snapshot.filesAttached,
-      warnings: snapshot.warnings,
+      warnings: current.submissionPhase === "uncertain"
+        ? [...uncertainWarnings, APPLICATION_SUBMISSION_UNCERTAIN_WARNING]
+        : snapshot.warnings,
       revisionCount: snapshot.revisionCount,
-      pendingAction: snapshot.pendingAction,
-      error: snapshot.error,
+      pendingAction: bridgeState === snapshot.state ? snapshot.pendingAction : null,
+      error: bridgeState === "failed" ? snapshot.error : null,
     });
     try {
       const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
-        generation: session.generation,
-        sessionId: session.sessionId,
-        bridgeState: snapshot.state,
+        generation: current.generation,
+        sessionId: current.sessionId,
+        bridgeState,
         publicSnapshot: projected,
         ...(lastUpstreamEventId !== undefined ? { lastUpstreamEventId } : {}),
       });
@@ -816,15 +975,48 @@ export class ApplicationSessionService {
     runId: string,
     session: PublicApplicationSession,
   ): ApplicationSessionSnapshotDto {
-    const previous = this.#storedView(session);
-    const updatedAt = this.#nextProjectionUpdatedAt(session);
+    const current = this.dependencies.repository.getLatestApplicationSession(runId);
+    if (
+      !current
+      || current.generation !== session.generation
+      || current.sessionId !== session.sessionId
+    ) {
+      throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
+    }
+    if (current.submissionPhase === "attempting") {
+      try {
+        this.dependencies.repository.finalizeApplicationSubmission(
+          current.sessionId,
+          "uncertain",
+        );
+        const finalized = this.dependencies.repository.getLatestApplicationSession(runId);
+        if (!finalized || finalized.generation !== current.generation) {
+          throw new RepositoryConflictError("application session changed");
+        }
+        const uncertain = this.#storedView(finalized);
+        if (finalized.bridgeState === "closed") return uncertain;
+        const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
+          generation: finalized.generation,
+          sessionId: finalized.sessionId,
+          bridgeState: "submission_uncertain",
+          publicSnapshot: uncertain,
+        });
+        return this.#storedView(recorded);
+      } catch (error) {
+        mapRepositoryError(error);
+      }
+    }
+    if (retainedSubmissionFinal(current)) return this.#storedView(current);
+
+    const previous = this.#storedView(current);
+    const updatedAt = this.#nextProjectionUpdatedAt(current);
     const lost = ApplicationSessionSnapshotDtoSchema.parse({
       ...previous,
-      generation: session.generation,
+      generation: current.generation,
       bridgeState: "lost",
-      createdAt: session.createdAt,
+      createdAt: current.createdAt,
       updatedAt,
-      terminalAt: session.terminalAt ?? updatedAt,
+      terminalAt: current.terminalAt ?? updatedAt,
       pendingAction: null,
       error: null,
       warnings: previous.warnings.includes(LOST_WARNING)
@@ -833,8 +1025,8 @@ export class ApplicationSessionService {
     });
     try {
       const recorded = this.dependencies.repository.markApplicationSessionLost(runId, {
-        generation: session.generation,
-        sessionId: session.sessionId,
+        generation: current.generation,
+        sessionId: current.sessionId,
         publicSnapshot: lost,
       });
       return this.#storedView(recorded);
@@ -877,27 +1069,47 @@ export class ApplicationSessionService {
   }
 
   #storedView(session: PublicApplicationSession): ApplicationSessionSnapshotDto {
+    const bridgeState = durableBridgeState(session);
     if (session.publicSnapshot !== null) {
       const parsed = ApplicationSessionSnapshotDtoSchema.safeParse(session.publicSnapshot);
       if (!parsed.success) throw applicationHarnessUnavailable();
+      const warnings = parsed.data.warnings.filter(
+        (warning) => warning !== APPLICATION_SUBMISSION_UNCERTAIN_WARNING,
+      ).slice(0, 99);
       const authoritative = ApplicationSessionSnapshotDtoSchema.safeParse({
         ...parsed.data,
         generation: session.generation,
-        bridgeState: session.bridgeState,
+        bridgeState,
+        harnessState: bridgeState === "closed"
+          ? (parsed.data.harnessState === "closed" ? "closed" : null)
+          : bridgeState === "lost"
+            ? parsed.data.harnessState
+            : bridgeState,
+        submissionPhase: session.submissionPhase,
         createdAt: session.createdAt,
-        updatedAt: session.updatedAt,
+        updatedAt: Math.max(session.updatedAt, parsed.data.updatedAt),
         terminalAt: session.terminalAt,
+        pendingAction: bridgeState === parsed.data.bridgeState
+          ? parsed.data.pendingAction
+          : null,
+        error: bridgeState === "failed" ? parsed.data.error : null,
+        warnings: session.submissionPhase === "uncertain"
+          ? [...warnings, APPLICATION_SUBMISSION_UNCERTAIN_WARNING]
+          : parsed.data.warnings,
       });
       if (!authoritative.success) throw applicationHarnessUnavailable();
       return authoritative.data;
     }
-    if (session.bridgeState === "failed") throw applicationHarnessUnavailable();
+    if (bridgeState === "failed") throw applicationHarnessUnavailable();
     return ApplicationSessionSnapshotDtoSchema.parse({
       generation: session.generation,
-      bridgeState: session.bridgeState,
-      harnessState: session.bridgeState === "reserved" || session.bridgeState === "closed"
+      bridgeState,
+      harnessState: bridgeState === "reserved" || bridgeState === "closed"
         ? null
-        : session.bridgeState,
+        : bridgeState === "lost"
+          ? null
+          : bridgeState,
+      submissionPhase: session.submissionPhase,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       terminalAt: session.terminalAt,
@@ -907,7 +1119,11 @@ export class ApplicationSessionService {
       fieldsFilled: [],
       fieldsNeedingHuman: [],
       filesAttached: [],
-      warnings: session.bridgeState === "lost" ? [LOST_WARNING] : [],
+      warnings: session.submissionPhase === "uncertain"
+        ? [APPLICATION_SUBMISSION_UNCERTAIN_WARNING]
+        : bridgeState === "lost"
+          ? [LOST_WARNING]
+          : [],
       revisionCount: 0,
       pendingAction: null,
       error: null,

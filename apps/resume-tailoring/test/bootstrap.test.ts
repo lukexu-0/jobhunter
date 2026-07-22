@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +39,10 @@ interface IngestionOverrides {
   readonly browserHarnessToken?: string;
   readonly applicationAgent?: ApplicationAgentRouteService;
   readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
+  readonly beforeApplication?: (
+    repository: PipelineRepository,
+    database: Database,
+  ) => void;
 }
 
 function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {}) {
@@ -94,6 +99,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
   };
   const artifacts = new ArtifactStore(artifactRoot);
   const repository = new PipelineRepository(pipelineDatabase);
+  ingestion.beforeApplication?.(repository, pipelineDatabase);
   const runs = suppliedRuns
     ? new RunApplicationService({
         repository,
@@ -292,7 +298,7 @@ describe("pipeline application bootstrap", () => {
     expect(fixture.pipelineDatabase.query<{ job_description: string }, [string]>(
       "SELECT job_description FROM runs WHERE id = ?",
     ).get(created.id)?.job_description).toBe(selectedDescription);
-    expect(JSON.stringify(created)).not.toContain(JOB_URL);
+    expect(created.jobUrl).toBe(JOB_URL);
     await fixture.app.close();
   });
 
@@ -338,6 +344,7 @@ describe("pipeline application bootstrap", () => {
       warnings: [],
       revision_count: 0,
       submit_attempted: false as const,
+      submission_confirmation: null,
     };
     const applicationAgent: ApplicationAgentRouteService = {
       status: () => ({
@@ -417,6 +424,34 @@ describe("pipeline application bootstrap", () => {
       oauth: "connected",
     });
     expect(authStatusReads).toBe(1);
+    await fixture.app.close();
+  });
+
+  test("reconciles interrupted application submissions before serving recovery", async () => {
+    const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+    const fixture = createFixture(false, {
+      beforeApplication: (repository, database) => {
+        const run = repository.createRun("Interrupted application", "attempting-run");
+        database.query(`
+          INSERT INTO run_application_sessions(
+            run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
+            submission_phase, submission_attempted_at, submission_confirmed_at,
+            public_snapshot_json, last_upstream_event_id, created_at, updated_at, terminal_at
+          ) VALUES (?, 1, ?, 1, ?, 'running', 'attempting', 900, NULL, NULL, NULL, 800, 900, NULL)
+        `).run(run.id, sessionId, "a".repeat(64));
+      },
+    });
+
+    expect(fixture.app.services.repository.getLatestApplicationSession("attempting-run"))
+      .toMatchObject({
+        bridgeState: "submission_uncertain",
+        submissionPhase: "uncertain",
+        publicSnapshot: expect.objectContaining({
+          bridgeState: "submission_uncertain",
+          harnessState: "submission_uncertain",
+          submissionPhase: "uncertain",
+        }),
+      });
     await fixture.app.close();
   });
 

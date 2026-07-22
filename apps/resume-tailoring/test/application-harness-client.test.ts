@@ -322,7 +322,7 @@ describe("HttpApplicationHarnessClient", () => {
         ],
       },
       { type: "revise", context: "Correct the application summary." },
-      { type: "ready" },
+      { type: "submit" },
       { type: "cancel" },
     ];
     const signal = new AbortController().signal;
@@ -426,9 +426,19 @@ describe("HttpApplicationHarnessClient", () => {
       },
       { event: "revision_applied", detail: { revision_count: 2 }, session: baseSession },
       {
-        event: "ready_for_human_submit",
+        event: "submission_started",
         detail: {},
-        session: rawSnapshot({ state: "ready_for_human_submit", pending_action: null }),
+        session: rawSnapshot({ state: "submitting", pending_action: null }),
+      },
+      {
+        event: "application_submitted",
+        detail: {},
+        session: rawSnapshot({ state: "submitted", pending_action: null }),
+      },
+      {
+        event: "submission_uncertain",
+        detail: {},
+        session: rawSnapshot({ state: "submission_uncertain", pending_action: null }),
       },
       {
         event: "cancelled",
@@ -536,7 +546,9 @@ describe("HttpApplicationHarnessClient", () => {
       { event: "additional_info_saved", detail: { count: 4 } },
       { event: "review_required", detail: {} },
       { event: "revision_applied", detail: { revisionCount: 2 } },
-      { event: "ready_for_human_submit", detail: {} },
+      { event: "submission_started", detail: {} },
+      { event: "application_submitted", detail: {} },
+      { event: "submission_uncertain", detail: {} },
       { event: "cancelled", detail: {} },
       { event: "failed", detail: {} },
       { event: "closed", detail: {} },

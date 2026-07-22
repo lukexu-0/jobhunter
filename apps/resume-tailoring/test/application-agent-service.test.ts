@@ -25,7 +25,7 @@ const INPUT: ApplicationAgentRunInput = {
 };
 
 const RESULT: ApplicationRunResult = {
-  status: "ready_for_human_submit",
+  status: "submitted",
   company: "Example Co",
   role: "Engineer",
   job_url: "https://jobs.example.test/opening",
@@ -40,8 +40,17 @@ const RESULT: ApplicationRunResult = {
   files_attached: ["resume.pdf"],
   warnings: [],
   revision_count: 1,
-  submit_attempted: false,
+  submit_attempted: true,
+  submission_confirmation: {
+    type: "post_submit_confirmation",
+    text: "Application received",
+  },
 };
+
+const SUBMISSION_GUARD_FACTORY = () => ({
+  claim: async () => undefined,
+  finalize: async (_outcome: "submitted" | "uncertain") => undefined,
+});
 
 function connectedStatus() {
   return {
@@ -55,6 +64,7 @@ function connectedStatus() {
 describe("ApplicationAgentService", () => {
   test("reports the fixed connected application-agent metadata", async () => {
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: connectedStatus,
     });
 
@@ -73,6 +83,7 @@ describe("ApplicationAgentService", () => {
     let runtimeConstructions = 0;
     let runs = 0;
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => ({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
@@ -109,6 +120,7 @@ describe("ApplicationAgentService", () => {
   test("sanitizes application-owned OAuth status read failures", async () => {
     const authSecret = `auth storage error: ${TOKEN}:${DIRECT_VALUE}`;
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         throw new Error(authSecret);
       },
@@ -134,8 +146,17 @@ describe("ApplicationAgentService", () => {
         throw new Error("unused");
       },
     };
+    const submissionGuard = {
+      claim: async () => undefined,
+      finalize: async (_outcome: "submitted" | "uncertain") => undefined,
+    };
+    const guardFactoryCalls: string[] = [];
     const service = new ApplicationAgentService(TOKEN, {
       authStatusReader: connectedStatus,
+      submissionGuardFactory: (sessionId) => {
+        guardFactoryCalls.push(sessionId);
+        return submissionGuard;
+      },
       runtimeClientFactory: (...args) => {
         runtimeFactoryCalls.push(args);
         return runtimeClient;
@@ -160,9 +181,11 @@ describe("ApplicationAgentService", () => {
     expect(runCalls).toHaveLength(1);
     expect(runCalls[0]?.[0]).toEqual(INPUT);
     expect(runCalls[0]?.[1]).toBe(signal);
+    expect(guardFactoryCalls).toEqual([SESSION_ID]);
     expect(runCalls[0]?.[2]).toEqual({
       providerFactory: agentRuntime.providerFactory,
       runtimeClient,
+      submissionGuard,
     });
     const serializedSuccess = JSON.stringify(success);
     expect(serializedSuccess).not.toContain(TOKEN);
@@ -176,6 +199,7 @@ describe("ApplicationAgentService", () => {
     let runtimeConstructions = 0;
     let runs = 0;
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         authReads += 1;
         return connectedStatus();
@@ -207,6 +231,7 @@ describe("ApplicationAgentService", () => {
 
   test("strictly revalidates the agent result before returning success", async () => {
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: connectedStatus,
       runtimeClientFactory: () => ({
         action: async () => { throw new Error("unused"); },
@@ -231,6 +256,7 @@ describe("ApplicationAgentService", () => {
     const providerSecret = `${TOKEN}:${RUNTIME_URL}:${DIRECT_VALUE}`;
     let authReads = 0;
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         authReads += 1;
         return connectedStatus();
@@ -261,6 +287,7 @@ describe("ApplicationAgentService", () => {
   test("turns a provider failure during a logout race into OAuth required", async () => {
     let authReads = 0;
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         authReads += 1;
         return authReads === 1
@@ -301,6 +328,7 @@ describe("ApplicationAgentService", () => {
     const { promise: pendingReread } = Promise.withResolvers<never>();
     let authReads = 0;
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         authReads += 1;
         if (authReads === 1) return connectedStatus();
@@ -327,6 +355,7 @@ describe("ApplicationAgentService", () => {
   test("preserves typed application-agent failures by identity", async () => {
     const typedFailure = new ApplicationAgentFailure("STEP_LIMIT");
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: connectedStatus,
       runtimeClientFactory: () => ({
         action: async () => { throw new Error("unused"); },
@@ -354,6 +383,7 @@ describe("ApplicationAgentService", () => {
       markRunStarted = resolve;
     });
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         authReads += 1;
         return connectedStatus();
@@ -387,6 +417,7 @@ describe("ApplicationAgentService", () => {
       markRunStarted = resolve;
     });
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: connectedStatus,
       runtimeClientFactory: () => ({
         action: async () => { throw new Error("unused"); },
@@ -417,6 +448,7 @@ describe("ApplicationAgentService", () => {
     } = Promise.withResolvers<void>();
     const { promise: pendingAuthRead } = Promise.withResolvers<never>();
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         markAuthStarted();
         return pendingAuthRead;
@@ -436,6 +468,7 @@ describe("ApplicationAgentService", () => {
     const controller = new AbortController();
     const abortReason = new Error("caller stopped OAuth preflight");
     const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
         controller.abort(abortReason);
         throw new Error(`auth failure: ${DIRECT_VALUE}`);

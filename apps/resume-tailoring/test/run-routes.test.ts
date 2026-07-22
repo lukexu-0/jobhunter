@@ -20,6 +20,7 @@ import type {
 
 const ORIGIN = "http://127.0.0.1:3456";
 const PDF_HASH = "a".repeat(64);
+const CANONICAL_JOB_URL = "https://jobs.example.test/role?gh_jid=123&source=route";
 const run: RunDto = {
   id: "run-1",
   status: "queued",
@@ -92,18 +93,18 @@ describe("run HTTP routes", () => {
     const target = service({
       createRun: async (jobUrl, generateKeywordMap, signal) => {
         received = { jobUrl, generateKeywordMap, signal };
-        return run;
+        return { ...run, jobUrl };
       },
     });
     const incoming = new Request("http://127.0.0.1:3457/v1/runs", post({
-      jobUrl: " HTTPS://Jobs.Example.Test:443/role#apply ",
+      jobUrl: " HTTPS://Jobs.Example.Test:443/role?gh_jid=123&source=route#apply ",
     }));
     const created = await createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target) })(incoming);
     expect(created.status).toBe(201);
     expect(created.headers.get("cache-control")).toBe("no-store");
-    expect(await created.json()).toEqual(run);
+    expect(await created.json()).toEqual({ ...run, jobUrl: CANONICAL_JOB_URL });
     expect(received).toEqual({
-      jobUrl: "https://jobs.example.test/role",
+      jobUrl: CANONICAL_JOB_URL,
       generateKeywordMap: true,
       signal: incoming.signal,
     });
@@ -136,6 +137,26 @@ describe("run HTTP routes", () => {
     });
     expect((await request(defaultTarget, "/v1/runs", post({ jobUrl: "https://jobs.example.test/default" }))).status).toBe(201);
     expect(defaulted).toBe(true);
+  });
+
+  test("returns canonical job URLs and omits them for legacy runs", async () => {
+    const exposedRun: RunDto = { ...run, jobUrl: CANONICAL_JOB_URL };
+    const target = service({
+      listRuns: () => [exposedRun],
+      getRun: () => exposedRun,
+    });
+
+    const listed = await request(target, "/v1/runs");
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toEqual({ runs: [exposedRun] });
+
+    const retrieved = await request(target, "/v1/runs/run-1");
+    expect(retrieved.status).toBe(200);
+    expect(await retrieved.json()).toEqual(exposedRun);
+
+    const legacy = await request(service(), "/v1/runs/run-1");
+    expect(legacy.status).toBe(200);
+    expect(await legacy.json()).not.toHaveProperty("jobUrl");
   });
 
   test("accepts only application statuses without waking the scheduler", async () => {
@@ -496,6 +517,7 @@ const applicationSnapshot: ApplicationSessionSnapshotDto = {
   generation: 2,
   bridgeState: "running",
   harnessState: "running",
+  submissionPhase: "not_attempted",
   createdAt: 1,
   updatedAt: 2,
   terminalAt: null,
@@ -706,7 +728,7 @@ describe("application session HTTP routes", () => {
       { type: "continue", extra: true },
       { type: "approve_origin", origin: "https://example.test/path" },
       { type: "provide_additional_info", answers: [] },
-      { type: "ready", answer: "private" },
+      { type: "ready" },
     ]) {
       const response = await applicationRequest(
         target,
@@ -749,6 +771,23 @@ describe("application session HTTP routes", () => {
       error: {
         code: "APPLICATION_HARNESS_UNAVAILABLE",
         message: "The local application service is unavailable",
+      },
+    });
+
+    const submissionFinal = await applicationRequest(
+      applicationService({
+        retry: async () => {
+          throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
+        },
+      }),
+      "/v1/runs/run-1/application/retry",
+      post({ expectedApprovedPdfSha256: PDF_HASH }),
+    );
+    expect(submissionFinal.status).toBe(409);
+    expect(await submissionFinal.json()).toEqual({
+      error: {
+        code: "APPLICATION_SUBMISSION_FINAL",
+        message: "The application submission cannot be retried",
       },
     });
 
@@ -842,7 +881,7 @@ describe("application session HTTP routes", () => {
     expect(await response.text()).toBe(
       "id: 2:7\n"
       + "event: snapshot\n"
-      + "data: {\"generation\":2,\"session\":{\"generation\":2,\"bridgeState\":\"running\",\"harnessState\":\"running\",\"createdAt\":1,\"updatedAt\":2,\"terminalAt\":null,\"expiresAt\":60001,\"company\":\"Example Corp\",\"role\":\"Staff Engineer\",\"fieldsFilled\":[],\"fieldsNeedingHuman\":[],\"filesAttached\":[\"resume.pdf\"],\"warnings\":[],\"revisionCount\":0,\"pendingAction\":null,\"error\":null},\"event\":\"snapshot\",\"detail\":{}}\n\n",
+      + "data: {\"generation\":2,\"session\":{\"generation\":2,\"bridgeState\":\"running\",\"harnessState\":\"running\",\"submissionPhase\":\"not_attempted\",\"createdAt\":1,\"updatedAt\":2,\"terminalAt\":null,\"expiresAt\":60001,\"company\":\"Example Corp\",\"role\":\"Staff Engineer\",\"fieldsFilled\":[],\"fieldsNeedingHuman\":[],\"filesAttached\":[\"resume.pdf\"],\"warnings\":[],\"revisionCount\":0,\"pendingAction\":null,\"error\":null},\"event\":\"snapshot\",\"detail\":{}}\n\n",
     );
   });
 

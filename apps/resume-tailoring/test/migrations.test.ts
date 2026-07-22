@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { migratePipelineDatabase } from "../src/db/migrations.ts";
+import { ApplicationSessionSnapshotDtoSchema } from "../src/contracts/index.ts";
 
 const databases: Database[] = [];
 
@@ -197,12 +198,290 @@ function versionNineDatabase(): Database {
   return db;
 }
 
+const SUBMISSION_UNCERTAIN_WARNING =
+  "The application submission could not be verified. Check the headed browser if it is still available, then close this session.";
+
+function versionTenDatabase(): Database {
+  const db = versionNineDatabase();
+  migratePipelineDatabase(db, 2_000);
+  db.exec(`
+    DROP TRIGGER IF EXISTS run_application_sessions_no_delete;
+    DROP TABLE run_application_sessions;
+    CREATE TABLE run_application_sessions (
+      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+      generation INTEGER NOT NULL CHECK (generation > 0),
+      session_id TEXT NOT NULL UNIQUE,
+      resume_revision INTEGER NOT NULL CHECK (resume_revision > 0),
+      pdf_sha256 TEXT NOT NULL CHECK (length(pdf_sha256) = 64),
+      bridge_state TEXT NOT NULL CHECK (
+        bridge_state IN (
+          'reserved','starting','running','awaiting_human_navigation',
+          'awaiting_origin_approval','awaiting_additional_info',
+          'awaiting_human_review','ready_for_human_submit',
+          'cancelled','failed','closed','lost'
+        )
+      ),
+      public_snapshot_json TEXT CHECK (
+        public_snapshot_json IS NULL OR json_valid(public_snapshot_json)
+      ),
+      last_upstream_event_id INTEGER CHECK (
+        last_upstream_event_id IS NULL OR last_upstream_event_id >= 0
+      ),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_at INTEGER,
+      PRIMARY KEY (run_id, generation),
+      FOREIGN KEY (run_id, resume_revision)
+        REFERENCES revisions(run_id, revision) ON DELETE RESTRICT,
+      CHECK (
+        (bridge_state IN ('cancelled','failed','closed','lost') AND terminal_at IS NOT NULL)
+        OR
+        (bridge_state NOT IN ('cancelled','failed','closed','lost') AND terminal_at IS NULL)
+      )
+    ) STRICT;
+    CREATE INDEX run_application_sessions_latest
+      ON run_application_sessions(run_id, generation DESC);
+    CREATE TRIGGER run_application_sessions_no_delete
+    BEFORE DELETE ON run_application_sessions
+    BEGIN
+      SELECT RAISE(ABORT, 'application session history cannot be deleted');
+    END;
+    DELETE FROM schema_migrations WHERE version > 10;
+    PRAGMA user_version = 10;
+  `);
+  return db;
+}
+
+function legacySnapshot(
+  generation: number,
+  bridgeState: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    generation,
+    bridgeState,
+    harnessState: bridgeState === "lost" || bridgeState === "reserved" ? null : bridgeState,
+    createdAt: 1_000,
+    updatedAt: 1_500,
+    terminalAt: ["cancelled", "failed", "closed", "lost"].includes(bridgeState) ? 1_500 : null,
+    expiresAt: bridgeState === "reserved" ? null : 9_000,
+    company: "Example",
+    role: "Engineer",
+    fieldsFilled: [],
+    fieldsNeedingHuman: [],
+    filesAttached: ["resume.pdf"],
+    warnings: [],
+    revisionCount: 1,
+    pendingAction: null,
+    error: bridgeState === "failed"
+      ? { code: "browser_failed", message: "The browser session failed" }
+      : null,
+    ...overrides,
+  };
+}
+
+test("migration eleven rewrites every legacy application snapshot into a strict durable projection", () => {
+  const db = versionTenDatabase();
+  const insert = db.query(`
+    INSERT INTO run_application_sessions(
+      run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
+      public_snapshot_json, last_upstream_event_id, created_at, updated_at, terminal_at
+    ) VALUES ('existing-run', ?, ?, 2, ?, ?, ?, ?, 1000, ?, ?)
+  `);
+  insert.run(
+    1,
+    "11111111-1111-4111-8111-111111111111",
+    "a".repeat(64),
+    "running",
+    JSON.stringify(legacySnapshot(1, "running")),
+    1,
+    1_500,
+    null,
+  );
+  const warningInputs = [
+    ...Array.from({ length: 101 }, (_, index) => `warning ${index + 1}`),
+    SUBMISSION_UNCERTAIN_WARNING,
+    SUBMISSION_UNCERTAIN_WARNING,
+  ];
+  insert.run(
+    2,
+    "22222222-2222-4222-8222-222222222222",
+    "a".repeat(64),
+    "ready_for_human_submit",
+    JSON.stringify(legacySnapshot(2, "ready_for_human_submit", {
+      warnings: warningInputs,
+      pendingAction: { type: "human_review" },
+      error: { code: "browser_failed", message: "The browser session failed" },
+    })),
+    2,
+    1_500,
+    null,
+  );
+  insert.run(
+    3,
+    "33333333-3333-4333-8333-333333333333",
+    "a".repeat(64),
+    "failed",
+    JSON.stringify(legacySnapshot(3, "failed")),
+    3,
+    1_500,
+    1_500,
+  );
+  insert.run(
+    4,
+    "44444444-4444-4444-8444-444444444444",
+    "a".repeat(64),
+    "closed",
+    null,
+    4,
+    1_500,
+    1_500,
+  );
+
+  migratePipelineDatabase(db, 5_000);
+
+  const rows = db.query<{
+    generation: number;
+    bridge_state: string;
+    submission_phase: string;
+    submission_attempted_at: number | null;
+    submission_confirmed_at: number | null;
+    public_snapshot_json: string | null;
+    updated_at: number;
+  }, []>(`
+    SELECT generation, bridge_state, submission_phase, submission_attempted_at,
+           submission_confirmed_at, public_snapshot_json, updated_at
+    FROM run_application_sessions
+    ORDER BY generation
+  `).all();
+  expect(rows.map((row) => ({
+    generation: row.generation,
+    bridgeState: row.bridge_state,
+    phase: row.submission_phase,
+    attemptedAt: row.submission_attempted_at,
+    confirmedAt: row.submission_confirmed_at,
+  }))).toEqual([
+    { generation: 1, bridgeState: "running", phase: "not_attempted", attemptedAt: null, confirmedAt: null },
+    { generation: 2, bridgeState: "submission_uncertain", phase: "uncertain", attemptedAt: 1_500, confirmedAt: null },
+    { generation: 3, bridgeState: "failed", phase: "not_attempted", attemptedAt: null, confirmedAt: null },
+    { generation: 4, bridgeState: "closed", phase: "not_attempted", attemptedAt: null, confirmedAt: null },
+  ]);
+  const projections = rows.map((row) => row.public_snapshot_json === null
+    ? null
+    : ApplicationSessionSnapshotDtoSchema.parse(JSON.parse(row.public_snapshot_json)));
+  expect(projections[0]?.submissionPhase).toBe("not_attempted");
+  expect(projections[2]?.submissionPhase).toBe("not_attempted");
+  expect(projections[3]).toBeNull();
+  expect(projections[1]).toMatchObject({
+    bridgeState: "submission_uncertain",
+    harnessState: "submission_uncertain",
+    submissionPhase: "uncertain",
+    pendingAction: null,
+    terminalAt: null,
+    error: null,
+    expiresAt: 9_000,
+    company: "Example",
+    role: "Engineer",
+  });
+  expect(projections[1]?.updatedAt).toBeGreaterThan(1_500);
+  expect(rows[1]?.updated_at).toBe(projections[1]?.updatedAt);
+  expect(projections[1]?.warnings).toHaveLength(100);
+  expect(projections[1]?.warnings.slice(0, 99)).toEqual(warningInputs.slice(0, 99));
+  expect(projections[1]?.warnings.at(-1)).toBe(SUBMISSION_UNCERTAIN_WARNING);
+  expect(projections[1]?.warnings.filter((warning) => warning === SUBMISSION_UNCERTAIN_WARNING)).toHaveLength(1);
+});
+
+test("migration eleven enforces phase timestamps and recreates ledger schema objects", () => {
+  const db = versionTenDatabase();
+  migratePipelineDatabase(db, 5_000);
+  const tableSql = db.query<{ sql: string }, []>(`
+    SELECT sql FROM sqlite_schema
+    WHERE type = 'table' AND name = 'run_application_sessions'
+  `).get()?.sql ?? "";
+  expect(tableSql).toContain("'not_attempted','attempting','submitted','uncertain'");
+  expect(tableSql).toContain("'submitting'");
+  expect(tableSql).toContain("'submitted'");
+  expect(tableSql).toContain("'submission_uncertain'");
+  expect(tableSql).not.toContain("'ready_for_human_submit'");
+  expect(db.query<{ type: string; tbl_name: string; sql: string }, []>(`
+    SELECT type, tbl_name, sql
+    FROM sqlite_schema
+    WHERE name = 'run_application_sessions_latest'
+  `).get()).toMatchObject({
+    type: "index",
+    tbl_name: "run_application_sessions",
+    sql: expect.stringContaining("generation DESC"),
+  });
+  expect(db.query<{ type: string; tbl_name: string; sql: string }, []>(`
+    SELECT type, tbl_name, sql
+    FROM sqlite_schema
+    WHERE name = 'run_application_sessions_no_delete'
+  `).get()).toMatchObject({
+    type: "trigger",
+    tbl_name: "run_application_sessions",
+    sql: expect.stringContaining("application session history cannot be deleted"),
+  });
+
+  const insert = db.query(`
+    INSERT INTO run_application_sessions(
+      run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
+      submission_phase, submission_attempted_at, submission_confirmed_at,
+      public_snapshot_json, last_upstream_event_id, created_at, updated_at, terminal_at
+    ) VALUES ('existing-run', ?, ?, 2, ?, ?, ?, ?, ?, NULL, NULL, 5000, 5000, NULL)
+  `);
+  const sessionId = (generation: number) =>
+    `00000000-0000-4000-8000-${String(generation).padStart(12, "0")}`;
+  for (const [generation, phase, attemptedAt, confirmedAt] of [
+    [1, "not_attempted", 5_000, null],
+    [2, "attempting", null, null],
+    [3, "submitted", 5_000, null],
+    [4, "uncertain", 5_000, 5_000],
+  ] as const) {
+    expect(() => insert.run(
+      generation,
+      sessionId(generation),
+      "a".repeat(64),
+      "running",
+      phase,
+      attemptedAt,
+      confirmedAt,
+    )).toThrow();
+  }
+  expect(() => insert.run(
+    5,
+    sessionId(5),
+    "a".repeat(64),
+    "ready_for_human_submit",
+    "not_attempted",
+    null,
+    null,
+  )).toThrow();
+  for (const [generation, bridgeState, phase, attemptedAt, confirmedAt] of [
+    [6, "submitting", "attempting", 5_000, null],
+    [7, "submitted", "submitted", 5_000, 5_001],
+    [8, "submission_uncertain", "uncertain", 5_000, null],
+  ] as const) {
+    insert.run(
+      generation,
+      sessionId(generation),
+      "a".repeat(64),
+      bridgeState,
+      phase,
+      attemptedAt,
+      confirmedAt,
+    );
+  }
+  expect(() => db.query(
+    "DELETE FROM run_application_sessions WHERE generation = 6",
+  ).run()).toThrow(/history/i);
+});
+
 test("migration ten preserves version nine runs and creates the durable application ledger", () => {
   const db = versionNineDatabase();
 
   migratePipelineDatabase(db, 2_000);
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(10);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(11);
   expect(db.query<{ job_url: string | null }, []>(
     "SELECT job_url FROM runs WHERE id = 'existing-run'",
   ).get()).toEqual({ job_url: null });
@@ -278,7 +557,7 @@ test("fresh databases default to pending while accepting applied", () => {
     ) VALUES ('default-run', 'default job description', 'queued', 2, 2000, 2000);
   `);
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(10);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(11);
   expect(db.query<{ application_status: string }, []>(
     "SELECT application_status FROM runs ORDER BY queue_sequence",
   ).all()).toEqual([
@@ -307,10 +586,10 @@ test("migrates version seven defaults without changing existing statuses", () =>
   migratePipelineDatabase(db, 2_000);
   db.exec("INSERT INTO runs(id) VALUES ('new-run')");
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(10);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(11);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -324,7 +603,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
 
   migratePipelineDatabase(db, 2_000);
 
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(10);
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(11);
   expect(db.query<{ version: number; applied_at: number }, []>(
     "SELECT version, applied_at FROM schema_migrations ORDER BY version",
   ).all()).toEqual([
@@ -336,6 +615,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 8, applied_at: 2000 },
     { version: 9, applied_at: 2000 },
     { version: 10, applied_at: 2000 },
+    { version: 11, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -376,8 +656,8 @@ test("migrates existing runs to application status applied atomically", () => {
 
   migratePipelineDatabase(migrated, 2_000);
 
-  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(10);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10]);
+  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(11);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11]);
   expect(migrated.query<{
     application_status: string;
     generate_keyword_map: number;
@@ -406,8 +686,8 @@ test("migrates version two retention state atomically without changing history",
 
   migratePipelineDatabase(migrated, 2_000);
 
-  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(10);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10]);
+  expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(11);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

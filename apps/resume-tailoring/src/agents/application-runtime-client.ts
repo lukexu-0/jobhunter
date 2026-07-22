@@ -20,8 +20,7 @@ function hasCodePointLength(
 }
 
 
-export const ApplicationRunResultSchema = z.object({
-  status: z.enum(["ready_for_human_submit", "cancelled"]),
+export const ApplicationResultBaseSchema = z.object({
   company: z.string().refine((value) => hasCodePointLength(value, 0, 500)).nullable().default(null),
   role: z.string().refine((value) => hasCodePointLength(value, 0, 500)).nullable().default(null),
   job_url: z.string().refine(isAbsoluteHttpUrl),
@@ -31,8 +30,49 @@ export const ApplicationRunResultSchema = z.object({
   files_attached: z.array(z.string().refine(isSanitizedBasename)).max(20).default([]),
   warnings: z.array(z.string().refine((value) => hasCodePointLength(value, 1, 1_000))).max(100).default([]),
   revision_count: z.number().int().min(0).max(100).default(0),
+});
+
+export const ReviewApplicationResultSchema = ApplicationResultBaseSchema.extend({
+  status: z.literal("ready_for_submission"),
   submit_attempted: z.literal(false).default(false),
 }).strict();
+export type ReviewApplicationResult = z.infer<typeof ReviewApplicationResultSchema>;
+
+const SubmissionConfirmationSchema = z.object({
+  type: z.literal("post_submit_confirmation"),
+  text: z.string().refine(
+    (value) => value === value.trim() && hasCodePointLength(value, 1, 1_000),
+  ),
+}).strict();
+
+export const SubmittedApplicationResultSchema = ApplicationResultBaseSchema.extend({
+  status: z.literal("submitted"),
+  submit_attempted: z.literal(true),
+  submission_confirmation: SubmissionConfirmationSchema,
+}).strict();
+export type SubmittedApplicationResult = z.infer<typeof SubmittedApplicationResultSchema>;
+
+export const SubmissionUncertainApplicationResultSchema = ApplicationResultBaseSchema.extend({
+  status: z.literal("submission_uncertain"),
+  submit_attempted: z.literal(true),
+  submission_confirmation: z.null(),
+}).strict();
+export type SubmissionUncertainApplicationResult = z.infer<
+  typeof SubmissionUncertainApplicationResultSchema
+>;
+
+export const CancelledApplicationResultSchema = ApplicationResultBaseSchema.extend({
+  status: z.literal("cancelled"),
+  submit_attempted: z.literal(false).default(false),
+  submission_confirmation: z.null(),
+}).strict();
+export type CancelledApplicationResult = z.infer<typeof CancelledApplicationResultSchema>;
+
+export const ApplicationRunResultSchema = z.discriminatedUnion("status", [
+  SubmittedApplicationResultSchema,
+  SubmissionUncertainApplicationResultSchema,
+  CancelledApplicationResultSchema,
+]);
 export type ApplicationRunResult = z.infer<typeof ApplicationRunResultSchema>;
 
 export const BrowserUseRuntimeActionSchema = z.object({
@@ -40,6 +80,14 @@ export const BrowserUseRuntimeActionSchema = z.object({
   code: z.string().refine((value) => Buffer.byteLength(value, "utf8") <= 65_536),
 }).strict();
 export type BrowserUseRuntimeAction = z.infer<typeof BrowserUseRuntimeActionSchema>;
+
+export const SubmitApplicationRuntimeActionSchema = z.object({
+  type: z.literal("submit_application"),
+  code: z.string().refine((value) => Buffer.byteLength(value, "utf8") <= 65_536),
+}).strict();
+export type SubmitApplicationRuntimeAction = z.infer<
+  typeof SubmitApplicationRuntimeActionSchema
+>;
 
 export const RequestHumanNavigationRuntimeActionSchema = z.object({
   type: z.literal("request_human_navigation"),
@@ -76,7 +124,7 @@ export type RequestAdditionalInfoRuntimeAction = z.infer<
 
 export const RequestHumanReviewRuntimeActionSchema = z.object({
   type: z.literal("request_human_review"),
-  result: ApplicationRunResultSchema,
+  result: ReviewApplicationResultSchema,
 }).strict();
 export type RequestHumanReviewRuntimeAction = z.infer<
   typeof RequestHumanReviewRuntimeActionSchema
@@ -91,6 +139,7 @@ export type ReportApplicationMismatchRuntimeAction = z.infer<
 
 export const RuntimeActionRequestSchema = z.discriminatedUnion("type", [
   BrowserUseRuntimeActionSchema,
+  SubmitApplicationRuntimeActionSchema,
   RequestHumanNavigationRuntimeActionSchema,
   RequestOriginApprovalRuntimeActionSchema,
   RequestAdditionalInfoRuntimeActionSchema,
@@ -143,6 +192,14 @@ export type BrowserUseResultRuntimeActionResponse = z.infer<
   typeof BrowserUseResultRuntimeActionResponseSchema
 >;
 
+export const SubmitApplicationResultRuntimeActionResponseSchema =
+  BrowserUseExecutionResultSchema.extend({
+    type: z.literal("submit_application_result"),
+  }).strict();
+export type SubmitApplicationResultRuntimeActionResponse = z.infer<
+  typeof SubmitApplicationResultRuntimeActionResponseSchema
+>;
+
 export const ContinueRuntimeActionResponseSchema = z.object({
   type: z.literal("continue"),
 }).strict();
@@ -168,17 +225,17 @@ export type ReviseRuntimeActionResponse = z.infer<
   typeof ReviseRuntimeActionResponseSchema
 >;
 
-export const ReadyRuntimeActionResponseSchema = z.object({
-  type: z.literal("ready"),
-  result: ApplicationRunResultSchema,
+export const SubmitRuntimeActionResponseSchema = z.object({
+  type: z.literal("submit"),
+  result: ReviewApplicationResultSchema,
 }).strict();
-export type ReadyRuntimeActionResponse = z.infer<
-  typeof ReadyRuntimeActionResponseSchema
+export type SubmitRuntimeActionResponse = z.infer<
+  typeof SubmitRuntimeActionResponseSchema
 >;
 
 export const CancelRuntimeActionResponseSchema = z.object({
   type: z.literal("cancel"),
-  result: ApplicationRunResultSchema,
+  result: CancelledApplicationResultSchema,
 }).strict();
 export type CancelRuntimeActionResponse = z.infer<
   typeof CancelRuntimeActionResponseSchema
@@ -249,10 +306,11 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   BrowserUseResultRuntimeActionResponseSchema,
+  SubmitApplicationResultRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   ApproveRuntimeActionResponseSchema,
   ReviseRuntimeActionResponseSchema,
-  ReadyRuntimeActionResponseSchema,
+  SubmitRuntimeActionResponseSchema,
   AdditionalInfoRuntimeActionResponseSchema,
   CancelRuntimeActionResponseSchema,
   ApplicationMismatchRuntimeActionResponseSchema,
@@ -264,8 +322,8 @@ export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
     if (!value.approved_origins.includes(value.origin)) {
       context.addIssue({ code: "custom", message: "origin must be approved" });
     }
-  } else if (value.type === "ready" && value.result.status !== "ready_for_human_submit") {
-    context.addIssue({ code: "custom", message: "ready result required" });
+  } else if (value.type === "submit" && value.result.status !== "ready_for_submission") {
+    context.addIssue({ code: "custom", message: "review result required" });
   } else if (value.type === "cancel" && value.result.status !== "cancelled") {
     context.addIssue({ code: "custom", message: "cancelled result required" });
   }

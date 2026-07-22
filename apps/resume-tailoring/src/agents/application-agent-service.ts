@@ -8,6 +8,7 @@ import {
   type ApplicationAgentDependencies,
   type ApplicationAgentRunInput,
   type ApplicationRunResult,
+  type ApplicationSubmissionGuard,
 } from "./application-agent";
 import {
   HttpApplicationRuntimeClient,
@@ -43,6 +44,10 @@ export type ApplicationRuntimeClientFactory = (
   bearerToken: string,
 ) => ApplicationRuntimeClient;
 
+export type ApplicationSubmissionGuardFactory = (
+  sessionId: string,
+) => ApplicationSubmissionGuard;
+
 export type ApplicationAgentRunner = (
   input: ApplicationAgentRunInput,
   signal: AbortSignal,
@@ -53,6 +58,7 @@ export interface ApplicationAgentServiceOptions {
   readonly authStatusReader?: ApplicationAgentAuthStatusReader;
   readonly runApplicationAgent?: ApplicationAgentRunner;
   readonly runtimeClientFactory?: ApplicationRuntimeClientFactory;
+  readonly submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly agentRuntime?: AgentRuntimeDependencies;
 }
 
@@ -85,11 +91,12 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
   readonly #authStatusReader: ApplicationAgentAuthStatusReader;
   readonly #runApplicationAgent: ApplicationAgentRunner;
   readonly #runtimeClientFactory: ApplicationRuntimeClientFactory;
+  readonly #submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly #agentRuntime: AgentRuntimeDependencies;
 
   constructor(
     harnessToken: string,
-    options: ApplicationAgentServiceOptions = {},
+    options: ApplicationAgentServiceOptions,
   ) {
     this.#harnessToken = harnessToken;
     this.#authStatusReader = options.authStatusReader ?? getAuthStatus;
@@ -98,6 +105,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
     this.#runtimeClientFactory = options.runtimeClientFactory
       ?? ((runtimeUrl, sessionId, bearerToken) =>
         new HttpApplicationRuntimeClient(runtimeUrl, sessionId, bearerToken));
+    this.#submissionGuardFactory = options.submissionGuardFactory;
     this.#agentRuntime = options.agentRuntime ?? {};
   }
 
@@ -150,9 +158,11 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
         input.sessionId,
         this.#harnessToken,
       );
+      const submissionGuard = this.#submissionGuardFactory(input.sessionId);
       const unparsedResult = await this.#runApplicationAgent(input, signal, {
         ...this.#agentRuntime,
         runtimeClient,
+        submissionGuard,
       });
       signal.throwIfAborted();
       const parsedResult = ApplicationRunResultSchema.safeParse(unparsedResult);

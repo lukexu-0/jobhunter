@@ -16,19 +16,29 @@ export const HARNESS_SESSION_STATES = [
   "awaiting_origin_approval",
   "awaiting_additional_info",
   "awaiting_human_review",
-  "ready_for_human_submit",
+  "submitting",
+  "submitted",
+  "submission_uncertain",
   "cancelled",
   "failed",
   "closed",
 ] as const;
 export type HarnessSessionState = (typeof HARNESS_SESSION_STATES)[number];
 export type ApplicationSessionBridgeState = "reserved" | HarnessSessionState | "lost";
+export type ApplicationSubmissionPhase =
+  | "not_attempted"
+  | "attempting"
+  | "submitted"
+  | "uncertain";
 const TERMINAL_APPLICATION_SESSION_STATES: Readonly<Partial<Record<ApplicationSessionBridgeState, true>>> = {
   cancelled: true,
   failed: true,
   closed: true,
   lost: true,
 };
+
+export const APPLICATION_SUBMISSION_UNCERTAIN_WARNING =
+  "The application submission could not be verified. Check the headed browser if it is still available, then close this session.";
 
 export class RepositoryConflictError extends Error {
   constructor(message: string) {
@@ -57,6 +67,13 @@ export class RunArtifactsPrunedError extends RepositoryConflictError {
   constructor(message = "run artifacts were removed") {
     super(message);
     this.name = "RunArtifactsPrunedError";
+  }
+}
+
+export class ApplicationSubmissionFinalError extends RepositoryConflictError {
+  constructor(message = "application submission cannot be retried") {
+    super(message);
+    this.name = "ApplicationSubmissionFinalError";
   }
 }
 
@@ -99,6 +116,9 @@ interface ApplicationSessionRow {
   resume_revision: number;
   pdf_sha256: string;
   bridge_state: ApplicationSessionBridgeState;
+  submission_phase: ApplicationSubmissionPhase;
+  submission_attempted_at: number | null;
+  submission_confirmed_at: number | null;
   public_snapshot_json: string | null;
   last_upstream_event_id: number | null;
   created_at: number;
@@ -109,6 +129,7 @@ interface ApplicationSessionRow {
 export interface PublicRun {
   readonly id: string;
   readonly jobDescription: string;
+  readonly jobUrl?: string;
   readonly status: RunStatus;
   readonly applicationStatus: ApplicationStatus;
   readonly titleOverride?: string;
@@ -167,6 +188,7 @@ export interface PublicApplicationSession {
   readonly resumeRevision: number;
   readonly pdfSha256: string;
   readonly bridgeState: ApplicationSessionBridgeState;
+  readonly submissionPhase: ApplicationSubmissionPhase;
   readonly publicSnapshot: unknown | null;
   readonly lastUpstreamEventId: number | null;
   readonly createdAt: number;
@@ -220,6 +242,7 @@ function publicRun(row: RunRow): PublicRun {
   return {
     id: row.id,
     jobDescription: row.job_description,
+    ...(row.job_url !== null ? { jobUrl: row.job_url } : {}),
     status: row.status,
     applicationStatus: row.application_status,
     ...(row.title_override !== null ? { titleOverride: row.title_override } : {}),
@@ -247,6 +270,7 @@ function publicApplicationSession(row: ApplicationSessionRow): PublicApplication
     resumeRevision: row.resume_revision,
     pdfSha256: row.pdf_sha256,
     bridgeState: row.bridge_state,
+    submissionPhase: row.submission_phase,
     publicSnapshot: row.public_snapshot_json === null ? null : JSON.parse(row.public_snapshot_json) as unknown,
     lastUpstreamEventId: row.last_upstream_event_id,
     createdAt: row.created_at,
@@ -269,6 +293,54 @@ function publicApplicationSnapshotUpdatedAt(snapshot: unknown): number | null {
   return Number.isSafeInteger(updatedAt) && (updatedAt as number) >= 0
     ? updatedAt as number
     : null;
+}
+
+function submissionUncertainSnapshot(
+  row: ApplicationSessionRow,
+  updatedAt: number,
+): string {
+  let existing: Record<string, unknown>;
+  if (row.public_snapshot_json === null) {
+    existing = {
+      generation: row.generation,
+      createdAt: row.created_at,
+      expiresAt: null,
+      company: null,
+      role: null,
+      fieldsFilled: [],
+      fieldsNeedingHuman: [],
+      filesAttached: [],
+      warnings: [],
+      revisionCount: 0,
+    };
+  } else {
+    const parsed = JSON.parse(row.public_snapshot_json) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("application session snapshot is not an object");
+    }
+    existing = parsed as Record<string, unknown>;
+  }
+  const warnings = Array.isArray(existing.warnings)
+    ? existing.warnings.filter(
+      (warning): warning is string => typeof warning === "string"
+        && warning !== APPLICATION_SUBMISSION_UNCERTAIN_WARNING,
+    ).slice(0, 99)
+    : [];
+  const closed = row.bridge_state === "closed";
+  return JSON.stringify({
+    ...existing,
+    generation: row.generation,
+    bridgeState: closed ? "closed" : "submission_uncertain",
+    harnessState: closed
+      ? (existing.harnessState === "closed" ? "closed" : null)
+      : "submission_uncertain",
+    submissionPhase: "uncertain",
+    updatedAt,
+    terminalAt: closed ? row.terminal_at : null,
+    pendingAction: null,
+    error: null,
+    warnings: [...warnings, APPLICATION_SUBMISSION_UNCERTAIN_WARNING],
+  });
 }
 
 export class PipelineRepository {
@@ -484,6 +556,13 @@ export class PipelineRepository {
       if ((latest?.session_id ?? null) !== expectedSessionId) {
         throw new RepositoryConflictError("application session changed");
       }
+      if (
+        latest?.submission_phase === "attempting"
+        || latest?.submission_phase === "submitted"
+        || latest?.submission_phase === "uncertain"
+      ) {
+        throw new ApplicationSubmissionFinalError();
+      }
       if (latest && TERMINAL_APPLICATION_SESSION_STATES[latest.bridge_state] !== true) {
         throw new RepositoryConflictError("application session is active");
       }
@@ -511,6 +590,162 @@ export class PipelineRepository {
     });
   }
 
+  claimApplicationSubmission(sessionId: string): void {
+    this.#immediate(() => {
+      const session = this.#db.query<ApplicationSessionRow, [string]>(
+        "SELECT * FROM run_application_sessions WHERE session_id = ?",
+      ).get(sessionId);
+      if (!session) throw new RepositoryConflictError("application session not found");
+      const current = this.#currentApplicationSession(
+        session.run_id,
+        session.generation,
+        sessionId,
+      );
+      if (current.submission_phase !== "not_attempted") {
+        throw new RepositoryConflictError("application submission was already claimed");
+      }
+      if (current.bridge_state !== "awaiting_human_review") {
+        throw new RepositoryConflictError(
+          "application submission is not awaiting human review",
+        );
+      }
+      const attemptedAt = this.#now();
+      const updatedAt = Math.max(current.updated_at + 1, attemptedAt);
+      const result = this.#db.query(`
+        UPDATE run_application_sessions
+        SET submission_phase = 'attempting',
+            submission_attempted_at = ?,
+            updated_at = ?
+        WHERE run_id = ? AND generation = ? AND session_id = ?
+          AND submission_phase = 'not_attempted'
+          AND bridge_state = 'awaiting_human_review'
+          AND generation = (
+            SELECT max(generation)
+            FROM run_application_sessions
+            WHERE run_id = ?
+          )
+      `).run(attemptedAt, updatedAt, current.run_id, current.generation, sessionId, current.run_id);
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("application submission was already claimed");
+      }
+    });
+  }
+
+  finalizeApplicationSubmission(
+    sessionId: string,
+    outcome: "submitted" | "uncertain",
+  ): void {
+    this.#immediate(() => {
+      const session = this.#db.query<ApplicationSessionRow, [string]>(
+        "SELECT * FROM run_application_sessions WHERE session_id = ?",
+      ).get(sessionId);
+      if (!session) throw new RepositoryConflictError("application session not found");
+      const current = this.#currentApplicationSession(
+        session.run_id,
+        session.generation,
+        sessionId,
+      );
+      const targetPhase = outcome === "submitted" ? "submitted" : "uncertain";
+      if (current.submission_phase === targetPhase) return;
+      if (
+        current.submission_phase === "submitted"
+        || current.submission_phase === "uncertain"
+      ) {
+        throw new RepositoryConflictError("conflicting submission outcome");
+      }
+      if (current.submission_phase !== "attempting") {
+        throw new RepositoryConflictError("application submission was not claimed");
+      }
+      const finalizedAt = this.#now();
+      const updatedAt = Math.max(current.updated_at + 1, finalizedAt);
+      const result = this.#db.query(`
+        UPDATE run_application_sessions
+        SET submission_phase = ?,
+            submission_confirmed_at = ?,
+            updated_at = ?
+        WHERE run_id = ? AND generation = ? AND session_id = ?
+          AND submission_phase = 'attempting'
+          AND generation = (
+            SELECT max(generation)
+            FROM run_application_sessions
+            WHERE run_id = ?
+          )
+      `).run(
+        targetPhase,
+        outcome === "submitted" ? finalizedAt : null,
+        updatedAt,
+        current.run_id,
+        current.generation,
+        sessionId,
+        current.run_id,
+      );
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("application submission finalization conflicted");
+      }
+      if (outcome === "submitted") {
+        this.#db.query(`
+          UPDATE runs
+          SET application_status = 'applied',
+              updated_at = CASE
+                WHEN application_status = 'applied' THEN updated_at
+                ELSE ?
+              END
+          WHERE id = ?
+            AND application_status IN ('pending','failed','applied')
+        `).run(finalizedAt, current.run_id);
+      }
+    });
+  }
+
+
+  reconcileAttemptingApplicationSubmissions(): number {
+    return this.#immediate(() => {
+      const attempting = this.#db.query<ApplicationSessionRow, []>(`
+        SELECT *
+        FROM run_application_sessions
+        WHERE submission_phase = 'attempting'
+        ORDER BY run_id, generation
+      `).all();
+      let reconciled = 0;
+      for (const row of attempting) {
+        const snapshotUpdatedAt = row.public_snapshot_json === null
+          ? null
+          : publicApplicationSnapshotUpdatedAt(
+            JSON.parse(row.public_snapshot_json) as unknown,
+          );
+        const updatedAt = Math.max(
+          row.updated_at + 1,
+          snapshotUpdatedAt === null ? 0 : snapshotUpdatedAt + 1,
+          this.#now(),
+        );
+        const result = this.#db.query(`
+          UPDATE run_application_sessions
+          SET bridge_state = CASE
+                WHEN bridge_state = 'closed' THEN 'closed'
+                ELSE 'submission_uncertain'
+              END,
+              submission_phase = 'uncertain',
+              submission_confirmed_at = NULL,
+              public_snapshot_json = ?,
+              updated_at = ?,
+              terminal_at = CASE
+                WHEN bridge_state = 'closed' THEN terminal_at
+                ELSE NULL
+              END
+          WHERE run_id = ? AND generation = ? AND session_id = ?
+            AND submission_phase = 'attempting'
+        `).run(
+          submissionUncertainSnapshot(row, updatedAt),
+          updatedAt,
+          row.run_id,
+          row.generation,
+          row.session_id,
+        );
+        reconciled += result.changes;
+      }
+      return reconciled;
+    });
+  }
   recordApplicationSnapshot(
     runId: string,
     input: {
@@ -550,6 +785,33 @@ export class PipelineRepository {
         )
       ) {
         return publicApplicationSession(current);
+      }
+      const bridgeMatchesSubmissionPhase =
+        (
+          current.submission_phase === "not_attempted"
+          && input.bridgeState !== "submitting"
+          && input.bridgeState !== "submitted"
+          && input.bridgeState !== "submission_uncertain"
+        )
+        || (
+          current.submission_phase === "attempting"
+          && input.bridgeState === "submitting"
+        )
+        || (
+          current.submission_phase === "submitted"
+          && (input.bridgeState === "submitted" || input.bridgeState === "closed")
+        )
+        || (
+          current.submission_phase === "uncertain"
+          && (
+            input.bridgeState === "submission_uncertain"
+            || input.bridgeState === "closed"
+          )
+        );
+      if (!bridgeMatchesSubmissionPhase) {
+        throw new RepositoryConflictError(
+          "application submission phase does not allow this bridge transition",
+        );
       }
       if (
         current.last_upstream_event_id !== null
@@ -623,6 +885,9 @@ export class PipelineRepository {
     const publicSnapshotJson = serializePublicApplicationSnapshot(input.publicSnapshot);
     return this.#immediate(() => {
       const current = this.#currentApplicationSession(runId, input.generation, input.sessionId);
+      if (current.submission_phase !== "not_attempted") {
+        throw new RepositoryConflictError("application submission is already final or attempting");
+      }
       if (
         current.public_snapshot_json === null
         || TERMINAL_APPLICATION_SESSION_STATES[current.bridge_state] === true
@@ -771,7 +1036,9 @@ export class PipelineRepository {
                 'awaiting_origin_approval',
                 'awaiting_additional_info',
                 'awaiting_human_review',
-                'ready_for_human_submit'
+                'submitting',
+                'submitted',
+                'submission_uncertain'
               )
           )
         ON CONFLICT(run_id) DO NOTHING
@@ -867,7 +1134,9 @@ export class PipelineRepository {
               'awaiting_origin_approval',
               'awaiting_additional_info',
               'awaiting_human_review',
-              'ready_for_human_submit'
+              'submitting',
+              'submitted',
+              'submission_uncertain'
             )
         ) AS active
       `).get(runId)?.active === 1;

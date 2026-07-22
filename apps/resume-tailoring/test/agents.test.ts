@@ -703,6 +703,53 @@ describe("guarded agents", () => {
     expect(defaultValidation.count()).toBe(0);
   });
 
+  test("awaits async terminal validation and rejects concurrent submission", async () => {
+    const validationStarted = Promise.withResolvers<void>();
+    const releaseValidation = Promise.withResolvers<void>();
+    const submission = createTerminalSubmission({
+      name: "async_result",
+      description: "async",
+      schema: z.object({ value: z.string() }).strict(),
+      validate: async () => {
+        validationStarted.resolve();
+        await releaseValidation.promise;
+      },
+    });
+    if (submission.tool.type !== "function") throw new Error("not a function tool");
+
+    const first = submission.tool.invoke(new RunContext(), JSON.stringify({ value: "ok" }));
+    await validationStarted.promise;
+    expect(submission.count()).toBe(0);
+    expect(submission.value()).toBeUndefined();
+    await expect(
+      submission.tool.invoke(new RunContext(), JSON.stringify({ value: "duplicate" })),
+    ).rejects.toThrow("exactly once");
+    releaseValidation.resolve();
+    await expect(first).resolves.toEqual({ value: "ok" });
+    expect(submission.count()).toBe(1);
+    expect(submission.value()).toEqual({ value: "ok" });
+
+    let rejectValidation = true;
+    const retryable = createTerminalSubmission({
+      name: "retryable_result",
+      description: "retryable",
+      schema: z.object({ value: z.string() }).strict(),
+      validate: async () => {
+        if (rejectValidation) throw new Error("durable commit failed");
+      },
+    });
+    if (retryable.tool.type !== "function") throw new Error("not a function tool");
+    await expect(
+      retryable.tool.invoke(new RunContext(), JSON.stringify({ value: "first" })),
+    ).rejects.toThrow("durable commit failed");
+    expect(retryable.count()).toBe(0);
+    rejectValidation = false;
+    await expect(
+      retryable.tool.invoke(new RunContext(), JSON.stringify({ value: "second" })),
+    ).resolves.toEqual({ value: "second" });
+    expect(retryable.count()).toBe(1);
+  });
+
   test("tailoring performs the exact four-call mechanical sequence", async () => {
     const tailoredTex = `${BASELINE}\n% isolated tailored copy`;
     const sequence: string[] = [];

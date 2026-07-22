@@ -12,9 +12,10 @@ import {
 } from "../src/api/application-harness-client.ts";
 import {
   ApplicationSessionService,
+  type ApplicationSessionStreamItem,
   readApplicantProfileMarkdown,
 } from "../src/api/application-session-service.ts";
-import type { ApplicationSessionCommand } from "../src/contracts/index.ts";
+import type { ApplicationSessionCommand, ApplicationSessionEventDto } from "../src/contracts/index.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
 import { PipelineRepository, type ActiveStage } from "../src/db/repository.ts";
 import { ArtifactStore } from "../src/system/artifacts.ts";
@@ -51,6 +52,13 @@ function harnessSnapshot(
     revisionCount: 0,
     pendingAction: null,
     error: null,
+  };
+}
+
+function harnessReviewSnapshot(): ApplicationHarnessSnapshot {
+  return {
+    ...harnessSnapshot("awaiting_human_review"),
+    pendingAction: { type: "human_review" },
   };
 }
 
@@ -389,6 +397,40 @@ describe("application session service", () => {
     });
     expect(JSON.stringify(closed?.publicSnapshot)).not.toContain(FIRST_SESSION_ID);
     expect(target.harness!.createCalls).toHaveLength(0);
+  });
+
+  test("close waits for a reserved start and then closes the created harness session", async () => {
+    const target = await createTarget();
+    const readStarted = deferred<void>();
+    const releaseRead = deferred<void>();
+    const service = new ApplicationSessionService({
+      repository: target.repository,
+      artifacts: {
+        read: async (path, maxBytes) => {
+          readStarted.resolve(undefined);
+          await releaseRead.promise;
+          return await target.artifacts.read(path, maxBytes);
+        },
+      },
+      harness: target.harness!,
+      uuidFactory: () => FIRST_SESSION_ID,
+      now: () => 1_000,
+      profileReader: () => PROFILE,
+    });
+
+    const started = service.start(target.runId, target.pdf.sha256, signal());
+    await readStarted.promise;
+    const closed = service.close(target.runId, signal());
+    releaseRead.resolve(undefined);
+    await Promise.all([started, closed]);
+
+    expect(target.harness!.createCalls).toHaveLength(1);
+    expect(target.harness!.deleteCalls).toEqual([FIRST_SESSION_ID]);
+    expect(target.harness!.snapshots.has(FIRST_SESSION_ID)).toBeFalse();
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "closed",
+      submissionPhase: "not_attempted",
+    });
   });
 
   test("concurrent compare-and-swap starters converge on one reserved UUID", async () => {
@@ -739,6 +781,45 @@ describe("application session service", () => {
     await behind.return?.(undefined);
   });
 
+  test("does not emit a stale SSE frame after another stream advances the durable cursor", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.harness!.events = [{
+      id: 6,
+      event: "agent_step",
+      session: {
+        ...harnessSnapshot("running"),
+        updatedAt: 10_200,
+      },
+      detail: { stepNumber: 2 },
+    }];
+    const stream = await target.service.events(target.runId, undefined, signal());
+    const current = target.repository.getLatestApplicationSession(target.runId);
+    if (!current || current.publicSnapshot === null) throw new Error("snapshot missing");
+    target.repository.recordApplicationSnapshot(target.runId, {
+      generation: 1,
+      sessionId: FIRST_SESSION_ID,
+      bridgeState: "running",
+      publicSnapshot: {
+        ...(current.publicSnapshot as Record<string, unknown>),
+        bridgeState: "running",
+        harnessState: "running",
+        updatedAt: 10_300,
+        pendingAction: null,
+      },
+      lastUpstreamEventId: 7,
+    });
+
+    const items: ApplicationSessionStreamItem[] = [];
+    for await (const item of stream) items.push(item);
+
+    expect(items).toEqual([]);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      lastUpstreamEventId: 7,
+      publicSnapshot: expect.objectContaining({ updatedAt: 10_300 }),
+    });
+  });
+
   test("maps an upstream SSE open failure before exposing an event iterator", async () => {
     const target = await createTarget();
     await target.service.start(target.runId, target.pdf.sha256, signal());
@@ -874,5 +955,214 @@ describe("application session service", () => {
         terminal.repository.getLatestApplicationSession(terminal.runId)?.publicSnapshot,
       )).not.toContain(FIRST_SESSION_ID);
     }
+  });
+
+  test("overlays claimed and submitted phases, streams fixed events, and retains finality after close", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    const initial = await target.service.start(target.runId, target.pdf.sha256, signal());
+    expect(initial.submissionPhase).toBe("not_attempted");
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+
+    expect(await target.service.get(target.runId)).toMatchObject({
+      bridgeState: "submitting",
+      harnessState: "submitting",
+      submissionPhase: "attempting",
+    });
+    target.harness!.events = [{
+      id: 1,
+      event: "submission_started",
+      session: { ...harnessSnapshot("submitting"), updatedAt: 10_200 },
+      detail: {},
+    }];
+    const started: ApplicationSessionEventDto[] = [];
+    for await (const item of await target.service.events(target.runId, undefined, signal())) {
+      started.push(item.event);
+    }
+    expect(started).toEqual([expect.objectContaining({
+      event: "submission_started",
+      session: expect.objectContaining({
+        bridgeState: "submitting",
+        submissionPhase: "attempting",
+      }),
+    })]);
+
+    target.repository.finalizeApplicationSubmission(FIRST_SESSION_ID, "submitted");
+    target.harness!.events = [{
+      id: 2,
+      event: "application_submitted",
+      session: { ...harnessSnapshot("submitted"), updatedAt: 10_300 },
+      detail: {},
+    }];
+    const submitted: ApplicationSessionStreamItem[] = [];
+    for await (const item of await target.service.events(
+      target.runId,
+      { generation: 1, upstreamEventId: 1 },
+      signal(),
+    )) submitted.push(item);
+    expect(submitted).toEqual([expect.objectContaining({
+      id: "1:2",
+      event: expect.objectContaining({
+        event: "application_submitted",
+        session: expect.objectContaining({
+          bridgeState: "submitted",
+          harnessState: "submitted",
+          submissionPhase: "submitted",
+        }),
+      }),
+    })]);
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("applied");
+
+    await expect(target.service.command(target.runId, { type: "submit" }, signal()))
+      .rejects.toMatchObject({
+        code: "APPLICATION_SUBMISSION_FINAL",
+        message: "The application submission cannot be retried",
+        status: 409,
+      });
+    expect(target.harness!.commandCalls).toEqual([]);
+    target.harness!.deleteError = new ApplicationHarnessError("session_not_found");
+    await target.service.close(target.runId, signal());
+    expect(await target.service.get(target.runId)).toMatchObject({
+      bridgeState: "closed",
+      submissionPhase: "submitted",
+    });
+    await expect(target.service.start(target.runId, target.pdf.sha256, signal()))
+      .rejects.toMatchObject({ code: "APPLICATION_SUBMISSION_FINAL", status: 409 });
+    await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
+      .rejects.toMatchObject({ code: "APPLICATION_SUBMISSION_FINAL", status: 409 });
+  });
+
+  test("blocks start and retry while a claimed submission awaits reconciliation", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+    target.database.query(`
+      UPDATE run_application_sessions
+      SET bridge_state = 'closed', terminal_at = 1010
+      WHERE session_id = ?
+    `).run(FIRST_SESSION_ID);
+
+    await expect(target.service.start(target.runId, target.pdf.sha256, signal()))
+      .rejects.toMatchObject({
+        code: "APPLICATION_SUBMISSION_FINAL",
+        message: "The application submission cannot be retried",
+        status: 409,
+      });
+    await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
+      .rejects.toMatchObject({
+        code: "APPLICATION_SUBMISSION_FINAL",
+        message: "The application submission cannot be retried",
+        status: 409,
+      });
+    expect(target.harness!.createCalls).toHaveLength(1);
+  });
+
+  test("converts post-claim harness loss to non-applied retained uncertainty", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+    target.harness!.streamError = new ApplicationHarnessError("session_not_found");
+
+    await expect(target.service.events(target.runId, undefined, signal()))
+      .rejects.toMatchObject({ code: "RUN_CONFLICT", status: 409 });
+
+    expect(await target.service.get(target.runId)).toMatchObject({
+      bridgeState: "submission_uncertain",
+      harnessState: "submission_uncertain",
+      submissionPhase: "uncertain",
+      pendingAction: null,
+      error: null,
+      warnings: [
+        "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
+      ],
+    });
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
+    await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
+      .rejects.toMatchObject({
+        code: "APPLICATION_SUBMISSION_FINAL",
+        message: "The application submission cannot be retried",
+        status: 409,
+      });
+  });
+
+  test("converts a terminal harness snapshot after claim into retained uncertainty", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+    target.harness!.events = [{
+      id: 1,
+      event: "submission_uncertain",
+      session: { ...harnessSnapshot("closed"), updatedAt: 10_200 },
+      detail: {},
+    }];
+
+    const events: ApplicationSessionStreamItem[] = [];
+    for await (const item of await target.service.events(target.runId, undefined, signal())) {
+      events.push(item);
+    }
+
+    expect(events).toEqual([expect.objectContaining({
+      id: "1:1",
+      event: expect.objectContaining({
+        session: expect.objectContaining({
+          bridgeState: "closed",
+          submissionPhase: "uncertain",
+          warnings: [
+            "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
+          ],
+        }),
+      }),
+    })]);
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
+    await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
+      .rejects.toMatchObject({ code: "APPLICATION_SUBMISSION_FINAL", status: 409 });
+  });
+
+  test("close preserves a concurrent submitted finalization and still closes the browser", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+    const finalize = target.repository.finalizeApplicationSubmission.bind(target.repository);
+    let raced = false;
+    target.repository.finalizeApplicationSubmission = (sessionId, outcome) => {
+      if (!raced && outcome === "uncertain") {
+        raced = true;
+        finalize(sessionId, "submitted");
+      }
+      finalize(sessionId, outcome);
+    };
+
+    await target.service.close(target.runId, signal());
+
+    expect(target.harness!.deleteCalls).toEqual([FIRST_SESSION_ID]);
+    expect(await target.service.get(target.runId)).toMatchObject({
+      bridgeState: "closed",
+      submissionPhase: "submitted",
+    });
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("applied");
+  });
+
+  test("closing after a committed claim finalizes uncertainty before releasing liveness", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+
+    await target.service.close(target.runId, signal());
+
+    expect(await target.service.get(target.runId)).toMatchObject({
+      bridgeState: "closed",
+      submissionPhase: "uncertain",
+      warnings: [
+        "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
+      ],
+    });
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
+    await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
+      .rejects.toMatchObject({ code: "APPLICATION_SUBMISSION_FINAL", status: 409 });
   });
 });

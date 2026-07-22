@@ -581,6 +581,7 @@ export class RunApplicationService {
     const pdf = artifactsRetained ? repository.getArtifact(run.id, "compiled-pdf") : null;
     return {
       id: run.id,
+      ...(run.jobUrl !== undefined ? { jobUrl: run.jobUrl } : {}),
       status: run.status,
       applicationStatus: run.applicationStatus,
       ...(run.titleOverride !== undefined ? { titleOverride: run.titleOverride } : {}),

@@ -10,20 +10,28 @@ import {
 import {
   AcceptedAdditionalInfoAnswerSchema,
   AdditionalInfoRuntimeActionResponseSchema,
+  ApplicationRunResultSchema,
+  CancelledApplicationResultSchema,
+  ReviewApplicationResultSchema,
+  SubmittedApplicationResultSchema,
+  SubmissionUncertainApplicationResultSchema,
   ApplicationRuntimeError,
   HttpApplicationRuntimeClient,
   RequestAdditionalInfoRuntimeActionSchema,
+  SubmitApplicationRuntimeActionSchema,
+  SubmitApplicationResultRuntimeActionResponseSchema,
   RuntimeActionRequestSchema,
   RuntimeActionResponseSchema,
   type RuntimeActionRequest,
   type RuntimeActionResponse,
+  type BrowserUseExecutionResult,
 } from "../src/agents/application-runtime-client";
 
 const RUNTIME_URL = "http://127.0.0.1:8765";
 const SESSION_ID = "123e4567-e89b-42d3-a456-426614174000";
 const TOKEN = "test-token-0123456789abcdef-0123456789";
 const READY_RESULT = {
-  status: "ready_for_human_submit" as const,
+  status: "ready_for_submission" as const,
   company: "Example Corp",
   role: "Engineer",
   job_url: "https://jobs.example.test/roles/123",
@@ -42,6 +50,70 @@ const READY_RESULT = {
   revision_count: 0,
   submit_attempted: false as const,
 };
+
+const SUBMIT_EXECUTION_RESULT: BrowserUseExecutionResult = {
+  exit_code: 0,
+  timed_out: false,
+  stdout: "",
+  stderr: "",
+  stdout_truncated: false,
+  stderr_truncated: false,
+  observation: {
+    url: "https://ats.example.test/applications/456/confirmation",
+    title: "Application received",
+    tabs: [],
+    dom: "Application received",
+    page_info: null,
+    screenshot: null,
+  },
+};
+
+test("separates review data from terminal submission outcomes", () => {
+  expect(ReviewApplicationResultSchema.parse(READY_RESULT)).toEqual(READY_RESULT);
+  expect(ApplicationRunResultSchema.safeParse(READY_RESULT).success).toBe(false);
+
+  const submitted = {
+    ...READY_RESULT,
+    status: "submitted" as const,
+    final_url: SUBMIT_EXECUTION_RESULT.observation.url,
+    submit_attempted: true as const,
+    submission_confirmation: {
+      type: "post_submit_confirmation" as const,
+      text: "Application received",
+    },
+  };
+  const uncertain = {
+    ...READY_RESULT,
+    status: "submission_uncertain" as const,
+    submit_attempted: true as const,
+    submission_confirmation: null,
+  };
+  const cancelled = {
+    ...READY_RESULT,
+    status: "cancelled" as const,
+    submission_confirmation: null,
+  };
+  expect(SubmittedApplicationResultSchema.parse(submitted)).toEqual(submitted);
+  expect(SubmissionUncertainApplicationResultSchema.parse(uncertain)).toEqual(uncertain);
+  expect(CancelledApplicationResultSchema.parse(cancelled)).toEqual(cancelled);
+  expect(ApplicationRunResultSchema.parse(submitted)).toEqual(submitted);
+  expect(ApplicationRunResultSchema.parse(uncertain)).toEqual(uncertain);
+  expect(ApplicationRunResultSchema.parse(cancelled)).toEqual(cancelled);
+  expect(SubmittedApplicationResultSchema.safeParse({
+    ...submitted,
+    submission_confirmation: {
+      type: "post_submit_confirmation",
+      text: "😀".repeat(1_001),
+    },
+  }).success).toBe(false);
+
+  const request = { type: "submit_application" as const, code: "print(page_info())" };
+  expect(SubmitApplicationRuntimeActionSchema.parse(request)).toEqual(request);
+  expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
+  const response = { type: "submit_application_result" as const, ...SUBMIT_EXECUTION_RESULT };
+  expect(SubmitApplicationResultRuntimeActionResponseSchema.parse(response)).toEqual(response);
+  expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
+});
 
 
 function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
@@ -91,6 +163,7 @@ const PUBLIC_APPLICATION_SNAPSHOT = {
   generation: 2,
   bridgeState: "awaiting_additional_info" as const,
   harnessState: "awaiting_additional_info" as const,
+  submissionPhase: "not_attempted" as const,
   createdAt: 1_720_000_000_000,
   updatedAt: 1_720_000_001_000,
   terminalAt: null,
@@ -159,6 +232,57 @@ test("strictly validates projected application snapshots and events", () => {
     pendingAction: null,
     error: { code: "browser_failed", message: "raw browser exception" },
   }).success).toBe(false);
+  const submitting = {
+    ...PUBLIC_APPLICATION_SNAPSHOT,
+    bridgeState: "submitting" as const,
+    harnessState: "submitting" as const,
+    submissionPhase: "attempting" as const,
+    pendingAction: null,
+  };
+  expect(ApplicationSessionSnapshotDtoSchema.parse(submitting)).toEqual(submitting);
+  expect(ApplicationSessionEventDtoSchema.parse({
+    generation: submitting.generation,
+    event: "submission_started",
+    session: submitting,
+    detail: {},
+  }).event).toBe("submission_started");
+  const submitted = {
+    ...submitting,
+    bridgeState: "submitted" as const,
+    harnessState: "submitted" as const,
+    submissionPhase: "submitted" as const,
+  };
+  expect(ApplicationSessionEventDtoSchema.parse({
+    generation: submitted.generation,
+    event: "application_submitted",
+    session: submitted,
+    detail: {},
+  }).event).toBe("application_submitted");
+  const uncertain = {
+    ...submitting,
+    bridgeState: "submission_uncertain" as const,
+    harnessState: "submission_uncertain" as const,
+    submissionPhase: "uncertain" as const,
+    warnings: [
+      "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
+    ],
+  };
+  expect(ApplicationSessionEventDtoSchema.parse({
+    generation: uncertain.generation,
+    event: "submission_uncertain",
+    session: uncertain,
+    detail: {},
+  }).event).toBe("submission_uncertain");
+  expect(ApplicationSessionSnapshotDtoSchema.safeParse({
+    ...submitted,
+    submissionPhase: "uncertain",
+  }).success).toBe(false);
+  expect(ApplicationSessionSnapshotDtoSchema.parse({
+    ...submitted,
+    bridgeState: "closed",
+    harnessState: "closed",
+    terminalAt: submitted.updatedAt,
+  }).submissionPhase).toBe("submitted");
 });
 
 test("strictly validates application commands and not-started views", () => {
@@ -182,6 +306,8 @@ test("strictly validates application commands and not-started views", () => {
     ],
   };
   expect(ApplicationSessionCommandSchema.parse(command)).toEqual(command);
+  expect(ApplicationSessionCommandSchema.parse({ type: "submit" })).toEqual({ type: "submit" });
+  expect(ApplicationSessionCommandSchema.safeParse({ type: "ready" }).success).toBe(false);
   expect(ApplicationSessionCommandSchema.safeParse({
     ...command,
     answers: [
@@ -437,7 +563,11 @@ describe("HttpApplicationRuntimeClient", () => {
   });
 
   test("strictly parses every Python runtime success response variant", async () => {
-    const cancelledResult = { ...READY_RESULT, status: "cancelled" as const };
+    const cancelledResult = {
+      ...READY_RESULT,
+      status: "cancelled" as const,
+      submission_confirmation: null,
+    };
     const responses = [
       {
         type: "browser_use_result",
@@ -463,6 +593,7 @@ describe("HttpApplicationRuntimeClient", () => {
           screenshot: { media_type: "image/png", data: "iVBORw0KGgo=" },
         },
       },
+      { type: "submit_application_result", ...SUBMIT_EXECUTION_RESULT },
       { type: "continue" },
       {
         type: "approve",
@@ -481,7 +612,7 @@ describe("HttpApplicationRuntimeClient", () => {
           value: "June through August 2027",
         }],
       },
-      { type: "ready", result: READY_RESULT },
+      { type: "submit", result: READY_RESULT },
       { type: "cancel", result: cancelledResult },
       { type: "application_mismatch" },
     ] satisfies RuntimeActionResponse[];
@@ -546,11 +677,11 @@ describe("HttpApplicationRuntimeClient", () => {
       stdout: character.repeat(20_001),
     }).success).toBe(false);
     expect(RuntimeActionResponseSchema.safeParse({
-      type: "ready",
+      type: "submit",
       result: unicodeReady,
     }).success).toBe(true);
     expect(RuntimeActionResponseSchema.safeParse({
-      type: "ready",
+      type: "submit",
       result: { ...unicodeReady, company: character.repeat(501) },
     }).success).toBe(false);
     expect(RuntimeActionResponseSchema.safeParse({
@@ -835,7 +966,7 @@ describe("HttpApplicationRuntimeClient", () => {
         approved_origins: ["https://ats.example.test", "https://ats.example.test"],
       }),
       jsonResponse({
-        type: "ready",
+        type: "submit",
         result: { ...READY_RESULT, status: "cancelled" },
       }),
       jsonResponse({ type: "additional_info", answers: [] }),
