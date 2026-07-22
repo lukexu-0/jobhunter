@@ -131,6 +131,12 @@ export interface PublicAttempt {
 export interface PublicEvent { readonly sequence: number; readonly revision: number | null; readonly kind: string; readonly payload: unknown; readonly createdAt: number }
 export interface PublicTimeline { readonly events: readonly PublicEvent[]; readonly attempts: readonly PublicAttempt[] }
 export interface PublicArtifact { readonly id: string; readonly revision: number; readonly attemptId: string | null; readonly stage: string; readonly kind: string; readonly sha256: string; readonly path: string; readonly byteSize: number; readonly createdAt: number }
+export interface PublicReviewableRevision {
+  readonly revision: number;
+  readonly status: "review" | "approved";
+  readonly createdAt: number;
+  readonly pdfSha256: string;
+}
 export interface RunSourceSnapshotInput {
   readonly manifestSha256: string;
   readonly baselineSha256: string;
@@ -852,16 +858,47 @@ export class PipelineRepository {
     const selected = revision ?? this.#run(runId).current_revision;
     return this.#db.query<RevisionRow, [string, number]>("SELECT * FROM revisions WHERE run_id=? AND revision=?").get(runId, selected) ?? null;
   }
-  resolveCurrentRevisionOrigin(runId: string): Exclude<RevisionOrigin, "retry"> {
-    let revision = this.getRevision(runId);
+  resolveRevisionOrigin(
+    runId: string,
+    selectedRevision: number,
+  ): Exclude<RevisionOrigin, "retry"> {
+    this.#run(runId);
+    let revision = this.getRevision(runId, selectedRevision);
     const seen = new Set<number>();
     while (revision?.origin === "retry") {
-      if (seen.has(revision.revision) || revision.source_revision === null) throw new Error("retry revision ancestry is corrupt");
+      if (seen.has(revision.revision) || revision.source_revision === null) {
+        throw new Error("retry revision ancestry is corrupt");
+      }
       seen.add(revision.revision);
       revision = this.getRevision(runId, revision.source_revision);
     }
     if (!revision) throw new RepositoryConflictError("revision not found");
     return revision.origin;
+  }
+
+  listReviewableRevisions(runId: string): PublicReviewableRevision[] {
+    this.#run(runId);
+    const revisions = this.#db.query<
+      { revision: number; status: "review" | "approved"; created_at: number },
+      [string]
+    >(`
+      SELECT revision, status, created_at
+      FROM revisions
+      WHERE run_id=? AND status IN ('review','approved')
+      ORDER BY revision
+    `).all(runId);
+    const reviewable: PublicReviewableRevision[] = [];
+    for (const revision of revisions) {
+      const pdf = this.getArtifact(runId, "compiled-pdf", revision.revision);
+      if (!pdf) continue;
+      reviewable.push({
+        revision: revision.revision,
+        status: revision.status,
+        createdAt: revision.created_at,
+        pdfSha256: pdf.sha256,
+      });
+    }
+    return reviewable;
   }
   getRevisionStatus(runId: string, revision: number): RunStatus | null {
     return this.getRevision(runId, revision)?.status ?? null;
@@ -1064,10 +1101,15 @@ export class PipelineRepository {
     const selected = revision ?? run.current_revision;
     return this.#db.query<ArtifactRow, [string, number]>("SELECT * FROM artifacts WHERE run_id=? AND revision=? ORDER BY created_at,id").all(runId, selected).map((row) => this.#publicArtifact(row));
   }
-  listResolvedArtifacts(runId: string): PublicArtifact[] {
+  listResolvedArtifacts(runId: string, revision?: number): PublicArtifact[] {
     const run = this.#run(runId);
-    const kinds = this.#db.query<{ kind: string }, [string]>("SELECT DISTINCT kind FROM artifacts WHERE run_id=? ORDER BY kind").all(runId);
-    return kinds.map(({ kind }) => this.getArtifact(runId, kind, run.current_revision)).filter((artifact): artifact is PublicArtifact => artifact !== null);
+    const selected = revision ?? run.current_revision;
+    const kinds = this.#db.query<{ kind: string }, [string]>(
+      "SELECT DISTINCT kind FROM artifacts WHERE run_id=? ORDER BY kind",
+    ).all(runId);
+    return kinds
+      .map(({ kind }) => this.getArtifact(runId, kind, selected))
+      .filter((artifact): artifact is PublicArtifact => artifact !== null);
   }
 
   getEditRequest(runId: string, targetRevision?: number): PublicEditRequest | null {

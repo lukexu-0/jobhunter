@@ -511,7 +511,7 @@ export class RunApplicationService {
       generateKeywordMap: run.generateKeywordMap,
       queueSequence: run.queueSequence,
       revision: run.currentRevision,
-      origin: publicOrigin(repository.resolveCurrentRevisionOrigin(run.id)),
+      origin: publicOrigin(repository.resolveRevisionOrigin(run.id, run.currentRevision)),
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
       ...(pdf && (run.status === "review" || run.status === "approved") ? { currentPdfSha256: pdf.sha256 } : {}),

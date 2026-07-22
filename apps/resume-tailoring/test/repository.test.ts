@@ -351,6 +351,16 @@ describe("persisted workflow commands", () => {
     repo.transition(retryClaim, "review");
     repo.release(retryClaim);
 
+    expect(repo.listReviewableRevisions(run.id)).toEqual([{
+      revision: 2,
+      status: "review",
+      createdAt: 1_000,
+      pdfSha256: hash,
+    }]);
+    expect(repo.resolveRevisionOrigin(run.id, 2)).toBe("initial");
+    expect(repo.listResolvedArtifacts(run.id, 2).map((artifact) => artifact.kind))
+      .toContain("compiled-pdf");
+
     expect(repo.getArtifact(run.id, "compiled-pdf", 2)?.sha256).toBe(hash);
     expect(repo.approve(run.id, hash).status).toBe("approved");
   });
@@ -369,6 +379,16 @@ describe("persisted workflow commands", () => {
     expect(revision?.source_revision).toBe(1);
     const request = db.query<{ comments: string; origin: string }, []>("SELECT comments,origin FROM edit_requests").get();
     expect(request).toEqual({ comments: "shorten a bullet", origin: "human_edit" });
+    expect(repo.listReviewableRevisions(runId)).toEqual([{
+      revision: 1,
+      status: "review",
+      createdAt: 1_000,
+      pdfSha256: hash,
+    }]);
+    expect(repo.resolveRevisionOrigin(runId, 1)).toBe("initial");
+    expect(repo.resolveRevisionOrigin(runId, 2)).toBe("human_edit");
+    expect(repo.listResolvedArtifacts(runId, 1).map((artifact) => artifact.kind))
+      .toEqual(["compiled-pdf"]);
     expect(() => db.query("UPDATE edit_requests SET comments='changed'").run()).toThrow();
   });
 
