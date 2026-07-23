@@ -182,6 +182,13 @@ export function isApplicationActionLatchBusy(
   return latch.requestPending || !latch.projectionAccepted;
 }
 
+function isDefiniteApplicationRequestRejection(error: unknown): boolean {
+  return error instanceof PipelineClientError
+    && error.status !== undefined
+    && error.status >= 400
+    && error.status < 500;
+}
+
 function lifecycleProjectionMatcher(
   action: "cancel" | "close" | "retry",
   baseline: ApplicationSessionSnapshotDto,
@@ -263,6 +270,8 @@ export function RunReviewWorkspace({
     error: unknown,
     fallback: string,
   ): Promise<void> => {
+    const requestRunId = run.id;
+    if (activeRunIdRef.current !== requestRunId) return;
     const message = publicMessage(error, fallback);
     setApplicationError(message);
     try {
@@ -270,8 +279,8 @@ export function RunReviewWorkspace({
     } catch {
       // Retain the latest confirmed projection and the fixed public failure.
     }
-    setApplicationError(message);
-  }, [refreshApplicationView]);
+    if (activeRunIdRef.current === requestRunId) setApplicationError(message);
+  }, [refreshApplicationView, run.id]);
 
   const selectedIsCurrent = selectedIteration?.revision === run.revision;
   const canReview = run.status === "review"
@@ -299,6 +308,7 @@ export function RunReviewWorkspace({
     applicationCommandLatchRef.current = null;
     setApplicationLifecycleAction(null);
     setApplicationCommandAction(null);
+    setIsStartingApplication(false);
     setApplicationError(null);
   }, [onApplicationView, run.id]);
 
@@ -465,6 +475,8 @@ export function RunReviewWorkspace({
   };
 
   const startApplication = async (pdfSha256: string) => {
+    const requestRunId = run.id;
+    if (activeRunIdRef.current !== requestRunId) return;
     setIsStartingApplication(true);
     setApplicationError(null);
     try {
@@ -475,7 +487,7 @@ export function RunReviewWorkspace({
         "The resume is approved, but the application assistant could not start.",
       );
     } finally {
-      setIsStartingApplication(false);
+      if (activeRunIdRef.current === requestRunId) setIsStartingApplication(false);
     }
   };
 
@@ -525,11 +537,13 @@ export function RunReviewWorkspace({
       installApplicationView(await retryApplicationSession(run.id, run.currentPdfSha256));
       settleApplicationLifecycleRequest(latch);
     } catch (error) {
+      const definiteRejection = isDefiniteApplicationRequestRejection(error);
+      if (!definiteRejection) settleApplicationLifecycleRequest(latch);
       await refreshAfterApplicationFailure(
         error,
         "The application assistant could not be retried.",
       );
-      if (applicationLifecycleLatchRef.current === latch) {
+      if (definiteRejection && applicationLifecycleLatchRef.current === latch) {
         applicationLifecycleLatchRef.current = null;
         setApplicationLifecycleAction(null);
       }
@@ -555,11 +569,13 @@ export function RunReviewWorkspace({
       }
       settleApplicationLifecycleRequest(latch);
     } catch (error) {
+      const definiteRejection = isDefiniteApplicationRequestRejection(error);
+      if (!definiteRejection) settleApplicationLifecycleRequest(latch);
       await refreshAfterApplicationFailure(
         error,
         "The application assistant could not be cancelled.",
       );
-      if (applicationLifecycleLatchRef.current === latch) {
+      if (definiteRejection && applicationLifecycleLatchRef.current === latch) {
         applicationLifecycleLatchRef.current = null;
         setApplicationLifecycleAction(null);
       }
@@ -581,8 +597,10 @@ export function RunReviewWorkspace({
       await refreshApplicationView();
       settleApplicationLifecycleRequest(latch);
     } catch (error) {
+      const definiteRejection = isDefiniteApplicationRequestRejection(error);
+      if (!definiteRejection) settleApplicationLifecycleRequest(latch);
       await refreshAfterApplicationFailure(error, "The browser could not be closed.");
-      if (applicationLifecycleLatchRef.current === latch) {
+      if (definiteRejection && applicationLifecycleLatchRef.current === latch) {
         applicationLifecycleLatchRef.current = null;
         setApplicationLifecycleAction(null);
       }
@@ -599,13 +617,14 @@ export function RunReviewWorkspace({
       await sendApplicationCommand(run.id, command);
       settleApplicationCommandRequest(latch);
     } catch (error) {
-      if (command.type === "submit") settleApplicationCommandRequest(latch);
+      const definiteRejection = isDefiniteApplicationRequestRejection(error);
+      if (!definiteRejection) settleApplicationCommandRequest(latch);
       await refreshAfterApplicationFailure(
         error,
         "The application command could not be accepted.",
       );
       if (
-        command.type !== "submit"
+        definiteRejection
         && applicationCommandLatchRef.current === latch
       ) {
         applicationCommandLatchRef.current = null;
@@ -615,6 +634,7 @@ export function RunReviewWorkspace({
   };
 
   const submitApproval = async () => {
+    const approvalRunId = run.id;
     if (
       actionsDisabled
       || !canStartAfterApproval
@@ -623,13 +643,16 @@ export function RunReviewWorkspace({
     setActionError(null);
     try {
       const approved = await onApprove(acknowledgeVisualIssues);
+      if (activeRunIdRef.current !== approvalRunId) return;
       if (!approved.currentPdfSha256) {
         setActionError("The resume was approved, but its PDF is unavailable to apply.");
         return;
       }
       await startApplication(approved.currentPdfSha256);
     } catch (error) {
-      setActionError(publicMessage(error, "The resume could not be approved."));
+      if (activeRunIdRef.current === approvalRunId) {
+        setActionError(publicMessage(error, "The resume could not be approved."));
+      }
     }
   };
 

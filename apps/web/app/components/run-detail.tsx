@@ -599,7 +599,7 @@ export function RunDetail({ runId }: RunDetailProps) {
     if (
       next === null
       || "state" in next
-      || next.bridgeState !== "submitted"
+      || next.submissionPhase !== "submitted"
       || submittedRefreshRunRef.current === runId
     ) {
       return;

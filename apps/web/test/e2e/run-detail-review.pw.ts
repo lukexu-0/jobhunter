@@ -101,8 +101,11 @@ interface NativeSseScenario {
   readonly servedBodies: string[];
   readonly initialBody: string;
   readonly resumedBody: string;
+  readonly initialFollowupBody?: string;
   readonly onResume: () => void;
   readonly waitForResume: Promise<void>;
+  readonly waitForInitialClose?: Promise<void>;
+  readonly waitForInitialFollowup?: Promise<void>;
 }
 
 let nativeSseScenario: NativeSseScenario | null = null;
@@ -137,7 +140,14 @@ test.beforeAll(async () => {
     });
     const body = resumed ? nativeSseScenario.resumedBody : nativeSseScenario.initialBody;
     nativeSseScenario.servedBodies.push(body);
-    response.end(body);
+    response.write(body);
+    if (!resumed && nativeSseScenario.initialFollowupBody !== undefined) {
+      await nativeSseScenario.waitForInitialFollowup;
+      nativeSseScenario.servedBodies.push(nativeSseScenario.initialFollowupBody);
+      response.write(nativeSseScenario.initialFollowupBody);
+    }
+    if (!resumed) await nativeSseScenario.waitForInitialClose;
+    response.end();
   });
   await new Promise<void>((resolve, reject) => {
     nativeSseServer.once("error", reject);
@@ -1112,6 +1122,104 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
 });
 
+test("an uncertain revision response keeps the command latch engaged", async ({ page }) => {
+  const review = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    pendingAction: { type: "human_review" },
+    updatedAt: createdAt + 100,
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: review,
+  });
+  mock.commandReplies.push({
+    status: 503,
+    body: apiError("PIPELINE_UNAVAILABLE", "The pipeline request failed."),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByLabel("Revision instructions").fill("Correct the public salary field.");
+  await page.getByRole("button", { name: "Request application revision" }).click();
+
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({
+    type: "revise",
+    context: "Correct the public salary field.",
+  });
+  await expect(page.getByRole("alert").filter({
+    hasText: "The pipeline request failed.",
+  })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Requesting revision…" })).toBeDisabled();
+});
+
+test("an uncertain retry response keeps the lifecycle latch engaged", async ({ page }) => {
+  const failed = snapshotFixture({
+    bridgeState: "failed",
+    updatedAt: createdAt + 100,
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: failed,
+  });
+  mock.retryReplies.push({
+    status: 503,
+    body: apiError("PIPELINE_UNAVAILABLE", "The pipeline request failed."),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByRole("button", { name: "Retry applying" }).click();
+
+  await expect.poll(() => mock.retryBodies.length).toBe(1);
+  await expect(page.getByRole("alert").filter({
+    hasText: "The pipeline request failed.",
+  })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retrying…" })).toBeDisabled();
+});
+
+test("a definite submit conflict releases the approval latch", async ({ page }) => {
+  const review = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    pendingAction: { type: "human_review" },
+    updatedAt: createdAt + 100,
+  });
+  const refreshedReview = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    pendingAction: { type: "human_review" },
+    updatedAt: createdAt + 200,
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: review,
+  });
+  mock.commandReplies.push({
+    status: 409,
+    body: apiError(
+      "APPLICATION_COMMAND_CONFLICT",
+      "The application state changed; review the latest session state",
+    ),
+    before: () => {
+      mock.application = refreshedReview;
+    },
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const submitButton = page.getByRole("button", { name: "Approve and submit" }).first();
+  await submitButton.click();
+  await page.getByRole("dialog", { name: "Submit this application?" })
+    .getByRole("button", { name: "Approve and submit" })
+    .click();
+
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({ type: "submit" });
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application state changed; review the latest session state",
+  })).toBeVisible();
+  await expect(submitButton).toBeEnabled();
+});
+
 test("navigation, origin approval, human review, submit approval, and close use exact public commands", async ({ page }) => {
   const navigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
@@ -1340,6 +1448,41 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
   expect(mock.runGetCount).toBe(1);
 });
 
+test("a closed submitted session refreshes the authoritative run status", async ({ page }) => {
+  const initialRun = approvedRun();
+  const appliedRun: RunDto = {
+    ...initialRun,
+    applicationStatus: "applied",
+    updatedAt: initialRun.updatedAt + 1,
+  };
+  const closed = snapshotFixture({
+    bridgeState: "closed",
+    harnessState: "closed",
+    submissionPhase: "submitted",
+    updatedAt: createdAt + 500,
+  });
+  const mock = await installPipeline(page, {
+    run: initialRun,
+    iterations: approvedIterations(),
+    application: closed,
+  });
+  mock.runReplies.push(
+    { status: 200, body: initialRun },
+    { status: 200, body: appliedRun },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  await expect.poll(() => mock.runGetCount).toBe(2);
+  await expect(
+    page.getByRole("complementary", { name: "Application summary and keyword comparison" })
+      .getByText("Applied", { exact: true }),
+  ).toBeVisible();
+  const appliedStage = page.getByRole("list", { name: "Workflow progress" })
+    .getByRole("listitem")
+    .filter({ hasText: "Applied" });
+  await expect(appliedStage.locator("svg")).toHaveCount(1);
+});
+
 test("a failed submitted-run refresh is retryable without resubmitting", async ({ page }) => {
   const initialRun = approvedRun();
   const appliedRun: RunDto = {
@@ -1522,6 +1665,8 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
     updatedAt: createdAt + 300,
   });
   const resumeFrame = deferred();
+  const initialClose = deferred();
+  const initialFollowup = deferred();
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
@@ -1542,16 +1687,25 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
   nativeSseScenario = {
     headers: mock.sseHeaders,
     servedBodies: mock.publicResponseBodies,
-    initialBody: `retry: 25\n${eventBlock(replayEvents[0], 6)}${eventBlock(replayEvents[1], 7)}`,
+    initialBody: `retry: 25\n${eventBlock(replayEvents[0], 6)}`,
+    initialFollowupBody: eventBlock(replayEvents[1], 7),
     resumedBody: `retry: 60000\n${eventBlock(staleEvent, 99)}`,
     waitForResume: resumeFrame.promise,
+    waitForInitialClose: initialClose.promise,
+    waitForInitialFollowup: initialFollowup.promise,
     onResume: () => {
       mock.application = lost;
     },
   };
 
   await page.goto(`/runs/${runId}`);
-  await expect(page.getByText("https://current.example.test", { exact: true })).toBeVisible();
+  await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(1);
+  initialFollowup.resolve();
+  try {
+    await expect(page.getByText("https://current.example.test", { exact: true })).toBeVisible();
+  } finally {
+    initialClose.resolve();
+  }
   await expect(page.getByText("Stale navigation instruction.", { exact: true })).toHaveCount(0);
   await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(2);
   expect(mock.sseHeaders[0]).toBeNull();
