@@ -328,6 +328,17 @@ AdditionalInfoQuestion: TypeAlias = Annotated[
 ]
 
 
+def _validate_unique_additional_info_questions(
+    values: list[AdditionalInfoQuestion],
+) -> list[AdditionalInfoQuestion]:
+    if len({question.id for question in values}) != len(values):
+        raise ValueError("question ids must be unique")
+    scoped_keys = {(question.scope, question.key) for question in values}
+    if len(scoped_keys) != len(values):
+        raise ValueError("question scope and key pairs must be unique")
+    return values
+
+
 class AdditionalInfoDeclinedCommandAnswer(FrozenPrivateModel):
     id: AdditionalInfoQuestionId
     status: Literal["declined"]
@@ -867,6 +878,11 @@ class BrowserUseExecutionResult(PublicModel):
     stdout_truncated: bool
     stderr_truncated: bool
     observation: BrowserObservation
+    candidate_questions: list[AdditionalInfoQuestion] = Field(
+        default_factory=list,
+        max_length=20,
+        exclude=True,
+    )
 
 
 class ApplicationResultBase(PublicModel):
@@ -889,6 +905,26 @@ class ApplicationResultBase(PublicModel):
     @classmethod
     def _validate_files(cls, values: list[str]) -> list[str]:
         return [validate_sanitized_basename(value) for value in values]
+
+    @field_validator("fields_filled")
+    @classmethod
+    def _validate_filled_fields(
+        cls, values: list[FieldResult]
+    ) -> list[FieldResult]:
+        if any(not value.value_present for value in values):
+            raise ValueError("fields_filled entries must have value_present true")
+        return values
+
+    @field_validator("fields_needing_human")
+    @classmethod
+    def _validate_unresolved_fields(
+        cls, values: list[FieldResult]
+    ) -> list[FieldResult]:
+        if any(value.value_present for value in values):
+            raise ValueError(
+                "fields_needing_human entries must have value_present false"
+            )
+        return values
 
 
 class ReviewApplicationResult(ApplicationResultBase):
@@ -952,17 +988,15 @@ class BrowserUseRuntimeAction(PublicModel):
 
 class SubmitApplicationRuntimeAction(PublicModel):
     type: Literal["submit_application"]
-    code: Annotated[
+    selector: Annotated[
         str,
-        StringConstraints(strict=True, max_length=65_536),
+        StringConstraints(
+            strict=True,
+            strip_whitespace=True,
+            min_length=1,
+            max_length=2_000,
+        ),
     ]
-
-    @field_validator("code")
-    @classmethod
-    def _validate_code_size(cls, value: str) -> str:
-        if len(value.encode("utf-8")) > 65_536:
-            raise ValueError("code must be at most 65,536 UTF-8 bytes")
-        return value
 
 
 class RequestHumanNavigationRuntimeAction(PublicModel):
@@ -997,12 +1031,7 @@ class RequestAdditionalInfoRuntimeAction(PublicModel):
     def _validate_unique_questions(
         cls, values: list[AdditionalInfoQuestion]
     ) -> list[AdditionalInfoQuestion]:
-        if len({question.id for question in values}) != len(values):
-            raise ValueError("question ids must be unique")
-        scoped_keys = {(question.scope, question.key) for question in values}
-        if len(scoped_keys) != len(values):
-            raise ValueError("question scope and key pairs must be unique")
-        return values
+        return _validate_unique_additional_info_questions(values)
 
 
 class RequestHumanReviewRuntimeAction(PublicModel):
@@ -1026,12 +1055,28 @@ RuntimeActionRequest: TypeAlias = Annotated[
 ]
 
 
+class CandidateQuestionsRequiredRuntimeActionResponse(PublicModel):
+    type: Literal["candidate_questions_required"]
+    questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
+
+    @field_validator("questions")
+    @classmethod
+    def _validate_unique_questions(
+        cls, values: list[AdditionalInfoQuestion]
+    ) -> list[AdditionalInfoQuestion]:
+        return _validate_unique_additional_info_questions(values)
+
+
 class BrowserUseResultRuntimeActionResponse(BrowserUseExecutionResult):
     type: Literal["browser_use_result"]
 
 
 class SubmitApplicationResultRuntimeActionResponse(BrowserUseExecutionResult):
     type: Literal["submit_application_result"]
+    pre_click_dom: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=40_000),
+    ]
 
 
 class ContinueRuntimeActionResponse(PublicModel):
@@ -1098,6 +1143,7 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 
 RuntimeActionResponse: TypeAlias = Annotated[
     BrowserUseResultRuntimeActionResponse
+    | CandidateQuestionsRequiredRuntimeActionResponse
     | SubmitApplicationResultRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | ApproveRuntimeActionResponse

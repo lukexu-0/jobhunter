@@ -20,13 +20,20 @@ function hasCodePointLength(
 }
 
 
+const FilledFieldResultSchema = FieldResultSchema.extend({
+  value_present: z.literal(true),
+});
+const UnresolvedFieldResultSchema = FieldResultSchema.extend({
+  value_present: z.literal(false),
+});
+
 export const ApplicationResultBaseSchema = z.object({
   company: z.string().refine((value) => hasCodePointLength(value, 0, 500)).nullable().default(null),
   role: z.string().refine((value) => hasCodePointLength(value, 0, 500)).nullable().default(null),
   job_url: z.string().refine(isAbsoluteHttpUrl),
   final_url: z.string().refine(isAbsoluteHttpUrl),
-  fields_filled: z.array(FieldResultSchema).max(500).default([]),
-  fields_needing_human: z.array(FieldResultSchema).max(500).default([]),
+  fields_filled: z.array(FilledFieldResultSchema).max(500).default([]),
+  fields_needing_human: z.array(UnresolvedFieldResultSchema).max(500).default([]),
   files_attached: z.array(z.string().refine(isSanitizedBasename)).max(20).default([]),
   warnings: z.array(z.string().refine((value) => hasCodePointLength(value, 1, 1_000))).max(100).default([]),
   revision_count: z.number().int().min(0).max(100).default(0),
@@ -83,7 +90,7 @@ export type BrowserUseRuntimeAction = z.infer<typeof BrowserUseRuntimeActionSche
 
 export const SubmitApplicationRuntimeActionSchema = z.object({
   type: z.literal("submit_application"),
-  code: z.string().refine((value) => Buffer.byteLength(value, "utf8") <= 65_536),
+  selector: z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
 }).strict();
 export type SubmitApplicationRuntimeAction = z.infer<
   typeof SubmitApplicationRuntimeActionSchema
@@ -106,17 +113,25 @@ export type RequestOriginApprovalRuntimeAction = z.infer<
 >;
 
 
+function validateAdditionalInfoQuestionBatch(
+  questions: readonly z.infer<typeof AdditionalInfoQuestionSchema>[],
+  context: z.RefinementCtx,
+): void {
+  if (new Set(questions.map((question) => question.id)).size !== questions.length) {
+    context.addIssue({ code: "custom", message: "question ids must be unique" });
+  }
+  const scopedKeys = questions.map((question) => `${question.scope}\0${question.key}`);
+  if (new Set(scopedKeys).size !== scopedKeys.length) {
+    context.addIssue({ code: "custom", message: "question scope and key pairs must be unique" });
+  }
+}
+
+
 export const RequestAdditionalInfoRuntimeActionSchema = z.object({
   type: z.literal("request_additional_info"),
   questions: z.array(AdditionalInfoQuestionSchema).min(1).max(20),
 }).strict().superRefine((value, context) => {
-  if (new Set(value.questions.map((question) => question.id)).size !== value.questions.length) {
-    context.addIssue({ code: "custom", message: "question ids must be unique" });
-  }
-  const scopedKeys = value.questions.map((question) => `${question.scope}\0${question.key}`);
-  if (new Set(scopedKeys).size !== scopedKeys.length) {
-    context.addIssue({ code: "custom", message: "question scope and key pairs must be unique" });
-  }
+  validateAdditionalInfoQuestionBatch(value.questions, context);
 });
 export type RequestAdditionalInfoRuntimeAction = z.infer<
   typeof RequestAdditionalInfoRuntimeActionSchema
@@ -192,9 +207,23 @@ export type BrowserUseResultRuntimeActionResponse = z.infer<
   typeof BrowserUseResultRuntimeActionResponseSchema
 >;
 
+
+export const CandidateQuestionsRequiredRuntimeActionResponseSchema = z.object({
+  type: z.literal("candidate_questions_required"),
+  questions: z.array(AdditionalInfoQuestionSchema).min(1).max(20),
+}).strict().superRefine((value, context) => {
+  validateAdditionalInfoQuestionBatch(value.questions, context);
+});
+export type CandidateQuestionsRequiredRuntimeActionResponse = z.infer<
+  typeof CandidateQuestionsRequiredRuntimeActionResponseSchema
+>;
+
 export const SubmitApplicationResultRuntimeActionResponseSchema =
   BrowserUseExecutionResultSchema.extend({
     type: z.literal("submit_application_result"),
+    pre_click_dom: z.string().refine(
+      (value) => hasCodePointLength(value, 0, 40_000),
+    ),
   }).strict();
 export type SubmitApplicationResultRuntimeActionResponse = z.infer<
   typeof SubmitApplicationResultRuntimeActionResponseSchema
@@ -306,6 +335,7 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   BrowserUseResultRuntimeActionResponseSchema,
+  CandidateQuestionsRequiredRuntimeActionResponseSchema,
   SubmitApplicationResultRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   ApproveRuntimeActionResponseSchema,
@@ -553,7 +583,9 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
         },
         body: JSON.stringify(parsedInput.data),
         signal,
-      }), signal);
+        // Bun otherwise closes human-gated requests after 300 seconds of inactivity.
+        timeout: false,
+      } as RequestInit & { timeout: false }), signal);
     } catch (error) {
       if (signal.aborted) throw signal.reason;
       throw new ApplicationRuntimeError("model_failed");
@@ -584,7 +616,9 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
       throw new ApplicationRuntimeError("model_failed");
     }
     const parsedResponse = RuntimeActionResponseSchema.safeParse(body);
-    if (!parsedResponse.success) throw new ApplicationRuntimeError("model_failed");
+    if (!parsedResponse.success) {
+      throw new ApplicationRuntimeError("model_failed");
+    }
     return parsedResponse.data;
   }
 }

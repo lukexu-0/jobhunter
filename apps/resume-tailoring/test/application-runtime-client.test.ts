@@ -10,6 +10,7 @@ import {
 import {
   AcceptedAdditionalInfoAnswerSchema,
   AdditionalInfoRuntimeActionResponseSchema,
+  CandidateQuestionsRequiredRuntimeActionResponseSchema,
   ApplicationRunResultSchema,
   CancelledApplicationResultSchema,
   ReviewApplicationResultSchema,
@@ -40,7 +41,7 @@ const READY_RESULT = {
     {
       label: "Full name",
       field_type: "text" as const,
-      value_present: true,
+      value_present: true as const,
       note: "",
     },
   ],
@@ -106,11 +107,45 @@ test("separates review data from terminal submission outcomes", () => {
       text: "😀".repeat(1_001),
     },
   }).success).toBe(false);
+  expect(ReviewApplicationResultSchema.safeParse({
+    ...READY_RESULT,
+    fields_filled: [{
+      ...READY_RESULT.fields_filled[0],
+      value_present: false,
+    }],
+  }).success).toBe(false);
+  expect(ReviewApplicationResultSchema.safeParse({
+    ...READY_RESULT,
+    fields_needing_human: [{
+      ...READY_RESULT.fields_filled[0],
+      value_present: true,
+    }],
+  }).success).toBe(false);
 
-  const request = { type: "submit_application" as const, code: "print(page_info())" };
+  const request = { type: "submit_application" as const, selector: "button[type='submit']" };
   expect(SubmitApplicationRuntimeActionSchema.parse(request)).toEqual(request);
   expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
-  const response = { type: "submit_application_result" as const, ...SUBMIT_EXECUTION_RESULT };
+  expect(SubmitApplicationRuntimeActionSchema.safeParse({
+    type: "submit_application",
+    selector: " ",
+  }).success).toBe(false);
+  expect(SubmitApplicationRuntimeActionSchema.safeParse({
+    type: "submit_application",
+    selector: "x".repeat(2_001),
+  }).success).toBe(false);
+  expect(SubmitApplicationRuntimeActionSchema.safeParse({
+    type: "submit_application",
+    selector: "😀".repeat(2_000),
+  }).success).toBe(true);
+  expect(SubmitApplicationRuntimeActionSchema.safeParse({
+    type: "submit_application",
+    code: "click_at_xy(10, 10)",
+  }).success).toBe(false);
+  const response = {
+    type: "submit_application_result" as const,
+    pre_click_dom: "button Final submit",
+    ...SUBMIT_EXECUTION_RESULT,
+  };
   expect(SubmitApplicationResultRuntimeActionResponseSchema.parse(response)).toEqual(response);
   expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
 });
@@ -342,6 +377,30 @@ test("mirrors strict additional-information question and request constraints", (
   expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
 });
 
+test("strictly carries deterministic candidate-question preflight batches", () => {
+  const response = {
+    type: "candidate_questions_required" as const,
+    questions: [{
+      id: "candidate_deadbeef",
+      key: "form.candidate_deadbeef",
+      scope: "application" as const,
+      question: "Review emphasis",
+      answer_type: "text" as const,
+    }],
+  };
+
+  expect(CandidateQuestionsRequiredRuntimeActionResponseSchema.parse(response)).toEqual(response);
+  expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
+  expect(CandidateQuestionsRequiredRuntimeActionResponseSchema.safeParse({
+    ...response,
+    questions: [],
+  }).success).toBe(false);
+  expect(CandidateQuestionsRequiredRuntimeActionResponseSchema.safeParse({
+    ...response,
+    unexpected: true,
+  }).success).toBe(false);
+});
+
 test("mirrors strict accepted-answer and additional-information response constraints", () => {
   const answers = [
     {
@@ -533,6 +592,7 @@ describe("HttpApplicationRuntimeClient", () => {
       },
       body: JSON.stringify(action),
     });
+    expect((requests[0]?.init as RequestInit & { timeout?: boolean }).timeout).toBe(false);
     expect(requests[0]?.init.signal).toBeInstanceOf(AbortSignal);
   });
   test("validates and serializes every runtime action variant", async () => {
@@ -593,7 +653,21 @@ describe("HttpApplicationRuntimeClient", () => {
           screenshot: { media_type: "image/png", data: "iVBORw0KGgo=" },
         },
       },
-      { type: "submit_application_result", ...SUBMIT_EXECUTION_RESULT },
+      {
+        type: "candidate_questions_required",
+        questions: [{
+          id: "candidate_deadbeef",
+          key: "form.candidate_deadbeef",
+          scope: "application",
+          question: "Review emphasis",
+          answer_type: "text",
+        }],
+      },
+      {
+        type: "submit_application_result",
+        pre_click_dom: "button Submit",
+        ...SUBMIT_EXECUTION_RESULT,
+      },
       { type: "continue" },
       {
         type: "approve",

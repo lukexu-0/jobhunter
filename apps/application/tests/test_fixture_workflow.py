@@ -17,6 +17,7 @@ from fastapi import UploadFile
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
+import jobhunter_browser_harness.sessions as sessions_module
 from fixtures.local_application import LocalApplicationFixture
 from jobhunter_browser_harness.browser import ResolvedBrowserLaunch
 from jobhunter_browser_harness.models import (
@@ -38,6 +39,7 @@ from jobhunter_browser_harness.models import (
     ApproveRuntimeActionResponse,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
+    CandidateQuestionsRequiredRuntimeActionResponse,
     ContinueCommand,
     ContinueRuntimeActionResponse,
     HarnessConfig,
@@ -61,6 +63,7 @@ _RELEVANT_ANSWER = (
 )
 _IRRELEVANT_FACT = "community garden fundraiser"
 _REVISION = "Human revision: emphasize careful incident ownership."
+_INITIAL_REVIEW_REPLY = "Initial human reply: emphasize production reliability."
 _SUMMER_AVAILABILITY = "June through August 2027"
 _REFERRAL_SOURCE = "Employee referral"
 _CALLER_SESSION_ID = UUID("1f017bcb-f6cd-4329-a78a-6e920522ca9d")
@@ -363,15 +366,6 @@ def _set_review_code(value: str) -> str:
     return f"js({script!r})\nprint(page_info())"
 
 
-def _submit_application_code() -> str:
-    return (
-        "box = js(\"(() => { const rect = document.getElementById('final-submit')"
-        ".getBoundingClientRect(); return {x: rect.x + rect.width / 2, "
-        "y: rect.y + rect.height / 2}; })()\")\n"
-        "click_at_xy(box['x'], box['y'])\n"
-        "js(\"new Promise(resolve => setTimeout(resolve, 250))\")\n"
-        "print(page_info())"
-    )
 
 
 @pytest.mark.skipif(
@@ -754,6 +748,81 @@ async def test_real_fixture_submits_once_after_human_approval(
             )
             continued = await navigation_task
             assert isinstance(continued, ContinueRuntimeActionResponse)
+            late_question = await manager.runtime_action(
+                created.session_id,
+                BrowserUseRuntimeAction(
+                    type="browser_use",
+                    code=_set_review_code("Model supplied from narrative evidence."),
+                ),
+            )
+            assert isinstance(
+                late_question,
+                CandidateQuestionsRequiredRuntimeActionResponse,
+            )
+            assert len(late_question.questions) == 1
+            question = late_question.questions[0]
+            assert question.scope == "application"
+            assert question.question == "Review emphasis"
+            assert question.answer_type == "text"
+            assert (await _page_values(record.browser))["review"] == (
+                "Initial perspective"
+            )
+
+            late_info_task = asyncio.create_task(
+                manager.runtime_action(
+                    created.session_id,
+                    RequestAdditionalInfoRuntimeAction(
+                        type="request_additional_info",
+                        questions=late_question.questions,
+                    ),
+                )
+            )
+            await _wait_for_state(
+                manager,
+                created.session_id,
+                "awaiting_additional_info",
+            )
+            late_pending = manager.get_snapshot(
+                created.session_id
+            ).pending_action
+            assert late_pending is not None
+            assert late_pending.model_dump(mode="json") == {
+                "type": "additional_info",
+                "questions": [question.model_dump(mode="json")],
+            }
+            await manager.command(
+                created.session_id,
+                ProvideAdditionalInfoCommand(
+                    type="provide_additional_info",
+                    answers=[
+                        AdditionalInfoTextCommandAnswer(
+                            id=question.id,
+                            status="answered",
+                            value=_INITIAL_REVIEW_REPLY,
+                        )
+                    ],
+                ),
+            )
+            late_info = await late_info_task
+            assert isinstance(late_info, AdditionalInfoRuntimeActionResponse)
+            assert len(late_info.answers) == 1
+            assert late_info.answers[0].value == _INITIAL_REVIEW_REPLY
+            applied_late_info = await manager.runtime_action(
+                created.session_id,
+                BrowserUseRuntimeAction(
+                    type="browser_use",
+                    code=_set_review_code(_INITIAL_REVIEW_REPLY),
+                ),
+            )
+            assert isinstance(
+                applied_late_info,
+                BrowserUseResultRuntimeActionResponse,
+            )
+            assert applied_late_info.exit_code == 0, applied_late_info.stderr
+            assert (await _page_values(record.browser))["review"] == (
+                _INITIAL_REVIEW_REPLY
+            )
+
 
             initial_review = _review_result(fixture, "resume.pdf", revision_count=0)
             review_task = asyncio.create_task(
@@ -818,6 +887,53 @@ async def test_real_fixture_submits_once_after_human_approval(
                 created.session_id
             ).pending_action is not None
             assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
+            runtime = record.skill_runtime
+            assert runtime is not None
+            probe_setup = await runtime.execute(
+                "js(\"\"\"(() => {"
+                "const wrapper = document.createElement('div');"
+                "wrapper.id = 'submit-container-probe';"
+                "wrapper.style.cssText = 'position:fixed;left:20px;top:20px;"
+                "width:240px;height:120px;z-index:2147483647;background:white';"
+                "const button = document.createElement('button');"
+                "button.id = 'submit-child-probe';"
+                "button.type = 'button';"
+                "button.innerHTML = '<span style=\"display:none\">Submit</span>';"
+                "button.style.cssText = 'width:100%;height:100%';"
+                "wrapper.append(button);"
+                "document.body.append(wrapper);"
+                "})()\"\"\")"
+            )
+            assert probe_setup.exit_code == 0, probe_setup.stderr
+            container_probe = await runtime.execute(
+                sessions_module._submit_application_source(
+                    "#submit-container-probe"
+                )
+            )
+            assert container_probe.exit_code != 0
+            semantic_probe = await runtime.execute(
+                sessions_module._submit_application_source("#submit-child-probe")
+            )
+            assert semantic_probe.exit_code != 0
+            disabled_setup = await runtime.execute(
+                "js(\"document.getElementById('submit-container-probe')"
+                ".setAttribute('aria-disabled', ' true ')\")"
+            )
+            assert disabled_setup.exit_code == 0, disabled_setup.stderr
+            disabled_probe = await runtime.execute(
+                sessions_module._submit_application_source("#submit-child-probe")
+            )
+            assert disabled_probe.exit_code != 0
+            probe_cleanup = await runtime.execute(
+                "js(\"\"\"(() => {"
+                "document.getElementById('submit-container-probe').remove();"
+                "document.getElementById('final-submit')"
+                ".scrollIntoView({block:'center'});"
+                "})()\"\"\")"
+            )
+            assert probe_cleanup.exit_code == 0, probe_cleanup.stderr
+            assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
+
             await manager.command(created.session_id, SubmitCommand(type="submit"))
             approved = await submit_gate_task
             assert isinstance(approved, SubmitRuntimeActionResponse)
@@ -827,10 +943,7 @@ async def test_real_fixture_submits_once_after_human_approval(
 
             submission = await manager.runtime_action(
                 created.session_id,
-                SubmitApplicationRuntimeAction(
-                    type="submit_application",
-                    code=_submit_application_code(),
-                ),
+                SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
             )
             assert isinstance(
                 submission,
@@ -839,6 +952,8 @@ async def test_real_fixture_submits_once_after_human_approval(
             assert submission.exit_code == 0, submission.stderr
             assert submission.timed_out is False
             assert submission.observation.url == fixture.form_url
+            assert "Submit application" in submission.pre_click_dom
+            assert "Submitted 1 time(s)" not in submission.pre_click_dom
             assert "Submitted 1 time(s)" in submission.observation.dom
             agent.finish(
                 SubmittedApplicationResult.model_validate(

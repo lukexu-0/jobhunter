@@ -16,10 +16,13 @@ from jobhunter_browser_harness.api import HarnessDependencies, create_app
 from jobhunter_browser_harness.models import (
     SESSION_ERROR_MESSAGES,
     AdditionalInfoRuntimeActionResponse,
+    AdditionalInfoTextQuestion,
     ApplicationRunResult,
     ReviewApplicationResult,
     ApproveRuntimeActionResponse,
     BrowserUseResultRuntimeActionResponse,
+    BrowserUseExecutionResult,
+    CandidateQuestionsRequiredRuntimeActionResponse,
     BrowserUseRuntimeAction,
     CancelledApplicationResult,
     CancelRuntimeActionResponse,
@@ -419,6 +422,33 @@ def test_review_application_result_sanitizes_urls_and_forces_submit_false() -> N
                 "submit_attempted": True,
             }
         )
+
+@pytest.mark.parametrize(
+    ("field", "value_present"),
+    [
+        ("fields_filled", False),
+        ("fields_needing_human", True),
+    ],
+)
+def test_application_result_field_groups_require_matching_presence(
+    field: str,
+    value_present: bool,
+) -> None:
+    values = ReviewApplicationResult(
+        status="ready_for_submission",
+        job_url="https://jobs.example/openings/42",
+        final_url="https://ats.example/application/42",
+    ).model_dump()
+    values[field] = [
+        {
+            "label": "Candidate response",
+            "field_type": "text",
+            "value_present": value_present,
+        }
+    ]
+
+    with pytest.raises(ValidationError):
+        ReviewApplicationResult.model_validate(values)
 
 
 def test_terminal_application_results_have_strict_submission_evidence() -> None:
@@ -1182,20 +1212,26 @@ async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
     assert service.runtime_action_calls == []
 
 
-def test_submit_application_runtime_action_enforces_utf8_bytes_and_round_trips() -> None:
+def test_submit_application_runtime_action_accepts_only_bounded_selector() -> None:
     action = RUNTIME_ACTION_ADAPTER.validate_python(
-        {"type": "submit_application", "code": "é" * 32_768}
+        {"type": "submit_application", "selector": "button[type='submit']"}
     )
     assert isinstance(action, SubmitApplicationRuntimeAction)
+    assert action.selector == "button[type='submit']"
 
-    with pytest.raises(ValidationError):
-        RUNTIME_ACTION_ADAPTER.validate_python(
-            {"type": "submit_application", "code": "é" * 32_769}
-        )
+    invalid_payloads = (
+        {"type": "submit_application", "selector": " "},
+        {"type": "submit_application", "selector": "x" * 2_001},
+        {"type": "submit_application", "code": "click_at_xy(10, 10)"},
+    )
+    for payload in invalid_payloads:
+        with pytest.raises(ValidationError):
+            RUNTIME_ACTION_ADAPTER.validate_python(payload)
 
     result = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
         {
             "type": "submit_application_result",
+            "pre_click_dom": "button Final submit",
             "exit_code": 0,
             "timed_out": False,
             "stdout": "",
@@ -1213,6 +1249,46 @@ def test_submit_application_runtime_action_enforces_utf8_bytes_and_round_trips()
         }
     )
     assert isinstance(result, SubmitApplicationResultRuntimeActionResponse)
+
+
+def test_browser_execution_keeps_candidate_question_preflight_internal() -> None:
+    question = AdditionalInfoTextQuestion(
+        id="candidate_deadbeef",
+        key="form.candidate_deadbeef",
+        scope="application",
+        question="Review emphasis",
+        answer_type="text",
+    )
+    result = BrowserUseExecutionResult.model_validate(
+        {
+            "exit_code": 0,
+            "timed_out": False,
+            "stdout": "",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "observation": {
+                "url": "https://ats.example/application",
+                "title": "Application",
+                "tabs": [],
+                "dom": "textarea Review emphasis",
+                "page_info": None,
+                "screenshot": None,
+            },
+            "candidate_questions": [question],
+        }
+    )
+
+    assert result.candidate_questions == [question]
+    assert "candidate_questions" not in result.model_dump(mode="json")
+    assert "candidate_questions" not in result.model_dump_json()
+    response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {
+            "type": "candidate_questions_required",
+            "questions": [question.model_dump(mode="json")],
+        }
+    )
+    assert isinstance(response, CandidateQuestionsRequiredRuntimeActionResponse)
 
 
 @pytest.mark.parametrize(
@@ -1244,6 +1320,18 @@ def test_submit_application_runtime_action_enforces_utf8_bytes_and_round_trips()
                     "data": "cG5n",
                 },
             },
+        },
+        {
+            "type": "candidate_questions_required",
+            "questions": [
+                {
+                    "id": "candidate_deadbeef",
+                    "key": "form.candidate_deadbeef",
+                    "scope": "application",
+                    "question": "Review emphasis",
+                    "answer_type": "text",
+                }
+            ],
         },
         {"type": "continue"},
         {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import stat
@@ -52,10 +53,12 @@ from jobhunter_browser_harness.models import (
     ApplicationMismatchRuntimeActionResponse,
     ApproveRuntimeActionResponse,
     ApproveOriginCommand,
+    BrowserTab,
     BrowserObservation,
     BrowserUseExecutionResult,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
+    CandidateQuestionsRequiredRuntimeActionResponse,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     CancelCommand,
@@ -331,6 +334,7 @@ class FakeSkillRuntime:
     result: BrowserUseExecutionResult = field(
         default_factory=browser_execution_result
     )
+    results: list[BrowserUseExecutionResult] | None = None
     blocker: asyncio.Event | None = None
     error: BrowserSkillRuntimeError | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -354,6 +358,10 @@ class FakeSkillRuntime:
                 await self.blocker.wait()
             if self.error is not None:
                 raise self.error
+            if self.results is not None:
+                if not self.results:
+                    raise AssertionError("No synthetic runtime result remains")
+                return self.results.pop(0)
             return self.result
         finally:
             self.active_task = None
@@ -1039,10 +1047,7 @@ async def test_navigation_origin_revision_submission_and_resource_retention(
     await manager.command(created.session_id, SubmitCommand(type="submit"))
     submission_response = await manager.runtime_action(
         created.session_id,
-        SubmitApplicationRuntimeAction(
-            type="submit_application",
-            code="print('submit once')",
-        ),
+        SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
     )
     assert isinstance(
         submission_response,
@@ -2536,6 +2541,49 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
     await manager.delete(created.session_id)
 
 
+async def test_runtime_maps_candidate_question_preflight_without_browser_output(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    question = AdditionalInfoTextQuestion(
+        id="candidate_deadbeef",
+        key="form.candidate_deadbeef",
+        scope="application",
+        question="Review emphasis",
+        answer_type="text",
+    )
+    runtime = FakeSkillRuntime(
+        result=browser_execution_result().model_copy(
+            update={"candidate_questions": [question]}
+        )
+    )
+    record.skill_runtime = runtime
+
+    result = await manager.runtime_action(
+        created.session_id,
+        BrowserUseRuntimeAction(
+            type="browser_use",
+            code="js(\"document.querySelector('textarea').value = 'model supplied'\")",
+        ),
+    )
+
+    assert isinstance(result, CandidateQuestionsRequiredRuntimeActionResponse)
+    assert result.questions == [question]
+    assert result.model_dump(mode="json") == {
+        "type": "candidate_questions_required",
+        "questions": [question.model_dump(mode="json")],
+    }
+    assert record.browser_action_count == 1
+    assert runtime.codes == [
+        "js(\"document.querySelector('textarea').value = 'model supplied'\")"
+    ]
+    await manager.delete(created.session_id)
+
+
 async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
     tmp_path: Path,
 ) -> None:
@@ -2891,6 +2939,70 @@ async def test_runtime_navigation_releases_command_lock_and_returns_nested_appro
     await manager.delete(created.session_id)
 
 
+def test_submit_application_source_escapes_selector_and_owns_one_click() -> None:
+    selector = (
+        "button[data-label=\"'); __builtins__['__import__']"
+        "('urllib.request').urlopen('/submit') #\"]"
+    )
+    source = sessions_module._submit_application_source(selector)
+    tree = ast.parse(source, mode="exec")
+
+    click_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "click_at_xy"
+    ]
+    js_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "js"
+    ]
+    assert len(click_calls) == 1
+    assert len(js_calls) == 1
+    javascript_node = js_calls[0].args[0]
+    assert isinstance(javascript_node, ast.Constant)
+    assert isinstance(javascript_node.value, str)
+    assert f"const selector = {json.dumps(selector, ensure_ascii=False)};" in (
+        javascript_node.value
+    )
+    assert not any(
+        isinstance(node, ast.Name)
+        and node.id in {"__import__", "cdp", "eval", "exec", "open"}
+        for node in ast.walk(tree)
+    )
+
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_js(javascript: str) -> dict[str, float]:
+        calls.append(("js", javascript))
+        return {"x": 10.5, "y": 20.5}
+
+    namespace = {
+        "js": fake_js,
+        "click_at_xy": lambda x, y: calls.append(("click_at_xy", x, y)),
+        "wait": lambda seconds: calls.append(("wait", seconds)),
+        "wait_for_load": lambda **kwargs: calls.append(("wait_for_load", kwargs)),
+        "wait_for_network_idle": lambda **kwargs: calls.append(
+            ("wait_for_network_idle", kwargs)
+        ),
+        "page_info": lambda: calls.append(("page_info",)),
+    }
+    exec(compile(tree, "<submit_application>", "exec"), namespace)
+
+    assert calls == [
+        ("js", javascript_node.value),
+        ("click_at_xy", 10.5, 20.5),
+        ("wait", 0.5),
+        ("wait_for_load", {"timeout": 15.0}),
+        ("wait_for_network_idle", {"timeout": 10.0, "idle_ms": 500}),
+        ("page_info",),
+    ]
+
+
 async def test_runtime_review_rejects_a_result_for_another_job_before_gate(
     tmp_path: Path,
 ) -> None:
@@ -2931,7 +3043,29 @@ async def test_runtime_review_returns_revision_then_submit_and_seals_runtime(
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
-    runtime = FakeSkillRuntime()
+    raw_execution = browser_execution_result()
+    runtime = FakeSkillRuntime(
+        result=raw_execution.model_copy(
+            update={
+                "observation": raw_execution.observation.model_copy(
+                    update={
+                        "tabs": [
+                            BrowserTab(
+                                url=raw_execution.observation.url,
+                                title="Application",
+                                tab_id="tab-1",
+                            ),
+                            BrowserTab(
+                                url="about:blank",
+                                title="Empty tab",
+                                tab_id="tab-2",
+                            ),
+                        ]
+                    }
+                )
+            }
+        )
+    )
     record.skill_runtime = runtime
 
     review = RequestHumanReviewRuntimeAction(
@@ -2976,27 +3110,102 @@ async def test_runtime_review_returns_revision_then_submit_and_seals_runtime(
 
     submitted = await manager.runtime_action(
         created.session_id,
-        SubmitApplicationRuntimeAction(
-            type="submit_application",
-            code="print('click the final submit control once')",
-        ),
+        SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
     )
     assert isinstance(submitted, SubmitApplicationResultRuntimeActionResponse)
-    assert runtime.codes == ["print('click the final submit control once')"]
+    assert submitted.observation.url == "https://jobs.example/openings/42"
+    assert submitted.observation.tabs == []
+    assert submitted.observation.page_info is None
+    assert "?private=value" not in submitted.model_dump_json()
+    assert submitted.pre_click_dom == runtime.result.observation.dom
+    assert runtime.codes == [
+        "page_info()",
+        sessions_module._submit_application_source("#final-submit")
+    ]
     assert manager.get_snapshot(created.session_id).state == "submitting"
     assert record.events[-1].event == "submission_started"
 
     with pytest.raises(HarnessServiceError) as duplicate:
         await manager.runtime_action(
             created.session_id,
-            SubmitApplicationRuntimeAction(
-                type="submit_application",
-                code="print('duplicate')",
-            ),
+            SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
         )
     assert duplicate.value.code == "command_conflict"
-    assert runtime.codes == ["print('click the final submit control once')"]
+    assert runtime.codes == [
+        "page_info()",
+        sessions_module._submit_application_source("#final-submit")
+    ]
     await manager.delete(created.session_id)
+
+@pytest.mark.parametrize("candidate_stage", ["pre_click", "submit"])
+async def test_submit_candidate_preflight_never_reports_a_click(
+    tmp_path: Path,
+    candidate_stage: str,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    execution = browser_execution_result()
+    question = AdditionalInfoTextQuestion(
+        id="candidate_deadbeef",
+        key="form.candidate_deadbeef",
+        scope="application",
+        question="Review emphasis",
+        answer_type="text",
+    )
+    candidate_execution = execution.model_copy(
+        update={"candidate_questions": [question]}
+    )
+    runtime = FakeSkillRuntime(
+        results=(
+            [candidate_execution]
+            if candidate_stage == "pre_click"
+            else [execution, candidate_execution]
+        )
+    )
+    record.skill_runtime = runtime
+
+    review = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanReviewRuntimeAction(
+                type="request_human_review",
+                result=review_result(),
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "review")
+    await manager.command(created.session_id, SubmitCommand(type="submit"))
+    assert isinstance(await review, SubmitRuntimeActionResponse)
+
+    with pytest.raises(HarnessServiceError) as failed:
+        await manager.runtime_action(
+            created.session_id,
+            SubmitApplicationRuntimeAction(
+                type="submit_application",
+                selector="#final-submit",
+            ),
+        )
+
+    assert failed.value.code == "browser_failed"
+    assert runtime.codes == (
+        ["page_info()"]
+        if candidate_stage == "pre_click"
+        else [
+            "page_info()",
+            sessions_module._submit_application_source("#final-submit"),
+        ]
+    )
+    assert manager.get_snapshot(created.session_id).state == "submission_uncertain"
+    assert [event.event for event in tuple(record.events)[-2:]] == [
+        "submission_started",
+        "submission_uncertain",
+    ]
+    await manager.delete(created.session_id)
+
+
 
 
 async def test_submit_execution_failure_parks_uncertainty_without_cleanup(
@@ -3026,10 +3235,7 @@ async def test_submit_execution_failure_parks_uncertainty_without_cleanup(
     with pytest.raises(HarnessServiceError) as failed:
         await manager.runtime_action(
             created.session_id,
-            SubmitApplicationRuntimeAction(
-                type="submit_application",
-                code="raise RuntimeError('synthetic post-claim failure')",
-            ),
+            SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
         )
     assert failed.value.code == "browser_failed"
 
@@ -3084,10 +3290,7 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     submission = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            SubmitApplicationRuntimeAction(
-                type="submit_application",
-                code="print('one accepted action')",
-            ),
+            SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
         )
     )
     await asyncio.sleep(0)
@@ -3104,7 +3307,10 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     await cancellation
     await wait_state(manager, created.session_id, "submission_uncertain")
     assert record.finalized is False
-    assert fakes.runtimes[0].codes == ["print('one accepted action')"]
+    assert fakes.runtimes[0].codes == [
+        "page_info()",
+        sessions_module._submit_application_source("#final-submit")
+    ]
     assert fakes.runtimes[0].closed is False
     assert fakes.browsers[0].killed is False
     await manager.delete(created.session_id)
@@ -3136,10 +3342,7 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     submission = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            SubmitApplicationRuntimeAction(
-                type="submit_application",
-                code="print('one action before expiry')",
-            ),
+            SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
         )
     )
     await asyncio.sleep(0)
@@ -3170,7 +3373,10 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
         "submission_uncertain",
         "closed",
     ]
-    assert fakes.runtimes[0].codes == ["print('one action before expiry')"]
+    assert fakes.runtimes[0].codes == [
+        "page_info()",
+        sessions_module._submit_application_source("#final-submit")
+    ]
     assert fakes.runtimes[0].closed is True
     assert fakes.browsers[0].killed is True
 
@@ -3207,10 +3413,7 @@ async def test_submit_latch_wins_a_queued_model_failure(
     submission = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            SubmitApplicationRuntimeAction(
-                type="submit_application",
-                code="print('one action before model failure')",
-            ),
+            SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
         )
     )
     await asyncio.sleep(0)
@@ -3224,7 +3427,10 @@ async def test_submit_latch_wins_a_queued_model_failure(
     )
     await wait_state(manager, created.session_id, "submission_uncertain")
     assert record.finalized is False
-    assert fakes.runtimes[0].codes == ["print('one action before model failure')"]
+    assert fakes.runtimes[0].codes == [
+        "page_info()",
+        sessions_module._submit_application_source("#final-submit")
+    ]
     assert fakes.runtimes[0].closed is False
     assert fakes.browsers[0].killed is False
     await manager.delete(created.session_id)
@@ -3265,10 +3471,7 @@ async def test_post_action_model_failures_park_uncertainty(
     await wait_until(lambda: record.human_gate.submission_approved)
     await manager.runtime_action(
         created.session_id,
-        SubmitApplicationRuntimeAction(
-            type="submit_application",
-            code="print('single final action')",
-        ),
+        SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
     )
     if failure_kind == "model_transport":
         release.set()

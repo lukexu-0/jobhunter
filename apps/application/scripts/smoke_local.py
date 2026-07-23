@@ -49,9 +49,8 @@ RESUME_EVIDENCE = (
     "operating deployment systems."
 )
 CONTEXT_EVIDENCE = (
-    "For this synthetic fixture, the candidate explicitly prefers Remote work, "
-    "is available Immediately, and confirms that the supplied application answers "
-    "are truthful."
+    "For this synthetic fixture, the candidate explicitly prefers Remote work "
+    "and confirms that the supplied application answers are truthful."
 )
 RELEVANT_ANECDOTE = (
     "Quartz rollback incident: during a production deployment incident, the candidate "
@@ -69,9 +68,10 @@ REVISION_VALUE = "Human revision: emphasize careful incident ownership."
 RESUME_NAME = "smoke-resume.pdf"
 SUMMER_AVAILABILITY = "June through August 2027"
 REFERRAL_SOURCE = "Employee referral"
+REVIEW_EMPHASIS_REPLY = "Initial human reply: emphasize production reliability."
 
 REQUEST_TIMEOUT = httpx.Timeout(connect=5.0, read=35.0, write=35.0, pool=5.0)
-EVENT_WAIT_SECONDS = 900.0
+EVENT_WAIT_SECONDS = 1_800.0
 FIXTURE_WAIT_SECONDS = 120.0
 
 
@@ -186,7 +186,6 @@ def create_inputs(root: Path) -> dict[str, Path]:
         "---\n"
         f'full_name: "{FULL_NAME}"\n'
         f'email: "{EMAIL}"\n'
-        'start_date: "Immediately"\n'
         "---\n\n"
         f"{PROFILE_NARRATIVE}\n",
         encoding="utf-8",
@@ -268,52 +267,68 @@ class EventStream:
         self._task = asyncio.create_task(self._run(), name="browser-harness-smoke-sse")
 
     async def _run(self) -> None:
-        async with self._client.stream("GET", self._url, headers=self._headers) as response:
-            if response.status_code != 200:
-                await response.aread()
-                self._capture.response(response)
-                raise SmokeFailure("Harness SSE endpoint did not return 200")
-            event_name: str | None = None
-            event_id: str | None = None
-            data_lines: list[str] = []
-            frame_lines: list[str] = []
-            async for line in response.aiter_lines():
-                if line == "":
-                    if frame_lines:
-                        self._capture.sse("\n".join(frame_lines) + "\n\n")
-                    if data_lines:
-                        try:
-                            payload = json.loads("\n".join(data_lines))
-                        except (json.JSONDecodeError, ValueError) as error:
-                            raise SmokeFailure("Harness SSE emitted invalid JSON data") from error
-                        require(isinstance(payload, dict), "Harness SSE data was not a JSON object")
-                        require(payload.get("event") == event_name, "Harness SSE event name disagreed with its data")
-                        require(str(payload.get("id")) == event_id, "Harness SSE event id disagreed with its data")
-                        async with self._condition:
-                            if self.events:
-                                require(
-                                    isinstance(payload.get("id"), int)
-                                    and payload["id"] > self.events[-1]["id"],
-                                    "Harness SSE event ids were not strictly monotonic",
-                                )
-                            self.events.append(payload)
-                            self._condition.notify_all()
-                    event_name = None
-                    event_id = None
-                    data_lines = []
-                    frame_lines = []
-                    continue
-                if line.startswith(":"):
-                    continue
-                frame_lines.append(line)
-                field, _, value = line.partition(":")
-                value = value[1:] if value.startswith(" ") else value
-                if field == "event":
-                    event_name = value
-                elif field == "id":
-                    event_id = value
-                elif field == "data":
-                    data_lines.append(value)
+        while True:
+            headers = dict(self._headers)
+            if self.events:
+                headers["Last-Event-ID"] = str(self.events[-1]["id"])
+            async with self._client.stream("GET", self._url, headers=headers) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    self._capture.response(response)
+                    raise SmokeFailure("Harness SSE endpoint did not return 200")
+                event_name: str | None = None
+                event_id: str | None = None
+                data_lines: list[str] = []
+                frame_lines: list[str] = []
+                async for line in response.aiter_lines():
+                    if line == "":
+                        if frame_lines:
+                            self._capture.sse("\n".join(frame_lines) + "\n\n")
+                        if data_lines:
+                            try:
+                                payload = json.loads("\n".join(data_lines))
+                            except (json.JSONDecodeError, ValueError) as error:
+                                raise SmokeFailure(
+                                    "Harness SSE emitted invalid JSON data"
+                                ) from error
+                            require(
+                                isinstance(payload, dict),
+                                "Harness SSE data was not a JSON object",
+                            )
+                            require(
+                                payload.get("event") == event_name,
+                                "Harness SSE event name disagreed with its data",
+                            )
+                            require(
+                                str(payload.get("id")) == event_id,
+                                "Harness SSE event id disagreed with its data",
+                            )
+                            async with self._condition:
+                                if self.events:
+                                    require(
+                                        isinstance(payload.get("id"), int)
+                                        and payload["id"] > self.events[-1]["id"],
+                                        "Harness SSE event ids were not strictly monotonic",
+                                    )
+                                self.events.append(payload)
+                                self._condition.notify_all()
+                        event_name = None
+                        event_id = None
+                        data_lines = []
+                        frame_lines = []
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    frame_lines.append(line)
+                    field, _, value = line.partition(":")
+                    value = value[1:] if value.startswith(" ") else value
+                    if field == "event":
+                        event_name = value
+                    elif field == "id":
+                        event_id = value
+                    elif field == "data":
+                        data_lines.append(value)
+            await asyncio.sleep(0.1)
 
     async def wait_for(
         self,
@@ -342,6 +357,21 @@ class EventStream:
                         raise SmokeFailure(
                             "Harness session failed before the expected workflow gate: "
                             f"{json.dumps(public_error, sort_keys=True)}"
+                        )
+                    terminal = next(
+                        (
+                            event
+                            for event in self.events
+                            if event.get("id", 0) > after_id
+                            and event.get("event") in {"cancelled", "closed"}
+                            and event.get("event") != event_name
+                        ),
+                        None,
+                    )
+                    if terminal is not None:
+                        raise SmokeFailure(
+                            "Harness session ended before the expected workflow gate: "
+                            f"{terminal.get('event')}"
                         )
                     task = self._task
                     require(task is not None, "Harness SSE task was not started")
@@ -449,6 +479,7 @@ def assert_saved_user_info(
     job_url: str,
     global_fact_key: str,
     application_fact_key: str,
+    review_fact_key: str | None = None,
 ) -> None:
     document = read_user_info(path)
     require(set(document) == {"version", "global", "applications"}, "User-info document shape changed")
@@ -464,15 +495,22 @@ def assert_saved_user_info(
         "User-info store contained a cross-application bucket",
     )
     application_facts = applications[job_url]
+    expected_application_keys = {application_fact_key}
+    if review_fact_key is not None:
+        expected_application_keys.add(review_fact_key)
     require(
         isinstance(application_facts, dict)
-        and set(application_facts) == {application_fact_key},
-        "User-info store did not contain exactly the expected application fact",
+        and set(application_facts) == expected_application_keys,
+        "User-info store did not contain exactly the expected application facts",
     )
-    expected_records = (
+    expected_records = [
         (global_facts[global_fact_key], "text", SUMMER_AVAILABILITY),
         (application_facts[application_fact_key], "single_select", REFERRAL_SOURCE),
-    )
+    ]
+    if review_fact_key is not None:
+        expected_records.append(
+            (application_facts[review_fact_key], "text", REVIEW_EMPHASIS_REPLY)
+        )
     for record, answer_type, expected_value in expected_records:
         require(isinstance(record, dict), "User-info fact was not an object")
         require(
@@ -517,11 +555,24 @@ def additional_info_command(
         "Agent requested the global fixture fact with the wrong shape",
     )
     global_question = global_questions[0]
+    global_id = global_question.get("id")
+    global_key = global_question.get("key")
+    global_prompt = global_question.get("question")
     require(
-        global_question.get("scope") == "global"
-        and global_question.get("answer_type") == "text"
-        and isinstance(global_question.get("id"), str),
-        "Agent requested the global fixture fact with the wrong shape",
+        all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (global_id, global_key, global_prompt)
+        ),
+        "Agent omitted global fixture question metadata",
+    )
+    normalized_global_prompt = global_prompt.casefold()
+    require(
+        "summer" in normalized_global_prompt
+        and any(
+            token in normalized_global_prompt
+            for token in ("availab", "date", "when", "work")
+        ),
+        "Agent did not ask for the unknown summer availability",
     )
     application_questions = [
         question
@@ -534,16 +585,35 @@ def additional_info_command(
         "Agent requested the application fixture fact with the wrong shape",
     )
     application_question = application_questions[0]
+    application_id = application_question.get("id")
+    application_key = application_question.get("key")
+    application_prompt = application_question.get("question")
     require(
-        application_question.get("scope") == "application"
-        and application_question.get("answer_type") == "single_select"
-        and isinstance(application_question.get("id"), str),
-        "Agent requested the application fixture fact with the wrong shape",
+        all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (application_id, application_key, application_prompt)
+        ),
+        "Agent omitted application fixture question metadata",
+    )
+    normalized_application_prompt = application_prompt.casefold()
+    require(
+        any(
+            token in normalized_application_prompt
+            for token in ("hear", "learn", "referr", "source", "find", "found", "discover")
+        ),
+        "Agent did not ask for the unknown referral source",
+    )
+    require(
+        global_id != application_id,
+        "Agent reused candidate-question IDs",
     )
     options = application_question.get("options")
     require(
-        isinstance(options, list) and len(options) >= 2,
-        "Agent omitted bounded referral-source options",
+        isinstance(options, list)
+        and all(isinstance(option, dict) for option in options)
+        and {option.get("label") for option in options}
+        == {REFERRAL_SOURCE, "Job board"},
+        "Agent did not provide the exact bounded referral-source options",
     )
     selected = next(
         (
@@ -554,30 +624,75 @@ def additional_info_command(
         None,
     )
     require(
-        isinstance(selected, dict) and isinstance(selected.get("id"), str),
-        "Agent omitted the expected referral-source option",
-    )
-    require(
-        isinstance(global_question.get("key"), str)
-        and isinstance(application_question.get("key"), str),
-        "Agent omitted a fixture fact key",
+        isinstance(selected, dict)
+        and isinstance(selected.get("id"), str)
+        and bool(selected["id"].strip())
+        and all(
+            isinstance(option.get("id"), str) and bool(option["id"].strip())
+            for option in options
+        )
+        and len({option["id"] for option in options}) == len(options),
+        "Agent omitted unique referral-source option identifiers",
     )
     command = {
         "type": "provide_additional_info",
         "answers": [
             {
-                "id": global_question["id"],
+                "id": global_id,
                 "status": "answered",
                 "value": SUMMER_AVAILABILITY,
             },
             {
-                "id": application_question["id"],
+                "id": application_id,
                 "status": "answered",
                 "option_id": selected["id"],
             },
         ],
     }
-    return command, global_question["key"], application_question["key"]
+    return command, global_key, application_key
+
+
+def review_emphasis_command(event: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    detail = event.get("detail")
+    require(isinstance(detail, dict), "Review-emphasis event omitted its detail")
+    questions = detail.get("questions")
+    require(
+        isinstance(questions, list)
+        and len(questions) == 1
+        and isinstance(questions[0], dict),
+        "Agent did not ask exactly one late-discovered review-emphasis question",
+    )
+    question = questions[0]
+    question_id = question.get("id")
+    fact_key = question.get("key")
+    prompt = question.get("question")
+    require(
+        question.get("scope") == "application"
+        and question.get("answer_type") == "text"
+        and all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (question_id, fact_key, prompt)
+        ),
+        "Agent requested the review-emphasis fact with the wrong shape",
+    )
+    normalized_prompt = prompt.casefold()
+    require(
+        "review" in normalized_prompt and "emphasis" in normalized_prompt,
+        "Agent did not identify the late-discovered review-emphasis question",
+    )
+    return (
+        {
+            "type": "provide_additional_info",
+            "answers": [
+                {
+                    "id": question_id,
+                    "status": "answered",
+                    "value": REVIEW_EMPHASIS_REPLY,
+                }
+            ],
+        },
+        fact_key,
+    )
 
 
 async def wait_fixture_values(
@@ -766,6 +881,7 @@ def privacy_scan(capture: Capture, token: str) -> None:
         REVISION,
         REVISION_VALUE,
         SUMMER_AVAILABILITY,
+        REVIEW_EMPHASIS_REPLY,
     )
     for value in forbidden_values:
         require(value not in corpus, "Captured API/SSE data failed the privacy scan")
@@ -899,6 +1015,8 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                     "truthful": True,
                     "years": "7",
                     "resume": RESUME_NAME,
+                    "summerAvailability": "",
+                    "referralSource": "",
                 },
                 "Agent requested additional information before filling fields supported by initial data",
             )
@@ -942,10 +1060,13 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 {
                     "summerAvailability": SUMMER_AVAILABILITY,
                     "referralSource": REFERRAL_SOURCE,
+                    "intermediateClick": "true",
+                    "intermediateEnter": "true",
+                    "custom": "evaluation-set",
                     "humanNext": "",
                     "reviewVisible": False,
                 },
-                "Agent did not apply both accepted answers in the same model run",
+                "Agent did not apply the accepted answers and complete every machine-actionable control",
             )
             before_navigation_submit = await asyncio.to_thread(fixture.submit_snapshot)
             require(
@@ -963,8 +1084,30 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 "Harness rejected continue after the manual Human Next click",
             )
 
+            post_navigation_info = await event_stream.wait_for(
+                "additional_info_required",
+                after_id=int(navigation["id"]),
+            )
+            review_info_command, review_fact_key = review_emphasis_command(
+                post_navigation_info
+            )
+            await post_command(
+                client,
+                capture,
+                commands_url,
+                headers,
+                review_info_command,
+                "Harness rejected the late-discovered review-emphasis answer",
+            )
+            review_info_saved = await event_stream.wait_for(
+                "additional_info_saved", after_id=int(post_navigation_info["id"])
+            )
+            require(
+                review_info_saved.get("detail") == {"count": 1},
+                "Harness did not report the saved review-emphasis answer",
+            )
             first_review = await event_stream.wait_for(
-                "review_required", after_id=int(navigation["id"])
+                "review_required", after_id=int(review_info_saved["id"])
             )
             await post_command(
                 client,
@@ -1007,9 +1150,22 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             submission_started = await event_stream.wait_for(
                 "submission_started", after_id=int(second_review["id"])
             )
-            submitted = await event_stream.wait_for(
-                "application_submitted", after_id=int(submission_started["id"])
+            submitted = await event_stream.wait_for_one_of(
+                ("application_submitted", "submission_uncertain"),
+                after_id=int(submission_started["id"]),
             )
+            if submitted.get("event") != "application_submitted":
+                print(
+                    "Agent submission became uncertain. Inspect headed Chrome, "
+                    "then press Enter here to close the smoke session."
+                )
+                try:
+                    await asyncio.to_thread(input)
+                except (KeyboardInterrupt, EOFError):
+                    raise SmokeFailure(
+                        "Agent submission became uncertain; browser inspection was interrupted"
+                    ) from None
+                raise SmokeFailure("Agent submission became uncertain")
             await wait_for_one_submit(fixture)
 
             event_names = [event["event"] for event in event_stream.events]
@@ -1143,6 +1299,7 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 fixture.posting_url,
                 global_fact_key,
                 application_fact_key,
+                review_fact_key,
             )
 
             followup_delete = await client.delete(

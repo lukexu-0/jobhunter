@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import stat
@@ -49,6 +50,7 @@ from .models import (
     CancelCommand,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
+    CandidateQuestionsRequiredRuntimeActionResponse,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     ContinueCommand,
@@ -110,6 +112,120 @@ _SUBMISSION_UNCERTAIN_WARNING = (
     "if it is still available, then close this session."
 )
 _MAX_APPLICATION_TASK_BYTES = 1024 * 1024
+
+def _submit_application_source(selector: str) -> str:
+    selector_json = json.dumps(selector, ensure_ascii=False)
+    javascript = f"""(() => {{
+  const selector = {selector_json};
+  const activatableSelector = [
+    "button",
+    "input[type='submit']",
+    "input[type='button']",
+    "input[type='image']",
+    "a[href]",
+    "[role='button']",
+  ].join(", ");
+  const normalizedLabel = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const finalActionPattern = /\\b(?:apply|send|submit)\\b/i;
+  const unsafeActionPattern = /\\b(?:back|cancel|close|delete|discard|draft|remove|save|withdraw)\\b/i;
+  const labelledByText = (element) => normalizedLabel(
+    (element.getAttribute("aria-labelledby") || "")
+      .split(/\\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.textContent || "")
+      .join(" ")
+  );
+  const controlLabels = (element) => {{
+    const inputLabel = element instanceof HTMLInputElement
+      ? element.value || element.getAttribute("alt") || ""
+      : "";
+    const visibleLabel = normalizedLabel(inputLabel || element.innerText || "");
+    const accessibleLabel = labelledByText(element)
+      || normalizedLabel(element.getAttribute("aria-label"))
+      || visibleLabel
+      || normalizedLabel(element.getAttribute("title"))
+      || (
+        element instanceof HTMLInputElement
+        && element.type.toLowerCase() === "submit"
+        ? "submit"
+        : ""
+      );
+    return {{accessibleLabel, visibleLabel}};
+  }};
+  const isFinalSubmissionControl = (element) => {{
+    const {{accessibleLabel, visibleLabel}} = controlLabels(element);
+    return finalActionPattern.test(accessibleLabel)
+      && !unsafeActionPattern.test(accessibleLabel)
+      && (
+        !visibleLabel
+        || (
+          finalActionPattern.test(visibleLabel)
+          && !unsafeActionPattern.test(visibleLabel)
+        )
+      );
+  }};
+  const pointFor = (element) => {{
+    if (
+      !element.isConnected
+      || !element.matches(activatableSelector)
+      || element.closest("[inert]")
+      || element.matches(":disabled")
+    ) return null;
+    if (!isFinalSubmissionControl(element)) return null;
+    for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {{
+      if (
+        (ancestor.getAttribute("aria-disabled") || "").trim().toLowerCase()
+        === "true"
+      ) return null;
+    }}
+    const style = getComputedStyle(element);
+    if (
+      style.display === "none"
+      || style.visibility === "hidden"
+      || style.opacity === "0"
+      || style.pointerEvents === "none"
+    ) return null;
+    if (
+      typeof element.checkVisibility === "function"
+      && !element.checkVisibility({{checkOpacity: true, checkVisibilityCSS: true}})
+    ) return null;
+    const rect = element.getBoundingClientRect();
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(innerWidth, rect.right);
+    const bottom = Math.min(innerHeight, rect.bottom);
+    if (right <= left || bottom <= top) return null;
+    const x = left + (right - left) / 2;
+    const y = top + (bottom - top) / 2;
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || hit.closest(activatableSelector) !== element) return null;
+    return {{x, y}};
+  }};
+  const points = Array.from(document.querySelectorAll(selector))
+    .map(pointFor)
+    .filter((point) => point !== null);
+  return points.length === 1 ? points[0] : null;
+}})()"""
+    return (
+        f"_submission_point = js({javascript!r})\n"
+        "if not isinstance(_submission_point, dict):\n"
+        "    raise RuntimeError('Final submission control is not uniquely actionable')\n"
+        "_submission_x = _submission_point.get('x')\n"
+        "_submission_y = _submission_point.get('y')\n"
+        "if (\n"
+        "    type(_submission_x) not in (int, float)\n"
+        "    or type(_submission_y) not in (int, float)\n"
+        "    or not (-float('inf') < float(_submission_x) < float('inf'))\n"
+        "    or not (-float('inf') < float(_submission_y) < float('inf'))\n"
+        "):\n"
+        "    raise RuntimeError('Final submission control position is invalid')\n"
+        "click_at_xy(float(_submission_x), float(_submission_y))\n"
+        "wait(0.5)\n"
+        "wait_for_load(timeout=15.0)\n"
+        "wait_for_network_idle(timeout=10.0, idle_ms=500)\n"
+        "page_info()"
+    )
+
 
 ModelFactory = Callable[[UUID, str, str], PipelineApplicationAgentClient]
 BrowserFactory = Callable[
@@ -894,14 +1010,25 @@ class ApplicationSessionManager:
                     record.browser_action_count,
                     result.observation.url,
                 )
+                if result.candidate_questions:
+                    return CandidateQuestionsRequiredRuntimeActionResponse(
+                        type="candidate_questions_required",
+                        questions=result.candidate_questions,
+                    )
                 return BrowserUseResultRuntimeActionResponse(
                     type="browser_use_result",
                     **result.model_dump(),
                 )
 
         if isinstance(action, SubmitApplicationRuntimeAction):
+            source = _submit_application_source(action.selector)
             try:
-                result = await runtime.execute(action.code)
+                pre_click = await runtime.execute("page_info()")
+                if pre_click.candidate_questions:
+                    raise BrowserSkillRuntimeError("browser_failed")
+                result = await runtime.execute(source)
+                if result.candidate_questions:
+                    raise BrowserSkillRuntimeError("browser_failed")
             except BrowserSkillRuntimeError as error:
                 public = session_error(error.code)
                 raise HarnessServiceError(
@@ -909,9 +1036,24 @@ class ApplicationSessionManager:
                     public.code,
                     public.message,
                 ) from None
+            public_result = result.model_copy(
+                update={
+                    "observation": result.observation.model_copy(
+                        update={
+                            "url": redact_public_url(
+                                result.observation.url,
+                                gate.redaction_values,
+                            ),
+                            "tabs": [],
+                            "page_info": None,
+                        }
+                    )
+                }
+            )
             return SubmitApplicationResultRuntimeActionResponse(
                 type="submit_application_result",
-                **result.model_dump(),
+                pre_click_dom=pre_click.observation.dom,
+                **public_result.model_dump(),
             )
 
         if isinstance(action, RequestHumanNavigationRuntimeAction):
