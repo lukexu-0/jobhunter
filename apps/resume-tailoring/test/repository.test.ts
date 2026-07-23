@@ -809,13 +809,71 @@ describe("application session ledger", () => {
       updatedAt: 1_050,
       terminalAt: null,
     });
-    expect(() => repo.recordApplicationSnapshot(runId, {
+    tick(50);
+    const replayed = repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "running",
+      publicSnapshot: { state: "running" },
+      lastUpstreamEventId: 7,
+    });
+    expect(replayed).toMatchObject({
+      bridgeState: "awaiting_human_navigation",
+      publicSnapshot: snapshot,
+      lastUpstreamEventId: 7,
+      updatedAt: 1_050,
+    });
+    const stale = repo.recordApplicationSnapshot(runId, {
       generation: 1,
       sessionId,
       bridgeState: "running",
       publicSnapshot: { state: "running" },
       lastUpstreamEventId: 6,
-    })).toThrow(/cursor/);
+    });
+    expect(stale).toMatchObject({
+      bridgeState: "awaiting_human_navigation",
+      publicSnapshot: snapshot,
+      lastUpstreamEventId: 7,
+      updatedAt: 1_050,
+    });
+  });
+
+  test("advances a higher cursor without replacing an equal-timestamp conflict", () => {
+    const { repo } = fixture();
+    const hash = "a".repeat(64);
+    const runId = createReview(repo, hash);
+    repo.approve(runId, hash);
+    const sessionId = "34343434-3434-4434-8434-343434343434";
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    const retainedSnapshot = {
+      state: "awaiting_human_navigation",
+      updatedAt: 200,
+      pendingAction: { type: "human_navigation", instruction: "Complete login" },
+    };
+    repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "awaiting_human_navigation",
+      publicSnapshot: retainedSnapshot,
+      lastUpstreamEventId: 6,
+    });
+    const before = repo.getLatestApplicationSession(runId);
+
+    const coalesced = repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "running",
+      publicSnapshot: { state: "running", updatedAt: 200 },
+      lastUpstreamEventId: 7,
+    });
+
+    expect(coalesced).toMatchObject({
+      bridgeState: "awaiting_human_navigation",
+      publicSnapshot: retainedSnapshot,
+      lastUpstreamEventId: 7,
+      updatedAt: before?.updatedAt,
+    });
+    expect(repo.getLatestApplicationSession(runId)).toEqual(coalesced);
   });
 
   test("marks an observed current session lost, closes it locally, and preserves prior generations", () => {

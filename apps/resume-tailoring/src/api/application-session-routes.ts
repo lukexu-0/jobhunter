@@ -71,6 +71,8 @@ function mappedError(error: unknown): Response {
   return apiResponse.error("INTERNAL_ERROR", "Request failed", 500);
 }
 
+export const APPLICATION_EVENT_STREAM_PATH =
+  /^\/v1\/runs\/[^/]+\/application\/events$/;
 const APPLICATION_EVENT_ID = /^([1-9]\d*):(0|[1-9]\d*)$/;
 const EVENT_STREAM_HEADERS = {
   "cache-control": "no-store",
@@ -106,12 +108,12 @@ function eventStreamResponse(
   };
   const abort = (): void => {
     if (finalized) return;
-    controller?.error(
-      signal.reason instanceof Error
-        ? signal.reason
-        : new DOMException("The request was aborted", "AbortError"),
-    );
     void finalize(true).catch(() => {});
+    try {
+      controller?.close();
+    } catch {
+      // The consumer may already have cancelled the stream.
+    }
   };
 
   const body = new ReadableStream<Uint8Array>({
@@ -203,8 +205,7 @@ export function createApplicationSessionRoutes(service: ApplicationSessionRouteS
       }
       if (
         request.method === "GET"
-        && segments[4] === "events"
-        && segments.length === 5
+        && APPLICATION_EVENT_STREAM_PATH.test(url.pathname)
       ) {
         const rawCursor = request.headers.get("last-event-id");
         const cursor = rawCursor === null ? undefined : parseApplicationEventId(rawCursor);

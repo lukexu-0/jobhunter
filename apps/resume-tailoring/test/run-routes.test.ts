@@ -935,7 +935,7 @@ describe("application session HTTP routes", () => {
     expect(calls).toBe(1);
   });
 
-  test("propagates request aborts and reader cancellation through iterator return", async () => {
+  test("closes aborted streams and propagates reader cancellation through iterator return", async () => {
     const createTarget = () => {
       let signal: AbortSignal | undefined;
       let returns = 0;
@@ -979,7 +979,7 @@ describe("application session HTTP routes", () => {
     const abortedReader = abortedResponse.body!.getReader();
     expect((await abortedReader.read()).done).toBe(false);
     abortController.abort(new DOMException("Client disconnected", "AbortError"));
-    await expect(abortedReader.read()).rejects.toThrow("Client disconnected");
+    expect(await abortedReader.read()).toEqual({ done: true, value: undefined });
     expect(abortedTarget.signal()?.aborted).toBe(true);
     expect(abortedTarget.returns()).toBe(1);
 

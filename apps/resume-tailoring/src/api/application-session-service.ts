@@ -244,6 +244,18 @@ function isTerminal(session: PublicApplicationSession): boolean {
 function retainedSubmissionFinal(session: PublicApplicationSession): boolean {
   return session.submissionPhase === "submitted" || session.submissionPhase === "uncertain";
 }
+function attemptingSubmissionEnded(
+  session: PublicApplicationSession,
+  harnessState: ApplicationHarnessSnapshot["state"],
+): boolean {
+  return session.submissionPhase === "attempting"
+    && (
+      harnessState === "submitted"
+      || harnessState === "submission_uncertain"
+      || TERMINAL_APPLICATION_STATES[harnessState] === true
+    );
+}
+
 
 function submissionCannotRetry(session: PublicApplicationSession): boolean {
   return session.submissionPhase === "attempting" || retainedSubmissionFinal(session);
@@ -506,13 +518,13 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): AsyncGenerator<ApplicationSessionStreamItem> {
     let session = initialSession;
+    let lastDeliveredUpstreamEventId = clientUpstreamEventId ?? -1;
     const replaySnapshot = session.publicSnapshot === null
       ? null
       : ApplicationSessionSnapshotDtoSchema.safeParse(session.publicSnapshot);
     if (replaySnapshot !== null && !replaySnapshot.success) {
       throw applicationHarnessUnavailable();
     }
-    const replayUpdatedAtFloor = replaySnapshot?.data.updatedAt ?? null;
     if (
       session.lastUpstreamEventId !== null
       && (
@@ -521,6 +533,7 @@ export class ApplicationSessionService {
       )
       && session.publicSnapshot !== null
     ) {
+      lastDeliveredUpstreamEventId = session.lastUpstreamEventId;
       yield {
         id: `${session.generation}:${session.lastUpstreamEventId}`,
         event: ApplicationSessionEventDtoSchema.parse({
@@ -534,16 +547,96 @@ export class ApplicationSessionService {
     try {
       for await (const event of upstreamEvents) {
         signal.throwIfAborted();
+        const durable = this.dependencies.repository.getLatestApplicationSession(runId);
+        if (!durable || durable.generation !== session.generation) {
+          throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
+        }
+        session = durable;
         if (
-          (
-            session.lastUpstreamEventId !== null
-            && event.id <= session.lastUpstreamEventId
-          )
-          || (
-            replayUpdatedAtFloor !== null
-            && event.session.updatedAt <= replayUpdatedAtFloor
-          )
+          session.lastUpstreamEventId !== null
+          && event.id <= session.lastUpstreamEventId
         ) {
+          if (
+            session.lastUpstreamEventId > lastDeliveredUpstreamEventId
+            && session.publicSnapshot !== null
+          ) {
+            lastDeliveredUpstreamEventId = session.lastUpstreamEventId;
+            yield {
+              id: `${session.generation}:${session.lastUpstreamEventId}`,
+              event: ApplicationSessionEventDtoSchema.parse({
+                generation: session.generation,
+                event: "snapshot",
+                session: this.#storedView(session),
+                detail: {},
+              }),
+            };
+          }
+          continue;
+        }
+        const durableSnapshot = session.publicSnapshot === null
+          ? null
+          : ApplicationSessionSnapshotDtoSchema.safeParse(session.publicSnapshot);
+        if (durableSnapshot !== null && !durableSnapshot.success) {
+          throw applicationHarnessUnavailable();
+        }
+        if (
+          durableSnapshot?.success === true
+          && event.session.updatedAt <= durableSnapshot.data.updatedAt
+        ) {
+          let retainedProjection = durableSnapshot.data;
+          try {
+            if (attemptingSubmissionEnded(session, event.session.state)) {
+              this.dependencies.repository.finalizeApplicationSubmission(
+                session.sessionId,
+                "uncertain",
+              );
+              const finalized =
+                this.dependencies.repository.getLatestApplicationSession(runId);
+              if (
+                !finalized
+                || finalized.generation !== session.generation
+                || finalized.sessionId !== session.sessionId
+              ) {
+                throw new RunServiceError(
+                  "RUN_CONFLICT",
+                  "application session changed",
+                  409,
+                );
+              }
+              session = finalized;
+              retainedProjection = ApplicationSessionSnapshotDtoSchema.parse({
+                ...this.#storedView(finalized),
+                updatedAt: this.#nextProjectionUpdatedAt(finalized),
+              });
+            }
+            if (
+              retainedProjection.bridgeState === "reserved"
+              || retainedProjection.bridgeState === "lost"
+            ) {
+              throw applicationHarnessUnavailable();
+            }
+            session = this.dependencies.repository.recordApplicationSnapshot(runId, {
+              generation: session.generation,
+              sessionId: session.sessionId,
+              bridgeState: retainedProjection.bridgeState,
+              publicSnapshot: retainedProjection,
+              lastUpstreamEventId: event.id,
+            });
+          } catch (error) {
+            mapRepositoryError(error);
+          }
+          if (event.id > lastDeliveredUpstreamEventId) {
+            lastDeliveredUpstreamEventId = event.id;
+            yield {
+              id: `${session.generation}:${event.id}`,
+              event: ApplicationSessionEventDtoSchema.parse({
+                generation: session.generation,
+                event: "snapshot",
+                session: this.#storedView(session),
+                detail: {},
+              }),
+            };
+          }
           continue;
         }
         this.#recordHarnessSnapshot(
@@ -557,13 +650,32 @@ export class ApplicationSessionService {
           throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
         }
         session = recorded;
-        if (recorded.lastUpstreamEventId !== event.id) continue;
+        if (recorded.lastUpstreamEventId !== event.id) {
+          if (
+            recorded.lastUpstreamEventId !== null
+            && recorded.lastUpstreamEventId > lastDeliveredUpstreamEventId
+            && recorded.publicSnapshot !== null
+          ) {
+            lastDeliveredUpstreamEventId = recorded.lastUpstreamEventId;
+            yield {
+              id: `${recorded.generation}:${recorded.lastUpstreamEventId}`,
+              event: ApplicationSessionEventDtoSchema.parse({
+                generation: recorded.generation,
+                event: "snapshot",
+                session: this.#storedView(recorded),
+                detail: {},
+              }),
+            };
+          }
+          continue;
+        }
         const projected = ApplicationSessionEventDtoSchema.parse({
           generation: session.generation,
           event: event.event,
           session: this.#storedView(recorded),
           detail: event.detail,
         });
+        lastDeliveredUpstreamEventId = event.id;
         yield {
           id: `${session.generation}:${event.id}`,
           event: projected,
@@ -604,6 +716,10 @@ export class ApplicationSessionService {
       || !isLive(session)
       || session.bridgeState === "reserved"
       || session.submissionPhase === "attempting"
+      || (
+        command.type === "submit"
+        && session.bridgeState !== "awaiting_human_review"
+      )
     ) {
       throw new ApplicationSessionServiceError("APPLICATION_COMMAND_CONFLICT");
     }
@@ -898,14 +1014,7 @@ export class ApplicationSessionService {
     ) {
       throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
     }
-    if (
-      current.submissionPhase === "attempting"
-      && (
-        snapshot.state === "submitted"
-        || snapshot.state === "submission_uncertain"
-        || TERMINAL_APPLICATION_STATES[snapshot.state] === true
-      )
-    ) {
+    if (attemptingSubmissionEnded(current, snapshot.state)) {
       this.dependencies.repository.finalizeApplicationSubmission(
         current.sessionId,
         "uncertain",

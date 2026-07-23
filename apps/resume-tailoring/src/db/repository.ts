@@ -773,6 +773,47 @@ export class PipelineRepository {
         ? null
         : JSON.parse(current.public_snapshot_json) as unknown;
       const currentSnapshotUpdatedAt = publicApplicationSnapshotUpdatedAt(currentSnapshot);
+      const retainSnapshotAndAdvanceCursor = (): PublicApplicationSession => {
+        if (input.lastUpstreamEventId === undefined) {
+          return publicApplicationSession(current);
+        }
+        const cursorResult = this.#db.query(`
+          UPDATE run_application_sessions
+          SET last_upstream_event_id = ?
+          WHERE run_id = ? AND generation = ? AND session_id = ?
+            AND (
+              last_upstream_event_id IS NULL
+              OR last_upstream_event_id < ?
+            )
+            AND generation = (
+              SELECT max(generation)
+              FROM run_application_sessions
+              WHERE run_id = ?
+            )
+        `).run(
+          input.lastUpstreamEventId,
+          runId,
+          input.generation,
+          input.sessionId,
+          input.lastUpstreamEventId,
+          runId,
+        );
+        if (cursorResult.changes !== 1) {
+          throw new RepositoryConflictError("application session is not the current generation");
+        }
+        const advanced = this.#db.query<ApplicationSessionRow, [string, number]>(
+          "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
+        ).get(runId, input.generation);
+        if (!advanced) throw new Error("application session cursor update failed");
+        return publicApplicationSession(advanced);
+      };
+      if (
+        current.last_upstream_event_id !== null
+        && input.lastUpstreamEventId !== undefined
+        && input.lastUpstreamEventId <= current.last_upstream_event_id
+      ) {
+        return publicApplicationSession(current);
+      }
       if (
         snapshotUpdatedAt !== null
         && currentSnapshotUpdatedAt !== null
@@ -784,7 +825,7 @@ export class PipelineRepository {
           )
         )
       ) {
-        return publicApplicationSession(current);
+        return retainSnapshotAndAdvanceCursor();
       }
       const bridgeMatchesSubmissionPhase =
         (
@@ -814,13 +855,6 @@ export class PipelineRepository {
         );
       }
       if (
-        current.last_upstream_event_id !== null
-        && input.lastUpstreamEventId !== undefined
-        && input.lastUpstreamEventId < current.last_upstream_event_id
-      ) {
-        throw new RepositoryConflictError("application event cursor moved backwards");
-      }
-      if (
         TERMINAL_APPLICATION_SESSION_STATES[current.bridge_state] === true
         && current.bridge_state !== input.bridgeState
         && !(
@@ -830,18 +864,19 @@ export class PipelineRepository {
       ) {
         throw new RepositoryConflictError("application session is terminal");
       }
-      const updatedAt = Math.max(current.updated_at + 1, this.#now());
-      const terminalAt = TERMINAL_APPLICATION_SESSION_STATES[input.bridgeState] === true
-        ? (current.terminal_at ?? updatedAt)
-        : null;
       const cursor = input.lastUpstreamEventId ?? current.last_upstream_event_id;
       if (
         current.bridge_state === input.bridgeState
         && current.public_snapshot_json === publicSnapshotJson
-        && current.last_upstream_event_id === cursor
       ) {
-        return publicApplicationSession(current);
+        return current.last_upstream_event_id === cursor
+          ? publicApplicationSession(current)
+          : retainSnapshotAndAdvanceCursor();
       }
+      const updatedAt = Math.max(current.updated_at + 1, this.#now());
+      const terminalAt = TERMINAL_APPLICATION_SESSION_STATES[input.bridgeState] === true
+        ? (current.terminal_at ?? updatedAt)
+        : null;
       const result = this.#db.query(`
         UPDATE run_application_sessions
         SET bridge_state = ?, public_snapshot_json = ?, last_upstream_event_id = ?,

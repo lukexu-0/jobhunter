@@ -676,19 +676,29 @@ describe("application session service", () => {
       detail: { stepNumber: 3 },
     }];
 
-    const iterator = (await target.service.events(
+    const items: ApplicationSessionStreamItem[] = [];
+    for await (const item of await target.service.events(
       target.runId,
       { generation: 1, upstreamEventId: 5 },
       signal(),
-    ))[Symbol.asyncIterator]();
-    const item = await iterator.next();
+    )) items.push(item);
 
     expect(target.harness!.streamCalls).toEqual([{
       sessionId: FIRST_SESSION_ID,
       lastEventId: 5,
     }]);
-    expect(item.done).toBeFalse();
-    expect(item.value).toEqual({
+    expect(items).toEqual([{
+      id: "1:6",
+      event: {
+        generation: 1,
+        event: "snapshot",
+        session: expect.objectContaining({
+          generation: 1,
+          bridgeState: "running",
+        }),
+        detail: {},
+      },
+    }, {
       id: "1:7",
       event: {
         generation: 1,
@@ -700,8 +710,8 @@ describe("application session service", () => {
         }),
         detail: { stepNumber: 3 },
       },
-    });
-    expect(item.value?.event.session.updatedAt).toBeGreaterThan(started.updatedAt);
+    }]);
+    expect(items[1]?.event.session.updatedAt).toBeGreaterThan(started.updatedAt);
     expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
       generation: 1,
       bridgeState: "running",
@@ -711,7 +721,7 @@ describe("application session service", () => {
         warnings: ["Review the highlighted field"],
       }),
     });
-    const serialized = JSON.stringify(item.value);
+    const serialized = JSON.stringify(items);
     expect(serialized).not.toContain(FIRST_SESSION_ID);
     expect(serialized).not.toContain(JOB_URL);
     expect(serialized).not.toContain(PROFILE);
@@ -781,7 +791,7 @@ describe("application session service", () => {
     await behind.return?.(undefined);
   });
 
-  test("does not emit a stale SSE frame after another stream advances the durable cursor", async () => {
+  test("replays the durable snapshot when another stream advances the cursor", async () => {
     const target = await createTarget();
     await target.service.start(target.runId, target.pdf.sha256, signal());
     target.harness!.events = [{
@@ -789,9 +799,17 @@ describe("application session service", () => {
       event: "agent_step",
       session: {
         ...harnessSnapshot("running"),
-        updatedAt: 10_200,
+        updatedAt: 10_400,
       },
       detail: { stepNumber: 2 },
+    }, {
+      id: 7,
+      event: "agent_step",
+      session: {
+        ...harnessSnapshot("running"),
+        updatedAt: 10_401,
+      },
+      detail: { stepNumber: 3 },
     }];
     const stream = await target.service.events(target.runId, undefined, signal());
     const current = target.repository.getLatestApplicationSession(target.runId);
@@ -813,10 +831,154 @@ describe("application session service", () => {
     const items: ApplicationSessionStreamItem[] = [];
     for await (const item of stream) items.push(item);
 
-    expect(items).toEqual([]);
+    expect(items).toEqual([{
+      id: "1:7",
+      event: {
+        generation: 1,
+        event: "snapshot",
+        session: expect.objectContaining({
+          generation: 1,
+          bridgeState: "running",
+          updatedAt: 10_300,
+        }),
+        detail: {},
+      },
+    }]);
     expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
       lastUpstreamEventId: 7,
       publicSnapshot: expect.objectContaining({ updatedAt: 10_300 }),
+    });
+  });
+
+  test("advances and emits a stale higher cursor without replacing the durable projection", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const current = target.repository.getLatestApplicationSession(target.runId);
+    if (!current || current.publicSnapshot === null) throw new Error("snapshot missing");
+    target.repository.recordApplicationSnapshot(target.runId, {
+      generation: 1,
+      sessionId: FIRST_SESSION_ID,
+      bridgeState: "running",
+      publicSnapshot: {
+        ...(current.publicSnapshot as Record<string, unknown>),
+        bridgeState: "running",
+        harnessState: "running",
+        updatedAt: 10_200,
+        role: "Durable role",
+        pendingAction: null,
+      },
+      lastUpstreamEventId: 6,
+    });
+    const staleEvent: ApplicationHarnessEvent = {
+      id: 7,
+      event: "agent_step",
+      session: {
+        ...harnessSnapshot("running"),
+        updatedAt: 10_199,
+        role: "Stale role",
+      },
+      detail: { stepNumber: 4 },
+    };
+    target.harness!.events = [staleEvent];
+
+    const items: ApplicationSessionStreamItem[] = [];
+    for await (const item of await target.service.events(
+      target.runId,
+      { generation: 1, upstreamEventId: 6 },
+      signal(),
+    )) items.push(item);
+
+    expect(items).toEqual([{
+      id: "1:7",
+      event: {
+        generation: 1,
+        event: "snapshot",
+        session: expect.objectContaining({
+          bridgeState: "running",
+          updatedAt: 10_200,
+          role: "Durable role",
+        }),
+        detail: {},
+      },
+    }]);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      lastUpstreamEventId: 7,
+      publicSnapshot: expect.objectContaining({
+        updatedAt: 10_200,
+        role: "Durable role",
+      }),
+    });
+
+    target.harness!.events = [staleEvent];
+    const reconnectItems: ApplicationSessionStreamItem[] = [];
+    for await (const item of await target.service.events(
+      target.runId,
+      { generation: 1, upstreamEventId: 7 },
+      signal(),
+    )) reconnectItems.push(item);
+    expect(reconnectItems).toEqual([]);
+    expect(target.harness!.streamCalls.at(-1)).toEqual({
+      sessionId: FIRST_SESSION_ID,
+      lastEventId: 7,
+    });
+  });
+
+  test("reconciles a stale terminal event after a claimed submission as uncertainty", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+    const current = target.repository.getLatestApplicationSession(target.runId);
+    if (!current || current.publicSnapshot === null) throw new Error("snapshot missing");
+    target.repository.recordApplicationSnapshot(target.runId, {
+      generation: 1,
+      sessionId: FIRST_SESSION_ID,
+      bridgeState: "submitting",
+      publicSnapshot: {
+        ...(current.publicSnapshot as Record<string, unknown>),
+        bridgeState: "submitting",
+        harnessState: "submitting",
+        submissionPhase: "attempting",
+        updatedAt: 10_200,
+        pendingAction: null,
+      },
+      lastUpstreamEventId: 6,
+    });
+    target.harness!.events = [{
+      id: 7,
+      event: "application_submitted",
+      session: {
+        ...harnessSnapshot("submitted"),
+        updatedAt: 10_199,
+      },
+      detail: {},
+    }];
+
+    const items: ApplicationSessionStreamItem[] = [];
+    for await (const item of await target.service.events(
+      target.runId,
+      { generation: 1, upstreamEventId: 6 },
+      signal(),
+    )) items.push(item);
+
+    expect(items).toEqual([{
+      id: "1:7",
+      event: {
+        generation: 1,
+        event: "snapshot",
+        session: expect.objectContaining({
+          bridgeState: "submission_uncertain",
+          harnessState: "submission_uncertain",
+          submissionPhase: "uncertain",
+          updatedAt: expect.any(Number),
+        }),
+        detail: {},
+      },
+    }]);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "submission_uncertain",
+      submissionPhase: "uncertain",
+      lastUpstreamEventId: 7,
     });
   });
 
@@ -833,6 +995,30 @@ describe("application session service", () => {
       code: "APPLICATION_HARNESS_UNAVAILABLE",
       status: 503,
     });
+  });
+
+  test("rejects submit until the durable projection is awaiting human review", async () => {
+    const running = await createTarget();
+    await running.service.start(running.runId, running.pdf.sha256, signal());
+    await expect(running.service.command(
+      running.runId,
+      { type: "submit" },
+      signal(),
+    )).rejects.toMatchObject({
+      code: "APPLICATION_COMMAND_CONFLICT",
+      status: 409,
+    });
+    expect(running.harness!.commandCalls).toEqual([]);
+
+    const reviewHarness = new FakeHarness();
+    reviewHarness.snapshotAfterCreate = harnessReviewSnapshot();
+    const review = await createTarget({ harness: reviewHarness });
+    await review.service.start(review.runId, review.pdf.sha256, signal());
+    await review.service.command(review.runId, { type: "submit" }, signal());
+    expect(reviewHarness.commandCalls).toEqual([{
+      sessionId: FIRST_SESSION_ID,
+      command: { type: "submit" },
+    }]);
   });
 
   test("forwards live commands without persistence and closes active, reserved, and lost sessions", async () => {
