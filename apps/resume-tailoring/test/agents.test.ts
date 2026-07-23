@@ -17,6 +17,7 @@ import { resolve } from "node:path";
 import { z } from "zod";
 import {
   AgentDeadlineError,
+  ANALYSIS_DEADLINE_MS,
   ATS_KEYWORD_EXTRACTION_DEADLINE_MS,
   createTerminalSubmission,
   runAnalysisAgent,
@@ -218,6 +219,7 @@ describe("guarded agents", () => {
     expect(`${ATS_KEYWORD_EXTRACTION_TASK} ${ATS_KEYWORD_EXTRACTION_INSTRUCTIONS}`.trim().split(/\s+/).length)
       .toBeLessThanOrEqual(150);
     expect(ATS_KEYWORD_EXTRACTION_DEADLINE_MS).toBe(120_000);
+    expect(ANALYSIS_DEADLINE_MS).toBe(20 * 60 * 1_000);
     const prompts = `${ANALYSIS_TASK}\n${ANALYSIS_INSTRUCTIONS}\n${TAILORING_TASK}\n${TAILORING_INSTRUCTIONS}`;
     for (const legacySection of [
       "Role-market analysis",
