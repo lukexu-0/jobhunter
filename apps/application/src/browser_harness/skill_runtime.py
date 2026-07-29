@@ -733,6 +733,18 @@ class BrowserSkillRuntime:
 
     async def _visible_candidate_controls(self) -> tuple[_CandidateControl, ...]:
         try:
+            return await self._visible_candidate_controls_once()
+        except asyncio.CancelledError:
+            raise
+        except BrowserSkillRuntimeError:
+            self._candidate_world_contexts.clear()
+        await asyncio.sleep(0)
+        return await self._visible_candidate_controls_once()
+
+    async def _visible_candidate_controls_once(
+        self,
+    ) -> tuple[_CandidateControl, ...]:
+        try:
             target_info = await self._browser.get_current_target_info()
             if not isinstance(target_info, dict):
                 raise BrowserSkillRuntimeError("browser_failed")

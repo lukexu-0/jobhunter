@@ -314,6 +314,53 @@ async def test_execute_runs_packaged_skill_in_bubblewrap_and_observes_browser(
         assert max(screenshot.size) <= 1_800
 
 
+async def test_execute_recovers_from_transient_candidate_scan_session_loss(
+    running_runtime: _RunningRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_type = type(running_runtime.browser)
+    original_get_session = browser_type.get_or_create_cdp_session
+    acquisition_attempts = 0
+
+    async def transiently_detached_session(
+        browser: Browser,
+        *args: object,
+        **kwargs: object,
+    ):
+        nonlocal acquisition_attempts
+        acquisition_attempts += 1
+        if acquisition_attempts == 1:
+            raise RuntimeError("synthetic session detached: <redacted>")
+        monkeypatch.setattr(
+            browser_type,
+            "get_or_create_cdp_session",
+            original_get_session,
+        )
+        return await original_get_session(browser, *args, **kwargs)
+
+    monkeypatch.setattr(
+        browser_type,
+        "get_or_create_cdp_session",
+        transiently_detached_session,
+    )
+
+    try:
+        result = await running_runtime.runtime.execute(
+            "print('candidate-scan-recovered')"
+        )
+    finally:
+        monkeypatch.setattr(
+            browser_type,
+            "get_or_create_cdp_session",
+            original_get_session,
+        )
+
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert result.stdout.strip() == "candidate-scan-recovered"
+    assert result.candidate_questions == []
+    assert acquisition_attempts == 2
+
 async def test_execute_gates_new_visible_candidate_question_before_running_code(
     running_runtime: _RunningRuntime,
 ) -> None:
