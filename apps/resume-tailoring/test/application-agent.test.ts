@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import {
   Agent,
   RunContext,
+  ToolCallError,
   type Model,
   type ModelProvider,
   type Tool,
@@ -1639,6 +1640,32 @@ describe("application agent", () => {
       RUN_INPUT,
       new AbortController().signal,
     )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+  });
+
+  test("unwraps an Agents SDK tool-call failure at the public error boundary", async () => {
+    const dependencies = dependenciesWith(
+      async () => {
+        throw new ApplicationRuntimeError("browser_failed");
+      },
+      async (agent, _input, options) => {
+        try {
+          await functionTool(agent, "browser_use").invoke(
+            new RunContext(options.context),
+            JSON.stringify({ code: "print('synthetic browser action')" }),
+          );
+        } catch (error) {
+          if (!(error instanceof ApplicationAgentFailure)) throw error;
+          throw new ToolCallError(`Failed to run function tools: ${error}`, error);
+        }
+        throw new Error("runtime failure must terminate the run");
+      },
+    );
+
+    await expect(runApplicationAgent(
+      RUN_INPUT,
+      new AbortController().signal,
+      dependencies,
+    )).rejects.toEqual(new ApplicationAgentFailure("BROWSER_FAILED"));
   });
 
   test("maps a runtime model timeout through the public error boundary", async () => {

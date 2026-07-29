@@ -897,7 +897,12 @@ export async function runApplicationAgent(
       let targetError = error;
       if (error !== null && typeof error === "object" && "error" in error) {
         const inner = error.error;
-        if (inner instanceof ApplicationAgentCancelled) targetError = inner;
+        if (
+          inner instanceof ApplicationAgentCancelled
+          || inner instanceof ApplicationAgentFailure
+        ) {
+          targetError = inner;
+        }
       }
       if (targetError instanceof ApplicationAgentCancelled) {
         if (context.submissionClaimed) {
