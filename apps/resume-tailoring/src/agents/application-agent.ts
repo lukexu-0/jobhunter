@@ -163,6 +163,17 @@ Do not request additional info while visible fields remain supported; upload the
 
 Before explicit submission approval, never activate final Submit, Send, or Apply; press Enter to submit; call submission APIs; or bypass review. When complete, request human review. Apply revisions and review again. After approval, only submit_application and submit_application_result are enabled. Call each once. Use the final control's CSS selector. Report submitted only with verbatim confirmation from the trusted observation; otherwise report submission_uncertain.`;
 
+const BROWSER_USE_DESCRIPTION = `Execute one Python body against the supplied session browser. Helpers are pre-imported; there is no \`page\` object. Print values you need in the tool output.
+
+Workflow:
+- Inspect with \`print(page_info())\`. Screenshots arrive with browser results; use screenshot coordinates with \`click_at_xy(x, y, button="left", clicks=1)\`, then inspect again.
+- First navigation: \`new_tab(url); wait_for_load()\`. Later same-origin navigation: \`goto_url(url); wait_for_load()\`. \`wait_for_load(timeout=15.0)\` takes numeric seconds and returns a boolean. For SPAs, use \`wait_for_element(selector, timeout=10.0, visible=False)\`.
+- Fill and upload with \`fill_input(selector, text, clear_first=True, timeout=0.0)\` and \`upload_file(selector, path)\`. Other input helpers are \`press_key(key, modifiers=0)\` and \`scroll(x, y, dy=-300, dx=0)\`.
+- \`capture_screenshot(path=None, full=False, max_dim=None)\` returns the saved PNG path. \`js(expression, target_id=None)\` returns the serializable evaluation value; run only minimal self-authored JavaScript. \`cdp(method, session_id=None, **params)\` returns the CDP result dictionary directly, for example \`cdp("DOM.getDocument", depth=-1)\`; do not read a nested \`result\`.
+- Tab helpers: \`list_tabs(include_chrome=True)\`, \`current_tab()\`, \`switch_tab(target)\`, \`ensure_real_tab()\`, and \`close_tab(target=None)\`.
+
+Pass only the Python body. Keep actions small, use numeric timeout arguments, and never start or attach another browser or invoke a daemon. Before cross-origin navigation, stop and request approval for the exact target origin. Never activate the final Submit, Send, or Apply control before explicit approval; use \`submit_application\` afterward.`;
+
 function requireRuntimeContext(
   runContext: { context: BrowserApplicationContext } | undefined,
 ): BrowserApplicationContext {
@@ -473,7 +484,7 @@ export async function runApplicationAgent(
 
   const browserUse = runtimeTool({
     name: "browser_use",
-    description: "Execute Python against the supplied session browser. Helpers are pre-imported: use capture_screenshot or page_info to inspect, new_tab for first navigation, wait_for_load after navigation, click_at_xy for coordinate clicks, js for DOM work, and cdp for raw CDP. Pass only the Python body and never start or attach another browser. When inspection reveals a cross-origin target, end the action without navigating; request origin approval before a later navigation action.",
+    description: BROWSER_USE_DESCRIPTION,
     parameters: BrowserUseToolParameters,
     timeoutMs: 130_000,
     isEnabled: (runtimeContext) =>
