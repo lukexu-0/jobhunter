@@ -50,7 +50,6 @@ from .models import (
     CancelCommand,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
-    CandidateQuestionsRequiredRuntimeActionResponse,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     ContinueCommand,
@@ -1010,11 +1009,6 @@ class ApplicationSessionManager:
                     record.browser_action_count,
                     result.observation.url,
                 )
-                if result.candidate_questions:
-                    return CandidateQuestionsRequiredRuntimeActionResponse(
-                        type="candidate_questions_required",
-                        questions=result.candidate_questions,
-                    )
                 return BrowserUseResultRuntimeActionResponse(
                     type="browser_use_result",
                     **result.model_dump(),
@@ -1024,11 +1018,7 @@ class ApplicationSessionManager:
             source = _submit_application_source(action.selector)
             try:
                 pre_click = await runtime.execute("page_info()")
-                if pre_click.candidate_questions:
-                    raise BrowserSkillRuntimeError("browser_failed")
                 result = await runtime.execute(source)
-                if result.candidate_questions:
-                    raise BrowserSkillRuntimeError("browser_failed")
             except BrowserSkillRuntimeError as error:
                 public = session_error(error.code)
                 raise HarnessServiceError(

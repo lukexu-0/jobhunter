@@ -17,7 +17,6 @@ from browser_use import Browser
 from PIL import Image
 from fixtures.local_application import LocalApplicationFixture
 import jobhunter_browser_harness.skill_process as skill_process
-import jobhunter_browser_harness.skill_runtime as skill_runtime_module
 
 from jobhunter_browser_harness.skill_runtime import (
     BrowserSkillRuntime,
@@ -163,53 +162,6 @@ async def test_observation_bounds_page_metadata_and_tab_inventory(
         for tab in observation.tabs
     )
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {
-            "identity": "\ud800",
-            "question": "Unencodable identity",
-            "answer_type": "text",
-            "options": [],
-        },
-        {
-            "identity": "valid",
-            "question": "Unencodable option",
-            "answer_type": "single_select",
-            "options": ["Valid", "\ud800"],
-        },
-        {
-            "identity": "valid",
-            "question": "\ud800",
-            "answer_type": "text",
-            "options": [],
-        },
-    ],
-)
-def test_candidate_control_maps_unencodable_dom_text_to_browser_failure(
-    payload: dict[str, object],
-) -> None:
-    with pytest.raises(BrowserSkillRuntimeError) as raised:
-        BrowserSkillRuntime._candidate_control(payload)
-
-    assert raised.value.code == "browser_failed"
-
-
-def test_candidate_scan_maps_recursive_json_to_browser_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def recursive_loads(_serialized: str) -> object:
-        raise RecursionError("synthetic recursive JSON")
-
-    monkeypatch.setattr(skill_runtime_module.json, "loads", recursive_loads)
-
-    with pytest.raises(BrowserSkillRuntimeError) as raised:
-        BrowserSkillRuntime._candidate_controls_from_serialized(
-            "{}",
-            "main",
-        )
-
-    assert raised.value.code == "browser_failed"
 
 
 
@@ -314,54 +266,8 @@ async def test_execute_runs_packaged_skill_in_bubblewrap_and_observes_browser(
         assert max(screenshot.size) <= 1_800
 
 
-async def test_execute_recovers_from_transient_candidate_scan_session_loss(
-    running_runtime: _RunningRuntime,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    browser_type = type(running_runtime.browser)
-    original_get_session = browser_type.get_or_create_cdp_session
-    acquisition_attempts = 0
 
-    async def transiently_detached_session(
-        browser: Browser,
-        *args: object,
-        **kwargs: object,
-    ):
-        nonlocal acquisition_attempts
-        acquisition_attempts += 1
-        if acquisition_attempts == 1:
-            raise RuntimeError("synthetic session detached: <redacted>")
-        monkeypatch.setattr(
-            browser_type,
-            "get_or_create_cdp_session",
-            original_get_session,
-        )
-        return await original_get_session(browser, *args, **kwargs)
-
-    monkeypatch.setattr(
-        browser_type,
-        "get_or_create_cdp_session",
-        transiently_detached_session,
-    )
-
-    try:
-        result = await running_runtime.runtime.execute(
-            "print('candidate-scan-recovered')"
-        )
-    finally:
-        monkeypatch.setattr(
-            browser_type,
-            "get_or_create_cdp_session",
-            original_get_session,
-        )
-
-    assert result.exit_code == 0
-    assert result.timed_out is False
-    assert result.stdout.strip() == "candidate-scan-recovered"
-    assert result.candidate_questions == []
-    assert acquisition_attempts == 2
-
-async def test_execute_gates_new_visible_candidate_question_before_running_code(
+async def test_execute_runs_code_when_a_new_visible_candidate_field_appears(
     running_runtime: _RunningRuntime,
 ) -> None:
     baseline = await running_runtime.runtime.execute(
@@ -393,22 +299,16 @@ async def test_execute_gates_new_visible_candidate_question_before_running_code(
         }"""
     )
 
-    blocked = await running_runtime.runtime.execute(
+    result = await running_runtime.runtime.execute(
         """js("document.body.dataset.modelWrite = 'true'; """
         """document.querySelector('#review-answer').value = 'model supplied'")\n"""
         """print("model-write-ran")"""
     )
 
-    assert blocked.stdout == ""
-    assert blocked.stderr == ""
-    assert len(blocked.candidate_questions) == 1
-    question = blocked.candidate_questions[0]
-    assert question.id.startswith("candidate_")
-    assert question.key == f"form.{question.id}"
-    assert question.scope == "application"
-    assert question.question == "Review emphasis"
-    assert question.answer_type == "text"
-    assert "candidate_questions" not in blocked.model_dump(mode="json")
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert result.stdout.strip() == "model-write-ran"
+    assert result.stderr == ""
     values = json.loads(
         await page.evaluate(
             """() => ({
@@ -417,257 +317,14 @@ async def test_execute_gates_new_visible_candidate_question_before_running_code(
             })"""
         )
     )
-    assert values == {"modelWrite": "", "review": "Initial perspective"}
-
-async def test_execute_gates_open_shadow_and_native_group_edges(
-    running_runtime: _RunningRuntime,
-) -> None:
-    baseline = await running_runtime.runtime.execute(
-        f"cdp('Page.navigate', url={running_runtime.application.form_url!r})\n"
-        "import time; time.sleep(0.5)"
-    )
-    assert baseline.exit_code == 0
-
-    page = await running_runtime.browser.must_get_current_page()
-    await page.evaluate(
-        """() => {
-          const host = document.createElement('candidate-details');
-          host.attachShadow({mode: 'open'}).innerHTML =
-            '<label>Shadow detail <input name="shadow-detail"></label>';
-          document.body.appendChild(host);
-
-          const checkboxLabel = document.createElement('label');
-          checkboxLabel.innerHTML =
-            'Readonly consent <input type="checkbox" name="readonly-consent" readonly>';
-          document.body.appendChild(checkboxLabel);
-
-          const radioLabel = document.createElement('label');
-          radioLabel.innerHTML =
-            'Lone option <input type="radio" name="lone-option">';
-          document.body.appendChild(radioLabel);
-
-          const formOne = document.createElement('form');
-          formOne.innerHTML =
-            '<fieldset><legend>Form one choice</legend>'
-            + '<label>Alpha <input type="radio" name="shared-choice"></label>'
-            + '<label>Beta <input type="radio" name="shared-choice"></label>'
-            + '</fieldset>';
-          document.body.appendChild(formOne);
-
-          const formTwo = document.createElement('form');
-          formTwo.innerHTML =
-            '<fieldset><legend>Form two choice</legend>'
-            + '<label>Gamma <input type="radio" name="shared-choice"></label>'
-            + '<label>Delta <input type="radio" name="shared-choice"></label>'
-            + '</fieldset>';
-          document.body.appendChild(formTwo);
-        }"""
-    )
-
-    blocked = await running_runtime.runtime.execute(
-        "js(\"document.body.dataset.edgeWrite = 'true'\")"
-    )
-
-    assert blocked.stdout == ""
-    questions = {
-        question.question: question for question in blocked.candidate_questions
-    }
-    assert set(questions) == {
-        "Shadow detail",
-        "Readonly consent",
-        "Lone option",
-        "Form one choice",
-        "Form two choice",
-    }
-    assert questions["Shadow detail"].answer_type == "text"
-    assert questions["Readonly consent"].answer_type == "boolean"
-    assert questions["Lone option"].answer_type == "boolean"
-    assert [
-        option.label for option in questions["Form one choice"].options
-    ] == ["Alpha", "Beta"]
-    assert [
-        option.label for option in questions["Form two choice"].options
-    ] == ["Gamma", "Delta"]
-    assert await page.evaluate(
-        "() => document.body.dataset.edgeWrite || ''"
-    ) == ""
+    assert values == {"modelWrite": "true", "review": "model supplied"}
 
 
-async def test_execute_does_not_baseline_controls_in_a_hidden_child_frame(
-    running_runtime: _RunningRuntime,
-) -> None:
-    baseline = await running_runtime.runtime.execute(
-        f"cdp('Page.navigate', url={running_runtime.application.form_url!r})\n"
-        "import time; time.sleep(0.5)"
-    )
-    assert baseline.exit_code == 0
-
-    page = await running_runtime.browser.must_get_current_page()
-    await page.evaluate(
-        """() => {
-          const frame = document.createElement('iframe');
-          frame.id = 'candidate-frame';
-          frame.style.opacity = '0';
-          frame.srcdoc =
-            '<label>Framed detail <input name="framed-detail"></label>';
-          document.body.appendChild(frame);
-        }"""
-    )
-    await asyncio.sleep(0.2)
-    hidden = await running_runtime.runtime.execute("print('hidden-frame-skipped')")
-    assert hidden.stdout.strip() == "hidden-frame-skipped"
-    assert hidden.candidate_questions == []
-
-    await page.evaluate(
-        "() => { document.querySelector('#candidate-frame').style.opacity = '1'; }"
-    )
-    blocked = await running_runtime.runtime.execute(
-        "js(\"document.body.dataset.frameWrite = 'true'\")"
-    )
-
-    assert [question.question for question in blocked.candidate_questions] == [
-        "Framed detail"
-    ]
-    assert await page.evaluate(
-        "() => document.body.dataset.frameWrite || ''"
-    ) == ""
-
-async def test_timed_out_action_does_not_baseline_new_candidate_controls(
-    running_runtime: _RunningRuntime,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    baseline = await running_runtime.runtime.execute(
-        f"cdp('Page.navigate', url={running_runtime.application.form_url!r})\n"
-        "import time; time.sleep(0.5)"
-    )
-    assert baseline.exit_code == 0
-
-    page = await running_runtime.browser.must_get_current_page()
-    original_exchange = running_runtime.runtime._exchange_execution
-
-    async def timed_out_exchange(
-        _request: dict[str, object],
-        *,
-        timeout: float,
-    ) -> dict[str, object]:
-        assert timeout > 0
-        await page.evaluate(
-            "() => { document.querySelector('#review-panel').hidden = false; }"
-        )
-        return {
-            "ok": True,
-            "exit_code": 124,
-            "timed_out": True,
-            "deadline_exhausted": False,
-            "stdout": "",
-            "stderr": "",
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-            "marker": None,
-            "cancelled": False,
-        }
-
-    monkeypatch.setattr(
-        running_runtime.runtime,
-        "_exchange_execution",
-        timed_out_exchange,
-    )
-    timed_out = await running_runtime.runtime.execute("print('never completed')")
-    assert timed_out.timed_out is True
-    monkeypatch.setattr(
-        running_runtime.runtime,
-        "_exchange_execution",
-        original_exchange,
-    )
-
-    blocked = await running_runtime.runtime.execute(
-        "js(\"document.body.dataset.timeoutWrite = 'true'\")"
-    )
-
-    assert [question.question for question in blocked.candidate_questions] == [
-        "Review emphasis"
-    ]
-    assert await page.evaluate(
-        "() => document.body.dataset.timeoutWrite || ''"
-    ) == ""
-
-async def test_execute_fails_closed_for_oversized_candidate_group(
-    running_runtime: _RunningRuntime,
-) -> None:
-    baseline = await running_runtime.runtime.execute(
-        f"cdp('Page.navigate', url={running_runtime.application.form_url!r})\n"
-        "import time; time.sleep(0.5)"
-    )
-    assert baseline.exit_code == 0
-
-    page = await running_runtime.browser.must_get_current_page()
-    await page.evaluate(
-        """() => {
-          const fieldset = document.createElement('fieldset');
-          const legend = document.createElement('legend');
-          legend.textContent = 'Oversized choice';
-          fieldset.appendChild(legend);
-          for (let index = 0; index < 21; index += 1) {
-            const label = document.createElement('label');
-            label.textContent = `Choice ${index}`;
-            const input = document.createElement('input');
-            input.type = 'radio';
-            input.name = 'oversized-choice';
-            label.appendChild(input);
-            fieldset.appendChild(label);
-          }
-          document.body.appendChild(fieldset);
-        }"""
-    )
-
-    with pytest.raises(BrowserSkillRuntimeError) as raised:
-        await running_runtime.runtime.execute(
-            "js(\"document.body.dataset.overflowWrite = 'true'\")"
-        )
-
-    assert raised.value.code == "browser_failed"
-    assert await page.evaluate(
-        "() => document.body.dataset.overflowWrite || ''"
-    ) == ""
 
 
-async def test_execute_bounds_work_for_too_many_candidate_controls(
-    running_runtime: _RunningRuntime,
-) -> None:
-    baseline = await running_runtime.runtime.execute(
-        f"cdp('Page.navigate', url={running_runtime.application.form_url!r})\n"
-        "import time; time.sleep(0.5)"
-    )
-    assert baseline.exit_code == 0
 
-    page = await running_runtime.browser.must_get_current_page()
-    await page.evaluate(
-        """() => {
-          const fragment = document.createDocumentFragment();
-          for (let index = 0; index < 5_000; index += 1) {
-            const label = document.createElement('label');
-            label.textContent = `Candidate detail ${index}`;
-            const input = document.createElement('input');
-            input.name = `candidate-detail-${index}`;
-            label.appendChild(input);
-            fragment.appendChild(label);
-          }
-          document.body.appendChild(fragment);
-        }"""
-    )
 
-    with pytest.raises(BrowserSkillRuntimeError) as raised:
-        await asyncio.wait_for(
-            running_runtime.runtime.execute(
-                "js(\"document.body.dataset.unboundedWrite = 'true'\")"
-            ),
-            timeout=2.0,
-        )
 
-    assert raised.value.code == "browser_failed"
-    assert await page.evaluate(
-        "() => document.body.dataset.unboundedWrite || ''"
-    ) == ""
 
 async def test_sandbox_hides_parent_state_and_reuses_one_daemon(
     running_runtime: _RunningRuntime,

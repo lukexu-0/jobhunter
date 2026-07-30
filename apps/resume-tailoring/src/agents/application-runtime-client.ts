@@ -208,16 +208,6 @@ export type BrowserUseResultRuntimeActionResponse = z.infer<
 >;
 
 
-export const CandidateQuestionsRequiredRuntimeActionResponseSchema = z.object({
-  type: z.literal("candidate_questions_required"),
-  questions: z.array(AdditionalInfoQuestionSchema).min(1).max(20),
-}).strict().superRefine((value, context) => {
-  validateAdditionalInfoQuestionBatch(value.questions, context);
-});
-export type CandidateQuestionsRequiredRuntimeActionResponse = z.infer<
-  typeof CandidateQuestionsRequiredRuntimeActionResponseSchema
->;
-
 export const SubmitApplicationResultRuntimeActionResponseSchema =
   BrowserUseExecutionResultSchema.extend({
     type: z.literal("submit_application_result"),
@@ -335,7 +325,6 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   BrowserUseResultRuntimeActionResponseSchema,
-  CandidateQuestionsRequiredRuntimeActionResponseSchema,
   SubmitApplicationResultRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   ApproveRuntimeActionResponseSchema,

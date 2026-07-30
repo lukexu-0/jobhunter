@@ -878,11 +878,6 @@ class BrowserUseExecutionResult(PublicModel):
     stdout_truncated: bool
     stderr_truncated: bool
     observation: BrowserObservation
-    candidate_questions: list[AdditionalInfoQuestion] = Field(
-        default_factory=list,
-        max_length=20,
-        exclude=True,
-    )
 
 
 class ApplicationResultBase(PublicModel):
@@ -1055,16 +1050,6 @@ RuntimeActionRequest: TypeAlias = Annotated[
 ]
 
 
-class CandidateQuestionsRequiredRuntimeActionResponse(PublicModel):
-    type: Literal["candidate_questions_required"]
-    questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
-
-    @field_validator("questions")
-    @classmethod
-    def _validate_unique_questions(
-        cls, values: list[AdditionalInfoQuestion]
-    ) -> list[AdditionalInfoQuestion]:
-        return _validate_unique_additional_info_questions(values)
 
 
 class BrowserUseResultRuntimeActionResponse(BrowserUseExecutionResult):
@@ -1143,7 +1128,6 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 
 RuntimeActionResponse: TypeAlias = Annotated[
     BrowserUseResultRuntimeActionResponse
-    | CandidateQuestionsRequiredRuntimeActionResponse
     | SubmitApplicationResultRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | ApproveRuntimeActionResponse

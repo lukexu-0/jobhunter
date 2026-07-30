@@ -139,7 +139,6 @@ export interface BrowserApplicationContext {
   submissionClaimed: boolean;
   submissionFinalized: boolean;
   browserUseCompleted: boolean;
-  pendingCandidateQuestions?: readonly AdditionalInfoQuestion[];
   postNavigationInspectionRequired: boolean;
   lastReviewResult?: ReviewApplicationResult;
   submitExecutionResult?: BrowserUseExecutionResult;
@@ -159,7 +158,7 @@ Complete every machine-actionable field. Prefer saved application, saved global,
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
-Do not request additional info while visible fields remain supported; upload the resume when visible. Batch all currently visible unknowns. If browser_use returns candidate_questions_required, call request_additional_info with its questions unchanged. After human navigation, batch newly revealed candidate questions before review. Scope availability globally; job-source and referral per application. Apply answers, re-scan, finish fields. Treat declines as unavailable; ask about saved facts only on conflict.
+Fill every visible field supported by current facts and upload the resume before requesting additional info. For remaining visible fields needing unavailable facts, call request_additional_info with one batch. After human navigation, inspect again and ask about new unknowns before review. Scope availability globally; job-source and referral per application. Apply answers, re-scan, and finish fields. Declines are unavailable; ask about saved facts only on conflict.
 
 Before explicit submission approval, never activate final Submit, Send, or Apply; press Enter to submit; call submission APIs; or bypass review. When complete, request human review. Apply revisions and review again. After approval, only submit_application and submit_application_result are enabled. Call each once. Use the final control's CSS selector. Report submitted only with verbatim confirmation from the trusted observation; otherwise report submission_uncertain.`;
 
@@ -185,34 +184,6 @@ function requireRuntimeContext(
 }
 
 
-function candidateQuestionBatchesMatch(
-  left: readonly AdditionalInfoQuestion[],
-  right: readonly AdditionalInfoQuestion[],
-): boolean {
-  if (left.length !== right.length) return false;
-  return left.every((question, index) => {
-    const expected = right[index];
-    if (
-      expected === undefined
-      || question.id !== expected.id
-      || question.key !== expected.key
-      || question.scope !== expected.scope
-      || question.question !== expected.question
-      || question.answer_type !== expected.answer_type
-    ) {
-      return false;
-    }
-    if (!("options" in question) && !("options" in expected)) return true;
-    if (!("options" in question) || !("options" in expected)) return false;
-    return question.options.length === expected.options.length
-      && question.options.every((option, optionIndex) => {
-        const expectedOption = expected.options[optionIndex];
-        return expectedOption !== undefined
-          && option.id === expectedOption.id
-          && option.label === expectedOption.label;
-      });
-  });
-}
 
 function acceptedAnswersMatchQuestions(
   answers: readonly {
@@ -235,11 +206,6 @@ function acceptedAnswersMatchQuestions(
     });
 }
 
-function rejectPendingCandidateQuestions(context: BrowserApplicationContext): void {
-  if (context.pendingCandidateQuestions !== undefined) {
-    throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-  }
-}
 
 function rejectMissingBrowserInspection(
   context: BrowserApplicationContext,
@@ -487,30 +453,13 @@ export async function runApplicationAgent(
     description: BROWSER_USE_DESCRIPTION,
     parameters: BrowserUseToolParameters,
     timeoutMs: 130_000,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined,
     execute: async ({ code }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
         { type: "browser_use", code },
         Math.min(130_000, remainingDeadlineMs(runtimeContext)),
         actionSignal,
       );
-      if (response.type === "candidate_questions_required") {
-        try {
-          const output = boundedJson(
-            response,
-            "candidate question preflight",
-            MAX_BROWSER_TOOL_OUTPUT_BYTES,
-          );
-          runtimeContext.pendingCandidateQuestions = response.questions;
-          delete runtimeContext.latestScreenshotDataUrl;
-          return output;
-        } catch {
-          throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
-        }
-      }
       if (response.type !== "browser_use_result") {
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
@@ -544,11 +493,8 @@ export async function runApplicationAgent(
     description: "Pause for browser interaction that only the human can complete: login, CAPTCHA, 2FA, or an inaccessible or explicitly manual control.",
     parameters: HumanNavigationToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async ({ instruction }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
@@ -572,11 +518,8 @@ export async function runApplicationAgent(
     description: "After a browser action reports a target's exact origin, request approval before any later browser action navigates to it.",
     parameters: OriginApprovalToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async ({ origin }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
@@ -592,26 +535,12 @@ export async function runApplicationAgent(
 
   const requestAdditionalInfo = runtimeTool({
     name: "request_additional_info",
-    description: "Do not call this while any visible field can be completed from current facts; upload the supplied resume when its control is visible. When browser_use returns candidate_questions_required, pass its questions unchanged. Otherwise ask the human one bounded batch of structured factual questions. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction or already answered questions unless the page explicitly conflicts.",
+    description: "After a successful browser inspection, fill every visible field supported by current facts and upload the supplied resume when its control is visible. Then ask the human one bounded batch of structured questions for the remaining visible fields whose facts are unavailable. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction or already answered questions unless the page explicitly conflicts.",
     parameters: AdditionalInfoToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions !== undefined
-      || runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async ({ questions }, runtimeContext, actionSignal) => {
-      if (
-        runtimeContext.pendingCandidateQuestions === undefined
-        && !runtimeContext.browserUseCompleted
-      ) {
-        throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
-      const pendingQuestions = runtimeContext.pendingCandidateQuestions;
-      if (
-        pendingQuestions !== undefined
-        && !candidateQuestionBatchesMatch(questions, pendingQuestions)
-      ) {
-        throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
+      rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
         { type: "request_additional_info", questions },
@@ -622,14 +551,8 @@ export async function runApplicationAgent(
       if (response.type !== "additional_info") {
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
-      if (
-        pendingQuestions !== undefined
-        && !acceptedAnswersMatchQuestions(response.answers, pendingQuestions)
-      ) {
+      if (!acceptedAnswersMatchQuestions(response.answers, questions)) {
         throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
-      if (pendingQuestions !== undefined) {
-        delete runtimeContext.pendingCandidateQuestions;
       }
       return JSON.stringify(response);
     },
@@ -641,11 +564,9 @@ export async function runApplicationAgent(
     parameters: HumanReviewToolParameters,
     timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted
+      runtimeContext.browserUseCompleted
       && !runtimeContext.postNavigationInspectionRequired,
     execute: async ({ result }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       rejectMissingPostNavigationInspection(runtimeContext);
       const response = await runtimeAction(
@@ -675,11 +596,8 @@ export async function runApplicationAgent(
     description: "Report that the requested posting is unavailable or the visible application materially mismatches it.",
     parameters: ApplicationMismatchToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async (_input, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,

@@ -39,7 +39,6 @@ from jobhunter_browser_harness.models import (
     ApproveRuntimeActionResponse,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
-    CandidateQuestionsRequiredRuntimeActionResponse,
     ContinueCommand,
     ContinueRuntimeActionResponse,
     HarnessConfig,
@@ -748,24 +747,27 @@ async def test_real_fixture_submits_once_after_human_approval(
             )
             continued = await navigation_task
             assert isinstance(continued, ContinueRuntimeActionResponse)
-            late_question = await manager.runtime_action(
+            inspected_review = await manager.runtime_action(
                 created.session_id,
                 BrowserUseRuntimeAction(
                     type="browser_use",
-                    code=_set_review_code("Model supplied from narrative evidence."),
+                    code="result = page_info()",
                 ),
             )
             assert isinstance(
-                late_question,
-                CandidateQuestionsRequiredRuntimeActionResponse,
+                inspected_review,
+                BrowserUseResultRuntimeActionResponse,
             )
-            assert len(late_question.questions) == 1
-            question = late_question.questions[0]
-            assert question.scope == "application"
-            assert question.question == "Review emphasis"
-            assert question.answer_type == "text"
+            assert inspected_review.exit_code == 0, inspected_review.stderr
             assert (await _page_values(record.browser))["review"] == (
                 "Initial perspective"
+            )
+            question = AdditionalInfoTextQuestion(
+                id="review_emphasis",
+                key="application.review_emphasis",
+                scope="application",
+                question="Review emphasis",
+                answer_type="text",
             )
 
             late_info_task = asyncio.create_task(
@@ -773,7 +775,7 @@ async def test_real_fixture_submits_once_after_human_approval(
                     created.session_id,
                     RequestAdditionalInfoRuntimeAction(
                         type="request_additional_info",
-                        questions=late_question.questions,
+                        questions=[question],
                     ),
                 )
             )

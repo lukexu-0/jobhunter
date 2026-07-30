@@ -58,7 +58,6 @@ from jobhunter_browser_harness.models import (
     BrowserUseExecutionResult,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
-    CandidateQuestionsRequiredRuntimeActionResponse,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     CancelCommand,
@@ -2541,47 +2540,6 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
     await manager.delete(created.session_id)
 
 
-async def test_runtime_maps_candidate_question_preflight_without_browser_output(
-    tmp_path: Path,
-) -> None:
-    manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
-    record = manager._active
-    assert record is not None
-    question = AdditionalInfoTextQuestion(
-        id="candidate_deadbeef",
-        key="form.candidate_deadbeef",
-        scope="application",
-        question="Review emphasis",
-        answer_type="text",
-    )
-    runtime = FakeSkillRuntime(
-        result=browser_execution_result().model_copy(
-            update={"candidate_questions": [question]}
-        )
-    )
-    record.skill_runtime = runtime
-
-    result = await manager.runtime_action(
-        created.session_id,
-        BrowserUseRuntimeAction(
-            type="browser_use",
-            code="js(\"document.querySelector('textarea').value = 'model supplied'\")",
-        ),
-    )
-
-    assert isinstance(result, CandidateQuestionsRequiredRuntimeActionResponse)
-    assert result.questions == [question]
-    assert result.model_dump(mode="json") == {
-        "type": "candidate_questions_required",
-        "questions": [question.model_dump(mode="json")],
-    }
-    assert record.browser_action_count == 1
-    assert runtime.codes == [
-        "js(\"document.querySelector('textarea').value = 'model supplied'\")"
-    ]
-    await manager.delete(created.session_id)
 
 
 async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
@@ -3137,73 +3095,6 @@ async def test_runtime_review_returns_revision_then_submit_and_seals_runtime(
     ]
     await manager.delete(created.session_id)
 
-@pytest.mark.parametrize("candidate_stage", ["pre_click", "submit"])
-async def test_submit_candidate_preflight_never_reports_a_click(
-    tmp_path: Path,
-    candidate_stage: str,
-) -> None:
-    manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
-    record = manager._active
-    assert record is not None and record.human_gate is not None
-    execution = browser_execution_result()
-    question = AdditionalInfoTextQuestion(
-        id="candidate_deadbeef",
-        key="form.candidate_deadbeef",
-        scope="application",
-        question="Review emphasis",
-        answer_type="text",
-    )
-    candidate_execution = execution.model_copy(
-        update={"candidate_questions": [question]}
-    )
-    runtime = FakeSkillRuntime(
-        results=(
-            [candidate_execution]
-            if candidate_stage == "pre_click"
-            else [execution, candidate_execution]
-        )
-    )
-    record.skill_runtime = runtime
-
-    review = asyncio.create_task(
-        manager.runtime_action(
-            created.session_id,
-            RequestHumanReviewRuntimeAction(
-                type="request_human_review",
-                result=review_result(),
-            ),
-        )
-    )
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    assert isinstance(await review, SubmitRuntimeActionResponse)
-
-    with pytest.raises(HarnessServiceError) as failed:
-        await manager.runtime_action(
-            created.session_id,
-            SubmitApplicationRuntimeAction(
-                type="submit_application",
-                selector="#final-submit",
-            ),
-        )
-
-    assert failed.value.code == "browser_failed"
-    assert runtime.codes == (
-        ["page_info()"]
-        if candidate_stage == "pre_click"
-        else [
-            "page_info()",
-            sessions_module._submit_application_source("#final-submit"),
-        ]
-    )
-    assert manager.get_snapshot(created.session_id).state == "submission_uncertain"
-    assert [event.event for event in tuple(record.events)[-2:]] == [
-        "submission_started",
-        "submission_uncertain",
-    ]
-    await manager.delete(created.session_id)
 
 
 
