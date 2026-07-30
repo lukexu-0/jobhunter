@@ -800,6 +800,10 @@ export async function runApplicationAgent(
     model: MODEL_NAME,
     modelSettings: {
       reasoning: { effort: "high" },
+      contextManagement: [{
+        type: "compaction",
+        compactThreshold: 334_800,
+      }],
       toolChoice: "required",
       parallelToolCalls: false,
       store: false,
