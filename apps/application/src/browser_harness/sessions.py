@@ -39,6 +39,8 @@ from .models import (
     AdditionalInfoRuntimeActionResponse,
     AdditionalInfoSavedDetail,
     AgentStepDetail,
+    BrowserUseDiagnostic,
+    BrowserUseExecutionResult,
     ApplicationRunResult,
     CancelledApplicationResult,
     ReviewApplicationResult,
@@ -111,6 +113,13 @@ _SUBMISSION_UNCERTAIN_WARNING = (
     "if it is still available, then close this session."
 )
 _MAX_APPLICATION_TASK_BYTES = 1024 * 1024
+_BROWSER_USE_DIAGNOSTIC_LIMIT = 100
+_BROWSER_USE_TIMEOUT_MESSAGE = (
+    "Browser Use execution timed out after 120 seconds."
+)
+_BROWSER_RUNTIME_ERROR_MESSAGE = "Browser runtime failed."
+_SESSION_TIMEOUT_DIAGNOSTIC_MESSAGE = "Application session expired."
+_REDACTED_STDERR_EXCERPT = "[redacted]"
 
 def _submit_application_source(selector: str) -> str:
     selector_json = json.dumps(selector, ensure_ascii=False)
@@ -994,6 +1003,12 @@ class ApplicationSessionManager:
             try:
                 result = await runtime.execute(action.code)
             except BrowserSkillRuntimeError as error:
+                async with record.request_lock:
+                    self._append_browser_use_diagnostic(
+                        record,
+                        record.browser_action_count + 1,
+                        error,
+                    )
                 public = session_error(error.code)
                 raise HarnessServiceError(
                     504 if error.code == "session_timeout" else 502,
@@ -1004,6 +1019,11 @@ class ApplicationSessionManager:
                 if record.finalized or record.final_request is not None:
                     raise asyncio.CancelledError
                 record.browser_action_count += 1
+                self._append_browser_use_diagnostic(
+                    record,
+                    record.browser_action_count,
+                    result,
+                )
                 await self._agent_step(
                     record,
                     record.browser_action_count,
@@ -1700,6 +1720,65 @@ class ApplicationSessionManager:
             await self._publish_event(record, event, detail)
         elif snapshot_changed:
             await self._publish_event(record, "snapshot", {})
+
+    def _append_browser_use_diagnostic(
+        self,
+        record: _ApplicationSession,
+        step: int,
+        outcome: BrowserUseExecutionResult | BrowserSkillRuntimeError,
+    ) -> None:
+        if isinstance(outcome, BrowserSkillRuntimeError):
+            session_timed_out = outcome.code == "session_timeout"
+            diagnostic = BrowserUseDiagnostic(
+                step=step,
+                status="timed_out" if session_timed_out else "failed",
+                exit_code=None,
+                timed_out=session_timed_out,
+                error_category=(
+                    "session_timeout" if session_timed_out else "browser_runtime"
+                ),
+                stderr_excerpt=(
+                    _SESSION_TIMEOUT_DIAGNOSTIC_MESSAGE
+                    if session_timed_out
+                    else _BROWSER_RUNTIME_ERROR_MESSAGE
+                ),
+                stderr_truncated=False,
+            )
+        else:
+            if outcome.timed_out:
+                status = "timed_out"
+                error_category = "execution_timeout"
+                stderr_excerpt = _BROWSER_USE_TIMEOUT_MESSAGE
+            elif outcome.exit_code != 0:
+                status = "failed"
+                error_category = "process_exit"
+                stderr_excerpt = (
+                    _REDACTED_STDERR_EXCERPT if outcome.stderr else None
+                )
+            else:
+                status = "succeeded"
+                error_category = None
+                stderr_excerpt = (
+                    _REDACTED_STDERR_EXCERPT if outcome.stderr else None
+                )
+            diagnostic = BrowserUseDiagnostic(
+                step=step,
+                status=status,
+                exit_code=outcome.exit_code,
+                timed_out=outcome.timed_out,
+                error_category=error_category,
+                stderr_excerpt=stderr_excerpt,
+                stderr_truncated=outcome.stderr_truncated,
+            )
+
+        diagnostics = list(record.snapshot.browser_use_diagnostics)
+        diagnostics.append(diagnostic)
+        if len(diagnostics) > _BROWSER_USE_DIAGNOSTIC_LIMIT:
+            del diagnostics[:-_BROWSER_USE_DIAGNOSTIC_LIMIT]
+        record.snapshot = self._updated_snapshot(
+            record.snapshot,
+            browser_use_diagnostics=diagnostics,
+        )
 
     async def _agent_step(
         self, record: _ApplicationSession, step_number: int, current_url: str

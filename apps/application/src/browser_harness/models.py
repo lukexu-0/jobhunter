@@ -574,6 +574,23 @@ class SessionError(PublicModel):
         return self
 
 
+class BrowserUseDiagnostic(PublicModel):
+    step: int = Field(ge=1, le=500)
+    status: Literal["succeeded", "failed", "timed_out"]
+    exit_code: int | None
+    timed_out: bool
+    error_category: Literal[
+        "process_exit",
+        "execution_timeout",
+        "browser_runtime",
+        "session_timeout",
+    ] | None
+    stderr_excerpt: (
+        Annotated[str, StringConstraints(strict=True, max_length=512)] | None
+    )
+    stderr_truncated: bool
+
+
 class HumanNavigationPendingAction(PublicModel):
     type: Literal["human_navigation"]
     instruction: Annotated[
@@ -626,6 +643,10 @@ class SessionSnapshot(PublicModel):
     fields_needing_human: list[FieldResult] = Field(default_factory=list, max_length=500)
     files_attached: list[StrictText] = Field(default_factory=list, max_length=20)
     warnings: list[WarningText] = Field(default_factory=list, max_length=100)
+    browser_use_diagnostics: list[BrowserUseDiagnostic] = Field(
+        default_factory=list,
+        max_length=100,
+    )
     revision_count: int = Field(default=0, ge=0, le=100)
     pending_action: PendingAction | None = None
     approved_origins: list[StrictText] = Field(default_factory=list, max_length=20)
