@@ -108,6 +108,17 @@ describe("allowlisted context ingestion", () => {
     expect(() => loadFixture(root)).toThrow("does not match the literal contract");
   });
 
+  test("rejects an extra Jobhunter binding that could activate its directives", () => {
+    const root = createRepositoryFixture();
+    const manifestPath = join(root, "apps/resume-tailoring/context-sources.json");
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+    parsed.explicitEntityBindings["project:jobhunter"] = "Example Company";
+    writeFileSync(manifestPath, JSON.stringify(parsed));
+    expect(() => loadFixture(root)).toThrow(
+      "explicitEntityBindings must contain only the Sample Project binding",
+    );
+  });
+
   test("rejects a symbolic link at any source path", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);

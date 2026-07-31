@@ -158,6 +158,9 @@ export function loadContextManifest(
   if (explicitEntityBindings["Sample Project"] !== "SampleProject") {
     throw new Error("The Sample Project binding to SampleProject is required");
   }
+  if (Object.keys(explicitEntityBindings).length !== 1) {
+    throw new Error("explicitEntityBindings must contain only the Sample Project binding");
+  }
   const manifest: ContextManifest = Object.freeze({
     version: 1,
     sources: Object.freeze(sources),
