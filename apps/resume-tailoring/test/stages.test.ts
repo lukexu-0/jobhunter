@@ -103,6 +103,18 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       bytes: 10,
       indexedAt: 1,
     },
+    {
+      id: "source-jobhunter",
+      relativePath: "jobhunter-resume-info.md",
+      kind: "authoritative-markdown",
+      entityId: "project:jobhunter",
+      displayName: "Synthetic Jobhunter context",
+      baselineEntityIds: ["Jobhunter"],
+      sourceVersionId: "version-jobhunter",
+      sha256: "e".repeat(64),
+      bytes: 10,
+      indexedAt: 1,
+    },
   ];
   const sourceIndexByEntity: Readonly<Record<string, number>> = {
     "Example Company": 1,

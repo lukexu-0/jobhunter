@@ -233,7 +233,7 @@ describe("RunApplicationService", () => {
       iterations: [{ ...iteration, privatePath: "/tmp/resume.pdf" }],
     }).success).toBeFalse();
   });
-  test("creates a runnable run with one atomic four-source snapshot and immutable queued input", async () => {
+  test("creates a runnable run with one atomic five-source snapshot and immutable queued input", async () => {
     const target = fixture();
     const jobDescription = JOB_DESCRIPTION;
     const run = await target.service.createRun(JOB_URL);
@@ -244,7 +244,7 @@ describe("RunApplicationService", () => {
     expect(run.jobUrl).toBe(JOB_URL);
     const disabled = await target.service.createRun(JOB_URL, false);
     expect(target.repository.getRun(disabled.id)?.generateKeywordMap).toBe(false);
-    expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(4);
+    expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(5);
     const input = target.repository.getArtifact(run.id, "job-description");
     expect(input).not.toBeNull();
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);

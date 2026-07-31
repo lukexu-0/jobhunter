@@ -32,6 +32,14 @@
       "entityId": "project:sample-project",
       "displayName": "SampleProject / Sample Project",
       "baselineEntityIds": ["Sample Project", "SampleProject"]
+    },
+    {
+      "id": "jobhunter-resume-info",
+      "relativePath": "jobhunter-resume-info.md",
+      "kind": "authoritative-markdown",
+      "entityId": "project:jobhunter",
+      "displayName": "Jobhunter resume information",
+      "baselineEntityIds": ["Jobhunter"]
     }
   ],
   "explicitEntityBindings": {

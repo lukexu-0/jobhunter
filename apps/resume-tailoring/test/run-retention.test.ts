@@ -20,6 +20,7 @@ const SOURCE_SNAPSHOT = {
     automated: "3".repeat(64),
     scheduler: "4".repeat(64),
     sampleProject: "5".repeat(64),
+    jobhunter: "6".repeat(64),
   },
   sources: [],
   evidence: [],

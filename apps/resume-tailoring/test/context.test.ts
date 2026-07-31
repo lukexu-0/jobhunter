@@ -41,7 +41,7 @@ function loadFixture(root: string) {
 }
 
 describe("allowlisted context ingestion", () => {
-  test("accepts exactly the literal four sources and rejects additions or traversal", () => {
+  test("accepts exactly the literal five sources and rejects additions, omissions, duplicates, substitution, or traversal", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
     expect(loaded.manifest.sources.map((source) => source.relativePath)).toEqual([...CONTEXT_SOURCE_ALLOWLIST]);
@@ -50,12 +50,31 @@ describe("allowlisted context ingestion", () => {
     const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
     parsed.sources.push({ ...parsed.sources[1], id: "untrusted", relativePath: "actual/other.md" });
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("exactly four sources");
+    expect(() => loadFixture(root)).toThrow("exactly five sources");
 
     parsed.sources.pop();
+    const missing = parsed.sources.pop();
+    writeFileSync(manifestPath, JSON.stringify(parsed));
+    expect(() => loadFixture(root)).toThrow("exactly five sources");
+
+    parsed.sources.push(missing);
+    const originalSecondId = parsed.sources[1].id;
+    parsed.sources[1].id = parsed.sources[0].id;
+    writeFileSync(manifestPath, JSON.stringify(parsed));
+    expect(() => loadFixture(root)).toThrow("Context source IDs must be unique");
+
+    parsed.sources[1].id = originalSecondId;
+    parsed.sources[1].relativePath = parsed.sources[0].relativePath;
+    writeFileSync(manifestPath, JSON.stringify(parsed));
+    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+
+    parsed.sources[1].relativePath = "actual/other.md";
+    writeFileSync(manifestPath, JSON.stringify(parsed));
+    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+
     parsed.sources[1].relativePath = "../outside.md";
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("literal four-file allowlist");
+    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
   });
 
   test("rejects a symbolic link at any source path", () => {
@@ -80,7 +99,7 @@ describe("allowlisted context ingestion", () => {
       const firstSnapshot = createContextSnapshot(database, loaded);
       syncContext(database, loaded, 200);
       const secondSnapshot = createContextSnapshot(database, loaded);
-      expect(first.sourceCount).toBe(4);
+      expect(first.sourceCount).toBe(5);
       expect(firstSnapshot.evidence.map((block) => block.id)).toEqual(secondSnapshot.evidence.map((block) => block.id));
       expect(Object.fromEntries(CONTEXT_SOURCE_ALLOWLIST.map((path) => [path, sha256(readFileSync(join(root, path)))]))).toEqual(before);
       expect(() => database.query("UPDATE source_versions SET indexed_at = 9").run()).toThrow("immutable");
@@ -97,15 +116,46 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
+  test("synchronizes the Jobhunter source and exposes its two directives alongside Sample Testing", () => {
+    const loaded = loadContextManifest();
+    const database = openContextDatabase(":memory:");
+    try {
+      syncContext(database, loaded);
+      const snapshot = createContextSnapshot(database, loaded);
+      expect(Object.keys(snapshot.sourceHashes)).toHaveLength(5);
+      expect(snapshot.sources.find((source) => source.id === "jobhunter-resume-info")).toMatchObject({
+        relativePath: "jobhunter-resume-info.md",
+        kind: "authoritative-markdown",
+        entityId: "project:jobhunter",
+        displayName: "Jobhunter resume information",
+        baselineEntityIds: ["Jobhunter"],
+      });
+      expect(snapshot.mustIncludeDirectives
+        .filter((directive) => directive.sourceId === "jobhunter-resume-info")
+        .map((directive) => directive.text)).toEqual([
+        "- Include the **Browser Use** harness.",
+        "- Include the **OpenAI Agents SDK**.",
+      ]);
+      expect(snapshot.mustIncludeDirectives
+        .filter((directive) => directive.sourceId === "automated-testing-resume-info")
+        .map((directive) => directive.text)).toEqual([
+        "- **Required framing:** Present Sample Testing/System A as an **agentic testing platform/workflow**, not as generic automation.",
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
   test("projects trusted Must Include directives from active authoritative evidence", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
-    const [baseline, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
+    const [baseline, requiredSource, nonmatchingSource, sentinelSource, neutralizedSource] = loaded.manifest.sources;
     const requiredText = "Keep the Jobhunter framing.\n- Preserve exact directive provenance.";
     writeFileSync(join(root, baseline!.relativePath), "## 21. Must Include\nBaseline content is not a directive.\n");
     writeFileSync(join(root, requiredSource!.relativePath), `# Required\n## 21. Must Include\n${requiredText}\n`);
     writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 22. Must Include\nA nonmatching heading is not a directive.\n");
     writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
+    writeFileSync(join(root, neutralizedSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
@@ -179,10 +229,11 @@ describe("allowlisted context ingestion", () => {
   test("keeps directive heading and sentinel matching exact", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
-    const [, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
+    const [, requiredSource, nonmatchingSource, sentinelSource, neutralizedSource] = loaded.manifest.sources;
     writeFileSync(join(root, requiredSource!.relativePath), "# Context\n## Must Include\nUnnumbered requirement.\n## 21. Must Include\nnone specified\n");
     writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 21. Must Include Extra\nNot a matching heading.\n");
     writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## Must Include\nNone   specified\n");
+    writeFileSync(join(root, neutralizedSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);

@@ -11,6 +11,7 @@ export const CONTEXT_SOURCE_ALLOWLIST = Object.freeze([
   "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
   "apps/user-info/current-context/projects/sample-project-archive.md",
   "apps/user-info/current-context/projects/sample-project.md",
+  "jobhunter-resume-info.md",
 ] as const);
 
 const ALLOWED: Readonly<Record<string, true>> = Object.freeze({
@@ -18,6 +19,7 @@ const ALLOWED: Readonly<Record<string, true>> = Object.freeze({
   "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md": true,
   "apps/user-info/current-context/projects/sample-project-archive.md": true,
   "apps/user-info/current-context/projects/sample-project.md": true,
+  "jobhunter-resume-info.md": true,
 });
 const SOURCE_KEYS: Readonly<Record<string, true>> = Object.freeze({
   id: true,
@@ -90,10 +92,10 @@ export function loadContextManifest(
   if (parsed.version !== 1) throw new Error("Context manifest version must be 1");
   if (!Array.isArray(parsed.sources)) throw new Error("Context manifest sources must be an array");
   const sources = parsed.sources.map(parseSource);
-  if (sources.length !== CONTEXT_SOURCE_ALLOWLIST.length) throw new Error("Context manifest must contain exactly four sources");
+  if (sources.length !== CONTEXT_SOURCE_ALLOWLIST.length) throw new Error("Context manifest must contain exactly five sources");
   const paths = sources.map((source) => source.relativePath);
   if (new Set(paths).size !== paths.length || paths.some((path) => !ALLOWED[path]) || CONTEXT_SOURCE_ALLOWLIST.some((path) => !paths.includes(path))) {
-    throw new Error("Context manifest sources do not match the literal four-file allowlist");
+    throw new Error("Context manifest sources do not match the literal five-file allowlist");
   }
   if (sources.filter((source) => source.kind === "baseline").length !== 1 || sources.find((source) => source.kind === "baseline")?.relativePath !== CONTEXT_SOURCE_ALLOWLIST[0]) {
     throw new Error("Context manifest must identify the canonical resume as its sole baseline");
