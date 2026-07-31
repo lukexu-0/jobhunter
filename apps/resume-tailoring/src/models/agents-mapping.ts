@@ -252,7 +252,7 @@ function mapInputItem(item: AgentInputItem, timestamp: number, bridge: CodexBrid
         content, usage: ZERO_PI_USAGE, stopReason: "stop", timestamp,
       };
     } else {
-      throw new Error(`Unsupported agent input item type: ${String(item.type)}`);
+      throw new Error("Unsupported agent message role");
     }
   } else {
     throw new Error(`Unsupported agent input item type: ${String(item.type)}`);
@@ -449,7 +449,7 @@ export function mapPiAssistantMessage(message: AssistantMessage): ModelResponse 
     } else if (part.type === "toolCall") {
       output.push({ type: "function_call", callId: part.id, name: part.name, arguments: JSON.stringify(part.arguments), status: "completed" });
     } else if (part.type !== "text") {
-      throw new Error(`Unsupported Codex response content type: ${part.type}`);
+      throw new Error("Unsupported Codex response content type");
     }
   }
   if (nativeHistory !== undefined && output.length === 0) {

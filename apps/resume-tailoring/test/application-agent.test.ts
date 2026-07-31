@@ -679,6 +679,10 @@ describe("application agent", () => {
         expect(agent.model).toBe("gpt-5.6-sol");
         expect(agent.modelSettings).toMatchObject({
           reasoning: { effort: "high" },
+          contextManagement: [{
+            type: "compaction",
+            compactThreshold: 334_800,
+          }],
           toolChoice: "required",
           parallelToolCalls: false,
           store: false,
