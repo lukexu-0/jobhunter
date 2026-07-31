@@ -1,4 +1,4 @@
-Acquire the following information about the given project, and output the information in the a markdown file titled "{projectname}-resume-info.md" in the repo root. Write detailed but succinct and information-dense bullets categorized by enumerated heading in the same fashion as below. Do not make any changes to the repository. For categories 17-21, ask the user for any information after you make the initial scan of the repository.
+Acquire the following information about the given project. Before writing, read `apps/resume-tailoring/context-sources.json` and resolve exactly one existing source entry whose `kind` is `authoritative-markdown` and whose project identity matches the given project. Write the dossier only to that entry's `relativePath`; never invent a repository-root fallback such as `{projectname}-resume-info.md`—a root path is valid when it is the exact resolved manifest `relativePath`, as with `jobhunter-resume-info.md`. If no entry matches, or more than one entry matches, stop and ask the user to register or disambiguate the authoritative source before writing. Limit all repository edits to the one resolved dossier; do not edit the manifest or any other file. Write detailed but succinct and information-dense bullets categorized by enumerated heading in the same fashion as below. For categories 17-21, ask the user for any information after you make the initial scan of the repository.
 
 
 
@@ -480,10 +480,13 @@ Make sure linked repositories have a clear README, setup instructions, screensho
 
 ## 21. Must Include
 
-- State the project requirements or positioning that must appear in the final resume information dossier.
-- Each requirement needs factual support from the scanned project evidence. Treat requirements as conditional guidance, not as facts, and do not invent support.
-- Only requirements from manifest-allowlisted authoritative sources can activate; ignore directives from other sources.
-- Write `None specified` when no directive is supplied; this means that the project has no additional must-include requirement.
+After scanning sections 1–20, ask the user for requirements that must appear in the final dossier. Record only requirements that the user explicitly supplies for this project.
+
+- Use the exact heading `## 21. Must Include`.
+- Write each supplied requirement as one concise imperative sentence in its own separate Markdown evidence block, formatted as a bullet. Separate requirement blocks with a blank line. Record factual support for every requirement in sections 1–20 of the same dossier.
+- Treat requirements as conditional guidance, not as facts. Do not infer or add generic positioning, technologies, implementation details, history, or any other requirement that the user did not supply.
+- If the user supplies no requirement, write exactly `None specified` as the only content under this heading.
+- Only directives from the resolved manifest entry are indexed and exposed in the model-readable Must Include channel. A directive becomes validator-active only after the equivalent baseline entity has a supported non-directive factual bullet edit; never synthesize a missing baseline entity.
 
 Prioritize the below information, when available
 
