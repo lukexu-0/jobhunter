@@ -135,6 +135,7 @@ describe("RunReviewWorkspace", () => {
         onSelectIteration={() => {}}
         run={run}
         selectedIteration={iterations[2]}
+
       />,
     );
     expect(currentMarkup).toContain("Edit instructions");

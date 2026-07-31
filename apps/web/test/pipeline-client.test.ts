@@ -96,6 +96,7 @@ const applicationSnapshot: ApplicationSessionSnapshotDto = {
   filesAttached: ["resume.pdf"],
   warnings: [],
   revisionCount: 0,
+  browserUseDiagnostics: [],
   pendingAction: null,
   error: null,
 };
