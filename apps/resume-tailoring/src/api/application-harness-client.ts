@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   AdditionalInfoQuestionSchema,
   ApplicationAdditionalInfoQuestionSchema,
+  ApplicationBrowserUseDiagnosticSchema,
   ApplicationFieldResultSchema,
   ApplicationPendingActionSchema,
   ApplicationSessionCommandSchema,
@@ -9,6 +10,7 @@ import {
   FieldResultSchema,
   HarnessSessionStateSchema,
   type ApplicationAdditionalInfoQuestion,
+  type ApplicationBrowserUseDiagnostic,
   type ApplicationFieldResult,
   type ApplicationPendingAction,
   type ApplicationSessionCommand,
@@ -81,6 +83,7 @@ export interface ApplicationHarnessSnapshot {
   readonly expiresAt: number;
   readonly company: string | null;
   readonly role: string | null;
+  readonly browserUseDiagnostics: ApplicationBrowserUseDiagnostic[];
   readonly fieldsFilled: ApplicationFieldResult[];
   readonly fieldsNeedingHuman: ApplicationFieldResult[];
   readonly filesAttached: string[];
@@ -119,6 +122,26 @@ const PENDING_TYPE_BY_STATE: Partial<
 };
 
 
+const RawBrowserUseDiagnosticSchema = z.object({
+  step: z.number().int().min(1).max(500),
+  status: z.enum(["succeeded", "failed", "timed_out"]),
+  exit_code: z.number().int(),
+  timed_out: z.boolean(),
+  error_category: z.enum([
+    "process_exit",
+    "execution_timeout",
+    "browser_runtime",
+    "session_timeout",
+  ]).nullable(),
+  stderr_excerpt: z.union([
+    z.literal("[redacted]"),
+    z.literal("Browser Use execution timed out after 120 seconds."),
+    z.literal("Browser runtime failed."),
+    z.literal("Application session expired."),
+  ]).nullable(),
+  stderr_truncated: z.boolean(),
+}).strict();
+
 const RawSnapshotSchema = z.object({
   session_id: UUIDSchema,
   state: HarnessSessionStateSchema,
@@ -138,6 +161,7 @@ const RawSnapshotSchema = z.object({
     z.string().refine((value) => codePointLength(value, 1, 1_000)),
   ).max(100),
   revision_count: z.number().int().min(0).max(100),
+  browser_use_diagnostics: z.array(RawBrowserUseDiagnosticSchema).max(100).default([]),
   pending_action: RawPendingActionSchema.nullable(),
   approved_origins: z.array(z.string().refine(isCanonicalHttpOrigin)).max(20)
     .refine((origins) => new Set(origins).size === origins.length),
@@ -569,6 +593,20 @@ function projectField(field: z.infer<typeof FieldResultSchema>): ApplicationFiel
   });
 }
 
+function projectBrowserUseDiagnostic(
+  diagnostic: z.infer<typeof RawBrowserUseDiagnosticSchema>,
+): ApplicationBrowserUseDiagnostic {
+  return ApplicationBrowserUseDiagnosticSchema.parse({
+    step: diagnostic.step,
+    status: diagnostic.status,
+    exitCode: diagnostic.exit_code,
+    timedOut: diagnostic.timed_out,
+    errorCategory: diagnostic.error_category,
+    stderrExcerpt: diagnostic.stderr_excerpt,
+    stderrTruncated: diagnostic.stderr_truncated,
+  });
+}
+
 function projectSnapshot(snapshot: RawSnapshot): ApplicationHarnessSnapshot {
   return {
     state: snapshot.state,
@@ -581,6 +619,7 @@ function projectSnapshot(snapshot: RawSnapshot): ApplicationHarnessSnapshot {
     fieldsNeedingHuman: snapshot.fields_needing_human.map(projectField),
     filesAttached: snapshot.files_attached,
     warnings: snapshot.warnings,
+    browserUseDiagnostics: snapshot.browser_use_diagnostics.map(projectBrowserUseDiagnostic),
     revisionCount: snapshot.revision_count,
     pendingAction: projectPendingAction(snapshot.pending_action),
     error: snapshot.error,

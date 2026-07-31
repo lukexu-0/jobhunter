@@ -16,13 +16,11 @@ from jobhunter_browser_harness.api import HarnessDependencies, create_app
 from jobhunter_browser_harness.models import (
     SESSION_ERROR_MESSAGES,
     AdditionalInfoRuntimeActionResponse,
-    AdditionalInfoTextQuestion,
     ApplicationRunResult,
     ReviewApplicationResult,
     ApproveRuntimeActionResponse,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseExecutionResult,
-    CandidateQuestionsRequiredRuntimeActionResponse,
     BrowserUseRuntimeAction,
     CancelledApplicationResult,
     CancelRuntimeActionResponse,
@@ -91,6 +89,17 @@ def make_snapshot(**overrides: Any) -> SessionSnapshot:
         ],
         "fields_needing_human": [],
         "files_attached": ["resume.pdf"],
+        "browser_use_diagnostics": [
+            {
+                "step": 1,
+                "status": "failed",
+                "exit_code": 7,
+                "timed_out": False,
+                "error_category": "process_exit",
+                "stderr_excerpt": "[redacted]",
+                "stderr_truncated": True,
+            }
+        ],
         "warnings": [],
         "revision_count": 0,
         "pending_action": {"type": "human_review"},
@@ -963,6 +972,17 @@ async def test_snapshot_get_returns_sanitized_public_model(
     assert response.json()["model_provider"] == "openai-codex"
     assert response.json()["model"] == "gpt-5.6-sol"
     assert response.json()["reasoning"] == "high"
+    assert response.json()["browser_use_diagnostics"] == [
+        {
+            "step": 1,
+            "status": "failed",
+            "exit_code": 7,
+            "timed_out": False,
+            "error_category": "process_exit",
+            "stderr_excerpt": "[redacted]",
+            "stderr_truncated": True,
+        }
+    ]
     assert service.snapshot_calls == [SESSION_ID]
 
 
@@ -1251,44 +1271,41 @@ def test_submit_application_runtime_action_accepts_only_bounded_selector() -> No
     assert isinstance(result, SubmitApplicationResultRuntimeActionResponse)
 
 
-def test_browser_execution_keeps_candidate_question_preflight_internal() -> None:
-    question = AdditionalInfoTextQuestion(
-        id="candidate_deadbeef",
-        key="form.candidate_deadbeef",
-        scope="application",
-        question="Review emphasis",
-        answer_type="text",
-    )
-    result = BrowserUseExecutionResult.model_validate(
-        {
-            "exit_code": 0,
-            "timed_out": False,
-            "stdout": "",
-            "stderr": "",
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-            "observation": {
-                "url": "https://ats.example/application",
-                "title": "Application",
-                "tabs": [],
-                "dom": "textarea Review emphasis",
-                "page_info": None,
-                "screenshot": None,
-            },
-            "candidate_questions": [question],
-        }
-    )
-
-    assert result.candidate_questions == [question]
-    assert "candidate_questions" not in result.model_dump(mode="json")
-    assert "candidate_questions" not in result.model_dump_json()
-    response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
-        {
-            "type": "candidate_questions_required",
-            "questions": [question.model_dump(mode="json")],
-        }
-    )
-    assert isinstance(response, CandidateQuestionsRequiredRuntimeActionResponse)
+def test_rejects_removed_candidate_question_preflight_contract() -> None:
+    question = {
+        "id": "candidate_deadbeef",
+        "key": "form.candidate_deadbeef",
+        "scope": "application",
+        "question": "Review emphasis",
+        "answer_type": "text",
+    }
+    with pytest.raises(ValidationError):
+        BrowserUseExecutionResult.model_validate(
+            {
+                "exit_code": 0,
+                "timed_out": False,
+                "stdout": "",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "observation": {
+                    "url": "https://ats.example/application",
+                    "title": "Application",
+                    "tabs": [],
+                    "dom": "textarea Review emphasis",
+                    "page_info": None,
+                    "screenshot": None,
+                },
+                "candidate_questions": [question],
+            }
+        )
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {
+                "type": "candidate_questions_required",
+                "questions": [question],
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -1320,18 +1337,6 @@ def test_browser_execution_keeps_candidate_question_preflight_internal() -> None
                     "data": "cG5n",
                 },
             },
-        },
-        {
-            "type": "candidate_questions_required",
-            "questions": [
-                {
-                    "id": "candidate_deadbeef",
-                    "key": "form.candidate_deadbeef",
-                    "scope": "application",
-                    "question": "Review emphasis",
-                    "answer_type": "text",
-                }
-            ],
         },
         {"type": "continue"},
         {

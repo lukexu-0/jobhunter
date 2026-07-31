@@ -139,7 +139,6 @@ export interface BrowserApplicationContext {
   submissionClaimed: boolean;
   submissionFinalized: boolean;
   browserUseCompleted: boolean;
-  pendingCandidateQuestions?: readonly AdditionalInfoQuestion[];
   postNavigationInspectionRequired: boolean;
   lastReviewResult?: ReviewApplicationResult;
   submitExecutionResult?: BrowserUseExecutionResult;
@@ -159,9 +158,37 @@ Complete every machine-actionable field. Prefer saved application, saved global,
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
-Do not request additional info while visible fields remain supported; upload the resume when visible. Batch all currently visible unknowns. If browser_use returns candidate_questions_required, call request_additional_info with its questions unchanged. After human navigation, batch newly revealed candidate questions before review. Scope availability globally; job-source and referral per application. Apply answers, re-scan, finish fields. Treat declines as unavailable; ask about saved facts only on conflict.
+Fill every visible field supported by current facts and upload the resume before requesting additional info. For remaining visible fields needing unavailable facts, call request_additional_info with one batch. After human navigation, inspect again and ask about new unknowns before review. Scope availability globally; job-source and referral per application. Apply answers, re-scan, and finish fields. Declines are unavailable; ask about saved facts only on conflict.
 
 Before explicit submission approval, never activate final Submit, Send, or Apply; press Enter to submit; call submission APIs; or bypass review. When complete, request human review. Apply revisions and review again. After approval, only submit_application and submit_application_result are enabled. Call each once. Use the final control's CSS selector. Report submitted only with verbatim confirmation from the trusted observation; otherwise report submission_uncertain.`;
+
+const BROWSER_USE_DESCRIPTION = `Execute one Python body against the supplied session browser. Helpers are pre-imported; there is no \`page\` object. Print values you need in the tool output.
+
+Core workflow and syntax:
+- Inspect: \`info = page_info(); print(info)\`. Capture: \`shot = capture_screenshot(path=None, full=False, max_dim=1800); print(shot)\`. Screenshots also arrive with browser results; use \`click_at_xy(x, y, button="left", clicks=1)\`, then inspect again.
+- Navigate first with \`new_tab(url); wait_for_load(timeout=15.0)\`. Navigate later with \`result = goto_url(url); wait_for_load(timeout=15.0); print(result)\`. For SPAs: \`wait_for_element(selector, timeout=10.0, visible=False)\`.
+- Fill: \`fill_input(selector, text, clear_first=True, timeout=0.0)\`. Insert direct text: \`type_text(text)\`. Upload: \`upload_file(selector, path)\`.
+- Keys and scroll: \`press_key(key, modifiers=0)\`, \`dispatch_key(selector, key="Enter", event="keypress")\`, and \`scroll(x, y, dy=-300, dx=0)\`.
+- Timing and events: \`wait(seconds=1.0)\`, \`wait_for_load(timeout=15.0)\`, \`wait_for_element(selector, timeout=10.0, visible=False)\`, \`wait_for_network_idle(timeout=10.0, idle_ms=500)\`, and \`events = drain_events(); print(events)\`.
+- JavaScript: \`value = js(expression, target_id=None); print(value)\`. Raw CDP: \`result = cdp(method, session_id=None, **params); print(result)\`; for example \`print(cdp("DOM.getDocument", depth=-1))\`. The returned dictionary is the CDP result directly, not a nested \`result\`.
+- Tabs and frames: \`print(list_tabs(include_chrome=True))\`, \`tab = current_tab()\`, \`switch_tab(tab)\`, \`ensure_real_tab()\`, \`close_tab(target=None)\`, and \`iframe_target(url_substr)\`. CDP target order is not visual tab order; inspect after switching.
+
+Interaction guidance and syntax:
+- Screenshots and viewport (\`screenshots\`, \`viewport\`): \`info = page_info(); print(info["w"], info["h"], info["sx"], info["sy"], info["pw"], info["ph"])\`. Re-capture and re-measure after navigation, scrolling, viewport or layout changes, opening an overlay, or switching a tab.
+- Scrolling (\`scrolling\`): distinguish page scrolling, nested containers, virtualized lists, and dropdown menus. Example: \`scroll(400, 600, dy=500); wait(0.25); print(page_info())\`.
+- Forms and Custom dropdowns (\`dropdowns\`): classify a dropdown as a native select, custom overlay, searchable combobox, or virtualized menu. Open and re-measure it. Searchable example: \`fill_input("[role=combobox]", "query"); wait_for_element("[role=option]", timeout=10.0, visible=True)\`. Native-select example: \`print(js("""(() => { const e = document.querySelector("select"); e.value = "option_value"; e.dispatchEvent(new Event("input", { bubbles: true })); e.dispatchEvent(new Event("change", { bubbles: true })); return e.value; })()"""))\`.
+- Same-origin iframes (\`iframes\`): traverse with \`contentDocument\` or \`contentWindow\`. Example: \`print(js("""(() => document.querySelector("iframe").contentDocument.body.innerText)()"""))\`. Frame-local coordinates differ from page/viewport coordinates used by \`click_at_xy\`.
+- Cross-origin iframes (\`cross-origin-iframes\`): \`target = iframe_target("apply.example"); print(js("document.body.innerText", target_id=target))\`. Compositor-level \`click_at_xy\` can be simpler than cross-target DOM work.
+- Shadow DOM (\`shadow-dom\`): recurse through open \`shadowRoot\` trees. Example: \`print(js("""(() => document.querySelector("custom-element").shadowRoot.querySelector("input").value)()"""))\`. For deeply nested components, inspect and use a re-measured coordinate click.
+- Native dialogs (\`dialogs\`): when \`page_info()\` returns a \`dialog\`, page JavaScript is frozen. Accept: \`cdp("Page.handleJavaScriptDialog", accept=True)\`. Dismiss: \`cdp("Page.handleJavaScriptDialog", accept=False)\`. Prompt: \`cdp("Page.handleJavaScriptDialog", accept=True, promptText="answer")\`. Then \`print(drain_events()); print(page_info())\`.
+- Drag and drop (\`drag-and-drop\`): re-measure source and target, then use low-level input events: \`cdp("Input.dispatchMouseEvent", type="mousePressed", x=100, y=200, button="left", clickCount=1); cdp("Input.dispatchMouseEvent", type="mouseMoved", x=400, y=500, button="left"); cdp("Input.dispatchMouseEvent", type="mouseReleased", x=400, y=500, button="left", clickCount=1)\`. File drop zones can instead use \`upload_file(selector, path)\` when backed by a file input.
+- Network requests (\`network-requests\`): \`drain_events(); click_at_xy(x, y); print(wait_for_network_idle(timeout=10.0, idle_ms=500)); print(drain_events())\`.
+- Downloads: \`cdp("Browser.setDownloadBehavior", behavior="allow", downloadPath=os.environ["JOBHUNTER_SESSION_DIRECTORY"])\`; perform the download action, wait, then \`print(drain_events())\`.
+- Domain skills: \`result = goto_url(url); print(result.get("domain_skills", []))\`. Read available Markdown with \`for path in (AGENT_WORKSPACE / "domain-skills").rglob("*.md"): print(path.read_text(encoding="utf-8"))\`.
+
+Relevant Browser Harness interaction references are \`cross-origin-iframes\`, \`dialogs\`, \`drag-and-drop\`, \`dropdowns\`, \`iframes\`, \`network-requests\`, \`screenshots\`, \`scrolling\`, \`shadow-dom\`, \`tabs\`, \`uploads\`, and \`viewport\`.
+
+Pass only the Python body. Keep actions small, use numeric timeout arguments, and never start or attach another browser or invoke a daemon.`;
 
 function requireRuntimeContext(
   runContext: { context: BrowserApplicationContext } | undefined,
@@ -174,34 +201,6 @@ function requireRuntimeContext(
 }
 
 
-function candidateQuestionBatchesMatch(
-  left: readonly AdditionalInfoQuestion[],
-  right: readonly AdditionalInfoQuestion[],
-): boolean {
-  if (left.length !== right.length) return false;
-  return left.every((question, index) => {
-    const expected = right[index];
-    if (
-      expected === undefined
-      || question.id !== expected.id
-      || question.key !== expected.key
-      || question.scope !== expected.scope
-      || question.question !== expected.question
-      || question.answer_type !== expected.answer_type
-    ) {
-      return false;
-    }
-    if (!("options" in question) && !("options" in expected)) return true;
-    if (!("options" in question) || !("options" in expected)) return false;
-    return question.options.length === expected.options.length
-      && question.options.every((option, optionIndex) => {
-        const expectedOption = expected.options[optionIndex];
-        return expectedOption !== undefined
-          && option.id === expectedOption.id
-          && option.label === expectedOption.label;
-      });
-  });
-}
 
 function acceptedAnswersMatchQuestions(
   answers: readonly {
@@ -224,11 +223,6 @@ function acceptedAnswersMatchQuestions(
     });
 }
 
-function rejectPendingCandidateQuestions(context: BrowserApplicationContext): void {
-  if (context.pendingCandidateQuestions !== undefined) {
-    throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-  }
-}
 
 function rejectMissingBrowserInspection(
   context: BrowserApplicationContext,
@@ -473,33 +467,16 @@ export async function runApplicationAgent(
 
   const browserUse = runtimeTool({
     name: "browser_use",
-    description: "Execute Python against the supplied session browser. Helpers are pre-imported: use capture_screenshot or page_info to inspect, new_tab for first navigation, wait_for_load after navigation, click_at_xy for coordinate clicks, js for DOM work, and cdp for raw CDP. Pass only the Python body and never start or attach another browser. When inspection reveals a cross-origin target, end the action without navigating; request origin approval before a later navigation action.",
+    description: BROWSER_USE_DESCRIPTION,
     parameters: BrowserUseToolParameters,
     timeoutMs: 130_000,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined,
     execute: async ({ code }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
         { type: "browser_use", code },
         Math.min(130_000, remainingDeadlineMs(runtimeContext)),
         actionSignal,
       );
-      if (response.type === "candidate_questions_required") {
-        try {
-          const output = boundedJson(
-            response,
-            "candidate question preflight",
-            MAX_BROWSER_TOOL_OUTPUT_BYTES,
-          );
-          runtimeContext.pendingCandidateQuestions = response.questions;
-          delete runtimeContext.latestScreenshotDataUrl;
-          return output;
-        } catch {
-          throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
-        }
-      }
       if (response.type !== "browser_use_result") {
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
@@ -533,11 +510,8 @@ export async function runApplicationAgent(
     description: "Pause for browser interaction that only the human can complete: login, CAPTCHA, 2FA, or an inaccessible or explicitly manual control.",
     parameters: HumanNavigationToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async ({ instruction }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
@@ -561,11 +535,8 @@ export async function runApplicationAgent(
     description: "After a browser action reports a target's exact origin, request approval before any later browser action navigates to it.",
     parameters: OriginApprovalToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async ({ origin }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
@@ -581,26 +552,12 @@ export async function runApplicationAgent(
 
   const requestAdditionalInfo = runtimeTool({
     name: "request_additional_info",
-    description: "Do not call this while any visible field can be completed from current facts; upload the supplied resume when its control is visible. When browser_use returns candidate_questions_required, pass its questions unchanged. Otherwise ask the human one bounded batch of structured factual questions. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction or already answered questions unless the page explicitly conflicts.",
+    description: "After a successful browser inspection, fill every visible field supported by current facts and upload the supplied resume when its control is visible. Then ask the human one bounded batch of structured questions for the remaining visible fields whose facts are unavailable. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction or already answered questions unless the page explicitly conflicts.",
     parameters: AdditionalInfoToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions !== undefined
-      || runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async ({ questions }, runtimeContext, actionSignal) => {
-      if (
-        runtimeContext.pendingCandidateQuestions === undefined
-        && !runtimeContext.browserUseCompleted
-      ) {
-        throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
-      const pendingQuestions = runtimeContext.pendingCandidateQuestions;
-      if (
-        pendingQuestions !== undefined
-        && !candidateQuestionBatchesMatch(questions, pendingQuestions)
-      ) {
-        throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
+      rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
         { type: "request_additional_info", questions },
@@ -611,14 +568,8 @@ export async function runApplicationAgent(
       if (response.type !== "additional_info") {
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
-      if (
-        pendingQuestions !== undefined
-        && !acceptedAnswersMatchQuestions(response.answers, pendingQuestions)
-      ) {
+      if (!acceptedAnswersMatchQuestions(response.answers, questions)) {
         throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
-      if (pendingQuestions !== undefined) {
-        delete runtimeContext.pendingCandidateQuestions;
       }
       return JSON.stringify(response);
     },
@@ -630,11 +581,9 @@ export async function runApplicationAgent(
     parameters: HumanReviewToolParameters,
     timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted
+      runtimeContext.browserUseCompleted
       && !runtimeContext.postNavigationInspectionRequired,
     execute: async ({ result }, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       rejectMissingPostNavigationInspection(runtimeContext);
       const response = await runtimeAction(
@@ -664,11 +613,8 @@ export async function runApplicationAgent(
     description: "Report that the requested posting is unavailable or the visible application materially mismatches it.",
     parameters: ApplicationMismatchToolParameters,
     timeoutMs: input.deadlineMs,
-    isEnabled: (runtimeContext) =>
-      runtimeContext.pendingCandidateQuestions === undefined
-      && runtimeContext.browserUseCompleted,
+    isEnabled: (runtimeContext) => runtimeContext.browserUseCompleted,
     execute: async (_input, runtimeContext, actionSignal) => {
-      rejectPendingCandidateQuestions(runtimeContext);
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
@@ -854,6 +800,10 @@ export async function runApplicationAgent(
     model: MODEL_NAME,
     modelSettings: {
       reasoning: { effort: "high" },
+      contextManagement: [{
+        type: "compaction",
+        compactThreshold: 272_000,
+      }],
       toolChoice: "required",
       parallelToolCalls: false,
       store: false,
@@ -897,7 +847,12 @@ export async function runApplicationAgent(
       let targetError = error;
       if (error !== null && typeof error === "object" && "error" in error) {
         const inner = error.error;
-        if (inner instanceof ApplicationAgentCancelled) targetError = inner;
+        if (
+          inner instanceof ApplicationAgentCancelled
+          || inner instanceof ApplicationAgentFailure
+        ) {
+          targetError = inner;
+        }
       }
       if (targetError instanceof ApplicationAgentCancelled) {
         if (context.submissionClaimed) {

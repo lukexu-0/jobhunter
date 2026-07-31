@@ -240,6 +240,136 @@ describe("OAuth Codex Agents model bridge", () => {
       { type: "text", text: "Signed answer", textSignature: "signed-text-1" },
     ]);
   });
+  test("round-trips native Codex reasoning history without duplicating covered output items", async () => {
+    const nativeHistory: NonNullable<AssistantMessage["providerPayload"]> = {
+      type: "openaiResponsesHistory",
+      provider: "openai-codex",
+      dt: true,
+      items: [
+        { type: "reasoning", encrypted_content: "encrypted-reasoning", summary: [] },
+        { type: "function_call", call_id: "call-native", name: "submit", arguments: "{\"answer\":\"yes\"}" },
+      ],
+    };
+    const message = {
+      ...assistantMessage([
+        { type: "thinking", thinking: "checked privately", thinkingSignature: "reason-native" },
+        { type: "toolCall", id: "call-native", name: "submit", arguments: { answer: "yes" } },
+      ]),
+      providerPayload: nativeHistory,
+    };
+    const first = await new OAuthCodexModel("attempt-native-history", {
+      resolverFactory: inertResolver,
+      transport: completedTransport(message),
+    }).getResponse(modelRequest());
+
+    expect(first.output[0]).toMatchObject({
+      type: "reasoning",
+      providerData: {
+        jobhunterCodex: {
+          version: 1,
+          kind: "history",
+          payload: nativeHistory,
+        },
+      },
+    });
+    expect(first.output[1]).toMatchObject({
+      type: "function_call",
+      providerData: {
+        jobhunterCodex: {
+          version: 1,
+          kind: "covered",
+        },
+      },
+    });
+
+    let nextContext: Context | undefined;
+    await new OAuthCodexModel("attempt-native-replay", {
+      resolverFactory: inertResolver,
+      transport: completedTransport(
+        assistantMessage([{ type: "text", text: "continued" }]),
+        (context) => { nextContext = context; },
+      ),
+    }).getResponse(modelRequest({
+      input: [
+        ...first.output,
+        { type: "function_call_result", callId: "call-native", name: "submit", output: "accepted", status: "completed" },
+      ],
+    }));
+
+    expect(nextContext?.messages.map((item) => item.role)).toEqual(["assistant", "toolResult"]);
+    const replay = nextContext?.messages[0];
+    expect(replay?.role).toBe("assistant");
+    if (replay?.role !== "assistant") throw new Error("Native history anchor missing");
+    expect(replay.providerPayload).toEqual(nativeHistory);
+  });
+
+  test("dispatches upstream pre-turn compaction and carries its encrypted item into the normal turn", async () => {
+    const calls: Array<{ context: Context; options: SimpleStreamOptions }> = [];
+    const compactionHistory: NonNullable<AssistantMessage["providerPayload"]> = {
+      type: "openaiResponsesHistory",
+      provider: "openai-codex",
+      dt: true,
+      items: [{
+        type: "compaction",
+        id: "cmp-1",
+        encrypted_content: "encrypted-compaction",
+        created_by: "server",
+      }],
+    };
+    const transport: CodexTransport = async function* (_model, context, options) {
+      calls.push({ context, options });
+      const message = calls.length === 1
+        ? { ...assistantMessage([{ type: "text", text: "compacted" }]), providerPayload: compactionHistory }
+        : assistantMessage([{ type: "text", text: "normal turn" }]);
+      yield { type: "start", partial: message };
+      yield { type: "done", reason: "stop", message };
+    };
+    const base = modelRequest();
+    const response = await new OAuthCodexModel("attempt-compaction", {
+      resolverFactory: inertResolver,
+      transport,
+    }).getResponse(modelRequest({
+      modelSettings: {
+        ...base.modelSettings,
+        contextManagement: [{ type: "compaction", compactThreshold: 1 }],
+      },
+    }));
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.options.codexCompaction).toMatchObject({
+      trigger: "auto",
+      reason: "context_limit",
+      implementation: "responses_compaction_v2",
+      phase: "pre_turn",
+      strategy: "prefix_compaction",
+    });
+    expect(calls[1]?.options.codexCompaction).toBeUndefined();
+    expect(calls[1]?.context.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    const compactionAnchor = calls[1]?.context.messages.at(-1);
+    expect(compactionAnchor?.role).toBe("assistant");
+    if (compactionAnchor?.role !== "assistant") throw new Error("Compaction history anchor missing");
+    expect(compactionAnchor.providerPayload).toEqual({
+      ...compactionHistory,
+      dt: false,
+    });
+    expect(response.output[0]).toMatchObject({
+      type: "compaction",
+      id: "cmp-1",
+      encrypted_content: "encrypted-compaction",
+      created_by: "server",
+      providerData: {
+        jobhunterCodex: {
+          version: 1,
+          kind: "history",
+          payload: {
+            ...compactionHistory,
+            dt: false,
+          },
+        },
+      },
+    });
+    expect(response.output[1]).toMatchObject({ type: "message", role: "assistant" });
+  });
 
   test("emits a valid response_done stream carrying final output and usage", async () => {
     const message = assistantMessage([{ type: "text", text: "hello" }, { type: "toolCall", id: "call-s", name: "submit", arguments: { answer: "stream" } }]);

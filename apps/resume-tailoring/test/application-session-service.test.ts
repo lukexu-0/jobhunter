@@ -48,6 +48,7 @@ function harnessSnapshot(
     fieldsFilled: [],
     fieldsNeedingHuman: [],
     filesAttached: ["resume.pdf"],
+    browserUseDiagnostics: [],
     warnings: [],
     revisionCount: 0,
     pendingAction: null,
@@ -672,6 +673,15 @@ describe("application session service", () => {
         ...harnessSnapshot("running"),
         updatedAt: harnessSnapshot().updatedAt + 1,
         warnings: ["Review the highlighted field"],
+        browserUseDiagnostics: [{
+          step: 3,
+          status: "failed",
+          exitCode: 1,
+          timedOut: false,
+          errorCategory: "process_exit",
+          stderrExcerpt: "[redacted]",
+          stderrTruncated: true,
+        }],
       },
       detail: { stepNumber: 3 },
     }];
@@ -707,6 +717,15 @@ describe("application session service", () => {
           generation: 1,
           bridgeState: "running",
           warnings: ["Review the highlighted field"],
+          browserUseDiagnostics: [{
+            step: 3,
+            status: "failed",
+            exitCode: 1,
+            timedOut: false,
+            errorCategory: "process_exit",
+            stderrExcerpt: "[redacted]",
+            stderrTruncated: true,
+          }],
         }),
         detail: { stepNumber: 3 },
       },
@@ -719,6 +738,15 @@ describe("application session service", () => {
       publicSnapshot: expect.objectContaining({
         generation: 1,
         warnings: ["Review the highlighted field"],
+        browserUseDiagnostics: [{
+          step: 3,
+          status: "failed",
+          exitCode: 1,
+          timedOut: false,
+          errorCategory: "process_exit",
+          stderrExcerpt: "[redacted]",
+          stderrTruncated: true,
+        }],
       }),
     });
     const serialized = JSON.stringify(items);

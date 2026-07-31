@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from threading import Event as ThreadEvent
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -58,7 +58,6 @@ from jobhunter_browser_harness.models import (
     BrowserUseExecutionResult,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
-    CandidateQuestionsRequiredRuntimeActionResponse,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     CancelCommand,
@@ -2524,6 +2523,19 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
     assert step.event == "agent_step"
     assert step.detail.step_number == 1
     assert step.detail.current_url == "https://jobs.example/openings/42"
+    diagnostic = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    assert [item.model_dump() for item in diagnostic] == [
+        {
+            "step": 1,
+            "status": "timed_out",
+            "exit_code": 124,
+            "timed_out": True,
+            "error_category": "execution_timeout",
+            "stderr_excerpt": "Browser Use execution timed out after 120 seconds.",
+            "stderr_truncated": False,
+        }
+    ]
+    assert record.events[-1].session.browser_use_diagnostics == diagnostic
 
     with pytest.raises(HarnessServiceError) as raised:
         await manager.runtime_action(
@@ -2541,7 +2553,7 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
     await manager.delete(created.session_id)
 
 
-async def test_runtime_maps_candidate_question_preflight_without_browser_output(
+async def test_runtime_browser_action_persists_only_redacted_process_diagnostics(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -2549,38 +2561,107 @@ async def test_runtime_maps_candidate_question_preflight_without_browser_output(
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None
-    question = AdditionalInfoTextQuestion(
-        id="candidate_deadbeef",
-        key="form.candidate_deadbeef",
-        scope="application",
-        question="Review emphasis",
-        answer_type="text",
-    )
-    runtime = FakeSkillRuntime(
+    record.skill_runtime = FakeSkillRuntime(
         result=browser_execution_result().model_copy(
-            update={"candidate_questions": [question]}
+            update={
+                "exit_code": 7,
+                "stderr": "private selector and provider detail",
+                "stderr_truncated": True,
+            }
         )
     )
-    record.skill_runtime = runtime
 
-    result = await manager.runtime_action(
+    await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(
-            type="browser_use",
-            code="js(\"document.querySelector('textarea').value = 'model supplied'\")",
-        ),
+        BrowserUseRuntimeAction(type="browser_use", code="print('private code')"),
     )
 
-    assert isinstance(result, CandidateQuestionsRequiredRuntimeActionResponse)
-    assert result.questions == [question]
-    assert result.model_dump(mode="json") == {
-        "type": "candidate_questions_required",
-        "questions": [question.model_dump(mode="json")],
-    }
-    assert record.browser_action_count == 1
-    assert runtime.codes == [
-        "js(\"document.querySelector('textarea').value = 'model supplied'\")"
+    diagnostics = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    assert [item.model_dump() for item in diagnostics] == [
+        {
+            "step": 1,
+            "status": "failed",
+            "exit_code": 7,
+            "timed_out": False,
+            "error_category": "process_exit",
+            "stderr_excerpt": "[redacted]",
+            "stderr_truncated": True,
+        }
     ]
+    serialized = manager.get_snapshot(created.session_id).model_dump_json()
+    assert "private selector" not in serialized
+    assert "private code" not in serialized
+    await manager.delete(created.session_id)
+    assert (
+        manager._tombstones[created.session_id]
+        .snapshot.browser_use_diagnostics
+        == diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "error_code",
+        "expected_status",
+        "expected_timed_out",
+        "expected_category",
+        "expected_excerpt",
+    ),
+    [
+        (
+            "browser_failed",
+            "failed",
+            False,
+            "browser_runtime",
+            "Browser runtime failed.",
+        ),
+        (
+            "session_timeout",
+            "timed_out",
+            True,
+            "session_timeout",
+            "Application session expired.",
+        ),
+    ],
+)
+async def test_runtime_browser_action_persists_fixed_runtime_error_diagnostics(
+    tmp_path: Path,
+    error_code: Literal["browser_failed", "session_timeout"],
+    expected_status: Literal["failed", "timed_out"],
+    expected_timed_out: bool,
+    expected_category: Literal["browser_runtime", "session_timeout"],
+    expected_excerpt: str,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    record.skill_runtime = FakeSkillRuntime(error=BrowserSkillRuntimeError(error_code))
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.runtime_action(
+            created.session_id,
+            BrowserUseRuntimeAction(type="browser_use", code="print('private code')"),
+        )
+
+    assert raised.value.code == error_code
+    diagnostics = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    assert [item.model_dump() for item in diagnostics] == [
+        {
+            "step": 1,
+            "status": expected_status,
+            "exit_code": -1,
+            "timed_out": expected_timed_out,
+            "error_category": expected_category,
+            "stderr_excerpt": expected_excerpt,
+            "stderr_truncated": False,
+        }
+    ]
+    assert (
+        "private code"
+        not in manager.get_snapshot(created.session_id).model_dump_json()
+    )
     await manager.delete(created.session_id)
 
 
@@ -3137,73 +3218,6 @@ async def test_runtime_review_returns_revision_then_submit_and_seals_runtime(
     ]
     await manager.delete(created.session_id)
 
-@pytest.mark.parametrize("candidate_stage", ["pre_click", "submit"])
-async def test_submit_candidate_preflight_never_reports_a_click(
-    tmp_path: Path,
-    candidate_stage: str,
-) -> None:
-    manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
-    record = manager._active
-    assert record is not None and record.human_gate is not None
-    execution = browser_execution_result()
-    question = AdditionalInfoTextQuestion(
-        id="candidate_deadbeef",
-        key="form.candidate_deadbeef",
-        scope="application",
-        question="Review emphasis",
-        answer_type="text",
-    )
-    candidate_execution = execution.model_copy(
-        update={"candidate_questions": [question]}
-    )
-    runtime = FakeSkillRuntime(
-        results=(
-            [candidate_execution]
-            if candidate_stage == "pre_click"
-            else [execution, candidate_execution]
-        )
-    )
-    record.skill_runtime = runtime
-
-    review = asyncio.create_task(
-        manager.runtime_action(
-            created.session_id,
-            RequestHumanReviewRuntimeAction(
-                type="request_human_review",
-                result=review_result(),
-            ),
-        )
-    )
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    assert isinstance(await review, SubmitRuntimeActionResponse)
-
-    with pytest.raises(HarnessServiceError) as failed:
-        await manager.runtime_action(
-            created.session_id,
-            SubmitApplicationRuntimeAction(
-                type="submit_application",
-                selector="#final-submit",
-            ),
-        )
-
-    assert failed.value.code == "browser_failed"
-    assert runtime.codes == (
-        ["page_info()"]
-        if candidate_stage == "pre_click"
-        else [
-            "page_info()",
-            sessions_module._submit_application_source("#final-submit"),
-        ]
-    )
-    assert manager.get_snapshot(created.session_id).state == "submission_uncertain"
-    assert [event.event for event in tuple(record.events)[-2:]] == [
-        "submission_started",
-        "submission_uncertain",
-    ]
-    await manager.delete(created.session_id)
 
 
 

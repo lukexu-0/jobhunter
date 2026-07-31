@@ -10,7 +10,6 @@ import {
 import {
   AcceptedAdditionalInfoAnswerSchema,
   AdditionalInfoRuntimeActionResponseSchema,
-  CandidateQuestionsRequiredRuntimeActionResponseSchema,
   ApplicationRunResultSchema,
   CancelledApplicationResultSchema,
   ReviewApplicationResultSchema,
@@ -215,6 +214,7 @@ const PUBLIC_APPLICATION_SNAPSHOT = {
   ],
   fieldsNeedingHuman: [],
   filesAttached: ["Alex_Example_Resume.pdf"],
+  browserUseDiagnostics: [],
   warnings: ["Review the application before submitting."],
   revisionCount: 1,
   pendingAction: {
@@ -377,27 +377,16 @@ test("mirrors strict additional-information question and request constraints", (
   expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
 });
 
-test("strictly carries deterministic candidate-question preflight batches", () => {
-  const response = {
-    type: "candidate_questions_required" as const,
+test("rejects the removed deterministic candidate-question response", () => {
+  expect(RuntimeActionResponseSchema.safeParse({
+    type: "candidate_questions_required",
     questions: [{
       id: "candidate_deadbeef",
       key: "form.candidate_deadbeef",
-      scope: "application" as const,
+      scope: "application",
       question: "Review emphasis",
-      answer_type: "text" as const,
+      answer_type: "text",
     }],
-  };
-
-  expect(CandidateQuestionsRequiredRuntimeActionResponseSchema.parse(response)).toEqual(response);
-  expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
-  expect(CandidateQuestionsRequiredRuntimeActionResponseSchema.safeParse({
-    ...response,
-    questions: [],
-  }).success).toBe(false);
-  expect(CandidateQuestionsRequiredRuntimeActionResponseSchema.safeParse({
-    ...response,
-    unexpected: true,
   }).success).toBe(false);
 });
 
@@ -652,16 +641,6 @@ describe("HttpApplicationRuntimeClient", () => {
           page_info: { viewport: { width: 1280, height: 720 } },
           screenshot: { media_type: "image/png", data: "iVBORw0KGgo=" },
         },
-      },
-      {
-        type: "candidate_questions_required",
-        questions: [{
-          id: "candidate_deadbeef",
-          key: "form.candidate_deadbeef",
-          scope: "application",
-          question: "Review emphasis",
-          answer_type: "text",
-        }],
       },
       {
         type: "submit_application_result",

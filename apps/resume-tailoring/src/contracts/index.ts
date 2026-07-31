@@ -586,6 +586,86 @@ const PENDING_ACTION_BY_STATE: Readonly<
   awaiting_additional_info: "additional_info",
   awaiting_human_review: "human_review",
 };
+export const ApplicationBrowserUseDiagnosticSchema = z.object({
+  step: z.number().int().min(1).max(500),
+  status: z.enum(["succeeded", "failed", "timed_out"]),
+  exitCode: z.number().int(),
+  timedOut: z.boolean(),
+  errorCategory: z.enum([
+    "process_exit",
+    "execution_timeout",
+    "browser_runtime",
+    "session_timeout",
+  ]).nullable(),
+  stderrExcerpt: z.union([
+    z.literal("[redacted]"),
+    z.literal("Browser Use execution timed out after 120 seconds."),
+    z.literal("Browser runtime failed."),
+    z.literal("Application session expired."),
+  ]).nullable(),
+  stderrTruncated: z.boolean(),
+}).strict().superRefine((diagnostic, context) => {
+  const expectedStatus = diagnostic.timedOut
+    ? "timed_out"
+    : diagnostic.exitCode === 0
+      ? "succeeded"
+      : "failed";
+  if (diagnostic.status !== expectedStatus) {
+    context.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "status must match exitCode and timedOut",
+    });
+  }
+  let expectedExcerpt: typeof diagnostic.stderrExcerpt = null;
+  let validCategory = false;
+  if (diagnostic.errorCategory === "execution_timeout") {
+    expectedExcerpt = "Browser Use execution timed out after 120 seconds.";
+    validCategory = diagnostic.timedOut;
+  } else if (diagnostic.errorCategory === "session_timeout") {
+    expectedExcerpt = "Application session expired.";
+    validCategory = diagnostic.timedOut && diagnostic.exitCode === -1;
+  } else if (diagnostic.errorCategory === "browser_runtime") {
+    expectedExcerpt = "Browser runtime failed.";
+    validCategory = !diagnostic.timedOut && diagnostic.exitCode === -1;
+  } else if (diagnostic.errorCategory === "process_exit") {
+    validCategory = !diagnostic.timedOut && diagnostic.exitCode !== 0;
+  } else {
+    validCategory = !diagnostic.timedOut && diagnostic.exitCode === 0;
+  }
+  if (!validCategory) {
+    context.addIssue({
+      code: "custom",
+      path: ["errorCategory"],
+      message: "errorCategory must match the browser result",
+    });
+  }
+  if (
+    expectedExcerpt !== null
+    && diagnostic.stderrExcerpt !== expectedExcerpt
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["stderrExcerpt"],
+      message: "stderrExcerpt must match the fixed error catalog",
+    });
+  }
+  if (
+    expectedExcerpt === null
+    && diagnostic.stderrExcerpt !== null
+    && diagnostic.stderrExcerpt !== "[redacted]"
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["stderrExcerpt"],
+      message: "stderrExcerpt must be absent or redacted",
+    });
+  }
+});
+export type ApplicationBrowserUseDiagnostic = z.infer<
+  typeof ApplicationBrowserUseDiagnosticSchema
+>;
+
 
 export const ApplicationSessionSnapshotDtoSchema = z.object({
   generation: z.number().int().positive(),
@@ -605,6 +685,7 @@ export const ApplicationSessionSnapshotDtoSchema = z.object({
     z.string().refine((value) => hasCodePointLength(value, 1, 1_000)),
   ).max(100),
   revisionCount: z.number().int().min(0).max(100),
+  browserUseDiagnostics: z.array(ApplicationBrowserUseDiagnosticSchema).max(100).default([]),
   pendingAction: ApplicationPendingActionSchema.nullable(),
   error: ApplicationSessionErrorSchema.nullable(),
 }).strict().superRefine((snapshot, context) => {

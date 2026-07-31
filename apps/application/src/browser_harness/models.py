@@ -574,6 +574,66 @@ class SessionError(PublicModel):
         return self
 
 
+class BrowserUseDiagnostic(PublicModel):
+    step: int = Field(ge=1, le=500)
+    status: Literal["succeeded", "failed", "timed_out"]
+    exit_code: int
+    timed_out: bool
+    error_category: Literal[
+        "process_exit",
+        "execution_timeout",
+        "browser_runtime",
+        "session_timeout",
+    ] | None
+    stderr_excerpt: Literal[
+        "[redacted]",
+        "Browser Use execution timed out after 120 seconds.",
+        "Browser runtime failed.",
+        "Application session expired.",
+    ] | None
+    stderr_truncated: bool
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> BrowserUseDiagnostic:
+        expected_status = (
+            "timed_out"
+            if self.timed_out
+            else "succeeded"
+            if self.exit_code == 0
+            else "failed"
+        )
+        if self.status != expected_status:
+            raise ValueError("status does not match the browser outcome")
+        if self.error_category == "execution_timeout":
+            expected_excerpt = "Browser Use execution timed out after 120 seconds."
+            valid_category = self.timed_out
+        elif self.error_category == "session_timeout":
+            expected_excerpt = "Application session expired."
+            valid_category = self.timed_out and self.exit_code == -1
+        elif self.error_category == "browser_runtime":
+            expected_excerpt = "Browser runtime failed."
+            valid_category = not self.timed_out and self.exit_code == -1
+        elif self.error_category == "process_exit":
+            expected_excerpt = None
+            valid_category = not self.timed_out and self.exit_code != 0
+        else:
+            expected_excerpt = None
+            valid_category = not self.timed_out and self.exit_code == 0
+        if not valid_category:
+            raise ValueError("error_category does not match the browser outcome")
+        if (
+            expected_excerpt is not None
+            and self.stderr_excerpt != expected_excerpt
+        ):
+            raise ValueError("stderr_excerpt does not match the fixed error catalog")
+        if expected_excerpt is None and self.stderr_excerpt not in (
+            None,
+            "[redacted]",
+        ):
+            raise ValueError("stderr_excerpt must be absent or redacted")
+        return self
+
+
 class HumanNavigationPendingAction(PublicModel):
     type: Literal["human_navigation"]
     instruction: Annotated[
@@ -626,6 +686,10 @@ class SessionSnapshot(PublicModel):
     fields_needing_human: list[FieldResult] = Field(default_factory=list, max_length=500)
     files_attached: list[StrictText] = Field(default_factory=list, max_length=20)
     warnings: list[WarningText] = Field(default_factory=list, max_length=100)
+    browser_use_diagnostics: list[BrowserUseDiagnostic] = Field(
+        default_factory=list,
+        max_length=100,
+    )
     revision_count: int = Field(default=0, ge=0, le=100)
     pending_action: PendingAction | None = None
     approved_origins: list[StrictText] = Field(default_factory=list, max_length=20)
@@ -878,11 +942,6 @@ class BrowserUseExecutionResult(PublicModel):
     stdout_truncated: bool
     stderr_truncated: bool
     observation: BrowserObservation
-    candidate_questions: list[AdditionalInfoQuestion] = Field(
-        default_factory=list,
-        max_length=20,
-        exclude=True,
-    )
 
 
 class ApplicationResultBase(PublicModel):
@@ -1055,16 +1114,6 @@ RuntimeActionRequest: TypeAlias = Annotated[
 ]
 
 
-class CandidateQuestionsRequiredRuntimeActionResponse(PublicModel):
-    type: Literal["candidate_questions_required"]
-    questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
-
-    @field_validator("questions")
-    @classmethod
-    def _validate_unique_questions(
-        cls, values: list[AdditionalInfoQuestion]
-    ) -> list[AdditionalInfoQuestion]:
-        return _validate_unique_additional_info_questions(values)
 
 
 class BrowserUseResultRuntimeActionResponse(BrowserUseExecutionResult):
@@ -1143,7 +1192,6 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 
 RuntimeActionResponse: TypeAlias = Annotated[
     BrowserUseResultRuntimeActionResponse
-    | CandidateQuestionsRequiredRuntimeActionResponse
     | SubmitApplicationResultRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | ApproveRuntimeActionResponse

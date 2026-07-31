@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import {
   Agent,
   RunContext,
+  ToolCallError,
   type Model,
   type ModelProvider,
   type Tool,
@@ -92,9 +93,85 @@ Complete every machine-actionable field. Prefer saved application, saved global,
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
-Do not request additional info while visible fields remain supported; upload the resume when visible. Batch all currently visible unknowns. If browser_use returns candidate_questions_required, call request_additional_info with its questions unchanged. After human navigation, batch newly revealed candidate questions before review. Scope availability globally; job-source and referral per application. Apply answers, re-scan, finish fields. Treat declines as unavailable; ask about saved facts only on conflict.
+Fill every visible field supported by current facts and upload the resume before requesting additional info. For remaining visible fields needing unavailable facts, call request_additional_info with one batch. After human navigation, inspect again and ask about new unknowns before review. Scope availability globally; job-source and referral per application. Apply answers, re-scan, and finish fields. Declines are unavailable; ask about saved facts only on conflict.
 
 Before explicit submission approval, never activate final Submit, Send, or Apply; press Enter to submit; call submission APIs; or bypass review. When complete, request human review. Apply revisions and review again. After approval, only submit_application and submit_application_result are enabled. Call each once. Use the final control's CSS selector. Report submitted only with verbatim confirmation from the trusted observation; otherwise report submission_uncertain.`;
+
+const EXPECTED_BROWSER_USE_DESCRIPTION = `Execute one Python body against the supplied session browser. Helpers are pre-imported; there is no \`page\` object. Print values you need in the tool output.
+
+Core workflow and syntax:
+- Inspect: \`info = page_info(); print(info)\`. Capture: \`shot = capture_screenshot(path=None, full=False, max_dim=1800); print(shot)\`. Screenshots also arrive with browser results; use \`click_at_xy(x, y, button="left", clicks=1)\`, then inspect again.
+- Navigate first with \`new_tab(url); wait_for_load(timeout=15.0)\`. Navigate later with \`result = goto_url(url); wait_for_load(timeout=15.0); print(result)\`. For SPAs: \`wait_for_element(selector, timeout=10.0, visible=False)\`.
+- Fill: \`fill_input(selector, text, clear_first=True, timeout=0.0)\`. Insert direct text: \`type_text(text)\`. Upload: \`upload_file(selector, path)\`.
+- Keys and scroll: \`press_key(key, modifiers=0)\`, \`dispatch_key(selector, key="Enter", event="keypress")\`, and \`scroll(x, y, dy=-300, dx=0)\`.
+- Timing and events: \`wait(seconds=1.0)\`, \`wait_for_load(timeout=15.0)\`, \`wait_for_element(selector, timeout=10.0, visible=False)\`, \`wait_for_network_idle(timeout=10.0, idle_ms=500)\`, and \`events = drain_events(); print(events)\`.
+- JavaScript: \`value = js(expression, target_id=None); print(value)\`. Raw CDP: \`result = cdp(method, session_id=None, **params); print(result)\`; for example \`print(cdp("DOM.getDocument", depth=-1))\`. The returned dictionary is the CDP result directly, not a nested \`result\`.
+- Tabs and frames: \`print(list_tabs(include_chrome=True))\`, \`tab = current_tab()\`, \`switch_tab(tab)\`, \`ensure_real_tab()\`, \`close_tab(target=None)\`, and \`iframe_target(url_substr)\`. CDP target order is not visual tab order; inspect after switching.
+
+Interaction guidance and syntax:
+- Screenshots and viewport (\`screenshots\`, \`viewport\`): \`info = page_info(); print(info["w"], info["h"], info["sx"], info["sy"], info["pw"], info["ph"])\`. Re-capture and re-measure after navigation, scrolling, viewport or layout changes, opening an overlay, or switching a tab.
+- Scrolling (\`scrolling\`): distinguish page scrolling, nested containers, virtualized lists, and dropdown menus. Example: \`scroll(400, 600, dy=500); wait(0.25); print(page_info())\`.
+- Forms and Custom dropdowns (\`dropdowns\`): classify a dropdown as a native select, custom overlay, searchable combobox, or virtualized menu. Open and re-measure it. Searchable example: \`fill_input("[role=combobox]", "query"); wait_for_element("[role=option]", timeout=10.0, visible=True)\`. Native-select example: \`print(js("""(() => { const e = document.querySelector("select"); e.value = "option_value"; e.dispatchEvent(new Event("input", { bubbles: true })); e.dispatchEvent(new Event("change", { bubbles: true })); return e.value; })()"""))\`.
+- Same-origin iframes (\`iframes\`): traverse with \`contentDocument\` or \`contentWindow\`. Example: \`print(js("""(() => document.querySelector("iframe").contentDocument.body.innerText)()"""))\`. Frame-local coordinates differ from page/viewport coordinates used by \`click_at_xy\`.
+- Cross-origin iframes (\`cross-origin-iframes\`): \`target = iframe_target("apply.example"); print(js("document.body.innerText", target_id=target))\`. Compositor-level \`click_at_xy\` can be simpler than cross-target DOM work.
+- Shadow DOM (\`shadow-dom\`): recurse through open \`shadowRoot\` trees. Example: \`print(js("""(() => document.querySelector("custom-element").shadowRoot.querySelector("input").value)()"""))\`. For deeply nested components, inspect and use a re-measured coordinate click.
+- Native dialogs (\`dialogs\`): when \`page_info()\` returns a \`dialog\`, page JavaScript is frozen. Accept: \`cdp("Page.handleJavaScriptDialog", accept=True)\`. Dismiss: \`cdp("Page.handleJavaScriptDialog", accept=False)\`. Prompt: \`cdp("Page.handleJavaScriptDialog", accept=True, promptText="answer")\`. Then \`print(drain_events()); print(page_info())\`.
+- Drag and drop (\`drag-and-drop\`): re-measure source and target, then use low-level input events: \`cdp("Input.dispatchMouseEvent", type="mousePressed", x=100, y=200, button="left", clickCount=1); cdp("Input.dispatchMouseEvent", type="mouseMoved", x=400, y=500, button="left"); cdp("Input.dispatchMouseEvent", type="mouseReleased", x=400, y=500, button="left", clickCount=1)\`. File drop zones can instead use \`upload_file(selector, path)\` when backed by a file input.
+- Network requests (\`network-requests\`): \`drain_events(); click_at_xy(x, y); print(wait_for_network_idle(timeout=10.0, idle_ms=500)); print(drain_events())\`.
+- Downloads: \`cdp("Browser.setDownloadBehavior", behavior="allow", downloadPath=os.environ["JOBHUNTER_SESSION_DIRECTORY"])\`; perform the download action, wait, then \`print(drain_events())\`.
+- Domain skills: \`result = goto_url(url); print(result.get("domain_skills", []))\`. Read available Markdown with \`for path in (AGENT_WORKSPACE / "domain-skills").rglob("*.md"): print(path.read_text(encoding="utf-8"))\`.
+
+Relevant Browser Harness interaction references are \`cross-origin-iframes\`, \`dialogs\`, \`drag-and-drop\`, \`dropdowns\`, \`iframes\`, \`network-requests\`, \`screenshots\`, \`scrolling\`, \`shadow-dom\`, \`tabs\`, \`uploads\`, and \`viewport\`.
+
+Pass only the Python body. Keep actions small, use numeric timeout arguments, and never start or attach another browser or invoke a daemon.`;
+
+const REQUIRED_BROWSER_GUIDANCE = [
+  "iframe_target(url_substr)",
+  "Native dialogs",
+  "wait_for_network_idle(timeout=10.0, idle_ms=500)",
+  "dispatch_key(selector, key=\"Enter\", event=\"keypress\")",
+  "type_text(text)",
+  "drain_events()",
+  "Shadow DOM",
+  "Custom dropdowns",
+  "Drag and drop",
+  "Cross-origin iframes",
+  "Downloads",
+  "Domain skills",
+  "cross-origin-iframes",
+  "dialogs",
+  "drag-and-drop",
+  "dropdowns",
+  "iframes",
+  "network-requests",
+  "screenshots",
+  "scrolling",
+  "shadow-dom",
+  "tabs",
+  "uploads",
+  "viewport",
+] as const;
+
+const REQUIRED_BROWSER_SYNTAX = [
+  "result = goto_url(url)",
+  "target = iframe_target(\"apply.example\")",
+  "js(\"document.body.innerText\", target_id=target)",
+  "cdp(\"Page.handleJavaScriptDialog\", accept=True)",
+  "cdp(\"Input.dispatchMouseEvent\", type=\"mousePressed\"",
+  "cdp(\"Browser.setDownloadBehavior\", behavior=\"allow\"",
+  "(AGENT_WORKSPACE / \"domain-skills\").rglob(\"*.md\")",
+] as const;
+
+const REMOVED_BROWSER_RESTRICTION_PROSE = [
+  "untrusted reference material",
+  "Do not use direct HTTP or network access to bypass",
+  "Target attachment is not permission",
+  "Never auto-accept consent",
+  "never upload it in place of the supplied resume",
+  "Never treat a coordinate click as permission to submit",
+  "Before cross-origin navigation, stop and request approval",
+  "Never activate the final Submit, Send, or Apply control before explicit approval",
+] as const;
 
 const RUN_INPUT = {
   sessionId: "123e4567-e89b-42d3-a456-426614174000",
@@ -378,296 +455,6 @@ describe("application agent", () => {
     ]);
   });
 
-  test("forces an exact human question batch before any further browser action", async () => {
-    const questions = [
-      {
-        id: "candidate_deadbeef",
-        key: "form.candidate_deadbeef",
-        scope: "application" as const,
-        question: "Review emphasis",
-        answer_type: "text" as const,
-      },
-      {
-        id: "candidate_cafebabe",
-        key: "form.candidate_cafebabe",
-        scope: "application" as const,
-        question: "Are you willing to travel?",
-        answer_type: "boolean" as const,
-      },
-    ];
-    const acceptedAnswers = [
-      {
-        id: "candidate_deadbeef",
-        key: "form.candidate_deadbeef",
-        scope: "application" as const,
-        answer_type: "text" as const,
-        status: "answered" as const,
-        value: "Emphasize production reliability.",
-      },
-      {
-        id: "candidate_cafebabe",
-        key: "form.candidate_cafebabe",
-        scope: "application" as const,
-        answer_type: "boolean" as const,
-        status: "declined" as const,
-      },
-    ];
-    const runtimeRequests: RuntimeActionRequest[] = [];
-    let additionalInfoCalls = 0;
-    let browserUseCalls = 0;
-    const dependencies = dependenciesWith(
-      async (request) => {
-        runtimeRequests.push(request);
-        if (request.type === "browser_use") {
-          browserUseCalls++;
-          if (browserUseCalls > 1) {
-            return { type: "candidate_questions_required", questions };
-          }
-          return {
-            type: "browser_use_result",
-            exit_code: 0,
-            timed_out: false,
-            stdout: "",
-            stderr: "",
-            stdout_truncated: false,
-            stderr_truncated: false,
-            observation: {
-              url: "https://apply.example.test/form",
-              title: "Application",
-              tabs: [],
-              dom: "input Review emphasis",
-              page_info: null,
-              screenshot: null,
-            },
-          };
-        }
-        if (request.type === "request_additional_info") {
-          additionalInfoCalls++;
-          return {
-            type: "additional_info",
-            answers: additionalInfoCalls === 1
-              ? acceptedAnswers.slice(0, 1)
-              : acceptedAnswers,
-          };
-        }
-        if (request.type === "request_human_review") {
-          return { type: "cancel", result: CANCELLED_RESULT };
-        }
-        throw new Error(`unexpected runtime action ${request.type}`);
-      },
-      async (agent, _input, options) => {
-        const context = options.context;
-        if (!context) throw new Error("application context is required");
-        const runContext = new RunContext(context);
-        const browserUse = functionTool(agent, "browser_use");
-        const additionalInfo = functionTool(agent, "request_additional_info");
-        const blockedTools = [
-          browserUse,
-          functionTool(agent, "request_human_navigation"),
-          functionTool(agent, "request_origin_approval"),
-          functionTool(agent, "request_human_review"),
-          functionTool(agent, "report_application_mismatch"),
-        ];
-
-        await browserUse.invoke(
-          runContext,
-          JSON.stringify({ code: "print('initial inspection')" }),
-        );
-        expect(context.browserUseCompleted).toBe(true);
-
-        expect(JSON.parse(String(await browserUse.invoke(
-          runContext,
-          JSON.stringify({ code: "print(page_info())" }),
-        )))).toEqual({ type: "candidate_questions_required", questions });
-        expect(context.pendingCandidateQuestions).toEqual(questions);
-        expect(context.browserUseCompleted).toBe(true);
-        for (const blocked of blockedTools) {
-          expect(await blocked.isEnabled(runContext, agent)).toBe(false);
-        }
-        expect(await additionalInfo.isEnabled(runContext, agent)).toBe(true);
-        await expect(browserUse.invoke(
-          runContext,
-          JSON.stringify({ code: "print('must not run')" }),
-        )).rejects.toMatchObject({ code: "INVALID_MODEL_OUTPUT" });
-        await expect(additionalInfo.invoke(
-          runContext,
-          JSON.stringify({
-            questions: [{ ...questions[0], question: "Changed by the model" }, questions[1]],
-          }),
-        )).rejects.toMatchObject({ code: "INVALID_MODEL_OUTPUT" });
-        expect(runtimeRequests).toHaveLength(2);
-
-        await expect(additionalInfo.invoke(
-          runContext,
-          JSON.stringify({ questions }),
-        )).rejects.toMatchObject({ code: "INVALID_MODEL_OUTPUT" });
-        expect(context.pendingCandidateQuestions).toEqual(questions);
-        expect(await browserUse.isEnabled(runContext, agent)).toBe(false);
-
-        expect(await additionalInfo.invoke(
-          runContext,
-          JSON.stringify({ questions }),
-        )).toBe(JSON.stringify({ type: "additional_info", answers: acceptedAnswers }));
-        expect(context.pendingCandidateQuestions).toBeUndefined();
-        expect(await browserUse.isEnabled(runContext, agent)).toBe(true);
-        expect(await functionTool(agent, "request_human_review").isEnabled(
-          runContext,
-          agent,
-        )).toBe(true);
-
-        await functionTool(agent, "request_human_review").invoke(
-          runContext,
-          JSON.stringify({ result: VALID_RESULT }),
-        );
-        throw new Error("review cancellation must terminate the run");
-      },
-    );
-
-    expect(await runApplicationAgent(
-      RUN_INPUT,
-      new AbortController().signal,
-      dependencies,
-    )).toEqual(CANCELLED_RESULT);
-    expect(runtimeRequests).toEqual([
-      { type: "browser_use", code: "print('initial inspection')" },
-      { type: "browser_use", code: "print(page_info())" },
-      { type: "request_additional_info", questions },
-      { type: "request_additional_info", questions },
-      { type: "request_human_review", result: VALID_RESULT },
-    ]);
-  });
-
-  test("keeps post-navigation inspection pending through candidate questions", async () => {
-    const questions = [{
-      id: "candidate_deadbeef",
-      key: "form.candidate_deadbeef",
-      scope: "application" as const,
-      question: "Review emphasis",
-      answer_type: "text" as const,
-    }];
-    const answers = [{
-      id: "candidate_deadbeef",
-      key: "form.candidate_deadbeef",
-      scope: "application" as const,
-      answer_type: "text" as const,
-      status: "answered" as const,
-      value: "Emphasize production reliability.",
-    }];
-    const runtimeRequests: RuntimeActionRequest[] = [];
-    let browserCalls = 0;
-    const dependencies = dependenciesWith(
-      async (request) => {
-        runtimeRequests.push(request);
-        switch (request.type) {
-          case "request_human_navigation":
-            return { type: "continue" };
-          case "browser_use":
-            browserCalls++;
-            if (browserCalls === 2) {
-              return { type: "candidate_questions_required", questions };
-            }
-            return {
-              type: "browser_use_result",
-              exit_code: 0,
-              timed_out: false,
-              stdout: "",
-              stderr: "",
-              stdout_truncated: false,
-              stderr_truncated: false,
-              observation: {
-                url: "https://apply.example.test/form",
-                title: "Application",
-                tabs: [],
-                dom: "input Review emphasis",
-                page_info: null,
-                screenshot: null,
-              },
-            };
-          case "request_additional_info":
-            return { type: "additional_info", answers };
-          case "request_human_review":
-            return { type: "cancel", result: CANCELLED_RESULT };
-          default:
-            throw new Error(`unexpected runtime action ${request.type}`);
-        }
-      },
-      async (agent, _input, options) => {
-        const context = options.context;
-        if (!context) throw new Error("application context is required");
-        const runContext = new RunContext(context);
-        const navigation = functionTool(agent, "request_human_navigation");
-        const browserUse = functionTool(agent, "browser_use");
-        const additionalInfo = functionTool(agent, "request_additional_info");
-        const review = functionTool(agent, "request_human_review");
-
-        expect(await navigation.isEnabled(runContext, agent)).toBe(false);
-        await expect(navigation.invoke(
-          runContext,
-          JSON.stringify({ instruction: "Complete login" }),
-        )).rejects.toMatchObject({ code: "INVALID_MODEL_OUTPUT" });
-        expect(runtimeRequests).toEqual([]);
-        await browserUse.invoke(
-          runContext,
-          JSON.stringify({ code: "print('initial inspection')" }),
-        );
-        expect(await navigation.isEnabled(runContext, agent)).toBe(true);
-
-        await navigation.invoke(
-          runContext,
-          JSON.stringify({ instruction: "Complete login" }),
-        );
-        expect(context.browserUseCompleted).toBe(false);
-        expect(context.postNavigationInspectionRequired).toBe(true);
-
-        expect(JSON.parse(String(await browserUse.invoke(
-          runContext,
-          JSON.stringify({ code: "print(page_info())" }),
-        )))).toEqual({ type: "candidate_questions_required", questions });
-        expect(context.browserUseCompleted).toBe(false);
-        expect(context.postNavigationInspectionRequired).toBe(true);
-
-        await additionalInfo.invoke(
-          runContext,
-          JSON.stringify({ questions }),
-        );
-        expect(context.pendingCandidateQuestions).toBeUndefined();
-        expect(context.browserUseCompleted).toBe(false);
-        expect(context.postNavigationInspectionRequired).toBe(true);
-        expect(await review.isEnabled(runContext, agent)).toBe(false);
-        await expect(review.invoke(
-          runContext,
-          JSON.stringify({ result: VALID_RESULT }),
-        )).rejects.toMatchObject({ code: "INVALID_MODEL_OUTPUT" });
-
-        await browserUse.invoke(
-          runContext,
-          JSON.stringify({ code: "print(page_info())" }),
-        );
-        expect(context.browserUseCompleted).toBe(true);
-        expect(context.postNavigationInspectionRequired).toBe(false);
-        expect(await review.isEnabled(runContext, agent)).toBe(true);
-        await review.invoke(
-          runContext,
-          JSON.stringify({ result: VALID_RESULT }),
-        );
-        throw new Error("review cancellation must terminate the run");
-      },
-    );
-
-    expect(await runApplicationAgent(
-      RUN_INPUT,
-      new AbortController().signal,
-      dependencies,
-    )).toEqual(CANCELLED_RESULT);
-    expect(runtimeRequests.map((request) => request.type)).toEqual([
-      "browser_use",
-      "request_human_navigation",
-      "browser_use",
-      "request_additional_info",
-      "browser_use",
-      "request_human_review",
-    ]);
-  });
 
   test("returns cancellation from the additional-information gate and rejects other responses", async () => {
     const questions = [{
@@ -892,6 +679,10 @@ describe("application agent", () => {
         expect(agent.model).toBe("gpt-5.6-sol");
         expect(agent.modelSettings).toMatchObject({
           reasoning: { effort: "high" },
+          contextManagement: [{
+            type: "compaction",
+            compactThreshold: 272_000,
+          }],
           toolChoice: "required",
           parallelToolCalls: false,
           store: false,
@@ -914,15 +705,26 @@ describe("application agent", () => {
           "submit_application_result",
         ]);
         expect(agent.tools.map((item) => item.type === "function" ? item.description : undefined)).toEqual([
-          "Execute Python against the supplied session browser. Helpers are pre-imported: use capture_screenshot or page_info to inspect, new_tab for first navigation, wait_for_load after navigation, click_at_xy for coordinate clicks, js for DOM work, and cdp for raw CDP. Pass only the Python body and never start or attach another browser. When inspection reveals a cross-origin target, end the action without navigating; request origin approval before a later navigation action.",
+          EXPECTED_BROWSER_USE_DESCRIPTION,
           "Pause for browser interaction that only the human can complete: login, CAPTCHA, 2FA, or an inaccessible or explicitly manual control.",
           "After a browser action reports a target's exact origin, request approval before any later browser action navigates to it.",
-          "Do not call this while any visible field can be completed from current facts; upload the supplied resume when its control is visible. When browser_use returns candidate_questions_required, pass its questions unchanged. Otherwise ask the human one bounded batch of structured factual questions. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction or already answered questions unless the page explicitly conflicts.",
+          "After a successful browser inspection, fill every visible field supported by current facts and upload the supplied resume when its control is visible. Then ask the human one bounded batch of structured questions for the remaining visible fields whose facts are unavailable. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction or already answered questions unless the page explicitly conflicts.",
           "Pause for final human review after every application field and warning has been handled. Summarize candidate-data and application fields, including completed nonstandard widgets. Omit navigation, human-only, and checkpoint controls; every fields_filled item has value_present true, and fields_needing_human contains only genuinely unresolved candidate fields.",
           "Report that the requested posting is unavailable or the visible application materially mismatches it.",
           "After explicit human approval, supply a stable CSS selector for the unique visible, enabled final Submit, Send, or Apply control. The browser harness resolves its current DOM position, performs exactly one application-owned native click, waits, and observes the result. Do not supply executable submission code.",
           "Record the final result using only the trusted submit_application observation.",
         ]);
+        const browserDescription = functionTool(agent, "browser_use").description;
+        for (const guidance of REQUIRED_BROWSER_GUIDANCE) {
+          expect(browserDescription).toContain(guidance);
+        }
+        expect(browserDescription).not.toContain("accept=True|False");
+        for (const syntax of REQUIRED_BROWSER_SYNTAX) {
+          expect(browserDescription).toContain(syntax);
+        }
+        for (const restriction of REMOVED_BROWSER_RESTRICTION_PROSE) {
+          expect(browserDescription).not.toContain(restriction);
+        }
         for (const item of agent.tools) {
           if (item.type !== "function") throw new Error("all application tools must be function tools");
           expect(item.strict).toBe(true);
@@ -1639,6 +1441,32 @@ describe("application agent", () => {
       RUN_INPUT,
       new AbortController().signal,
     )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+  });
+
+  test("unwraps an Agents SDK tool-call failure at the public error boundary", async () => {
+    const dependencies = dependenciesWith(
+      async () => {
+        throw new ApplicationRuntimeError("browser_failed");
+      },
+      async (agent, _input, options) => {
+        try {
+          await functionTool(agent, "browser_use").invoke(
+            new RunContext(options.context),
+            JSON.stringify({ code: "print('synthetic browser action')" }),
+          );
+        } catch (error) {
+          if (!(error instanceof ApplicationAgentFailure)) throw error;
+          throw new ToolCallError(`Failed to run function tools: ${error}`, error);
+        }
+        throw new Error("runtime failure must terminate the run");
+      },
+    );
+
+    await expect(runApplicationAgent(
+      RUN_INPUT,
+      new AbortController().signal,
+      dependencies,
+    )).rejects.toEqual(new ApplicationAgentFailure("BROWSER_FAILED"));
   });
 
   test("maps a runtime model timeout through the public error boundary", async () => {
