@@ -28,6 +28,10 @@ Persistent state is split deliberately:
 
 Treat these as runtime-owned stores. Use repository/services and supported scripts rather than ad hoc mutation.
 
+Context directives use the literal four-source allowlist: `apps/user-info/resume-main/Alex_Example_Resume.tex`, `apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md`, `apps/user-info/current-context/projects/sample-project-archive.md`, and `apps/user-info/current-context/projects/sample-project.md`. Only active evidence from an allowlisted `authoritative-markdown` source with an exact parsed terminal heading matching `^(?:21\.\s+)?Must Include$` becomes a separately typed requirement. A directive is a trusted requirement, never factual evidence; it activates only when the same entity has non-directive support. An unchanged or absent baseline entity is not synthesized, and disallowed sources, other headings, or `None specified` produce no directive.
+
+Analysis and edit model inputs separate directive metadata from factual authoritative evidence. Only supported non-skill bullet edits activate directives. Validation requires every active directive to remain on a same-entity factual edit and plan decision; directive IDs cannot support keywords, skills, fact winners, omissions, one-page correction candidates, or comments.
+
 ## Key Directories
 
 | Path | Purpose |
