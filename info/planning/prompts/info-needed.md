@@ -486,7 +486,7 @@ After scanning sections 1–20, ask the user for requirements that must appear i
 - Write each supplied requirement as one concise imperative sentence in its own separate Markdown evidence block, formatted as a bullet. Separate requirement blocks with a blank line. Record factual support for every requirement in sections 1–20 of the same dossier.
 - Treat requirements as conditional guidance, not as facts. Do not infer or add generic positioning, technologies, implementation details, history, or any other requirement that the user did not supply.
 - If the user supplies no requirement, write exactly `None specified` as the only content under this heading.
-- Only directives from the resolved manifest entry are indexed and exposed in the model-readable Must Include channel. A directive becomes validator-active only after the equivalent baseline entity has a supported non-directive factual bullet edit; never synthesize a missing baseline entity.
+- Requirements written by this workflow are indexed and exposed in the model-readable Must Include channel only when they reside in the resolved manifest entry. A directive becomes validator-active only after the equivalent baseline entity has a supported non-directive factual bullet edit; never synthesize a missing baseline entity.
 
 Prioritize the below information, when available
 
