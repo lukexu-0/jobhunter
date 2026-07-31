@@ -464,6 +464,14 @@ describe("guarded agents", () => {
         text: "Mention the project's production scale.",
         sha256: "2".repeat(64),
       },
+      {
+        ...CONTEXT.evidence[1]!,
+        id: "past-project-no-requirement",
+        ordinal: 3,
+        headingPath: ["Past Project", "21. Must Include"],
+        text: "None specified",
+        sha256: "3".repeat(64),
+      },
     ] as const;
     const context: ContextSnapshot = {
       ...CONTEXT,
@@ -1067,9 +1075,16 @@ describe("guarded agents", () => {
       text: "Keep the supported production-impact requirement.",
       sha256: "3".repeat(64),
     };
+    const sentinelBlock = {
+      ...requirementBlock,
+      id: "past-project-edit-no-requirement",
+      ordinal: 2,
+      text: "None specified",
+      sha256: "4".repeat(64),
+    };
     const context: ContextSnapshot = {
       ...CONTEXT,
-      evidence: [...CONTEXT.evidence, requirementBlock],
+      evidence: [...CONTEXT.evidence, requirementBlock, sentinelBlock],
       mustIncludeDirectives: [{
         evidenceId: requirementBlock.id,
         sourceId: requirementBlock.sourceId,

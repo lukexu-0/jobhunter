@@ -130,6 +130,7 @@ function withMustIncludeDirective(
     ...factualEvidence,
     id: `directive-${evidenceIndex}`,
     ordinal: factualEvidence.ordinal + 1,
+    headingPath: [...factualEvidence.headingPath, "21. Must Include"],
     text: "The resume must include the candidate's testing impact.",
   };
   return {
@@ -449,6 +450,23 @@ describe("analysis validation", () => {
       baseline,
       directive.snapshot,
     )).toThrow("requirement evidence directive-0 cannot be used by a JD keyword");
+
+    const sentinelEvidence: EvidenceBlock = {
+      ...directive.evidence,
+      id: "no-requirement",
+      text: "None specified",
+    };
+    const sentinelSnapshot: ContextSnapshot = {
+      ...snapshot,
+      evidence: [...snapshot.evidence, sentinelEvidence],
+      mustIncludeDirectives: [],
+    };
+    expect(() => validateAnalysisAgainstBaseline(
+      replaceEvidence(analysis, [sentinelEvidence.id]),
+      JOB_DESCRIPTION,
+      baseline,
+      sentinelSnapshot,
+    )).toThrow("requirement evidence no-requirement cannot be used by a JD keyword");
 
     const baselineOnly: JobAnalysis = {
       ...replaceEvidence(analysis, ["canonical-baseline-evidence"]),

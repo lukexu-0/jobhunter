@@ -125,6 +125,57 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
+  test("ignores retired source heads outside the current manifest", () => {
+    const root = createRepositoryFixture();
+    const loaded = loadFixture(root);
+    const database = openContextDatabase(":memory:");
+    try {
+      syncContext(database, loaded);
+      database.query(`
+        INSERT INTO source_versions
+          (id, source_id, relative_path, kind, entity_id, display_name, baseline_entity_ids_json, sha256, byte_count, indexed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        "retired-version",
+        "retired-source",
+        "retired/context.md",
+        "authoritative-markdown",
+        "project:retired",
+        "Retired source",
+        "[]",
+        sha256("retired source"),
+        14,
+        1,
+      );
+      database.query(`
+        INSERT INTO evidence_blocks
+          (id, source_version_id, source_id, entity_id, ordinal, heading_path_json, text, caveats_json, sha256)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        "retired-evidence",
+        "retired-version",
+        "retired-source",
+        "project:retired",
+        0,
+        JSON.stringify(["21. Must Include"]),
+        "Retired requirement.",
+        "[]",
+        sha256("retired requirement"),
+      );
+      database.query("INSERT INTO source_heads (source_id, source_version_id) VALUES (?, ?)")
+        .run("retired-source", "retired-version");
+
+      const snapshot = createContextSnapshot(database, loaded);
+      const manifestSourceIds = loaded.manifest.sources.map((source) => source.id);
+      expect(snapshot.sources.map((source) => source.id)).toEqual(manifestSourceIds);
+      expect(snapshot.evidence.every((block) => manifestSourceIds.includes(block.sourceId))).toBe(true);
+      expect(snapshot.evidence.some((block) => block.id === "retired-evidence")).toBe(false);
+      expect(snapshot.mustIncludeDirectives.some((directive) => directive.sourceId === "retired-source")).toBe(false);
+    } finally {
+      database.close();
+    }
+  });
+
   test("keeps directive heading and sentinel matching exact", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);

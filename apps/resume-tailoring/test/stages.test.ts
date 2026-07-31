@@ -176,6 +176,7 @@ function resumeFixturesWithActiveDirective(jobDescription: string): ResumeFixtur
     ...factualEvidence,
     id: ACTIVE_DIRECTIVE_EVIDENCE_ID,
     ordinal: factualEvidence.ordinal + 1,
+    headingPath: [...factualEvidence.headingPath, "21. Must Include"],
     text: "The resume must include the candidate's supported testing impact.",
   };
   const snapshot: ContextSnapshot = {
@@ -729,7 +730,14 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       ...factualEvidence,
       id: "competition-directive",
       ordinal: 0,
+      headingPath: [...factualEvidence.headingPath, "21. Must Include"],
       text: "The resume must include the competition result when supported.",
+    };
+    const sentinelEvidence: EvidenceBlock = {
+      ...directiveEvidence,
+      id: "competition-no-requirement",
+      ordinal: 2,
+      text: "None specified",
     };
     const sources = baseFixture.snapshot.sources.map((candidate) =>
       candidate.id === source.id ? source : candidate);
@@ -739,6 +747,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       sourceHashes: Object.fromEntries(sources.map((item) => [item.id, item.sha256])),
       evidence: [
         directiveEvidence,
+        sentinelEvidence,
         factualEvidence,
         ...baseFixture.snapshot.evidence.filter((evidence) => evidence.id !== replacedEvidence.id),
       ],
@@ -769,7 +778,28 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(correction?.candidates.flatMap((candidate) => candidate.evidenceIds))
       .not.toContain(directiveEvidence.id);
     expect(correction?.candidates.flatMap((candidate) => candidate.evidenceIds))
+      .not.toContain(sentinelEvidence.id);
+    expect(correction?.candidates.flatMap((candidate) => candidate.evidenceIds))
       .toContain(factualEvidence.id);
+    await reportUnexpectedFailure(harness);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+  });
+
+  test("does not offer analysis-active must-include bullets for one-page omission", async () => {
+    const fixtures = resumeFixturesWithActiveDirective("Strong TypeScript engineer");
+    const activeEdit = fixtures.analysis.exactEdits.find((edit) =>
+      edit.kind === "bullet"
+      && edit.evidenceIds.includes(ACTIVE_DIRECTIVE_EVIDENCE_ID))!;
+    const harness = await createHarness({
+      fixtures,
+      deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
+    });
+
+    await processToStop(harness);
+
+    const correction = harness.agentInputs.tailoring[1]?.onePageCorrection;
+    expect(correction?.candidates.map((candidate) => candidate.baselineItemId))
+      .not.toContain(activeEdit.baselineItemId);
     await reportUnexpectedFailure(harness);
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
   });

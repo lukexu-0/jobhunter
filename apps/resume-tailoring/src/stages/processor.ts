@@ -13,6 +13,7 @@ import {
   type OnePageCorrection,
 } from "../agents/index.ts";
 import type { ContextSnapshot } from "../context/types.ts";
+import { isMustIncludeEvidenceBlock } from "../context/directives.ts";
 import { ResumeDiffSchema } from "../contracts/index.ts";
 import { ClaimRejectedError, type PublicArtifact, type PublicAttempt, type PublicRun } from "../db/repository.ts";
 import { inspectResumePng, type GeminiInspectorOptions } from "../models/gemini-inspector.ts";
@@ -52,6 +53,13 @@ const SECTION_OMISSION_PRIORITY: Readonly<Record<OnePageCorrection["candidates"]
   projects: 1,
   experience: 2,
 };
+
+function mustIncludeSectionEvidenceIds(snapshot: ContextSnapshot): readonly string[] {
+  const sourceById = new Map(snapshot.sources.map((source) => [source.id, source]));
+  return snapshot.evidence
+    .filter((block) => isMustIncludeEvidenceBlock(sourceById.get(block.sourceId), block))
+    .map((block) => block.id);
+}
 
 interface OnePageCorrectionArtifact {
   readonly failureCount: number;
@@ -317,9 +325,11 @@ export class PipelineStageProcessor {
   async #tailor(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
     const analysisArtifact = this.#requiredArtifact(run.id, "job-analysis");
     const analysis = JobAnalysisSchema.parse(await this.#readJson(analysisArtifact));
+    const mustIncludeEvidenceIds = mustIncludeSectionEvidenceIds(sources.snapshot);
+    const mustIncludeEvidenceIdSet = new Set(mustIncludeEvidenceIds);
     const correctionArtifact = this.#currentRevisionArtifact(run, "one-page-correction");
     const onePageCorrection = correctionArtifact
-      ? await this.#onePageCorrection(correctionArtifact, sources, analysis)
+      ? await this.#onePageCorrection(correctionArtifact, sources, analysis, mustIncludeEvidenceIdSet)
       : undefined;
     await this.#verifyAgain(run.id, signal);
     const result = await this.#tailoringAgent({
@@ -327,8 +337,7 @@ export class PipelineStageProcessor {
       input: {
         analysis,
         baseline: sources.baseline,
-        mustIncludeEvidenceIds: sources.snapshot.mustIncludeDirectives.map((directive) =>
-          directive.evidenceId),
+        mustIncludeEvidenceIds,
         operations: {
           renderPlan: (plan, toolSignal) => {
             toolSignal.throwIfAborted();
@@ -564,7 +573,12 @@ export class PipelineStageProcessor {
         : undefined;
       if (priorArtifact && prior) {
         const analysis = JobAnalysisSchema.parse(await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")));
-        const currentCorrection = await this.#onePageCorrection(priorArtifact, sources, analysis);
+        const currentCorrection = await this.#onePageCorrection(
+          priorArtifact,
+          sources,
+          analysis,
+          new Set(mustIncludeSectionEvidenceIds(sources.snapshot)),
+        );
         if (currentCorrection.requiredOmissionCount >= currentCorrection.candidates.length) {
           this.#repository.finishAttempt(claim, attempt.id, "failed", audit);
           this.#repository.transition(claim, "failed", { failedStage: "deterministic_qa" });
@@ -695,24 +709,32 @@ export class PipelineStageProcessor {
     artifact: PublicArtifact,
     sources: StageSourceContext,
     analysis: JobAnalysis,
+    mustIncludeEvidenceIds: ReadonlySet<string>,
   ): Promise<OnePageCorrection> {
     const state = parseOnePageCorrectionArtifact(await this.#readJson(artifact));
     const baseline = parseBaselineResume(sources.baseline);
     const baselineSourceIds = new Set(
       sources.snapshot.sources.filter((source) => source.kind === "baseline").map((source) => source.id),
     );
+    const editTargets = new Set(analysis.exactEdits.map((edit) => edit.baselineItemId));
     const directiveEvidenceIds = new Set(
       sources.snapshot.mustIncludeDirectives.map((directive) => directive.evidenceId),
     );
-    const editTargets = new Set(analysis.exactEdits.map((edit) => edit.baselineItemId));
+    const mustIncludeEditTargets = new Set(
+      analysis.exactEdits
+        .filter((edit) => edit.kind === "bullet"
+          && edit.evidenceIds.some((evidenceId) => directiveEvidenceIds.has(evidenceId)))
+        .map((edit) => edit.baselineItemId),
+    );
     const candidates = baseline.bullets
       .map((bullet, index) => {
+        if (mustIncludeEditTargets.has(bullet.id)) return undefined;
         const evidence = sources.snapshot.evidence.find((candidate) =>
-          !directiveEvidenceIds.has(candidate.id)
+          !mustIncludeEvidenceIds.has(candidate.id)
           && baselineSourceIds.has(candidate.sourceId)
           && equivalentEntities(candidate.entityId, bullet.entityId, sources.snapshot))
           ?? sources.snapshot.evidence.find((candidate) =>
-            !directiveEvidenceIds.has(candidate.id)
+            !mustIncludeEvidenceIds.has(candidate.id)
             && equivalentEntities(candidate.entityId, bullet.entityId, sources.snapshot));
         return evidence ? {
           baselineItemId: bullet.id,

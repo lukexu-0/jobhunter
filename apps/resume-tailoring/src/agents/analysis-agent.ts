@@ -16,6 +16,7 @@ import {
 import { parseBaselineResume } from "../resume/parser.ts";
 import { MODEL_NAME } from "../models/oauth-codex-model.ts";
 import type { ContextSnapshot } from "../context/types.ts";
+import { isMustIncludeEvidenceBlock } from "../context/directives.ts";
 import {
   ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256,
   validateAtsKeywordExtractionAgainstJobDescription,
@@ -311,16 +312,14 @@ export async function runAnalysisAgent(attempt: AnalysisAgentAttempt): Promise<J
     attempt.input.rawJobDescription,
   );
   const baselineInventory = parseBaselineResume(attempt.input.canonicalCv);
-  const sourceKindById = new Map(attempt.input.context.sources.map((source) => [source.id, source.kind]));
-  const directiveEvidenceIds = new Set(
-    attempt.input.context.mustIncludeDirectives.map((directive) => directive.evidenceId),
-  );
-  const authoritative = Object.freeze(attempt.input.context.evidence.filter(
-    (block) => sourceKindById.get(block.sourceId) === "authoritative-markdown"
-      && !directiveEvidenceIds.has(block.id),
-  ));
+  const sourceById = new Map(attempt.input.context.sources.map((source) => [source.id, source]));
+  const authoritative = Object.freeze(attempt.input.context.evidence.filter((block) => {
+    const source = sourceById.get(block.sourceId);
+    return source?.kind === "authoritative-markdown"
+      && !isMustIncludeEvidenceBlock(source, block);
+  }));
   const baselineCitations = attempt.input.context.evidence
-    .filter((block) => sourceKindById.get(block.sourceId) === "baseline")
+    .filter((block) => sourceById.get(block.sourceId)?.kind === "baseline")
     .map(({ id, sourceVersionId, sourceId, entityId, headingPath, caveats, sha256 }) => (
       { id, sourceVersionId, sourceId, entityId, headingPath, caveats, sha256 }
     ));

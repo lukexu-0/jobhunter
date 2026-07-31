@@ -186,6 +186,7 @@ export function createContextSnapshot(
 ): ContextSnapshot {
   const freshness = checkContextFreshness(database, loaded);
   if (!freshness.fresh) throw new Error("Context index is stale; synchronize before creating a snapshot");
+  const manifestSourceIds = new Set(loaded.manifest.sources.map((source) => source.id));
   const rows = database.query<SourceRow, []>(`
     SELECT v.* FROM source_versions v JOIN source_heads h ON h.source_version_id = v.id
   `).all();
@@ -206,7 +207,7 @@ export function createContextSnapshot(
     SELECT b.* FROM evidence_blocks b JOIN source_heads h ON h.source_version_id = b.source_version_id
     ORDER BY b.source_id, b.ordinal
   `).all();
-  const evidence = Object.freeze(evidenceRows.map(evidenceFromRow));
+  const evidence = Object.freeze(evidenceRows.filter((row) => manifestSourceIds.has(row.source_id)).map(evidenceFromRow));
   const sourceHashes = Object.freeze(Object.fromEntries(sources.map((source) => [source.id, source.sha256])));
   const baseline = sources.find((source) => source.kind === "baseline");
   if (!baseline) throw new Error("Indexed context has no baseline");

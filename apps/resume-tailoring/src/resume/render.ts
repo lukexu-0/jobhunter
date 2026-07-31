@@ -1,4 +1,5 @@
 import type { ContextSnapshot, EvidenceBlock } from "../context/types.ts";
+import { isMustIncludeEvidenceBlock } from "../context/directives.ts";
 import { parseBaselineResume, type BaselineEntity, type ParsedBaselineResume } from "./parser.ts";
 import { TailoringPlanSchema, type ResumeSection, type TailoringDecision, type TailoringPlan } from "./types.ts";
 
@@ -60,21 +61,25 @@ export function validatePlanMustIncludeDirectives(
   const directiveByEvidenceId = new Map(
     snapshot.mustIncludeDirectives.map((directive) => [directive.evidenceId, directive]),
   );
-  if (directiveByEvidenceId.size === 0) return;
-  const directiveEvidenceIds = new Set(directiveByEvidenceId.keys());
   const evidenceById = new Map(snapshot.evidence.map((block) => [block.id, block]));
   const sourceById = new Map(snapshot.sources.map((source) => [source.id, source]));
+  const mustIncludeEvidenceIds = new Set(
+    snapshot.evidence
+      .filter((block) => isMustIncludeEvidenceBlock(sourceById.get(block.sourceId), block))
+      .map((block) => block.id),
+  );
+  if (mustIncludeEvidenceIds.size === 0) return;
   const includedDecisions = plan.decisions.filter((decision) =>
     decision.action === "add" || decision.action === "rewrite");
   const hasFactualSupport = (
     evidenceIds: readonly string[],
     directive: ContextSnapshot["mustIncludeDirectives"][number],
   ): boolean => evidenceIds.some((evidenceId) => {
-    if (directiveEvidenceIds.has(evidenceId)) return false;
+    if (mustIncludeEvidenceIds.has(evidenceId)) return false;
     const block = evidenceById.get(evidenceId);
     const source = block ? sourceById.get(block.sourceId) : undefined;
     return Boolean(block
-      && source?.kind !== "baseline"
+      && source?.kind === "authoritative-markdown"
       && equivalentEntities(block.entityId, directive.entityId, snapshot));
   });
   const activeDirectiveIds = new Set(
@@ -86,8 +91,11 @@ export function validatePlanMustIncludeDirectives(
 
   for (const decision of plan.decisions) {
     for (const evidenceId of decision.evidenceIds) {
+      if (!mustIncludeEvidenceIds.has(evidenceId)) continue;
       const directive = directiveByEvidenceId.get(evidenceId);
-      if (!directive) continue;
+      if (!directive) {
+        throw new ResumeValidationError(`non-directive Must Include evidence ${evidenceId} cannot support a plan decision`);
+      }
       if (decision.action !== "add" && decision.action !== "rewrite") {
         throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot be used on ${decision.action} decision content`);
       }
@@ -102,19 +110,19 @@ export function validatePlanMustIncludeDirectives(
   }
   for (const decision of plan.skillDecisions) {
     for (const evidenceId of decision.evidenceIds) {
-      if (directiveEvidenceIds.has(evidenceId)) {
+      if (mustIncludeEvidenceIds.has(evidenceId)) {
         throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot be used on a skill decision`);
       }
     }
   }
   for (const winner of plan.factWinners) {
-    if (directiveEvidenceIds.has(winner.evidenceId)) {
+    if (mustIncludeEvidenceIds.has(winner.evidenceId)) {
       throw new ResumeValidationError(`requirement evidence ${winner.evidenceId} cannot support a fact winner`);
     }
   }
   for (const omission of plan.omissions) {
     for (const evidenceId of omission.evidenceIds) {
-      if (directiveEvidenceIds.has(evidenceId)) {
+      if (mustIncludeEvidenceIds.has(evidenceId)) {
         throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot support omission metadata`);
       }
     }
@@ -126,7 +134,10 @@ export function validatePlanMustIncludeDirectives(
   );
   for (const override of plan.baselineOverrides) {
     for (const evidenceId of override.evidenceIds) {
-      if (!directiveEvidenceIds.has(evidenceId)) continue;
+      if (!mustIncludeEvidenceIds.has(evidenceId)) continue;
+      if (!directiveByEvidenceId.has(evidenceId)) {
+        throw new ResumeValidationError(`non-directive Must Include evidence ${evidenceId} cannot support baseline override metadata`);
+      }
       const decision = decisionsByBaselineItemId.get(override.baselineItemId);
       if (!decision?.evidenceIds.includes(evidenceId)) {
         throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot be relocated to baseline override metadata`);

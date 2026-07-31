@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ContextSnapshot } from "../context/types.ts";
+import { isMustIncludeEvidenceBlock } from "../context/directives.ts";
 import { parseBaselineResume } from "./parser.ts";
 import { EditResultSchema, JobAnalysisSchema, TailoringPlanSchema, type CommentDisposition, type EditResult, type JobAnalysis, type RepairResult, type TailoringPlan } from "./types.ts";
 import { equivalentEntities, ResumeValidationError, validatePlanMustIncludeDirectives } from "./render.ts";
@@ -226,16 +227,20 @@ export function collectAnalysisSemanticIssues(
   const directiveByEvidenceId = new Map(
     snapshot.mustIncludeDirectives.map((directive) => [directive.evidenceId, directive]),
   );
-  const directiveEvidenceIds = new Set(directiveByEvidenceId.keys());
+  const mustIncludeEvidenceIds = new Set(
+    snapshot.evidence
+      .filter((block) => isMustIncludeEvidenceBlock(sourceById.get(block.sourceId), block))
+      .map((block) => block.id),
+  );
   const hasFactualSupport = (
     evidenceIds: readonly string[],
     directive: ContextSnapshot["mustIncludeDirectives"][number],
   ): boolean => evidenceIds.some((evidenceId) => {
-    if (directiveEvidenceIds.has(evidenceId)) return false;
+    if (mustIncludeEvidenceIds.has(evidenceId)) return false;
     const block = evidenceById.get(evidenceId);
     const source = block ? sourceById.get(block.sourceId) : undefined;
     return Boolean(block
-      && source?.kind !== "baseline"
+      && source?.kind === "authoritative-markdown"
       && equivalentEntities(block.entityId, directive.entityId, snapshot));
   });
   const bulletEdits = analysis.exactEdits.filter((edit) => edit.kind === "bullet");
@@ -248,7 +253,7 @@ export function collectAnalysisSemanticIssues(
   for (let keywordIndex = 0; keywordIndex < analysis.jdKeywords.length; keywordIndex++) {
     const keyword = analysis.jdKeywords[keywordIndex]!;
     for (let evidenceIndex = 0; evidenceIndex < keyword.evidenceIds.length; evidenceIndex++) {
-      if (!directiveEvidenceIds.has(keyword.evidenceIds[evidenceIndex]!)) continue;
+      if (!mustIncludeEvidenceIds.has(keyword.evidenceIds[evidenceIndex]!)) continue;
       issues.push(semanticIssue(
         "must-include-placement",
         "must-include-directives",
@@ -260,8 +265,18 @@ export function collectAnalysisSemanticIssues(
   for (let editIndex = 0; editIndex < analysis.exactEdits.length; editIndex++) {
     const edit = analysis.exactEdits[editIndex]!;
     for (let evidenceIndex = 0; evidenceIndex < edit.evidenceIds.length; evidenceIndex++) {
-      const directive = directiveByEvidenceId.get(edit.evidenceIds[evidenceIndex]!);
-      if (!directive) continue;
+      const evidenceId = edit.evidenceIds[evidenceIndex]!;
+      if (!mustIncludeEvidenceIds.has(evidenceId)) continue;
+      const directive = directiveByEvidenceId.get(evidenceId);
+      if (!directive) {
+        issues.push(semanticIssue(
+          "must-include-placement",
+          "must-include-directives",
+          ["exactEdits", editIndex, "evidenceIds", evidenceIndex],
+          "must not cite non-directive Must Include section evidence",
+        ));
+        continue;
+      }
       if (edit.kind === "skill") {
         issues.push(semanticIssue(
           "must-include-placement",
@@ -366,7 +381,8 @@ function failFastSemanticMessage(
       const evidenceId = typeof evidenceIndex === "number"
         ? (edit?.evidenceIds[evidenceIndex] ?? keyword?.evidenceIds[evidenceIndex])
         : undefined;
-      return `requirement evidence ${evidenceId ?? "unknown"} cannot be used by ${edit?.kind === "skill" ? "a skill edit" : "a JD keyword"}`;
+      const target = keyword ? "a JD keyword" : edit?.kind === "skill" ? "a skill edit" : "a bullet edit";
+      return `requirement evidence ${evidenceId ?? "unknown"} cannot be used by ${target}`;
     }
     case "must-include-support": {
       const evidenceIndex = issue.path[3];
@@ -417,18 +433,20 @@ function validateAnalysisPlanMustIncludeContinuity(
 ): void {
   const evidenceById = new Map(snapshot.evidence.map((block) => [block.id, block]));
   const sourceById = new Map(snapshot.sources.map((source) => [source.id, source]));
-  const directiveEvidenceIds = new Set(
-    snapshot.mustIncludeDirectives.map((directive) => directive.evidenceId),
+  const mustIncludeEvidenceIds = new Set(
+    snapshot.evidence
+      .filter((block) => isMustIncludeEvidenceBlock(sourceById.get(block.sourceId), block))
+      .map((block) => block.id),
   );
   const hasFactualSupport = (
     evidenceIds: readonly string[],
     directive: ContextSnapshot["mustIncludeDirectives"][number],
   ): boolean => evidenceIds.some((evidenceId) => {
-    if (directiveEvidenceIds.has(evidenceId)) return false;
+    if (mustIncludeEvidenceIds.has(evidenceId)) return false;
     const block = evidenceById.get(evidenceId);
     const source = block ? sourceById.get(block.sourceId) : undefined;
     return Boolean(block
-      && source?.kind !== "baseline"
+      && source?.kind === "authoritative-markdown"
       && equivalentEntities(block.entityId, directive.entityId, snapshot));
   });
   const bulletEdits = analysis.exactEdits.filter((edit) => edit.kind === "bullet");
@@ -453,8 +471,11 @@ export function validateCommentDispositions(comments: readonly string[], disposi
   const indexes = dispositions.map((item) => item.commentIndex);
   if (new Set(indexes).size !== indexes.length || indexes.some((index) => index < 0 || index >= comments.length)) throw new ResumeValidationError("comment dispositions contain missing, duplicate, or unknown indexes");
   const evidenceIds = new Set(snapshot.evidence.map((block) => block.id));
-  const directiveEvidenceIds = new Set(
-    snapshot.mustIncludeDirectives.map((directive) => directive.evidenceId),
+  const sourceById = new Map(snapshot.sources.map((source) => [source.id, source]));
+  const mustIncludeEvidenceIds = new Set(
+    snapshot.evidence
+      .filter((block) => isMustIncludeEvidenceBlock(sourceById.get(block.sourceId), block))
+      .map((block) => block.id),
   );
   for (let index = 0; index < comments.length; index++) {
     const comment = comments[index];
@@ -463,7 +484,7 @@ export function validateCommentDispositions(comments: readonly string[], disposi
     if (!disposition) throw new ResumeValidationError(`comment ${index} has no disposition`);
     for (const evidenceId of disposition.evidenceIds) {
       if (!evidenceIds.has(evidenceId)) throw new ResumeValidationError(`comment disposition cites unknown evidence ${evidenceId}`);
-      if (directiveEvidenceIds.has(evidenceId)) throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot support a comment disposition`);
+      if (mustIncludeEvidenceIds.has(evidenceId)) throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot support a comment disposition`);
     }
   }
 }
