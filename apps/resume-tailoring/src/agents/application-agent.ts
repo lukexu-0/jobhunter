@@ -802,7 +802,7 @@ export async function runApplicationAgent(
       reasoning: { effort: "high" },
       contextManagement: [{
         type: "compaction",
-        compactThreshold: 334_800,
+        compactThreshold: 272_000,
       }],
       toolChoice: "required",
       parallelToolCalls: false,
