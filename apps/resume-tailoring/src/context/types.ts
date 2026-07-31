@@ -35,12 +35,20 @@ export interface EvidenceBlock {
 }
 
 
+export interface ContextMustIncludeDirective {
+  readonly evidenceId: string;
+  readonly sourceId: string;
+  readonly entityId: string;
+  readonly text: string;
+}
+
 export interface ContextSnapshot {
   readonly manifestSha256: string;
   readonly baselineSha256: string;
   readonly sourceHashes: Readonly<Record<string, string>>;
   readonly sources: readonly IndexedContextSource[];
   readonly evidence: readonly EvidenceBlock[];
+  readonly mustIncludeDirectives: readonly ContextMustIncludeDirective[];
   readonly explicitEntityBindings: Readonly<Record<string, string>>;
 }
 

@@ -7,6 +7,7 @@ import {
   REPOSITORY_ROOT,
   checkContextFreshness,
   createContextSnapshot,
+  extractMustIncludeDirectives,
   loadContextManifest,
   openContextDatabase,
   resolveContextSource,
@@ -91,6 +92,77 @@ describe("allowlisted context ingestion", () => {
       syncContext(database, loaded, 300);
       const versions = database.query<{ count: number }, []>("SELECT count(*) AS count FROM source_versions WHERE source_id = 'sample-project-archive'").get();
       expect(versions?.count).toBe(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("projects trusted Must Include directives from active authoritative evidence", () => {
+    const root = createRepositoryFixture();
+    const loaded = loadFixture(root);
+    const [baseline, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
+    const requiredText = "Keep the Jobhunter framing.\n- Preserve exact directive provenance.";
+    writeFileSync(join(root, baseline!.relativePath), "## 21. Must Include\nBaseline content is not a directive.\n");
+    writeFileSync(join(root, requiredSource!.relativePath), `# Required\n## 21. Must Include\n${requiredText}\n`);
+    writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 22. Must Include\nA nonmatching heading is not a directive.\n");
+    writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
+    const database = openContextDatabase(":memory:");
+    try {
+      syncContext(database, loaded);
+      const snapshot = createContextSnapshot(database, loaded);
+      const requiredEvidence = snapshot.evidence.find((block) => block.text === requiredText);
+      expect(requiredEvidence).toBeDefined();
+      expect(snapshot.mustIncludeDirectives).toEqual([{
+        evidenceId: requiredEvidence!.id,
+        sourceId: requiredSource!.id,
+        entityId: requiredSource!.entityId,
+        text: requiredText,
+      }]);
+      expect(Object.isFrozen(snapshot.mustIncludeDirectives)).toBe(true);
+      expect(Object.isFrozen(snapshot.mustIncludeDirectives[0])).toBe(true);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("keeps directive heading and sentinel matching exact", () => {
+    const root = createRepositoryFixture();
+    const loaded = loadFixture(root);
+    const [, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
+    writeFileSync(join(root, requiredSource!.relativePath), "# Context\n## Must Include\nUnnumbered requirement.\n## 21. Must Include\nnone specified\n");
+    writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 21. Must Include Extra\nNot a matching heading.\n");
+    writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## Must Include\nNone   specified\n");
+    const database = openContextDatabase(":memory:");
+    try {
+      syncContext(database, loaded);
+      const snapshot = createContextSnapshot(database, loaded);
+      expect(snapshot.mustIncludeDirectives.map(({ sourceId, text }) => ({ sourceId, text }))).toEqual([
+        { sourceId: requiredSource!.id, text: "Unnumbered requirement." },
+        { sourceId: requiredSource!.id, text: "none specified" },
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("rejects evidence that is not associated with its indexed manifest source", () => {
+    const root = createRepositoryFixture();
+    const loaded = loadFixture(root);
+    const requiredSource = loaded.manifest.sources[1]!;
+    writeFileSync(join(root, requiredSource.relativePath), "# Context\n## Must Include\nRequired association.\n");
+    const database = openContextDatabase(":memory:");
+    try {
+      syncContext(database, loaded);
+      const snapshot = createContextSnapshot(database, loaded);
+      const evidence = snapshot.evidence.find((block) => block.text === "Required association.")!;
+      expect(() => extractMustIncludeDirectives(snapshot.sources, [{
+        ...evidence,
+        sourceVersionId: snapshot.sources[0]!.sourceVersionId,
+      }])).toThrow("does not match its indexed source");
+      expect(() => extractMustIncludeDirectives(snapshot.sources, [{
+        ...evidence,
+        sourceId: "not-in-manifest",
+      }])).toThrow("does not match its indexed source");
     } finally {
       database.close();
     }
