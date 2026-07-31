@@ -577,7 +577,7 @@ class SessionError(PublicModel):
 class BrowserUseDiagnostic(PublicModel):
     step: int = Field(ge=1, le=500)
     status: Literal["succeeded", "failed", "timed_out"]
-    exit_code: int | None
+    exit_code: int
     timed_out: bool
     error_category: Literal[
         "process_exit",
@@ -585,10 +585,53 @@ class BrowserUseDiagnostic(PublicModel):
         "browser_runtime",
         "session_timeout",
     ] | None
-    stderr_excerpt: (
-        Annotated[str, StringConstraints(strict=True, max_length=512)] | None
-    )
+    stderr_excerpt: Literal[
+        "[redacted]",
+        "Browser Use execution timed out after 120 seconds.",
+        "Browser runtime failed.",
+        "Application session expired.",
+    ] | None
     stderr_truncated: bool
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> BrowserUseDiagnostic:
+        expected_status = (
+            "timed_out"
+            if self.timed_out
+            else "succeeded"
+            if self.exit_code == 0
+            else "failed"
+        )
+        if self.status != expected_status:
+            raise ValueError("status does not match the browser outcome")
+        if self.error_category == "execution_timeout":
+            expected_excerpt = "Browser Use execution timed out after 120 seconds."
+            valid_category = self.timed_out
+        elif self.error_category == "session_timeout":
+            expected_excerpt = "Application session expired."
+            valid_category = self.timed_out and self.exit_code == -1
+        elif self.error_category == "browser_runtime":
+            expected_excerpt = "Browser runtime failed."
+            valid_category = not self.timed_out and self.exit_code == -1
+        elif self.error_category == "process_exit":
+            expected_excerpt = None
+            valid_category = not self.timed_out and self.exit_code != 0
+        else:
+            expected_excerpt = None
+            valid_category = not self.timed_out and self.exit_code == 0
+        if not valid_category:
+            raise ValueError("error_category does not match the browser outcome")
+        if (
+            expected_excerpt is not None
+            and self.stderr_excerpt != expected_excerpt
+        ):
+            raise ValueError("stderr_excerpt does not match the fixed error catalog")
+        if expected_excerpt is None and self.stderr_excerpt not in (
+            None,
+            "[redacted]",
+        ):
+            raise ValueError("stderr_excerpt must be absent or redacted")
+        return self
 
 
 class HumanNavigationPendingAction(PublicModel):

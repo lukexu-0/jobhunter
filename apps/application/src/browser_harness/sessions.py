@@ -1732,7 +1732,7 @@ class ApplicationSessionManager:
             diagnostic = BrowserUseDiagnostic(
                 step=step,
                 status="timed_out" if session_timed_out else "failed",
-                exit_code=None,
+                exit_code=-1,
                 timed_out=session_timed_out,
                 error_category=(
                     "session_timeout" if session_timed_out else "browser_runtime"

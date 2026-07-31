@@ -33,6 +33,15 @@ function rawSnapshot(overrides: Record<string, unknown> = {}): Record<string, un
     files_attached: ["resume.pdf"],
     warnings: ["Review before submitting."],
     revision_count: 1,
+    browser_use_diagnostics: [{
+      step: 1,
+      status: "failed",
+      exit_code: 1,
+      timed_out: false,
+      error_category: "process_exit",
+      stderr_excerpt: "[redacted]",
+      stderr_truncated: false,
+    }],
     pending_action: {
       type: "additional_info",
       questions: [{
@@ -79,6 +88,15 @@ describe("HttpApplicationHarnessClient", () => {
       filesAttached: ["resume.pdf"],
       warnings: ["Review before submitting."],
       revisionCount: 1,
+      browserUseDiagnostics: [{
+        step: 1,
+        status: "failed",
+        exitCode: 1,
+        timedOut: false,
+        errorCategory: "process_exit",
+        stderrExcerpt: "[redacted]",
+        stderrTruncated: false,
+      }],
       pendingAction: {
         type: "additional_info",
         questions: [{

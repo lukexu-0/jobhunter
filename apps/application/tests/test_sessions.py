@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from threading import Event as ThreadEvent
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -2523,6 +2523,19 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
     assert step.event == "agent_step"
     assert step.detail.step_number == 1
     assert step.detail.current_url == "https://jobs.example/openings/42"
+    diagnostic = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    assert [item.model_dump() for item in diagnostic] == [
+        {
+            "step": 1,
+            "status": "timed_out",
+            "exit_code": 124,
+            "timed_out": True,
+            "error_category": "execution_timeout",
+            "stderr_excerpt": "Browser Use execution timed out after 120 seconds.",
+            "stderr_truncated": False,
+        }
+    ]
+    assert record.events[-1].session.browser_use_diagnostics == diagnostic
 
     with pytest.raises(HarnessServiceError) as raised:
         await manager.runtime_action(
@@ -2540,6 +2553,116 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
     await manager.delete(created.session_id)
 
 
+async def test_runtime_browser_action_persists_only_redacted_process_diagnostics(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    record.skill_runtime = FakeSkillRuntime(
+        result=browser_execution_result().model_copy(
+            update={
+                "exit_code": 7,
+                "stderr": "private selector and provider detail",
+                "stderr_truncated": True,
+            }
+        )
+    )
+
+    await manager.runtime_action(
+        created.session_id,
+        BrowserUseRuntimeAction(type="browser_use", code="print('private code')"),
+    )
+
+    diagnostics = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    assert [item.model_dump() for item in diagnostics] == [
+        {
+            "step": 1,
+            "status": "failed",
+            "exit_code": 7,
+            "timed_out": False,
+            "error_category": "process_exit",
+            "stderr_excerpt": "[redacted]",
+            "stderr_truncated": True,
+        }
+    ]
+    serialized = manager.get_snapshot(created.session_id).model_dump_json()
+    assert "private selector" not in serialized
+    assert "private code" not in serialized
+    await manager.delete(created.session_id)
+    assert (
+        manager._tombstones[created.session_id]
+        .snapshot.browser_use_diagnostics
+        == diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "error_code",
+        "expected_status",
+        "expected_timed_out",
+        "expected_category",
+        "expected_excerpt",
+    ),
+    [
+        (
+            "browser_failed",
+            "failed",
+            False,
+            "browser_runtime",
+            "Browser runtime failed.",
+        ),
+        (
+            "session_timeout",
+            "timed_out",
+            True,
+            "session_timeout",
+            "Application session expired.",
+        ),
+    ],
+)
+async def test_runtime_browser_action_persists_fixed_runtime_error_diagnostics(
+    tmp_path: Path,
+    error_code: Literal["browser_failed", "session_timeout"],
+    expected_status: Literal["failed", "timed_out"],
+    expected_timed_out: bool,
+    expected_category: Literal["browser_runtime", "session_timeout"],
+    expected_excerpt: str,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    record.skill_runtime = FakeSkillRuntime(error=BrowserSkillRuntimeError(error_code))
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.runtime_action(
+            created.session_id,
+            BrowserUseRuntimeAction(type="browser_use", code="print('private code')"),
+        )
+
+    assert raised.value.code == error_code
+    diagnostics = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    assert [item.model_dump() for item in diagnostics] == [
+        {
+            "step": 1,
+            "status": expected_status,
+            "exit_code": -1,
+            "timed_out": expected_timed_out,
+            "error_category": expected_category,
+            "stderr_excerpt": expected_excerpt,
+            "stderr_truncated": False,
+        }
+    ]
+    assert (
+        "private code"
+        not in manager.get_snapshot(created.session_id).model_dump_json()
+    )
+    await manager.delete(created.session_id)
 
 
 async def test_runtime_additional_info_requires_browser_then_resumes_same_run(

@@ -214,6 +214,7 @@ const PUBLIC_APPLICATION_SNAPSHOT = {
   ],
   fieldsNeedingHuman: [],
   filesAttached: ["Alex_Example_Resume.pdf"],
+  browserUseDiagnostics: [],
   warnings: ["Review the application before submitting."],
   revisionCount: 1,
   pendingAction: {

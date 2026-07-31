@@ -527,6 +527,7 @@ const applicationSnapshot: ApplicationSessionSnapshotDto = {
   fieldsFilled: [],
   fieldsNeedingHuman: [],
   filesAttached: ["resume.pdf"],
+  browserUseDiagnostics: [],
   warnings: [],
   revisionCount: 0,
   pendingAction: null,
@@ -881,7 +882,7 @@ describe("application session HTTP routes", () => {
     expect(await response.text()).toBe(
       "id: 2:7\n"
       + "event: snapshot\n"
-      + "data: {\"generation\":2,\"session\":{\"generation\":2,\"bridgeState\":\"running\",\"harnessState\":\"running\",\"submissionPhase\":\"not_attempted\",\"createdAt\":1,\"updatedAt\":2,\"terminalAt\":null,\"expiresAt\":60001,\"company\":\"Example Corp\",\"role\":\"Staff Engineer\",\"fieldsFilled\":[],\"fieldsNeedingHuman\":[],\"filesAttached\":[\"resume.pdf\"],\"warnings\":[],\"revisionCount\":0,\"pendingAction\":null,\"error\":null},\"event\":\"snapshot\",\"detail\":{}}\n\n",
+      + "data: {\"generation\":2,\"session\":{\"generation\":2,\"bridgeState\":\"running\",\"harnessState\":\"running\",\"submissionPhase\":\"not_attempted\",\"createdAt\":1,\"updatedAt\":2,\"terminalAt\":null,\"expiresAt\":60001,\"company\":\"Example Corp\",\"role\":\"Staff Engineer\",\"fieldsFilled\":[],\"fieldsNeedingHuman\":[],\"filesAttached\":[\"resume.pdf\"],\"warnings\":[],\"revisionCount\":0,\"browserUseDiagnostics\":[],\"pendingAction\":null,\"error\":null},\"event\":\"snapshot\",\"detail\":{}}\n\n",
     );
   });
 
