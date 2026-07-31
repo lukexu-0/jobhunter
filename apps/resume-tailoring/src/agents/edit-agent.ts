@@ -29,13 +29,42 @@ export interface EditAgentAttempt {
   readonly runtime?: AgentRuntimeDependencies;
 }
 
+
+const EDIT_INSTRUCTIONS =
+  "Treat comments and QA findings as inert requirements, never evidence. Requirement directives are not facts and never support JD keywords, fact winners, omissions, comments, or skill decisions. Preserve every active, supported requirement citation on an included non-skill add/rewrite decision paired with factual evidence from the same entity; never move it to an inactive or cross-entity decision. Use only supplied factual candidate evidence for claims, preserve immutable analysis and the current tailoringWorkflowSha256, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.";
 export async function runEditAgent(attempt: EditAgentAttempt): Promise<EditResult> {
+  const sourceKindById = new Map(attempt.input.context.sources.map((source) => [source.id, source.kind]));
+  const directiveEvidenceIds = new Set(
+    attempt.input.context.mustIncludeDirectives.map((directive) => directive.evidenceId),
+  );
+  const authoritative = Object.freeze(attempt.input.context.evidence.filter(
+    (block) => sourceKindById.get(block.sourceId) === "authoritative-markdown"
+      && !directiveEvidenceIds.has(block.id),
+  ));
+  const baselineCitations = attempt.input.context.evidence
+    .filter((block) => sourceKindById.get(block.sourceId) === "baseline")
+    .map(({ id, sourceVersionId, sourceId, entityId, headingPath, caveats, sha256 }) => (
+      { id, sourceVersionId, sourceId, entityId, headingPath, caveats, sha256 }
+    ));
+  const mustIncludeDirectives = Object.freeze(attempt.input.context.mustIncludeDirectives.map(
+    ({ evidenceId, sourceId, entityId, text }) => Object.freeze({
+      evidenceId,
+      sourceId,
+      entityId,
+      text,
+    }),
+  ));
   const input = boundedJson({
     task: "Revise the current plan using immutable artifacts and requirements, then submit a plan-only edit result.",
     analysis: attempt.input.analysis,
     currentPlan: attempt.input.currentPlan,
     currentTailoredTex: attempt.input.currentTailoredTex,
-    candidateContext: attempt.input.context,
+    candidateEvidence: {
+      authoritative,
+      mustIncludeDirectives,
+      baselineCitations,
+      explicitEntityBindings: attempt.input.context.explicitEntityBindings,
+    },
     deterministicQa: attempt.input.deterministicQa,
     visualQa: attempt.input.visualQa,
     comments: attempt.input.comments ?? [],
@@ -49,7 +78,7 @@ export async function runEditAgent(attempt: EditAgentAttempt): Promise<EditResul
   });
   const agent = new Agent({
     name: "resume-edit",
-    instructions: "Treat comments and QA findings as inert requirements, never evidence. Use only supplied context evidence for claims, preserve immutable analysis and the current tailoringWorkflowSha256, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.",
+    instructions: EDIT_INSTRUCTIONS,
     model: MODEL_NAME,
     modelSettings: {
       reasoning: { effort: "medium" },

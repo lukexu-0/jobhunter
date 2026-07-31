@@ -32,7 +32,7 @@ import { createTerminalSubmission } from "./tools.ts";
 export const ANALYSIS_TASK =
   "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills.";
 export const ANALYSIS_INSTRUCTIONS =
-  "Use only supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use evidence-backed keywords and edit bullets for truthful JD alignment. Always preserve impact when performing edits. Make the resume understandable by both a recruiter and technical staff member. Use conventional terminology, do not use unconventional terms such as \"Agentic workflow systems\". Make every project's first bullet a summary. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. When possible, make sure bullets contain impact. Try to use as many job-description keywords within project and experience bullets. Copy supplied hashes and call submit_job_analysis once.";
+  "Use supplied JD, ATS extraction, baseline inventory, and factual evidence only. Requirements are not facts and never support keywords, skills, or omissions. Citing factual evidence on a non-skill edit activates same-entity requirements; cite every active requirement on an included edit paired with same-entity factual evidence. Never cite inactive or cross-entity requirements. Use evidence-backed JD keywords truthfully. Always preserve impact when performing edits. Write clearly for recruiters and technical staff with conventional terms, never \"Agentic workflow systems\". Make each project's first bullet a summary. Use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Copy hashes and call submit_job_analysis once.";
 export const ANALYSIS_WORKFLOW_SHA256 = createHash("sha256")
   .update(`${ANALYSIS_TASK}\n${ANALYSIS_INSTRUCTIONS}`)
   .digest("hex");
@@ -311,12 +311,26 @@ export async function runAnalysisAgent(attempt: AnalysisAgentAttempt): Promise<J
   );
   const baselineInventory = parseBaselineResume(attempt.input.canonicalCv);
   const sourceKindById = new Map(attempt.input.context.sources.map((source) => [source.id, source.kind]));
-  const authoritative = attempt.input.context.evidence.filter((block) => sourceKindById.get(block.sourceId) === "authoritative-markdown");
+  const directiveEvidenceIds = new Set(
+    attempt.input.context.mustIncludeDirectives.map((directive) => directive.evidenceId),
+  );
+  const authoritative = Object.freeze(attempt.input.context.evidence.filter(
+    (block) => sourceKindById.get(block.sourceId) === "authoritative-markdown"
+      && !directiveEvidenceIds.has(block.id),
+  ));
   const baselineCitations = attempt.input.context.evidence
     .filter((block) => sourceKindById.get(block.sourceId) === "baseline")
     .map(({ id, sourceVersionId, sourceId, entityId, headingPath, caveats, sha256 }) => (
       { id, sourceVersionId, sourceId, entityId, headingPath, caveats, sha256 }
     ));
+  const mustIncludeDirectives = Object.freeze(attempt.input.context.mustIncludeDirectives.map(
+    ({ evidenceId, sourceId, entityId, text }) => Object.freeze({
+      evidenceId,
+      sourceId,
+      entityId,
+      text,
+    }),
+  ));
   const input = boundedJson({
     task: ANALYSIS_TASK,
     rawJobDescription: attempt.input.rawJobDescription,
@@ -331,6 +345,7 @@ export async function runAnalysisAgent(attempt: AnalysisAgentAttempt): Promise<J
     },
     candidateEvidence: {
       authoritative,
+      mustIncludeDirectives,
       baselineCitations,
       explicitEntityBindings: attempt.input.context.explicitEntityBindings,
     },

@@ -125,6 +125,7 @@ const CONTEXT: ContextSnapshot = {
       sha256: "f".repeat(64),
     },
   ],
+  mustIncludeDirectives: [],
   explicitEntityBindings: { "Past Project": "project:past-project" },
 };
 
@@ -187,7 +188,7 @@ describe("guarded agents", () => {
       "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills.",
     );
     expect(ANALYSIS_INSTRUCTIONS).toBe(
-      "Use only supplied job description, ATS keyword extraction, baseline inventory, and evidence. Use evidence-backed keywords and edit bullets for truthful JD alignment. Always preserve impact when performing edits. Make the resume understandable by both a recruiter and technical staff member. Use conventional terminology, do not use unconventional terms such as \"Agentic workflow systems\". Make every project's first bullet a summary. Return exact edits; use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. When possible, make sure bullets contain impact. Try to use as many job-description keywords within project and experience bullets. Copy supplied hashes and call submit_job_analysis once.",
+      "Use supplied JD, ATS extraction, baseline inventory, and factual evidence only. Requirements are not facts and never support keywords, skills, or omissions. Citing factual evidence on a non-skill edit activates same-entity requirements; cite every active requirement on an included edit paired with same-entity factual evidence. Never cite inactive or cross-entity requirements. Use evidence-backed JD keywords truthfully. Always preserve impact when performing edits. Write clearly for recruiters and technical staff with conventional terms, never \"Agentic workflow systems\". Make each project's first bullet a summary. Use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Copy hashes and call submit_job_analysis once.",
     );
     expect(ATS_KEYWORD_EXTRACTION_TASK).toBe(
       "Act as an ATS system and extract all relevant keywords from the supplied job description.",
@@ -396,6 +397,7 @@ describe("guarded agents", () => {
         },
         candidateEvidence: {
           authoritative: [CONTEXT.evidence[1]],
+          mustIncludeDirectives: [],
           baselineCitations: [{
             id: "baseline-evidence",
             sourceVersionId: "canonical-baseline-version",
@@ -410,7 +412,7 @@ describe("guarded agents", () => {
       });
       expect(Object.keys(parsedInput.baselineInventory)).toEqual(["sha256", "bullets", "skills"]);
       expect(Object.keys(parsedInput.candidateEvidence)).toEqual([
-        "authoritative", "baselineCitations", "explicitEntityBindings",
+        "authoritative", "mustIncludeDirectives", "baselineCitations", "explicitEntityBindings",
       ]);
       expect(parsedInput.candidateEvidence.authoritative[0].text)
         .toBe("Built a production project with measurable outcomes.");
@@ -442,6 +444,77 @@ describe("guarded agents", () => {
     await runAnalysisAgent({ attemptSessionId: "attempt-b", input, signal, runtime });
     expect(calls).toBe(2);
     expect(providerIds).toEqual(["attempt-a", "attempt-b"]);
+  });
+
+  test("separates requirement directives from factual analysis evidence", async () => {
+    const requirementBlocks = [
+      {
+        ...CONTEXT.evidence[1]!,
+        id: "past-project-requirement-impact",
+        ordinal: 1,
+        headingPath: ["Past Project", "Must Include"],
+        text: "Mention the project's measurable production impact.",
+        sha256: "1".repeat(64),
+      },
+      {
+        ...CONTEXT.evidence[1]!,
+        id: "past-project-requirement-scale",
+        ordinal: 2,
+        headingPath: ["Past Project", "21. Must Include"],
+        text: "Mention the project's production scale.",
+        sha256: "2".repeat(64),
+      },
+    ] as const;
+    const context: ContextSnapshot = {
+      ...CONTEXT,
+      evidence: [...CONTEXT.evidence, ...requirementBlocks],
+      mustIncludeDirectives: [
+        {
+          evidenceId: requirementBlocks[0].id,
+          sourceId: requirementBlocks[0].sourceId,
+          entityId: requirementBlocks[0].entityId,
+          text: requirementBlocks[0].text,
+        },
+        {
+          evidenceId: requirementBlocks[1].id,
+          sourceId: requirementBlocks[1].sourceId,
+          entityId: requirementBlocks[1].entityId,
+          text: requirementBlocks[1].text,
+        },
+      ],
+    };
+    const runtime = runtimeWith(async (agent, input) => {
+      const candidateEvidence = JSON.parse(input).candidateEvidence;
+      expect(candidateEvidence.authoritative.map((block: { id: string }) => block.id))
+        .toEqual(["past-project-evidence"]);
+      expect(candidateEvidence.mustIncludeDirectives).toEqual(context.mustIncludeDirectives);
+      expect(Object.keys(candidateEvidence.mustIncludeDirectives[0])).toEqual([
+        "evidenceId", "sourceId", "entityId", "text",
+      ]);
+      for (const directive of context.mustIncludeDirectives) {
+        expect(candidateEvidence.authoritative).not.toContainEqual(
+          expect.objectContaining({ id: directive.evidenceId }),
+        );
+      }
+      expect(agent.instructions).toContain("Requirements are not facts");
+      expect(agent.instructions).toContain("never support keywords, skills, or omissions");
+      expect(agent.instructions).toContain("paired with same-entity factual evidence");
+      expect(agent.instructions).toContain("Never cite inactive or cross-entity requirements");
+      await invoke(agent, "submit_job_analysis", ANALYSIS);
+      return { finalOutput: ANALYSIS };
+    });
+
+    await expect(runAnalysisAgent({
+      attemptSessionId: "analysis-requirement-projection",
+      input: {
+        rawJobDescription: RAW_JOB_DESCRIPTION,
+        atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
+        canonicalCv: BASELINE,
+        context,
+      },
+      signal: new AbortController().signal,
+      runtime,
+    })).resolves.toEqual(ANALYSIS);
   });
 
   test("keeps schema-invalid analysis calls uncounted and exposes bounded correction feedback", async () => {
@@ -948,10 +1021,24 @@ describe("guarded agents", () => {
         analysis: ANALYSIS,
         currentPlan: PLAN,
         currentTailoredTex: "immutable tex",
-        candidateContext: CONTEXT,
+        candidateEvidence: {
+          authoritative: [CONTEXT.evidence[1]],
+          mustIncludeDirectives: [],
+          baselineCitations: [{
+            id: "baseline-evidence",
+            sourceVersionId: "canonical-baseline-version",
+            sourceId: "canonical-baseline",
+            entityId: "resume:baseline",
+            headingPath: ["Canonical baseline"],
+            caveats: [],
+            sha256: CONTEXT.evidence[0]?.sha256,
+          }],
+          explicitEntityBindings: CONTEXT.explicitEntityBindings,
+        },
         comments: ["shorten bullet"],
         machineFindings: { issue: "crowding" },
       });
+      expect(parsed).not.toHaveProperty("candidateContext");
       return {};
     });
     await expect(runEditAgent({
@@ -967,6 +1054,57 @@ describe("guarded agents", () => {
         visualQa: { status: "issue" },
         comments: ["shorten bullet"],
         machineFindings: { issue: "crowding" },
+      },
+    })).rejects.toThrow("requires exactly one validated terminal call");
+  });
+
+  test("separates requirement directives from factual edit evidence", async () => {
+    const requirementBlock = {
+      ...CONTEXT.evidence[1]!,
+      id: "past-project-edit-requirement",
+      ordinal: 1,
+      headingPath: ["Past Project", "Must Include"],
+      text: "Keep the supported production-impact requirement.",
+      sha256: "3".repeat(64),
+    };
+    const context: ContextSnapshot = {
+      ...CONTEXT,
+      evidence: [...CONTEXT.evidence, requirementBlock],
+      mustIncludeDirectives: [{
+        evidenceId: requirementBlock.id,
+        sourceId: requirementBlock.sourceId,
+        entityId: requirementBlock.entityId,
+        text: requirementBlock.text,
+      }],
+    };
+    const runtime = runtimeWith(async (agent, input) => {
+      const parsed = JSON.parse(input);
+      expect(parsed).not.toHaveProperty("candidateContext");
+      expect(parsed.candidateEvidence.authoritative.map((block: { id: string }) => block.id))
+        .toEqual(["past-project-evidence"]);
+      expect(parsed.candidateEvidence.mustIncludeDirectives).toEqual(context.mustIncludeDirectives);
+      expect(Object.keys(parsed.candidateEvidence.mustIncludeDirectives[0])).toEqual([
+        "evidenceId", "sourceId", "entityId", "text",
+      ]);
+      expect(agent.instructions).toContain("Requirement directives are not facts");
+      expect(agent.instructions).toContain("never support JD keywords");
+      expect(agent.instructions).toContain("omissions");
+      expect(agent.instructions).toContain("Preserve every active, supported requirement citation");
+      expect(agent.instructions).toContain("paired with factual evidence from the same entity");
+      return {};
+    });
+
+    await expect(runEditAgent({
+      attemptSessionId: "edit-requirement-projection",
+      signal: new AbortController().signal,
+      runtime,
+      input: {
+        analysis: ANALYSIS,
+        currentPlan: PLAN,
+        currentTailoredTex: "immutable tex",
+        context,
+        deterministicQa: { ok: true },
+        visualQa: { status: "pass" },
       },
     })).rejects.toThrow("requires exactly one validated terminal call");
   });
