@@ -14,12 +14,44 @@ export const CONTEXT_SOURCE_ALLOWLIST = Object.freeze([
   "jobhunter-resume-info.md",
 ] as const);
 
-const ALLOWED: Readonly<Record<string, true>> = Object.freeze({
-  "apps/user-info/resume-main/Alex_Example_Resume.tex": true,
-  "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md": true,
-  "apps/user-info/current-context/projects/sample-project-archive.md": true,
-  "apps/user-info/current-context/projects/sample-project.md": true,
-  "jobhunter-resume-info.md": true,
+type ContextSourceContract = Omit<ContextSourceDefinition, "relativePath">;
+
+const SOURCE_CONTRACTS: Readonly<Record<string, ContextSourceContract>> = Object.freeze({
+  "apps/user-info/resume-main/Alex_Example_Resume.tex": Object.freeze({
+    id: "resume-baseline",
+    kind: "baseline",
+    entityId: "candidate-resume",
+    displayName: "Canonical resume baseline",
+    baselineEntityIds: Object.freeze([]),
+  }),
+  "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md": Object.freeze({
+    id: "automated-testing-resume-info",
+    kind: "authoritative-markdown",
+    entityId: "experience:example-company",
+    displayName: "Sample Testing resume information",
+    baselineEntityIds: Object.freeze(["Example Company"]),
+  }),
+  "apps/user-info/current-context/projects/sample-project-archive.md": Object.freeze({
+    id: "sample-project-archive",
+    kind: "authoritative-markdown",
+    entityId: "project:sample-project-archive",
+    displayName: "Sample Project Archive",
+    baselineEntityIds: Object.freeze(["Sample Project Archive"]),
+  }),
+  "apps/user-info/current-context/projects/sample-project.md": Object.freeze({
+    id: "sample-project",
+    kind: "authoritative-markdown",
+    entityId: "project:sample-project",
+    displayName: "SampleProject / Sample Project",
+    baselineEntityIds: Object.freeze(["Sample Project", "SampleProject"]),
+  }),
+  "jobhunter-resume-info.md": Object.freeze({
+    id: "jobhunter-resume-info",
+    kind: "authoritative-markdown",
+    entityId: "project:jobhunter",
+    displayName: "Jobhunter resume information",
+    baselineEntityIds: Object.freeze(["Jobhunter"]),
+  }),
 });
 const SOURCE_KEYS: Readonly<Record<string, true>> = Object.freeze({
   id: true,
@@ -44,6 +76,15 @@ export interface LoadedContextManifest {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function matchesSourceContract(source: ContextSourceDefinition, contract: ContextSourceContract): boolean {
+  return source.id === contract.id
+    && source.kind === contract.kind
+    && source.entityId === contract.entityId
+    && source.displayName === contract.displayName
+    && source.baselineEntityIds.length === contract.baselineEntityIds.length
+    && source.baselineEntityIds.every((entityId, index) => entityId === contract.baselineEntityIds[index]);
 }
 
 function requireExactKeys(value: Record<string, unknown>, allowed: Readonly<Record<string, true>>, label: string): void {
@@ -94,7 +135,7 @@ export function loadContextManifest(
   const sources = parsed.sources.map(parseSource);
   if (sources.length !== CONTEXT_SOURCE_ALLOWLIST.length) throw new Error("Context manifest must contain exactly five sources");
   const paths = sources.map((source) => source.relativePath);
-  if (new Set(paths).size !== paths.length || paths.some((path) => !ALLOWED[path]) || CONTEXT_SOURCE_ALLOWLIST.some((path) => !paths.includes(path))) {
+  if (new Set(paths).size !== paths.length || paths.some((path) => !SOURCE_CONTRACTS[path]) || CONTEXT_SOURCE_ALLOWLIST.some((path) => !paths.includes(path))) {
     throw new Error("Context manifest sources do not match the literal five-file allowlist");
   }
   if (sources.filter((source) => source.kind === "baseline").length !== 1 || sources.find((source) => source.kind === "baseline")?.relativePath !== CONTEXT_SOURCE_ALLOWLIST[0]) {
@@ -102,6 +143,12 @@ export function loadContextManifest(
   }
   const ids = sources.map((source) => source.id);
   if (new Set(ids).size !== ids.length) throw new Error("Context source IDs must be unique");
+  for (const source of sources) {
+    const contract = SOURCE_CONTRACTS[source.relativePath];
+    if (!contract || !matchesSourceContract(source, contract)) {
+      throw new Error(`Context source definition does not match the literal contract: ${source.relativePath}`);
+    }
+  }
   if (!isRecord(parsed.explicitEntityBindings)) throw new Error("explicitEntityBindings must map strings to strings");
   const explicitEntityBindings: Record<string, string> = {};
   for (const [key, binding] of Object.entries(parsed.explicitEntityBindings)) {
@@ -118,9 +165,8 @@ export function loadContextManifest(
   });
   return Object.freeze({ manifest, manifestSha256: sha256(raw), manifestPath: safeManifestPath, repositoryRoot: root });
 }
-
 export function resolveContextSource(repositoryRoot: string, source: ContextSourceDefinition): string {
-  if (!ALLOWED[source.relativePath]) throw new Error(`Context source is not allowlisted: ${source.relativePath}`);
+  if (!SOURCE_CONTRACTS[source.relativePath]) throw new Error(`Context source is not allowlisted: ${source.relativePath}`);
   return resolveContainedFile(realpathSync(repositoryRoot), resolve(repositoryRoot, source.relativePath), `context source ${source.id}`);
 }
 

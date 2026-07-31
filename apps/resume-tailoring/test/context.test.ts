@@ -77,6 +77,37 @@ describe("allowlisted context ingestion", () => {
     expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
   });
 
+  test("preserves source order flexibility while rejecting literal source metadata aliases", () => {
+    const root = createRepositoryFixture();
+    const manifestPath = join(root, "apps/resume-tailoring/context-sources.json");
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+    parsed.sources.reverse();
+    writeFileSync(manifestPath, JSON.stringify(parsed));
+    expect(loadFixture(root).manifest.sources.map((source) => source.relativePath))
+      .toEqual([...CONTEXT_SOURCE_ALLOWLIST].reverse());
+
+    for (const mutation of [
+      { id: "jobhunter-resume-info-alias" },
+      { entityId: "project:wrong" },
+      { displayName: "Aliased Jobhunter resume information" },
+      { baselineEntityIds: ["Wrong baseline entity"] },
+    ]) {
+      const candidate = JSON.parse(JSON.stringify(parsed));
+      const jobhunter = candidate.sources.find((source: { relativePath: string }) =>
+        source.relativePath === "jobhunter-resume-info.md");
+      Object.assign(jobhunter, mutation);
+      writeFileSync(manifestPath, JSON.stringify(candidate));
+      expect(() => loadFixture(root)).toThrow("does not match the literal contract");
+    }
+
+    const reorderedBindingCandidate = JSON.parse(JSON.stringify(parsed));
+    const sampleProject = reorderedBindingCandidate.sources.find((source: { relativePath: string }) =>
+      source.relativePath === "apps/user-info/current-context/projects/sample-project.md");
+    sampleProject.baselineEntityIds.reverse();
+    writeFileSync(manifestPath, JSON.stringify(reorderedBindingCandidate));
+    expect(() => loadFixture(root)).toThrow("does not match the literal contract");
+  });
+
   test("rejects a symbolic link at any source path", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
