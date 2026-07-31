@@ -56,6 +56,7 @@ const ANALYSIS_SEMANTIC_CATEGORY_LABELS: Record<AnalysisSemanticIssueCategory, s
   "evidence-provenance": "Evidence provenance",
   "baseline-targets": "Baseline targets",
   "skill-replacements": "Skill replacements",
+  "must-include-directives": "Must-include directives",
 };
 
 class AnalysisSemanticValidationError extends Error {

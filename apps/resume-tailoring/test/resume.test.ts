@@ -98,6 +98,7 @@ function fixtures(): { snapshot: ContextSnapshot; analysis: JobAnalysis; plan: T
     sourceHashes: Object.fromEntries(sources.map((source) => [source.id, source.sha256])),
     sources,
     evidence: [...authoritativeEvidence, baselineEvidence],
+    mustIncludeDirectives: [],
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
   const analysis = JobAnalysisSchema.parse(jobAnalysisFixture({
@@ -118,6 +119,32 @@ function replaceEvidence(analysis: JobAnalysis, evidenceIds: readonly string[]):
 
 function zeroEditAnalysis(analysis: JobAnalysis): JobAnalysis {
   return { ...analysis, jdKeywords: [], exactEdits: [] };
+}
+
+function withMustIncludeDirective(
+  snapshot: ContextSnapshot,
+  evidenceIndex = 0,
+): { readonly snapshot: ContextSnapshot; readonly evidence: EvidenceBlock } {
+  const factualEvidence = snapshot.evidence[evidenceIndex]!;
+  const directiveEvidence: EvidenceBlock = {
+    ...factualEvidence,
+    id: `directive-${evidenceIndex}`,
+    ordinal: factualEvidence.ordinal + 1,
+    text: "The resume must include the candidate's testing impact.",
+  };
+  return {
+    evidence: directiveEvidence,
+    snapshot: {
+      ...snapshot,
+      evidence: [...snapshot.evidence, directiveEvidence],
+      mustIncludeDirectives: [{
+        evidenceId: directiveEvidence.id,
+        sourceId: directiveEvidence.sourceId,
+        entityId: directiveEvidence.entityId,
+        text: directiveEvidence.text,
+      }],
+    },
+  };
 }
 
 describe("strict resume contracts", () => {
@@ -400,6 +427,300 @@ describe("analysis validation", () => {
     expect(validateAnalysisAgainstBaseline(baselineSupported, JOB_DESCRIPTION, baseline, snapshot)).toEqual(baselineSupported);
   });
 
+  test("requires an active must-include directive on a fact-supported bullet edit", () => {
+    const { snapshot, analysis } = fixtures();
+    const directive = withMustIncludeDirective(snapshot);
+
+    expect(() => validateAnalysisAgainstBaseline(
+      analysis,
+      JOB_DESCRIPTION,
+      baseline,
+      directive.snapshot,
+    )).toThrow("active must-include directive directive-0 is missing from a supported bullet edit");
+  });
+
+  test("rejects directive-only, baseline-only, cross-entity, JD-keyword, and skill citations", () => {
+    const { snapshot, analysis } = fixtures();
+    const directive = withMustIncludeDirective(snapshot);
+    const directiveOnly = replaceEvidence(analysis, [directive.evidence.id]);
+    expect(() => validateAnalysisAgainstBaseline(
+      directiveOnly,
+      JOB_DESCRIPTION,
+      baseline,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be used by a JD keyword");
+
+    const baselineOnly: JobAnalysis = {
+      ...replaceEvidence(analysis, ["canonical-baseline-evidence"]),
+      exactEdits: replaceEvidence(analysis, ["canonical-baseline-evidence"]).exactEdits
+        .map((edit) => edit.kind === "bullet"
+          ? { ...edit, evidenceIds: [...edit.evidenceIds, directive.evidence.id] }
+          : edit),
+    };
+    expect(() => validateAnalysisAgainstBaseline(
+      baselineOnly,
+      JOB_DESCRIPTION,
+      baseline,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 lacks non-directive same-entity factual support");
+
+    const skillCitation: JobAnalysis = {
+      ...analysis,
+      exactEdits: analysis.exactEdits.map((edit) => edit.kind === "skill"
+        ? { ...edit, evidenceIds: [...edit.evidenceIds, directive.evidence.id] }
+        : edit),
+    };
+    expect(() => validateAnalysisAgainstBaseline(
+      skillCitation,
+      JOB_DESCRIPTION,
+      baseline,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be used by a skill edit");
+
+    const keywordCitation = replaceEvidence(
+      analysis,
+      ["evidence-0", directive.evidence.id],
+    );
+    expect(() => validateAnalysisAgainstBaseline(
+      keywordCitation,
+      JOB_DESCRIPTION,
+      baseline,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be used by a JD keyword");
+
+    const otherDirective = withMustIncludeDirective(snapshot, 1);
+    const crossEntity: JobAnalysis = {
+      ...analysis,
+      exactEdits: analysis.exactEdits.map((edit) => edit.kind === "bullet"
+        ? { ...edit, evidenceIds: [...edit.evidenceIds, otherDirective.evidence.id] }
+        : edit),
+    };
+    expect(() => validateAnalysisAgainstBaseline(
+      crossEntity,
+      JOB_DESCRIPTION,
+      baseline,
+      otherDirective.snapshot,
+    )).toThrow(/attributed/i);
+  });
+
+  test("renders and ledgers only plans that keep an active directive on its fact-supported rewrite", () => {
+    const { snapshot, analysis } = fixtures();
+    const directive = withMustIncludeDirective(snapshot);
+    const supportedAnalysis: JobAnalysis = {
+      ...analysis,
+      exactEdits: analysis.exactEdits.map((edit) => edit.kind === "bullet"
+        ? { ...edit, evidenceIds: [...edit.evidenceIds, directive.evidence.id] }
+        : edit),
+    };
+    expect(() => validateAnalysisAgainstBaseline(
+      supportedAnalysis,
+      JOB_DESCRIPTION,
+      baseline,
+      directive.snapshot,
+    )).not.toThrow();
+    const plan = buildMechanicalTailoringPlan(supportedAnalysis, baseline);
+    expect(() => renderTailoredResume(plan, baseline, directive.snapshot)).not.toThrow();
+    expect(buildEvidenceLedger(
+      supportedAnalysis,
+      plan,
+      directive.snapshot,
+    ).citations.map((citation) => citation.evidenceId)).toContain(directive.evidence.id);
+
+    const dropped = TailoringPlanSchema.parse({
+      ...plan,
+      decisions: plan.decisions.map((decision) => decision.action === "rewrite"
+        ? {
+            ...decision,
+            evidenceIds: decision.evidenceIds.filter((id) => id !== directive.evidence.id),
+          }
+        : decision),
+    });
+    expect(() => renderTailoredResume(
+      dropped,
+      baseline,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be relocated to baseline override metadata");
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      dropped,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be relocated to baseline override metadata");
+  });
+
+  test("direct ledger validation preserves analysis-active directives when a plan drops all support", () => {
+    const { snapshot, analysis } = fixtures();
+    const directive = withMustIncludeDirective(snapshot);
+    const supportedAnalysis: JobAnalysis = {
+      ...analysis,
+      exactEdits: analysis.exactEdits.map((edit) => edit.kind === "bullet"
+        ? { ...edit, evidenceIds: [...edit.evidenceIds, directive.evidence.id] }
+        : edit),
+    };
+    const plan = buildMechanicalTailoringPlan(supportedAnalysis, baseline);
+    const rewrite = plan.decisions.find((decision) => decision.action === "rewrite")!;
+    const originalBullet = parsedBaseline.bullets.find((bullet) =>
+      bullet.id === rewrite.baselineItemId)!;
+    const dropped = TailoringPlanSchema.parse({
+      ...plan,
+      decisions: plan.decisions.map((decision) => decision.id === rewrite.id
+        ? {
+            ...decision,
+            action: "retain",
+            text: originalBullet.text,
+            evidenceIds: [],
+            factKeys: [],
+            rationale: "Drop the analyzed rewrite.",
+          }
+        : decision),
+      baselineOverrides: plan.baselineOverrides.filter((override) =>
+        override.baselineItemId !== rewrite.baselineItemId),
+    });
+
+    expect(() => renderTailoredResume(dropped, baseline, directive.snapshot)).not.toThrow();
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      dropped,
+      directive.snapshot,
+    )).toThrow("analysis-active must-include directive directive-0 is missing from a supported decision");
+  });
+
+  test("rejects directives on retained or omitted content, skills, fact winners, omissions, and comments", () => {
+    const { snapshot, analysis } = fixtures();
+    const directive = withMustIncludeDirective(snapshot);
+    const supportedAnalysis: JobAnalysis = {
+      ...analysis,
+      exactEdits: analysis.exactEdits.map((edit) => edit.kind === "bullet"
+        ? { ...edit, evidenceIds: [...edit.evidenceIds, directive.evidence.id] }
+        : edit),
+    };
+    const plan = buildMechanicalTailoringPlan(supportedAnalysis, baseline);
+    const retained = plan.decisions.find((decision) => decision.action === "retain")!;
+    const nonRetainSkill = plan.skillDecisions.find((decision) =>
+      decision.action !== "retain")!;
+    const withDecision = (action: "retain" | "omit"): TailoringPlan =>
+      TailoringPlanSchema.parse({
+        ...plan,
+        decisions: plan.decisions.map((decision) => decision.id === retained.id
+          ? {
+              ...decision,
+              action,
+              text: action === "omit" ? null : decision.text,
+              evidenceIds: [directive.evidence.id],
+            }
+          : decision),
+      });
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      withDecision("retain"),
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be used on retain decision content");
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      withDecision("omit"),
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be used on omit decision content");
+
+    const skillPlan = TailoringPlanSchema.parse({
+      ...plan,
+      skillDecisions: plan.skillDecisions.map((decision) =>
+        decision.id === nonRetainSkill.id
+          ? { ...decision, evidenceIds: [...decision.evidenceIds, directive.evidence.id] }
+          : decision),
+    });
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      skillPlan,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot be used on a skill decision");
+
+    const factWinnerPlan = TailoringPlanSchema.parse({
+      ...plan,
+      factWinners: [{
+        factKey: "requirement-as-fact",
+        value: "resume",
+        entityId: directive.evidence.entityId,
+        evidenceId: directive.evidence.id,
+      }],
+    });
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      factWinnerPlan,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot support a fact winner");
+
+    const omissionPlan = TailoringPlanSchema.parse({
+      ...plan,
+      omissions: [{
+        baselineItemId: retained.baselineItemId!,
+        rationale: "Metadata-only misuse.",
+        evidenceIds: [directive.evidence.id],
+      }],
+    });
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      omissionPlan,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 cannot support omission metadata");
+
+    const directiveOnlyBase = buildMechanicalTailoringPlan(analysis, baseline);
+    const directiveOnlyPlan = TailoringPlanSchema.parse({
+      ...directiveOnlyBase,
+      decisions: directiveOnlyBase.decisions.map((decision) =>
+        decision.action === "rewrite"
+          ? { ...decision, evidenceIds: [directive.evidence.id] }
+          : decision),
+      baselineOverrides: directiveOnlyBase.baselineOverrides.map((override) =>
+        ({ ...override, evidenceIds: [directive.evidence.id] })),
+    });
+    expect(() => buildEvidenceLedger(
+      analysis,
+      directiveOnlyPlan,
+      directive.snapshot,
+    )).toThrow("requirement evidence directive-0 lacks non-directive same-entity factual support");
+
+    const inactiveDirective = withMustIncludeDirective(snapshot, 1);
+    const inactivePlan = buildMechanicalTailoringPlan(analysis, baseline);
+    const inactiveRewrite = inactivePlan.decisions.find((decision) =>
+      decision.action === "rewrite")!;
+    const crossEntityPlan = TailoringPlanSchema.parse({
+      ...inactivePlan,
+      decisions: inactivePlan.decisions.map((decision) =>
+        decision.id === inactiveRewrite.id
+          ? {
+              ...decision,
+              evidenceIds: [...decision.evidenceIds, inactiveDirective.evidence.id],
+            }
+          : decision),
+      baselineOverrides: inactivePlan.baselineOverrides.map((override) =>
+        override.baselineItemId === inactiveRewrite.baselineItemId
+          ? {
+              ...override,
+              evidenceIds: [...override.evidenceIds, inactiveDirective.evidence.id],
+            }
+          : override),
+    });
+    expect(() => buildEvidenceLedger(
+      analysis,
+      crossEntityPlan,
+      inactiveDirective.snapshot,
+    )).toThrow("requirement evidence directive-1 lacks non-directive same-entity factual support");
+
+    expect(() => buildEvidenceLedger(
+      supportedAnalysis,
+      plan,
+      directive.snapshot,
+      {
+        comments: ["Keep the impact."],
+        commentDispositions: [{
+          commentIndex: 0,
+          status: "applied",
+          rationale: "Misuse requirement metadata as comment support.",
+          evidenceIds: [directive.evidence.id],
+        }],
+      },
+    )).toThrow("requirement evidence directive-0 cannot support a comment disposition");
+  });
+
   test("collects structured safe semantic issues without changing fail-fast validation", () => {
     const { snapshot, analysis } = fixtures();
     const invalid: JobAnalysis = {
@@ -564,6 +885,30 @@ describe("mechanical tailoring and canonical rendering", () => {
       expect.objectContaining({ action: "add", skill: skillEdit.after, entityId: skillEdit.evidenceEntityId }),
     ]);
     expect(() => renderTailoredResume(plan, baseline, snapshot)).not.toThrow();
+  });
+
+  test("does not copy must-include directive IDs onto mechanical skill replacement halves", () => {
+    const { snapshot, analysis } = fixtures();
+    const directive = withMustIncludeDirective(snapshot);
+    const analysisWithDirective: JobAnalysis = {
+      ...analysis,
+      exactEdits: analysis.exactEdits.map((edit) => ({
+        ...edit,
+        evidenceIds: [...edit.evidenceIds, directive.evidence.id],
+      })),
+    };
+
+    const plan = buildMechanicalTailoringPlan(
+      analysisWithDirective,
+      baseline,
+      undefined,
+      [directive.evidence.id],
+    );
+
+    expect(plan.decisions.find((decision) => decision.action === "rewrite")?.evidenceIds)
+      .toContain(directive.evidence.id);
+    expect(plan.skillDecisions.flatMap((decision) => decision.evidenceIds))
+      .not.toContain(directive.evidence.id);
   });
 
   test("renders exact escaped replacements without changing immutable structure or counts", () => {

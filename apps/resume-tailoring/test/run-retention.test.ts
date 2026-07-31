@@ -23,6 +23,7 @@ const SOURCE_SNAPSHOT = {
   },
   sources: [],
   evidence: [],
+  mustIncludeDirectives: [],
   explicitEntityBindings: {},
 } as const;
 const REVIEW_STAGES = ["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"] as const;

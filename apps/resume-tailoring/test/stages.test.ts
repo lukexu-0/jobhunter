@@ -19,6 +19,7 @@ import {
   parseBaselineResume,
   parseMacroCalls,
   renderTailoredResume,
+  TailoringPlanSchema,
   type AtsKeywordExtraction,
   type EditResult,
   type DeterministicQaReport,
@@ -129,6 +130,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
     sourceHashes: Object.fromEntries(sources.map((source) => [source.id, source.sha256])),
     sources,
     evidence,
+    mustIncludeDirectives: [],
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
   const atsKeywordExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
@@ -152,7 +154,94 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
   };
 }
 
+const ACTIVE_DIRECTIVE_EVIDENCE_ID = "active-directive";
+
+function resumeFixturesWithActiveDirective(jobDescription: string): ResumeFixtures {
+  const fixtures = resumeFixtures(jobDescription);
+  const bulletEdit = fixtures.analysis.exactEdits.find((edit) => edit.kind === "bullet")!;
+  const existingSource = fixtures.snapshot.sources.find((source) =>
+    source.id === "source-automated-testing")!;
+  const source: IndexedContextSource = {
+    ...existingSource,
+    baselineEntityIds: [...existingSource.baselineEntityIds, bulletEdit.entityId],
+  };
+  const factualEvidence: EvidenceBlock = {
+    ...fixtures.snapshot.evidence[0]!,
+    sourceVersionId: source.sourceVersionId,
+    sourceId: source.id,
+    entityId: source.entityId,
+    sha256: source.sha256,
+  };
+  const directiveEvidence: EvidenceBlock = {
+    ...factualEvidence,
+    id: ACTIVE_DIRECTIVE_EVIDENCE_ID,
+    ordinal: factualEvidence.ordinal + 1,
+    text: "The resume must include the candidate's supported testing impact.",
+  };
+  const snapshot: ContextSnapshot = {
+    ...fixtures.snapshot,
+    sources: fixtures.snapshot.sources.map((candidate) =>
+      candidate.id === source.id ? source : candidate),
+    evidence: [
+      factualEvidence,
+      ...fixtures.snapshot.evidence.slice(1),
+      directiveEvidence,
+    ],
+    mustIncludeDirectives: [{
+      evidenceId: directiveEvidence.id,
+      sourceId: directiveEvidence.sourceId,
+      entityId: directiveEvidence.entityId,
+      text: directiveEvidence.text,
+    }],
+  };
+  const analysis: JobAnalysis = {
+    ...fixtures.analysis,
+    exactEdits: fixtures.analysis.exactEdits.map((edit) => edit.kind === "bullet"
+      ? { ...edit, evidenceIds: [...edit.evidenceIds, directiveEvidence.id] }
+      : edit),
+  };
+  return {
+    ...fixtures,
+    snapshot,
+    snapshotInput: {
+      manifestSha256: snapshot.manifestSha256,
+      baselineSha256: snapshot.baselineSha256,
+      sourceHashes: snapshot.sourceHashes,
+    },
+    analysis,
+    plan: buildMechanicalTailoringPlan(
+      analysis,
+      baseline,
+      undefined,
+      [directiveEvidence.id],
+    ),
+  };
+}
+
+function dropAnalyzedRewrite(plan: TailoringPlan): TailoringPlan {
+  const rewrite = plan.decisions.find((decision) => decision.action === "rewrite")!;
+  const originalBullet = parsedBaseline.bullets.find((bullet) =>
+    bullet.id === rewrite.baselineItemId)!;
+  return TailoringPlanSchema.parse({
+    ...plan,
+    decisions: plan.decisions.map((decision) =>
+      decision.id === rewrite.id
+        ? {
+            ...decision,
+            action: "retain",
+            text: originalBullet.text,
+            evidenceIds: [],
+            factKeys: [],
+            rationale: "Drop all analyzed support.",
+          }
+        : decision),
+    baselineOverrides: plan.baselineOverrides.filter((override) =>
+      override.baselineItemId !== rewrite.baselineItemId),
+  });
+}
+
 interface HarnessOptions {
+  readonly fixtures?: ResumeFixtures;
   readonly compileOutcomes?: readonly ("success" | "repairable" | "terminal")[];
   readonly deterministicPass?: boolean;
   readonly deterministicReports?: readonly DeterministicQaReport[];
@@ -191,7 +280,7 @@ interface Harness {
 
 async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const jobDescription = "Strong TypeScript engineer";
-  const fixtures = resumeFixtures(jobDescription);
+  const fixtures = options.fixtures ?? resumeFixtures(jobDescription);
   const database = openPipelineDatabase(":memory:");
   databases.push(database);
   let now = 0;
@@ -287,6 +376,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
           fixtures.analysis,
           baseline,
           attempt.input.onePageCorrection,
+          attempt.input.mustIncludeEvidenceIds,
         ),
         toolCount: 4,
       };
@@ -438,6 +528,46 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
   });
 
+  test("rejects missing active directives before analysis artifacts finalize", async () => {
+    const activeFixtures = resumeFixturesWithActiveDirective("Strong TypeScript engineer");
+    const unsupported = resumeFixtures("Strong TypeScript engineer");
+    const harness = await createHarness({
+      fixtures: {
+        ...activeFixtures,
+        analysis: unsupported.analysis,
+        plan: unsupported.plan,
+      },
+    });
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "analyzing",
+    });
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+  });
+
+  test("rejects an initial plan that drops all support for an analysis-active directive", async () => {
+    const fixtures = resumeFixturesWithActiveDirective("Strong TypeScript engineer");
+    const dropped = dropAnalyzedRewrite(fixtures.plan);
+    const harness = await createHarness({
+      fixtures,
+      tailoringAgent: async () => ({ plan: dropped, toolCount: 4 }),
+    });
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "tailoring",
+    });
+    expect(harness.repository.getArtifact(harness.runId, "tailoring-plan")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "evidence-ledger")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "tailored-tex")).toBeNull();
+  });
+
   test("persists canonical TeX rendered from an injected reduced tailoring result", async () => {
     const fixture = resumeFixtures("Strong TypeScript engineer");
     const result: TailoringResult = { plan: fixture.plan, toolCount: 4 };
@@ -570,6 +700,78 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf") !== null)
         .toBe(generateKeywordMap);
     }
+  });
+
+  test("excludes must-include directive evidence from one-page correction candidates", async () => {
+    const baseFixture = resumeFixtures("Strong TypeScript engineer");
+    const competition = parsedBaseline.entities.find((entity) =>
+      entity.section === "competitions-other")!;
+    const replacedEvidence = baseFixture.snapshot.evidence.find((evidence) =>
+      evidence.entityId === competition.entityId)!;
+    const existingSource = baseFixture.snapshot.sources.find((candidate) =>
+      candidate.id === "source-reward-scheduler")!;
+    const source: IndexedContextSource = {
+      ...existingSource,
+      baselineEntityIds: [...existingSource.baselineEntityIds, competition.entityId],
+    };
+    const factualEvidence: EvidenceBlock = {
+      id: "competition-fact",
+      sourceVersionId: source.sourceVersionId,
+      sourceId: source.id,
+      entityId: source.entityId,
+      ordinal: 1,
+      headingPath: [competition.entityId],
+      text: competition.bullets[0]!.text,
+      caveats: [],
+      sha256: source.sha256,
+    };
+    const directiveEvidence: EvidenceBlock = {
+      ...factualEvidence,
+      id: "competition-directive",
+      ordinal: 0,
+      text: "The resume must include the competition result when supported.",
+    };
+    const sources = baseFixture.snapshot.sources.map((candidate) =>
+      candidate.id === source.id ? source : candidate);
+    const snapshot: ContextSnapshot = {
+      ...baseFixture.snapshot,
+      sources,
+      sourceHashes: Object.fromEntries(sources.map((item) => [item.id, item.sha256])),
+      evidence: [
+        directiveEvidence,
+        factualEvidence,
+        ...baseFixture.snapshot.evidence.filter((evidence) => evidence.id !== replacedEvidence.id),
+      ],
+      mustIncludeDirectives: [{
+        evidenceId: directiveEvidence.id,
+        sourceId: directiveEvidence.sourceId,
+        entityId: directiveEvidence.entityId,
+        text: directiveEvidence.text,
+      }],
+    };
+    const fixtures: ResumeFixtures = {
+      ...baseFixture,
+      snapshot,
+      snapshotInput: {
+        manifestSha256: snapshot.manifestSha256,
+        baselineSha256: snapshot.baselineSha256,
+        sourceHashes: snapshot.sourceHashes,
+      },
+    };
+    const harness = await createHarness({
+      fixtures,
+      deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
+    });
+
+    await processToStop(harness);
+
+    const correction = harness.agentInputs.tailoring[1]?.onePageCorrection;
+    expect(correction?.candidates.flatMap((candidate) => candidate.evidenceIds))
+      .not.toContain(directiveEvidence.id);
+    expect(correction?.candidates.flatMap((candidate) => candidate.evidenceIds))
+      .toContain(factualEvidence.id);
+    await reportUnexpectedFailure(harness);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
   });
 
   test("repeats progressively stronger one-page corrections until deterministic QA passes", async () => {
@@ -856,6 +1058,44 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       expect(visual.repository.getRun(visual.runId)).toMatchObject({ status: "review", visualAcknowledgementRequired: true });
       expect(visual.repository.getArtifact(visual.runId, "visual-qa")).not.toBeNull();
     }
+  });
+
+  test("rejects an edited plan that drops all support for an analysis-active directive", async () => {
+    const fixtures = resumeFixturesWithActiveDirective("Strong TypeScript engineer");
+    const harness = await createHarness({
+      fixtures,
+      editAgent: async (attempt) => ({
+        plan: dropAnalyzedRewrite(attempt.input.currentPlan),
+        commentDispositions: [{
+          commentIndex: 0,
+          status: "applied",
+          rationale: "Attempt to drop the rewrite.",
+          evidenceIds: ["evidence-0"],
+        }],
+      }),
+    });
+    await processToStop(harness);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    expect(harness.agentInputs.tailoring[0]?.mustIncludeEvidenceIds)
+      .toEqual([ACTIVE_DIRECTIVE_EVIDENCE_ID]);
+    const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
+    harness.repository.editRun(
+      harness.runId,
+      "drop the rewritten impact",
+      firstPdf.sha256,
+      fixtures.snapshotInput,
+    );
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "editing",
+      currentRevision: 2,
+    });
+    expect(harness.repository.getArtifact(harness.runId, "tailoring-plan")?.revision).toBe(1);
+    expect(harness.repository.timeline(harness.runId).attempts
+      .find((attempt) => attempt.stage === "editing")).toMatchObject({ status: "failed" });
   });
 
   test("human and machine edits reuse revision-one analysis and receive exact immutable prior QA", async () => {

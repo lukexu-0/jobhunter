@@ -63,10 +63,12 @@ export function buildMechanicalTailoringPlan(
   analysisInput: JobAnalysis,
   baselineSource: string,
   onePageCorrection?: OnePageCorrection,
+  mustIncludeEvidenceIds: readonly string[] = [],
 ): TailoringPlan {
   const analysis = JobAnalysisSchema.parse(analysisInput);
   const baseline = parseBaselineResume(baselineSource);
   if (analysis.baselineSha256 !== baseline.sha256) throw new ResumeValidationError("job analysis baseline hash does not match the source");
+  const mustIncludeEvidenceIdSet = new Set(mustIncludeEvidenceIds);
   if (onePageCorrection) {
     if (!onePageCorrection.note.trim() || Buffer.byteLength(onePageCorrection.note) > 512) {
       throw new ResumeValidationError("one-page correction note must contain at most 512 bytes");
@@ -90,7 +92,8 @@ export function buildMechanicalTailoringPlan(
       || bullet.section !== candidate.section
       || bullet.entityId !== candidate.entityId
       || bullet.text !== candidate.text
-      || candidate.evidenceIds.length === 0) {
+      || candidate.evidenceIds.length === 0
+      || candidate.evidenceIds.some((evidenceId) => mustIncludeEvidenceIdSet.has(evidenceId))) {
       throw new ResumeValidationError(`invalid one-page omission candidate ${candidate.baselineItemId}`);
     }
     if (omissionCandidates.has(candidate.baselineItemId)) {
@@ -194,6 +197,8 @@ export function buildMechanicalTailoringPlan(
     }
     if (edit.kind !== "skill") throw new ResumeValidationError(`exact edit ${edit.id} does not match baseline skill ${skill.id}`);
     const rationale = `Replace baseline skill via exact analysis edit ${edit.id}.`;
+    const skillEvidenceIds = edit.evidenceIds.filter((evidenceId) =>
+      !mustIncludeEvidenceIdSet.has(evidenceId));
     return [
       {
         id: stablePlanId("skill", skill.id, "omit", edit.id),
@@ -201,7 +206,7 @@ export function buildMechanicalTailoringPlan(
         category: skill.category,
         skill: edit.before,
         action: "omit" as const,
-        evidenceIds: edit.evidenceIds,
+        evidenceIds: skillEvidenceIds,
         rationale,
       },
       {
@@ -210,7 +215,7 @@ export function buildMechanicalTailoringPlan(
         category: skill.category,
         skill: edit.after,
         action: "add" as const,
-        evidenceIds: edit.evidenceIds,
+        evidenceIds: skillEvidenceIds,
         rationale,
       },
     ];
@@ -252,6 +257,7 @@ export interface TailoringAgentInput {
   readonly baseline: string;
   readonly operations: TailoringAgentOperations;
   readonly onePageCorrection?: OnePageCorrection;
+  readonly mustIncludeEvidenceIds?: readonly string[];
 }
 
 export interface TailoringAgentAttempt {
@@ -328,6 +334,7 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
         attempt.input.analysis,
         attempt.input.baseline,
         attempt.input.onePageCorrection,
+        attempt.input.mustIncludeEvidenceIds,
       );
       const toolSignal = AbortSignal.any([attempt.signal, AbortSignal.timeout(DEFAULT_TOOL_TIMEOUT_MS)]);
       const preview = await attempt.input.operations.renderPlan(plan, toolSignal);

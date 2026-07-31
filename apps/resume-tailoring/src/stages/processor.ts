@@ -327,6 +327,8 @@ export class PipelineStageProcessor {
       input: {
         analysis,
         baseline: sources.baseline,
+        mustIncludeEvidenceIds: sources.snapshot.mustIncludeDirectives.map((directive) =>
+          directive.evidenceId),
         operations: {
           renderPlan: (plan, toolSignal) => {
             toolSignal.throwIfAborted();
@@ -699,14 +701,19 @@ export class PipelineStageProcessor {
     const baselineSourceIds = new Set(
       sources.snapshot.sources.filter((source) => source.kind === "baseline").map((source) => source.id),
     );
+    const directiveEvidenceIds = new Set(
+      sources.snapshot.mustIncludeDirectives.map((directive) => directive.evidenceId),
+    );
     const editTargets = new Set(analysis.exactEdits.map((edit) => edit.baselineItemId));
     const candidates = baseline.bullets
       .map((bullet, index) => {
         const evidence = sources.snapshot.evidence.find((candidate) =>
-          baselineSourceIds.has(candidate.sourceId)
+          !directiveEvidenceIds.has(candidate.id)
+          && baselineSourceIds.has(candidate.sourceId)
           && equivalentEntities(candidate.entityId, bullet.entityId, sources.snapshot))
           ?? sources.snapshot.evidence.find((candidate) =>
-            equivalentEntities(candidate.entityId, bullet.entityId, sources.snapshot));
+            !directiveEvidenceIds.has(candidate.id)
+            && equivalentEntities(candidate.entityId, bullet.entityId, sources.snapshot));
         return evidence ? {
           baselineItemId: bullet.id,
           section: bullet.section,

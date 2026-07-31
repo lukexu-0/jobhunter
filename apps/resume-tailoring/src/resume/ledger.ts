@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { ContextSnapshot } from "../context/types.ts";
 import { parseBaselineResume } from "./parser.ts";
 import { EditResultSchema, JobAnalysisSchema, TailoringPlanSchema, type CommentDisposition, type EditResult, type JobAnalysis, type RepairResult, type TailoringPlan } from "./types.ts";
-import { equivalentEntities, ResumeValidationError } from "./render.ts";
+import { equivalentEntities, ResumeValidationError, validatePlanMustIncludeDirectives } from "./render.ts";
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -34,7 +34,10 @@ export type AnalysisSemanticIssueCode =
   | "skill-target"
   | "skill-before"
   | "skill-existing"
-  | "skill-duplicate";
+  | "skill-duplicate"
+  | "must-include-placement"
+  | "must-include-support"
+  | "must-include-required";
 
 export type AnalysisSemanticIssueCategory =
   | "hashes-and-snapshot"
@@ -42,7 +45,8 @@ export type AnalysisSemanticIssueCategory =
   | "job-description-grounding"
   | "evidence-provenance"
   | "baseline-targets"
-  | "skill-replacements";
+  | "skill-replacements"
+  | "must-include-directives";
 
 export interface AnalysisSemanticIssue {
   readonly code: AnalysisSemanticIssueCode;
@@ -219,6 +223,83 @@ export function collectAnalysisSemanticIssues(
     }
     replacementSkills.add(replacementKey);
   }
+  const directiveByEvidenceId = new Map(
+    snapshot.mustIncludeDirectives.map((directive) => [directive.evidenceId, directive]),
+  );
+  const directiveEvidenceIds = new Set(directiveByEvidenceId.keys());
+  const hasFactualSupport = (
+    evidenceIds: readonly string[],
+    directive: ContextSnapshot["mustIncludeDirectives"][number],
+  ): boolean => evidenceIds.some((evidenceId) => {
+    if (directiveEvidenceIds.has(evidenceId)) return false;
+    const block = evidenceById.get(evidenceId);
+    const source = block ? sourceById.get(block.sourceId) : undefined;
+    return Boolean(block
+      && source?.kind !== "baseline"
+      && equivalentEntities(block.entityId, directive.entityId, snapshot));
+  });
+  const bulletEdits = analysis.exactEdits.filter((edit) => edit.kind === "bullet");
+  const activeDirectiveIds = new Set(
+    snapshot.mustIncludeDirectives
+      .filter((directive) => bulletEdits.some((edit) =>
+        hasFactualSupport(edit.evidenceIds, directive)))
+      .map((directive) => directive.evidenceId),
+  );
+  for (let keywordIndex = 0; keywordIndex < analysis.jdKeywords.length; keywordIndex++) {
+    const keyword = analysis.jdKeywords[keywordIndex]!;
+    for (let evidenceIndex = 0; evidenceIndex < keyword.evidenceIds.length; evidenceIndex++) {
+      if (!directiveEvidenceIds.has(keyword.evidenceIds[evidenceIndex]!)) continue;
+      issues.push(semanticIssue(
+        "must-include-placement",
+        "must-include-directives",
+        ["jdKeywords", keywordIndex, "evidenceIds", evidenceIndex],
+        "must not cite requirement evidence as JD-keyword factual support",
+      ));
+    }
+  }
+  for (let editIndex = 0; editIndex < analysis.exactEdits.length; editIndex++) {
+    const edit = analysis.exactEdits[editIndex]!;
+    for (let evidenceIndex = 0; evidenceIndex < edit.evidenceIds.length; evidenceIndex++) {
+      const directive = directiveByEvidenceId.get(edit.evidenceIds[evidenceIndex]!);
+      if (!directive) continue;
+      if (edit.kind === "skill") {
+        issues.push(semanticIssue(
+          "must-include-placement",
+          "must-include-directives",
+          ["exactEdits", editIndex, "evidenceIds", evidenceIndex],
+          "must not cite requirement evidence on a skill edit",
+        ));
+      } else if (!activeDirectiveIds.has(directive.evidenceId)) {
+        issues.push(semanticIssue(
+          "must-include-support",
+          "must-include-directives",
+          ["exactEdits", editIndex, "evidenceIds", evidenceIndex],
+          "must cite an active requirement with non-directive same-entity factual support",
+        ));
+      } else if (!hasFactualSupport(edit.evidenceIds, directive)) {
+        issues.push(semanticIssue(
+          "must-include-support",
+          "must-include-directives",
+          ["exactEdits", editIndex, "evidenceIds", evidenceIndex],
+          "must pair requirement evidence with non-directive same-entity factual support on the same bullet edit",
+        ));
+      }
+    }
+  }
+  for (let directiveIndex = 0; directiveIndex < snapshot.mustIncludeDirectives.length; directiveIndex++) {
+    const directive = snapshot.mustIncludeDirectives[directiveIndex]!;
+    if (!activeDirectiveIds.has(directive.evidenceId)) continue;
+    const placed = bulletEdits.some((edit) =>
+      edit.evidenceIds.includes(directive.evidenceId)
+      && hasFactualSupport(edit.evidenceIds, directive));
+    if (placed) continue;
+    issues.push(semanticIssue(
+      "must-include-required",
+      "must-include-directives",
+      ["mustIncludeDirectives", directiveIndex, "evidenceId"],
+      "must be cited on a fact-supported bullet edit when active",
+    ));
+  }
   return issues;
 }
 
@@ -280,6 +361,25 @@ function failFastSemanticMessage(
       return `replacement skill ${edit?.after ?? "unknown"} already exists`;
     case "skill-duplicate":
       return `duplicate replacement skill ${edit?.after ?? "unknown"}`;
+    case "must-include-placement": {
+      const evidenceIndex = issue.path[3];
+      const evidenceId = typeof evidenceIndex === "number"
+        ? (edit?.evidenceIds[evidenceIndex] ?? keyword?.evidenceIds[evidenceIndex])
+        : undefined;
+      return `requirement evidence ${evidenceId ?? "unknown"} cannot be used by ${edit?.kind === "skill" ? "a skill edit" : "a JD keyword"}`;
+    }
+    case "must-include-support": {
+      const evidenceIndex = issue.path[3];
+      const evidenceId = typeof evidenceIndex === "number" ? edit?.evidenceIds[evidenceIndex] : undefined;
+      return `requirement evidence ${evidenceId ?? "unknown"} lacks non-directive same-entity factual support on its bullet edit`;
+    }
+    case "must-include-required": {
+      const directiveIndex = issue.path[1];
+      const directive = typeof directiveIndex === "number"
+        ? snapshot.mustIncludeDirectives[directiveIndex]
+        : undefined;
+      return `active must-include directive ${directive?.evidenceId ?? "unknown"} is missing from a supported bullet edit`;
+    }
   }
 }
 
@@ -310,17 +410,61 @@ function validateKnownAnalysisEvidence(analysis: JobAnalysis, snapshot: ContextS
   }
 }
 
+function validateAnalysisPlanMustIncludeContinuity(
+  analysis: JobAnalysis,
+  plan: TailoringPlan,
+  snapshot: ContextSnapshot,
+): void {
+  const evidenceById = new Map(snapshot.evidence.map((block) => [block.id, block]));
+  const sourceById = new Map(snapshot.sources.map((source) => [source.id, source]));
+  const directiveEvidenceIds = new Set(
+    snapshot.mustIncludeDirectives.map((directive) => directive.evidenceId),
+  );
+  const hasFactualSupport = (
+    evidenceIds: readonly string[],
+    directive: ContextSnapshot["mustIncludeDirectives"][number],
+  ): boolean => evidenceIds.some((evidenceId) => {
+    if (directiveEvidenceIds.has(evidenceId)) return false;
+    const block = evidenceById.get(evidenceId);
+    const source = block ? sourceById.get(block.sourceId) : undefined;
+    return Boolean(block
+      && source?.kind !== "baseline"
+      && equivalentEntities(block.entityId, directive.entityId, snapshot));
+  });
+  const bulletEdits = analysis.exactEdits.filter((edit) => edit.kind === "bullet");
+  const includedDecisions = plan.decisions.filter((decision) =>
+    decision.action === "add" || decision.action === "rewrite");
+  for (const directive of snapshot.mustIncludeDirectives) {
+    const active = bulletEdits.some((edit) =>
+      hasFactualSupport(edit.evidenceIds, directive));
+    if (!active) continue;
+    const preserved = includedDecisions.some((decision) =>
+      decision.evidenceIds.includes(directive.evidenceId)
+      && equivalentEntities(decision.entityId, directive.entityId, snapshot)
+      && hasFactualSupport(decision.evidenceIds, directive));
+    if (!preserved) {
+      throw new ResumeValidationError(`analysis-active must-include directive ${directive.evidenceId} is missing from a supported decision`);
+    }
+  }
+}
+
 export function validateCommentDispositions(comments: readonly string[], dispositions: readonly CommentDisposition[], snapshot: ContextSnapshot): void {
   if (comments.length !== dispositions.length) throw new ResumeValidationError("every comment requires exactly one disposition");
   const indexes = dispositions.map((item) => item.commentIndex);
   if (new Set(indexes).size !== indexes.length || indexes.some((index) => index < 0 || index >= comments.length)) throw new ResumeValidationError("comment dispositions contain missing, duplicate, or unknown indexes");
   const evidenceIds = new Set(snapshot.evidence.map((block) => block.id));
+  const directiveEvidenceIds = new Set(
+    snapshot.mustIncludeDirectives.map((directive) => directive.evidenceId),
+  );
   for (let index = 0; index < comments.length; index++) {
     const comment = comments[index];
     if (!comment?.trim()) throw new ResumeValidationError(`comment ${index} is empty`);
     const disposition = dispositions.find((item) => item.commentIndex === index);
     if (!disposition) throw new ResumeValidationError(`comment ${index} has no disposition`);
-    for (const evidenceId of disposition.evidenceIds) if (!evidenceIds.has(evidenceId)) throw new ResumeValidationError(`comment disposition cites unknown evidence ${evidenceId}`);
+    for (const evidenceId of disposition.evidenceIds) {
+      if (!evidenceIds.has(evidenceId)) throw new ResumeValidationError(`comment disposition cites unknown evidence ${evidenceId}`);
+      if (directiveEvidenceIds.has(evidenceId)) throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot support a comment disposition`);
+    }
   }
 }
 
@@ -353,6 +497,8 @@ export function buildEvidenceLedger(analysisInput: JobAnalysis, planInput: Tailo
   const plan = TailoringPlanSchema.parse(planInput);
   validateAnalysisImmutability(plan, analysis);
   validateKnownAnalysisEvidence(analysis, snapshot);
+  validatePlanMustIncludeDirectives(plan, snapshot);
+  validateAnalysisPlanMustIncludeContinuity(analysis, plan, snapshot);
   const comments = options.comments ?? [];
   const dispositions = options.commentDispositions ?? [];
   validateCommentDispositions(comments, dispositions, snapshot);
@@ -400,6 +546,8 @@ function validateAppliedCommentEvidence(plan: TailoringPlan, dispositions: reado
 export function validateEditResult(resultInput: EditResult, comments: readonly string[], analysis: JobAnalysis, snapshot: ContextSnapshot): void {
   const result = EditResultSchema.parse(resultInput);
   validateAnalysisImmutability(result.plan, analysis);
+  validatePlanMustIncludeDirectives(result.plan, snapshot);
+  validateAnalysisPlanMustIncludeContinuity(analysis, result.plan, snapshot);
   validateCommentDispositions(comments, result.commentDispositions, snapshot);
   validateAppliedCommentEvidence(result.plan, result.commentDispositions);
 }

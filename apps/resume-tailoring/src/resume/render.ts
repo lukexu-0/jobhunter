@@ -53,6 +53,98 @@ function evidenceFor(ids: readonly string[], entityId: string, evidence: Readonl
   });
 }
 
+export function validatePlanMustIncludeDirectives(
+  plan: TailoringPlan,
+  snapshot: ContextSnapshot,
+): void {
+  const directiveByEvidenceId = new Map(
+    snapshot.mustIncludeDirectives.map((directive) => [directive.evidenceId, directive]),
+  );
+  if (directiveByEvidenceId.size === 0) return;
+  const directiveEvidenceIds = new Set(directiveByEvidenceId.keys());
+  const evidenceById = new Map(snapshot.evidence.map((block) => [block.id, block]));
+  const sourceById = new Map(snapshot.sources.map((source) => [source.id, source]));
+  const includedDecisions = plan.decisions.filter((decision) =>
+    decision.action === "add" || decision.action === "rewrite");
+  const hasFactualSupport = (
+    evidenceIds: readonly string[],
+    directive: ContextSnapshot["mustIncludeDirectives"][number],
+  ): boolean => evidenceIds.some((evidenceId) => {
+    if (directiveEvidenceIds.has(evidenceId)) return false;
+    const block = evidenceById.get(evidenceId);
+    const source = block ? sourceById.get(block.sourceId) : undefined;
+    return Boolean(block
+      && source?.kind !== "baseline"
+      && equivalentEntities(block.entityId, directive.entityId, snapshot));
+  });
+  const activeDirectiveIds = new Set(
+    snapshot.mustIncludeDirectives
+      .filter((directive) => includedDecisions.some((decision) =>
+        hasFactualSupport(decision.evidenceIds, directive)))
+      .map((directive) => directive.evidenceId),
+  );
+
+  for (const decision of plan.decisions) {
+    for (const evidenceId of decision.evidenceIds) {
+      const directive = directiveByEvidenceId.get(evidenceId);
+      if (!directive) continue;
+      if (decision.action !== "add" && decision.action !== "rewrite") {
+        throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot be used on ${decision.action} decision content`);
+      }
+      if (!activeDirectiveIds.has(evidenceId)
+        || !hasFactualSupport(decision.evidenceIds, directive)) {
+        throw new ResumeValidationError(`requirement evidence ${evidenceId} lacks non-directive same-entity factual support on its decision`);
+      }
+      if (!equivalentEntities(decision.entityId, directive.entityId, snapshot)) {
+        throw new ResumeValidationError(`requirement evidence ${evidenceId} is attributed to ${directive.entityId}, not ${decision.entityId}`);
+      }
+    }
+  }
+  for (const decision of plan.skillDecisions) {
+    for (const evidenceId of decision.evidenceIds) {
+      if (directiveEvidenceIds.has(evidenceId)) {
+        throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot be used on a skill decision`);
+      }
+    }
+  }
+  for (const winner of plan.factWinners) {
+    if (directiveEvidenceIds.has(winner.evidenceId)) {
+      throw new ResumeValidationError(`requirement evidence ${winner.evidenceId} cannot support a fact winner`);
+    }
+  }
+  for (const omission of plan.omissions) {
+    for (const evidenceId of omission.evidenceIds) {
+      if (directiveEvidenceIds.has(evidenceId)) {
+        throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot support omission metadata`);
+      }
+    }
+  }
+  const decisionsByBaselineItemId = new Map(
+    plan.decisions
+      .filter((decision) => decision.baselineItemId !== null)
+      .map((decision) => [decision.baselineItemId!, decision]),
+  );
+  for (const override of plan.baselineOverrides) {
+    for (const evidenceId of override.evidenceIds) {
+      if (!directiveEvidenceIds.has(evidenceId)) continue;
+      const decision = decisionsByBaselineItemId.get(override.baselineItemId);
+      if (!decision?.evidenceIds.includes(evidenceId)) {
+        throw new ResumeValidationError(`requirement evidence ${evidenceId} cannot be relocated to baseline override metadata`);
+      }
+    }
+  }
+  for (const directive of snapshot.mustIncludeDirectives) {
+    if (!activeDirectiveIds.has(directive.evidenceId)) continue;
+    const placed = includedDecisions.some((decision) =>
+      decision.evidenceIds.includes(directive.evidenceId)
+      && equivalentEntities(decision.entityId, directive.entityId, snapshot)
+      && hasFactualSupport(decision.evidenceIds, directive));
+    if (!placed) {
+      throw new ResumeValidationError(`active must-include directive ${directive.evidenceId} is missing from a supported decision`);
+    }
+  }
+}
+
 function assertUnique(values: readonly string[], label: string): void {
   if (new Set(values).size !== values.length) throw new ResumeValidationError(`duplicate ${label}`);
 }
@@ -146,6 +238,7 @@ function validatePlan(planInput: TailoringPlan, baseline: ParsedBaselineResume, 
     if (decision.action !== "retain") evidenceFor(decision.evidenceIds, decision.entityId!, evidence, snapshot);
   }
   for (const key of baselineSkills.keys()) if (skillCoverage.get(key) !== 1) throw new ResumeValidationError(`plan does not cover baseline skill ${key.replace("\u0000", ": ")}`);
+  validatePlanMustIncludeDirectives(plan, snapshot);
   return plan;
 }
 
