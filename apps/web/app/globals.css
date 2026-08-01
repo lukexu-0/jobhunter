@@ -372,7 +372,7 @@ a {
 
 .run-initializer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
   align-items: end;
   gap: var(--space-3);
   padding: var(--space-5) 0;
@@ -396,13 +396,28 @@ a {
   text-transform: uppercase;
 }
 
-.run-initializer__mode {
-  display: inline-flex;
-  min-height: var(--control-height);
-  align-items: center;
-  gap: var(--space-2);
+.run-initializer__options {
+  min-width: 0;
   grid-column: 2;
   grid-row: 1;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.run-initializer__option-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.run-initializer__mode {
+  display: grid;
+  min-height: var(--control-height);
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
   border: var(--border-width) solid var(--color-border-strong);
   border-radius: var(--radius-control);
   padding: var(--space-2) var(--space-3);
@@ -410,17 +425,33 @@ a {
   color: var(--color-text);
   cursor: pointer;
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 700;
-  letter-spacing: var(--tracking-label);
-  line-height: var(--line-tight);
-  text-transform: uppercase;
-  white-space: nowrap;
   transition:
     border-color var(--transition-fast),
     background-color var(--transition-fast),
     color var(--transition-fast),
     opacity var(--transition-fast);
+}
+
+.run-initializer__mode-copy {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.run-initializer__mode-title {
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: var(--tracking-label);
+  line-height: var(--line-tight);
+  text-transform: uppercase;
+}
+
+.run-initializer__mode-description {
+  color: var(--color-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  letter-spacing: normal;
+  line-height: var(--line-base);
 }
 
 .run-initializer__mode:hover {
@@ -439,7 +470,7 @@ a {
 .run-initializer__mode input {
   width: var(--space-4);
   height: var(--space-4);
-  margin: 0;
+  margin: var(--space-1) 0 0;
   accent-color: var(--color-accent);
   cursor: inherit;
 }
@@ -1414,14 +1445,15 @@ a {
     grid-column: 1 / -1;
   }
 
-  .run-initializer__mode {
-    grid-column: 1;
+  .run-initializer__options {
+    grid-column: 1 / -1;
     grid-row: 2;
   }
 
   .run-initializer .square-control {
     grid-column: 2;
-    grid-row: 2;
+    grid-row: 3;
+    justify-self: end;
   }
 
   .applications-toolbar {
@@ -1496,10 +1528,15 @@ a {
     grid-row: auto;
   }
 
+  .run-initializer__option-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .run-initializer .square-control {
     width: 100%;
     grid-column: 1;
     grid-row: auto;
+    justify-self: stretch;
   }
 
 

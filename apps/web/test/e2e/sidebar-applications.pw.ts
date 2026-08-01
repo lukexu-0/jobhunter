@@ -17,7 +17,8 @@ function runFixture(id: string, applicationStatus: ApplicationStatus, status: Ru
     origin: "initial",
     queueSequence: 1,
     generateKeywordMap: false,
-    autoApply: false,
+    skipReview: false,
+    autoSubmit: false,
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_000,
     visualAcknowledgementRequired: false,
@@ -32,7 +33,6 @@ function documentViewerFixture(id: string, includeKeywordMap: boolean): RunDto {
   return {
     ...runFixture(id, "applied", "review"),
     generateKeywordMap: includeKeywordMap,
-    autoApply: false,
     revision,
     currentPdfSha256: resumeSha256,
     artifacts: [
@@ -430,7 +430,17 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
   await expect(initializer).toBeVisible();
   await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
   await expect(initializer.getByLabel("Job posting URLs")).toHaveAttribute("id", "job-url");
-  await expect(initializer.getByRole("checkbox", { name: "Auto-apply" })).toBeChecked({ checked: false });
+  const options = initializer.getByRole("group", { name: "Run options" });
+  await expect(options.getByRole("checkbox", { name: "Skip résumé review", exact: true })).not.toBeChecked();
+  await expect(options.getByRole("checkbox", { name: "Auto-submit application", exact: true })).not.toBeChecked();
+  await expect(options.getByText(
+    "Automatically approves only when automated résumé checks pass, then starts the application.",
+    { exact: true },
+  )).toBeVisible();
+  await expect(options.getByText(
+    "Submits only when the application has no blockers.",
+    { exact: true },
+  )).toBeVisible();
   await expect(initializer.getByText("Generate resume-to-job-description keyword map", { exact: true })).toHaveCount(0);
   await expect(initializer.getByRole("textbox")).toHaveCount(1);
   await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
@@ -492,8 +502,12 @@ test("uses shared request eligibility and remains usable without overflow", asyn
 });
 
 
-test("posts the selected auto-apply mode with the canonical URL, disables while pending, and navigates on success", async ({ page }) => {
-  const initializedRun = { ...runFixture("initialized-run", "applied", "failed"), autoApply: true };
+test("posts both selected run options with the canonical URL, disables while pending, and navigates on success", async ({ page }) => {
+  const initializedRun = {
+    ...runFixture("initialized-run", "applied", "failed"),
+    skipReview: true,
+    autoSubmit: true,
+  };
   let postedBody: string | null = null;
   let pendingPost: Route | undefined;
   const { promise: postStarted, resolve: markPostStarted } = Promise.withResolvers<void>();
@@ -520,9 +534,12 @@ test("posts the selected auto-apply mode with the canonical URL, disables while 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
   const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
-  const autoApply = initializer.getByRole("checkbox", { name: "Auto-apply" });
-  await expect(autoApply).toBeChecked({ checked: false });
-  await autoApply.check();
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await expect(skipReview).not.toBeChecked();
+  await expect(autoSubmit).not.toBeChecked();
+  await skipReview.check();
+  await autoSubmit.check();
   await input.fill("HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description");
   await initialize.click();
   await postStarted;
@@ -530,10 +547,12 @@ test("posts the selected auto-apply mode with the canonical URL, disables while 
   expect(postedBody).toBe(JSON.stringify({
     jobUrl: "https://jobs.example.test/roles/123?source=ui",
     generateKeywordMap: true,
-    autoApply: true,
+    skipReview: true,
+    autoSubmit: true,
   }));
   await expect(input).toBeDisabled();
-  await expect(autoApply).toBeDisabled();
+  await expect(skipReview).toBeDisabled();
+  await expect(autoSubmit).toBeDisabled();
   await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
 
   if (!pendingPost) throw new Error("Initialize request was not intercepted");
@@ -547,7 +566,7 @@ test("posts the selected auto-apply mode with the canonical URL, disables while 
   await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
 });
 
-test("preserves auto-apply mode while confirming a duplicate canonical URL", async ({ page }) => {
+test("preserves both run options while confirming a duplicate canonical URL", async ({ page }) => {
   const canonicalJobUrl = "https://jobs.example.test/roles/123?source=ui";
   const enteredJobUrl = "HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description";
   const existingRun: RunDto = {
@@ -581,13 +600,15 @@ test("preserves auto-apply mode while confirming a duplicate canonical URL", asy
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
   const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
-  const autoApply = initializer.getByRole("checkbox", { name: "Auto-apply" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
   const dialog = page.getByRole("dialog", { name: "Initialize duplicate application?" });
   const description =
     "This job posting URL has already been used. Initialize another application anyway?";
 
   await input.fill(enteredJobUrl);
-  await autoApply.check();
+  await skipReview.check();
+  await autoSubmit.check();
   await initialize.click();
 
   await expect(dialog).toBeVisible();
@@ -600,7 +621,8 @@ test("preserves auto-apply mode while confirming a duplicate canonical URL", asy
   await expect(dialog).not.toBeVisible();
   await expect(input).toHaveValue(enteredJobUrl);
   await expect(initialize).toBeFocused();
-  await expect(autoApply).toBeChecked();
+  await expect(skipReview).toBeChecked();
+  await expect(autoSubmit).toBeChecked();
   expect(postedPayloads).toHaveLength(0);
 
   await initialize.click();
@@ -609,7 +631,8 @@ test("preserves auto-apply mode while confirming a duplicate canonical URL", asy
   await expect(dialog).not.toBeVisible();
   await expect(input).toHaveValue(enteredJobUrl);
   await expect(initialize).toBeFocused();
-  await expect(autoApply).toBeChecked();
+  await expect(skipReview).toBeChecked();
+  await expect(autoSubmit).toBeChecked();
   expect(postedPayloads).toHaveLength(0);
 
   await initialize.click();
@@ -620,7 +643,8 @@ test("preserves auto-apply mode while confirming a duplicate canonical URL", asy
   expect(postedPayloads).toEqual([{
     jobUrl: canonicalJobUrl,
     generateKeywordMap: true,
-    autoApply: true,
+    skipReview: true,
+    autoSubmit: true,
   }]);
 });
 
@@ -741,7 +765,14 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
     const body = request.postDataJSON() as {
       jobUrl: string;
       generateKeywordMap: boolean;
+      skipReview: boolean;
+      autoSubmit: boolean;
     };
+    expect(body).toMatchObject({
+      generateKeywordMap: true,
+      skipReview: true,
+      autoSubmit: false,
+    });
     expect(body.generateKeywordMap).toBe(true);
     expect(expectedUrls).toContain(body.jobUrl);
     expect(pendingPosts.has(body.jobUrl)).toBe(false);
@@ -758,6 +789,9 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
   const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await skipReview.check();
   await input.fill([
     " HTTPS://Jobs.Example.Test:443/roles/alpha#overview,",
     "https://jobs.example.test/roles/bravo?source=board",
@@ -809,6 +843,8 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
   await expect(page).toHaveURL(/\/$/);
   await expect(input).toHaveValue("");
   await expect(input).toBeEnabled();
+  await expect(skipReview).not.toBeChecked();
+  await expect(autoSubmit).not.toBeChecked();
   await expect(initialize).toBeDisabled();
   await expect(page.locator("tbody tr")).toHaveCount(7);
   for (const run of initializedRuns.values()) {
@@ -862,7 +898,14 @@ test("keeps successful rows and only failed canonical URLs after a partial initi
     const body = request.postDataJSON() as {
       jobUrl: string;
       generateKeywordMap: boolean;
+      skipReview: boolean;
+      autoSubmit: boolean;
     };
+    expect(body).toMatchObject({
+      generateKeywordMap: true,
+      skipReview: true,
+      autoSubmit: true,
+    });
     expect(body.generateKeywordMap).toBe(true);
     expect(expectedUrls).toContain(body.jobUrl);
     expect(pendingPosts.has(body.jobUrl)).toBe(false);
@@ -872,14 +915,19 @@ test("keeps successful rows and only failed canonical URLs after a partial initi
   });
   await page.goto("/");
 
-  const input = page.getByRole("textbox", { name: "Job posting URLs" });
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await skipReview.check();
+  await autoSubmit.check();
   await input.fill([
     " HTTPS://Jobs.Example.Test:443/roles/success-one#description,",
     "https://jobs.example.test/roles/unavailable#apply\n",
     "https://jobs.example.test/roles/success-two?source=board#details ",
     "https://jobs.example.test/roles/restricted#requirements",
   ].join(" "));
-  await page.getByRole("button", { name: "Initialize" }).click();
+  await initializer.getByRole("button", { name: "Initialize" }).click();
   await allPostsStarted;
 
   expect([...postedUrls].sort()).toEqual([...expectedUrls].sort());
@@ -915,6 +963,8 @@ test("keeps successful rows and only failed canonical URLs after a partial initi
   await expect(input).toHaveAttribute("aria-invalid", "true");
   await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
+  await expect(skipReview).toBeChecked();
+  await expect(autoSubmit).toBeChecked();
   await expect(page.locator("tbody tr")).toHaveCount(2);
   for (const run of successfulRuns.values()) {
     await expect(page.locator(`tbody a.application-link[href="/runs/${run.id}"]`)).toBeVisible();
@@ -945,7 +995,14 @@ test("retains every canonical URL when a multi-URL initialization fails", async 
     const body = request.postDataJSON() as {
       jobUrl: string;
       generateKeywordMap: boolean;
+      skipReview: boolean;
+      autoSubmit: boolean;
     };
+    expect(body).toMatchObject({
+      generateKeywordMap: true,
+      skipReview: true,
+      autoSubmit: false,
+    });
     expect(body.generateKeywordMap).toBe(true);
     expect(expectedUrls).toContain(body.jobUrl);
     pendingPosts.set(body.jobUrl, route);
@@ -955,6 +1012,9 @@ test("retains every canonical URL when a multi-URL initialization fails", async 
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
   const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await skipReview.check();
   await input.fill([
     "HTTPS://Jobs.Example.Test:443/roles/first#details,",
     "https://jobs.example.test/roles/second#apply",
@@ -982,6 +1042,8 @@ test("retains every canonical URL when a multi-URL initialization fails", async 
   await expect(input).toBeEnabled();
   await expect(input).toHaveAttribute("aria-invalid", "true");
   await expect(initializer.getByRole("button", { name: "Initialize" })).toBeEnabled();
+  await expect(skipReview).toBeChecked();
+  await expect(autoSubmit).not.toBeChecked();
   await expect(page.locator("tbody a.application-link")).toHaveCount(0);
 });
 
@@ -1012,7 +1074,7 @@ test("disables a batch larger than the newest-run window", async ({ page }) => {
   expect(postCount).toBe(0);
 });
 
-test("retains the URL and selected auto-apply mode after initialization failures", async ({ page }) => {
+test("retains the URL and independently selected run options after initialization failures", async ({ page }) => {
   const submittedUrl = "https://jobs.example.test/unavailable#details";
   const retryUrl = "https://jobs.example.test/another-role";
   let postCount = 0;
@@ -1031,7 +1093,8 @@ test("retains the URL and selected auto-apply mode after initialization failures
     expect(request.postDataJSON()).toEqual({
       jobUrl: postCount === 1 ? "https://jobs.example.test/unavailable" : retryUrl,
       generateKeywordMap: true,
-      autoApply: postCount === 2,
+      skipReview: false,
+      autoSubmit: postCount === 2,
     });
     await route.fulfill({
       status: 422,
@@ -1047,7 +1110,8 @@ test("retains the URL and selected auto-apply mode after initialization failures
   await page.goto("/");
 
   const input = page.getByRole("textbox", { name: "Job posting URLs" });
-  const autoApply = page.getByRole("checkbox", { name: "Auto-apply" });
+  const skipReview = page.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = page.getByRole("checkbox", { name: "Auto-submit application" });
   await input.fill(submittedUrl);
   await page.getByRole("button", { name: "Initialize" }).click();
 
@@ -1056,13 +1120,15 @@ test("retains the URL and selected auto-apply mode after initialization failures
   await expect(alert).toHaveText("The page does not contain a usable job description");
   await expect(input).toHaveValue(submittedUrl);
   await expect(input).toBeEnabled();
-  await expect(autoApply).toBeChecked({ checked: false });
-  await expect(autoApply).toBeEnabled();
+  await expect(skipReview).not.toBeChecked();
+  await expect(autoSubmit).not.toBeChecked();
+  await expect(skipReview).toBeEnabled();
+  await expect(autoSubmit).toBeEnabled();
   await expect(input).toHaveAttribute("aria-invalid", "true");
   await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
 
-  await autoApply.check();
+  await autoSubmit.check();
   await expect(alert).toHaveCount(0);
   await input.fill(retryUrl);
   await expect(input).toHaveValue(retryUrl);
@@ -1074,8 +1140,10 @@ test("retains the URL and selected auto-apply mode after initialization failures
   await expect(alert).toHaveText("The page does not contain a usable job description");
   await expect(input).toHaveValue(retryUrl);
   await expect(input).toBeEnabled();
-  await expect(autoApply).toBeChecked();
-  await expect(autoApply).toBeEnabled();
+  await expect(skipReview).not.toBeChecked();
+  await expect(autoSubmit).toBeChecked();
+  await expect(skipReview).toBeEnabled();
+  await expect(autoSubmit).toBeEnabled();
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
   expect(postCount).toBe(2);
 });

@@ -72,7 +72,8 @@ type RunDialog =
 interface ValidatedCreateRunRequest {
   readonly jobUrl: string;
   readonly generateKeywordMap: boolean;
-  readonly autoApply: boolean;
+  readonly skipReview: boolean;
+  readonly autoSubmit: boolean;
 }
 
 type CreateRunResult =
@@ -95,7 +96,8 @@ function publicMessage(error: unknown, fallback: string): string {
 
 function parseCreateRunRequests(
   value: string,
-  autoApply: boolean,
+  skipReview: boolean,
+  autoSubmit: boolean,
 ): ValidatedCreateRunRequest[] | null {
   const tokens = value.trim().split(/[,\s]+/u).filter(Boolean);
   if (tokens.length === 0 || tokens.length > MAX_RUNS_PER_SUBMISSION) return null;
@@ -105,7 +107,8 @@ function parseCreateRunRequests(
     const parsed = CreateRunRequestSchema.safeParse({
       jobUrl: token,
       generateKeywordMap: true,
-      autoApply,
+      skipReview,
+      autoSubmit,
     });
     if (!parsed.success) return null;
     requests.push(parsed.data);
@@ -218,7 +221,8 @@ export function RunDashboard() {
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [jobUrl, setJobUrl] = useState("");
-  const [autoApply, setAutoApply] = useState(false);
+  const [skipReview, setSkipReview] = useState(false);
+  const [autoSubmit, setAutoSubmit] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -262,8 +266,8 @@ export function RunDashboard() {
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequests = useMemo(
-    () => parseCreateRunRequests(jobUrl, autoApply),
-    [autoApply, jobUrl],
+    () => parseCreateRunRequests(jobUrl, skipReview, autoSubmit),
+    [autoSubmit, jobUrl, skipReview],
   );
   const isCreateRequestValid = createRunRequests !== null;
 
@@ -574,10 +578,12 @@ export function RunDashboard() {
         const run = await createRun(
           request.jobUrl,
           request.generateKeywordMap,
-          request.autoApply,
+          request.skipReview,
+          request.autoSubmit,
         );
         setJobUrl("");
-        setAutoApply(false);
+        setSkipReview(false);
+        setAutoSubmit(false);
         router.push(`/runs/${encodeURIComponent(run.id)}`);
       } catch (error) {
         setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
@@ -596,7 +602,8 @@ export function RunDashboard() {
             run: await createRun(
               request.jobUrl,
               request.generateKeywordMap,
-              request.autoApply,
+              request.skipReview,
+              request.autoSubmit,
             ),
           };
         } catch (error) {
@@ -620,7 +627,8 @@ export function RunDashboard() {
 
     if (failures.length === 0) {
       setJobUrl("");
-      setAutoApply(false);
+      setSkipReview(false);
+      setAutoSubmit(false);
       setCreateSuccess(`${successfulRuns.length} applications initialized.`);
     } else {
       setJobUrl(failures.map(({ request }) => request.jobUrl).join(", "));
@@ -721,18 +729,49 @@ export function RunDashboard() {
           />
         </div>
 
-        <label className="run-initializer__mode">
-          <input
-            type="checkbox"
-            checked={autoApply}
-            disabled={isCreating}
-            onChange={(event) => {
-              setAutoApply(event.currentTarget.checked);
-              setCreateError(null);
-            }}
-          />
-          <span>Auto-apply</span>
-        </label>
+        <fieldset className="run-initializer__options">
+          <legend className="run-initializer__label">Run options</legend>
+          <div className="run-initializer__option-list">
+            <label className="run-initializer__mode">
+              <input
+                type="checkbox"
+                aria-describedby="skip-review-description"
+                aria-labelledby="skip-review-label"
+                checked={skipReview}
+                disabled={isCreating}
+                onChange={(event) => {
+                  setSkipReview(event.currentTarget.checked);
+                  setCreateError(null);
+                }}
+              />
+              <span className="run-initializer__mode-copy">
+                <span className="run-initializer__mode-title" id="skip-review-label">Skip résumé review</span>
+                <span className="run-initializer__mode-description" id="skip-review-description">
+                  Automatically approves only when automated résumé checks pass, then starts the application.
+                </span>
+              </span>
+            </label>
+            <label className="run-initializer__mode">
+              <input
+                type="checkbox"
+                aria-describedby="auto-submit-description"
+                aria-labelledby="auto-submit-label"
+                checked={autoSubmit}
+                disabled={isCreating}
+                onChange={(event) => {
+                  setAutoSubmit(event.currentTarget.checked);
+                  setCreateError(null);
+                }}
+              />
+              <span className="run-initializer__mode-copy">
+                <span className="run-initializer__mode-title" id="auto-submit-label">Auto-submit application</span>
+                <span className="run-initializer__mode-description" id="auto-submit-description">
+                  Submits only when the application has no blockers.
+                </span>
+              </span>
+            </label>
+          </div>
+        </fieldset>
 
         <button
           ref={duplicateDialogOpenerRef}

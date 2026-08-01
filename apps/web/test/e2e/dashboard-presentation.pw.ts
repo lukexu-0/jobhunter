@@ -18,7 +18,8 @@ function runFixture(): RunDto {
     applicationStatus: "applied",
     queueSequence: 1,
     generateKeywordMap: false,
-    autoApply: false,
+    skipReview: false,
+    autoSubmit: false,
     revision: 1,
     origin: "initial",
     createdAt: 1_700_000_000_000,
@@ -36,7 +37,8 @@ async function interceptAnalyzedRun(page: Page): Promise<void> {
     id: "presentation-identity-run",
     queueSequence: 1,
     generateKeywordMap: false,
-    autoApply: false,
+    skipReview: false,
+    autoSubmit: false,
     artifacts: [{
       id: "presentation-job-analysis",
       kind: "job-analysis",
@@ -55,7 +57,8 @@ async function interceptAnalyzedRun(page: Page): Promise<void> {
     id: "presentation-not-mentioned",
     queueSequence: 2,
     generateKeywordMap: false,
-    autoApply: false,
+    skipReview: false,
+    autoSubmit: false,
     artifacts: [{
       id: "not-mentioned-job-analysis",
       kind: "job-analysis",
@@ -74,7 +77,8 @@ async function interceptAnalyzedRun(page: Page): Promise<void> {
     id: "presentation-malformed-target",
     queueSequence: 3,
     generateKeywordMap: false,
-    autoApply: false,
+    skipReview: false,
+    autoSubmit: false,
     artifacts: [{
       id: "malformed-target-job-analysis",
       kind: "job-analysis",
@@ -154,8 +158,9 @@ test("does not show a keyword-map control", async ({ page }) => {
   await interceptEmptyRuns(page);
   await page.goto("/");
 
-  const initializer = page.getByRole("form", { name: "Initialize application" });
-  await expect(initializer.getByRole("checkbox", { name: "Auto-apply" })).toBeChecked({ checked: false });
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  await expect(initializer.getByRole("checkbox", { name: "Skip résumé review", exact: true })).not.toBeChecked();
+  await expect(initializer.getByRole("checkbox", { name: "Auto-submit application", exact: true })).not.toBeChecked();
   await expect(initializer.getByText("Generate resume-to-job-description keyword map", { exact: true })).toHaveCount(0);
 });
 

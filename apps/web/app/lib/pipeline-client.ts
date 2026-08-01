@@ -250,9 +250,15 @@ export async function deleteRun(id: string): Promise<void> {
 export function createRun(
   jobUrl: string,
   generateKeywordMap = true,
-  autoApply = false,
+  skipReview = false,
+  autoSubmit = false,
 ): Promise<RunDto> {
-  const parsed = CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap, autoApply });
+  const parsed = CreateRunRequestSchema.safeParse({
+    jobUrl,
+    generateKeywordMap,
+    skipReview,
+    autoSubmit,
+  });
   if (!parsed.success) {
     throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
   }

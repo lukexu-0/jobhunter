@@ -53,7 +53,8 @@ function run(status: RunStatus = "queued"): RunDto {
     applicationStatus: "applied",
     queueSequence: 1,
     generateKeywordMap: false,
-    autoApply: false,
+    skipReview: false,
+    autoSubmit: false,
     revision: 0,
     origin: "initial",
     createdAt: 1,
@@ -279,7 +280,8 @@ describe("pipeline run requests", () => {
           body: JSON.stringify({
             jobUrl: "https://jobs.example.test/roles/Platform",
             generateKeywordMap: true,
-            autoApply: false,
+            skipReview: false,
+            autoSubmit: false,
           }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -318,7 +320,8 @@ describe("pipeline run requests", () => {
           body: JSON.stringify({
             jobUrl: "https://jobs.example.test/roles/platform",
             generateKeywordMap: false,
-            autoApply: false,
+            skipReview: false,
+            autoSubmit: false,
           }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -328,25 +331,32 @@ describe("pipeline run requests", () => {
     ]);
   });
 
-  test("forwards an explicit auto-apply selection", async () => {
+  test("forwards the two run options independently", async () => {
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     capture(json(run()), requests);
 
-    await createRun("https://jobs.example.test/roles/platform", true, true);
+    await createRun("https://jobs.example.test/roles/skip-review", true, true, false);
+    await createRun("https://jobs.example.test/roles/auto-submit", true, false, true);
+    await createRun("https://jobs.example.test/roles/both", true, true, true);
 
-    expect(requests).toEqual([
+    expect(requests.map(({ init }) => JSON.parse(String(init?.body)))).toEqual([
       {
-        input: "/api/pipeline/runs",
-        init: {
-          body: JSON.stringify({
-            jobUrl: "https://jobs.example.test/roles/platform",
-            generateKeywordMap: true,
-            autoApply: true,
-          }),
-          cache: "no-store",
-          headers: { "content-type": "application/json" },
-          method: "POST",
-        },
+        jobUrl: "https://jobs.example.test/roles/skip-review",
+        generateKeywordMap: true,
+        skipReview: true,
+        autoSubmit: false,
+      },
+      {
+        jobUrl: "https://jobs.example.test/roles/auto-submit",
+        generateKeywordMap: true,
+        skipReview: false,
+        autoSubmit: true,
+      },
+      {
+        jobUrl: "https://jobs.example.test/roles/both",
+        generateKeywordMap: true,
+        skipReview: true,
+        autoSubmit: true,
       },
     ]);
   });
