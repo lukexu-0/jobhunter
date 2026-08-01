@@ -266,12 +266,13 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
-  test("ignores retired source heads outside the current manifest", () => {
+  test("retires source heads outside the current manifest while preserving immutable history", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
+      const activeEvidenceCount = createContextSnapshot(database, loaded).evidence.length;
       database.query(`
         INSERT INTO source_versions
           (id, source_id, relative_path, kind, entity_id, display_name, baseline_entity_ids_json, sha256, byte_count, indexed_at)
@@ -303,15 +304,53 @@ describe("allowlisted context ingestion", () => {
         "[]",
         sha256("retired requirement"),
       );
+      database.query(`
+        INSERT INTO evidence_fts (evidence_id, source_id, entity_id, heading_path, text, caveats)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        "retired-evidence",
+        "retired-source",
+        "project:retired",
+        "21. Must Include",
+        "Retired requirement.",
+        "",
+      );
       database.query("INSERT INTO source_heads (source_id, source_version_id) VALUES (?, ?)")
         .run("retired-source", "retired-version");
+
+      expect(searchEvidence(database, "Retired requirement").map((block) => block.id))
+        .toEqual(["retired-evidence"]);
+
+      const report = syncContext(database, loaded, 2);
+      expect(database.query<{ source_id: string }, [string]>(
+        "SELECT source_id FROM source_heads WHERE source_id = ?",
+      ).get("retired-source")).toBeNull();
+      expect(searchEvidence(database, "Retired requirement")).toEqual([]);
 
       const snapshot = createContextSnapshot(database, loaded);
       const manifestSourceIds = loaded.manifest.sources.map((source) => source.id);
       expect(snapshot.sources.map((source) => source.id)).toEqual(manifestSourceIds);
+      expect(snapshot.evidence).toHaveLength(activeEvidenceCount);
       expect(snapshot.evidence.every((block) => manifestSourceIds.includes(block.sourceId))).toBe(true);
       expect(snapshot.evidence.some((block) => block.id === "retired-evidence")).toBe(false);
       expect(snapshot.mustIncludeDirectives.some((directive) => directive.sourceId === "retired-source")).toBe(false);
+      expect(report.blockCount).toBe(activeEvidenceCount);
+      expect(report.blockCount).toBe(snapshot.evidence.length);
+
+      expect(database.query<{
+        version_count: number;
+        evidence_count: number;
+        fts_count: number;
+      }, []>(`
+        SELECT
+          (SELECT count(*) FROM source_versions WHERE id = 'retired-version') AS version_count,
+          (SELECT count(*) FROM evidence_blocks WHERE id = 'retired-evidence') AS evidence_count,
+          (SELECT count(*) FROM evidence_fts WHERE evidence_id = 'retired-evidence') AS fts_count
+      `).get()).toEqual({
+        version_count: 1,
+        evidence_count: 1,
+        fts_count: 1,
+      });
     } finally {
       database.close();
     }

@@ -91,6 +91,7 @@ export function syncContext(
   now = Date.now(),
 ): ContextSyncReport {
   const changedSources: string[] = [];
+  const activeSourceIds = new Set(loaded.manifest.sources.map((source) => source.id));
   let blockCount = 0;
   const sync = database.transaction(() => {
     for (const source of loaded.manifest.sources) {
@@ -131,6 +132,13 @@ export function syncContext(
         INSERT INTO source_heads (source_id, source_version_id) VALUES (?, ?)
         ON CONFLICT(source_id) DO UPDATE SET source_version_id = excluded.source_version_id
       `).run(source.id, sourceVersionId);
+    }
+    const heads = database.query<{ readonly source_id: string }, []>(
+      "SELECT source_id FROM source_heads",
+    ).all();
+    const deleteHead = database.query("DELETE FROM source_heads WHERE source_id = ?");
+    for (const head of heads) {
+      if (!activeSourceIds.has(head.source_id)) deleteHead.run(head.source_id);
     }
     database.query(`
       INSERT INTO context_metadata (key, value) VALUES ('manifest_sha256', ?)
