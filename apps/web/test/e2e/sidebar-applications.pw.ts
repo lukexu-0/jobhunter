@@ -537,6 +537,83 @@ test("posts the selected auto-apply mode with the canonical URL, disables while 
   await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
 });
 
+test("preserves auto-apply mode while confirming a duplicate canonical URL", async ({ page }) => {
+  const canonicalJobUrl = "https://jobs.example.test/roles/123?source=ui";
+  const enteredJobUrl = "HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description";
+  const existingRun: RunDto = {
+    ...runFixture("existing-duplicate-run", "applied", "failed"),
+    jobUrl: canonicalJobUrl,
+  };
+  const initializedRun = runFixture("duplicate-initialized-run", "applied", "failed");
+  const postedPayloads: unknown[] = [];
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [existingRun] }),
+      });
+      return;
+    }
+
+    expect(request.method()).toBe("POST");
+    postedPayloads.push(request.postDataJSON());
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify(initializedRun),
+    });
+  });
+  await interceptDocumentRun(page, initializedRun);
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize application" });
+  const input = initializer.getByRole("textbox", { name: "Job posting URL" });
+  const initialize = initializer.getByRole("button", { name: "Initialize" });
+  const autoApply = initializer.getByRole("checkbox", { name: "Auto-apply" });
+  const dialog = page.getByRole("dialog", { name: "Initialize duplicate application?" });
+  const description =
+    "This job posting URL has already been used. Initialize another application anyway?";
+
+  await input.fill(enteredJobUrl);
+  await autoApply.check();
+  await initialize.click();
+
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toHaveAttribute("aria-labelledby", "duplicate-application-dialog-title");
+  await expect(dialog).toHaveAttribute("aria-describedby", "duplicate-application-dialog-description");
+  await expect(dialog.getByText(description, { exact: true })).toBeVisible();
+  expect(postedPayloads).toHaveLength(0);
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(input).toHaveValue(enteredJobUrl);
+  await expect(initialize).toBeFocused();
+  await expect(autoApply).toBeChecked();
+  expect(postedPayloads).toHaveLength(0);
+
+  await initialize.click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(input).toHaveValue(enteredJobUrl);
+  await expect(initialize).toBeFocused();
+  await expect(autoApply).toBeChecked();
+  expect(postedPayloads).toHaveLength(0);
+
+  await initialize.click();
+  await dialog.getByRole("button", { name: "Initialize anyway" }).click();
+
+  await expect(page).toHaveURL(/\/runs\/duplicate-initialized-run$/);
+  await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
+  expect(postedPayloads).toEqual([{
+    jobUrl: canonicalJobUrl,
+    generateKeywordMap: true,
+    autoApply: true,
+  }]);
+});
+
 test("retains the URL and selected auto-apply mode after initialization failures", async ({ page }) => {
   const submittedUrl = "https://jobs.example.test/unavailable#details";
   const retryUrl = "https://jobs.example.test/another-role";
