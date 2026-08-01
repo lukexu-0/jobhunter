@@ -194,7 +194,10 @@ test("prunes only the two oldest inactive run trees while preserving all SQLite 
   const service = new RunApplicationService({
     repository,
     artifacts,
-    context: { createSnapshot: () => SOURCE_SNAPSHOT },
+    context: {
+      createSnapshot: () => SOURCE_SNAPSHOT,
+      syncContext: () => {},
+    },
     scheduler: () => undefined,
   });
   await expect(service.getArtifact(ids[0]!, records[0]!.pdf.id)).rejects.toMatchObject({

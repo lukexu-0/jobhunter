@@ -59,6 +59,8 @@ function mappedError(error: unknown): Response {
       message = "Job description extraction failed";
     } else if (code === "JOB_EXTRACTION_TIMEOUT") {
       message = "Job description extraction timed out";
+    } else if (code === "CONTEXT_SYNC_FAILED") {
+      message = "Context synchronization failed";
     }
   }
   return apiResponse.error(code, message, status);

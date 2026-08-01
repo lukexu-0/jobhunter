@@ -65,6 +65,17 @@ export interface ContextDriftReport {
   readonly changedSources: readonly string[];
 }
 
+type ContextStaleMessage =
+  | "Context index is stale; synchronize before creating a snapshot"
+  | "Context source drift detected; synchronize before continuing";
+
+export class ContextStaleError extends Error {
+  constructor(message: ContextStaleMessage = "Context index is stale; synchronize before creating a snapshot") {
+    super(message);
+    this.name = "ContextStaleError";
+  }
+}
+
 function parseStringArray(json: string, label: string): readonly string[] {
   const value: unknown = JSON.parse(json);
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`${label} is corrupt`);
@@ -192,7 +203,7 @@ export function createContextSnapshot(
   loaded: LoadedContextManifest = loadContextManifest(),
 ): ContextSnapshot {
   const freshness = checkContextFreshness(database, loaded);
-  if (!freshness.fresh) throw new Error("Context index is stale; synchronize before creating a snapshot");
+  if (!freshness.fresh) throw new ContextStaleError();
   const manifestSourceIds = new Set(loaded.manifest.sources.map((source) => source.id));
   const rows = database.query<SourceRow, []>(`
     SELECT v.* FROM source_versions v JOIN source_heads h ON h.source_version_id = v.id

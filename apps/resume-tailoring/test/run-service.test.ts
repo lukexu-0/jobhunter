@@ -53,6 +53,7 @@ interface FixtureOptions {
   readonly loadJobSource?: LoadJobSource;
   readonly extractJobDescription?: ExtractJobDescription;
   readonly createSnapshot?: (defaultSnapshot: () => ContextSnapshot) => ContextSnapshot | Promise<ContextSnapshot>;
+  readonly syncContext?: (defaultSync: () => void) => void | Promise<void>;
   readonly idFactory?: () => string;
 }
 
@@ -66,6 +67,7 @@ interface Fixture {
   readonly service: RunApplicationService;
   readonly ids: { count: number };
   readonly kicks: { count: number };
+  readonly syncs: { count: number };
 }
 function fixture(options: FixtureOptions = {}): Fixture {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "run-application-")));
@@ -92,12 +94,21 @@ function fixture(options: FixtureOptions = {}): Fixture {
   const artifacts = new ArtifactStore(join(root, "artifacts"));
   const kicks = { count: 0 };
   const ids = { count: 0 };
+  const syncs = { count: 0 };
   const service = new RunApplicationService({
     repository,
     context: {
       createSnapshot: () => options.createSnapshot
         ? options.createSnapshot(() => createContextSnapshot(contextDatabase, loaded))
         : createContextSnapshot(contextDatabase, loaded),
+      syncContext: async () => {
+        syncs.count += 1;
+        if (options.syncContext) {
+          await options.syncContext(() => { syncContext(contextDatabase, loaded, 20); });
+        } else {
+          syncContext(contextDatabase, loaded, 20);
+        }
+      },
     },
     artifacts,
     scheduler: () => { kicks.count += 1; },
@@ -109,7 +120,7 @@ function fixture(options: FixtureOptions = {}): Fixture {
       ?? (async () => ({ kind: "description", jobDescription: JOB_DESCRIPTION })),
     ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
   });
-  return { root, loaded, contextDatabase, pipelineDatabase, repository, artifacts, service, kicks, ids };
+  return { root, loaded, contextDatabase, pipelineDatabase, repository, artifacts, service, kicks, ids, syncs };
 }
 interface PersistenceCounts {
   readonly runs: number;
@@ -266,6 +277,99 @@ describe("RunApplicationService", () => {
     expect(input).not.toBeNull();
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
     expect(target.repository.acquire()?.runId).toBe(run.id);
+  });
+
+  test("synchronizes stale context once and creates the run from the refreshed snapshot", async () => {
+    let snapshotCalls = 0;
+    const target = fixture({
+      createSnapshot: (defaultSnapshot) => {
+        snapshotCalls += 1;
+        return defaultSnapshot();
+      },
+    });
+    const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[0]!);
+    writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nRefreshed baseline.\n`);
+
+    const run = await target.service.createRun(JOB_URL);
+
+    expect(run).toMatchObject({ id: "run-1", status: "queued", revision: 1 });
+    expect(target.syncs.count).toBe(1);
+    expect(snapshotCalls).toBe(2);
+    expect(persistenceCounts(target.pipelineDatabase)).toEqual({
+      runs: 1,
+      revisions: 1,
+      snapshots: 1,
+      artifacts: 1,
+      events: 3,
+    });
+  });
+
+  test("returns a bounded HTTP synchronization failure without persisting a run", async () => {
+    let snapshotCalls = 0;
+    const target = fixture({
+      createSnapshot: (defaultSnapshot) => {
+        snapshotCalls += 1;
+        return defaultSnapshot();
+      },
+      syncContext: () => {
+        throw new Error("private database failure");
+      },
+    });
+    const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[0]!);
+    writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nUnsynchronized baseline.\n`);
+    const route = createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target.service) });
+
+    const response = await route(new Request("http://127.0.0.1:3457/v1/runs", post({
+      jobUrl: JOB_URL,
+    })));
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "CONTEXT_SYNC_FAILED",
+        message: "Context synchronization failed",
+      },
+    });
+    expect(target.syncs.count).toBe(1);
+    expect(snapshotCalls).toBe(1);
+    expectNoPersistence(target);
+  });
+
+  test("retries the snapshot once after a no-op synchronization and returns stale context", async () => {
+    let snapshotCalls = 0;
+    const target = fixture({
+      createSnapshot: (defaultSnapshot) => {
+        snapshotCalls += 1;
+        return defaultSnapshot();
+      },
+      syncContext: () => {},
+    });
+    const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[0]!);
+    writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nStill stale baseline.\n`);
+
+    await expect(target.service.createRun(JOB_URL)).rejects.toMatchObject({
+      code: "CONTEXT_STALE",
+      status: 409,
+    });
+    expect(target.syncs.count).toBe(1);
+    expect(snapshotCalls).toBe(2);
+    expectNoPersistence(target);
+  });
+
+  test("does not synchronize after a generic first-snapshot exception", async () => {
+    const snapshotFailure = new Error("snapshot storage failed");
+    let snapshotCalls = 0;
+    const target = fixture({
+      createSnapshot: () => {
+        snapshotCalls += 1;
+        throw snapshotFailure;
+      },
+    });
+
+    await expect(target.service.createRun(JOB_URL)).rejects.toBe(snapshotFailure);
+    expect(target.syncs.count).toBe(0);
+    expect(snapshotCalls).toBe(1);
+    expectNoPersistence(target);
   });
   test("exposes durable run modes and canonical job URLs on created, listed, and retrieved DTOs", async () => {
     const target = fixture();
@@ -742,8 +846,8 @@ describe("RunApplicationService", () => {
 
     const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[1]!);
     writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nChanged authoritative source.\n`);
-    syncContext(target.contextDatabase, target.loaded, 20);
     await expect(target.service.retryRun(run.id)).rejects.toMatchObject({ code: "SOURCE_DRIFT", status: 409 });
+    expect(target.syncs.count).toBe(1);
   });
 
   test("maps every artifact-dependent command on a reserved run to HTTP 410", async () => {

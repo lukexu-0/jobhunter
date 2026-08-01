@@ -14,6 +14,7 @@ import {
   type TimelineEvent,
 } from "../contracts";
 import type { ContextSnapshot } from "../context/types.ts";
+import { ContextStaleError } from "../context";
 import {
   PipelineRepository,
   RepositoryConflictError,
@@ -84,6 +85,7 @@ function isRunStatus(value: unknown): value is RunStatus {
 
 export interface RunContextSnapshotService {
   createSnapshot(): ContextSnapshot | Promise<ContextSnapshot>;
+  syncContext(): unknown;
 }
 
 export interface RunScheduler {
@@ -101,7 +103,7 @@ export interface RunApplicationDependencies {
 }
 
 export class RunServiceError extends Error {
-  constructor(readonly code: string, message: string, readonly status: 400 | 404 | 409 | 410 | 422 | 502 | 504) {
+  constructor(readonly code: string, message: string, readonly status: 400 | 404 | 409 | 410 | 422 | 500 | 502 | 504) {
     super(message);
     this.name = "RunServiceError";
   }
@@ -529,8 +531,23 @@ export class RunApplicationService {
   async #freshSnapshot(): Promise<ContextSnapshot> {
     try {
       return await this.dependencies.context.createSnapshot();
+    } catch (error) {
+      if (!(error instanceof ContextStaleError)) throw error;
+    }
+
+    try {
+      await this.dependencies.context.syncContext();
     } catch {
-      throw new RunServiceError("CONTEXT_STALE", "Context index is stale; synchronize it before continuing", 409);
+      throw new RunServiceError("CONTEXT_SYNC_FAILED", "Context synchronization failed", 500);
+    }
+
+    try {
+      return await this.dependencies.context.createSnapshot();
+    } catch (error) {
+      if (error instanceof ContextStaleError) {
+        throw new RunServiceError("CONTEXT_STALE", "Context index is stale; synchronize it before continuing", 409);
+      }
+      throw error;
     }
   }
 

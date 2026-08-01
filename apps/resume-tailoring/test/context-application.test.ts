@@ -21,6 +21,7 @@ import {
   REPOSITORY_ROOT,
   loadContextManifest,
 } from "../src/context/manifest.ts";
+import { ContextStaleError } from "../src/context/index.ts";
 
 const fixtures: string[] = [];
 
@@ -60,7 +61,7 @@ describe("ContextApplicationService", () => {
         staleSources: [],
         missingSources: loadedManifest.manifest.sources.map((source) => source.id),
       });
-      expect(() => service.createSnapshot()).toThrow("stale");
+      expect(() => service.createSnapshot()).toThrow(ContextStaleError);
 
       const synchronized = service.syncContext();
       expect(synchronized).toMatchObject({
@@ -142,8 +143,8 @@ describe("ContextApplicationService", () => {
       writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nDrifted after synchronization.\n`);
 
       expect(service.getContext()).toMatchObject({ fresh: false, staleSources: [changedSource.id] });
-      expect(() => service.createSnapshot()).toThrow("stale");
-      expect(() => service.loadStageSourceContext("run-2")).toThrow("stale");
+      expect(() => service.createSnapshot()).toThrow(ContextStaleError);
+      expect(() => service.loadStageSourceContext("run-2")).toThrow(ContextStaleError);
     } finally {
       service.close();
       database.close();

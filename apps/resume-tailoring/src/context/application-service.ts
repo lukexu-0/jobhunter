@@ -11,6 +11,7 @@ import {
 } from "./manifest.ts";
 import {
   checkContextFreshness,
+  ContextStaleError,
   createContextSnapshot,
   syncContext as synchronizeContext,
   verifyContextSnapshot,
@@ -88,7 +89,7 @@ export class ContextApplicationService implements ContextRouteService, RunContex
 
   #requireNoDrift(snapshot: ContextSnapshot): void {
     if (!verifyContextSnapshot(snapshot, this.#loadedManifest).valid) {
-      throw new Error("Context source drift detected; synchronize before continuing");
+      throw new ContextStaleError("Context source drift detected; synchronize before continuing");
     }
   }
 }
