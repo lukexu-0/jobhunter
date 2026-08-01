@@ -35,6 +35,7 @@ const run: RunDto = {
   status: "review",
   applicationStatus: "pending",
   generateKeywordMap: false,
+  autoApply: false,
   queueSequence: 1,
   revision: 8,
   origin: "human-comments",

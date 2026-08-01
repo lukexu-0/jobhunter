@@ -84,6 +84,7 @@ interface RunRow {
   status: RunStatus;
   application_status: ApplicationStatus;
   generate_keyword_map: number;
+  auto_apply: number;
   title_override: string | null;
   organization_override: string | null;
   deleted_at: number | null;
@@ -117,6 +118,7 @@ interface ApplicationSessionRow {
   pdf_sha256: string;
   bridge_state: ApplicationSessionBridgeState;
   submission_phase: ApplicationSubmissionPhase;
+  automatic_review_ready: 0 | 1;
   submission_attempted_at: number | null;
   submission_confirmed_at: number | null;
   public_snapshot_json: string | null;
@@ -135,6 +137,7 @@ export interface PublicRun {
   readonly titleOverride?: string;
   readonly organizationOverride?: string;
   readonly generateKeywordMap: boolean;
+  readonly autoApply: boolean;
   readonly queueSequence: number;
   readonly currentRevision: number;
   readonly failedStage: ActiveStage | null;
@@ -248,6 +251,7 @@ function publicRun(row: RunRow): PublicRun {
     ...(row.title_override !== null ? { titleOverride: row.title_override } : {}),
     ...(row.organization_override !== null ? { organizationOverride: row.organization_override } : {}),
     generateKeywordMap: row.generate_keyword_map === 1,
+    autoApply: row.auto_apply === 1,
     queueSequence: row.queue_sequence,
     currentRevision: row.current_revision,
     failedStage: row.failed_stage,
@@ -444,6 +448,7 @@ export class PipelineRepository {
     id = this.#idFactory(),
     generateKeywordMap = true,
     queueSequence?: number,
+    autoApply = false,
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     if (jobUrl.length < 1 || jobUrl.length > 2_048 || jobUrl.trim() !== jobUrl) {
@@ -468,6 +473,7 @@ export class PipelineRepository {
       throw new Error("queued input artifact metadata is invalid");
     }
     if (typeof generateKeywordMap !== "boolean") throw new Error("generate keyword map setting must be boolean");
+    if (typeof autoApply !== "boolean") throw new Error("auto-apply setting must be boolean");
     if (queueSequence !== undefined && (!Number.isSafeInteger(queueSequence) || queueSequence < 1)) {
       throw new Error("queue sequence must be a positive integer");
     }
@@ -475,8 +481,8 @@ export class PipelineRepository {
     return this.#immediate(() => {
       const now = this.#now();
       const sequence = queueSequence ?? this.nextQueueSequence();
-      this.#db.query("INSERT INTO runs(id, job_description, job_url, status, generate_keyword_map, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, 1, ?, ?, ?)")
-        .run(id, jobDescription, jobUrl, generateKeywordMap ? 1 : 0, sequence, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, job_url, status, generate_keyword_map, auto_apply, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, 1, ?, ?, ?)")
+        .run(id, jobDescription, jobUrl, generateKeywordMap ? 1 : 0, autoApply ? 1 : 0, sequence, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#db.query("INSERT INTO run_source_snapshots(run_id,manifest_sha256,baseline_sha256,source_hashes_json,created_at) VALUES (?,?,?,?,?)")
         .run(id, snapshot.manifestSha256, snapshot.baselineSha256, JSON.stringify(sourceHashes), now);
@@ -495,12 +501,19 @@ export class PipelineRepository {
   }
 
 
-  createRun(jobDescription: string, id = this.#idFactory(), generateKeywordMap = true): PublicRun {
+  createRun(
+    jobDescription: string,
+    id = this.#idFactory(),
+    generateKeywordMap = true,
+    autoApply = false,
+  ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     if (typeof generateKeywordMap !== "boolean") throw new Error("generate keyword map setting must be boolean");
+    if (typeof autoApply !== "boolean") throw new Error("auto-apply setting must be boolean");
     return this.#immediate(() => {
       const now = this.#now();
-      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs").run(id, jobDescription, generateKeywordMap ? 1 : 0, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, auto_apply, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', ?, ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs")
+        .run(id, jobDescription, generateKeywordMap ? 1 : 0, autoApply ? 1 : 0, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#event(id, 1, "run.created", { status: "queued", origin: "initial" }, now);
       return publicRun(this.#run(id));
@@ -590,6 +603,50 @@ export class PipelineRepository {
     });
   }
 
+  markAutomaticApplicationReviewReady(sessionId: string): void {
+    this.#immediate(() => {
+      const session = this.#db.query<ApplicationSessionRow, [string]>(
+        "SELECT * FROM run_application_sessions WHERE session_id = ?",
+      ).get(sessionId);
+      if (!session) throw new RepositoryConflictError("application session not found");
+      const current = this.#currentApplicationSession(
+        session.run_id,
+        session.generation,
+        sessionId,
+      );
+      if (current.submission_phase !== "not_attempted") {
+        throw new RepositoryConflictError("application submission was already claimed");
+      }
+      if (TERMINAL_APPLICATION_SESSION_STATES[current.bridge_state] === true) {
+        throw new RepositoryConflictError("application session is terminal");
+      }
+      if (current.automatic_review_ready === 1) return;
+      const updatedAt = Math.max(current.updated_at + 1, this.#now());
+      const result = this.#db.query(`
+        UPDATE run_application_sessions
+        SET automatic_review_ready = 1,
+            updated_at = ?
+        WHERE run_id = ? AND generation = ? AND session_id = ?
+          AND submission_phase = 'not_attempted'
+          AND automatic_review_ready = 0
+          AND generation = (
+            SELECT max(generation)
+            FROM run_application_sessions
+            WHERE run_id = ?
+          )
+      `).run(
+        updatedAt,
+        current.run_id,
+        current.generation,
+        sessionId,
+        current.run_id,
+      );
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("application submission review changed");
+      }
+    });
+  }
+
   claimApplicationSubmission(sessionId: string): void {
     this.#immediate(() => {
       const session = this.#db.query<ApplicationSessionRow, [string]>(
@@ -604,9 +661,15 @@ export class PipelineRepository {
       if (current.submission_phase !== "not_attempted") {
         throw new RepositoryConflictError("application submission was already claimed");
       }
-      if (current.bridge_state !== "awaiting_human_review") {
+      if (TERMINAL_APPLICATION_SESSION_STATES[current.bridge_state] === true) {
+        throw new RepositoryConflictError("application session is terminal");
+      }
+      if (
+        current.bridge_state !== "awaiting_human_review"
+        && current.automatic_review_ready !== 1
+      ) {
         throw new RepositoryConflictError(
-          "application submission is not awaiting human review",
+          "application submission is not review-ready",
         );
       }
       const attemptedAt = this.#now();
@@ -618,7 +681,8 @@ export class PipelineRepository {
             updated_at = ?
         WHERE run_id = ? AND generation = ? AND session_id = ?
           AND submission_phase = 'not_attempted'
-          AND bridge_state = 'awaiting_human_review'
+          AND (bridge_state = 'awaiting_human_review' OR automatic_review_ready = 1)
+          AND bridge_state NOT IN ('cancelled','failed','closed','lost')
           AND generation = (
             SELECT max(generation)
             FROM run_application_sessions

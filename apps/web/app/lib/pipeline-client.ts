@@ -247,8 +247,12 @@ export async function deleteRun(id: string): Promise<void> {
   await fetchPipeline(runPath(id), { method: "DELETE" });
 }
 
-export function createRun(jobUrl: string, generateKeywordMap = true): Promise<RunDto> {
-  const parsed = CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap });
+export function createRun(
+  jobUrl: string,
+  generateKeywordMap = true,
+  autoApply = false,
+): Promise<RunDto> {
+  const parsed = CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap, autoApply });
   if (!parsed.success) {
     throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
   }

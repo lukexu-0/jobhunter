@@ -7,6 +7,7 @@ const reviewRun: RunDto = {
   applicationStatus: "applied",
   queueSequence: 1,
   generateKeywordMap: false,
+  autoApply: false,
   revision: 4,
   origin: "initial",
   createdAt: 1_700_000_000_000,
@@ -94,6 +95,7 @@ test("keeps loading a tailoring run artifact across polling and eventually shows
     status: "tailoring",
     queueSequence: 1,
     generateKeywordMap: false,
+    autoApply: false,
     artifacts: [{
       ...reviewRun.artifacts[0],
       id: "tailoring-job-analysis",

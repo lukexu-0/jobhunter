@@ -22,6 +22,7 @@ const INPUT: ApplicationAgentRunInput = {
   task: `Apply using ${DIRECT_VALUE}`,
   maxTurns: 42,
   deadlineMs: 60_000,
+  autoApply: false,
 };
 
 const RESULT: ApplicationRunResult = {
@@ -48,6 +49,7 @@ const RESULT: ApplicationRunResult = {
 };
 
 const SUBMISSION_GUARD_FACTORY = () => ({
+  markReviewReady: async () => undefined,
   claim: async () => undefined,
   finalize: async (_outcome: "submitted" | "uncertain") => undefined,
 });
@@ -147,6 +149,7 @@ describe("ApplicationAgentService", () => {
       },
     };
     const submissionGuard = {
+      markReviewReady: async () => undefined,
       claim: async () => undefined,
       finalize: async (_outcome: "submitted" | "uncertain") => undefined,
     };

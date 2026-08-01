@@ -131,6 +131,7 @@ class FakeHarness implements ApplicationHarnessClient {
 async function createTarget(options: {
   approved?: boolean;
   harness?: FakeHarness | null;
+  autoApply?: boolean;
   jobUrl?: string | null;
   profileReader?: () => string | Promise<string>;
   sessionIds?: string[];
@@ -148,7 +149,7 @@ async function createTarget(options: {
   const artifactRoot = await mkdtemp(join(tmpdir(), "application-session-service-"));
   temporaryRoots.push(artifactRoot);
   const artifacts = new ArtifactStore(artifactRoot);
-  const run = repository.createRun("Private job description", "run-1");
+  const run = repository.createRun("Private job description", "run-1", true, options.autoApply ?? false);
   database.query("UPDATE runs SET job_url = ? WHERE id = ?").run(
     options.jobUrl === undefined ? JOB_URL : options.jobUrl,
     run.id,
@@ -233,7 +234,7 @@ async function createProfileRoot(): Promise<{ root: string; profilePath: string 
 }
 
 describe("application session service", () => {
-  test("uploads only the reserved UUID, private URL, exact profile, and verified approved PDF", async () => {
+  test("uploads the manual run mode with the reserved UUID, private sources, and verified PDF", async () => {
     const target = await createTarget();
 
     const view = await target.service.start(target.runId, target.pdf.sha256, signal());
@@ -244,6 +245,7 @@ describe("application session service", () => {
       jobUrl: JOB_URL,
       personalInformationMarkdown: PROFILE,
       resumePdf: PDF_BYTES,
+      autoApply: false,
     });
     expect(view).toMatchObject({ generation: 1, bridgeState: "running", harnessState: "running" });
     expect(view).not.toHaveProperty("sessionId");
@@ -251,6 +253,15 @@ describe("application session service", () => {
     expect(serialized).not.toContain(FIRST_SESSION_ID);
     expect(serialized).not.toContain(JOB_URL);
     expect(serialized).not.toContain(PROFILE);
+  });
+
+  test("uploads the persisted auto-apply run mode", async () => {
+    const target = await createTarget({ autoApply: true });
+
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+
+    expect(target.harness!.createCalls).toHaveLength(1);
+    expect(target.harness!.createCalls[0]?.autoApply).toBe(true);
   });
 
   test("reports exact eligibility blockers without exposing private sources", async () => {

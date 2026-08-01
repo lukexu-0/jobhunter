@@ -311,6 +311,7 @@ class HumanGate:
         approved_origins: Sequence[str],
         publish: GateEventPublisher,
         review_snapshot: ReviewSnapshotSink | None = None,
+        auto_apply: bool = False,
         action_timeout: float = 3_600,
     ) -> None:
         canonical_origins = [validate_approved_origin(origin) for origin in approved_origins]
@@ -320,6 +321,8 @@ class HumanGate:
             raise ValueError("approved origins must be unique")
         if action_timeout <= 0:
             raise ValueError("action_timeout must be positive")
+        if type(auto_apply) is not bool:
+            raise ValueError("auto_apply must be a boolean")
         self._job_url = validate_job_url(job_url)
         self._approved_origins = canonical_origins
         self._redaction_values = {
@@ -330,6 +333,7 @@ class HumanGate:
         self._user_info_store = user_info_store
         self._publish = publish
         self._review_snapshot = review_snapshot
+        self._auto_apply = auto_apply
         self._action_timeout = action_timeout
         self._lock = asyncio.Lock()
         self._pending: _PendingGate | None = None
@@ -472,27 +476,50 @@ class HumanGate:
         )
         if self._review_snapshot is not None:
             await self._review_snapshot(review_result)
-        decision, context = await self._wait_for_gate(
-            kind="review",
-            browser_session=browser_session,
-            state="awaiting_human_review",
-            event="review_required",
-            detail={},
+        if not self._auto_apply:
+            decision, context = await self._wait_for_gate(
+                kind="review",
+                browser_session=browser_session,
+                state="awaiting_human_review",
+                event="review_required",
+                detail={},
+            )
+            if decision == "revise" and context is not None:
+                return ActionResult(
+                    extracted_content=(
+                        "Human revision received. Apply it, re-scan the form, "
+                        "then request review again."
+                    ),
+                    long_term_memory=context,
+                    metadata={"revision_count": self._revision_count},
+                )
+            if decision == "submit":
+                return ActionResult(
+                    extracted_content=review_result.model_dump_json(),
+                    long_term_memory=(
+                        "Final submission was approved. Use submit_application "
+                        "exactly once."
+                    ),
+                )
+            return await self._cancelled_result(browser_session, review_result)
+        if review_result.fields_needing_human:
+            raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+        async with self._lock:
+            if self._submission_approved:
+                raise self._conflict("Final submission was already approved")
+            cancelled = self._cancelled
+            if not cancelled:
+                if self._pending is not None and not self._pending.future.done():
+                    raise RuntimeError("A human gate is already pending")
+                self._submission_approved = True
+        if cancelled:
+            return await self._cancelled_result(browser_session, review_result)
+        return ActionResult(
+            extracted_content=review_result.model_dump_json(),
+            long_term_memory=(
+                "Final submission was approved. Use submit_application exactly once."
+            ),
         )
-        if decision == "revise" and context is not None:
-            return ActionResult(
-                extracted_content="Human revision received. Apply it, re-scan the form, then request review again.",
-                long_term_memory=context,
-                metadata={"revision_count": self._revision_count},
-            )
-        if decision == "submit":
-            return ActionResult(
-                extracted_content=review_result.model_dump_json(),
-                long_term_memory=(
-                    "Final submission was approved. Use submit_application exactly once."
-                ),
-            )
-        return await self._cancelled_result(browser_session, review_result)
 
     async def continue_navigation(self) -> None:
         async with self._lock:

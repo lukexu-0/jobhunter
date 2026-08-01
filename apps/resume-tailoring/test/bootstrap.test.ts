@@ -381,6 +381,7 @@ describe("pipeline application bootstrap", () => {
           task: "Complete the application",
           maxTurns: 25,
           deadlineMs: 30_000,
+          autoApply: false,
         }),
       }),
     );

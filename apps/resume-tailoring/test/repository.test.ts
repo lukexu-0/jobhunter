@@ -114,11 +114,18 @@ describe("pipeline repository claims", () => {
 });
 
 describe("persisted workflow commands", () => {
-  test("persists immutable run metadata and independently managed application status", () => {
+  test("persists immutable run modes and independently managed application status", () => {
     const { db, repo, tick, now } = fixture();
-    expect(repo.createRun("Default JD", "default-setting").generateKeywordMap).toBe(true);
-    const created = repo.createRun("JD", "enabled-setting", true);
-    expect(created).toMatchObject({ applicationStatus: "pending", generateKeywordMap: true });
+    expect(repo.createRun("Default JD", "default-setting")).toMatchObject({
+      generateKeywordMap: true,
+      autoApply: false,
+    });
+    const created = repo.createRun("JD", "enabled-setting", true, true);
+    expect(created).toMatchObject({
+      applicationStatus: "pending",
+      generateKeywordMap: true,
+      autoApply: true,
+    });
     const eventCount = repo.timeline(created.id).events.length;
 
     tick(1_000);
@@ -129,6 +136,7 @@ describe("persisted workflow commands", () => {
     expect(repo.getRun(created.id)?.applicationStatus).toBe("interview");
     expect(secondRepo.getRun(created.id)?.applicationStatus).toBe("interview");
     expect(secondRepo.getRun(created.id)?.generateKeywordMap).toBe(true);
+    expect(secondRepo.getRun(created.id)?.autoApply).toBe(true);
     expect(updated.status).toBe("queued");
     expect(updated.updatedAt).toBeGreaterThan(created.updatedAt);
     expect(repo.timeline(created.id).events).toHaveLength(eventCount);
@@ -574,11 +582,14 @@ describe("application session ledger", () => {
       .toThrow(/conflicting submission outcome/);
   });
 
-  test("claims only the current session awaiting human review", () => {
+  test("rejects claims without durable review readiness", () => {
     const { repo } = fixture();
     const hash = "d".repeat(64);
-    const states = ["running", "cancelled"] as const;
-    for (const [index, bridgeState] of states.entries()) {
+    const states = [
+      { bridgeState: "running", expectedError: /not review-ready/ },
+      { bridgeState: "cancelled", expectedError: /terminal/ },
+    ] as const;
+    for (const [index, { bridgeState, expectedError }] of states.entries()) {
       const runId = createReview(repo, hash, false, `claim-state-${bridgeState}`);
       repo.approve(runId, hash);
       const sessionId =
@@ -592,12 +603,62 @@ describe("application session ledger", () => {
       });
 
       expect(() => repo.claimApplicationSubmission(sessionId))
-        .toThrow(/not awaiting human review/);
+        .toThrow(expectedError);
       expect(repo.getLatestApplicationSession(runId)).toMatchObject({
         bridgeState,
         submissionPhase: "not_attempted",
       });
     }
+  });
+
+  test("claims after durable automatic review authorization without relaxing bridge state", () => {
+    const { repo } = fixture();
+    const hash = "a".repeat(64);
+    const runId = createReview(repo, hash, false, "automatic-review-ready");
+    repo.approve(runId, hash);
+    const sessionId = "60606060-6060-4060-8060-000000000001";
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "running",
+      publicSnapshot: { state: "running" },
+    });
+
+    repo.markAutomaticApplicationReviewReady(sessionId);
+    expect(repo.getLatestApplicationSession(runId)).toMatchObject({
+      bridgeState: "running",
+      submissionPhase: "not_attempted",
+    });
+    repo.claimApplicationSubmission(sessionId);
+    expect(repo.getLatestApplicationSession(runId)).toMatchObject({
+      bridgeState: "running",
+      submissionPhase: "attempting",
+    });
+    expect(() => repo.markAutomaticApplicationReviewReady(sessionId))
+      .toThrow(/already claimed/);
+  });
+
+  test("automatic review authorization cannot claim a terminal session", () => {
+    const { repo } = fixture();
+    const hash = "b".repeat(64);
+    const runId = createReview(repo, hash, false, "automatic-review-cancelled");
+    repo.approve(runId, hash);
+    const sessionId = "60606060-6060-4060-8060-000000000002";
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    repo.markAutomaticApplicationReviewReady(sessionId);
+    repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "cancelled",
+      publicSnapshot: { state: "cancelled" },
+    });
+
+    expect(() => repo.claimApplicationSubmission(sessionId)).toThrow(/terminal/);
+    expect(repo.getLatestApplicationSession(runId)).toMatchObject({
+      bridgeState: "cancelled",
+      submissionPhase: "not_attempted",
+    });
   });
 
   test("submitted finalization preserves downstream lifecycles while uncertainty never applies", () => {

@@ -238,28 +238,52 @@ describe("RunApplicationService", () => {
     const jobDescription = JOB_DESCRIPTION;
     const run = await target.service.createRun(JOB_URL);
 
-    expect(run).toMatchObject({ id: "run-1", status: "queued", revision: 1, origin: "initial" });
+    expect(run).toMatchObject({
+      id: "run-1",
+      status: "queued",
+      revision: 1,
+      origin: "initial",
+      autoApply: false,
+    });
     expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(true);
     expect(target.repository.getRunJobUrl(run.id)).toBe(JOB_URL);
     expect(run.jobUrl).toBe(JOB_URL);
-    const disabled = await target.service.createRun(JOB_URL, false);
-    expect(target.repository.getRun(disabled.id)?.generateKeywordMap).toBe(false);
+    const enabled = await target.service.createRun(JOB_URL, false, true);
+    expect(target.repository.getRun(enabled.id)).toMatchObject({
+      generateKeywordMap: false,
+      autoApply: true,
+    });
     expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(5);
     const input = target.repository.getArtifact(run.id, "job-description");
     expect(input).not.toBeNull();
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
     expect(target.repository.acquire()?.runId).toBe(run.id);
   });
-  test("exposes durable queue settings and canonical job URLs on created, listed, and retrieved run DTOs", async () => {
+  test("exposes durable run modes and canonical job URLs on created, listed, and retrieved DTOs", async () => {
     const target = fixture();
-    const created = await target.service.createRun(JOB_URL, false);
+    const created = await target.service.createRun(JOB_URL, false, true);
     const listed = await target.service.listRuns();
     const retrieved = await target.service.getRun(created.id);
 
-    expect(created).toMatchObject({ queueSequence: 1, generateKeywordMap: false, jobUrl: JOB_URL });
+    expect(created).toMatchObject({
+      queueSequence: 1,
+      generateKeywordMap: false,
+      autoApply: true,
+      jobUrl: JOB_URL,
+    });
     expect(listed).toHaveLength(1);
-    expect(listed[0]).toMatchObject({ queueSequence: 1, generateKeywordMap: false, jobUrl: JOB_URL });
-    expect(retrieved).toMatchObject({ queueSequence: 1, generateKeywordMap: false, jobUrl: JOB_URL });
+    expect(listed[0]).toMatchObject({
+      queueSequence: 1,
+      generateKeywordMap: false,
+      autoApply: true,
+      jobUrl: JOB_URL,
+    });
+    expect(retrieved).toMatchObject({
+      queueSequence: 1,
+      generateKeywordMap: false,
+      autoApply: true,
+      jobUrl: JOB_URL,
+    });
   });
   test("omits the job URL for legacy runs", async () => {
     const target = fixture();

@@ -17,6 +17,7 @@ function runFixture(id: string, applicationStatus: ApplicationStatus, status: Ru
     origin: "initial",
     queueSequence: 1,
     generateKeywordMap: false,
+    autoApply: false,
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_000,
     visualAcknowledgementRequired: false,
@@ -31,6 +32,7 @@ function documentViewerFixture(id: string, includeKeywordMap: boolean): RunDto {
   return {
     ...runFixture(id, "applied", "review"),
     generateKeywordMap: includeKeywordMap,
+    autoApply: false,
     revision,
     currentPdfSha256: resumeSha256,
     artifacts: [
@@ -428,7 +430,7 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
   await expect(initializer).toBeVisible();
   await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
   await expect(initializer.getByLabel("Job posting URL")).toHaveAttribute("id", "job-url");
-  await expect(initializer.getByRole("checkbox")).toHaveCount(0);
+  await expect(initializer.getByRole("checkbox", { name: "Auto-apply" })).toBeChecked({ checked: false });
   await expect(initializer.getByText("Generate resume-to-job-description keyword map", { exact: true })).toHaveCount(0);
   await expect(initializer.getByRole("textbox")).toHaveCount(1);
   await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
@@ -480,8 +482,8 @@ test("uses shared request eligibility and remains usable without overflow", asyn
 });
 
 
-test("posts the canonical URL with keyword maps enabled, disables while pending, and navigates on success", async ({ page }) => {
-  const initializedRun = runFixture("initialized-run", "applied", "failed");
+test("posts the selected auto-apply mode with the canonical URL, disables while pending, and navigates on success", async ({ page }) => {
+  const initializedRun = { ...runFixture("initialized-run", "applied", "failed"), autoApply: true };
   let postedBody: string | null = null;
   let pendingPost: Route | undefined;
   const { promise: postStarted, resolve: markPostStarted } = Promise.withResolvers<void>();
@@ -508,6 +510,9 @@ test("posts the canonical URL with keyword maps enabled, disables while pending,
   const initializer = page.getByRole("form", { name: "Initialize application" });
   const input = initializer.getByRole("textbox", { name: "Job posting URL" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
+  const autoApply = initializer.getByRole("checkbox", { name: "Auto-apply" });
+  await expect(autoApply).toBeChecked({ checked: false });
+  await autoApply.check();
   await input.fill("HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description");
   await initialize.click();
   await postStarted;
@@ -515,8 +520,10 @@ test("posts the canonical URL with keyword maps enabled, disables while pending,
   expect(postedBody).toBe(JSON.stringify({
     jobUrl: "https://jobs.example.test/roles/123?source=ui",
     generateKeywordMap: true,
+    autoApply: true,
   }));
   await expect(input).toBeDisabled();
+  await expect(autoApply).toBeDisabled();
   await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
 
   if (!pendingPost) throw new Error("Initialize request was not intercepted");
@@ -530,7 +537,7 @@ test("posts the canonical URL with keyword maps enabled, disables while pending,
   await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
 });
 
-test("retains the URL, clears the error on change, and retries with keyword maps enabled", async ({ page }) => {
+test("retains the URL and selected auto-apply mode after initialization failures", async ({ page }) => {
   const submittedUrl = "https://jobs.example.test/unavailable#details";
   const retryUrl = "https://jobs.example.test/another-role";
   let postCount = 0;
@@ -549,6 +556,7 @@ test("retains the URL, clears the error on change, and retries with keyword maps
     expect(request.postDataJSON()).toEqual({
       jobUrl: postCount === 1 ? "https://jobs.example.test/unavailable" : retryUrl,
       generateKeywordMap: true,
+      autoApply: postCount === 2,
     });
     await route.fulfill({
       status: 422,
@@ -564,6 +572,7 @@ test("retains the URL, clears the error on change, and retries with keyword maps
   await page.goto("/");
 
   const input = page.getByRole("textbox", { name: "Job posting URL" });
+  const autoApply = page.getByRole("checkbox", { name: "Auto-apply" });
   await input.fill(submittedUrl);
   await page.getByRole("button", { name: "Initialize" }).click();
 
@@ -572,12 +581,15 @@ test("retains the URL, clears the error on change, and retries with keyword maps
   await expect(alert).toHaveText("The page does not contain a usable job description");
   await expect(input).toHaveValue(submittedUrl);
   await expect(input).toBeEnabled();
+  await expect(autoApply).toBeChecked({ checked: false });
+  await expect(autoApply).toBeEnabled();
   await expect(input).toHaveAttribute("aria-invalid", "true");
   await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
 
-  await input.fill(retryUrl);
+  await autoApply.check();
   await expect(alert).toHaveCount(0);
+  await input.fill(retryUrl);
   await expect(input).toHaveValue(retryUrl);
   await expect(input).not.toHaveAttribute("aria-invalid");
   await expect(input).not.toHaveAttribute("aria-describedby");
@@ -587,6 +599,8 @@ test("retains the URL, clears the error on change, and retries with keyword maps
   await expect(alert).toHaveText("The page does not contain a usable job description");
   await expect(input).toHaveValue(retryUrl);
   await expect(input).toBeEnabled();
+  await expect(autoApply).toBeChecked();
+  await expect(autoApply).toBeEnabled();
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
   expect(postCount).toBe(2);
 });

@@ -20,6 +20,7 @@ const run: RunDto = {
   applicationStatus: "applied",
   queueSequence: 1,
   generateKeywordMap: true,
+  autoApply: false,
   revision: 2,
   origin: "initial",
   createdAt: 1_700_000_000_000,

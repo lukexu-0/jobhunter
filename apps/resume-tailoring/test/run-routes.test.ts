@@ -27,6 +27,7 @@ const run: RunDto = {
   applicationStatus: "applied",
   queueSequence: 1,
   generateKeywordMap: true,
+  autoApply: false,
   revision: 0,
   origin: "initial",
   createdAt: 1,
@@ -88,24 +89,31 @@ function patch(body: unknown): RequestInit {
 }
 
 describe("run HTTP routes", () => {
-  test("canonicalizes the job URL, forwards the default map option and request signal, and kicks only after persistence succeeds", async () => {
-    let received: { jobUrl: string; generateKeywordMap: boolean; signal: AbortSignal | undefined } | undefined;
+  test("canonicalizes the job URL, forwards run modes and request signal, and kicks only after persistence succeeds", async () => {
+    let received: {
+      jobUrl: string;
+      generateKeywordMap: boolean;
+      autoApply: boolean;
+      signal: AbortSignal | undefined;
+    } | undefined;
     const target = service({
-      createRun: async (jobUrl, generateKeywordMap, signal) => {
-        received = { jobUrl, generateKeywordMap, signal };
-        return { ...run, jobUrl };
+      createRun: async (jobUrl, generateKeywordMap, autoApply, signal) => {
+        received = { jobUrl, generateKeywordMap, autoApply, signal };
+        return { ...run, jobUrl, autoApply };
       },
     });
     const incoming = new Request("http://127.0.0.1:3457/v1/runs", post({
       jobUrl: " HTTPS://Jobs.Example.Test:443/role?gh_jid=123&source=route#apply ",
+      autoApply: true,
     }));
     const created = await createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target) })(incoming);
     expect(created.status).toBe(201);
     expect(created.headers.get("cache-control")).toBe("no-store");
-    expect(await created.json()).toEqual({ ...run, jobUrl: CANONICAL_JOB_URL });
+    expect(await created.json()).toEqual({ ...run, jobUrl: CANONICAL_JOB_URL, autoApply: true });
     expect(received).toEqual({
       jobUrl: CANONICAL_JOB_URL,
       generateKeywordMap: true,
+      autoApply: true,
       signal: incoming.signal,
     });
     expect(target.kickCount()).toBe(1);
@@ -128,15 +136,15 @@ describe("run HTTP routes", () => {
     });
     expect(failedTarget.kickCount()).toBe(0);
 
-    let defaulted: boolean | undefined;
+    let defaulted: { generateKeywordMap: boolean; autoApply: boolean } | undefined;
     const defaultTarget = service({
-      createRun: async (_jobUrl, generateKeywordMap) => {
-        defaulted = generateKeywordMap;
+      createRun: async (_jobUrl, generateKeywordMap, autoApply) => {
+        defaulted = { generateKeywordMap, autoApply };
         return run;
       },
     });
     expect((await request(defaultTarget, "/v1/runs", post({ jobUrl: "https://jobs.example.test/default" }))).status).toBe(201);
-    expect(defaulted).toBe(true);
+    expect(defaulted).toEqual({ generateKeywordMap: true, autoApply: false });
   });
 
   test("returns canonical job URLs and omits them for legacy runs", async () => {
@@ -303,6 +311,7 @@ describe("run HTTP routes", () => {
       { jobUrl: "ftp://example.test/job" },
       { jobUrl: "https://user:secret@example.test/job" },
       { jobUrl: "https://example.test/job", generateKeywordMap: "true" },
+      { jobUrl: "https://example.test/job", autoApply: "true" },
       { jobUrl: "https://example.test/job", extra: true },
       {},
     ]) {

@@ -514,6 +514,7 @@ class ApplicationSessionManager:
         session_id: UUID | None = None,
         job_url: str,
         allow_domains: Sequence[str],
+        auto_apply: bool = False,
         max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
@@ -526,6 +527,8 @@ class ApplicationSessionManager:
             origins.extend(validate_approved_origin(value) for value in allow_domains)
             if len(origins) > 20 or len(set(origins)) != len(origins):
                 raise ValueError("approved origins are invalid")
+            if type(auto_apply) is not bool:
+                raise ValueError("auto_apply is invalid")
             if not 1 <= max_steps <= 500:
                 raise ValueError("max_steps is invalid")
         except (TypeError, ValueError):
@@ -635,6 +638,7 @@ class ApplicationSessionManager:
                 session_id=session_id,
                 job_url=validated_job_url,
                 approved_origins=tuple(origins),
+                auto_apply=auto_apply,
                 max_steps=max_steps,
                 artifacts=uploaded,
                 direct_fields=tuple(candidate.direct_fields.items()),
@@ -701,6 +705,7 @@ class ApplicationSessionManager:
                 self._apply_result(record, result)
 
             record.human_gate = HumanGate(
+                auto_apply=request.auto_apply,
                 job_url=validated_job_url,
                 private_values=(
                     *candidate.direct_fields.values(),
@@ -1300,6 +1305,7 @@ class ApplicationSessionManager:
                     return
                 result = await model.run(
                     runtime_url=f"http://127.0.0.1:{self._config.port}",
+                    auto_apply=request.auto_apply,
                     task=record.application_task,
                     max_turns=request.max_steps,
                     deadline_ms=min(remaining_ms, 86_400_000),

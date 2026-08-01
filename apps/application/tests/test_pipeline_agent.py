@@ -81,6 +81,7 @@ def _success_payload(**overrides: Any) -> dict[str, Any]:
 async def _run(agent: PipelineApplicationAgentClient):
     return await agent.run(
         runtime_url="http://127.0.0.1:8765",
+        auto_apply=False,
         task="private task",
         max_turns=25,
         deadline_ms=30_000,
@@ -185,6 +186,7 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
 
     result = await harness.agent.run(
         runtime_url="http://localhost:8765",
+        auto_apply=True,
         task="complete the application",
         max_turns=37,
         deadline_ms=12_345,
@@ -207,6 +209,7 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
         '{"sessionId":"52aa48d2-c3c8-40df-80de-d213631a04aa",'
         '"runtimeUrl":"http://localhost:8765",'
         '"task":"complete the application",'
+        '"autoApply":true,'
         '"maxTurns":37,"deadlineMs":12345}'
     )
 
@@ -663,6 +666,7 @@ async def test_run_rejects_non_loopback_runtime_origin_before_request(
     with pytest.raises(ValueError, match="runtime_url must be a loopback HTTP origin"):
         await harness.agent.run(
             runtime_url="http://example.test:8765",
+            auto_apply=False,
             task="task",
             max_turns=10,
             deadline_ms=30_000,
@@ -673,6 +677,7 @@ async def test_run_rejects_non_loopback_runtime_origin_before_request(
 @pytest.mark.parametrize(
     ("override", "message"),
     [
+        ({"auto_apply": 1}, "auto_apply is invalid"),
         ({"task": "a" * (1_048_576 + 1)}, "task is invalid"),
         ({"task": b"not text"}, "task is invalid"),
         ({"max_turns": 0}, "max_turns is invalid"),
@@ -692,6 +697,7 @@ async def test_run_rejects_values_outside_the_strict_post_contract(
         lambda _request: httpx.Response(200, json=_success_payload())
     )
     arguments: dict[str, Any] = {
+        "auto_apply": False,
         "runtime_url": "http://127.0.0.1:8765",
         "task": "task",
         "max_turns": 10,

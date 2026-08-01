@@ -261,7 +261,12 @@ export class RunApplicationService {
     return run ? await this.#toDto(run) : undefined;
   }
 
-  async createRun(jobUrl: string, generateKeywordMapOrSignal: boolean | AbortSignal = true, requestSignal?: AbortSignal): Promise<RunDto> {
+  async createRun(
+    jobUrl: string,
+    generateKeywordMapOrSignal: boolean | AbortSignal = true,
+    autoApply = false,
+    requestSignal?: AbortSignal,
+  ): Promise<RunDto> {
     const generateKeywordMap = typeof generateKeywordMapOrSignal === "boolean" ? generateKeywordMapOrSignal : true;
     const signal = typeof generateKeywordMapOrSignal === "boolean" ? requestSignal : generateKeywordMapOrSignal;
     signal?.throwIfAborted();
@@ -336,7 +341,7 @@ export class RunApplicationService {
         sha256: input.sha256,
         path: input.path,
         byteSize: input.bytes,
-      }, runId, generateKeywordMap, reservation.run);
+      }, runId, generateKeywordMap, reservation.run, autoApply);
     } catch (error) {
       try {
         await this.dependencies.artifacts.removeRun(reservation.run);
@@ -587,6 +592,7 @@ export class RunApplicationService {
       ...(run.titleOverride !== undefined ? { titleOverride: run.titleOverride } : {}),
       ...(run.organizationOverride !== undefined ? { organizationOverride: run.organizationOverride } : {}),
       generateKeywordMap: run.generateKeywordMap,
+      autoApply: run.autoApply,
       queueSequence: run.queueSequence,
       revision: run.currentRevision,
       origin: publicOrigin(repository.resolveRevisionOrigin(run.id, run.currentRevision)),

@@ -58,7 +58,6 @@ from jobhunter_browser_harness.models import (
     BrowserUseExecutionResult,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
-    CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     CancelCommand,
     ContinueCommand,
@@ -74,7 +73,6 @@ from jobhunter_browser_harness.models import (
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
     RequestOriginApprovalRuntimeAction,
-    ReviseRuntimeActionResponse,
     ReviseCommand,
     SESSION_ERROR_MESSAGES,
 )
@@ -582,12 +580,14 @@ async def create_valid(
     manager: ApplicationSessionManager,
     *,
     session_id: UUID | None = None,
+    auto_apply: bool = False,
 ):
     personal, resume = valid_uploads()
     return await manager.create_session(
         session_id=session_id,
         job_url=JOB_URL,
         allow_domains=[],
+        auto_apply=auto_apply,
         max_steps=100,
         personal_information=personal,
         resume=resume,
@@ -935,7 +935,7 @@ async def test_tombstoned_caller_id_is_a_distinct_conflict_without_uploads(
     assert storage_called is False
 
 
-async def test_navigation_origin_revision_submission_and_resource_retention(
+async def test_navigation_origin_auto_submission_and_resource_retention(
     tmp_path: Path,
 ) -> None:
     submission_executed = asyncio.Event()
@@ -955,24 +955,19 @@ async def test_navigation_origin_revision_submission_and_resource_retention(
             return CancelledApplicationResult.model_validate_json(
                 navigation.extracted_content
             )
-        first_review = await gate.request_human_review(review_result(), browser)
-        if first_review.is_done:
+        review = await gate.request_human_review(review_result(), browser)
+        if review.is_done:
             return CancelledApplicationResult.model_validate_json(
-                first_review.extracted_content
+                review.extracted_content
             )
-        assert first_review.long_term_memory == "Use the corrected project example"
-        second_review = await gate.request_human_review(
-            review_result(revision_count=gate.revision_count), browser
-        )
-        assert second_review.is_done is False
-        assert second_review.long_term_memory == (
+        assert review.long_term_memory == (
             "Final submission was approved. Use submit_application exactly once."
         )
         await submission_executed.wait()
         return submitted_result(revision_count=gate.revision_count)
 
     manager, fakes, root = make_manager(tmp_path, runner)
-    created = await create_valid(manager)
+    created = await create_valid(manager, auto_apply=True)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
     record = manager._active
     assert record is not None and record.browser is not None and record.human_gate is not None
@@ -1021,29 +1016,24 @@ async def test_navigation_origin_revision_submission_and_resource_retention(
         created.session_id,
         ApproveOriginCommand(type="approve_origin", origin="https://ats.example"),
     )
-    await wait_state(manager, created.session_id, "awaiting_human_review")
-    review_snapshot = manager.get_snapshot(created.session_id)
-    assert review_snapshot.pending_action is not None
-    assert review_snapshot.pending_action.model_dump(mode="json") == {
-        "type": "human_review",
-    }
-    review_replay = manager._replay_events(
-        review_snapshot,
-        tuple(record.events),
-        999,
-    )[0].session
-    assert review_replay.pending_action == review_snapshot.pending_action
-    assert review_replay.expires_at == review_snapshot.expires_at
-    await manager.command(
-        created.session_id,
-        ReviseCommand(type="revise", context="  Use the corrected project example  "),
-    )
     await wait_until(
-        lambda: manager._active is not None
-        and manager._active.human_gate is not None
-        and manager._active.human_gate.pending_kind == "review"
+        lambda: record.human_gate is not None
+        and record.human_gate.submission_approved
     )
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
+    review_snapshot = manager.get_snapshot(created.session_id)
+    assert review_snapshot.state == "running"
+    assert review_snapshot.pending_action is None
+    assert review_snapshot.company == "Example Corp"
+    assert review_snapshot.revision_count == 0
+    with pytest.raises(HarnessServiceError) as revise:
+        await manager.command(
+            created.session_id,
+            ReviseCommand(type="revise", context="Use a corrected project example"),
+        )
+    assert revise.value.code == "command_conflict"
+    with pytest.raises(HarnessServiceError) as submit:
+        await manager.command(created.session_id, SubmitCommand(type="submit"))
+    assert submit.value.code == "command_conflict"
     submission_response = await manager.runtime_action(
         created.session_id,
         SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
@@ -1068,7 +1058,7 @@ async def test_navigation_origin_revision_submission_and_resource_retention(
     )
 
     snapshot = manager.get_snapshot(created.session_id)
-    assert snapshot.revision_count == 1
+    assert snapshot.revision_count == 0
     assert snapshot.approved_origins == ["https://jobs.example", "https://ats.example"]
     assert record.human_gate.approved_origins == (
         "https://jobs.example",
@@ -1085,13 +1075,10 @@ async def test_navigation_origin_revision_submission_and_resource_retention(
         "human_navigation_required",
         "origin_approval_required",
         "snapshot",
-        "review_required",
-        "revision_applied",
-        "review_required",
         "submission_started",
         "application_submitted",
     ]
-    assert [event.id for event in record.events] == list(range(1, 11))
+    assert [event.id for event in record.events] == list(range(1, 8))
     assert record.events[4].session.pending_action is None
     public_events = json.dumps([event.model_dump(mode="json") for event in record.events])
     assert PROFILE_SECRET not in public_events
@@ -2243,9 +2230,9 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
         navigation = await gate.request_human_navigation(encoded_secret, browser)
         assert not navigation.is_done
         review = await gate.request_human_review(private_result(), browser)
-        return CancelledApplicationResult.model_validate_json(
-            review.extracted_content
-        )
+        assert not review.is_done
+        await asyncio.Future()
+        raise AssertionError("unreachable")
 
     manager, _fakes, _root = make_manager(tmp_path, gated)
     personal = upload(
@@ -2260,6 +2247,7 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     created = await manager.create_session(
         job_url=private_job_url,
         allow_domains=[],
+        auto_apply=True,
         max_steps=100,
         personal_information=personal,
         resume=upload("resume.pdf", pdf_bytes()),
@@ -2268,7 +2256,11 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     )
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
     await manager.command(created.session_id, ContinueCommand(type="continue"))
-    await wait_state(manager, created.session_id, "awaiting_human_review")
+    await wait_until(
+        lambda: manager._active is not None
+        and manager._active.human_gate is not None
+        and manager._active.human_gate.submission_approved
+    )
     review_snapshot = manager.get_snapshot(created.session_id)
     assert review_snapshot.company == "[redacted]"
     assert review_snapshot.role == "[redacted]"
@@ -3116,11 +3108,11 @@ async def test_runtime_review_rejects_a_result_for_another_job_before_gate(
     await manager.delete(created.session_id)
 
 
-async def test_runtime_review_returns_revision_then_submit_and_seals_runtime(
+async def test_runtime_review_auto_approves_and_seals_runtime(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
+    created = await create_valid(manager, auto_apply=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
@@ -3153,27 +3145,23 @@ async def test_runtime_review_returns_revision_then_submit_and_seals_runtime(
         type="request_human_review",
         result=review_result(),
     )
-    first = asyncio.create_task(manager.runtime_action(created.session_id, review))
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
-    await manager.command(
-        created.session_id,
-        ReviseCommand(type="revise", context="Use the corrected date."),
+    approved = await asyncio.wait_for(
+        manager.runtime_action(created.session_id, review),
+        timeout=0.1,
     )
-    revised = await first
-    assert revised == ReviseRuntimeActionResponse(
-        type="revise",
-        context="Use the corrected date.",
-        revision_count=1,
-    )
-
-    second = asyncio.create_task(manager.runtime_action(created.session_id, review))
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    approved = await second
     assert isinstance(approved, SubmitRuntimeActionResponse)
     assert approved.result.status == "ready_for_submission"
-    assert approved.result.revision_count == 1
-    assert manager.get_snapshot(created.session_id).state == "awaiting_human_review"
+    assert approved.result.revision_count == 0
+    assert record.human_gate.pending_kind is None
+    assert record.human_gate.submission_approved is True
+    assert manager.get_snapshot(created.session_id).state == "running"
+
+    with pytest.raises(HarnessServiceError) as revise:
+        await manager.command(
+            created.session_id,
+            ReviseCommand(type="revise", context="Use the corrected date."),
+        )
+    assert revise.value.code == "command_conflict"
 
     with pytest.raises(HarnessServiceError) as replay:
         await manager.command(created.session_id, SubmitCommand(type="submit"))
@@ -3226,25 +3214,22 @@ async def test_submit_execution_failure_parks_uncertainty_without_cleanup(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
+    created = await create_valid(manager, auto_apply=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
     runtime = FakeSkillRuntime(error=BrowserSkillRuntimeError("browser_failed"))
     record.skill_runtime = runtime
 
-    review = asyncio.create_task(
-        manager.runtime_action(
-            created.session_id,
-            RequestHumanReviewRuntimeAction(
-                type="request_human_review",
-                result=review_result(),
-            ),
-        )
+    review = await manager.runtime_action(
+        created.session_id,
+        RequestHumanReviewRuntimeAction(
+            type="request_human_review",
+            result=review_result(),
+        ),
     )
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    assert isinstance(await review, SubmitRuntimeActionResponse)
+    assert isinstance(review, SubmitRuntimeActionResponse)
+    assert record.human_gate.pending_kind is None
 
     with pytest.raises(HarnessServiceError) as failed:
         await manager.runtime_action(
@@ -3282,23 +3267,19 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
+    created = await create_valid(manager, auto_apply=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
 
-    review = asyncio.create_task(
-        manager.runtime_action(
-            created.session_id,
-            RequestHumanReviewRuntimeAction(
-                type="request_human_review",
-                result=review_result(),
-            ),
-        )
+    review = await manager.runtime_action(
+        created.session_id,
+        RequestHumanReviewRuntimeAction(
+            type="request_human_review",
+            result=review_result(),
+        ),
     )
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    assert isinstance(await review, SubmitRuntimeActionResponse)
+    assert isinstance(review, SubmitRuntimeActionResponse)
 
     await record.request_lock.acquire()
     submission = asyncio.create_task(
@@ -3334,23 +3315,19 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
+    created = await create_valid(manager, auto_apply=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
 
-    review = asyncio.create_task(
-        manager.runtime_action(
-            created.session_id,
-            RequestHumanReviewRuntimeAction(
-                type="request_human_review",
-                result=review_result(),
-            ),
-        )
+    review = await manager.runtime_action(
+        created.session_id,
+        RequestHumanReviewRuntimeAction(
+            type="request_human_review",
+            result=review_result(),
+        ),
     )
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    assert isinstance(await review, SubmitRuntimeActionResponse)
+    assert isinstance(review, SubmitRuntimeActionResponse)
 
     await record.request_lock.acquire()
     submission = asyncio.create_task(
@@ -3416,12 +3393,14 @@ async def test_submit_latch_wins_a_queued_model_failure(
         )
 
     manager, fakes, _ = make_manager(tmp_path, runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "awaiting_human_review")
+    created = await create_valid(manager, auto_apply=True)
+    await wait_until(
+        lambda: manager._active is not None
+        and manager._active.human_gate is not None
+        and manager._active.human_gate.submission_approved
+    )
     record = manager._active
     assert record is not None and record.human_gate is not None
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    await wait_until(lambda: record.human_gate.submission_approved)
 
     await record.request_lock.acquire()
     submission = asyncio.create_task(
@@ -3476,12 +3455,9 @@ async def test_post_action_model_failures_park_uncertainty(
         raise AssertionError("unreachable")
 
     manager, fakes, _ = make_manager(tmp_path, runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "awaiting_human_review")
+    created = await create_valid(manager, auto_apply=True)
     record = manager._active
     assert record is not None and record.human_gate is not None
-
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
     await wait_until(lambda: record.human_gate.submission_approved)
     await manager.runtime_action(
         created.session_id,
@@ -3518,11 +3494,9 @@ async def test_failure_after_approval_but_before_submit_action_is_ordinary_faile
         )
 
     manager, fakes, _ = make_manager(tmp_path, runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "awaiting_human_review")
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-
+    created = await create_valid(manager, auto_apply=True)
     await wait_state(manager, created.session_id, "failed")
+
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.error is not None
     assert snapshot.error.code == "model_failed"
@@ -3531,32 +3505,43 @@ async def test_failure_after_approval_but_before_submit_action_is_ordinary_faile
     assert fakes.browsers[0].killed is True
 
 
-async def test_runtime_review_returns_typed_cancel_result(
+async def test_runtime_review_rejects_unresolved_fields_without_approval(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
+    created = await create_valid(manager, auto_apply=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
     record.skill_runtime = FakeSkillRuntime()
-    review = asyncio.create_task(
-        manager.runtime_action(
+    unresolved = ReviewApplicationResult.model_validate(
+        {
+            **review_result().model_dump(),
+            "fields_needing_human": [
+                {
+                    "label": "Work authorization",
+                    "field_type": "radio",
+                    "value_present": False,
+                    "note": "Candidate answer is required.",
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(HarnessServiceError) as rejected:
+        await manager.runtime_action(
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
-                result=review_result(),
+                result=unresolved,
             ),
         )
-    )
-    await wait_until(lambda: record.human_gate.pending_kind == "review")
 
-    await record.human_gate.cancel()
-    cancelled = await review
-
-    assert isinstance(cancelled, CancelRuntimeActionResponse)
-    assert cancelled.result.status == "cancelled"
-    assert cancelled.result.submit_attempted is False
+    assert rejected.value.status_code == 422
+    assert rejected.value.code == "invalid_request"
+    assert record.human_gate.submission_approved is False
+    assert record.human_gate.pending_kind is None
+    assert manager.get_snapshot(created.session_id).state == "running"
     await manager.delete(created.session_id)
 
 
@@ -3738,10 +3723,12 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     call = fakes.models[0].run_calls[0]
     assert set(call) == {
         "runtime_url",
+        "auto_apply",
         "task",
         "max_turns",
         "deadline_ms",
     }
+    assert call["auto_apply"] is False
     assert call["runtime_url"] == "http://127.0.0.1:8765"
     task = json.loads(call["task"])
     assert task["job"]["url"] == JOB_URL
@@ -3760,6 +3747,8 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
         }
     }
     assert "question" not in call["task"]
+    assert "auto_apply" not in call["task"]
+    assert "autoApply" not in call["task"]
     assert "updated_at" not in call["task"]
     assert task["evidence"][0]["category"] == "resume"
     assert "workflow" not in call["task"].lower()

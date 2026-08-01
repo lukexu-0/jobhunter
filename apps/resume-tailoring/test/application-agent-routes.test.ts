@@ -16,6 +16,7 @@ const INPUT = {
   task: "Fill the application.",
   maxTurns: 40,
   deadlineMs: 60_000,
+  autoApply: false,
 };
 const RESULT = {
   status: "submitted" as const,

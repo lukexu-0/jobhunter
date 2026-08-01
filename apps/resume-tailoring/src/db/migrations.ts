@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 12;
+export const PIPELINE_SCHEMA_VERSION = 14;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -520,6 +520,46 @@ LEFT JOIN run_claim_v11 ON run_claim_v11.id = 1;
 DROP TABLE run_claim_v11;
 `;
 
+function migrateRunClaimCapacity(db: Database): void {
+  const existing = db.query<{ name: string }, []>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_claim'",
+  ).get();
+  if (existing) {
+    db.exec(migration12);
+    return;
+  }
+  db.exec(`
+    CREATE TABLE run_claim (
+      id INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND ${RUN_CLAIM_CAPACITY}),
+      run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+      claim_token TEXT UNIQUE,
+      expires_at INTEGER,
+      CHECK ((run_id IS NULL AND claim_token IS NULL AND expires_at IS NULL) OR
+             (run_id IS NOT NULL AND claim_token IS NOT NULL AND expires_at IS NOT NULL))
+    ) STRICT;
+
+    WITH RECURSIVE claim_slots(id) AS (
+      SELECT 1
+      UNION ALL
+      SELECT id + 1 FROM claim_slots WHERE id < ${RUN_CLAIM_CAPACITY}
+    )
+    INSERT INTO run_claim(id, run_id, claim_token, expires_at)
+    SELECT id, NULL, NULL, NULL FROM claim_slots;
+  `);
+}
+
+const migration13 = `
+ALTER TABLE run_application_sessions
+ADD COLUMN automatic_review_ready INTEGER NOT NULL DEFAULT 0
+  CHECK (automatic_review_ready IN (0,1));
+`;
+
+const migration14 = `
+ALTER TABLE runs
+ADD COLUMN auto_apply INTEGER NOT NULL DEFAULT 0
+  CHECK (auto_apply IN (0,1));
+`;
+
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
   const version = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
@@ -569,8 +609,16 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(11, now);
       }
       if (version < 12) {
-        db.exec(migration12);
+        migrateRunClaimCapacity(db);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(12, now);
+      }
+      if (version < 13) {
+        db.exec(migration13);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(13, now);
+      }
+      if (version < 14) {
+        db.exec(migration14);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(14, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

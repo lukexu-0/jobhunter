@@ -5,7 +5,7 @@ import secrets
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Protocol
+from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
 from fastapi import Body, FastAPI, File, Form, Header, Request, UploadFile
@@ -31,6 +31,7 @@ class HarnessSessionService(Protocol):
         session_id: UUID | None,
         job_url: str,
         allow_domains: Sequence[str],
+        auto_apply: bool,
         max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
@@ -131,6 +132,7 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         resume: Annotated[UploadFile, File()],
         session_id: Annotated[UUID | None, Form()] = None,
         allow_domain: Annotated[list[str] | None, Form()] = None,
+        auto_apply: Annotated[Literal["false", "true"], Form()] = "false",
         max_steps: Annotated[int, Form(ge=1, le=500)] = 100,
         context: Annotated[list[UploadFile] | None, File()] = None,
         anecdote: Annotated[list[UploadFile] | None, File()] = None,
@@ -144,6 +146,7 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
             session_id=session_id,
             job_url=job_url,
             allow_domains=allow_domains,
+            auto_apply=auto_apply == "true",
             max_steps=max_steps,
             personal_information=personal_information,
             resume=resume,

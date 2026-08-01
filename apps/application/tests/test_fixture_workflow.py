@@ -43,7 +43,6 @@ from jobhunter_browser_harness.models import (
     ContinueRuntimeActionResponse,
     HarnessConfig,
     ProvideAdditionalInfoCommand,
-    SubmitCommand,
     SubmitRuntimeActionResponse,
     SubmitApplicationRuntimeAction,
     SubmitApplicationResultRuntimeActionResponse,
@@ -51,8 +50,6 @@ from jobhunter_browser_harness.models import (
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
     RequestOriginApprovalRuntimeAction,
-    ReviseCommand,
-    ReviseRuntimeActionResponse,
 )
 from jobhunter_browser_harness.sessions import ApplicationSessionManager
 
@@ -61,7 +58,6 @@ _RELEVANT_ANSWER = (
     "verifying service health, and documenting the follow-up."
 )
 _IRRELEVANT_FACT = "community garden fundraiser"
-_REVISION = "Human revision: emphasize careful incident ownership."
 _INITIAL_REVIEW_REPLY = "Initial human reply: emphasize production reliability."
 _SUMMER_AVAILABILITY = "June through August 2027"
 _REFERRAL_SOURCE = "Employee referral"
@@ -372,7 +368,7 @@ def _set_review_code(value: str) -> str:
     reason="Bubblewrap namespace execution requires Linux",
 )
 @pytest.mark.asyncio
-async def test_real_fixture_submits_once_after_human_approval(
+async def test_real_fixture_submits_once_after_automatic_review_approval(
     tmp_path: Path,
 ) -> None:
     executable = _chromium_executable()
@@ -415,6 +411,7 @@ async def test_real_fixture_submits_once_after_human_approval(
             session_id=_CALLER_SESSION_ID,
             job_url=fixture.posting_url,
             allow_domains=[],
+            auto_apply=True,
             max_steps=20,
             personal_information=personal,
             resume=resume,
@@ -826,68 +823,21 @@ async def test_real_fixture_submits_once_after_human_approval(
             )
 
 
-            initial_review = _review_result(fixture, "resume.pdf", revision_count=0)
-            review_task = asyncio.create_task(
-                manager.runtime_action(
-                    created.session_id,
-                    RequestHumanReviewRuntimeAction(
-                        type="request_human_review",
-                        result=initial_review,
+            approved = await manager.runtime_action(
+                created.session_id,
+                RequestHumanReviewRuntimeAction(
+                    type="request_human_review",
+                    result=_review_result(
+                        fixture,
+                        "resume.pdf",
+                        revision_count=0,
                     ),
-                )
-            )
-            await _wait_for_state(
-                manager,
-                created.session_id,
-                "awaiting_human_review",
-            )
-            review_pending = manager.get_snapshot(created.session_id).pending_action
-            assert review_pending is not None
-            assert review_pending.model_dump(mode="json") == {
-                "type": "human_review",
-            }
-            await manager.command(
-                created.session_id,
-                ReviseCommand(type="revise", context=_REVISION),
-            )
-            revised = await review_task
-            assert revised == ReviseRuntimeActionResponse(
-                type="revise",
-                context=_REVISION,
-                revision_count=1,
-            )
-
-            revision = await manager.runtime_action(
-                created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code=_set_review_code(_REVISION),
                 ),
             )
-            assert isinstance(revision, BrowserUseResultRuntimeActionResponse)
-            assert revision.exit_code == 0, revision.stderr
-
-            submit_gate_task = asyncio.create_task(
-                manager.runtime_action(
-                    created.session_id,
-                    RequestHumanReviewRuntimeAction(
-                        type="request_human_review",
-                        result=_review_result(
-                            fixture,
-                            "resume.pdf",
-                            revision_count=1,
-                        ),
-                    )
-                )
-            )
-            await _wait_for_state(
-                manager,
-                created.session_id,
-                "awaiting_human_review",
-            )
-            assert manager.get_snapshot(
-                created.session_id
-            ).pending_action is not None
+            assert isinstance(approved, SubmitRuntimeActionResponse)
+            assert approved.result.revision_count == 0
+            assert approved.result.submit_attempted is False
+            assert manager.get_snapshot(created.session_id).pending_action is None
             assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
             runtime = record.skill_runtime
             assert runtime is not None
@@ -936,12 +886,6 @@ async def test_real_fixture_submits_once_after_human_approval(
             assert probe_cleanup.exit_code == 0, probe_cleanup.stderr
             assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
 
-            await manager.command(created.session_id, SubmitCommand(type="submit"))
-            approved = await submit_gate_task
-            assert isinstance(approved, SubmitRuntimeActionResponse)
-            assert approved.result.revision_count == 1
-            assert approved.result.submit_attempted is False
-            assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
 
             submission = await manager.runtime_action(
                 created.session_id,
@@ -995,14 +939,14 @@ async def test_real_fixture_submits_once_after_human_approval(
             values = await _page_values(record.browser)
             assert values == before_human | {
                 "humanNext": "true",
-                "review": _REVISION,
+                "review": _INITIAL_REVIEW_REPLY,
                 "reviewVisible": True,
             }
             assert _IRRELEVANT_FACT not in str(values)
             submitted = await asyncio.to_thread(fixture.submit_snapshot)
             assert submitted["submit_count"] == 1
             assert submitted["last_submission"]["incident_answer"] == _RELEVANT_ANSWER
-            assert submitted["last_submission"]["review_answer"] == _REVISION
+            assert submitted["last_submission"]["review_answer"] == _INITIAL_REVIEW_REPLY
             assert submitted["last_submission"]["resume"] == "resume.pdf"
         finally:
             await manager.delete(created.session_id)
