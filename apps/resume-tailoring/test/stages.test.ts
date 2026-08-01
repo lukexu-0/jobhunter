@@ -1174,7 +1174,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     await processToStop(harness);
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
     expect(harness.agentInputs.tailoring[0]?.mustIncludeEvidenceIds)
-      .toEqual([ACTIVE_DIRECTIVE_EVIDENCE_ID]);
+      .toEqual(["jobhunter-directive-0", "jobhunter-directive-1", ACTIVE_DIRECTIVE_EVIDENCE_ID]);
     const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
     harness.repository.editRun(
       harness.runId,
