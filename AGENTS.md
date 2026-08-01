@@ -6,7 +6,7 @@ Jobhunter is a local, evidence-grounded resume tailoring and application system 
 
 - A Bun/TypeScript pipeline that ingests job postings, snapshots candidate context, runs model-backed analysis and tailoring, compiles TeX, performs PDF QA, and persists revision history.
 - A Next.js review UI for initializing runs, tracking workflow state, reviewing artifacts, and managing provider OAuth.
-- An optional Python/FastAPI browser harness for a constrained, human-gated application workflow.
+- An optional Python/FastAPI browser harness for a constrained application workflow. Manual review is the default; each new run can select automatic submission.
 
 The system favors strict contracts, source provenance, immutable artifacts, bounded I/O, and redacted public errors over permissive recovery.
 
@@ -17,7 +17,7 @@ The system favors strict contracts, source provenance, immutable artifacts, boun
 3. Pipeline routes delegate to `RunApplicationService`, which validates the job source, requires fresh context, snapshots source hashes, writes the input artifact, and creates a queued run transactionally.
 4. `WorkerScheduler` serially claims work. `PipelineStageProcessor` drives `queued → analyzing → tailoring → compiling → deterministic QA → visual QA → review`; editing, regeneration, retry, and repair create or reuse revisions under explicit state rules.
 5. Model, TeX, Poppler, and visual-QA outputs are schema checked, size bounded, atomically written, hashed, and finalized in SQLite. Approval/edit commands use source hashes, revisions, and expected PDF hashes as conflict guards.
-6. The Python harness listens on `127.0.0.1:8765`, owns browser/session/human-gate state, and calls only the bearer-protected Bun `/v1/internal/application-agent` boundary. Do not import across this Python/TypeScript boundary or expose the internal route to browser code.
+6. The Python harness listens on `127.0.0.1:8765`, owns browser/session/human-gate state, and calls only the bearer-protected Bun `/v1/internal/application-agent` boundary. The per-run mode is persisted by the pipeline and is forwarded as `auto_apply` (`"true"` or `"false"`) in multipart form, then as `autoApply` in the strict internal request. Automatic mode keeps origin, navigation, additional-information, mismatch, submission-ledger, one-shot action, and submission-result safeguards. Do not import across this Python/TypeScript boundary or expose the internal route to browser code.
 
 Persistent state is split deliberately:
 
