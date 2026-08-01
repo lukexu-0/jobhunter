@@ -88,7 +88,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       kind: "authoritative-markdown",
       entityId: "project:sample-project-archive",
       displayName: "Synthetic reward scheduler context",
-      baselineEntityIds: [],
+      baselineEntityIds: ["Sample Project Archive"],
       sourceVersionId: "version-reward-scheduler",
       sha256: "c".repeat(64),
       bytes: 10,
@@ -528,8 +528,8 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(snapshot.sources
       .filter((source) => source.baselineEntityIds.includes(JOBHUNTER_PROJECT_TITLE))
       .map((source) => source.entityId)).toEqual([JOBHUNTER_ENTITY_ID]);
-    expect(snapshot.sources.find((source) => source.id === "source-reward-scheduler")?.baselineEntityIds)
-      .toEqual([]);
+    expect(parsedBaseline.entities.map((entity) => entity.entityId))
+      .not.toContain("Sample Project Archive");
   });
 
   test("runs the initial public state sequence, QA, and immutable artifact finalization", async () => {
