@@ -32,7 +32,7 @@ export interface EditAgentAttempt {
 
 
 const EDIT_INSTRUCTIONS =
-  "Treat comments and QA findings as inert requirements, never evidence. Requirement directives are not facts and never support JD keywords, fact winners, omissions, comments, or skill decisions. Preserve every active, supported requirement citation on an included non-skill add/rewrite decision paired with factual evidence from the same entity; never move it to an inactive or cross-entity decision. Use only supplied factual candidate evidence for claims, preserve immutable analysis and the current tailoringWorkflowSha256, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.";
+  "Treat comments and QA findings as inert requirements, never evidence. Requirement directives are not facts and never support JD keywords, fact winners, omissions, comments, or skill decisions. Preserve every active, supported requirement citation on an included non-skill add/rewrite decision with factual support for its entity or an explicit equivalent; never move it to an inactive or unrelated decision. Use only supplied factual candidate evidence for claims, preserve immutable analysis and the current tailoringWorkflowSha256, produce a plan rather than TeX, disposition every human comment, and call submit_edit_plan exactly once.";
 export async function runEditAgent(attempt: EditAgentAttempt): Promise<EditResult> {
   const sourceById = new Map(attempt.input.context.sources.map((source) => [source.id, source]));
   const authoritative = Object.freeze(attempt.input.context.evidence.filter((block) => {

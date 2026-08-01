@@ -158,6 +158,49 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
+  test("refreshes manifest metadata without reindexing unchanged source bytes", () => {
+    const root = createRepositoryFixture();
+    const loaded = loadFixture(root);
+    const legacyLoaded = {
+      ...loaded,
+      manifest: {
+        ...loaded.manifest,
+        sources: loaded.manifest.sources.map((source) => source.id === "jobhunter-resume-info"
+          ? { ...source, baselineEntityIds: ["Jobhunter"] }
+          : source),
+      },
+      manifestSha256: sha256("legacy Jobhunter alias"),
+    };
+    const database = openContextDatabase(":memory:");
+    try {
+      syncContext(database, legacyLoaded, 100);
+      const legacySource = createContextSnapshot(database, legacyLoaded).sources
+        .find((source) => source.id === "jobhunter-resume-info")!;
+      expect(checkContextFreshness(database, loaded)).toEqual({
+        fresh: false,
+        manifestMatches: false,
+        staleSources: [],
+        missingSources: [],
+      });
+
+      const report = syncContext(database, loaded, 200);
+      const currentSource = createContextSnapshot(database, loaded).sources
+        .find((source) => source.id === "jobhunter-resume-info")!;
+      const versions = database.query<{ count: number }, []>(
+        "SELECT count(*) AS count FROM source_versions WHERE source_id = 'jobhunter-resume-info'",
+      ).get();
+
+      expect(legacySource.baselineEntityIds).toEqual(["Jobhunter"]);
+      expect(report.changedSources).not.toContain("jobhunter-resume-info");
+      expect(currentSource.baselineEntityIds).toEqual(["Resume Tailoring and Application Agent"]);
+      expect(currentSource.sourceVersionId).toBe(legacySource.sourceVersionId);
+      expect(currentSource.sha256).toBe(legacySource.sha256);
+      expect(versions?.count).toBe(1);
+    } finally {
+      database.close();
+    }
+  });
+
   test("synchronizes the Jobhunter source and exposes its two directives alongside Sample Testing", () => {
     const loaded = loadContextManifest();
     const database = openContextDatabase(":memory:");

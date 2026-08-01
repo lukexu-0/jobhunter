@@ -32,7 +32,6 @@ interface SourceRow {
   readonly kind: "baseline" | "authoritative-markdown";
   readonly entity_id: string;
   readonly display_name: string;
-  readonly baseline_entity_ids_json: string;
   readonly sha256: string;
   readonly byte_count: number;
   readonly indexed_at: number;
@@ -196,7 +195,6 @@ export function createContextSnapshot(
     if (!row) throw new Error(`Missing indexed source: ${definition.id}`);
     return Object.freeze({
       ...definition,
-      baselineEntityIds: parseStringArray(row.baseline_entity_ids_json, "baseline entity IDs"),
       sourceVersionId: row.id,
       sha256: row.sha256,
       bytes: row.byte_count,

@@ -229,16 +229,11 @@ describe("strict resume contracts", () => {
     ]);
     const jobhunter = projects.find((item) => item.entityId === "Resume Tailoring and Application Agent");
     expect(jobhunter?.headingArguments[1]).toBe("Jan 2020 -- Present");
-    expect(jobhunter?.bullets).toHaveLength(3);
-    expect(jobhunter?.bullets[0]?.text).toBe(
-      "Built a local resume-tailoring and application agent that turns job postings into evidence-backed, ATS-aligned one-page resumes and human-reviewed application workflows.",
-    );
-    const jobhunterContent = [
-      ...(jobhunter?.headingArguments ?? []),
-      ...(jobhunter?.bullets.map((item) => item.text) ?? []),
-    ].join(" ");
-    expect(jobhunterContent).toContain("OpenAI Agents SDK");
-    expect(jobhunterContent).toContain("Browser Use");
+    expect(jobhunter?.bullets.map((item) => item.text)).toEqual([
+      "Local agent converts job postings into evidence-backed, ATS-aligned one-page resumes and human-reviewed application workflows.",
+      "OpenAI Agents SDK orchestration coordinates ATS extraction, analysis, tailoring, and bounded compile repair with source provenance, revision lineage, and deterministic and visual QA.",
+      "Python Browser Use harness runs inside a Bubblewrap sandbox with exact-origin navigation and human approval gates, limiting submission to one explicit final click without automatic retries.",
+    ]);
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");
     expect(competition?.headingArguments).toEqual(["Semifinalist", "Jan 2020 -- Jun 2020", "Example Engineering Competition", ""]);
@@ -455,7 +450,7 @@ describe("analysis validation", () => {
     )).toThrow("active must-include directive directive-0 is missing from a supported bullet edit");
   });
 
-  test("rejects directive-only, baseline-only, cross-entity, JD-keyword, and skill citations", () => {
+  test("rejects directive-only, baseline-only, unrelated-entity, JD-keyword, and skill citations", () => {
     const { snapshot, analysis } = fixtures();
     const directive = withMustIncludeDirective(snapshot);
     const directiveOnly = replaceEvidence(analysis, [directive.evidence.id]);
@@ -495,7 +490,7 @@ describe("analysis validation", () => {
       JOB_DESCRIPTION,
       baseline,
       directive.snapshot,
-    )).toThrow("requirement evidence directive-0 lacks non-directive same-entity factual support");
+    )).toThrow("requirement evidence directive-0 lacks non-directive factual support from the same or an explicitly equivalent entity");
 
     const skillCitation: JobAnalysis = {
       ...analysis,
@@ -709,7 +704,7 @@ describe("analysis validation", () => {
       analysis,
       directiveOnlyPlan,
       directive.snapshot,
-    )).toThrow("requirement evidence directive-0 lacks non-directive same-entity factual support");
+    )).toThrow("requirement evidence directive-0 lacks non-directive factual support from the same or an explicitly equivalent entity");
 
     const inactiveDirective = withMustIncludeDirective(snapshot, 1);
     const inactivePlan = buildMechanicalTailoringPlan(analysis, baseline);
@@ -736,7 +731,7 @@ describe("analysis validation", () => {
       analysis,
       crossEntityPlan,
       inactiveDirective.snapshot,
-    )).toThrow("requirement evidence directive-1 lacks non-directive same-entity factual support");
+    )).toThrow("requirement evidence directive-1 lacks non-directive factual support from the same or an explicitly equivalent entity");
 
     expect(() => buildEvidenceLedger(
       supportedAnalysis,
