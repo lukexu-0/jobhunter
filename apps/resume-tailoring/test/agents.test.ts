@@ -188,7 +188,7 @@ describe("guarded agents", () => {
       "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills.",
     );
     expect(ANALYSIS_INSTRUCTIONS).toBe(
-      "Use supplied JD, ATS extraction, baseline inventory, and factual evidence only. Requirements are not facts and never support keywords, skills, or omissions. Citing factual evidence on a non-skill edit activates same-entity requirements; cite every active requirement on an included edit paired with same-entity factual evidence. Never cite inactive or cross-entity requirements. Use evidence-backed JD keywords truthfully. Always preserve impact when performing edits. Write clearly for recruiters and technical staff with conventional terms, never \"Agentic workflow systems\". Make each project's first bullet a summary. Use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Copy hashes and call submit_job_analysis once.",
+      "Use supplied JD, ATS extraction, baseline inventory, and factual evidence only. Requirements are not facts and never support keywords, skills, or omissions. Non-skill edit evidence activates requirements for its entity and explicit equivalents. Cite active requirements only on fact-supported edits for that entity; never cite inactive or unrelated requirements. Use evidence-backed JD keywords truthfully. Always preserve impact when performing edits. Write clearly for recruiters and technical staff with conventional terms, never \"Agentic workflow systems\". Make each project's first bullet a summary. Use \"Accomplished [X] as measured by [Y] by doing [Z]\" only when evidence supports X, Y, and Z. Copy hashes and call submit_job_analysis once.",
     );
     expect(ATS_KEYWORD_EXTRACTION_TASK).toBe(
       "Act as an ATS system and extract all relevant keywords from the supplied job description.",
@@ -506,8 +506,8 @@ describe("guarded agents", () => {
       }
       expect(agent.instructions).toContain("Requirements are not facts");
       expect(agent.instructions).toContain("never support keywords, skills, or omissions");
-      expect(agent.instructions).toContain("paired with same-entity factual evidence");
-      expect(agent.instructions).toContain("Never cite inactive or cross-entity requirements");
+      expect(agent.instructions).toContain("requirements for its entity and explicit equivalents");
+      expect(agent.instructions).toContain("never cite inactive or unrelated requirements");
       await invoke(agent, "submit_job_analysis", ANALYSIS);
       return { finalOutput: ANALYSIS };
     });
@@ -1105,7 +1105,7 @@ describe("guarded agents", () => {
       expect(agent.instructions).toContain("never support JD keywords");
       expect(agent.instructions).toContain("omissions");
       expect(agent.instructions).toContain("Preserve every active, supported requirement citation");
-      expect(agent.instructions).toContain("paired with factual evidence from the same entity");
+      expect(agent.instructions).toContain("factual support for its entity or an explicit equivalent");
       return {};
     });
 

@@ -101,7 +101,7 @@ export function validatePlanMustIncludeDirectives(
       }
       if (!activeDirectiveIds.has(evidenceId)
         || !hasFactualSupport(decision.evidenceIds, directive)) {
-        throw new ResumeValidationError(`requirement evidence ${evidenceId} lacks non-directive same-entity factual support on its decision`);
+        throw new ResumeValidationError(`requirement evidence ${evidenceId} lacks non-directive factual support from the same or an explicitly equivalent entity on its decision`);
       }
       if (!equivalentEntities(decision.entityId, directive.entityId, snapshot)) {
         throw new ResumeValidationError(`requirement evidence ${evidenceId} is attributed to ${directive.entityId}, not ${decision.entityId}`);

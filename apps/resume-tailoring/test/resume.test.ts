@@ -215,14 +215,24 @@ describe("strict resume contracts", () => {
 
   test("parses canonical sections, entities, bullets, and stable IDs", () => {
     const again = parseBaselineResume(baseline);
-    expect(parsedBaseline.entities.filter((item) => item.section === "projects").map((item) => item.entityId)).toEqual([
-      "Sample Project Archive",
+    const projects = parsedBaseline.entities.filter((item) => item.section === "projects");
+    const projectTitles = projects.map((item) => item.entityId);
+    expect(projectTitles).toEqual([
+      "Resume Tailoring and Application Agent",
       "Sample Project",
     ]);
+    expect(projectTitles).not.toContain("Sample Project Archive");
     const legacyBaseline = baseline.replaceAll("\\enspace\\textbar\\enspace", () => "$|$");
     expect(parseBaselineResume(legacyBaseline).entities.filter((item) => item.section === "projects").map((item) => item.entityId)).toEqual([
-      "Sample Project Archive",
+      "Resume Tailoring and Application Agent",
       "Sample Project",
+    ]);
+    const jobhunter = projects.find((item) => item.entityId === "Resume Tailoring and Application Agent");
+    expect(jobhunter?.headingArguments[1]).toBe("Jan 2020 -- Present");
+    expect(jobhunter?.bullets.map((item) => item.text)).toEqual([
+      "Saved over 100 hours rewriting resumes and applying to jobs by building a local agent that produces evidence-backed, ATS-aligned one-page resumes and human-reviewed application workflows.",
+      "Orchestrated ATS extraction, analysis, tailoring, and bounded compile repair with the OpenAI Agents SDK, preserving source provenance and revision lineage through deterministic and visual QA.",
+      "Engineered a Python Browser Use harness with Bubblewrap sandboxing, exact-origin navigation, human approval gates, and one-shot submission controls without automatic retries.",
     ]);
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");
@@ -440,7 +450,7 @@ describe("analysis validation", () => {
     )).toThrow("active must-include directive directive-0 is missing from a supported bullet edit");
   });
 
-  test("rejects directive-only, baseline-only, cross-entity, JD-keyword, and skill citations", () => {
+  test("rejects directive-only, baseline-only, unrelated-entity, JD-keyword, and skill citations", () => {
     const { snapshot, analysis } = fixtures();
     const directive = withMustIncludeDirective(snapshot);
     const directiveOnly = replaceEvidence(analysis, [directive.evidence.id]);
@@ -480,7 +490,7 @@ describe("analysis validation", () => {
       JOB_DESCRIPTION,
       baseline,
       directive.snapshot,
-    )).toThrow("requirement evidence directive-0 lacks non-directive same-entity factual support");
+    )).toThrow("requirement evidence directive-0 lacks non-directive factual support from the same or an explicitly equivalent entity");
 
     const skillCitation: JobAnalysis = {
       ...analysis,
@@ -694,7 +704,7 @@ describe("analysis validation", () => {
       analysis,
       directiveOnlyPlan,
       directive.snapshot,
-    )).toThrow("requirement evidence directive-0 lacks non-directive same-entity factual support");
+    )).toThrow("requirement evidence directive-0 lacks non-directive factual support from the same or an explicitly equivalent entity");
 
     const inactiveDirective = withMustIncludeDirective(snapshot, 1);
     const inactivePlan = buildMechanicalTailoringPlan(analysis, baseline);
@@ -721,7 +731,7 @@ describe("analysis validation", () => {
       analysis,
       crossEntityPlan,
       inactiveDirective.snapshot,
-    )).toThrow("requirement evidence directive-1 lacks non-directive same-entity factual support");
+    )).toThrow("requirement evidence directive-1 lacks non-directive factual support from the same or an explicitly equivalent entity");
 
     expect(() => buildEvidenceLedger(
       supportedAnalysis,

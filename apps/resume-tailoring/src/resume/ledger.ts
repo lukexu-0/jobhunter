@@ -289,14 +289,14 @@ export function collectAnalysisSemanticIssues(
           "must-include-support",
           "must-include-directives",
           ["exactEdits", editIndex, "evidenceIds", evidenceIndex],
-          "must cite an active requirement with non-directive same-entity factual support",
+          "must cite an active requirement with non-directive factual support from the same or an explicitly equivalent entity",
         ));
       } else if (!hasFactualSupport(edit.evidenceIds, directive)) {
         issues.push(semanticIssue(
           "must-include-support",
           "must-include-directives",
           ["exactEdits", editIndex, "evidenceIds", evidenceIndex],
-          "must pair requirement evidence with non-directive same-entity factual support on the same bullet edit",
+          "must pair requirement evidence with non-directive factual support from the same or an explicitly equivalent entity on the same bullet edit",
         ));
       }
     }
@@ -387,7 +387,7 @@ function failFastSemanticMessage(
     case "must-include-support": {
       const evidenceIndex = issue.path[3];
       const evidenceId = typeof evidenceIndex === "number" ? edit?.evidenceIds[evidenceIndex] : undefined;
-      return `requirement evidence ${evidenceId ?? "unknown"} lacks non-directive same-entity factual support on its bullet edit`;
+      return `requirement evidence ${evidenceId ?? "unknown"} lacks non-directive factual support from the same or an explicitly equivalent entity on its bullet edit`;
     }
     case "must-include-required": {
       const directiveIndex = issue.path[1];

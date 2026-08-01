@@ -427,8 +427,8 @@ export class PipelineRepository {
     if (!/^[a-f0-9]{64}$/.test(snapshot.manifestSha256) || !/^[a-f0-9]{64}$/.test(snapshot.baselineSha256)) {
       throw new Error("source snapshot hashes must be lowercase SHA-256 values");
     }
-    if (hashes.length !== 5 || hashes.some(([, hash]) => !/^[a-f0-9]{64}$/.test(hash))) {
-      throw new Error("source snapshot must contain exactly five authoritative SHA-256 hashes");
+    if (hashes.length !== 4 || hashes.some(([, hash]) => !/^[a-f0-9]{64}$/.test(hash))) {
+      throw new Error("source snapshot must contain exactly four authoritative SHA-256 hashes");
     }
     return Object.fromEntries(hashes);
   }

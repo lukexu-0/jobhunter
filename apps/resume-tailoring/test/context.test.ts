@@ -41,7 +41,13 @@ function loadFixture(root: string) {
 }
 
 describe("allowlisted context ingestion", () => {
-  test("accepts exactly the literal five sources and rejects additions, omissions, duplicates, substitution, or traversal", () => {
+  test("accepts exactly the literal four sources and rejects additions, omissions, duplicates, substitution, or traversal", () => {
+    expect(CONTEXT_SOURCE_ALLOWLIST).toEqual([
+      "apps/user-info/resume-main/Alex_Example_Resume.tex",
+      "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
+      "apps/user-info/current-context/projects/sample-project.md",
+      "jobhunter-resume-info.md",
+    ]);
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
     expect(loaded.manifest.sources.map((source) => source.relativePath)).toEqual([...CONTEXT_SOURCE_ALLOWLIST]);
@@ -50,12 +56,12 @@ describe("allowlisted context ingestion", () => {
     const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
     parsed.sources.push({ ...parsed.sources[1], id: "untrusted", relativePath: "actual/other.md" });
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("exactly five sources");
+    expect(() => loadFixture(root)).toThrow("exactly four sources");
 
     parsed.sources.pop();
     const missing = parsed.sources.pop();
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("exactly five sources");
+    expect(() => loadFixture(root)).toThrow("exactly four sources");
 
     parsed.sources.push(missing);
     const originalSecondId = parsed.sources[1].id;
@@ -66,15 +72,15 @@ describe("allowlisted context ingestion", () => {
     parsed.sources[1].id = originalSecondId;
     parsed.sources[1].relativePath = parsed.sources[0].relativePath;
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+    expect(() => loadFixture(root)).toThrow("literal four-file allowlist");
 
     parsed.sources[1].relativePath = "actual/other.md";
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+    expect(() => loadFixture(root)).toThrow("literal four-file allowlist");
 
     parsed.sources[1].relativePath = "../outside.md";
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+    expect(() => loadFixture(root)).toThrow("literal four-file allowlist");
   });
 
   test("preserves source order flexibility while rejecting literal source metadata aliases", () => {
@@ -90,7 +96,7 @@ describe("allowlisted context ingestion", () => {
       { id: "jobhunter-resume-info-alias" },
       { entityId: "project:wrong" },
       { displayName: "Aliased Jobhunter resume information" },
-      { baselineEntityIds: ["Wrong baseline entity"] },
+      { baselineEntityIds: ["Jobhunter"] },
     ]) {
       const candidate = JSON.parse(JSON.stringify(parsed));
       const jobhunter = candidate.sources.find((source: { relativePath: string }) =>
@@ -141,7 +147,7 @@ describe("allowlisted context ingestion", () => {
       const firstSnapshot = createContextSnapshot(database, loaded);
       syncContext(database, loaded, 200);
       const secondSnapshot = createContextSnapshot(database, loaded);
-      expect(first.sourceCount).toBe(5);
+      expect(first.sourceCount).toBe(4);
       expect(firstSnapshot.evidence.map((block) => block.id)).toEqual(secondSnapshot.evidence.map((block) => block.id));
       expect(Object.fromEntries(CONTEXT_SOURCE_ALLOWLIST.map((path) => [path, sha256(readFileSync(join(root, path)))]))).toEqual(before);
       expect(() => database.query("UPDATE source_versions SET indexed_at = 9").run()).toThrow("immutable");
@@ -149,34 +155,78 @@ describe("allowlisted context ingestion", () => {
 
       const changedPath = join(root, CONTEXT_SOURCE_ALLOWLIST[2]);
       writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nAdditional bounded fact.\n`);
-      expect(checkContextFreshness(database, loaded).staleSources).toEqual(["sample-project-archive"]);
+      expect(checkContextFreshness(database, loaded).staleSources).toEqual(["sample-project"]);
       syncContext(database, loaded, 300);
-      const versions = database.query<{ count: number }, []>("SELECT count(*) AS count FROM source_versions WHERE source_id = 'sample-project-archive'").get();
+      const versions = database.query<{ count: number }, []>("SELECT count(*) AS count FROM source_versions WHERE source_id = 'sample-project'").get();
       expect(versions?.count).toBe(2);
     } finally {
       database.close();
     }
   });
 
-  test("synchronizes the Jobhunter source and exposes its two directives alongside Sample Testing", () => {
+  test("refreshes manifest metadata without reindexing unchanged source bytes", () => {
+    const root = createRepositoryFixture();
+    const loaded = loadFixture(root);
+    const legacyLoaded = {
+      ...loaded,
+      manifest: {
+        ...loaded.manifest,
+        sources: loaded.manifest.sources.map((source) => source.id === "jobhunter-resume-info"
+          ? { ...source, baselineEntityIds: ["Jobhunter"] }
+          : source),
+      },
+      manifestSha256: sha256("legacy Jobhunter alias"),
+    };
+    const database = openContextDatabase(":memory:");
+    try {
+      syncContext(database, legacyLoaded, 100);
+      const legacySource = createContextSnapshot(database, legacyLoaded).sources
+        .find((source) => source.id === "jobhunter-resume-info")!;
+      expect(checkContextFreshness(database, loaded)).toEqual({
+        fresh: false,
+        manifestMatches: false,
+        staleSources: [],
+        missingSources: [],
+      });
+
+      const report = syncContext(database, loaded, 200);
+      const currentSource = createContextSnapshot(database, loaded).sources
+        .find((source) => source.id === "jobhunter-resume-info")!;
+      const versions = database.query<{ count: number }, []>(
+        "SELECT count(*) AS count FROM source_versions WHERE source_id = 'jobhunter-resume-info'",
+      ).get();
+
+      expect(legacySource.baselineEntityIds).toEqual(["Jobhunter"]);
+      expect(report.changedSources).not.toContain("jobhunter-resume-info");
+      expect(currentSource.baselineEntityIds).toEqual(["Resume Tailoring and Application Agent"]);
+      expect(currentSource.sourceVersionId).toBe(legacySource.sourceVersionId);
+      expect(currentSource.sha256).toBe(legacySource.sha256);
+      expect(versions?.count).toBe(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("synchronizes the Jobhunter source and exposes its three directives alongside Sample Testing", () => {
     const loaded = loadContextManifest();
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
       const snapshot = createContextSnapshot(database, loaded);
-      expect(Object.keys(snapshot.sourceHashes)).toHaveLength(5);
+      expect(Object.keys(snapshot.sourceHashes)).toHaveLength(4);
       expect(snapshot.sources.find((source) => source.id === "jobhunter-resume-info")).toMatchObject({
         relativePath: "jobhunter-resume-info.md",
         kind: "authoritative-markdown",
         entityId: "project:jobhunter",
         displayName: "Jobhunter resume information",
-        baselineEntityIds: ["Jobhunter"],
+        baselineEntityIds: ["Resume Tailoring and Application Agent"],
       });
       expect(snapshot.mustIncludeDirectives
         .filter((directive) => directive.sourceId === "jobhunter-resume-info")
         .map((directive) => directive.text)).toEqual([
         "- Include the **Browser Use** harness.",
         "- Include the **OpenAI Agents SDK**.",
+        "- Include the user-reported impact: **saved over 100 hours rewriting resumes and applying to jobs**.",
       ]);
       expect(snapshot.mustIncludeDirectives
         .filter((directive) => directive.sourceId === "automated-testing-resume-info")
@@ -191,13 +241,12 @@ describe("allowlisted context ingestion", () => {
   test("projects trusted Must Include directives from active authoritative evidence", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
-    const [baseline, requiredSource, nonmatchingSource, sentinelSource, neutralizedSource] = loaded.manifest.sources;
+    const [baseline, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
     const requiredText = "Keep the Jobhunter framing.\n- Preserve exact directive provenance.";
     writeFileSync(join(root, baseline!.relativePath), "## 21. Must Include\nBaseline content is not a directive.\n");
     writeFileSync(join(root, requiredSource!.relativePath), `# Required\n## 21. Must Include\n${requiredText}\n`);
     writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 22. Must Include\nA nonmatching heading is not a directive.\n");
     writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
-    writeFileSync(join(root, neutralizedSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
@@ -217,12 +266,13 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
-  test("ignores retired source heads outside the current manifest", () => {
+  test("retires source heads outside the current manifest while preserving immutable history", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
+      const activeEvidenceCount = createContextSnapshot(database, loaded).evidence.length;
       database.query(`
         INSERT INTO source_versions
           (id, source_id, relative_path, kind, entity_id, display_name, baseline_entity_ids_json, sha256, byte_count, indexed_at)
@@ -254,15 +304,53 @@ describe("allowlisted context ingestion", () => {
         "[]",
         sha256("retired requirement"),
       );
+      database.query(`
+        INSERT INTO evidence_fts (evidence_id, source_id, entity_id, heading_path, text, caveats)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        "retired-evidence",
+        "retired-source",
+        "project:retired",
+        "21. Must Include",
+        "Retired requirement.",
+        "",
+      );
       database.query("INSERT INTO source_heads (source_id, source_version_id) VALUES (?, ?)")
         .run("retired-source", "retired-version");
+
+      expect(searchEvidence(database, "Retired requirement").map((block) => block.id))
+        .toEqual(["retired-evidence"]);
+
+      const report = syncContext(database, loaded, 2);
+      expect(database.query<{ source_id: string }, [string]>(
+        "SELECT source_id FROM source_heads WHERE source_id = ?",
+      ).get("retired-source")).toBeNull();
+      expect(searchEvidence(database, "Retired requirement")).toEqual([]);
 
       const snapshot = createContextSnapshot(database, loaded);
       const manifestSourceIds = loaded.manifest.sources.map((source) => source.id);
       expect(snapshot.sources.map((source) => source.id)).toEqual(manifestSourceIds);
+      expect(snapshot.evidence).toHaveLength(activeEvidenceCount);
       expect(snapshot.evidence.every((block) => manifestSourceIds.includes(block.sourceId))).toBe(true);
       expect(snapshot.evidence.some((block) => block.id === "retired-evidence")).toBe(false);
       expect(snapshot.mustIncludeDirectives.some((directive) => directive.sourceId === "retired-source")).toBe(false);
+      expect(report.blockCount).toBe(activeEvidenceCount);
+      expect(report.blockCount).toBe(snapshot.evidence.length);
+
+      expect(database.query<{
+        version_count: number;
+        evidence_count: number;
+        fts_count: number;
+      }, []>(`
+        SELECT
+          (SELECT count(*) FROM source_versions WHERE id = 'retired-version') AS version_count,
+          (SELECT count(*) FROM evidence_blocks WHERE id = 'retired-evidence') AS evidence_count,
+          (SELECT count(*) FROM evidence_fts WHERE evidence_id = 'retired-evidence') AS fts_count
+      `).get()).toEqual({
+        version_count: 1,
+        evidence_count: 1,
+        fts_count: 1,
+      });
     } finally {
       database.close();
     }
@@ -271,11 +359,10 @@ describe("allowlisted context ingestion", () => {
   test("keeps directive heading and sentinel matching exact", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
-    const [, requiredSource, nonmatchingSource, sentinelSource, neutralizedSource] = loaded.manifest.sources;
+    const [, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
     writeFileSync(join(root, requiredSource!.relativePath), "# Context\n## Must Include\nUnnumbered requirement.\n## 21. Must Include\nnone specified\n");
     writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 21. Must Include Extra\nNot a matching heading.\n");
     writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## Must Include\nNone   specified\n");
-    writeFileSync(join(root, neutralizedSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
@@ -341,7 +428,7 @@ describe("allowlisted context ingestion", () => {
       syncContext(database, loaded);
       const snapshot = createContextSnapshot(database, loaded);
       expect(verifyContextSnapshot(snapshot, loaded)).toEqual({ valid: true, manifestChanged: false, changedSources: [] });
-      const sourcePath = join(root, CONTEXT_SOURCE_ALLOWLIST[3]);
+      const sourcePath = join(root, CONTEXT_SOURCE_ALLOWLIST[2]);
       writeFileSync(sourcePath, `${readFileSync(sourcePath, "utf8")}\nDrift\n`);
       expect(verifyContextSnapshot(snapshot, loaded)).toEqual({
         valid: false,

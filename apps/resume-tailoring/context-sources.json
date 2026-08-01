@@ -18,14 +18,6 @@
       "baselineEntityIds": ["Example Company"]
     },
     {
-      "id": "sample-project-archive",
-      "relativePath": "apps/user-info/current-context/projects/sample-project-archive.md",
-      "kind": "authoritative-markdown",
-      "entityId": "project:sample-project-archive",
-      "displayName": "Sample Project Archive",
-      "baselineEntityIds": ["Sample Project Archive"]
-    },
-    {
       "id": "sample-project",
       "relativePath": "apps/user-info/current-context/projects/sample-project.md",
       "kind": "authoritative-markdown",
@@ -39,7 +31,7 @@
       "kind": "authoritative-markdown",
       "entityId": "project:jobhunter",
       "displayName": "Jobhunter resume information",
-      "baselineEntityIds": ["Jobhunter"]
+      "baselineEntityIds": ["Resume Tailoring and Application Agent"]
     }
   ],
   "explicitEntityBindings": {
