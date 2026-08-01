@@ -27,6 +27,7 @@
 .topBar {
   position: relative;
   z-index: 20;
+  grid-row: 1;
   display: grid;
   min-height: calc(var(--control-height) + var(--space-5));
   grid-template-columns: max-content minmax(0, 1fr);
@@ -40,6 +41,7 @@
 .topAlerts {
   position: relative;
   z-index: 10;
+  grid-row: 2;
   display: grid;
   gap: var(--space-2);
 }
@@ -205,6 +207,7 @@
 .paneGrid {
   display: grid;
   min-height: 0;
+  grid-row: 3;
   grid-template-columns: minmax(0, 19.875fr) minmax(0, 53.625fr) minmax(0, 26.5fr);
 }
 
