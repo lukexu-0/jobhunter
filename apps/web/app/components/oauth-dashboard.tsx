@@ -20,10 +20,6 @@ const PROVIDERS = [
     provider: "openai-codex",
     name: "OpenAI Codex",
   },
-  {
-    provider: "google-antigravity",
-    name: "Google Antigravity",
-  },
 ] as const satisfies ReadonlyArray<{
   provider: OAuthProvider;
   name: string;
@@ -365,7 +361,7 @@ export function OAuthDashboard() {
             const isPending = session?.state === "pending";
             const isConnected = providerStatus?.state === "connected";
             const statusLabel = isLoadingStatus ? "Checking" : providerStatus?.state ?? "Unavailable";
-            const identity = providerStatus?.identity?.email ?? providerStatus?.identity?.accountId ?? providerStatus?.identity?.projectId;
+            const identity = providerStatus?.identity?.email ?? providerStatus?.identity?.accountId;
 
             return (
               <li className="provider-row" key={provider.provider}>

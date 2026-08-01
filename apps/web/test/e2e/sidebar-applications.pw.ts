@@ -1749,7 +1749,6 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
-          { provider: "google-antigravity", state: "connected", identity: { email: "google@example.com" } },
         ],
       }),
     });
@@ -1765,7 +1764,9 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await expect(page).toHaveURL(/\/providers$/);
   const providerBadges = page.locator(".status-badge");
-  await expect(providerBadges).toHaveText(["connected", "connected"]);
+  await expect(providerBadges).toHaveText(["connected"]);
+  await expect(page.locator(".provider-row")).toHaveCount(1);
+  await expect(page.getByText("Google Antigravity", { exact: true })).toHaveCount(0);
 
   holdRunRefresh = true;
   await primaryNavigation.getByRole("link", { name: "Applications" }).click();
@@ -1778,8 +1779,8 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   holdAuthRefresh = true;
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await authRefreshStarted;
-  await expect(providerBadges).toHaveText(["connected", "connected"]);
-  await expect(providerBadges).not.toContainText(["Checking", "Checking"]);
+  await expect(providerBadges).toHaveText(["connected"]);
+  await expect(providerBadges).not.toContainText("Checking");
   releaseAuthRefresh();
   await authRefreshCompleted;
 });
@@ -1815,7 +1816,6 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
-          { provider: "google-antigravity", state: "disconnected" },
         ],
       }),
     });
