@@ -47,6 +47,11 @@ interface EffectiveIdentity {
   readonly organization?: string;
 }
 
+interface PendingCreateRequest {
+  readonly jobUrl: string;
+  readonly generateKeywordMap: boolean;
+}
+
 interface ActionMenuState {
   readonly runId: string;
   readonly style: CSSProperties;
@@ -134,6 +139,7 @@ export function RunDashboard() {
   const [jobUrl, setJobUrl] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [duplicateCreateRequest, setDuplicateCreateRequest] = useState<PendingCreateRequest | null>(null);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
   const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
   const [actionMenu, setActionMenu] = useState<ActionMenuState | null>(null);
@@ -142,6 +148,8 @@ export function RunDashboard() {
   const [dialogError, setDialogError] = useState<string | null>(null);
   const actionMenuRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const duplicateDialogRef = useRef<HTMLDialogElement>(null);
+  const duplicateDialogOpenerRef = useRef<HTMLButtonElement>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const actionTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -470,19 +478,47 @@ export function RunDashboard() {
     }
   };
 
-  const submitRun = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (isCreating || !createRunRequest.success) return;
-
+  const initializeRun = async (request: PendingCreateRequest) => {
+    if (isCreating) return;
     setIsCreating(true);
     setCreateError(null);
     try {
-      const run = await createRun(createRunRequest.data.jobUrl, createRunRequest.data.generateKeywordMap);
+      const run = await createRun(request.jobUrl, request.generateKeywordMap);
       router.push(`/runs/${encodeURIComponent(run.id)}`);
     } catch (error) {
       setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
       setIsCreating(false);
     }
+  };
+
+  const dismissDuplicateDialog = () => {
+    if (duplicateDialogRef.current?.open) duplicateDialogRef.current.close();
+    setDuplicateCreateRequest(null);
+    duplicateDialogOpenerRef.current?.focus();
+  };
+
+  const submitRun = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (isCreating || !createRunRequest.success) return;
+    const request = createRunRequest.data;
+    const isDuplicate = runs.some(
+      (run) => run.jobUrl !== undefined && run.jobUrl === request.jobUrl,
+    );
+    if (isDuplicate) {
+      setDuplicateCreateRequest(request);
+      if (!duplicateDialogRef.current?.open) duplicateDialogRef.current?.showModal();
+      return;
+    }
+    void initializeRun(request);
+  };
+
+  const confirmDuplicateRun = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (isCreating || !duplicateCreateRequest) return;
+    const request = duplicateCreateRequest;
+    if (duplicateDialogRef.current?.open) duplicateDialogRef.current.close();
+    setDuplicateCreateRequest(null);
+    void initializeRun(request);
   };
 
   const showFilteredEmpty = !isLoading && runs.length > 0 && filteredRuns.length === 0;
@@ -543,6 +579,7 @@ export function RunDashboard() {
         </div>
 
         <button
+          ref={duplicateDialogOpenerRef}
           className="square-control square-control--primary"
           type="submit"
           disabled={isCreating || !isCreateRequestValid}
@@ -784,6 +821,40 @@ export function RunDashboard() {
           document.body,
         )
         : null}
+
+      <dialog
+        ref={duplicateDialogRef}
+        className="run-action-dialog"
+        aria-labelledby="duplicate-application-dialog-title"
+        aria-describedby="duplicate-application-dialog-description"
+        onCancel={(event) => {
+          event.preventDefault();
+          dismissDuplicateDialog();
+        }}
+      >
+        <form className="run-action-dialog__form" onSubmit={confirmDuplicateRun}>
+          <header className="run-action-dialog__header">
+            <h2 id="duplicate-application-dialog-title">Initialize duplicate application?</h2>
+          </header>
+          <div className="run-action-dialog__body">
+            <p id="duplicate-application-dialog-description">
+              This job posting URL has already been used. Initialize another application anyway?
+            </p>
+          </div>
+          <footer className="run-action-dialog__actions">
+            <button className="square-control" type="button" onClick={dismissDuplicateDialog}>
+              Cancel
+            </button>
+            <button
+              className="square-control square-control--primary"
+              type="submit"
+              disabled={isCreating || !duplicateCreateRequest}
+            >
+              Initialize anyway
+            </button>
+          </footer>
+        </form>
+      </dialog>
 
       {activeDialog ? (
         <dialog
