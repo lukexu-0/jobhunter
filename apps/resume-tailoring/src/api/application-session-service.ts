@@ -280,6 +280,7 @@ function durableBridgeState(
 
 interface PreparedStart {
   readonly jobUrl: string;
+  readonly autoApply: boolean;
   readonly profile: string;
   readonly pdf: PublicArtifact;
 }
@@ -887,7 +888,7 @@ export class ApplicationSessionService {
     signal.throwIfAborted();
     const pdf = this.dependencies.repository.getArtifact(runId, "compiled-pdf", run.currentRevision);
     if (!pdf || pdf.sha256 !== expectedApprovedPdfSha256) throw applicationSourceUnavailable();
-    return { jobUrl, profile, pdf };
+    return { jobUrl, autoApply: run.autoApply, profile, pdf };
   }
 
   #resume(
@@ -970,6 +971,7 @@ export class ApplicationSessionService {
       await harness.create({
         sessionId: session.sessionId,
         jobUrl: prepared.jobUrl,
+        autoApply: prepared.autoApply,
         personalInformationMarkdown: prepared.profile,
         resumePdf,
       }, signal);

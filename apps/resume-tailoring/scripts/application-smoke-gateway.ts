@@ -140,6 +140,9 @@ export function createApplicationSmokeSubmissionGuardFactory(
       reservations.add(sessionId);
     }
     return Object.freeze({
+      markReviewReady: async () => {
+        repository.markAutomaticApplicationReviewReady(sessionId);
+      },
       claim: async () => {
         repository.claimApplicationSubmission(sessionId);
       },

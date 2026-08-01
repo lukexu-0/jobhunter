@@ -177,6 +177,7 @@ describe("HttpApplicationHarnessClient", () => {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123?source=local",
       personalInformationMarkdown: "# Applicant\n\nPrivate profile",
+      autoApply: true,
       resumePdf,
     }, signal)).resolves.toBeUndefined();
 
@@ -196,12 +197,14 @@ describe("HttpApplicationHarnessClient", () => {
     expect([...form.keys()]).toEqual([
       "session_id",
       "job_url",
+      "auto_apply",
       "personal_information",
       "resume",
       "max_steps",
     ]);
     expect(form.get("session_id")).toBe(SESSION_ID);
     expect(form.get("job_url")).toBe("https://jobs.private.example/roles/123?source=local");
+    expect(form.get("auto_apply")).toBe("true");
     expect(form.get("max_steps")).toBe("100");
     const profile = form.get("personal_information");
     const resume = form.get("resume");
@@ -225,6 +228,32 @@ describe("HttpApplicationHarnessClient", () => {
     expect(capturedUrl).not.toContain(TOKEN);
     expect([...form.values()].map((part) => String(part)).join("|")).not.toContain(TOKEN);
   });
+  test("sends manual review mode explicitly", async () => {
+    let form: FormData | undefined;
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async (_input, init) => {
+        if (init?.body instanceof FormData) form = init.body;
+        return Response.json({
+          session_id: SESSION_ID,
+          state: "starting",
+          events_url: `${ORIGIN}/v1/sessions/${SESSION_ID}/events`,
+          commands_url: `${ORIGIN}/v1/sessions/${SESSION_ID}/commands`,
+        }, { status: 202 });
+      },
+    });
+
+    await client.create({
+      sessionId: SESSION_ID,
+      jobUrl: "https://jobs.private.example/roles/123",
+      autoApply: false,
+      personalInformationMarkdown: "# Applicant",
+      resumePdf: new TextEncoder().encode("%PDF-private"),
+    }, new AbortController().signal);
+
+    expect(form?.get("auto_apply")).toBe("false");
+  });
   test("accepts fixed create routes advertised through an equivalent loopback alias", async () => {
     const client = new HttpApplicationHarnessClient({
       origin: "http://localhost:8765",
@@ -241,6 +270,7 @@ describe("HttpApplicationHarnessClient", () => {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
       personalInformationMarkdown: "# Applicant",
+      autoApply: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
     }, new AbortController().signal)).resolves.toBeUndefined();
   });
@@ -250,6 +280,7 @@ describe("HttpApplicationHarnessClient", () => {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
       personalInformationMarkdown: "# Applicant",
+      autoApply: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
     };
     const invalidBodies = [
@@ -661,6 +692,7 @@ describe("HttpApplicationHarnessClient", () => {
     const createInput = {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
+      autoApply: false,
       personalInformationMarkdown: "# Applicant",
       resumePdf: new TextEncoder().encode("%PDF-private"),
     };

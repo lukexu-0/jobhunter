@@ -145,6 +145,8 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       : new ApplicationAgentService(browserHarnessToken, {
           authStatusReader: () => auth.getAuthStatus(),
           submissionGuardFactory: (sessionId) => ({
+            markReviewReady: async () =>
+              repository.markAutomaticApplicationReviewReady(sessionId),
             claim: async () => repository.claimApplicationSubmission(sessionId),
             finalize: async (outcome) =>
               repository.finalizeApplicationSubmission(sessionId, outcome),

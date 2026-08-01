@@ -405,6 +405,7 @@ export const RunDtoSchema = z
     titleOverride: RunIdentityTextSchema.optional(),
     organizationOverride: RunIdentityTextSchema.optional(),
     generateKeywordMap: z.boolean(),
+    autoApply: z.boolean(),
     queueSequence: z.number().int().positive(),
     revision: z.number().int().nonnegative(),
     origin: RevisionOriginSchema,
@@ -988,6 +989,7 @@ export const RunListResponseSchema = z.object({ runs: z.array(RunDtoSchema) }).s
 export const CreateRunRequestSchema = z.object({
   jobUrl: JobUrlSchema,
   generateKeywordMap: z.boolean().default(true),
+  autoApply: z.boolean().default(false),
 }).strict();
 export const EditRunRequestSchema = z
   .object({

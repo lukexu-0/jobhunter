@@ -276,6 +276,7 @@ function runFixture(options: {
     status: options.status ?? "review",
     applicationStatus: "pending",
     generateKeywordMap: true,
+    autoApply: false,
     queueSequence: 1,
     revision,
     origin: options.origin ?? "human-comments",

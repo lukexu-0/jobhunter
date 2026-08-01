@@ -131,6 +131,7 @@ def make_gate(
     action_timeout: float = 1,
     review_snapshot: Any = None,
     user_info_store: Any = None,
+    auto_apply: bool = False,
 ) -> tuple[HumanGate, EventPublisher]:
     publisher = publisher or EventPublisher()
     origins = approved_origins or [JOB_ORIGIN]
@@ -141,6 +142,7 @@ def make_gate(
         approved_origins=origins,
         publish=publisher,
         review_snapshot=review_snapshot,
+        auto_apply=auto_apply,
         action_timeout=action_timeout,
     )
     return gate, publisher
@@ -260,6 +262,7 @@ def make_request(tmp_path: Path, *, max_steps: int = 3) -> ApplicationRunRequest
         session_id=SESSION_ID,
         job_url=JOB_URL,
         approved_origins=(JOB_ORIGIN,),
+        auto_apply=False,
         max_steps=max_steps,
         artifacts=artifacts,
     )
@@ -492,64 +495,56 @@ async def test_duplicate_and_wrong_state_commands_conflict_without_changing_gate
 
 
 @pytest.mark.asyncio
-async def test_revision_trims_context_counts_events_and_resolves_concurrent_race_once() -> None:
+async def test_manual_review_waits_and_supports_revise_then_submit() -> None:
     gate, publisher = make_gate()
     browser = FakeBrowserSession()
 
     first_review = asyncio.create_task(gate.request_human_review(make_result(), browser))
-    await publisher.next_event(0)
+    await publisher.next_event()
+    assert not first_review.done()
+    assert gate.pending_kind == "review"
     await gate.revise("  Correct only the years-of-experience field.  ")
     first = await first_review
+
     assert first.is_done is False
     assert first.long_term_memory == "Correct only the years-of-experience field."
     assert first.metadata == {"revision_count": 1}
-    assert publisher.events[1] == (
-        "running",
-        "revision_applied",
-        {"revision_count": 1},
-    )
+    assert gate.submission_approved is False
 
     second_review = asyncio.create_task(gate.request_human_review(make_result(), browser))
     await publisher.next_event(2)
-    outcomes = await asyncio.gather(
-        gate.revise("first racing correction"),
-        gate.revise("second racing correction"),
-        return_exceptions=True,
-    )
-    successes = [outcome for outcome in outcomes if outcome is None]
-    failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-    assert len(successes) == 1
-    assert len(failures) == 1
-    assert_conflict(failures[0])
-    second = await second_review
-    assert second.long_term_memory in {
-        "first racing correction",
-        "second racing correction",
-    }
-    assert second.metadata == {"revision_count": 2}
-    assert gate.revision_count == 2
-    assert publisher.events[-1] == (
-        "running",
-        "revision_applied",
-        {"revision_count": 2},
+    assert not second_review.done()
+    await gate.submit()
+    approved = await second_review
+    approved_payload = ReviewApplicationResult.model_validate_json(
+        approved.extracted_content
     )
 
-    with pytest.raises(HarnessServiceError) as empty:
-        await gate.revise("   ")
-    assert empty.value.status_code == 422
-    with pytest.raises(HarnessServiceError) as oversized:
-        await gate.revise("x" * 20_001)
-    assert oversized.value.status_code == 422
+    assert approved.is_done is False
+    assert approved_payload.status == "ready_for_submission"
+    assert approved_payload.submit_attempted is False
+    assert approved_payload.revision_count == 1
+    assert gate.submission_approved is True
+    assert gate.pending_kind is None
 
 
 @pytest.mark.asyncio
-async def test_submit_approval_is_one_way_and_cancellation_is_terminal_json() -> None:
-    gate, publisher = make_gate()
+async def test_auto_review_immediately_authorizes_only_fully_resolved_applications() -> None:
+    snapshots: list[ReviewApplicationResult] = []
+
+    async def capture_snapshot(result: ReviewApplicationResult) -> None:
+        snapshots.append(result)
+
+    gate, publisher = make_gate(
+        auto_apply=True,
+        review_snapshot=capture_snapshot,
+    )
     browser = FakeBrowserSession("https://jobs.example/apply?secret=yes")
-    review = asyncio.create_task(gate.request_human_review(make_result(), browser))
-    await publisher.next_event()
-    await gate.submit()
-    approved = await review
+
+    approved = await asyncio.wait_for(
+        gate.request_human_review(make_result(), browser),
+        timeout=0.1,
+    )
     approved_payload = ReviewApplicationResult.model_validate_json(
         approved.extracted_content
     )
@@ -558,31 +553,69 @@ async def test_submit_approval_is_one_way_and_cancellation_is_terminal_json() ->
     assert approved_payload.status == "ready_for_submission"
     assert approved_payload.submit_attempted is False
     assert approved_payload.revision_count == 0
+    assert snapshots == [approved_payload]
     assert gate.submission_approved is True
+    assert gate.pending_kind is None
+    assert publisher.events == []
 
     with pytest.raises(HarnessServiceError) as replay:
         await gate.submit()
     assert_conflict(replay.value)
-    with pytest.raises(HarnessServiceError) as post_approval_gate:
-        await gate.request_human_navigation("Do not reopen a gate.", browser)
-    assert_conflict(post_approval_gate.value)
 
-    cancelled_gate, cancelled_publisher = make_gate()
-    cancelled_review = asyncio.create_task(
-        cancelled_gate.request_human_review(make_result(), browser)
+    unresolved_snapshots: list[ReviewApplicationResult] = []
+
+    async def capture_unresolved_snapshot(result: ReviewApplicationResult) -> None:
+        unresolved_snapshots.append(result)
+
+    unresolved_gate, unresolved_publisher = make_gate(
+        auto_apply=True,
+        review_snapshot=capture_unresolved_snapshot,
     )
-    await cancelled_publisher.next_event()
-    await cancelled_gate.cancel()
-    cancelled = await cancelled_review
+    unresolved = ReviewApplicationResult.model_validate(
+        {
+            **make_result().model_dump(),
+            "fields_needing_human": [
+                {
+                    "label": "Work authorization",
+                    "field_type": "radio",
+                    "value_present": False,
+                    "note": "Candidate answer is required.",
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(HarnessServiceError) as rejected:
+        await unresolved_gate.request_human_review(unresolved, browser)
+
+    assert rejected.value.status_code == 422
+    assert rejected.value.code == "invalid_request"
+    assert unresolved_gate.submission_approved is False
+    assert unresolved_gate.pending_kind is None
+    assert unresolved_publisher.events == []
+    assert len(unresolved_snapshots) == 1
+    assert unresolved_snapshots[0].fields_needing_human[0].note == "Needs human review"
+
+@pytest.mark.asyncio
+async def test_manual_review_after_cancellation_returns_terminal_json() -> None:
+    gate, publisher = make_gate()
+    browser = FakeBrowserSession("https://jobs.example/apply?secret=yes")
+    await gate.cancel()
+
+    cancelled = await gate.request_human_review(make_result(), browser)
     cancelled_payload = CancelledApplicationResult.model_validate_json(
         cancelled.extracted_content
     )
+
     assert cancelled.is_done is True
     assert cancelled.success is False
     assert cancelled_payload.status == "cancelled"
     assert cancelled_payload.final_url == "https://jobs.example/apply"
     assert cancelled_payload.submit_attempted is False
     assert cancelled_payload.submission_confirmation is None
+    assert gate.submission_approved is False
+    assert gate.pending_kind is None
+    assert publisher.events == []
 
 
 

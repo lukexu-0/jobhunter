@@ -16,7 +16,12 @@ import { apiResponse } from "./handler";
 export interface RunRouteService {
   listRuns(): Promise<RunDto[]> | RunDto[];
   getRun(id: string): Promise<RunDto | undefined> | RunDto | undefined;
-  createRun(jobUrl: string, generateKeywordMap: boolean, signal?: AbortSignal): Promise<RunDto>;
+  createRun(
+    jobUrl: string,
+    generateKeywordMap: boolean,
+    autoApply: boolean,
+    signal?: AbortSignal,
+  ): Promise<RunDto>;
   updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto>;
   updateRunIdentity(
     id: string,
@@ -90,7 +95,12 @@ export function createRunRoutes(service: RunRouteService) {
       if (request.method === "POST" && segments.length === 2) {
         const body = CreateRunRequestSchema.safeParse(await parseBody(request));
         if (!body.success) return apiResponse.error("INVALID_REQUEST", "Run request is invalid", 400);
-        const run = checkedRun(await service.createRun(body.data.jobUrl, body.data.generateKeywordMap, request.signal));
+        const run = checkedRun(await service.createRun(
+          body.data.jobUrl,
+          body.data.generateKeywordMap,
+          body.data.autoApply,
+          request.signal,
+        ));
         service.kick();
         return apiResponse.json(run, 201);
       }

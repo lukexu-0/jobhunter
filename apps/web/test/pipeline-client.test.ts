@@ -53,6 +53,7 @@ function run(status: RunStatus = "queued"): RunDto {
     applicationStatus: "applied",
     queueSequence: 1,
     generateKeywordMap: false,
+    autoApply: false,
     revision: 0,
     origin: "initial",
     createdAt: 1,
@@ -278,6 +279,7 @@ describe("pipeline run requests", () => {
           body: JSON.stringify({
             jobUrl: "https://jobs.example.test/roles/Platform",
             generateKeywordMap: true,
+            autoApply: false,
           }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -316,6 +318,30 @@ describe("pipeline run requests", () => {
           body: JSON.stringify({
             jobUrl: "https://jobs.example.test/roles/platform",
             generateKeywordMap: false,
+            autoApply: false,
+          }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+    ]);
+  });
+
+  test("forwards an explicit auto-apply selection", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(json(run()), requests);
+
+    await createRun("https://jobs.example.test/roles/platform", true, true);
+
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/runs",
+        init: {
+          body: JSON.stringify({
+            jobUrl: "https://jobs.example.test/roles/platform",
+            generateKeywordMap: true,
+            autoApply: true,
           }),
           cache: "no-store",
           headers: { "content-type": "application/json" },

@@ -20,6 +20,7 @@ const reviewRun: RunDto = {
   origin: "initial",
   queueSequence: 2,
   generateKeywordMap: true,
+  autoApply: false,
   createdAt: 1_700_000_000_000,
   updatedAt: 1_700_000_001_000,
   visualAcknowledgementRequired: false,

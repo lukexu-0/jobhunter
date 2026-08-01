@@ -50,6 +50,7 @@ interface EffectiveIdentity {
 interface PendingCreateRequest {
   readonly jobUrl: string;
   readonly generateKeywordMap: boolean;
+  readonly autoApply: boolean;
 }
 
 interface ActionMenuState {
@@ -137,6 +138,7 @@ export function RunDashboard() {
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [jobUrl, setJobUrl] = useState("");
+  const [autoApply, setAutoApply] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [duplicateCreateRequest, setDuplicateCreateRequest] = useState<PendingCreateRequest | null>(null);
@@ -178,8 +180,8 @@ export function RunDashboard() {
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequest = useMemo(
-    () => CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap: true }),
-    [jobUrl],
+    () => CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap: true, autoApply }),
+    [autoApply, jobUrl],
   );
   const isCreateRequestValid = createRunRequest.success;
 
@@ -483,7 +485,13 @@ export function RunDashboard() {
     setIsCreating(true);
     setCreateError(null);
     try {
-      const run = await createRun(request.jobUrl, request.generateKeywordMap);
+      const run = await createRun(
+        request.jobUrl,
+        request.generateKeywordMap,
+        request.autoApply,
+      );
+      setJobUrl("");
+      setAutoApply(false);
       router.push(`/runs/${encodeURIComponent(run.id)}`);
     } catch (error) {
       setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
@@ -577,6 +585,19 @@ export function RunDashboard() {
             }}
           />
         </div>
+
+        <label className="run-initializer__mode">
+          <input
+            type="checkbox"
+            checked={autoApply}
+            disabled={isCreating}
+            onChange={(event) => {
+              setAutoApply(event.currentTarget.checked);
+              setCreateError(null);
+            }}
+          />
+          <span>Auto-apply</span>
+        </label>
 
         <button
           ref={duplicateDialogOpenerRef}
