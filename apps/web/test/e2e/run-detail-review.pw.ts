@@ -1534,7 +1534,7 @@ test("a failed submitted-run refresh is retryable without resubmitting", async (
   expect(mock.commands).toEqual([]);
 });
 
-test("an approved initial revision with a cancelled application permits exact-hash resume edits", async ({ page }) => {
+test("Ctrl-Enter requests exact-hash resume edits for an approved initial revision after cancellation", async ({ page }) => {
   const initialApprovedRun = runFixture({
     status: "approved",
     revision: 1,
@@ -1577,7 +1577,7 @@ test("an approved initial revision with a cancelled application permits exact-ha
   await expect(page.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
 
   await editInstructions.fill("  Strengthen initial platform ownership.  ");
-  await requestEdits.click();
+  await editInstructions.press("Control+Enter");
 
   await expect.poll(
     () => mock.requests.filter((request) => request.path === `${pipelineRunPath}/edit`).length,

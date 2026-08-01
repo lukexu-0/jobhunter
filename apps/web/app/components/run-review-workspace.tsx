@@ -704,6 +704,16 @@ export function RunReviewWorkspace({
                 disabled={editDisabled}
                 maxLength={8_000}
                 onChange={(event) => setEditComments(event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (
+                    event.key !== "Enter"
+                    || !event.ctrlKey
+                    || event.repeat
+                    || event.nativeEvent.isComposing
+                  ) return;
+                  event.preventDefault();
+                  event.currentTarget.form?.requestSubmit();
+                }}
                 required
                 value={editComments}
               />
