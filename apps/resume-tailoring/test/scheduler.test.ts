@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { WorkerScheduler, type SchedulerRepository } from "../src/worker/scheduler";
 import type { RunClaim } from "../src/worker/claims";
 
@@ -6,95 +6,83 @@ function claim(runId: string, byte: number): RunClaim {
   return { runId, token: Buffer.alloc(32, byte).toString("base64url"), expiresAt: 60_000 };
 }
 
-describe("singleton worker scheduler", () => {
-  test("drains FIFO claims without overlapping processors and releases exact claims", async () => {
-    const queue = [claim("run-1", 1), claim("run-2", 2)];
-    const released: string[] = [];
+describe("concurrent worker scheduler", () => {
+  test("runs exactly five processors concurrently, waits to start a sixth, and releases exact claims", async () => {
+    const claims = Array.from({ length: 6 }, (_, index) => claim(`run-${index + 1}`, index + 1));
+    const queue = [...claims];
+    const released: Array<Pick<RunClaim, "runId" | "token">> = [];
     const repository: SchedulerRepository = {
       acquire: () => queue.shift() ?? null,
       heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
-      release: (value) => { released.push(value.runId); },
+      release: ({ runId, token }) => { released.push({ runId, token }); },
     };
-    let active = 0;
-    let maximumActive = 0;
-    const order: string[] = [];
+    const gates = new Map<string, () => void>();
+    let signalFiveStarted!: () => void;
+    const fiveStarted = new Promise<void>((resolve) => { signalFiveStarted = resolve; });
+    let signalSixStarted!: () => void;
+    const sixStarted = new Promise<void>((resolve) => { signalSixStarted = resolve; });
+    const started: string[] = [];
     const scheduler = new WorkerScheduler(repository, async (value) => {
-      active += 1;
-      maximumActive = Math.max(maximumActive, active);
-      order.push(`start:${value.runId}`);
-      await Bun.sleep(5);
-      order.push(`finish:${value.runId}`);
-      active -= 1;
+      started.push(value.runId);
+      if (started.length === 5) signalFiveStarted();
+      if (value.runId === "run-6") signalSixStarted();
+      await new Promise<void>((resolve) => { gates.set(value.runId, resolve); });
     }, { heartbeatMs: 1_000 });
 
     scheduler.kick();
-    scheduler.kick();
+    await fiveStarted;
+    expect(new Set(started)).toEqual(new Set(["run-1", "run-2", "run-3", "run-4", "run-5"]));
+    expect(released).toEqual([]);
+
+    gates.get("run-1")!();
+    await sixStarted;
+    expect(new Set(started)).toEqual(new Set(["run-1", "run-2", "run-3", "run-4", "run-5", "run-6"]));
+    expect(released).toEqual([{ runId: claims[0]!.runId, token: claims[0]!.token }]);
+
+    for (const runId of ["run-2", "run-3", "run-4", "run-5", "run-6"]) gates.get(runId)!();
     await scheduler.waitForIdle();
-    expect(maximumActive).toBe(1);
-    expect(order).toEqual(["start:run-1", "finish:run-1", "start:run-2", "finish:run-2"]);
-    expect(released).toEqual(["run-1", "run-2"]);
+    expect(released).toHaveLength(6);
+    expect(new Set(released.map(({ runId, token }) => `${runId}:${token}`))).toEqual(
+      new Set(claims.map(({ runId, token }) => `${runId}:${token}`)),
+    );
   });
 
-  test("close aborts and joins the active processor", async () => {
-    vi.useFakeTimers();
-    try {
-      const only = claim("run-1", 3);
-      let acquired = false;
-      let signalProcessorStarted!: () => void;
-      const processorStarted = new Promise<void>((resolve) => { signalProcessorStarted = resolve; });
-      let signalAbortObserved!: () => void;
-      const abortObserved = new Promise<void>((resolve) => { signalAbortObserved = resolve; });
-      let releaseProcessor!: () => void;
-      const processorGate = new Promise<void>((resolve) => { releaseProcessor = resolve; });
-      let expireWatchdog!: () => void;
-      const watchdog = new Promise<"timeout">((resolve) => {
-        expireWatchdog = () => resolve("timeout");
+  test("close aborts and joins all five active processors", async () => {
+    const queue = Array.from({ length: 5 }, (_, index) => claim(`run-${index + 1}`, index + 1));
+    const gates = new Map<string, () => void>();
+    const aborted: string[] = [];
+    const finished: string[] = [];
+    let signalAllStarted!: () => void;
+    const allStarted = new Promise<void>((resolve) => { signalAllStarted = resolve; });
+    let started = 0;
+    const scheduler = new WorkerScheduler({
+      acquire: () => queue.shift() ?? null,
+      heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+      release: () => undefined,
+    }, async (value, signal) => {
+      started++;
+      if (started === 5) signalAllStarted();
+      await new Promise<void>((resolve) => {
+        gates.set(value.runId, resolve);
+        signal.addEventListener("abort", () => { aborted.push(value.runId); }, { once: true });
       });
-      const watchdogTimer = setTimeout(expireWatchdog, 100);
-      let processorFinished = false;
-      const scheduler = new WorkerScheduler({
-        acquire: () => acquired ? null : ((acquired = true), only),
-        heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
-        release: () => undefined,
-      }, async (_value, signal) => {
-        signalProcessorStarted();
-        const outcome = await Promise.race([
-          new Promise<"aborted">((resolve) => {
-            signal.addEventListener("abort", () => {
-              signalAbortObserved();
-              resolve("aborted");
-            }, { once: true });
-          }),
-          watchdog,
-        ]);
-        if (outcome === "aborted") await processorGate;
-        processorFinished = true;
-      });
+      finished.push(value.runId);
+    });
 
-      scheduler.kick();
-      await processorStarted;
-      let closeSettled = false;
-      const closing = scheduler.close().then(() => { closeSettled = true; });
-      const closeAbortOutcomePromise = Promise.race([
-        abortObserved.then(() => "aborted" as const),
-        watchdog,
-      ]);
-      await Promise.resolve();
-      vi.advanceTimersByTime(100);
-      const closeAbortOutcome = await closeAbortOutcomePromise;
-      await Promise.resolve();
-      const settledBeforeProcessorFinished = closeSettled;
-      releaseProcessor();
-      await closing;
-      clearTimeout(watchdogTimer);
+    scheduler.kick();
+    await allStarted;
+    let closeSettled = false;
+    const closing = scheduler.close().then(() => { closeSettled = true; });
+    await Promise.resolve();
 
-      expect(closeAbortOutcome).toBe("aborted");
-      expect(settledBeforeProcessorFinished).toBeFalse();
-      expect(processorFinished).toBeTrue();
-      expect(closeSettled).toBeTrue();
-    } finally {
-      vi.useRealTimers();
-    }
+    expect([...aborted].sort()).toEqual(["run-1", "run-2", "run-3", "run-4", "run-5"]);
+    expect(closeSettled).toBeFalse();
+    expect(finished).toEqual([]);
+
+    for (const release of gates.values()) release();
+    await closing;
+    expect([...finished].sort()).toEqual(["run-1", "run-2", "run-3", "run-4", "run-5"]);
+    expect(closeSettled).toBeTrue();
   });
 
   test("defers after-drain maintenance until recovery after heartbeat loss", async () => {

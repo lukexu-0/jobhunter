@@ -1,4 +1,4 @@
-import { CLAIM_HEARTBEAT_MS, CLAIM_TTL_MS, type RunClaim } from "./claims";
+import { CLAIM_HEARTBEAT_MS, CLAIM_TTL_MS, RUN_CLAIM_CAPACITY, type RunClaim } from "./claims";
 
 export interface SchedulerRepository {
   acquire(): RunClaim | null;
@@ -10,6 +10,7 @@ export type ClaimedRunProcessor = (claim: RunClaim, signal: AbortSignal) => Prom
 
 export interface WorkerSchedulerOptions {
   heartbeatMs?: number;
+  concurrency?: number;
   recoveryDelayMs?: number;
   setInterval?: typeof globalThis.setInterval;
   clearInterval?: typeof globalThis.clearInterval;
@@ -19,6 +20,7 @@ export interface WorkerSchedulerOptions {
 }
 
 export class WorkerScheduler {
+  readonly #concurrency: number;
   readonly #heartbeatMs: number;
   readonly #recoveryDelayMs: number;
   readonly #setInterval: typeof globalThis.setInterval;
@@ -27,10 +29,10 @@ export class WorkerScheduler {
   readonly #onError: (error: unknown) => void;
   readonly #afterDrain: () => void | Promise<void>;
   readonly #shutdownReason = new DOMException("Worker scheduler closed", "AbortError");
+  readonly #activeControllers = new Set<AbortController>();
   #running: Promise<void> | undefined;
-  #activeController: AbortController | undefined;
   #kickPending = false;
-  #recoveryPending = false;
+  #recoveryPending = 0;
   #closed = false;
 
   constructor(
@@ -38,6 +40,11 @@ export class WorkerScheduler {
     private readonly processClaim: ClaimedRunProcessor,
     options: WorkerSchedulerOptions = {},
   ) {
+    const concurrency = options.concurrency ?? RUN_CLAIM_CAPACITY;
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > RUN_CLAIM_CAPACITY) {
+      throw new Error(`worker concurrency must be an integer between 1 and ${RUN_CLAIM_CAPACITY}`);
+    }
+    this.#concurrency = concurrency;
     this.#heartbeatMs = options.heartbeatMs ?? CLAIM_HEARTBEAT_MS;
     this.#recoveryDelayMs = options.recoveryDelayMs ?? CLAIM_TTL_MS;
     this.#setInterval = options.setInterval ?? globalThis.setInterval;
@@ -48,14 +55,14 @@ export class WorkerScheduler {
   }
 
   kick(): void {
-    if (this.#closed || this.#recoveryPending) return;
+    if (this.#closed || this.#recoveryPending > 0) return;
     if (this.#running) {
       this.#kickPending = true;
       return;
     }
     this.#running = this.#drain().finally(() => {
       this.#running = undefined;
-      if (this.#kickPending && !this.#closed && !this.#recoveryPending) {
+      if (this.#kickPending && !this.#closed && this.#recoveryPending === 0) {
         this.#kickPending = false;
         this.kick();
       }
@@ -68,36 +75,67 @@ export class WorkerScheduler {
 
   async close(): Promise<void> {
     this.#closed = true;
-    this.#activeController?.abort(this.#shutdownReason);
+    for (const controller of this.#activeControllers) controller.abort(this.#shutdownReason);
     this.#kickPending = false;
-    this.#recoveryPending = false;
+    this.#recoveryPending = 0;
     await this.waitForIdle();
   }
 
   async #drain(): Promise<void> {
-    while (!this.#closed) {
-      let claim: RunClaim | null;
-      try {
-        claim = this.repository.acquire();
-      } catch (error) {
-        this.#onError(error);
-        return;
-      }
-      if (!claim) {
+    const active = new Set<Promise<boolean>>();
+    let acquisitionFailed = false;
+    let queueExhausted = false;
+    let recoveryInterrupted = false;
+
+    while (!this.#closed && !acquisitionFailed && !recoveryInterrupted) {
+      while (
+        !this.#closed
+        && this.#recoveryPending === 0
+        && !queueExhausted
+        && active.size < this.#concurrency
+      ) {
+        let claim: RunClaim | null;
         try {
-          await this.#afterDrain();
+          claim = this.repository.acquire();
         } catch (error) {
           this.#onError(error);
+          acquisitionFailed = true;
+          break;
+        }
+        if (!claim) {
+          queueExhausted = true;
+          break;
+        }
+        let processing!: Promise<boolean>;
+        processing = this.#processOne(claim).finally(() => {
+          active.delete(processing);
+        });
+        active.add(processing);
+      }
+
+      if (this.#closed || acquisitionFailed || recoveryInterrupted) break;
+      if (active.size === 0) {
+        if (queueExhausted && this.#recoveryPending === 0) {
+          try {
+            await this.#afterDrain();
+          } catch (error) {
+            this.#onError(error);
+          }
         }
         return;
       }
-      if (!await this.#processOne(claim)) return;
+
+      const leaseLive = await Promise.race(active);
+      queueExhausted = false;
+      if (!leaseLive) recoveryInterrupted = true;
     }
+
+    if (active.size > 0) await Promise.all(active);
   }
 
   async #processOne(claim: RunClaim): Promise<boolean> {
     const controller = new AbortController();
-    this.#activeController = controller;
+    this.#activeControllers.add(controller);
     let leaseLive = true;
     let heartbeatRunning = false;
     const heartbeat = async () => {
@@ -128,17 +166,20 @@ export class WorkerScheduler {
           controller.abort(error);
         }
       }
-      if (!leaseLive && !this.#closed) {
-        this.#recoveryPending = true;
-        this.#kickPending = false;
-        const recovery = this.#setTimeout(() => {
-          this.#recoveryPending = false;
-          this.kick();
-        }, this.#recoveryDelayMs);
-        recovery.unref?.();
-      }
-      if (this.#activeController === controller) this.#activeController = undefined;
+      if (!leaseLive && !this.#closed) this.#scheduleRecovery();
+      this.#activeControllers.delete(controller);
     }
     return leaseLive;
+  }
+
+  #scheduleRecovery(): void {
+    this.#recoveryPending += 1;
+    this.#kickPending = false;
+    const recovery = this.#setTimeout(() => {
+      if (this.#closed) return;
+      this.#recoveryPending -= 1;
+      if (this.#recoveryPending === 0) this.kick();
+    }, this.#recoveryDelayMs);
+    recovery.unref?.();
   }
 }

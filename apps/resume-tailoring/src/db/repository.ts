@@ -97,6 +97,7 @@ interface RunRow {
   updated_at: number;
 }
 interface ClaimRow { run_id: string | null; claim_token: string | null; expires_at: number | null }
+interface ClaimSlotRow extends ClaimRow { id: number }
 interface AttemptRow {
   id: string; run_id: string; revision: number; stage: ActiveStage; attempt_no: number; origin: AttemptOrigin;
   claim_token: string; attempt_session_id: string; status: "running" | "cancel_requested" | "cancelled" | "succeeded" | "failed";
@@ -417,7 +418,7 @@ export class PipelineRepository {
   }
 
   #assertClaim(claim: Pick<RunClaim, "runId" | "token">, now: number): ClaimRow {
-    const row = this.#db.query<ClaimRow, [string, string, number]>("SELECT run_id, claim_token, expires_at FROM run_claim WHERE id=1 AND run_id=? AND claim_token=? AND expires_at>?").get(claim.runId, claim.token, now);
+    const row = this.#db.query<ClaimRow, [string, string, number]>("SELECT run_id, claim_token, expires_at FROM run_claim WHERE run_id=? AND claim_token=? AND expires_at>?").get(claim.runId, claim.token, now);
     if (!row) throw new ClaimRejectedError();
     return row;
   }
@@ -1092,7 +1093,17 @@ export class PipelineRepository {
   }
 
   listRuns(limit = 100): PublicRun[] {
-    return this.#db.query<RunRow, [number]>("SELECT * FROM runs WHERE deleted_at IS NULL ORDER BY queue_sequence LIMIT ?").all(limit).map(publicRun);
+    return this.#db.query<RunRow, [number]>(`
+      SELECT *
+      FROM (
+        SELECT *
+        FROM runs
+        WHERE deleted_at IS NULL
+        ORDER BY queue_sequence DESC
+        LIMIT ?
+      ) AS recent_runs
+      ORDER BY queue_sequence
+    `).all(limit).map(publicRun);
   }
 
   reserveArtifactPruneCandidates(retainCount: number): string[] {
@@ -1114,8 +1125,7 @@ export class PipelineRepository {
           AND NOT EXISTS (
             SELECT 1
             FROM run_claim
-            WHERE run_claim.id = 1
-              AND run_claim.run_id = runs.id
+            WHERE run_claim.run_id = runs.id
           )
           AND NOT EXISTS (
             SELECT 1
@@ -1308,67 +1318,125 @@ export class PipelineRepository {
   acquire(): RunClaim | null {
     return this.#immediate(() => {
       const now = this.#now();
-      const singleton = this.#db.query<ClaimRow, []>("SELECT run_id, claim_token, expires_at FROM run_claim WHERE id=1").get();
-      if (!singleton) throw new Error("missing singleton run claim");
-      if (singleton.run_id && singleton.expires_at !== null && singleton.expires_at > now) return null;
+      const expiredSlots = this.#db.query<ClaimSlotRow, [number]>(`
+        SELECT id, run_id, claim_token, expires_at
+        FROM run_claim
+        WHERE run_id IS NOT NULL AND expires_at <= ?
+        ORDER BY id
+      `).all(now);
 
-      let candidate: RunRow | null = null;
-      if (singleton.run_id) {
+      for (const slot of expiredSlots) {
         const interrupted = this.#db.query<RunRow, [string]>(
           "SELECT * FROM runs WHERE id=? AND deleted_at IS NULL",
-        ).get(singleton.run_id);
+        ).get(slot.run_id!);
         if (
           interrupted
           && runnableStatuses.has(interrupted.status)
           && !this.#hasArtifactRetentionReservation(interrupted.id)
         ) {
-          const active = this.#db.query<AttemptRow, [string]>("SELECT * FROM attempts WHERE run_id=? AND status IN ('running','cancel_requested') ORDER BY started_at DESC LIMIT 1").get(interrupted.id);
+          const active = this.#db.query<AttemptRow, [string]>(
+            "SELECT * FROM attempts WHERE run_id=? AND status IN ('running','cancel_requested') ORDER BY started_at DESC LIMIT 1",
+          ).get(interrupted.id);
           if (active) {
-            const knownDead = active.process_pid !== null && active.process_start_token !== null && !this.#isProcessAlive(active.process_pid, active.process_start_token);
+            const knownDead =
+              active.process_pid !== null
+              && active.process_start_token !== null
+              && !this.#isProcessAlive(active.process_pid, active.process_start_token);
             if (!knownDead) {
-              if (active.status === "running") this.#db.query("UPDATE attempts SET status='cancel_requested' WHERE id=? AND claim_token=? AND status='running'").run(active.id, active.claim_token);
-              return null;
+              if (active.status === "running") {
+                this.#db.query(
+                  "UPDATE attempts SET status='cancel_requested' WHERE id=? AND claim_token=? AND status='running'",
+                ).run(active.id, active.claim_token);
+              }
+              continue;
             }
-            this.#db.query("UPDATE attempts SET status='cancelled', finished_at=?, cancellation_ack_at=? WHERE id=? AND status IN ('running','cancel_requested')").run(now, now, active.id);
-            this.#event(active.run_id, active.revision, "attempt.process_dead", { attemptId: active.id }, now);
+            this.#db.query(
+              "UPDATE attempts SET status='cancelled', finished_at=?, cancellation_ack_at=? WHERE id=? AND status IN ('running','cancel_requested')",
+            ).run(now, now, active.id);
+            this.#event(
+              active.run_id,
+              active.revision,
+              "attempt.process_dead",
+              { attemptId: active.id },
+              now,
+            );
           }
-          candidate = interrupted;
+          return this.#claimSlot(slot, interrupted, now);
         }
+
+        this.#db.query(
+          "UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=?",
+        ).run(slot.id);
       }
-      if (!candidate) {
-        candidate = this.#db.query<RunRow, []>(`
-          SELECT *
-          FROM runs
-          WHERE status IN ('queued','analyzing','tailoring','editing','compiling','repairing','deterministic_qa','visual_qa')
-            AND deleted_at IS NULL
-            AND NOT EXISTS (
-              SELECT 1
-              FROM run_artifact_retention
-              WHERE run_artifact_retention.run_id = runs.id
-            )
-          ORDER BY queue_sequence
-          LIMIT 1
-        `).get() ?? null;
-      }
-      if (!candidate) {
-        this.#db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=1").run();
-        return null;
-      }
-      let token = this.#tokenFactory();
-      for (let retries = 0; token === singleton.claim_token && retries < 4; retries++) token = this.#tokenFactory();
-      if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("token factory must return a 256-bit base64url token");
-      if (token === singleton.claim_token) throw new Error("token factory did not provide a fresh claim token");
-      const expiresAt = now + CLAIM_TTL_MS;
-      this.#db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=? WHERE id=1").run(candidate.id, token, expiresAt);
-      this.#event(candidate.id, candidate.current_revision, "run.claimed", { expiresAt }, now);
-      return { runId: candidate.id, token, expiresAt };
+
+      const availableSlot = this.#db.query<ClaimSlotRow, []>(`
+        SELECT id, run_id, claim_token, expires_at
+        FROM run_claim
+        WHERE run_id IS NULL
+        ORDER BY id
+        LIMIT 1
+      `).get();
+      if (!availableSlot) return null;
+
+      const candidate = this.#db.query<RunRow, []>(`
+        SELECT *
+        FROM runs
+        WHERE status IN ('queued','analyzing','tailoring','editing','compiling','repairing','deterministic_qa','visual_qa')
+          AND deleted_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM run_artifact_retention
+            WHERE run_artifact_retention.run_id = runs.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM run_claim
+            WHERE run_claim.run_id = runs.id
+          )
+        ORDER BY queue_sequence
+        LIMIT 1
+      `).get();
+      if (!candidate) return null;
+      return this.#claimSlot(availableSlot, candidate, now);
     });
+  }
+
+  #claimSlot(slot: ClaimSlotRow, candidate: RunRow, now: number): RunClaim {
+    let token = this.#tokenFactory();
+    let tokenClaimed = this.#db.query<{ claimed: number }, [string]>(`
+      SELECT EXISTS (
+        SELECT 1
+        FROM run_claim
+        WHERE claim_token = ?
+      ) AS claimed
+    `).get(token)?.claimed === 1;
+    for (let retries = 0; tokenClaimed && retries < 4; retries++) {
+      token = this.#tokenFactory();
+      tokenClaimed = this.#db.query<{ claimed: number }, [string]>(`
+        SELECT EXISTS (
+          SELECT 1
+          FROM run_claim
+          WHERE claim_token = ?
+        ) AS claimed
+      `).get(token)?.claimed === 1;
+    }
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+      throw new Error("token factory must return a 256-bit base64url token");
+    }
+    if (tokenClaimed) throw new Error("token factory did not provide a fresh claim token");
+
+    const expiresAt = now + CLAIM_TTL_MS;
+    this.#db.query(
+      "UPDATE run_claim SET run_id=?, claim_token=?, expires_at=? WHERE id=?",
+    ).run(candidate.id, token, expiresAt, slot.id);
+    this.#event(candidate.id, candidate.current_revision, "run.claimed", { expiresAt }, now);
+    return { runId: candidate.id, token, expiresAt };
   }
 
   heartbeat(claim: Pick<RunClaim, "runId" | "token">): RunClaim {
     return this.#immediate(() => {
       const now = this.#now(); const expiresAt = now + CLAIM_TTL_MS;
-      const result = this.#db.query("UPDATE run_claim SET expires_at=? WHERE id=1 AND run_id=? AND claim_token=? AND expires_at>?").run(expiresAt, claim.runId, claim.token, now);
+      const result = this.#db.query("UPDATE run_claim SET expires_at=? WHERE run_id=? AND claim_token=? AND expires_at>?").run(expiresAt, claim.runId, claim.token, now);
       if (result.changes !== 1) throw new ClaimRejectedError();
       return { runId: claim.runId, token: claim.token, expiresAt };
     });
@@ -1377,7 +1445,7 @@ export class PipelineRepository {
   release(claim: Pick<RunClaim, "runId" | "token">): void {
     this.#immediate(() => {
       const now = this.#now();
-      const result = this.#db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=1 AND run_id=? AND claim_token=? AND expires_at>?").run(claim.runId, claim.token, now);
+      const result = this.#db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE run_id=? AND claim_token=? AND expires_at>?").run(claim.runId, claim.token, now);
       if (result.changes !== 1) throw new ClaimRejectedError();
     });
   }
@@ -1545,8 +1613,14 @@ export class PipelineRepository {
 
   #assertCommandable(runId: string, now: number): RunRow {
     const run = this.#run(runId);
-    const claim = this.#db.query<ClaimRow, []>("SELECT run_id,claim_token,expires_at FROM run_claim WHERE id=1").get();
-    if (claim?.run_id === runId && claim.expires_at !== null && claim.expires_at > now) throw new RepositoryConflictError("run has a live claim");
+    const claimed = this.#db.query<{ claimed: number }, [string, number]>(`
+      SELECT EXISTS (
+        SELECT 1
+        FROM run_claim
+        WHERE run_id = ? AND expires_at > ?
+      ) AS claimed
+    `).get(runId, now)?.claimed === 1;
+    if (claimed) throw new RepositoryConflictError("run has a live claim");
     return run;
   }
 

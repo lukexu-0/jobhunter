@@ -56,60 +56,104 @@ function recordApplicationReview(
 }
 
 describe("pipeline repository claims", () => {
-  test("acquires FIFO with a private 256-bit token and heartbeats for 60 seconds", () => {
+  test("acquires five distinct FIFO runs, waits at capacity, and reuses a released slot", () => {
     const { repo, tick, now } = fixture();
-    const first = repo.createRun("first", "z");
-    repo.createRun("second", "a");
-    const claim = repo.acquire();
-    expect(claim?.runId).toBe(first.id);
-    expect(claim?.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(claim?.expiresAt).toBe(now() + 60_000);
-    tick(20_000);
-    const renewed = repo.heartbeat(claim!);
-    expect(renewed.expiresAt).toBe(now() + 60_000);
+    const runs = Array.from({ length: 6 }, (_, index) => repo.createRun(
+      `job-${index + 1}`,
+      `run-${6 - index}`,
+    ));
+    const claims = Array.from({ length: 5 }, () => repo.acquire());
+
+    expect(claims.map((claim) => claim?.runId)).toEqual(runs.slice(0, 5).map(({ id }) => id));
+    expect(new Set(claims.map((claim) => claim?.runId)).size).toBe(5);
+    for (const value of claims) {
+      expect(value?.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(value?.expiresAt).toBe(now() + 60_000);
+    }
     expect(repo.acquire()).toBeNull();
+
+    tick(20_000);
+    const renewed = repo.heartbeat(claims[0]!);
+    expect(renewed.expiresAt).toBe(now() + 60_000);
+    reachStage(repo, claims[2]!, ["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
+    repo.transition(claims[2]!, "review");
+    repo.release(claims[2]!);
+    const sixth = repo.acquire();
+    expect(sixth?.runId).toBe(runs[5]!.id);
+    expect(repo.acquire()).toBeNull();
+    expect(new Set([...claims.filter((_, index) => index !== 2), sixth].map((claim) => claim?.runId)).size).toBe(5);
   });
 
-  test("rejects expired and reclaimed owners and requires exact-token release", () => {
-    const { repo, tick } = fixture();
-    repo.createRun("one");
-    const old = repo.acquire()!;
-    expect(() => repo.release({ runId: old.runId, token: "x".repeat(43) })).toThrow(ClaimRejectedError);
-    tick(60_001);
-    const replacement = repo.acquire()!;
-    expect(replacement.token).not.toBe(old.token);
-    expect(() => repo.heartbeat(old)).toThrow(ClaimRejectedError);
-    expect(() => repo.transition(old, "analyzing")).toThrow(ClaimRejectedError);
-    repo.release(replacement);
-  });
-
-  test("blocks every successor until cancellation acknowledgement", () => {
-    const { repo, tick } = fixture({ alive: true });
-    const first = repo.createRun("first");
+  test("heartbeat and release require the exact run and token in every claim slot", () => {
+    const { repo } = fixture();
+    repo.createRun("first");
     repo.createRun("second");
+    const first = repo.acquire()!;
+    const second = repo.acquire()!;
+
+    expect(() => repo.heartbeat({ runId: first.runId, token: second.token })).toThrow(ClaimRejectedError);
+    expect(() => repo.release({ runId: first.runId, token: second.token })).toThrow(ClaimRejectedError);
+    expect(repo.heartbeat(first).runId).toBe(first.runId);
+    expect(repo.heartbeat(second).runId).toBe(second.runId);
+
+    repo.release(second);
+    expect(() => repo.heartbeat(second)).toThrow(ClaimRejectedError);
+    expect(repo.heartbeat(first).runId).toBe(first.runId);
+  });
+
+  test("recovers an expired non-first-slot claim after cancellation acknowledgement", () => {
+    const { repo, tick } = fixture({ alive: true });
+    const firstRun = repo.createRun("first");
+    const secondRun = repo.createRun("second");
+    const first = repo.acquire()!;
     const old = repo.acquire()!;
+    expect(first.runId).toBe(firstRun.id);
+    expect(old.runId).toBe(secondRun.id);
     repo.transition(old, "analyzing");
     const attempt = repo.startAttempt(old, "analyzing", { processPid: 42, processStartToken: "boot:1" });
-    tick(60_001);
+
+    tick(20_000);
+    repo.heartbeat(first);
+    tick(40_001);
     expect(repo.acquire()).toBeNull();
-    expect(repo.timeline(first.id).attempts[0]?.status).toBe("cancel_requested");
+    expect(repo.timeline(secondRun.id).attempts[0]?.status).toBe("cancel_requested");
     expect(repo.acknowledgeCancellation(attempt.id, "wrong")).toBeFalse();
     expect(repo.acknowledgeCancellation(attempt.id, old.token)).toBeTrue();
     const replacement = repo.acquire();
-    expect(replacement?.runId).toBe(first.id);
+    expect(replacement?.runId).toBe(secondRun.id);
     expect(replacement?.token).not.toBe(old.token);
+    expect(repo.heartbeat(first).runId).toBe(firstRun.id);
   });
 
-  test("can reclaim after a recorded process identity is known dead", () => {
+  test("reclaims an expired non-first-slot claim after its process is known dead", () => {
     const { repo, tick } = fixture({ alive: false });
-    const run = repo.createRun("first");
+    const firstRun = repo.createRun("first");
+    const secondRun = repo.createRun("second");
+    const first = repo.acquire()!;
     const old = repo.acquire()!;
+    expect(first.runId).toBe(firstRun.id);
+    expect(old.runId).toBe(secondRun.id);
     repo.transition(old, "analyzing");
     const attempt = repo.startAttempt(old, "analyzing", { processPid: 42, processStartToken: "boot:1" });
-    tick(60_001);
+
+    tick(20_000);
+    repo.heartbeat(first);
+    tick(40_001);
     const replacement = repo.acquire();
-    expect(replacement?.runId).toBe(run.id);
-    expect(repo.timeline(run.id).attempts.find((item) => item.id === attempt.id)?.status).toBe("cancelled");
+    expect(replacement?.runId).toBe(secondRun.id);
+    expect(repo.timeline(secondRun.id).attempts.find((item) => item.id === attempt.id)?.status).toBe("cancelled");
+    expect(repo.heartbeat(first).runId).toBe(firstRun.id);
+  });
+});
+
+describe("run listing", () => {
+  test("returns the newest bounded window in queue order", () => {
+    const { repo } = fixture();
+    const ids = Array.from({ length: 105 }, (_, index) =>
+      repo.createRun(`job-${index + 1}`, `listed-${index + 1}`).id);
+
+    expect(repo.listRuns(3).map(({ id }) => id)).toEqual(ids.slice(-3));
+    expect(repo.listRuns().map(({ id }) => id)).toEqual(ids.slice(-100));
   });
 });
 
@@ -237,7 +281,8 @@ describe("persisted workflow commands", () => {
     expect(repo.listRuns().map(({ id }) => id)).toEqual([deleted.id, successor.id]);
     expect(repo.timeline(deleted.id).attempts.find(({ id }) => id === attempt.id)?.status).toBe("running");
 
-    expect(repo.acquire()).toBeNull();
+    const successorClaim = repo.acquire();
+    expect(successorClaim?.runId).toBe(successor.id);
     expect(repo.timeline(deleted.id).attempts.find(({ id }) => id === attempt.id)?.status).toBe("cancel_requested");
     expect(() => repo.deleteRun(deleted.id)).toThrow(/active attempt/);
     expect(repo.acknowledgeCancellation(attempt.id, claim.token)).toBeTrue();
@@ -256,6 +301,7 @@ describe("persisted workflow commands", () => {
     expect(db.query<{ count: number }, []>(
       "SELECT count(*) AS count FROM artifacts WHERE run_id = 'deleted-run'",
     ).get()?.count).toBe(1);
+    repo.release(successorClaim!);
     expect(repo.acquire()?.runId).toBe(successor.id);
   });
 
@@ -1238,7 +1284,7 @@ describe("artifact retention reservations", () => {
     for (const id of ids) createReview(repo, "b".repeat(64), false, id);
     db.query("UPDATE runs SET status='queued' WHERE id=?").run(ids[0]!);
     db.query("UPDATE runs SET status='analyzing' WHERE id=?").run(ids[4]!);
-    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=? WHERE id=1").run(ids[1]!, "c".repeat(43), 99_999);
+    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=? WHERE id=4").run(ids[1]!, "c".repeat(43), 99_999);
     for (const [index, status] of [[2, "running"], [3, "cancel_requested"]] as const) {
       db.query(`
         INSERT INTO attempts(
@@ -1251,9 +1297,9 @@ describe("artifact retention reservations", () => {
     expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[5]!]);
     expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[5]!]);
 
-    db.query("UPDATE runs SET status='review' WHERE id IN (?, ?)").run(ids[0]!, ids[4]!);
-    db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=1").run();
+    db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=4").run();
     db.query("UPDATE attempts SET status='succeeded', finished_at=2000 WHERE id IN ('active-2','active-3')").run();
+    db.query("UPDATE runs SET status='review' WHERE id IN (?, ?)").run(ids[0]!, ids[4]!);
 
     expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 6));
     tick(1_000);
@@ -1287,7 +1333,7 @@ describe("artifact retention reservations", () => {
     for (const id of ids) createReview(repo, "f".repeat(64), false, id);
     expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
     db.query("UPDATE runs SET status='queued' WHERE id IN (?, ?)").run(ids[0]!, ids[11]!);
-    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=0 WHERE id=1").run(ids[0]!, "g".repeat(43));
+    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=0 WHERE id=5").run(ids[0]!, "g".repeat(43));
 
     expect(repo.acquire()?.runId).toBe(ids[11]);
   });

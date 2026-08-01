@@ -9,6 +9,21 @@ afterEach(() => {
   while (databases.length) databases.pop()?.close();
 });
 
+function addLegacyRunClaimTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE run_claim (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+      claim_token TEXT,
+      expires_at INTEGER,
+      CHECK ((run_id IS NULL AND claim_token IS NULL AND expires_at IS NULL) OR
+             (run_id IS NOT NULL AND claim_token IS NOT NULL AND expires_at IS NOT NULL))
+    ) STRICT;
+    INSERT INTO run_claim(id, run_id, claim_token, expires_at)
+      VALUES (1, NULL, NULL, NULL);
+  `);
+}
+
 function versionOneDatabase(options: { readonly includesApplicationStatus?: boolean } = {}): Database {
   const db = new Database(":memory:");
   databases.push(db);
@@ -24,6 +39,7 @@ function versionOneDatabase(options: { readonly includesApplicationStatus?: bool
     INSERT INTO schema_migrations(version, applied_at) VALUES (1, 1000);
     PRAGMA user_version = 1;
   `);
+  addLegacyRunClaimTable(db);
   return db;
 }
 
@@ -72,6 +88,7 @@ function versionTwoDatabase(options: { readonly includesRetentionTable?: boolean
   if (options.includesRetentionTable) {
     db.exec("CREATE TABLE run_artifact_retention (run_id TEXT PRIMARY KEY) STRICT");
   }
+  addLegacyRunClaimTable(db);
   return db;
 }
 
@@ -128,6 +145,7 @@ function versionSixDatabase(): Database {
       VALUES (1, 1000), (2, 1100), (3, 1200), (6, 1300);
     PRAGMA user_version = 6;
   `);
+  addLegacyRunClaimTable(db);
   return db;
 }
 function versionSevenDatabase(): Database {
@@ -148,6 +166,7 @@ function versionSevenDatabase(): Database {
       VALUES (1, 1000), (2, 1100), (3, 1200), (6, 1300), (7, 1400);
     PRAGMA user_version = 7;
   `);
+  addLegacyRunClaimTable(db);
   return db;
 }
 
@@ -195,6 +214,7 @@ function versionNineDatabase(): Database {
       VALUES (1, 1000), (2, 1100), (3, 1200), (6, 1300), (7, 1400), (8, 1500), (9, 1600);
     PRAGMA user_version = 9;
   `);
+  addLegacyRunClaimTable(db);
   return db;
 }
 
@@ -246,10 +266,83 @@ function versionTenDatabase(): Database {
       SELECT RAISE(ABORT, 'application session history cannot be deleted');
     END;
     INSERT INTO schema_migrations(version, applied_at) VALUES (10, 2000);
+    CREATE TABLE run_claim (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+      claim_token TEXT,
+      expires_at INTEGER,
+      CHECK ((run_id IS NULL AND claim_token IS NULL AND expires_at IS NULL) OR
+             (run_id IS NOT NULL AND claim_token IS NOT NULL AND expires_at IS NOT NULL))
+    ) STRICT;
+    INSERT INTO run_claim(id, run_id, claim_token, expires_at)
+      VALUES (1, NULL, NULL, NULL);
     PRAGMA user_version = 10;
   `);
   return db;
 }
+
+function versionElevenDatabase(): Database {
+  const db = versionTenDatabase();
+  migratePipelineDatabase(db, 2_500);
+  db.exec(`
+    DROP TABLE run_claim;
+    CREATE TABLE run_claim (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+      claim_token TEXT,
+      expires_at INTEGER,
+      CHECK ((run_id IS NULL AND claim_token IS NULL AND expires_at IS NULL) OR
+             (run_id IS NOT NULL AND claim_token IS NOT NULL AND expires_at IS NOT NULL))
+    ) STRICT;
+    INSERT INTO run_claim(id, run_id, claim_token, expires_at)
+      VALUES (1, NULL, NULL, NULL);
+    DELETE FROM schema_migrations WHERE version > 11;
+    PRAGMA user_version = 11;
+  `);
+  return db;
+}
+
+test("migration twelve preserves the live claim and adds four unique empty claim slots", () => {
+  const db = versionElevenDatabase();
+  const token = "a".repeat(43);
+  db.query(
+    "UPDATE run_claim SET run_id='existing-run', claim_token=?, expires_at=90000 WHERE id=1",
+  ).run(token);
+
+  migratePipelineDatabase(db, 3_000);
+
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
+  expect(db.query<{ version: number }, []>(
+    "SELECT version FROM schema_migrations ORDER BY version",
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+  expect(db.query<{
+    id: number;
+    run_id: string | null;
+    claim_token: string | null;
+    expires_at: number | null;
+  }, []>("SELECT id,run_id,claim_token,expires_at FROM run_claim ORDER BY id").all()).toEqual([
+    { id: 1, run_id: "existing-run", claim_token: token, expires_at: 90_000 },
+    { id: 2, run_id: null, claim_token: null, expires_at: null },
+    { id: 3, run_id: null, claim_token: null, expires_at: null },
+    { id: 4, run_id: null, claim_token: null, expires_at: null },
+    { id: 5, run_id: null, claim_token: null, expires_at: null },
+  ]);
+
+  expect(() => db.query(
+    "UPDATE run_claim SET run_id='existing-run', claim_token=?, expires_at=90001 WHERE id=2",
+  ).run("b".repeat(43))).toThrow(/unique/i);
+  db.query(`
+    INSERT INTO runs(
+      id, job_description, status, current_revision, queue_sequence, created_at, updated_at
+    ) VALUES ('second-run', 'second', 'queued', 1, 2, 3000, 3000)
+  `).run();
+  expect(() => db.query(
+    "UPDATE run_claim SET run_id='second-run', claim_token=?, expires_at=90002 WHERE id=2",
+  ).run(token)).toThrow(/unique/i);
+  expect(() => db.query(
+    "INSERT INTO run_claim(id, run_id, claim_token, expires_at) VALUES (6, NULL, NULL, NULL)",
+  ).run()).toThrow(/check/i);
+});
 
 function legacySnapshot(
   generation: number,
