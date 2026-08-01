@@ -969,20 +969,15 @@ test("an accepted live projection clears a stale application load failure", asyn
   });
   const failedFrame = deferred();
   const mock = await installPipeline(page, {
+    run: runFixture({ status: "queued" }),
     application: running,
-  });
-  mock.editReply = runFixture({
-    status: "editing",
-    revision: 3,
-    origin: "human-comments",
-    pdfSha256: null,
   });
   queueSse(mock, eventFixture("failed", failed, {}), 2, failedFrame.promise);
   let failedApplicationReads = 0;
   await page.route(`**${pipelineRunPath}/application`, async (route) => {
     if (
       route.request().method() === "GET"
-      && mock.run.revision === 3
+      && mock.run.status === "approved"
     ) {
       failedApplicationReads += 1;
       await route.fulfill({
@@ -1000,8 +995,9 @@ test("an accepted live projection clears a stale application load failure", asyn
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
-  await page.getByLabel("Edit instructions").fill("Refresh the opening sentence.");
-  await page.getByRole("button", { name: "Request edits" }).click();
+  mock.run = approvedRun();
+  mock.iterations = approvedIterations();
+  await page.waitForTimeout(2_600);
   const loadFailure = page.getByRole("alert").filter({
     hasText: "The local application service is unavailable",
   });
@@ -1538,18 +1534,53 @@ test("a failed submitted-run refresh is retryable without resubmitting", async (
   expect(mock.commands).toEqual([]);
 });
 
-test("a reserved generation resumes with the approved hash and running cancel is a command", async ({ page }) => {
+test("a reserved generation resumes, running cancel is a command, and cancelled application permits resume edits", async ({ page }) => {
   const reserved = snapshotFixture({ bridgeState: "reserved" });
   const running = snapshotFixture({ bridgeState: "running", updatedAt: createdAt + 200 });
   const cancelled = snapshotFixture({ bridgeState: "cancelled", updatedAt: createdAt + 300 });
+  const editingRun = runFixture({
+    status: "editing",
+    revision: 3,
+    origin: "human-comments",
+    pdfSha256: null,
+  });
+  const revisedIteration = iteration(3, "human-comments", pdfHash3);
+  const revisedRun = runFixture({
+    status: "review",
+    revision: 3,
+    origin: "human-comments",
+    pdfSha256: pdfHash3,
+  });
+  const revisedApprovedRun = runFixture({
+    status: "approved",
+    revision: 3,
+    origin: "human-comments",
+    pdfSha256: pdfHash3,
+  });
+  const revisedStarting = snapshotFixture({
+    bridgeState: "starting",
+    generation: 2,
+    updatedAt: createdAt + 400,
+  });
   const cancelFrame = deferred();
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
     application: reserved,
   });
-  mock.startReplies.push({ status: 202, body: running });
+  mock.startReplies.push(
+    { status: 202, body: running },
+    { status: 202, body: revisedStarting },
+  );
   queueSse(mock, eventFixture("cancelled", cancelled, {}), 2, cancelFrame.promise);
+  mock.editReply = editingRun;
+  mock.editReplies.push({
+    status: 200,
+    before: () => {
+      mock.application = notStartedAfterApproval();
+    },
+  });
+  mock.approveReply = revisedApprovedRun;
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByRole("status").filter({ hasText: "Preparing browser" })).toBeVisible();
@@ -1566,7 +1597,74 @@ test("a reserved generation resumes with the approved hash and running cancel is
   await expect(page.getByRole("status").filter({ hasText: "Cancelled" })).toBeVisible();
   mock.application = cancelled;
   await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
+
+  const editInstructions = page.getByLabel("Edit instructions");
+  const requestEdits = page.getByRole("button", { name: "Request edits" });
+  await expect(page.getByLabel("Displayed resume")).toHaveValue("2");
+  await expect(editInstructions).toBeVisible();
+  await expect(requestEdits).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Regenerate" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Approve and apply" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+
+  await editInstructions.fill("  Strengthen platform ownership.  ");
+  await requestEdits.click();
+
+  await expect.poll(
+    () => mock.requests.filter((request) => request.path === `${pipelineRunPath}/edit`).length,
+  ).toBe(1);
+  expect(mock.requests.find((request) => request.path === `${pipelineRunPath}/edit`)).toEqual({
+    method: "POST",
+    path: `${pipelineRunPath}/edit`,
+    body: {
+      comments: "Strengthen platform ownership.",
+      expectedPdfSha256: pdfHash2,
+    },
+  });
+  await expect(editInstructions).toHaveCount(0);
+  await expect(requestEdits).toHaveCount(0);
+  expect(mock.run.revision).toBe(3);
   expect(mock.deleteCount).toBe(0);
+
+  mock.run = revisedRun;
+  mock.iterations = iterationList(
+    iteration(1, "initial", pdfHash1),
+    iteration(2, "human-comments", pdfHash2, "approved"),
+    revisedIteration,
+  );
+  await page.waitForTimeout(2_600);
+
+  await expect(page.getByLabel("Displayed resume")).toHaveValue("3");
+  await expect(page.getByLabel("Selected resume PDF for Public Role 3")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/3/artifacts/resume-r3`,
+  );
+  await expect(page.getByRole("status").filter({ hasText: "Cancelled" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Retry applying" })).toHaveCount(0);
+  const approveAndApply = page.getByRole("button", { name: "Approve and apply" });
+  await expect(approveAndApply).toBeEnabled();
+
+  mock.iterations = iterationList(
+    iteration(1, "initial", pdfHash1),
+    iteration(2, "human-comments", pdfHash2, "approved"),
+    iteration(3, "human-comments", pdfHash3, "approved"),
+  );
+  await approveAndApply.click();
+
+  await expect.poll(() => mock.startBodies.length).toBe(2);
+  expect(mock.requests.filter((request) => request.path === `${pipelineRunPath}/approve`)).toEqual([{
+    method: "POST",
+    path: `${pipelineRunPath}/approve`,
+    body: {
+      expectedPdfSha256: pdfHash3,
+      acknowledgeVisualIssues: false,
+    },
+  }]);
+  expect(mock.startBodies).toEqual([
+    { expectedApprovedPdfSha256: pdfHash2 },
+    { expectedApprovedPdfSha256: pdfHash3 },
+  ]);
+  await expect(page.getByRole("status").filter({ hasText: "Starting browser" })).toBeVisible();
 });
 
 test("a not-yet-created reserved generation cancels locally with DELETE", async ({ page }) => {

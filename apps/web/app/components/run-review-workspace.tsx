@@ -282,18 +282,26 @@ export function RunReviewWorkspace({
     if (activeRunIdRef.current === requestRunId) setApplicationError(message);
   }, [refreshApplicationView, run.id]);
 
-  const selectedIsCurrent = selectedIteration?.revision === run.revision;
-  const canReview = run.status === "review"
-    && selectedIsCurrent
-    && selectedIteration?.pdfSha256 === run.currentPdfSha256
+  const snapshot = applicationSnapshot(applicationView);
+  const selectionReady = selectedIteration?.revision === run.revision
+    && selectedIteration.pdfSha256 === run.currentPdfSha256
     && artifactState === "retained";
-  const actionsDisabled = !canReview || !isFresh || busyAction !== null;
+  const canReview = run.status === "review" && selectionReady;
+  const canEditCancelledApplication = run.status === "approved"
+    && snapshot?.bridgeState === "cancelled"
+    && selectionReady;
+  const canEdit = canReview || canEditCancelledApplication;
   const notStarted = applicationView && "state" in applicationView
     ? applicationView
     : null;
   const canStartAfterApproval = notStarted?.canStartAfterApproval === true;
   const blockedReason = blockedReasonMessage(notStarted?.blockedReason);
-  const snapshot = applicationSnapshot(applicationView);
+  const editDisabled = !isFresh || busyAction !== null;
+  const approvalDisabled = editDisabled
+    || isLoadingApplication
+    || !canStartAfterApproval
+    || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues)
+    || isStartingApplication;
   const liveGeneration = snapshot && isStreamableApplicationSnapshot(snapshot)
     ? snapshot.generation
     : null;
@@ -310,7 +318,7 @@ export function RunReviewWorkspace({
     setApplicationCommandAction(null);
     setIsStartingApplication(false);
     setApplicationError(null);
-  }, [onApplicationView, run.id]);
+  }, [onApplicationView, run.id, run.revision]);
 
   useEffect(() => {
     setAcknowledgeVisualIssues(false);
@@ -459,7 +467,7 @@ export function RunReviewWorkspace({
 
   const submitEdit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (actionsDisabled) return;
+    if (!canEdit || editDisabled) return;
     const comments = editComments.trim();
     if (comments.length < 1 || comments.length > 8_000) {
       setEditError("Enter edit instructions between 1 and 8,000 characters.");
@@ -635,11 +643,7 @@ export function RunReviewWorkspace({
 
   const submitApproval = async () => {
     const approvalRunId = run.id;
-    if (
-      actionsDisabled
-      || !canStartAfterApproval
-      || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues)
-    ) return;
+    if (!canReview || approvalDisabled) return;
     setActionError(null);
     try {
       const approved = await onApprove(acknowledgeVisualIssues);
@@ -686,39 +690,41 @@ export function RunReviewWorkspace({
         ) : null}
         {iterationError ? <p className={styles.panelError} role="alert">{iterationError}</p> : null}
 
+        {canEdit ? (
+          <form
+            className={styles.workspaceActions}
+            noValidate
+            onSubmit={(event) => void submitEdit(event)}
+          >
+            <label className={styles.workspaceField}>
+              <span>Edit instructions</span>
+              <textarea
+                aria-describedby={editError ? "resume-edit-error" : undefined}
+                aria-invalid={editError ? true : undefined}
+                disabled={editDisabled}
+                maxLength={8_000}
+                onChange={(event) => setEditComments(event.currentTarget.value)}
+                required
+                value={editComments}
+              />
+            </label>
+            {editError ? (
+              <p className={styles.panelError} id="resume-edit-error" role="alert">
+                {editError}
+              </p>
+            ) : null}
+            <button className={styles.secondaryButton} disabled={editDisabled} type="submit">
+              {busyAction === "edit" ? "Requesting…" : "Request edits"}
+            </button>
+          </form>
+        ) : null}
         {canReview ? (
           <>
-            <form
-              className={styles.workspaceActions}
-              noValidate
-              onSubmit={(event) => void submitEdit(event)}
-            >
-              <label className={styles.workspaceField}>
-                <span>Edit instructions</span>
-                <textarea
-                  aria-describedby={editError ? "resume-edit-error" : undefined}
-                  aria-invalid={editError ? true : undefined}
-                  disabled={actionsDisabled}
-                  maxLength={8_000}
-                  onChange={(event) => setEditComments(event.currentTarget.value)}
-                  required
-                  value={editComments}
-                />
-              </label>
-              {editError ? (
-                <p className={styles.panelError} id="resume-edit-error" role="alert">
-                  {editError}
-                </p>
-              ) : null}
-              <button className={styles.secondaryButton} disabled={actionsDisabled} type="submit">
-                {busyAction === "edit" ? "Requesting…" : "Request edits"}
-              </button>
-            </form>
             {run.visualAcknowledgementRequired ? (
               <label className={styles.workspaceCheck}>
                 <input
                   checked={acknowledgeVisualIssues}
-                  disabled={actionsDisabled || isStartingApplication}
+                  disabled={editDisabled || isStartingApplication}
                   onChange={(event) => setAcknowledgeVisualIssues(event.currentTarget.checked)}
                   type="checkbox"
                 />
@@ -727,13 +733,7 @@ export function RunReviewWorkspace({
             ) : null}
             <button
               className={styles.primaryButton}
-              disabled={
-                actionsDisabled
-                || isLoadingApplication
-                || !canStartAfterApproval
-                || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues)
-                || isStartingApplication
-              }
+              disabled={approvalDisabled}
               onClick={() => void submitApproval()}
               type="button"
             >

@@ -782,6 +782,106 @@ describe("application session service", () => {
     expect(target.repository.getLatestApplicationSession(target.runId)?.generation).toBe(1);
   });
 
+  test("automatically starts an approved edited revision after its cancelled generation is closed", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessSnapshot("cancelled");
+    const target = await createTarget({
+      harness,
+      skipReview: true,
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID, THIRD_SESSION_ID],
+    });
+
+    const cancelled = await target.service.start(target.runId, target.pdf.sha256, signal());
+    expect(cancelled).toMatchObject({ generation: 1, bridgeState: "cancelled" });
+    expect(await target.service.start(target.runId, target.pdf.sha256, signal()))
+      .toEqual(cancelled);
+    expect(harness.createCalls).toHaveLength(1);
+
+    target.repository.editRun(
+      target.runId,
+      "Emphasize the platform ownership work.",
+      target.pdf.sha256,
+    );
+    await target.service.close(target.runId, signal());
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      generation: 1,
+      bridgeState: "closed",
+      resumeRevision: 1,
+    });
+
+    const claim = target.repository.acquire();
+    if (!claim || claim.runId !== target.runId) throw new Error("edit claim missing");
+    for (const stage of ["compiling", "deterministic_qa", "visual_qa"] as const) {
+      target.repository.transition(claim, stage);
+    }
+    const attempt = target.repository.startAttempt(claim, "visual_qa");
+    const attemptRoot = await target.artifacts.createAttempt({
+      run: target.repository.getRun(target.runId)!.queueSequence,
+      revision: "2",
+      stage: "visual_qa",
+      attempt: attempt.attemptNo,
+    });
+    const editedPdfBytes = new TextEncoder().encode(
+      "%PDF-1.7\nrevised approved resume\n%%EOF\n",
+    );
+    const editedPdf = await target.artifacts.write(
+      join(attemptRoot, "resume.pdf"),
+      editedPdfBytes,
+      10 * 1024 * 1024,
+    );
+    target.repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "compiled-pdf",
+      sha256: editedPdf.sha256,
+      path: editedPdf.path,
+      byteSize: editedPdf.bytes,
+    });
+    target.repository.finishAttempt(claim, attempt.id, "succeeded");
+    target.repository.transition(claim, "review");
+    target.repository.release(claim);
+
+    expect(await target.service.get(target.runId)).toEqual({
+      state: "not_started",
+      canStart: false,
+      canStartAfterApproval: true,
+    });
+
+    harness.snapshotAfterCreate = harnessSnapshot("running");
+    const blocker = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2" },
+    );
+    expect(await target.service.start(blocker.run.id, blocker.pdf.sha256, signal()))
+      .toMatchObject({ generation: 1, bridgeState: "running" });
+
+    target.repository.approve(target.runId, editedPdf.sha256);
+    expect(await target.service.get(target.runId)).toEqual({
+      state: "not_started",
+      canStart: true,
+      canStartAfterApproval: false,
+    });
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
+    expect(harness.createCalls).toHaveLength(2);
+
+    await target.service.close(blocker.run.id, signal());
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(harness.createCalls).toHaveLength(3);
+    expect(harness.createCalls[2]).toMatchObject({
+      sessionId: THIRD_SESSION_ID,
+      resumePdf: editedPdfBytes,
+    });
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      generation: 2,
+      sessionId: THIRD_SESSION_ID,
+      bridgeState: "running",
+      resumeRevision: 2,
+      pdfSha256: editedPdf.sha256,
+    });
+  });
+
   test("persists each upstream cursor and projected snapshot before yielding its generation event", async () => {
     const target = await createTarget();
     const started = await target.service.start(target.runId, target.pdf.sha256, signal());

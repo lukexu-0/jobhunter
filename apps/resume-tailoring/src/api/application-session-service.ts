@@ -242,6 +242,15 @@ function isTerminal(session: PublicApplicationSession): boolean {
   return TERMINAL_APPLICATION_STATES[session.bridgeState] === true;
 }
 
+function isSupersededApplicationSession(
+  session: PublicApplicationSession,
+  currentRevision: number,
+): boolean {
+  return isTerminal(session)
+    && !submissionCannotRetry(session)
+    && session.resumeRevision < currentRevision;
+}
+
 function retainedSubmissionFinal(session: PublicApplicationSession): boolean {
   return session.submissionPhase === "submitted" || session.submissionPhase === "uncertain";
 }
@@ -318,7 +327,9 @@ export class ApplicationSessionService {
     } catch (error) {
       mapRepositoryError(error);
     }
-    if (latest) return this.#storedView(latest);
+    if (latest && !isSupersededApplicationSession(latest, run.currentRevision)) {
+      return this.#storedView(latest);
+    }
 
     let jobUrl: string | null;
     try {
@@ -373,6 +384,37 @@ export class ApplicationSessionService {
     if (latest) {
       if (submissionCannotRetry(latest)) {
         throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
+      }
+      const run = isTerminal(latest)
+        ? this.dependencies.repository.getRun(runId)
+        : null;
+      if (run && isSupersededApplicationSession(latest, run.currentRevision)) {
+        const prepared = await this.#prepareStart(runId, expectedApprovedPdfSha256, signal);
+        let reserved: PublicApplicationSession;
+        try {
+          reserved = this.dependencies.repository.reserveApplicationSession(
+            runId,
+            latest.sessionId,
+            this.#uuidFactory(),
+            expectedApprovedPdfSha256,
+          );
+        } catch (error) {
+          const concurrent = this.dependencies.repository.getLatestApplicationSession(runId);
+          if (concurrent && submissionCannotRetry(concurrent)) {
+            throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
+          }
+          if (
+            concurrent
+            && concurrent.generation > latest.generation
+            && concurrent.resumeRevision === prepared.pdf.revision
+            && concurrent.pdfSha256 === expectedApprovedPdfSha256
+            && isLive(concurrent)
+          ) {
+            return await this.#resume(runId, concurrent, prepared, signal);
+          }
+          mapRepositoryError(error);
+        }
+        return await this.#resume(runId, reserved, prepared, signal);
       }
       if (latest.pdfSha256 !== expectedApprovedPdfSha256) {
         throw new RunServiceError("STALE_PDF", "approved PDF hash is stale", 409);

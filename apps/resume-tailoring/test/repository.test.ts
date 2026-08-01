@@ -518,6 +518,198 @@ describe("persisted workflow commands", () => {
     expect(() => db.query("UPDATE edit_requests SET comments='changed'").run()).toThrow();
   });
 
+  test("approved human edits reopen only the artifact used by the latest cancelled application session", () => {
+    const { repo } = fixture();
+    const hash = "2".repeat(64);
+    const runId = createReview(repo, hash, false, "cancelled-application-edit");
+    const sessionId = "01010101-0101-4101-8101-010101010101";
+    repo.approve(runId, hash);
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "cancelled",
+      publicSnapshot: { state: "cancelled" },
+    });
+
+    const edited = repo.editRun(runId, "Tailor the summary to the reopened application.", hash);
+
+    expect(edited).toMatchObject({
+      status: "editing",
+      currentRevision: 2,
+      approvedPdfSha256: null,
+    });
+    expect(repo.getRevision(runId, 2)).toMatchObject({
+      origin: "human_edit",
+      source_revision: 1,
+      status: "editing",
+    });
+    expect(repo.getEditRequest(runId, 2)).toMatchObject({
+      sourceRevision: 1,
+      targetRevision: 2,
+      origin: "human_edit",
+      comments: "Tailor the summary to the reopened application.",
+      expectedPdfSha256: hash,
+    });
+    expect(repo.getLatestApplicationSession(runId)).toMatchObject({
+      sessionId,
+      resumeRevision: 1,
+      pdfSha256: hash,
+      bridgeState: "cancelled",
+    });
+  });
+
+  test("approved human edits require a cancelled latest application session", () => {
+    const latestStates = [null, "failed", "closed", "lost"] as const;
+
+    for (const [index, latestState] of latestStates.entries()) {
+      const { repo } = fixture();
+      const hash = "3".repeat(64);
+      const runId = createReview(repo, hash, false, `approved-edit-${latestState ?? "missing"}`);
+      repo.approve(runId, hash);
+
+      if (latestState !== null) {
+        const cancelledSessionId =
+          `02020202-0202-4202-8202-${String(index * 2 + 1).padStart(12, "0")}`;
+        const latestSessionId =
+          `02020202-0202-4202-8202-${String(index * 2 + 2).padStart(12, "0")}`;
+        repo.reserveApplicationSession(runId, null, cancelledSessionId, hash);
+        repo.recordApplicationSnapshot(runId, {
+          generation: 1,
+          sessionId: cancelledSessionId,
+          bridgeState: "cancelled",
+          publicSnapshot: { state: "cancelled" },
+        });
+        repo.reserveApplicationSession(runId, cancelledSessionId, latestSessionId, hash);
+        if (latestState === "lost") {
+          repo.recordApplicationSnapshot(runId, {
+            generation: 2,
+            sessionId: latestSessionId,
+            bridgeState: "running",
+            publicSnapshot: { state: "running" },
+          });
+          repo.markApplicationSessionLost(runId, {
+            generation: 2,
+            sessionId: latestSessionId,
+            publicSnapshot: { state: "lost" },
+          });
+        } else {
+          repo.recordApplicationSnapshot(runId, {
+            generation: 2,
+            sessionId: latestSessionId,
+            bridgeState: latestState,
+            publicSnapshot: { state: latestState },
+          });
+        }
+      }
+
+      expect(() => repo.editRun(runId, "This edit must remain blocked.", hash))
+        .toThrow(RepositoryConflictError);
+      expect(repo.getRun(runId)).toMatchObject({
+        status: "approved",
+        currentRevision: 1,
+        approvedPdfSha256: hash,
+      });
+      expect(repo.getRevision(runId, 2)).toBeNull();
+      expect(repo.getEditRequest(runId, 2)).toBeNull();
+    }
+  });
+
+  test("approved human edits reject cancelled sessions for a different revision or PDF", () => {
+    {
+      const { db, repo } = fixture();
+      const firstHash = "4".repeat(64);
+      const approvedHash = "5".repeat(64);
+      const runId = createReview(repo, firstHash, false, "cancelled-edit-revision-mismatch");
+      repo.editRun(runId, "Create the second review revision.", firstHash);
+      const claim = repo.acquire()!;
+      reachStage(repo, claim, ["compiling", "deterministic_qa", "visual_qa"]);
+      const attempt = repo.startAttempt(claim, "visual_qa");
+      repo.finalizeArtifact(claim, {
+        attemptId: attempt.id,
+        stage: "visual_qa",
+        kind: "compiled-pdf",
+        sha256: approvedHash,
+        path: `/tmp/${runId}-revision-2.pdf`,
+        byteSize: 10,
+      });
+      repo.finishAttempt(claim, attempt.id, "succeeded");
+      repo.transition(claim, "review");
+      repo.release(claim);
+      repo.approve(runId, approvedHash);
+      const sessionId = "03030303-0303-4303-8303-030303030301";
+      repo.reserveApplicationSession(runId, null, sessionId, approvedHash);
+      repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: "cancelled",
+        publicSnapshot: { state: "cancelled" },
+      });
+      db.query("UPDATE run_application_sessions SET resume_revision=1 WHERE session_id=?").run(sessionId);
+
+      expect(() => repo.editRun(runId, "Reject the stale session revision.", approvedHash))
+        .toThrow(RepositoryConflictError);
+      expect(repo.getRun(runId)).toMatchObject({
+        status: "approved",
+        currentRevision: 2,
+        approvedPdfSha256: approvedHash,
+      });
+      expect(repo.getRevision(runId, 3)).toBeNull();
+      expect(repo.getEditRequest(runId, 3)).toBeNull();
+    }
+
+    {
+      const { db, repo } = fixture();
+      const hash = "6".repeat(64);
+      const runId = createReview(repo, hash, false, "cancelled-edit-hash-mismatch");
+      const sessionId = "03030303-0303-4303-8303-030303030302";
+      repo.approve(runId, hash);
+      repo.reserveApplicationSession(runId, null, sessionId, hash);
+      repo.recordApplicationSnapshot(runId, {
+        generation: 1,
+        sessionId,
+        bridgeState: "cancelled",
+        publicSnapshot: { state: "cancelled" },
+      });
+      db.query("UPDATE run_application_sessions SET pdf_sha256=? WHERE session_id=?")
+        .run("7".repeat(64), sessionId);
+
+      expect(() => repo.editRun(runId, "Reject the stale session PDF.", hash))
+        .toThrow(RepositoryConflictError);
+      expect(repo.getRun(runId)).toMatchObject({
+        status: "approved",
+        currentRevision: 1,
+        approvedPdfSha256: hash,
+      });
+      expect(repo.getRevision(runId, 2)).toBeNull();
+      expect(repo.getEditRequest(runId, 2)).toBeNull();
+    }
+  });
+
+  test("machine regeneration remains blocked after a matching application cancellation", () => {
+    const { repo } = fixture();
+    const hash = "8".repeat(64);
+    const runId = createReview(repo, hash, false, "cancelled-application-regenerate");
+    const sessionId = "04040404-0404-4404-8404-040404040404";
+    repo.approve(runId, hash);
+    repo.reserveApplicationSession(runId, null, sessionId, hash);
+    repo.recordApplicationSnapshot(runId, {
+      generation: 1,
+      sessionId,
+      bridgeState: "cancelled",
+      publicSnapshot: { state: "cancelled" },
+    });
+
+    expect(() => repo.regenerate(runId, hash)).toThrow(RepositoryConflictError);
+    expect(repo.getRun(runId)).toMatchObject({
+      status: "approved",
+      currentRevision: 1,
+      approvedPdfSha256: hash,
+    });
+    expect(repo.getRevision(runId, 2)).toBeNull();
+    expect(repo.getEditRequest(runId, 2)).toBeNull();
+  });
+
   test("approval rejects stale PDF and requires visual acknowledgement", () => {
     const { repo } = fixture();
     const hash = "9".repeat(64);
@@ -678,6 +870,83 @@ describe("application session ledger", () => {
 
     repo.deleteRun(next);
     expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+  });
+
+  test("selects an approved edited skip-review revision after its older session is closed", () => {
+    const { repo } = fixture();
+    const originalHash = "5".repeat(64);
+    const editedHash = "6".repeat(64);
+    const run = repo.createRun("JD", "automatic-edited", false, true, false);
+    const originalClaim = repo.acquire()!;
+    reachStage(repo, originalClaim, [
+      "analyzing",
+      "tailoring",
+      "compiling",
+      "deterministic_qa",
+      "visual_qa",
+    ]);
+    const originalAttempt = repo.startAttempt(originalClaim, "visual_qa");
+    repo.finalizeArtifact(originalClaim, {
+      attemptId: originalAttempt.id,
+      stage: "visual_qa",
+      kind: "compiled-pdf",
+      sha256: originalHash,
+      path: "/tmp/automatic-edited-original.pdf",
+      byteSize: 10,
+    });
+    repo.finishAttempt(originalClaim, originalAttempt.id, "succeeded");
+    repo.completeVisualQa(originalClaim, originalHash, false);
+    repo.release(originalClaim);
+
+    const originalSessionId = "14141414-1414-4414-8414-141414141414";
+    repo.reserveApplicationSession(run.id, null, originalSessionId, originalHash);
+    repo.recordApplicationSnapshot(run.id, {
+      generation: 1,
+      sessionId: originalSessionId,
+      bridgeState: "cancelled",
+      publicSnapshot: { state: "cancelled" },
+    });
+    repo.editRun(run.id, "Emphasize platform ownership.", originalHash);
+    repo.recordApplicationSnapshot(run.id, {
+      generation: 1,
+      sessionId: originalSessionId,
+      bridgeState: "closed",
+      publicSnapshot: { state: "closed" },
+    });
+
+    const editedClaim = repo.acquire()!;
+    expect(editedClaim.runId).toBe(run.id);
+    reachStage(repo, editedClaim, ["compiling", "deterministic_qa", "visual_qa"]);
+    const editedAttempt = repo.startAttempt(editedClaim, "visual_qa");
+    repo.finalizeArtifact(editedClaim, {
+      attemptId: editedAttempt.id,
+      stage: "visual_qa",
+      kind: "compiled-pdf",
+      sha256: editedHash,
+      path: "/tmp/automatic-edited-revision-2.pdf",
+      byteSize: 10,
+    });
+    repo.finishAttempt(editedClaim, editedAttempt.id, "succeeded");
+    repo.completeVisualQa(editedClaim, editedHash, false);
+    repo.release(editedClaim);
+
+    const blockerHash = "7".repeat(64);
+    const blockerRunId = createReview(repo, blockerHash, false, "manual-blocker");
+    repo.approve(blockerRunId, blockerHash);
+    const blockerSessionId = "15151515-1515-4515-8515-151515151515";
+    repo.reserveApplicationSession(blockerRunId, null, blockerSessionId, blockerHash);
+    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+    repo.recordApplicationSnapshot(blockerRunId, {
+      generation: 1,
+      sessionId: blockerSessionId,
+      bridgeState: "closed",
+      publicSnapshot: { state: "closed" },
+    });
+
+    expect(repo.getNextAutomaticApplicationStart()).toEqual({
+      runId: run.id,
+      approvedPdfSha256: editedHash,
+    });
   });
 
   test("claims before submission and finalizes one durable outcome atomically", () => {
