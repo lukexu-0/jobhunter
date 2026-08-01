@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
+import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 11;
+export const PIPELINE_SCHEMA_VERSION = 12;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -490,6 +491,35 @@ function migrateApplicationStatusDefaultPending(db: Database): void {
     );
   replaceRunsTable(db, upgradedRunsSql);
 }
+const migration12 = `
+ALTER TABLE run_claim RENAME TO run_claim_v11;
+
+CREATE TABLE run_claim (
+  id INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND ${RUN_CLAIM_CAPACITY}),
+  run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+  claim_token TEXT UNIQUE,
+  expires_at INTEGER,
+  CHECK ((run_id IS NULL AND claim_token IS NULL AND expires_at IS NULL) OR
+         (run_id IS NOT NULL AND claim_token IS NOT NULL AND expires_at IS NOT NULL))
+) STRICT;
+
+WITH RECURSIVE claim_slots(id) AS (
+  SELECT 1
+  UNION ALL
+  SELECT id + 1 FROM claim_slots WHERE id < ${RUN_CLAIM_CAPACITY}
+)
+INSERT INTO run_claim(id, run_id, claim_token, expires_at)
+SELECT
+  claim_slots.id,
+  CASE WHEN claim_slots.id = 1 THEN run_claim_v11.run_id ELSE NULL END,
+  CASE WHEN claim_slots.id = 1 THEN run_claim_v11.claim_token ELSE NULL END,
+  CASE WHEN claim_slots.id = 1 THEN run_claim_v11.expires_at ELSE NULL END
+FROM claim_slots
+LEFT JOIN run_claim_v11 ON run_claim_v11.id = 1;
+
+DROP TABLE run_claim_v11;
+`;
+
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
   const version = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
@@ -537,6 +567,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 11) {
         migrateApplicationSubmissionLedger(db, now);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(11, now);
+      }
+      if (version < 12) {
+        db.exec(migration12);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(12, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

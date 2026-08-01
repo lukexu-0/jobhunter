@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 
 export const CLAIM_TTL_MS = 60_000;
 export const CLAIM_HEARTBEAT_MS = 20_000;
+export const RUN_CLAIM_CAPACITY = 5;
 
 export interface RunClaim {
   readonly runId: string;
