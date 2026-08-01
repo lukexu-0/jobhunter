@@ -90,7 +90,7 @@ describe("allowlisted context ingestion", () => {
       { id: "jobhunter-resume-info-alias" },
       { entityId: "project:wrong" },
       { displayName: "Aliased Jobhunter resume information" },
-      { baselineEntityIds: ["Wrong baseline entity"] },
+      { baselineEntityIds: ["Jobhunter"] },
     ]) {
       const candidate = JSON.parse(JSON.stringify(parsed));
       const jobhunter = candidate.sources.find((source: { relativePath: string }) =>
@@ -170,7 +170,7 @@ describe("allowlisted context ingestion", () => {
         kind: "authoritative-markdown",
         entityId: "project:jobhunter",
         displayName: "Jobhunter resume information",
-        baselineEntityIds: ["Jobhunter"],
+        baselineEntityIds: ["Resume Tailoring and Application Agent"],
       });
       expect(snapshot.mustIncludeDirectives
         .filter((directive) => directive.sourceId === "jobhunter-resume-info")

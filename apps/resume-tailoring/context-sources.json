@@ -39,7 +39,7 @@
       "kind": "authoritative-markdown",
       "entityId": "project:jobhunter",
       "displayName": "Jobhunter resume information",
-      "baselineEntityIds": ["Jobhunter"]
+      "baselineEntityIds": ["Resume Tailoring and Application Agent"]
     }
   ],
   "explicitEntityBindings": {

@@ -50,7 +50,7 @@ const SOURCE_CONTRACTS: Readonly<Record<string, ContextSourceContract>> = Object
     kind: "authoritative-markdown",
     entityId: "project:jobhunter",
     displayName: "Jobhunter resume information",
-    baselineEntityIds: Object.freeze(["Jobhunter"]),
+    baselineEntityIds: Object.freeze(["Resume Tailoring and Application Agent"]),
   }),
 });
 const SOURCE_KEYS: Readonly<Record<string, true>> = Object.freeze({
