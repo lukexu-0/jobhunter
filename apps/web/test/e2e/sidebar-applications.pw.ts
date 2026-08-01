@@ -624,6 +624,73 @@ test("preserves auto-apply mode while confirming a duplicate canonical URL", asy
   }]);
 });
 
+test("confirms duplicate URLs before starting a multi-URL batch", async ({ page }) => {
+  const expectedUrls = [
+    "https://jobs.example.test/roles/existing",
+    "https://jobs.example.test/roles/new",
+  ];
+  const existingRun: RunDto = {
+    ...runFixture("batch-existing-run", "pending", "approved"),
+    jobUrl: expectedUrls[0],
+  };
+  const initializedRuns = new Map<string, RunDto>([
+    [expectedUrls[0], runFixture("batch-duplicate-run", "pending", "approved")],
+    [expectedUrls[1], runFixture("batch-new-run", "pending", "approved")],
+  ]);
+  const postedUrls: string[] = [];
+  let listRequestCount = 0;
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      listRequestCount += 1;
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          runs: listRequestCount === 1
+            ? [existingRun]
+            : [existingRun, ...initializedRuns.values()],
+        }),
+      });
+      return;
+    }
+
+    const body = request.postDataJSON() as {
+      jobUrl: string;
+      generateKeywordMap: boolean;
+    };
+    postedUrls.push(body.jobUrl);
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify(initializedRuns.get(body.jobUrl)),
+    });
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  await input.fill([
+    "HTTPS://Jobs.Example.Test:443/roles/existing#details,",
+    "https://jobs.example.test/roles/new",
+  ].join(" "));
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Initialize duplicate applications?" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText(
+    "One or more job posting URLs have already been used. Initialize these applications anyway?",
+    { exact: true },
+  )).toBeVisible();
+  expect(postedUrls).toEqual([]);
+
+  await dialog.getByRole("button", { name: "Initialize anyway" }).click();
+  await expect(page.getByRole("status")).toHaveText("2 applications initialized.");
+  expect([...postedUrls].sort()).toEqual([...expectedUrls].sort());
+  await expect(input).toHaveValue("");
+  await expect(page.locator("tbody tr")).toHaveCount(3);
+});
+
 test("initializes mixed comma and whitespace URLs concurrently, stays on the dashboard, and adds every run", async ({ page }) => {
   const expectedUrls = [
     "https://jobs.example.test/roles/alpha",

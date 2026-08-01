@@ -266,16 +266,6 @@ function versionTenDatabase(): Database {
       SELECT RAISE(ABORT, 'application session history cannot be deleted');
     END;
     INSERT INTO schema_migrations(version, applied_at) VALUES (10, 2000);
-    CREATE TABLE run_claim (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
-      claim_token TEXT,
-      expires_at INTEGER,
-      CHECK ((run_id IS NULL AND claim_token IS NULL AND expires_at IS NULL) OR
-             (run_id IS NOT NULL AND claim_token IS NOT NULL AND expires_at IS NOT NULL))
-    ) STRICT;
-    INSERT INTO run_claim(id, run_id, claim_token, expires_at)
-      VALUES (1, NULL, NULL, NULL);
     PRAGMA user_version = 10;
   `);
   return db;
@@ -283,20 +273,8 @@ function versionTenDatabase(): Database {
 
 function versionElevenDatabase(): Database {
   const db = versionTenDatabase();
-  migratePipelineDatabase(db, 2_500);
   db.exec(`
-    DROP TABLE run_claim;
-    CREATE TABLE run_claim (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
-      claim_token TEXT,
-      expires_at INTEGER,
-      CHECK ((run_id IS NULL AND claim_token IS NULL AND expires_at IS NULL) OR
-             (run_id IS NOT NULL AND claim_token IS NOT NULL AND expires_at IS NOT NULL))
-    ) STRICT;
-    INSERT INTO run_claim(id, run_id, claim_token, expires_at)
-      VALUES (1, NULL, NULL, NULL);
-    DELETE FROM schema_migrations WHERE version > 11;
+    INSERT INTO schema_migrations(version, applied_at) VALUES (11, 2500);
     PRAGMA user_version = 11;
   `);
   return db;
