@@ -3,6 +3,7 @@ import { bootstrapAgentRuntime } from "./agents/runner.ts";
 import { createPipelineApplication, type PipelineApplication } from "./bootstrap.ts";
 import { APPLICATION_AGENT_PATH } from "./api/application-agent-routes.ts";
 import { APPLICATION_EVENT_STREAM_PATH } from "./api/application-session-routes.ts";
+import { resolveBrowserHarnessToken } from "./system/harness-token.ts";
 
 const hostname = "127.0.0.1";
 const port = 3457;
@@ -40,7 +41,10 @@ export function startPipelineHttpServer(
 
 export async function main(): Promise<void> {
   bootstrapAgentRuntime();
-  const app = createPipelineApplication();
+  const browserHarnessToken = await resolveBrowserHarnessToken();
+  const app = createPipelineApplication(
+    browserHarnessToken === undefined ? {} : { browserHarnessToken },
+  );
   const server = startPipelineHttpServer(app);
   app.kick();
   console.log(`Resume pipeline listening on http://${hostname}:${port}`);
