@@ -9,7 +9,6 @@ export const DEFAULT_CONTEXT_MANIFEST_PATH = resolve(REPOSITORY_ROOT, "apps/resu
 export const CONTEXT_SOURCE_ALLOWLIST = Object.freeze([
   "apps/user-info/resume-main/Alex_Example_Resume.tex",
   "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
-  "apps/user-info/current-context/projects/sample-project-archive.md",
   "apps/user-info/current-context/projects/sample-project.md",
   "jobhunter-resume-info.md",
 ] as const);
@@ -30,13 +29,6 @@ const SOURCE_CONTRACTS: Readonly<Record<string, ContextSourceContract>> = Object
     entityId: "experience:example-company",
     displayName: "Sample Testing resume information",
     baselineEntityIds: Object.freeze(["Example Company"]),
-  }),
-  "apps/user-info/current-context/projects/sample-project-archive.md": Object.freeze({
-    id: "sample-project-archive",
-    kind: "authoritative-markdown",
-    entityId: "project:sample-project-archive",
-    displayName: "Sample Project Archive",
-    baselineEntityIds: Object.freeze(["Sample Project Archive"]),
   }),
   "apps/user-info/current-context/projects/sample-project.md": Object.freeze({
     id: "sample-project",
@@ -133,10 +125,10 @@ export function loadContextManifest(
   if (parsed.version !== 1) throw new Error("Context manifest version must be 1");
   if (!Array.isArray(parsed.sources)) throw new Error("Context manifest sources must be an array");
   const sources = parsed.sources.map(parseSource);
-  if (sources.length !== CONTEXT_SOURCE_ALLOWLIST.length) throw new Error("Context manifest must contain exactly five sources");
+  if (sources.length !== CONTEXT_SOURCE_ALLOWLIST.length) throw new Error("Context manifest must contain exactly four sources");
   const paths = sources.map((source) => source.relativePath);
   if (new Set(paths).size !== paths.length || paths.some((path) => !SOURCE_CONTRACTS[path]) || CONTEXT_SOURCE_ALLOWLIST.some((path) => !paths.includes(path))) {
-    throw new Error("Context manifest sources do not match the literal five-file allowlist");
+    throw new Error("Context manifest sources do not match the literal four-file allowlist");
   }
   if (sources.filter((source) => source.kind === "baseline").length !== 1 || sources.find((source) => source.kind === "baseline")?.relativePath !== CONTEXT_SOURCE_ALLOWLIST[0]) {
     throw new Error("Context manifest must identify the canonical resume as its sole baseline");

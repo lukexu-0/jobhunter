@@ -180,7 +180,6 @@ describe("persisted workflow commands", () => {
         sourceHashes: {
           baseline: "2".repeat(64),
           automated: "3".repeat(64),
-          scheduler: "4".repeat(64),
           sampleProject: "5".repeat(64),
           jobhunter: "6".repeat(64),
         },
@@ -251,7 +250,7 @@ describe("persisted workflow commands", () => {
     expect(repo.acquire()?.runId).toBe(successor.id);
   });
 
-  test("stores one immutable five-source snapshot, rejects invalid snapshots, and detects drift", () => {
+  test("stores one immutable four-source snapshot, rejects invalid snapshots, and detects drift", () => {
     const { db, repo } = fixture();
     const run = repo.createRun("JD");
     const snapshot = {
@@ -260,7 +259,6 @@ describe("persisted workflow commands", () => {
       sourceHashes: {
         baseline: "2".repeat(64),
         automated: "3".repeat(64),
-        scheduler: "4".repeat(64),
         sampleProject: "5".repeat(64),
         jobhunter: "6".repeat(64),
       },
@@ -270,18 +268,17 @@ describe("persisted workflow commands", () => {
       sourceHashes: {
         baseline: "2".repeat(64),
         automated: "3".repeat(64),
-        scheduler: "4".repeat(64),
         sampleProject: "5".repeat(64),
       },
-    })).toThrow("exactly five authoritative SHA-256 hashes");
+    })).toThrow("exactly four authoritative SHA-256 hashes");
     expect(() => repo.attachSourceSnapshot(run.id, {
       ...snapshot,
       sourceHashes: { ...snapshot.sourceHashes, untrusted: "7".repeat(64) },
-    })).toThrow("exactly five authoritative SHA-256 hashes");
+    })).toThrow("exactly four authoritative SHA-256 hashes");
     expect(() => repo.attachSourceSnapshot(run.id, {
       ...snapshot,
       sourceHashes: { ...snapshot.sourceHashes, jobhunter: "A".repeat(64) },
-    })).toThrow("exactly five authoritative SHA-256 hashes");
+    })).toThrow("exactly four authoritative SHA-256 hashes");
     expect(() => repo.attachSourceSnapshot(run.id, {
       ...snapshot,
       manifestSha256: "A".repeat(64),

@@ -41,7 +41,13 @@ function loadFixture(root: string) {
 }
 
 describe("allowlisted context ingestion", () => {
-  test("accepts exactly the literal five sources and rejects additions, omissions, duplicates, substitution, or traversal", () => {
+  test("accepts exactly the literal four sources and rejects additions, omissions, duplicates, substitution, or traversal", () => {
+    expect(CONTEXT_SOURCE_ALLOWLIST).toEqual([
+      "apps/user-info/resume-main/Alex_Example_Resume.tex",
+      "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
+      "apps/user-info/current-context/projects/sample-project.md",
+      "jobhunter-resume-info.md",
+    ]);
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
     expect(loaded.manifest.sources.map((source) => source.relativePath)).toEqual([...CONTEXT_SOURCE_ALLOWLIST]);
@@ -50,12 +56,12 @@ describe("allowlisted context ingestion", () => {
     const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
     parsed.sources.push({ ...parsed.sources[1], id: "untrusted", relativePath: "actual/other.md" });
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("exactly five sources");
+    expect(() => loadFixture(root)).toThrow("exactly four sources");
 
     parsed.sources.pop();
     const missing = parsed.sources.pop();
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("exactly five sources");
+    expect(() => loadFixture(root)).toThrow("exactly four sources");
 
     parsed.sources.push(missing);
     const originalSecondId = parsed.sources[1].id;
@@ -66,15 +72,15 @@ describe("allowlisted context ingestion", () => {
     parsed.sources[1].id = originalSecondId;
     parsed.sources[1].relativePath = parsed.sources[0].relativePath;
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+    expect(() => loadFixture(root)).toThrow("literal four-file allowlist");
 
     parsed.sources[1].relativePath = "actual/other.md";
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+    expect(() => loadFixture(root)).toThrow("literal four-file allowlist");
 
     parsed.sources[1].relativePath = "../outside.md";
     writeFileSync(manifestPath, JSON.stringify(parsed));
-    expect(() => loadFixture(root)).toThrow("literal five-file allowlist");
+    expect(() => loadFixture(root)).toThrow("literal four-file allowlist");
   });
 
   test("preserves source order flexibility while rejecting literal source metadata aliases", () => {
@@ -141,7 +147,7 @@ describe("allowlisted context ingestion", () => {
       const firstSnapshot = createContextSnapshot(database, loaded);
       syncContext(database, loaded, 200);
       const secondSnapshot = createContextSnapshot(database, loaded);
-      expect(first.sourceCount).toBe(5);
+      expect(first.sourceCount).toBe(4);
       expect(firstSnapshot.evidence.map((block) => block.id)).toEqual(secondSnapshot.evidence.map((block) => block.id));
       expect(Object.fromEntries(CONTEXT_SOURCE_ALLOWLIST.map((path) => [path, sha256(readFileSync(join(root, path)))]))).toEqual(before);
       expect(() => database.query("UPDATE source_versions SET indexed_at = 9").run()).toThrow("immutable");
@@ -149,9 +155,9 @@ describe("allowlisted context ingestion", () => {
 
       const changedPath = join(root, CONTEXT_SOURCE_ALLOWLIST[2]);
       writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nAdditional bounded fact.\n`);
-      expect(checkContextFreshness(database, loaded).staleSources).toEqual(["sample-project-archive"]);
+      expect(checkContextFreshness(database, loaded).staleSources).toEqual(["sample-project"]);
       syncContext(database, loaded, 300);
-      const versions = database.query<{ count: number }, []>("SELECT count(*) AS count FROM source_versions WHERE source_id = 'sample-project-archive'").get();
+      const versions = database.query<{ count: number }, []>("SELECT count(*) AS count FROM source_versions WHERE source_id = 'sample-project'").get();
       expect(versions?.count).toBe(2);
     } finally {
       database.close();
@@ -207,7 +213,7 @@ describe("allowlisted context ingestion", () => {
     try {
       syncContext(database, loaded);
       const snapshot = createContextSnapshot(database, loaded);
-      expect(Object.keys(snapshot.sourceHashes)).toHaveLength(5);
+      expect(Object.keys(snapshot.sourceHashes)).toHaveLength(4);
       expect(snapshot.sources.find((source) => source.id === "jobhunter-resume-info")).toMatchObject({
         relativePath: "jobhunter-resume-info.md",
         kind: "authoritative-markdown",
@@ -235,13 +241,12 @@ describe("allowlisted context ingestion", () => {
   test("projects trusted Must Include directives from active authoritative evidence", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
-    const [baseline, requiredSource, nonmatchingSource, sentinelSource, neutralizedSource] = loaded.manifest.sources;
+    const [baseline, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
     const requiredText = "Keep the Jobhunter framing.\n- Preserve exact directive provenance.";
     writeFileSync(join(root, baseline!.relativePath), "## 21. Must Include\nBaseline content is not a directive.\n");
     writeFileSync(join(root, requiredSource!.relativePath), `# Required\n## 21. Must Include\n${requiredText}\n`);
     writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 22. Must Include\nA nonmatching heading is not a directive.\n");
     writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
-    writeFileSync(join(root, neutralizedSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
@@ -315,11 +320,10 @@ describe("allowlisted context ingestion", () => {
   test("keeps directive heading and sentinel matching exact", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
-    const [, requiredSource, nonmatchingSource, sentinelSource, neutralizedSource] = loaded.manifest.sources;
+    const [, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
     writeFileSync(join(root, requiredSource!.relativePath), "# Context\n## Must Include\nUnnumbered requirement.\n## 21. Must Include\nnone specified\n");
     writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 21. Must Include Extra\nNot a matching heading.\n");
     writeFileSync(join(root, sentinelSource!.relativePath), "# Context\n## Must Include\nNone   specified\n");
-    writeFileSync(join(root, neutralizedSource!.relativePath), "# Context\n## 21. Must Include\nNone specified\n");
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
@@ -385,7 +389,7 @@ describe("allowlisted context ingestion", () => {
       syncContext(database, loaded);
       const snapshot = createContextSnapshot(database, loaded);
       expect(verifyContextSnapshot(snapshot, loaded)).toEqual({ valid: true, manifestChanged: false, changedSources: [] });
-      const sourcePath = join(root, CONTEXT_SOURCE_ALLOWLIST[3]);
+      const sourcePath = join(root, CONTEXT_SOURCE_ALLOWLIST[2]);
       writeFileSync(sourcePath, `${readFileSync(sourcePath, "utf8")}\nDrift\n`);
       expect(verifyContextSnapshot(snapshot, loaded)).toEqual({
         valid: false,

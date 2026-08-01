@@ -18,7 +18,6 @@ const SOURCE_SNAPSHOT = {
   sourceHashes: {
     baseline: "2".repeat(64),
     automated: "3".repeat(64),
-    scheduler: "4".repeat(64),
     sampleProject: "5".repeat(64),
     jobhunter: "6".repeat(64),
   },

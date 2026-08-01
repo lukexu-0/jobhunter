@@ -83,18 +83,6 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       indexedAt: 1,
     },
     {
-      id: "source-reward-scheduler",
-      relativePath: "authoritative-reward-scheduler.md",
-      kind: "authoritative-markdown",
-      entityId: "project:sample-project-archive",
-      displayName: "Synthetic reward scheduler context",
-      baselineEntityIds: ["Sample Project Archive"],
-      sourceVersionId: "version-reward-scheduler",
-      sha256: "c".repeat(64),
-      bytes: 10,
-      indexedAt: 1,
-    },
-    {
       id: "source-sample-project",
       relativePath: "authoritative-sample-project.md",
       kind: "authoritative-markdown",
@@ -121,9 +109,9 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
   ];
   const sourceIndexByEntity: Readonly<Record<string, number>> = {
     "Example Company": 1,
-    [JOBHUNTER_PROJECT_TITLE]: 4,
-    "Sample Project": 3,
-    SampleProject: 3,
+    [JOBHUNTER_PROJECT_TITLE]: 3,
+    "Sample Project": 2,
+    SampleProject: 2,
   };
   const evidence: EvidenceBlock[] = parsedBaseline.entities.map((entity, index) => {
     const source = sources[sourceIndexByEntity[entity.entityId] ?? 0]!;
@@ -143,7 +131,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       sha256: source.sha256,
     };
   });
-  const jobhunterSource = sources[4]!;
+  const jobhunterSource = sources[3]!;
   const jobhunterDirectiveEvidence: EvidenceBlock[] = [
     "- Include the **Browser Use** harness.",
     "- Include the **OpenAI Agents SDK**.",
@@ -778,7 +766,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     const replacedEvidence = baseFixture.snapshot.evidence.find((evidence) =>
       evidence.entityId === competition.entityId)!;
     const existingSource = baseFixture.snapshot.sources.find((candidate) =>
-      candidate.id === "source-reward-scheduler")!;
+      candidate.id === "source-sample-project")!;
     const source: IndexedContextSource = {
       ...existingSource,
       baselineEntityIds: [...existingSource.baselineEntityIds, competition.entityId],

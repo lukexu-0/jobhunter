@@ -68,7 +68,7 @@ describe("ContextApplicationService", () => {
         manifestMatches: true,
         staleSources: [],
         missingSources: [],
-        sourceCount: 5,
+        sourceCount: 4,
         changedSources: loadedManifest.manifest.sources.map((source) => source.id),
       });
       expect(service.getContext()).toEqual({
@@ -83,7 +83,7 @@ describe("ContextApplicationService", () => {
     }
   });
 
-  test("creates a fresh snapshot containing exactly the five indexed source hashes", () => {
+  test("creates a fresh snapshot containing exactly the four indexed source hashes", () => {
     const { root, loadedManifest } = createRepositoryFixture();
     const expectedHashes = Object.fromEntries(loadedManifest.manifest.sources.map((source) => [
       source.id,
@@ -95,7 +95,7 @@ describe("ContextApplicationService", () => {
       service.syncContext();
       const snapshot = service.createSnapshot();
       expect(snapshot.sourceHashes).toEqual(expectedHashes);
-      expect(Object.keys(snapshot.sourceHashes)).toHaveLength(5);
+      expect(Object.keys(snapshot.sourceHashes)).toHaveLength(4);
       expect(snapshot.sources.map((source) => source.id)).toEqual(loadedManifest.manifest.sources.map((source) => source.id));
     } finally {
       service.close();
