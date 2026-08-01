@@ -201,7 +201,7 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
-  test("synchronizes the Jobhunter source and exposes its two directives alongside Sample Testing", () => {
+  test("synchronizes the Jobhunter source and exposes its three directives alongside Sample Testing", () => {
     const loaded = loadContextManifest();
     const database = openContextDatabase(":memory:");
     try {
@@ -220,6 +220,7 @@ describe("allowlisted context ingestion", () => {
         .map((directive) => directive.text)).toEqual([
         "- Include the **Browser Use** harness.",
         "- Include the **OpenAI Agents SDK**.",
+        "- Include the user-reported impact: **saved over 100 hours rewriting resumes and applying to jobs**.",
       ]);
       expect(snapshot.mustIncludeDirectives
         .filter((directive) => directive.sourceId === "automated-testing-resume-info")

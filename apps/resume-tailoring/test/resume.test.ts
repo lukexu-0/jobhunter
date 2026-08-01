@@ -230,9 +230,9 @@ describe("strict resume contracts", () => {
     const jobhunter = projects.find((item) => item.entityId === "Resume Tailoring and Application Agent");
     expect(jobhunter?.headingArguments[1]).toBe("Jan 2020 -- Present");
     expect(jobhunter?.bullets.map((item) => item.text)).toEqual([
-      "Local agent converts job postings into evidence-backed, ATS-aligned one-page resumes and human-reviewed application workflows.",
-      "OpenAI Agents SDK orchestration coordinates ATS extraction, analysis, tailoring, and bounded compile repair with source provenance, revision lineage, and deterministic and visual QA.",
-      "Python Browser Use harness runs inside a Bubblewrap sandbox with exact-origin navigation and human approval gates, limiting submission to one explicit final click without automatic retries.",
+      "Saved over 100 hours rewriting resumes and applying to jobs by building a local agent that produces evidence-backed, ATS-aligned one-page resumes and human-reviewed application workflows.",
+      "Orchestrated ATS extraction, analysis, tailoring, and bounded compile repair with the OpenAI Agents SDK, preserving source provenance and revision lineage through deterministic and visual QA.",
+      "Engineered a Python Browser Use harness with Bubblewrap sandboxing, exact-origin navigation, human approval gates, and one-shot submission controls without automatic retries.",
     ]);
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");

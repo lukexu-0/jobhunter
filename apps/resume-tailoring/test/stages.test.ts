@@ -147,6 +147,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
   const jobhunterDirectiveEvidence: EvidenceBlock[] = [
     "- Include the **Browser Use** harness.",
     "- Include the **OpenAI Agents SDK**.",
+    "- Include the user-reported impact: **saved over 100 hours rewriting resumes and applying to jobs**.",
   ].map((text, index) => ({
     id: `jobhunter-directive-${index}`,
     sourceVersionId: jobhunterSource.sourceVersionId,
@@ -517,7 +518,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       sourceId: jobhunterSource.id,
       entityId: JOBHUNTER_ENTITY_ID,
     });
-    expect(snapshot.mustIncludeDirectives).toHaveLength(2);
+    expect(snapshot.mustIncludeDirectives).toHaveLength(3);
     expect(snapshot.mustIncludeDirectives.every((directive) =>
       directive.sourceId === jobhunterSource.id
       && directive.entityId === JOBHUNTER_ENTITY_ID)).toBe(true);
@@ -1174,7 +1175,12 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     await processToStop(harness);
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
     expect(harness.agentInputs.tailoring[0]?.mustIncludeEvidenceIds)
-      .toEqual(["jobhunter-directive-0", "jobhunter-directive-1", ACTIVE_DIRECTIVE_EVIDENCE_ID]);
+      .toEqual([
+        "jobhunter-directive-0",
+        "jobhunter-directive-1",
+        "jobhunter-directive-2",
+        ACTIVE_DIRECTIVE_EVIDENCE_ID,
+      ]);
     const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
     harness.repository.editRun(
       harness.runId,
