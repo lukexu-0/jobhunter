@@ -520,7 +520,7 @@ class SessionCreateRequest(FrozenPrivateModel):
     session_id: UUID
     job_url: StrictText
     approved_origins: tuple[StrictText, ...] = Field(min_length=1, max_length=20)
-    auto_apply: bool
+    auto_submit: bool
     max_steps: int = Field(default=100, ge=1, le=500)
     artifacts: UploadedArtifacts
     direct_fields: tuple[tuple[StrictText, StrictText], ...] = ()

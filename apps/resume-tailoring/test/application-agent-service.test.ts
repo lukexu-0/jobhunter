@@ -22,7 +22,7 @@ const INPUT: ApplicationAgentRunInput = {
   task: `Apply using ${DIRECT_VALUE}`,
   maxTurns: 42,
   deadlineMs: 60_000,
-  autoApply: false,
+  autoSubmit: false,
 };
 
 const RESULT: ApplicationRunResult = {

@@ -131,7 +131,7 @@ def make_gate(
     action_timeout: float = 1,
     review_snapshot: Any = None,
     user_info_store: Any = None,
-    auto_apply: bool = False,
+    auto_submit: bool = False,
 ) -> tuple[HumanGate, EventPublisher]:
     publisher = publisher or EventPublisher()
     origins = approved_origins or [JOB_ORIGIN]
@@ -142,7 +142,7 @@ def make_gate(
         approved_origins=origins,
         publish=publisher,
         review_snapshot=review_snapshot,
-        auto_apply=auto_apply,
+        auto_submit=auto_submit,
         action_timeout=action_timeout,
     )
     return gate, publisher
@@ -262,7 +262,7 @@ def make_request(tmp_path: Path, *, max_steps: int = 3) -> ApplicationRunRequest
         session_id=SESSION_ID,
         job_url=JOB_URL,
         approved_origins=(JOB_ORIGIN,),
-        auto_apply=False,
+        auto_submit=False,
         max_steps=max_steps,
         artifacts=artifacts,
     )
@@ -536,7 +536,7 @@ async def test_auto_review_immediately_authorizes_only_fully_resolved_applicatio
         snapshots.append(result)
 
     gate, publisher = make_gate(
-        auto_apply=True,
+        auto_submit=True,
         review_snapshot=capture_snapshot,
     )
     browser = FakeBrowserSession("https://jobs.example/apply?secret=yes")
@@ -568,7 +568,7 @@ async def test_auto_review_immediately_authorizes_only_fully_resolved_applicatio
         unresolved_snapshots.append(result)
 
     unresolved_gate, unresolved_publisher = make_gate(
-        auto_apply=True,
+        auto_submit=True,
         review_snapshot=capture_unresolved_snapshot,
     )
     unresolved = ReviewApplicationResult.model_validate(

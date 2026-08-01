@@ -177,7 +177,7 @@ describe("HttpApplicationHarnessClient", () => {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123?source=local",
       personalInformationMarkdown: "# Applicant\n\nPrivate profile",
-      autoApply: true,
+      autoSubmit: true,
       resumePdf,
     }, signal)).resolves.toBeUndefined();
 
@@ -197,14 +197,14 @@ describe("HttpApplicationHarnessClient", () => {
     expect([...form.keys()]).toEqual([
       "session_id",
       "job_url",
-      "auto_apply",
+      "auto_submit",
       "personal_information",
       "resume",
       "max_steps",
     ]);
     expect(form.get("session_id")).toBe(SESSION_ID);
     expect(form.get("job_url")).toBe("https://jobs.private.example/roles/123?source=local");
-    expect(form.get("auto_apply")).toBe("true");
+    expect(form.get("auto_submit")).toBe("true");
     expect(form.get("max_steps")).toBe("100");
     const profile = form.get("personal_information");
     const resume = form.get("resume");
@@ -247,12 +247,12 @@ describe("HttpApplicationHarnessClient", () => {
     await client.create({
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
-      autoApply: false,
+      autoSubmit: false,
       personalInformationMarkdown: "# Applicant",
       resumePdf: new TextEncoder().encode("%PDF-private"),
     }, new AbortController().signal);
 
-    expect(form?.get("auto_apply")).toBe("false");
+    expect(form?.get("auto_submit")).toBe("false");
   });
   test("accepts fixed create routes advertised through an equivalent loopback alias", async () => {
     const client = new HttpApplicationHarnessClient({
@@ -270,7 +270,7 @@ describe("HttpApplicationHarnessClient", () => {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
       personalInformationMarkdown: "# Applicant",
-      autoApply: false,
+      autoSubmit: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
     }, new AbortController().signal)).resolves.toBeUndefined();
   });
@@ -280,7 +280,7 @@ describe("HttpApplicationHarnessClient", () => {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
       personalInformationMarkdown: "# Applicant",
-      autoApply: false,
+      autoSubmit: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
     };
     const invalidBodies = [
@@ -692,7 +692,7 @@ describe("HttpApplicationHarnessClient", () => {
     const createInput = {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
-      autoApply: false,
+      autoSubmit: false,
       personalInformationMarkdown: "# Applicant",
       resumePdf: new TextEncoder().encode("%PDF-private"),
     };

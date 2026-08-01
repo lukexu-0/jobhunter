@@ -135,7 +135,7 @@ class PipelineApplicationAgentClient:
         self,
         *,
         runtime_url: str,
-        auto_apply: bool,
+        auto_submit: bool,
         task: str,
         max_turns: int,
         deadline_ms: int,
@@ -143,8 +143,8 @@ class PipelineApplicationAgentClient:
         runtime_origin = _normalize_loopback_origin(
             runtime_url, name="runtime_url"
         )
-        if type(auto_apply) is not bool:
-            raise ValueError("auto_apply is invalid")
+        if type(auto_submit) is not bool:
+            raise ValueError("auto_submit is invalid")
         _validate_utf8_text(task, name="task", max_bytes=1_048_576)
         if type(max_turns) is not int or not 1 <= max_turns <= 500:
             raise ValueError("max_turns is invalid")
@@ -159,7 +159,7 @@ class PipelineApplicationAgentClient:
                 "sessionId": str(self._session_id),
                 "runtimeUrl": runtime_origin,
                 "task": task,
-                "autoApply": auto_apply,
+                "autoSubmit": auto_submit,
                 "maxTurns": max_turns,
                 "deadlineMs": deadline_ms,
             },

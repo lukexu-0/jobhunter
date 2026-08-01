@@ -411,7 +411,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             session_id=_CALLER_SESSION_ID,
             job_url=fixture.posting_url,
             allow_domains=[],
-            auto_apply=True,
+            auto_submit=True,
             max_steps=20,
             personal_information=personal,
             resume=resume,

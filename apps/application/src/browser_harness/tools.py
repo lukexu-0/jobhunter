@@ -311,7 +311,7 @@ class HumanGate:
         approved_origins: Sequence[str],
         publish: GateEventPublisher,
         review_snapshot: ReviewSnapshotSink | None = None,
-        auto_apply: bool = False,
+        auto_submit: bool = False,
         action_timeout: float = 3_600,
     ) -> None:
         canonical_origins = [validate_approved_origin(origin) for origin in approved_origins]
@@ -321,8 +321,8 @@ class HumanGate:
             raise ValueError("approved origins must be unique")
         if action_timeout <= 0:
             raise ValueError("action_timeout must be positive")
-        if type(auto_apply) is not bool:
-            raise ValueError("auto_apply must be a boolean")
+        if type(auto_submit) is not bool:
+            raise ValueError("auto_submit must be a boolean")
         self._job_url = validate_job_url(job_url)
         self._approved_origins = canonical_origins
         self._redaction_values = {
@@ -333,7 +333,7 @@ class HumanGate:
         self._user_info_store = user_info_store
         self._publish = publish
         self._review_snapshot = review_snapshot
-        self._auto_apply = auto_apply
+        self._auto_submit = auto_submit
         self._action_timeout = action_timeout
         self._lock = asyncio.Lock()
         self._pending: _PendingGate | None = None
@@ -476,7 +476,7 @@ class HumanGate:
         )
         if self._review_snapshot is not None:
             await self._review_snapshot(review_result)
-        if not self._auto_apply:
+        if not self._auto_submit:
             decision, context = await self._wait_for_gate(
                 kind="review",
                 browser_session=browser_session,

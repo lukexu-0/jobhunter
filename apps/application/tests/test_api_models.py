@@ -134,7 +134,7 @@ class FakeSessionService:
         session_id: UUID | None,
         job_url: str,
         allow_domains: Sequence[str],
-        auto_apply: bool,
+        auto_submit: bool,
         max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
@@ -148,7 +148,7 @@ class FakeSessionService:
                 "session_id": session_id,
                 "job_url": job_url,
                 "allow_domains": list(allow_domains),
-                "auto_apply": auto_apply,
+                "auto_submit": auto_submit,
                 "max_steps": max_steps,
                 "personal_information": (
                     personal_information.filename,
@@ -228,7 +228,7 @@ def multipart_parts(
     anecdotes: int = 0,
     max_steps: int | str = 100,
     session_id: UUID | str | None = None,
-    auto_apply: bool | str | None = None,
+    auto_submit: bool | str | None = None,
 ) -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
     parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]] = [
         ("job_url", (None, "https://jobs.example/openings/42?source=board")),
@@ -239,8 +239,8 @@ def multipart_parts(
         ),
         ("resume", ("resume.pdf", b"%PDF-1.7 synthetic", "application/pdf")),
     ]
-    if auto_apply is not None:
-        parts.insert(0, ("auto_apply", (None, str(auto_apply).lower())))
+    if auto_submit is not None:
+        parts.insert(0, ("auto_submit", (None, str(auto_submit).lower())))
     if session_id is not None:
         parts.insert(0, ("session_id", (None, str(session_id))))
     parts.extend(("allow_domain", (None, domain)) for domain in domains)
@@ -839,7 +839,7 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
         headers=AUTHORIZATION,
         files=multipart_parts(
             session_id=SESSION_ID,
-            auto_apply=True,
+            auto_submit=True,
             domains=("https://jobs.example", "https://ats.example"),
             contexts=2,
             anecdotes=2,
@@ -859,7 +859,7 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
     assert call["session_id"] == SESSION_ID
     assert call["job_url"] == "https://jobs.example/openings/42?source=board"
     assert call["allow_domains"] == ["https://jobs.example", "https://ats.example"]
-    assert call["auto_apply"] is True
+    assert call["auto_submit"] is True
     assert call["max_steps"] == 321
     assert call["personal_information"] == (
         "profile.md",
@@ -889,7 +889,7 @@ async def test_multipart_omits_optional_caller_session_id(
 
     assert response.status_code == 202
     assert service.create_calls[0]["session_id"] is None
-    assert service.create_calls[0]["auto_apply"] is False
+    assert service.create_calls[0]["auto_submit"] is False
 
 
 async def test_multipart_rejects_invalid_caller_session_id_before_dispatch(
@@ -911,7 +911,7 @@ async def test_multipart_rejects_invalid_caller_session_id_before_dispatch(
     assert service.create_calls == []
 
 
-async def test_multipart_rejects_non_boolean_auto_apply_before_dispatch(
+async def test_multipart_rejects_non_boolean_auto_submit_before_dispatch(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
 ) -> None:
     client, service = api_client
@@ -919,7 +919,7 @@ async def test_multipart_rejects_non_boolean_auto_apply_before_dispatch(
     response = await client.post(
         "/v1/sessions",
         headers=AUTHORIZATION,
-        files=multipart_parts(auto_apply="yes"),
+        files=multipart_parts(auto_submit="yes"),
     )
 
     assert response.status_code == 422

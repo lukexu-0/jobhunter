@@ -580,14 +580,14 @@ async def create_valid(
     manager: ApplicationSessionManager,
     *,
     session_id: UUID | None = None,
-    auto_apply: bool = False,
+    auto_submit: bool = False,
 ):
     personal, resume = valid_uploads()
     return await manager.create_session(
         session_id=session_id,
         job_url=JOB_URL,
         allow_domains=[],
-        auto_apply=auto_apply,
+        auto_submit=auto_submit,
         max_steps=100,
         personal_information=personal,
         resume=resume,
@@ -967,7 +967,7 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
         return submitted_result(revision_count=gate.revision_count)
 
     manager, fakes, root = make_manager(tmp_path, runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
     record = manager._active
     assert record is not None and record.browser is not None and record.human_gate is not None
@@ -2247,7 +2247,7 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     created = await manager.create_session(
         job_url=private_job_url,
         allow_domains=[],
-        auto_apply=True,
+        auto_submit=True,
         max_steps=100,
         personal_information=personal,
         resume=upload("resume.pdf", pdf_bytes()),
@@ -3112,7 +3112,7 @@ async def test_runtime_review_auto_approves_and_seals_runtime(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
@@ -3214,7 +3214,7 @@ async def test_submit_execution_failure_parks_uncertainty_without_cleanup(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
@@ -3267,7 +3267,7 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
@@ -3315,7 +3315,7 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
@@ -3393,7 +3393,7 @@ async def test_submit_latch_wins_a_queued_model_failure(
         )
 
     manager, fakes, _ = make_manager(tmp_path, runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_until(
         lambda: manager._active is not None
         and manager._active.human_gate is not None
@@ -3455,7 +3455,7 @@ async def test_post_action_model_failures_park_uncertainty(
         raise AssertionError("unreachable")
 
     manager, fakes, _ = make_manager(tmp_path, runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     record = manager._active
     assert record is not None and record.human_gate is not None
     await wait_until(lambda: record.human_gate.submission_approved)
@@ -3494,7 +3494,7 @@ async def test_failure_after_approval_but_before_submit_action_is_ordinary_faile
         )
 
     manager, fakes, _ = make_manager(tmp_path, runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "failed")
 
     snapshot = manager.get_snapshot(created.session_id)
@@ -3509,7 +3509,7 @@ async def test_runtime_review_rejects_unresolved_fields_without_approval(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager, auto_apply=True)
+    created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
@@ -3723,12 +3723,12 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     call = fakes.models[0].run_calls[0]
     assert set(call) == {
         "runtime_url",
-        "auto_apply",
+        "auto_submit",
         "task",
         "max_turns",
         "deadline_ms",
     }
-    assert call["auto_apply"] is False
+    assert call["auto_submit"] is False
     assert call["runtime_url"] == "http://127.0.0.1:8765"
     task = json.loads(call["task"])
     assert task["job"]["url"] == JOB_URL
@@ -3747,8 +3747,8 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
         }
     }
     assert "question" not in call["task"]
-    assert "auto_apply" not in call["task"]
-    assert "autoApply" not in call["task"]
+    assert "auto_submit" not in call["task"]
+    assert "autoSubmit" not in call["task"]
     assert "updated_at" not in call["task"]
     assert task["evidence"][0]["category"] == "resume"
     assert "workflow" not in call["task"].lower()

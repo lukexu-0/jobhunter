@@ -72,7 +72,7 @@ export interface ApplicationHarnessClientOptions {
 export interface ApplicationHarnessCreateInput {
   readonly sessionId: string;
   readonly jobUrl: string;
-  readonly autoApply: boolean;
+  readonly autoSubmit: boolean;
   readonly personalInformationMarkdown: string;
   readonly resumePdf: Uint8Array;
 }
@@ -859,7 +859,7 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     if (
       !sessionId.success
       || !isHarnessJobUrl(input.jobUrl)
-      || typeof input.autoApply !== "boolean"
+      || typeof input.autoSubmit !== "boolean"
       || profileBytes < 1
       || profileBytes > 1024 * 1024
       || !(input.resumePdf instanceof Uint8Array)
@@ -872,7 +872,7 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     const form = new FormData();
     form.set("session_id", sessionId.data);
     form.set("job_url", input.jobUrl);
-    form.set("auto_apply", input.autoApply ? "true" : "false");
+    form.set("auto_submit", input.autoSubmit ? "true" : "false");
     form.set(
       "personal_information",
       new File([input.personalInformationMarkdown], "applicant-profile.md", {
