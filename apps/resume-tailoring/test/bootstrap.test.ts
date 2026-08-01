@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthRouteService } from "../src/api/auth-routes.ts";
 import type { ApplicationAgentRouteService } from "../src/agents/application-agent-service.ts";
-import { createPipelineApplication, type PipelineWorkerHandle } from "../src/bootstrap.ts";
+import {
+  createPipelineApplication,
+  type PipelineApplicationOptions,
+  type PipelineWorkerHandle,
+} from "../src/bootstrap.ts";
 import {
   loadJobSourceFromUrl,
   type LoadedJobSource,
@@ -43,6 +47,8 @@ interface IngestionOverrides {
     repository: PipelineRepository,
     database: Database,
   ) => void;
+  readonly useDefaultWorker?: boolean;
+  readonly workerOptions?: PipelineApplicationOptions["workerOptions"];
 }
 
 function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {}) {
@@ -122,7 +128,9 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     repository,
     artifacts,
     context,
-    worker,
+    ...(ingestion.useDefaultWorker
+      ? (ingestion.workerOptions ? { workerOptions: ingestion.workerOptions } : {})
+      : { worker }),
     auth,
     ...(runs ? { runs } : {}),
     ...(ingestion.browserHarnessToken
@@ -381,7 +389,7 @@ describe("pipeline application bootstrap", () => {
           task: "Complete the application",
           maxTurns: 25,
           deadlineMs: 30_000,
-          autoApply: false,
+          autoSubmit: false,
         }),
       }),
     );
@@ -471,7 +479,7 @@ describe("pipeline application bootstrap", () => {
     await fixture.app.close();
   });
 
-  test("an empty startup kick composes injected maintenance before retention without constructing providers", async () => {
+  test("an empty startup kick runs automatic application startup after injected maintenance and retention", async () => {
     const pipelineDatabase = openPipelineDatabase(":memory:");
     const contextDatabase = openContextDatabase(":memory:");
     const artifactRoot = join(mkdtempSync(join(tmpdir(), "pipeline-empty-startup-")), "runs");
@@ -522,12 +530,52 @@ describe("pipeline application bootstrap", () => {
       maintenanceOrder.push(`retention:${retainCount}`);
       return reserveCandidates(retainCount);
     };
+    let signalAutomaticStart!: () => void;
+    const automaticStart = new Promise<void>((resolve) => { signalAutomaticStart = resolve; });
+    app.services.applicationSessions.startNextAutomaticApplication = async (signal) => {
+      expect(signal.aborted).toBe(false);
+      maintenanceOrder.push("automatic-application");
+      signalAutomaticStart();
+      return false;
+    };
 
     app.kick();
+    await automaticStart;
     await app.close();
     expect(providerCalls).toBe(0);
-    expect(maintenanceOrder).toEqual(["injected", "retention:10"]);
+    expect(maintenanceOrder).toEqual([
+      "injected",
+      "retention:10",
+      "automatic-application",
+    ]);
     expect(existsSync(artifactRoot)).toBe(false);
+  });
+
+  test("reports automatic application startup failures through the worker error handler", async () => {
+    const reportedError = new Error("automatic application startup failed");
+    const reported: unknown[] = [];
+    let signalReported!: () => void;
+    const errorReported = new Promise<void>((resolve) => { signalReported = resolve; });
+    const fixture = createFixture(false, {
+      useDefaultWorker: true,
+      workerOptions: {
+        scheduler: {
+          onError: (error) => {
+            reported.push(error);
+            signalReported();
+          },
+        },
+      },
+    });
+    fixture.app.services.applicationSessions.startNextAutomaticApplication = async () => {
+      throw reportedError;
+    };
+
+    fixture.app.kick();
+    await errorReported;
+
+    expect(reported).toEqual([reportedError]);
+    await fixture.app.close();
   });
 
   test("closes worker, auth, context, and owned databases in order exactly once", async () => {

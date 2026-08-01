@@ -48,6 +48,10 @@ export interface PipelineWorkerHandle {
   close(): Promise<void>;
 }
 
+export interface PipelineApplicationSessionService extends ApplicationSessionRouteService {
+  startNextAutomaticApplication(signal: AbortSignal): Promise<boolean>;
+}
+
 export interface PipelineApplicationOptions {
   readonly webOrigin?: string;
   readonly pipelineDatabase?: Database;
@@ -66,7 +70,7 @@ export interface PipelineApplicationOptions {
   readonly applicationAgent?: ApplicationAgentRouteService;
   readonly applicationHarnessOrigin?: string;
   readonly applicationHarness?: ApplicationHarnessClient;
-  readonly applicationSessions?: ApplicationSessionRouteService;
+  readonly applicationSessions?: PipelineApplicationSessionService;
 }
 
 /** Internal handles are exposed for typed integration tests, not serialized by any route. */
@@ -79,7 +83,7 @@ export interface PipelineApplicationServices {
   readonly worker: PipelineWorkerHandle;
   readonly runs: RunApplicationService;
   readonly auth: ClosableAuthRouteService;
-  readonly applicationSessions: ApplicationSessionRouteService;
+  readonly applicationSessions: PipelineApplicationSessionService;
 }
 
 export interface PipelineApplication {
@@ -116,17 +120,37 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   repository.reconcileAttemptingApplicationSubmissions();
   const contextDatabase = options.contextDatabase ?? (options.context ? undefined : openContextDatabase());
   const context = options.context ?? createContextApplicationService({ database: contextDatabase! });
+  const applicationHarnessOrigin = options.applicationHarnessOrigin ?? process.env.JOBHUNTER_HARNESS_URL;
+  let worker = options.worker;
+  const applicationSessions = options.applicationSessions ?? new ApplicationSessionService({
+    repository,
+    artifacts,
+    onApplicationSessionReleased: () => worker?.kick(),
+    ...(
+      options.applicationHarness
+        ? { harness: options.applicationHarness }
+        : browserHarnessToken === undefined
+          ? {}
+          : {
+              harness: new HttpApplicationHarnessClient({
+                token: browserHarnessToken,
+                ...(applicationHarnessOrigin ? { origin: applicationHarnessOrigin } : {}),
+              }),
+            }
+    ),
+  });
   const schedulerOptions = options.workerOptions?.scheduler;
-  const worker = options.worker ?? createPipelineWorkerRuntime({
+  worker ??= createPipelineWorkerRuntime({
     ...options.workerOptions,
     repository,
     artifacts,
     loadSourceContext: (runId) => context.loadStageSourceContext(runId),
     scheduler: {
       ...schedulerOptions,
-      afterDrain: async () => {
-        await schedulerOptions?.afterDrain?.();
+      afterDrain: async (signal) => {
+        await schedulerOptions?.afterDrain?.(signal);
         await enforceRunArtifactRetention(repository, artifacts);
+        await applicationSessions.startNextAutomaticApplication(signal);
       },
     },
   });
@@ -152,27 +176,6 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
               repository.finalizeApplicationSubmission(sessionId, outcome),
           }),
         }));
-  const applicationHarnessOrigin = options.applicationHarnessOrigin ?? process.env.JOBHUNTER_HARNESS_URL;
-  const applicationSessions = options.applicationSessions ?? new ApplicationSessionService({
-    repository,
-    artifacts,
-    ...(
-      options.applicationHarness
-        ? { harness: options.applicationHarness }
-        : browserHarnessToken === undefined
-          ? {}
-          : {
-              harness: new HttpApplicationHarnessClient({
-                token: browserHarnessToken,
-                ...(applicationHarnessOrigin ? { origin: applicationHarnessOrigin } : {}),
-              }),
-            }
-    ),
-  });
-  const routeApplicationAgent = createApplicationAgentRoutes(
-    applicationAgent,
-    browserHarnessToken,
-  );
   const closeAuth = options.closeAuth
     ?? (options.auth ? options.auth.close?.bind(options.auth) ?? (() => undefined) : defaultAuthService.closeAuth);
 

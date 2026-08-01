@@ -128,35 +128,32 @@ class FakeHarness implements ApplicationHarnessClient {
   }
 }
 
-async function createTarget(options: {
-  approved?: boolean;
-  harness?: FakeHarness | null;
-  autoApply?: boolean;
-  jobUrl?: string | null;
-  profileReader?: () => string | Promise<string>;
-  sessionIds?: string[];
-} = {}) {
-  let now = 1_000;
-  const database = openPipelineDatabase(":memory:", { now: () => now });
-  databases.push(database);
-  const repository = new PipelineRepository(database, {
-    now: () => now,
-    idFactory: (() => {
-      let value = 0;
-      return () => `fixture-id-${++value}`;
-    })(),
-  });
-  const artifactRoot = await mkdtemp(join(tmpdir(), "application-session-service-"));
-  temporaryRoots.push(artifactRoot);
-  const artifacts = new ArtifactStore(artifactRoot);
-  const run = repository.createRun("Private job description", "run-1", true, options.autoApply ?? false);
+async function createApprovedRun(
+  repository: PipelineRepository,
+  database: Database,
+  artifacts: ArtifactStore,
+  options: {
+    readonly id: string;
+    readonly approved?: boolean;
+    readonly autoSubmit?: boolean;
+    readonly skipReview?: boolean;
+    readonly jobUrl?: string | null;
+  },
+) {
+  const run = repository.createRun(
+    "Private job description",
+    options.id,
+    true,
+    options.skipReview ?? false,
+    options.autoSubmit ?? false,
+  );
   database.query("UPDATE runs SET job_url = ? WHERE id = ?").run(
     options.jobUrl === undefined ? JOB_URL : options.jobUrl,
     run.id,
   );
   await artifacts.createRunInput({ run: run.queueSequence });
   const claim = repository.acquire();
-  if (!claim) throw new Error("claim missing");
+  if (!claim || claim.runId !== run.id) throw new Error("claim missing");
   const stages: ActiveStage[] = [
     "analyzing",
     "tailoring",
@@ -172,7 +169,11 @@ async function createTarget(options: {
     stage: "visual_qa",
     attempt: attempt.attemptNo,
   });
-  const pdf = await artifacts.write(join(attemptRoot, "resume.pdf"), PDF_BYTES, 10 * 1024 * 1024);
+  const pdf = await artifacts.write(
+    join(attemptRoot, "resume.pdf"),
+    PDF_BYTES,
+    10 * 1024 * 1024,
+  );
   repository.finalizeArtifact(claim, {
     attemptId: attempt.id,
     stage: "visual_qa",
@@ -185,6 +186,39 @@ async function createTarget(options: {
   repository.transition(claim, "review");
   repository.release(claim);
   if (options.approved !== false) repository.approve(run.id, pdf.sha256);
+  return { pdf, run };
+}
+
+async function createTarget(options: {
+  approved?: boolean;
+  harness?: FakeHarness | null;
+  autoSubmit?: boolean;
+  skipReview?: boolean;
+  jobUrl?: string | null;
+  profileReader?: () => string | Promise<string>;
+  sessionIds?: string[];
+  onApplicationSessionReleased?: () => void;
+} = {}) {
+  let now = 1_000;
+  const database = openPipelineDatabase(":memory:", { now: () => now });
+  databases.push(database);
+  const repository = new PipelineRepository(database, {
+    now: () => now,
+    idFactory: (() => {
+      let value = 0;
+      return () => `fixture-id-${++value}`;
+    })(),
+  });
+  const artifactRoot = await mkdtemp(join(tmpdir(), "application-session-service-"));
+  temporaryRoots.push(artifactRoot);
+  const artifacts = new ArtifactStore(artifactRoot);
+  const { pdf, run } = await createApprovedRun(repository, database, artifacts, {
+    id: "run-1",
+    ...(options.approved === undefined ? {} : { approved: options.approved }),
+    ...(options.autoSubmit === undefined ? {} : { autoSubmit: options.autoSubmit }),
+    ...(options.skipReview === undefined ? {} : { skipReview: options.skipReview }),
+    ...(options.jobUrl === undefined ? {} : { jobUrl: options.jobUrl }),
+  });
 
   const harness = options.harness === undefined ? new FakeHarness() : options.harness;
   const sessionIds = options.sessionIds ?? [FIRST_SESSION_ID, SECOND_SESSION_ID];
@@ -196,6 +230,9 @@ async function createTarget(options: {
     uuidFactory: () => sessionIds[sessionIndex++] ?? SECOND_SESSION_ID,
     now: () => now,
     profileReader: options.profileReader ?? (() => PROFILE),
+    ...(options.onApplicationSessionReleased
+      ? { onApplicationSessionReleased: options.onApplicationSessionReleased }
+      : {}),
   });
   return {
     artifacts,
@@ -234,6 +271,75 @@ async function createProfileRoot(): Promise<{ root: string; profilePath: string 
 }
 
 describe("application session service", () => {
+
+  test("starts one eligible skip-review application and leaves manual-review runs idle", async () => {
+    const automatic = await createTarget({ skipReview: true });
+
+    expect(await automatic.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(automatic.harness!.createCalls).toHaveLength(1);
+
+    const manual = await createTarget({ skipReview: false });
+    expect(await manual.service.startNextAutomaticApplication(signal())).toBe(false);
+    expect(manual.harness!.createCalls).toHaveLength(0);
+  });
+
+  test("serializes automatic starts while the harness is occupied and continues after close", async () => {
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      skipReview: true,
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+    });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true, autoSubmit: true },
+    );
+
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
+    expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
+      FIRST_SESSION_ID,
+    ]);
+
+    await target.service.close(target.runId, signal());
+    expect(availabilityKicks).toBe(1);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
+      FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
+    ]);
+    expect(target.harness!.createCalls[1]).toMatchObject({
+      autoSubmit: true,
+      jobUrl: JOB_URL,
+    });
+    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+      bridgeState: "running",
+      pdfSha256: second.pdf.sha256,
+    });
+  });
+
+  test("keeps an automatic-start failure approved and recoverable through the existing start path", async () => {
+    const harness = new FakeHarness();
+    harness.createError = new ApplicationHarnessError("unavailable");
+    const target = await createTarget({ harness, skipReview: true });
+
+    await expect(
+      target.service.startNextAutomaticApplication(signal()),
+    ).rejects.toMatchObject({ code: "APPLICATION_HARNESS_UNAVAILABLE" });
+    expect(target.repository.getRun(target.runId)).toMatchObject({
+      status: "approved",
+      approvedPdfSha256: target.pdf.sha256,
+    });
+
+    harness.createError = null;
+    await expect(
+      target.service.start(target.runId, target.pdf.sha256, signal()),
+    ).resolves.toMatchObject({ bridgeState: "running" });
+    expect(harness.createCalls).toHaveLength(2);
+    expect(harness.createCalls[0]?.sessionId).toBe(harness.createCalls[1]?.sessionId);
+  });
   test("uploads the manual run mode with the reserved UUID, private sources, and verified PDF", async () => {
     const target = await createTarget();
 
@@ -245,7 +351,7 @@ describe("application session service", () => {
       jobUrl: JOB_URL,
       personalInformationMarkdown: PROFILE,
       resumePdf: PDF_BYTES,
-      autoApply: false,
+      autoSubmit: false,
     });
     expect(view).toMatchObject({ generation: 1, bridgeState: "running", harnessState: "running" });
     expect(view).not.toHaveProperty("sessionId");
@@ -255,13 +361,13 @@ describe("application session service", () => {
     expect(serialized).not.toContain(PROFILE);
   });
 
-  test("uploads the persisted auto-apply run mode", async () => {
-    const target = await createTarget({ autoApply: true });
+  test("uploads the persisted auto-submit run mode", async () => {
+    const target = await createTarget({ autoSubmit: true });
 
     await target.service.start(target.runId, target.pdf.sha256, signal());
 
     expect(target.harness!.createCalls).toHaveLength(1);
-    expect(target.harness!.createCalls[0]?.autoApply).toBe(true);
+    expect(target.harness!.createCalls[0]?.autoSubmit).toBe(true);
   });
 
   test("reports exact eligibility blockers without exposing private sources", async () => {
@@ -584,9 +690,11 @@ describe("application session service", () => {
       .not.toContain(JOB_URL);
   });
 
-  test("marks an observed 404 lost and rotates only through explicit terminal retry", async () => {
+  test("marks an observed 404 lost, signals availability once, and rotates only through explicit terminal retry", async () => {
+    let availabilityKicks = 0;
     const target = await createTarget({
       sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID, THIRD_SESSION_ID],
+      onApplicationSessionReleased: () => { availabilityKicks++; },
     });
     const first = await target.service.start(target.runId, target.pdf.sha256, signal());
     expect(first).toMatchObject({ generation: 1, bridgeState: "running" });
@@ -608,9 +716,11 @@ describe("application session service", () => {
       terminalAt: 1_100,
       sessionId: FIRST_SESSION_ID,
     });
+    expect(availabilityKicks).toBe(1);
 
     expect(await target.service.start(target.runId, target.pdf.sha256, signal())).toEqual(lost);
     expect(target.repository.getLatestApplicationSession(target.runId)?.generation).toBe(1);
+    expect(availabilityKicks).toBe(1);
 
     const retried = await target.service.retry(target.runId, target.pdf.sha256, signal());
     expect(retried).toMatchObject({ generation: 2, bridgeState: "running" });
@@ -634,12 +744,15 @@ describe("application session service", () => {
           error: { code: "browser_failed", message: "The browser session failed" },
         }
         : harnessSnapshot(bridgeState);
+      let terminalKicks = 0;
       const terminal = await createTarget({
         harness: terminalHarness,
         sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+        onApplicationSessionReleased: () => { terminalKicks++; },
       });
       expect(await terminal.service.start(terminal.runId, terminal.pdf.sha256, signal()))
         .toMatchObject({ generation: 1, bridgeState });
+      expect(terminalKicks).toBe(1);
       expect(await terminal.service.retry(terminal.runId, terminal.pdf.sha256, signal()))
         .toMatchObject({ generation: 2, bridgeState });
     }

@@ -200,6 +200,62 @@ describe("concurrent worker scheduler", () => {
     expect(afterDrainCalls).toBe(2);
   });
 
+  test("queues an availability kick without recursively entering after-drain work", async () => {
+    const repository: SchedulerRepository = {
+      acquire: () => null,
+      heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+      release: () => undefined,
+    };
+    let afterDrainCalls = 0;
+    let afterDrainDepth = 0;
+    let maximumDepth = 0;
+    let scheduler!: WorkerScheduler;
+    scheduler = new WorkerScheduler(repository, async () => undefined, {
+      afterDrain: async () => {
+        afterDrainCalls++;
+        afterDrainDepth++;
+        maximumDepth = Math.max(maximumDepth, afterDrainDepth);
+        if (afterDrainCalls === 1) scheduler.kick();
+        await Promise.resolve();
+        afterDrainDepth--;
+      },
+    });
+
+    scheduler.kick();
+    await scheduler.waitForIdle();
+
+    expect(afterDrainCalls).toBe(2);
+    expect(maximumDepth).toBe(1);
+  });
+
+  test("aborts in-flight after-drain startup when the scheduler closes", async () => {
+    const reported: unknown[] = [];
+    let observedSignal: AbortSignal | undefined;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const scheduler = new WorkerScheduler({
+      acquire: () => null,
+      heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+      release: () => undefined,
+    }, async () => undefined, {
+      afterDrain: async (signal) => {
+        observedSignal = signal;
+        signalStarted();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+      onError: (error) => { reported.push(error); },
+    });
+
+    scheduler.kick();
+    await started;
+    await scheduler.close();
+
+    expect(observedSignal?.aborted).toBe(true);
+    expect(reported).toEqual([]);
+  });
+
   test("reports after-drain failures without replaying completed claims", async () => {
     const queue = [claim("run-1", 4)];
     const processed: string[] = [];

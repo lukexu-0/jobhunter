@@ -16,7 +16,7 @@ export interface WorkerSchedulerOptions {
   clearInterval?: typeof globalThis.clearInterval;
   setTimeout?: typeof globalThis.setTimeout;
   onError?: (error: unknown) => void;
-  afterDrain?: () => void | Promise<void>;
+  afterDrain?: (signal: AbortSignal) => void | Promise<void>;
 }
 
 export class WorkerScheduler {
@@ -27,7 +27,8 @@ export class WorkerScheduler {
   readonly #clearInterval: typeof globalThis.clearInterval;
   readonly #setTimeout: typeof globalThis.setTimeout;
   readonly #onError: (error: unknown) => void;
-  readonly #afterDrain: () => void | Promise<void>;
+  readonly #afterDrain: (signal: AbortSignal) => void | Promise<void>;
+  readonly #shutdownController = new AbortController();
   readonly #shutdownReason = new DOMException("Worker scheduler closed", "AbortError");
   readonly #activeControllers = new Set<AbortController>();
   #running: Promise<void> | undefined;
@@ -75,6 +76,7 @@ export class WorkerScheduler {
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#shutdownController.abort(this.#shutdownReason);
     for (const controller of this.#activeControllers) controller.abort(this.#shutdownReason);
     this.#kickPending = false;
     this.#recoveryPending = 0;
@@ -117,9 +119,9 @@ export class WorkerScheduler {
       if (active.size === 0) {
         if (queueExhausted && this.#recoveryPending === 0) {
           try {
-            await this.#afterDrain();
+            await this.#afterDrain(this.#shutdownController.signal);
           } catch (error) {
-            this.#onError(error);
+            if (!this.#closed) this.#onError(error);
           }
         }
         return;

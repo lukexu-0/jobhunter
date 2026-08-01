@@ -111,6 +111,7 @@ export interface ApplicationSessionServiceDependencies {
   readonly uuidFactory?: () => string;
   readonly now?: () => number;
   readonly profileReader?: ApplicantProfileReader;
+  readonly onApplicationSessionReleased?: () => void;
 }
 
 export interface ApplicationSessionEventCursor {
@@ -280,7 +281,7 @@ function durableBridgeState(
 
 interface PreparedStart {
   readonly jobUrl: string;
-  readonly autoApply: boolean;
+  readonly autoSubmit: boolean;
   readonly profile: string;
   readonly pdf: PublicArtifact;
 }
@@ -298,6 +299,14 @@ export class ApplicationSessionService {
     this.#uuidFactory = dependencies.uuidFactory ?? randomUUID;
     this.#now = dependencies.now ?? Date.now;
     this.#profileReader = dependencies.profileReader ?? (() => readApplicantProfileMarkdown());
+  }
+
+  async startNextAutomaticApplication(signal: AbortSignal): Promise<boolean> {
+    signal.throwIfAborted();
+    const candidate = this.dependencies.repository.getNextAutomaticApplicationStart();
+    if (!candidate) return false;
+    await this.start(candidate.runId, candidate.approvedPdfSha256, signal);
+    return true;
   }
 
   async get(runId: string): Promise<ApplicationSessionView> {
@@ -840,12 +849,13 @@ export class ApplicationSessionService {
     }
     const closed = this.#closedProjection(session, "closed");
     try {
-      this.dependencies.repository.recordApplicationSnapshot(runId, {
+      const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
         generation: session.generation,
         sessionId: session.sessionId,
         bridgeState: "closed",
         publicSnapshot: closed,
       });
+      this.#notifyApplicationSessionReleased(session, recorded);
     } catch (error) {
       mapRepositoryError(error);
     }
@@ -888,7 +898,7 @@ export class ApplicationSessionService {
     signal.throwIfAborted();
     const pdf = this.dependencies.repository.getArtifact(runId, "compiled-pdf", run.currentRevision);
     if (!pdf || pdf.sha256 !== expectedApprovedPdfSha256) throw applicationSourceUnavailable();
-    return { jobUrl, autoApply: run.autoApply, profile, pdf };
+    return { jobUrl, autoSubmit: run.autoSubmit, profile, pdf };
   }
 
   #resume(
@@ -971,7 +981,7 @@ export class ApplicationSessionService {
       await harness.create({
         sessionId: session.sessionId,
         jobUrl: prepared.jobUrl,
-        autoApply: prepared.autoApply,
+        autoSubmit: prepared.autoSubmit,
         personalInformationMarkdown: prepared.profile,
         resumePdf,
       }, signal);
@@ -1071,6 +1081,7 @@ export class ApplicationSessionService {
         publicSnapshot: projected,
         ...(lastUpstreamEventId !== undefined ? { lastUpstreamEventId } : {}),
       });
+      this.#notifyApplicationSessionReleased(current, recorded);
       return this.#storedView(recorded);
     } catch (error) {
       mapRepositoryError(error);
@@ -1141,6 +1152,7 @@ export class ApplicationSessionService {
         sessionId: current.sessionId,
         publicSnapshot: lost,
       });
+      this.#notifyApplicationSessionReleased(current, recorded);
       return this.#storedView(recorded);
     } catch (error) {
       mapRepositoryError(error);
@@ -1169,14 +1181,24 @@ export class ApplicationSessionService {
   #recordLocalClosed(runId: string, session: PublicApplicationSession): void {
     const closed = this.#closedProjection(session, null);
     try {
-      this.dependencies.repository.recordApplicationSnapshot(runId, {
+      const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
         generation: session.generation,
         sessionId: session.sessionId,
         bridgeState: "closed",
         publicSnapshot: closed,
       });
+      this.#notifyApplicationSessionReleased(session, recorded);
     } catch (error) {
       mapRepositoryError(error);
+    }
+  }
+
+  #notifyApplicationSessionReleased(
+    previous: PublicApplicationSession,
+    current: PublicApplicationSession,
+  ): void {
+    if (isLive(previous) && isTerminal(current)) {
+      this.dependencies.onApplicationSessionReleased?.();
     }
   }
 
