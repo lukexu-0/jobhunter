@@ -31,11 +31,7 @@ function oauthRow(provider: AuthProvider, overrides: Record<string, unknown> = {
       access: "stored-access-secret",
       refresh: "stored-refresh-secret",
       expires: 2_000_000_000_000,
-      ...(provider === "openai-codex"
-        ? { accountId: "acct-secret-1234" }
-        : provider === "google-antigravity"
-          ? { projectId: "project-secret-5678" }
-          : {}),
+      accountId: "acct-secret-1234",
       ...overrides,
     },
     disabledCause: null,
@@ -59,13 +55,12 @@ class FakeStorage implements AuthStorageLike {
     if (this.loginReleased) this.loginValidated.resolve();
     return provider ? this.rows.filter((row) => row.provider === provider) : [...this.rows];
   }
-  getOAuthAccountIdentity(provider: string): { accountId?: string; email?: string; projectId?: string } | undefined {
+  getOAuthAccountIdentity(provider: string): { accountId?: string; email?: string } | undefined {
     const row = this.rows.find((candidate) => candidate.provider === provider);
     if (!row || row.credential.type !== "oauth") return undefined;
     return {
       ...(row.credential.accountId ? { accountId: row.credential.accountId } : {}),
       ...(row.credential.email ? { email: row.credential.email } : {}),
-      ...(row.credential.projectId ? { projectId: row.credential.projectId } : {}),
     };
   }
   async getOAuthAccess(
@@ -98,7 +93,7 @@ const ids = {
 };
 
 describe("app-owned OAuth storage and sessions", () => {
-  test("rejects static and duplicate stored credentials", () => {
+  test("rejects static, unsupported, and duplicate stored credentials", () => {
     const staticStorage = new FakeStorage();
     staticStorage.rows = [{
       id: 1,
@@ -107,21 +102,25 @@ describe("app-owned OAuth storage and sessions", () => {
       disabledCause: null,
     } as StoredAuthCredential];
     expect(() => assertOAuthOnlyStorage(staticStorage)).toThrow(AuthConfigurationError);
-    const staticGoogle = new FakeStorage();
-    staticGoogle.rows = [{
+
+    const retiredGoogle = new FakeStorage();
+    retiredGoogle.rows = [{
       id: 1,
       provider: "google-antigravity",
-      credential: { type: "api_key", key: "must-never-be-used" },
+      credential: {
+        type: "oauth",
+        access: "legacy-access",
+        refresh: "legacy-refresh",
+        expires: 2_000_000_000_000,
+        projectId: "legacy-project",
+      },
       disabledCause: null,
     } as StoredAuthCredential];
-    expect(() => assertOAuthOnlyStorage(staticGoogle)).toThrow(AuthConfigurationError);
+    expect(() => assertOAuthOnlyStorage(retiredGoogle)).toThrow("Unsupported credential provider: google-antigravity");
 
     const duplicateStorage = new FakeStorage();
     duplicateStorage.rows = [oauthRow("openai-codex"), { ...oauthRow("openai-codex"), id: 2 }];
     expect(() => assertOAuthOnlyStorage(duplicateStorage)).toThrow("Multiple active OAuth credentials");
-    const duplicateGoogle = new FakeStorage();
-    duplicateGoogle.rows = [oauthRow("google-antigravity"), { ...oauthRow("google-antigravity"), id: 2 }];
-    expect(() => assertOAuthOnlyStorage(duplicateGoogle)).toThrow("Multiple active OAuth credentials");
   });
 
   test("rejects connect when connected and rejects a concurrent provider session", async () => {
@@ -179,8 +178,8 @@ describe("app-owned OAuth storage and sessions", () => {
 
     const expiringStorage = new FakeStorage();
     const expiring = new AuthService(expiringStorage, { now: () => now, randomId: () => ids.second, schedule: () => undefined });
-    await expiring.startSession("google-antigravity");
-    expect(expiringStorage.loginProviders).toEqual(["google-antigravity"]);
+    await expiring.startSession("openai-codex");
+    expect(expiringStorage.loginProviders).toEqual(["openai-codex"]);
     now += 10 * 60_000;
     expect(expiring.getSession(ids.second)?.state).toBe("expired");
     expect(expiringStorage.callbacks!.signal?.aborted).toBe(true);
@@ -188,24 +187,25 @@ describe("app-owned OAuth storage and sessions", () => {
     expect(expiring.getSession(ids.second)).toBeUndefined();
   });
 
-  test("routes both supported providers through storage login and verifies persisted OAuth", async () => {
-    for (const provider of ["openai-codex", "google-antigravity"] as const) {
-      const storage = new FakeStorage();
-      const service = new AuthService(storage, {
-        randomId: () => ids.first,
-        schedule: () => undefined,
-      });
+  test("routes OpenAI Codex through storage login and verifies persisted OAuth", async () => {
+    const storage = new FakeStorage();
+    const service = new AuthService(storage, {
+      randomId: () => ids.first,
+      schedule: () => undefined,
+    });
 
-      const started = await service.startSession(provider);
-      expect(started).toMatchObject({ provider, state: "pending" });
-      expect(storage.loginProviders).toEqual([provider]);
-      storage.rows = [oauthRow(provider)];
-      storage.loginGate.resolve();
-      await storage.loginValidated.promise;
+    const started = await service.startSession("openai-codex");
+    expect(started).toMatchObject({ provider: "openai-codex", state: "pending" });
+    expect(storage.loginProviders).toEqual(["openai-codex"]);
+    storage.rows = [oauthRow("openai-codex")];
+    storage.loginGate.resolve();
+    await storage.loginValidated.promise;
 
-      expect(service.getSession(ids.first)?.state).toBe("succeeded");
-      expect(service.getAuthStatus().providers.find((status) => status.provider === provider)?.state).toBe("connected");
-    }
+    expect(service.getSession(ids.first)?.state).toBe("succeeded");
+    expect(service.getAuthStatus().providers).toEqual([expect.objectContaining({
+      provider: "openai-codex",
+      state: "connected",
+    })]);
   });
 
   test("returns only redacted account identity and explicitly logs out", async () => {
@@ -217,7 +217,7 @@ describe("app-owned OAuth storage and sessions", () => {
       state: "connected",
       identity: { email: "p***@example.com", accountId: "***1234" },
     });
-    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex", "google-antigravity"]);
+    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex"]);
     expect(encoded).not.toContain("stored-access-secret");
     expect(encoded).not.toContain("stored-refresh-secret");
     expect(encoded).not.toContain("person@example.com");
@@ -229,42 +229,18 @@ describe("app-owned OAuth storage and sessions", () => {
 });
 
 describe("OAuth-only resolver", () => {
-  test("allows both exact Codex models and rejects every unsupported provider-model pair before storage access", async () => {
+  test("allows both exact Codex models and rejects unsupported models before storage access", async () => {
     const codex = new FakeStorage();
     codex.rows = [oauthRow("openai-codex")];
     codex.access = { accessToken: "codex-bearer", accountId: "acct" };
     expect(await resolveOAuthOnlyWithStorage(codex, "openai-codex", "attempt-sol", "gpt-5.6-sol")).toBe("codex-bearer");
     expect(await resolveOAuthOnlyWithStorage(codex, "openai-codex", "attempt-luna", "gpt-5.6-luna")).toBe("codex-bearer");
 
-    const google = new FakeStorage();
-    google.rows = [oauthRow("google-antigravity")];
-    google.access = {
-      accessToken: "google-bearer",
-      projectId: "cloud-project",
-      email: "person@example.com",
-    };
-    const key = await resolveOAuthOnlyWithStorage(google, "google-antigravity", "attempt", "gemini-3.5-flash");
-    expect(JSON.parse(key)).toEqual({
-      token: "google-bearer",
-      projectId: "cloud-project",
-      email: "p***@example.com",
-    });
-    expect(key).not.toContain("refresh");
-
-    const wrongPairs: Array<[AuthProvider, string]> = [
-      ["openai-codex", "gpt-5-6-luna"],
-      ["openai-codex", "gemini-3.5-flash"],
-      ["openai-codex", "unknown-model"],
-      ["google-antigravity", "gpt-5.6-sol"],
-      ["google-antigravity", "gpt-5.6-luna"],
-      ["google-antigravity", "unknown-model"],
-    ];
-    for (const [provider, model] of wrongPairs) {
-      await expect(resolveOAuthOnlyWithStorage(codex, provider, "attempt", model))
-        .rejects.toThrow(`Unsupported OAuth model ${provider}/${model}`);
+    for (const model of ["gpt-5-6-luna", "gemini-3.5-flash", "unknown-model"]) {
+      await expect(resolveOAuthOnlyWithStorage(codex, "openai-codex", "attempt", model))
+        .rejects.toThrow(`Unsupported OAuth model openai-codex/${model}`);
     }
     expect(codex.accessOptions).toHaveLength(2);
-    expect(google.accessOptions).toHaveLength(1);
   });
   test("fails OAUTH_REQUIRED without OAuth and permits only one forced refresh", async () => {
     const missing = new FakeStorage();
@@ -297,6 +273,8 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
   const unsupportedRefresh = "unsupported-refresh-sentinel-a18f26c4";
   const disabledAccess = "disabled-unsupported-access-sentinel-61bb0052";
   const disabledRefresh = "disabled-unsupported-refresh-sentinel-f5a3d87d";
+  const googleStickySentinel = "google-sticky-sentinel-d12c4e81";
+  const codexStickyValue = '{"type":"oauth","index":0,"credentialId":3}';
   const codexData = JSON.stringify({
     access: "allowed-codex-access",
     refresh: "allowed-codex-refresh",
@@ -335,26 +313,33 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
         expires_at_ms INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE cache (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
     `);
     const insertCredential = db.query(
       "INSERT INTO auth_credentials(id, provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES (?, ?, 'oauth', ?, ?, 1, 1)",
     );
-    insertCredential.run(1, "retired-provider", JSON.stringify({
+    insertCredential.run(1, "google-antigravity", JSON.stringify({
       access: unsupportedAccess,
       refresh: unsupportedRefresh,
       expires: 2_000_000_000_000,
+      projectId: "legacy-active-project",
     }), null);
-    insertCredential.run(2, "retired-provider", JSON.stringify({
+    insertCredential.run(2, "google-antigravity", JSON.stringify({
       access: disabledAccess,
       refresh: disabledRefresh,
       expires: 2_000_000_000_000,
+      projectId: "legacy-disabled-project",
     }), "retired");
     insertCredential.run(3, "openai-codex", codexData, null);
     const insertBlock = db.query(
       "INSERT INTO auth_credential_blocks(credential_id, provider_key, block_scope, blocked_until_ms, updated_at) VALUES (?, ?, '', 999999, 1)",
     );
-    insertBlock.run(1, "retired-provider:oauth");
-    insertBlock.run(2, "retired-provider:oauth");
+    insertBlock.run(1, "google-antigravity:oauth");
+    insertBlock.run(2, "google-antigravity:oauth");
     insertBlock.run(3, "openai-codex:oauth");
     const insertLease = db.query(
       "INSERT INTO auth_credential_refresh_leases(credential_id, owner, expires_at_ms, updated_at) VALUES (?, ?, 999999, 1)",
@@ -362,6 +347,11 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
     insertLease.run(1, "unsupported-active");
     insertLease.run(2, "unsupported-disabled");
     insertLease.run(3, "codex");
+    const insertCache = db.query("INSERT INTO cache(key, value, expires_at) VALUES (?, ?, 9999999999)");
+    insertCache.run("session:sticky:google-antigravity:active", googleStickySentinel);
+    insertCache.run("session:sticky:google-antigravity:disabled", '{"type":"oauth","index":1,"credentialId":2}');
+    insertCache.run("session:sticky:openai-codex:active", codexStickyValue);
+    insertCache.run("usage_cache:google-antigravity:legacy", "unrelated-cache-row");
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     db.close();
 
@@ -370,9 +360,10 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
 
     const verified = new Database(dbPath, { readonly: true });
     try {
-      expect(verified.query("SELECT id FROM auth_credentials WHERE provider = 'retired-provider'").all()).toEqual([]);
+      expect(verified.query("SELECT id FROM auth_credentials WHERE provider = 'google-antigravity'").all()).toEqual([]);
       expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id IN (1, 2)").all()).toEqual([]);
       expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id IN (1, 2)").all()).toEqual([]);
+      expect(verified.query("SELECT key FROM cache WHERE key LIKE 'session:sticky:google-antigravity:%'").all()).toEqual([]);
       expect(verified.query("SELECT id, provider, data, disabled_cause FROM auth_credentials WHERE id = 3").get()).toEqual({
         id: 3,
         provider: "openai-codex",
@@ -385,6 +376,12 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
       expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id = 3").get()).toEqual({
         credential_id: 3,
       });
+      expect(verified.query("SELECT value FROM cache WHERE key = 'session:sticky:openai-codex:active'").get()).toEqual({
+        value: codexStickyValue,
+      });
+      expect(verified.query("SELECT value FROM cache WHERE key = 'usage_cache:google-antigravity:legacy'").get()).toEqual({
+        value: "unrelated-cache-row",
+      });
     } finally {
       verified.close();
     }
@@ -392,7 +389,7 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
     for (const path of [dbPath, `${dbPath}-wal`]) {
       if (!existsSync(path)) continue;
       const bytes = readFileSync(path);
-      for (const sentinel of [unsupportedAccess, unsupportedRefresh, disabledAccess, disabledRefresh]) {
+      for (const sentinel of [unsupportedAccess, unsupportedRefresh, disabledAccess, disabledRefresh, googleStickySentinel]) {
         expect(bytes.includes(Buffer.from(sentinel))).toBe(false);
       }
     }
@@ -401,7 +398,7 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
   }
 });
 
-test("provider environment scrubbing retains only allowed Google project hints", () => {
+test("provider environment scrubbing removes credentials and stale Google project hints", () => {
   const environment: NodeJS.ProcessEnv = {
     OPENAI_API_KEY: "secret",
     CODEX_API_KEY: "secret",
@@ -421,12 +418,9 @@ test("provider environment scrubbing retains only allowed Google project hints",
     GOOGLE_VERTEX_AI: "true",
     VERTEX_AI_API_KEY: "secret",
     VERTEX_API_KEY: "secret",
-    GOOGLE_CLOUD_PROJECT: "allowed-project",
-    GOOGLE_CLOUD_PROJECT_ID: "allowed-project-id",
+    GOOGLE_CLOUD_PROJECT: "stale-project",
+    GOOGLE_CLOUD_PROJECT_ID: "stale-project-id",
   };
   scrubProviderEnvironment(environment);
-  expect(environment).toEqual({
-    GOOGLE_CLOUD_PROJECT: "allowed-project",
-    GOOGLE_CLOUD_PROJECT_ID: "allowed-project-id",
-  });
+  expect(environment).toEqual({});
 });

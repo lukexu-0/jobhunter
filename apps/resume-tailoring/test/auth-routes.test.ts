@@ -14,10 +14,7 @@ const session: AuthSession = {
 
 function fakeService(overrides: Partial<AuthRouteService> = {}): AuthRouteService {
   const status: AuthStatusResponse = {
-    providers: [
-      { provider: "openai-codex", state: "disconnected" },
-      { provider: "google-antigravity", state: "disconnected" },
-    ],
+    providers: [{ provider: "openai-codex", state: "disconnected" }],
   };
   return {
     getAuthStatus: () => status,
@@ -46,26 +43,20 @@ describe("OAuth HTTP routes", () => {
     const response = await request(fakeService(), "/v1/auth");
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      providers: [
-        { provider: "openai-codex", state: "disconnected" },
-        { provider: "google-antigravity", state: "disconnected" },
-      ],
+      providers: [{ provider: "openai-codex", state: "disconnected" }],
     });
   });
 
-  test("validates exactly two provider statuses and rejects the retired provider", () => {
-    const providers = [
-      { provider: "openai-codex", state: "disconnected" },
-      { provider: "google-antigravity", state: "disconnected" },
-    ];
+  test("validates exactly one OpenAI Codex provider status", () => {
+    const providers = [{ provider: "openai-codex", state: "disconnected" }];
     expect(AuthStatusResponseSchema.safeParse({ providers }).success).toBe(true);
     expect(AuthStatusResponseSchema.safeParse({
-      providers: [...providers, { provider: "unsupported-provider", state: "disconnected" }],
+      providers: [...providers, { provider: "google-antigravity", state: "disconnected" }],
     }).success).toBe(false);
-    expect(AuthStatusResponseSchema.safeParse({ providers: providers.slice(0, 1) }).success).toBe(false);
+    expect(AuthStatusResponseSchema.safeParse({ providers: [] }).success).toBe(false);
   });
 
-  test("starts exact providers with an empty JSON object", async () => {
+  test("starts the exact provider with an empty JSON object", async () => {
     let started: OAuthProvider | undefined;
     const response = await request(
       fakeService({ startSession: async (provider) => ((started = provider), session) }),
@@ -76,7 +67,7 @@ describe("OAuth HTTP routes", () => {
     expect(started).toBe("openai-codex");
     expect(await response.json()).toEqual(session);
   });
-  test("returns public not-found for an unsupported provider route without starting a session", async () => {
+  test("returns public not-found for the retired Google provider route without starting a session", async () => {
     let started = false;
     const response = await request(
       fakeService({
@@ -85,7 +76,7 @@ describe("OAuth HTTP routes", () => {
           return session;
         },
       }),
-      "/v1/auth/unsupported-provider/sessions",
+      "/v1/auth/google-antigravity/sessions",
       jsonMutation("POST"),
     );
     expect(response.status).toBe(404);

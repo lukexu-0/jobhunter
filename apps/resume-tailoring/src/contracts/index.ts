@@ -68,14 +68,13 @@ export const ApiErrorSchema = z.object({
 });
 export type ApiError = z.infer<typeof ApiErrorSchema>;
 
-export const OAuthProviderSchema = z.enum(["openai-codex", "google-antigravity"]);
+export const OAuthProviderSchema = z.literal("openai-codex");
 export type OAuthProvider = z.infer<typeof OAuthProviderSchema>;
 
 export const AuthIdentitySchema = z
   .object({
     email: z.string().min(1).optional(),
     accountId: z.string().min(1).optional(),
-    projectId: z.string().min(1).optional(),
   })
   .strict();
 export type AuthIdentity = z.infer<typeof AuthIdentitySchema>;
@@ -91,7 +90,7 @@ export type AuthProviderStatus = z.infer<typeof AuthProviderStatusSchema>;
 
 export const AuthStatusResponseSchema = z
   .object({
-    providers: z.array(AuthProviderStatusSchema).length(2),
+    providers: z.array(AuthProviderStatusSchema).length(1),
   })
   .strict();
 export type AuthStatusResponse = z.infer<typeof AuthStatusResponseSchema>;

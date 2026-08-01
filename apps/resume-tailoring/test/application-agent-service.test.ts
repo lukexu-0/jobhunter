@@ -56,10 +56,7 @@ const SUBMISSION_GUARD_FACTORY = () => ({
 
 function connectedStatus() {
   return {
-    providers: [
-      { provider: "openai-codex" as const, state: "connected" as const },
-      { provider: "google-antigravity" as const, state: "disconnected" as const },
-    ],
+    providers: [{ provider: "openai-codex" as const, state: "connected" as const }],
   };
 }
 
@@ -87,10 +84,7 @@ describe("ApplicationAgentService", () => {
     const service = new ApplicationAgentService(TOKEN, {
       submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => ({
-        providers: [
-          { provider: "openai-codex", state: "disconnected" },
-          { provider: "google-antigravity", state: "connected" },
-        ],
+        providers: [{ provider: "openai-codex", state: "disconnected" }],
       }),
       runtimeClientFactory: () => {
         runtimeConstructions += 1;
@@ -296,10 +290,7 @@ describe("ApplicationAgentService", () => {
         return authReads === 1
           ? connectedStatus()
           : {
-              providers: [
-                { provider: "openai-codex", state: "disconnected" },
-                { provider: "google-antigravity", state: "disconnected" },
-              ],
+              providers: [{ provider: "openai-codex", state: "disconnected" }],
             };
       },
       runtimeClientFactory: () => ({

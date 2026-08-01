@@ -72,10 +72,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
   };
   const auth: AuthRouteService & { close(): void } = {
     getAuthStatus: ingestion.getAuthStatus ?? (() => ({
-      providers: [
-        { provider: "openai-codex", state: "disconnected" },
-        { provider: "google-antigravity", state: "disconnected" },
-      ],
+      providers: [{ provider: "openai-codex", state: "disconnected" }],
     })),
     startSession: async () => {
       calls.startAuth += 1;
@@ -412,10 +409,7 @@ describe("pipeline application bootstrap", () => {
       getAuthStatus: () => {
         authStatusReads += 1;
         return {
-          providers: [
-            { provider: "openai-codex", state: "connected" },
-            { provider: "google-antigravity", state: "disconnected" },
-          ],
+          providers: [{ provider: "openai-codex", state: "connected" }],
         };
       },
     });
@@ -489,10 +483,7 @@ describe("pipeline application bootstrap", () => {
     const context = createContextApplicationService({ database: contextDatabase });
     const auth: AuthRouteService & { close(): void } = {
       getAuthStatus: () => ({
-        providers: [
-          { provider: "openai-codex", state: "disconnected" },
-          { provider: "google-antigravity", state: "disconnected" },
-        ],
+        providers: [{ provider: "openai-codex", state: "disconnected" }],
       }),
       startSession: async () => { throw new Error("unexpected authentication"); },
       getSession: () => undefined,

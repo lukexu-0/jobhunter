@@ -10,20 +10,13 @@ export class OAuthRequiredError extends Error {
   }
 }
 
-function redactEmail(email: string): string {
-  const separator = email.lastIndexOf("@");
-  if (separator <= 0) return "***";
-  return `${email[0]}***${email.slice(separator)}`;
-}
 
-const OAUTH_MODELS = {
-  "openai-codex": ["gpt-5.6-sol", "gpt-5.6-luna"],
-  "google-antigravity": ["gemini-3.5-flash"],
-} as const;
+const OAUTH_MODELS = ["gpt-5.6-sol", "gpt-5.6-luna"] as const;
 
 function assertModel(provider: AuthProvider, modelId: string): void {
-  const models = OAUTH_MODELS[provider as keyof typeof OAUTH_MODELS] as readonly string[] | undefined;
-  if (!models?.includes(modelId)) throw new Error(`Unsupported OAuth model ${provider}/${modelId}`);
+  if (!(OAUTH_MODELS as readonly string[]).includes(modelId)) {
+    throw new Error(`Unsupported OAuth model ${provider}/${modelId}`);
+  }
 }
 
 export async function resolveOAuthOnlyWithStorage(
@@ -48,13 +41,7 @@ export async function resolveOAuthOnlyWithStorage(
   }
   if (!access?.accessToken) throw new OAuthRequiredError(provider);
 
-  if (provider === "openai-codex") return access.accessToken;
-  if (!access.projectId) throw new OAuthRequiredError(provider);
-  return JSON.stringify({
-    token: access.accessToken,
-    projectId: access.projectId,
-    ...(access.email ? { email: redactEmail(access.email) } : {}),
-  });
+  return access.accessToken;
 }
 
 export async function oauthOnlyResolver(

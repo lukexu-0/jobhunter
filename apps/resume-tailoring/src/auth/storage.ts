@@ -7,7 +7,7 @@ import {
   type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai";
 
-export const AUTH_PROVIDERS = ["openai-codex", "google-antigravity"] as const;
+export const AUTH_PROVIDERS = ["openai-codex"] as const;
 export type AuthProvider = (typeof AUTH_PROVIDERS)[number];
 
 export class AuthConfigurationError extends Error {
@@ -24,7 +24,7 @@ export interface AuthStorageLike {
   close(): void;
   listStoredCredentials(provider?: string): StoredAuthCredential[];
   getOAuthAccountIdentity(provider: string, sessionId?: string):
-    | { accountId?: string; email?: string; projectId?: string }
+    | { accountId?: string; email?: string }
     | undefined;
   getOAuthAccess(
     provider: string,
@@ -61,7 +61,7 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
   try {
     db.exec("PRAGMA busy_timeout = 5000; PRAGMA secure_delete = ON;");
     const tableRows = db.query<{ name: string }, []>(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('auth_credentials', 'auth_credential_blocks', 'auth_credential_refresh_leases')",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('auth_credentials', 'auth_credential_blocks', 'auth_credential_refresh_leases', 'cache')",
     ).all();
     const tables = new Set(tableRows.map(({ name }) => name));
     if (!tables.has(AUTH_TABLE)) {
@@ -80,7 +80,7 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
         if (!tables.has(table)) continue;
         const statement = db.query(
           `DELETE FROM ${table} WHERE credential_id IN (
-            SELECT id FROM auth_credentials WHERE provider NOT IN (?, ?)
+            SELECT id FROM auth_credentials WHERE provider <> ?
           )`,
         );
         try {
@@ -89,11 +89,21 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
           statement.finalize();
         }
       }
-      const deleteCredentials = db.query("DELETE FROM auth_credentials WHERE provider NOT IN (?, ?)");
+      const deleteCredentials = db.query("DELETE FROM auth_credentials WHERE provider <> ?");
       try {
-        deleteCredentials.run(...AUTH_PROVIDERS);
+        deleteCredentials.run(AUTH_PROVIDERS[0]);
       } finally {
         deleteCredentials.finalize();
+      }
+      if (tables.has("cache")) {
+        const deleteStickyCache = db.query(
+          "DELETE FROM cache WHERE key LIKE 'session:sticky:%' AND key NOT LIKE ?",
+        );
+        try {
+          deleteStickyCache.run(`session:sticky:${AUTH_PROVIDERS[0]}:%`);
+        } finally {
+          deleteStickyCache.finalize();
+        }
       }
       db.exec("COMMIT");
     } catch (error) {
@@ -150,9 +160,6 @@ function validateOAuthRow(row: StoredAuthCredential): void {
   }
   if (row.provider === "openai-codex" && !credential.accountId) {
     throw new AuthConfigurationError("OpenAI Codex OAuth credential has no account identity");
-  }
-  if (row.provider === "google-antigravity" && !credential.projectId) {
-    throw new AuthConfigurationError("Google Antigravity OAuth credential has no project ID");
   }
 }
 

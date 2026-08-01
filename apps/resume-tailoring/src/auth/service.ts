@@ -21,6 +21,8 @@ const PROVIDER_ENVIRONMENT_KEYS = [
   "CLOUDSDK_AUTH_ACCESS_TOKEN",
   "GCP_PROJECT",
   "GCLOUD_PROJECT",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_PROJECT_ID",
   "GOOGLE_VERTEX_LOCATION",
   "GOOGLE_CLOUD_LOCATION",
   "VERTEX_LOCATION",
@@ -51,12 +53,11 @@ function redact(value: string): string {
   return value.length <= 4 ? "***" : `***${value.slice(-4)}`;
 }
 
-function redactedIdentity(identity: { email?: string; accountId?: string; projectId?: string } | undefined): AuthIdentity | undefined {
+function redactedIdentity(identity: { email?: string; accountId?: string } | undefined): AuthIdentity | undefined {
   if (!identity) return undefined;
   const redacted: AuthIdentity = {
     ...(identity.email ? { email: redact(identity.email) } : {}),
     ...(identity.accountId ? { accountId: redact(identity.accountId) } : {}),
-    ...(identity.projectId ? { projectId: redact(identity.projectId) } : {}),
   };
   return Object.keys(redacted).length > 0 ? redacted : undefined;
 }
