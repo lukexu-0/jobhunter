@@ -176,6 +176,10 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
               repository.finalizeApplicationSubmission(sessionId, outcome),
           }),
         }));
+  const routeApplicationAgent = createApplicationAgentRoutes(
+    applicationAgent,
+    browserHarnessToken,
+  );
   const closeAuth = options.closeAuth
     ?? (options.auth ? options.auth.close?.bind(options.auth) ?? (() => undefined) : defaultAuthService.closeAuth);
 

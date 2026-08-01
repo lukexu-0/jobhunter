@@ -333,7 +333,10 @@ describe("pipeline run requests", () => {
 
   test("forwards the two run options independently", async () => {
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
-    capture(json(run()), requests);
+    setFetchMock(async (input, init) => {
+      requests.push({ input, init });
+      return json(run());
+    });
 
     await createRun("https://jobs.example.test/roles/skip-review", true, true, false);
     await createRun("https://jobs.example.test/roles/auto-submit", true, false, true);

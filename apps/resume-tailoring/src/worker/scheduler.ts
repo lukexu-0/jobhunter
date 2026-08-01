@@ -61,13 +61,14 @@ export class WorkerScheduler {
       this.#kickPending = true;
       return;
     }
-    this.#running = this.#drain().finally(() => {
+    const running = Promise.resolve().then(() => this.#drain()).finally(() => {
       this.#running = undefined;
       if (this.#kickPending && !this.#closed && this.#recoveryPending === 0) {
         this.#kickPending = false;
         this.kick();
       }
     });
+    this.#running = running;
   }
 
   async waitForIdle(): Promise<void> {
