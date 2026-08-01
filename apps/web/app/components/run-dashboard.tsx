@@ -12,6 +12,8 @@ import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-
 const PAGE_SIZE = 8;
 const POLL_INTERVAL_MS = 3_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
+const MAX_CONCURRENT_RUN_CREATIONS = 5;
+const MAX_RUNS_PER_SUBMISSION = 100;
 const EMPTY_RUNS: RunDto[] = [];
 const ROW_INTERACTIVE_SELECTOR = "a, button, input, select, textarea, summary, [contenteditable='true']";
 const FOCUSABLE_INTERACTIVE_SELECTOR = "a[href], area[href], button:not(:disabled), input:not(:disabled):not([type='hidden']), select:not(:disabled), textarea:not(:disabled), summary, iframe, audio[controls], video[controls], [contenteditable]:not([contenteditable='false']), [tabindex]";
@@ -47,11 +49,7 @@ interface EffectiveIdentity {
   readonly organization?: string;
 }
 
-interface PendingCreateRequest {
-  readonly jobUrl: string;
-  readonly generateKeywordMap: boolean;
-  readonly autoApply: boolean;
-}
+
 
 interface ActionMenuState {
   readonly runId: string;
@@ -71,11 +69,93 @@ type RunDialog =
     readonly runName: string;
   };
 
+interface ValidatedCreateRunRequest {
+  readonly jobUrl: string;
+  readonly generateKeywordMap: boolean;
+  readonly autoApply: boolean;
+}
+
+type CreateRunResult =
+  | {
+    readonly success: true;
+    readonly run: RunDto;
+  }
+  | {
+    readonly success: false;
+    readonly request: ValidatedCreateRunRequest;
+    readonly error: unknown;
+  };
+
 function publicMessage(error: unknown, fallback: string): string {
   if (!(error instanceof PipelineClientError)) return fallback;
   const message = error.message.trim();
   if (!message) return fallback;
   return message.slice(0, MAX_PUBLIC_MESSAGE_LENGTH);
+}
+
+function parseCreateRunRequests(
+  value: string,
+  autoApply: boolean,
+): ValidatedCreateRunRequest[] | null {
+  const tokens = value.trim().split(/[,\s]+/u).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > MAX_RUNS_PER_SUBMISSION) return null;
+
+  const requests: ValidatedCreateRunRequest[] = [];
+  for (const token of tokens) {
+    const parsed = CreateRunRequestSchema.safeParse({
+      jobUrl: token,
+      generateKeywordMap: true,
+      autoApply,
+    });
+    if (!parsed.success) return null;
+    requests.push(parsed.data);
+  }
+  return requests;
+}
+
+async function mapWithConcurrency<Item, Result>(
+  items: readonly Item[],
+  concurrency: number,
+  worker: (item: Item) => Promise<Result>,
+): Promise<Result[]> {
+  const results = new Array<Result>(items.length);
+  let nextIndex = 0;
+
+  const runWorker = async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index]!);
+    }
+  };
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
+function mergeRuns(current: readonly RunDto[] | undefined, incoming: readonly RunDto[]): RunDto[] {
+  const merged: RunDto[] = [];
+  const seenIds = new Set<string>();
+  for (const run of incoming) {
+    if (seenIds.has(run.id)) continue;
+    seenIds.add(run.id);
+    merged.push(run);
+  }
+  for (const run of current ?? EMPTY_RUNS) {
+    if (seenIds.has(run.id)) continue;
+    seenIds.add(run.id);
+    merged.push(run);
+  }
+  return merged;
+}
+
+function batchFailureMessage(successCount: number, totalCount: number, error: unknown): string {
+  const failure = publicMessage(error, "An application could not be initialized. Try again.");
+  return `${successCount} of ${totalCount} applications initialized. ${failure}`.slice(
+    0,
+    MAX_PUBLIC_MESSAGE_LENGTH,
+  );
 }
 
 function parseJobIdentity(value: unknown): JobIdentity | null {
@@ -140,8 +220,10 @@ export function RunDashboard() {
   const [jobUrl, setJobUrl] = useState("");
   const [autoApply, setAutoApply] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [createSuccess, setCreateSuccess] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
-  const [duplicateCreateRequest, setDuplicateCreateRequest] = useState<PendingCreateRequest | null>(null);
+  const [duplicateCreateRequests, setDuplicateCreateRequests] =
+    useState<readonly ValidatedCreateRunRequest[] | null>(null);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
   const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
   const [actionMenu, setActionMenu] = useState<ActionMenuState | null>(null);
@@ -179,11 +261,11 @@ export function RunDashboard() {
   }, [scheduleFocusRestoration]);
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
-  const createRunRequest = useMemo(
-    () => CreateRunRequestSchema.safeParse({ jobUrl, generateKeywordMap: true, autoApply }),
+  const createRunRequests = useMemo(
+    () => parseCreateRunRequests(jobUrl, autoApply),
     [autoApply, jobUrl],
   );
-  const isCreateRequestValid = createRunRequest.success;
+  const isCreateRequestValid = createRunRequests !== null;
 
   const load = useCallback(async (showLoading = false) => {
     const requestId = ++latestListRequest.current;
@@ -480,53 +562,105 @@ export function RunDashboard() {
     }
   };
 
-  const initializeRun = async (request: PendingCreateRequest) => {
+  const initializeRuns = async (requests: readonly ValidatedCreateRunRequest[]) => {
     if (isCreating) return;
     setIsCreating(true);
     setCreateError(null);
-    try {
-      const run = await createRun(
-        request.jobUrl,
-        request.generateKeywordMap,
-        request.autoApply,
-      );
+    setCreateSuccess(null);
+
+    if (requests.length === 1) {
+      const request = requests[0]!;
+      try {
+        const run = await createRun(
+          request.jobUrl,
+          request.generateKeywordMap,
+          request.autoApply,
+        );
+        setJobUrl("");
+        setAutoApply(false);
+        router.push(`/runs/${encodeURIComponent(run.id)}`);
+      } catch (error) {
+        setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
+        setIsCreating(false);
+      }
+      return;
+    }
+
+    const results = await mapWithConcurrency(
+      requests,
+      MAX_CONCURRENT_RUN_CREATIONS,
+      async (request): Promise<CreateRunResult> => {
+        try {
+          return {
+            success: true,
+            run: await createRun(
+              request.jobUrl,
+              request.generateKeywordMap,
+              request.autoApply,
+            ),
+          };
+        } catch (error) {
+          return { success: false, request, error };
+        }
+      },
+    );
+    const successfulRuns: RunDto[] = [];
+    const failures: Extract<CreateRunResult, { success: false }>[] = [];
+    for (const result of results) {
+      if (result.success) successfulRuns.push(result.run);
+      else failures.push(result);
+    }
+
+    if (successfulRuns.length > 0) {
+      latestListRequest.current += 1;
+      setIsLoading(false);
+      setRuns((current) => mergeRuns(current, successfulRuns));
+      void load();
+    }
+
+    if (failures.length === 0) {
       setJobUrl("");
       setAutoApply(false);
-      router.push(`/runs/${encodeURIComponent(run.id)}`);
-    } catch (error) {
-      setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
-      setIsCreating(false);
+      setCreateSuccess(`${successfulRuns.length} applications initialized.`);
+    } else {
+      setJobUrl(failures.map(({ request }) => request.jobUrl).join(", "));
+      setCreateError(batchFailureMessage(successfulRuns.length, results.length, failures[0]!.error));
     }
+    setIsCreating(false);
   };
 
   const dismissDuplicateDialog = () => {
     if (duplicateDialogRef.current?.open) duplicateDialogRef.current.close();
-    setDuplicateCreateRequest(null);
+    setDuplicateCreateRequests(null);
     duplicateDialogOpenerRef.current?.focus();
   };
 
   const submitRun = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (isCreating || !createRunRequest.success) return;
-    const request = createRunRequest.data;
-    const isDuplicate = runs.some(
-      (run) => run.jobUrl !== undefined && run.jobUrl === request.jobUrl,
+    if (isCreating || !createRunRequests) return;
+    const knownJobUrls = new Set(
+      runs.flatMap((run) => run.jobUrl === undefined ? [] : [run.jobUrl]),
     );
-    if (isDuplicate) {
-      setDuplicateCreateRequest(request);
+    const hasDuplicate = createRunRequests.some((request) => {
+      if (knownJobUrls.has(request.jobUrl)) return true;
+      knownJobUrls.add(request.jobUrl);
+      return false;
+    });
+    if (hasDuplicate) {
+      setDuplicateCreateRequests(createRunRequests);
       if (!duplicateDialogRef.current?.open) duplicateDialogRef.current?.showModal();
       return;
     }
-    void initializeRun(request);
+    void initializeRuns(createRunRequests);
   };
 
   const confirmDuplicateRun = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (isCreating || !duplicateCreateRequest) return;
-    const request = duplicateCreateRequest;
+    if (isCreating || !duplicateCreateRequests) return;
+    const requests = duplicateCreateRequests;
     if (duplicateDialogRef.current?.open) duplicateDialogRef.current.close();
-    setDuplicateCreateRequest(null);
-    void initializeRun(request);
+    setDuplicateCreateRequests(null);
+    void initializeRuns(requests);
   };
 
   const showFilteredEmpty = !isLoading && runs.length > 0 && filteredRuns.length === 0;
@@ -560,28 +694,29 @@ export function RunDashboard() {
 
       <form
         className="run-initializer"
-        aria-label="Initialize application"
+        aria-label="Initialize applications"
         noValidate
         onSubmit={(event) => void submitRun(event)}
       >
         <div className="run-initializer__field">
-          <label className="run-initializer__label" htmlFor="job-url">Job posting URL</label>
+          <label className="run-initializer__label" htmlFor="job-url">Job posting URLs</label>
           <input
             id="job-url"
-            type="url"
+            type="text"
             inputMode="url"
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
-            placeholder="https://company.com/jobs/role"
+            placeholder="https://company.com/jobs/role, https://company.com/jobs/another-role"
             value={jobUrl}
             disabled={isCreating}
             aria-invalid={createError ? true : undefined}
-            aria-describedby={createError ? "job-url-error" : undefined}
+            aria-describedby={createError ? "job-url-error" : createSuccess ? "job-url-success" : undefined}
             aria-errormessage={createError ? "job-url-error" : undefined}
             onChange={(event) => {
               setJobUrl(event.target.value);
               setCreateError(null);
+              setCreateSuccess(null);
             }}
           />
         </div>
@@ -608,6 +743,7 @@ export function RunDashboard() {
           {isCreating ? "Initializing…" : "Initialize"}
         </button>
         {createError ? <p className="dashboard-alert" id="job-url-error" role="alert">{createError}</p> : null}
+        {createSuccess ? <p className="dashboard-notice dashboard-notice--success" id="job-url-success" role="status">{createSuccess}</p> : null}
       </form>
 
         <section className="applications-summary" aria-label="Application count">
@@ -855,11 +991,17 @@ export function RunDashboard() {
       >
         <form className="run-action-dialog__form" onSubmit={confirmDuplicateRun}>
           <header className="run-action-dialog__header">
-            <h2 id="duplicate-application-dialog-title">Initialize duplicate application?</h2>
+            <h2 id="duplicate-application-dialog-title">
+              {duplicateCreateRequests && duplicateCreateRequests.length > 1
+                ? "Initialize duplicate applications?"
+                : "Initialize duplicate application?"}
+            </h2>
           </header>
           <div className="run-action-dialog__body">
             <p id="duplicate-application-dialog-description">
-              This job posting URL has already been used. Initialize another application anyway?
+              {duplicateCreateRequests && duplicateCreateRequests.length > 1
+                ? "One or more job posting URLs have already been used. Initialize these applications anyway?"
+                : "This job posting URL has already been used. Initialize another application anyway?"}
             </p>
           </div>
           <footer className="run-action-dialog__actions">
@@ -869,7 +1011,7 @@ export function RunDashboard() {
             <button
               className="square-control square-control--primary"
               type="submit"
-              disabled={isCreating || !duplicateCreateRequest}
+              disabled={isCreating || !duplicateCreateRequests}
             >
               Initialize anyway
             </button>

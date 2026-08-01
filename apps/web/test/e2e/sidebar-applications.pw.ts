@@ -426,10 +426,10 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
   await page.goto("/");
 
   const heading = page.getByRole("heading", { name: "Applications" });
-  const initializer = page.getByRole("form", { name: "Initialize application" });
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
   await expect(initializer).toBeVisible();
   await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
-  await expect(initializer.getByLabel("Job posting URL")).toHaveAttribute("id", "job-url");
+  await expect(initializer.getByLabel("Job posting URLs")).toHaveAttribute("id", "job-url");
   await expect(initializer.getByRole("checkbox", { name: "Auto-apply" })).toBeChecked({ checked: false });
   await expect(initializer.getByText("Generate resume-to-job-description keyword map", { exact: true })).toHaveCount(0);
   await expect(initializer.getByRole("textbox")).toHaveCount(1);
@@ -447,17 +447,27 @@ test("uses shared request eligibility and remains usable without overflow", asyn
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/");
 
-    const initializer = page.getByRole("form", { name: "Initialize application" });
-    const input = initializer.getByRole("textbox", { name: "Job posting URL" });
+    const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+    const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
     const initialize = initializer.getByRole("button", { name: "Initialize" });
-    await expect(input).toHaveAttribute("type", "url");
+    await expect(input).toHaveAttribute("type", "text");
     await expect(input).toHaveAttribute("inputmode", "url");
     await expect(input).toHaveAttribute("autocapitalize", "none");
     await expect(input).toHaveAttribute("autocorrect", "off");
     await expect(input).toHaveAttribute("spellcheck", "false");
-    await expect(input).toHaveAttribute("placeholder", "https://company.com/jobs/role");
+    await expect(input).toHaveAttribute(
+      "placeholder",
+      "https://company.com/jobs/role, https://company.com/jobs/another-role",
+    );
 
-    for (const invalidUrl of ["", "   ", "example.com/job", "ftp://example.com/job", "https://user:pass@example.com/job"]) {
+    for (const invalidUrl of [
+      "",
+      "   ",
+      "example.com/job",
+      "ftp://example.com/job",
+      "https://user:pass@example.com/job",
+      "https://jobs.example.test/valid, not-a-url",
+    ]) {
       await input.fill(invalidUrl);
       await expect(initialize).toBeDisabled();
     }
@@ -507,8 +517,8 @@ test("posts the selected auto-apply mode with the canonical URL, disables while 
   await interceptDocumentRun(page, initializedRun);
   await page.goto("/");
 
-  const initializer = page.getByRole("form", { name: "Initialize application" });
-  const input = initializer.getByRole("textbox", { name: "Job posting URL" });
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
   const autoApply = initializer.getByRole("checkbox", { name: "Auto-apply" });
   await expect(autoApply).toBeChecked({ checked: false });
@@ -568,8 +578,8 @@ test("preserves auto-apply mode while confirming a duplicate canonical URL", asy
   await interceptDocumentRun(page, initializedRun);
   await page.goto("/");
 
-  const initializer = page.getByRole("form", { name: "Initialize application" });
-  const input = initializer.getByRole("textbox", { name: "Job posting URL" });
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
   const autoApply = initializer.getByRole("checkbox", { name: "Auto-apply" });
   const dialog = page.getByRole("dialog", { name: "Initialize duplicate application?" });
@@ -614,6 +624,327 @@ test("preserves auto-apply mode while confirming a duplicate canonical URL", asy
   }]);
 });
 
+test("initializes mixed comma and whitespace URLs concurrently, stays on the dashboard, and adds every run", async ({ page }) => {
+  const expectedUrls = [
+    "https://jobs.example.test/roles/alpha",
+    "https://jobs.example.test/roles/bravo?source=board",
+    "https://jobs.example.test/roles/charlie",
+    "https://jobs.example.test/roles/delta",
+    "https://jobs.example.test/roles/echo",
+    "https://jobs.example.test/roles/foxtrot",
+  ];
+  const initializedRuns = new Map<string, RunDto>(
+    expectedUrls.map((url, index) => [
+      url,
+      runFixture(`initialized-${index + 1}`, "pending", "approved"),
+    ]),
+  );
+  const existingRun = runFixture("existing-run", "pending", "approved");
+  const pendingPosts = new Map<string, Route>();
+  const postedUrls: string[] = [];
+  let activePosts = 0;
+  let maxActivePosts = 0;
+  let listRequestCount = 0;
+  let pendingInitialList: Route | undefined;
+  const { promise: initialListStarted, resolve: markInitialListStarted } = Promise.withResolvers<void>();
+  const { promise: firstFiveStarted, resolve: markFirstFiveStarted } = Promise.withResolvers<void>();
+  const { promise: allPostsStarted, resolve: markAllPostsStarted } = Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/concurrency-check", async (route) => {
+    await route.fulfill({ status: 204 });
+  });
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      listRequestCount += 1;
+      if (listRequestCount === 1) {
+        pendingInitialList = route;
+        markInitialListStarted();
+        return;
+      }
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [existingRun, ...initializedRuns.values()] }),
+      });
+      return;
+    }
+
+    expect(request.method()).toBe("POST");
+    expect(request.headers()["content-type"]).toContain("application/json");
+    const body = request.postDataJSON() as {
+      jobUrl: string;
+      generateKeywordMap: boolean;
+    };
+    expect(body.generateKeywordMap).toBe(true);
+    expect(expectedUrls).toContain(body.jobUrl);
+    expect(pendingPosts.has(body.jobUrl)).toBe(false);
+    postedUrls.push(body.jobUrl);
+    pendingPosts.set(body.jobUrl, route);
+    activePosts += 1;
+    maxActivePosts = Math.max(maxActivePosts, activePosts);
+    if (postedUrls.length === 5) markFirstFiveStarted();
+    if (postedUrls.length === expectedUrls.length) markAllPostsStarted();
+  });
+  await page.goto("/");
+  await initialListStarted;
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const initialize = initializer.getByRole("button", { name: "Initialize" });
+  await input.fill([
+    " HTTPS://Jobs.Example.Test:443/roles/alpha#overview,",
+    "https://jobs.example.test/roles/bravo?source=board",
+    "https://jobs.example.test/roles/charlie#apply,\n",
+    "https://jobs.example.test/roles/delta\t",
+    "https://jobs.example.test/roles/echo,",
+    "https://jobs.example.test/roles/foxtrot#details ",
+  ].join(" "));
+  await initialize.click();
+  await firstFiveStarted;
+
+  await page.evaluate(async () => {
+    const response = await fetch("/api/pipeline/concurrency-check");
+    if (!response.ok) throw new Error("Concurrency checkpoint failed");
+  });
+  expect(postedUrls).toHaveLength(5);
+  expect(activePosts).toBe(5);
+  expect(maxActivePosts).toBe(5);
+  await expect(input).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
+
+  const firstPending = pendingPosts.entries().next().value;
+  if (!firstPending) throw new Error("No initialize request was intercepted");
+  const [firstUrl, firstRoute] = firstPending;
+  pendingPosts.delete(firstUrl);
+  activePosts -= 1;
+  await firstRoute.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify(initializedRuns.get(firstUrl)),
+  });
+  await allPostsStarted;
+
+  expect(activePosts).toBe(5);
+  expect(maxActivePosts).toBe(5);
+  expect([...postedUrls].sort()).toEqual([...expectedUrls].sort());
+
+  await Promise.all([...pendingPosts].map(async ([url, route]) => {
+    pendingPosts.delete(url);
+    activePosts -= 1;
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify(initializedRuns.get(url)),
+    });
+  }));
+
+  await expect(page.getByRole("status")).toHaveText("6 applications initialized.");
+  await expect(page).toHaveURL(/\/$/);
+  await expect(input).toHaveValue("");
+  await expect(input).toBeEnabled();
+  await expect(initialize).toBeDisabled();
+  await expect(page.locator("tbody tr")).toHaveCount(7);
+  for (const run of initializedRuns.values()) {
+    await expect(page.locator(`tbody a.application-link[href="/runs/${run.id}"]`)).toBeVisible();
+  }
+  await expect(page.locator(`tbody a.application-link[href="/runs/${existingRun.id}"]`)).toBeVisible();
+  await expect(page.locator(".applications-total")).toHaveText("7");
+  await expect(page.getByText("Loading applications…", { exact: true })).toHaveCount(0);
+  if (!pendingInitialList) throw new Error("Initial run list request was not intercepted");
+  await pendingInitialList.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ runs: [existingRun] }),
+  });
+  await expect(page.locator("tbody tr")).toHaveCount(7);
+});
+
+test("keeps successful rows and only failed canonical URLs after a partial initialization", async ({ page }) => {
+  const expectedUrls = [
+    "https://jobs.example.test/roles/success-one",
+    "https://jobs.example.test/roles/unavailable",
+    "https://jobs.example.test/roles/success-two?source=board",
+    "https://jobs.example.test/roles/restricted",
+  ];
+  const failedUrls = [expectedUrls[1], expectedUrls[3]];
+  const successfulRuns = new Map<string, RunDto>([
+    [expectedUrls[0], runFixture("partial-success-1", "pending", "approved")],
+    [expectedUrls[2], runFixture("partial-success-2", "pending", "approved")],
+  ]);
+  const pendingPosts = new Map<string, Route>();
+  const postedUrls: string[] = [];
+  const firstPublicFailure = `The page does not contain a usable job description. ${"Try another public posting URL. ".repeat(10)}`;
+  const laterPublicFailure = "A later public failure must not replace the first.";
+  const expectedAlert = `2 of 4 applications initialized. ${firstPublicFailure}`.slice(0, 240);
+  let listRequestCount = 0;
+  const { promise: allPostsStarted, resolve: markAllPostsStarted } = Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      listRequestCount += 1;
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          runs: listRequestCount === 1 ? [] : [...successfulRuns.values()],
+        }),
+      });
+      return;
+    }
+
+    expect(request.method()).toBe("POST");
+    const body = request.postDataJSON() as {
+      jobUrl: string;
+      generateKeywordMap: boolean;
+    };
+    expect(body.generateKeywordMap).toBe(true);
+    expect(expectedUrls).toContain(body.jobUrl);
+    expect(pendingPosts.has(body.jobUrl)).toBe(false);
+    postedUrls.push(body.jobUrl);
+    pendingPosts.set(body.jobUrl, route);
+    if (postedUrls.length === expectedUrls.length) markAllPostsStarted();
+  });
+  await page.goto("/");
+
+  const input = page.getByRole("textbox", { name: "Job posting URLs" });
+  await input.fill([
+    " HTTPS://Jobs.Example.Test:443/roles/success-one#description,",
+    "https://jobs.example.test/roles/unavailable#apply\n",
+    "https://jobs.example.test/roles/success-two?source=board#details ",
+    "https://jobs.example.test/roles/restricted#requirements",
+  ].join(" "));
+  await page.getByRole("button", { name: "Initialize" }).click();
+  await allPostsStarted;
+
+  expect([...postedUrls].sort()).toEqual([...expectedUrls].sort());
+  await Promise.all([...pendingPosts].map(async ([url, route]) => {
+    const successfulRun = successfulRuns.get(url);
+    if (successfulRun) {
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify(successfulRun),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 422,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_DESCRIPTION_UNAVAILABLE",
+          message: url === failedUrls[0] ? firstPublicFailure : laterPublicFailure,
+        },
+      }),
+    });
+  }));
+
+  const alert = page.locator("#job-url-error");
+  await expect(alert).toHaveText(expectedAlert);
+  await expect(alert).not.toContainText(laterPublicFailure);
+  expect((await alert.textContent())?.length).toBe(240);
+  await expect(page).toHaveURL(/\/$/);
+  await expect(input).toHaveValue(failedUrls.join(", "));
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveAttribute("aria-invalid", "true");
+  await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
+  await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  for (const run of successfulRuns.values()) {
+    await expect(page.locator(`tbody a.application-link[href="/runs/${run.id}"]`)).toBeVisible();
+  }
+});
+
+
+test("retains every canonical URL when a multi-URL initialization fails", async ({ page }) => {
+  const expectedUrls = [
+    "https://jobs.example.test/roles/first",
+    "https://jobs.example.test/roles/second",
+  ];
+  const pendingPosts = new Map<string, Route>();
+  const firstPublicFailure = "The first job posting could not be imported.";
+  const laterPublicFailure = "The later failure must not replace the first.";
+  const { promise: allPostsStarted, resolve: markAllPostsStarted } = Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+
+    const body = request.postDataJSON() as {
+      jobUrl: string;
+      generateKeywordMap: boolean;
+    };
+    expect(body.generateKeywordMap).toBe(true);
+    expect(expectedUrls).toContain(body.jobUrl);
+    pendingPosts.set(body.jobUrl, route);
+    if (pendingPosts.size === expectedUrls.length) markAllPostsStarted();
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  await input.fill([
+    "HTTPS://Jobs.Example.Test:443/roles/first#details,",
+    "https://jobs.example.test/roles/second#apply",
+  ].join(" "));
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  await allPostsStarted;
+
+  await Promise.all([...pendingPosts].map(async ([url, route]) => {
+    await route.fulfill({
+      status: 422,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_DESCRIPTION_UNAVAILABLE",
+          message: url === expectedUrls[0] ? firstPublicFailure : laterPublicFailure,
+        },
+      }),
+    });
+  }));
+
+  const alert = page.locator("#job-url-error");
+  await expect(alert).toHaveText(`0 of 2 applications initialized. ${firstPublicFailure}`);
+  await expect(alert).not.toContainText(laterPublicFailure);
+  await expect(input).toHaveValue(expectedUrls.join(", "));
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveAttribute("aria-invalid", "true");
+  await expect(initializer.getByRole("button", { name: "Initialize" })).toBeEnabled();
+  await expect(page.locator("tbody a.application-link")).toHaveCount(0);
+});
+
+test("disables a batch larger than the newest-run window", async ({ page }) => {
+  let postCount = 0;
+  await page.route("**/api/pipeline/runs", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+    postCount += 1;
+    await route.fulfill({ status: 500 });
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  await initializer.getByRole("textbox", { name: "Job posting URLs" }).fill(
+    Array.from(
+      { length: 101 },
+      (_, index) => `https://jobs.example.test/roles/over-limit-${index + 1}`,
+    ).join(" "),
+  );
+
+  await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
+  expect(postCount).toBe(0);
+});
+
 test("retains the URL and selected auto-apply mode after initialization failures", async ({ page }) => {
   const submittedUrl = "https://jobs.example.test/unavailable#details";
   const retryUrl = "https://jobs.example.test/another-role";
@@ -648,7 +979,7 @@ test("retains the URL and selected auto-apply mode after initialization failures
   });
   await page.goto("/");
 
-  const input = page.getByRole("textbox", { name: "Job posting URL" });
+  const input = page.getByRole("textbox", { name: "Job posting URLs" });
   const autoApply = page.getByRole("checkbox", { name: "Auto-apply" });
   await input.fill(submittedUrl);
   await page.getByRole("button", { name: "Initialize" }).click();
