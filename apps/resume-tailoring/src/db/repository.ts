@@ -558,10 +558,25 @@ export class PipelineRepository {
         AND runs.status = 'approved'
         AND runs.skip_review = 1
         AND runs.approved_pdf_sha256 IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1
-          FROM run_application_sessions
-          WHERE run_application_sessions.run_id = runs.id
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM run_application_sessions
+            WHERE run_application_sessions.run_id = runs.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM run_application_sessions AS latest_session
+            WHERE latest_session.run_id = runs.id
+              AND latest_session.generation = (
+                SELECT max(generation)
+                FROM run_application_sessions
+                WHERE run_id = runs.id
+              )
+              AND latest_session.resume_revision < runs.current_revision
+              AND latest_session.bridge_state IN ('cancelled', 'failed', 'closed', 'lost')
+              AND latest_session.submission_phase = 'not_attempted'
+          )
         )
         AND NOT EXISTS (
           SELECT 1
@@ -1748,14 +1763,32 @@ export class PipelineRepository {
       const now = this.#now(); const run = this.#assertCommandable(runId, now);
       this.#assertRunArtifactsRetained(run.id);
       if (currentSources) this.#assertSourceSnapshot(runId, currentSources);
-      if (run.status !== "review") throw new RepositoryConflictError("run is not in review");
+      const editsApprovedApplication = run.status === "approved" && origin === "human_edit";
+      if (run.status !== "review" && !editsApprovedApplication) throw new RepositoryConflictError("run is not in review");
       const pdf = this.getArtifact(run.id, "compiled-pdf", run.current_revision);
       if (!pdf || pdf.sha256 !== expectedPdfSha256) throw new RepositoryConflictError("review PDF hash is stale");
+      if (editsApprovedApplication) {
+        const latestApplication = this.#db.query<ApplicationSessionRow, [string]>(`
+          SELECT *
+          FROM run_application_sessions
+          WHERE run_id = ?
+          ORDER BY generation DESC
+          LIMIT 1
+        `).get(run.id);
+        if (
+          latestApplication?.bridge_state !== "cancelled"
+          || latestApplication.resume_revision !== run.current_revision
+          || latestApplication.pdf_sha256 !== pdf.sha256
+          || run.approved_pdf_sha256 !== pdf.sha256
+        ) {
+          throw new RepositoryConflictError("approved run does not have a matching cancelled application session");
+        }
+      }
       const target = run.current_revision + 1;
       this.#db.query("INSERT INTO revisions(run_id,revision,origin,source_revision,status,created_at) VALUES (?,?,?,?, 'editing',?)").run(run.id, target, origin, run.current_revision, now);
       this.#db.query("INSERT INTO edit_requests(id,run_id,source_revision,target_revision,origin,comments,expected_pdf_sha256,created_at) VALUES (?,?,?,?,?,?,?,?)")
         .run(this.#idFactory(), run.id, run.current_revision, target, origin, comments, expectedPdfSha256, now);
-      this.#db.query("UPDATE runs SET current_revision=?,status='editing',failed_stage=NULL,visual_ack_required=0,updated_at=? WHERE id=?").run(target, now, run.id);
+      this.#db.query("UPDATE runs SET current_revision=?,status='editing',failed_stage=NULL,approved_pdf_sha256=NULL,visual_ack_required=0,updated_at=? WHERE id=?").run(target, now, run.id);
       this.#event(run.id, target, "run.edit_requested", { origin, sourceRevision: run.current_revision, expectedPdfSha256 }, now);
       return publicRun(this.#run(run.id));
     });

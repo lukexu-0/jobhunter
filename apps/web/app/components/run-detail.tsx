@@ -875,9 +875,12 @@ export function RunDetail({ runId }: RunDetailProps) {
     }
   };
 
-  const currentReviewPdfHash = (): string => {
+  const currentActionPdfHash = (allowApproved: boolean): string => {
     if (
-      run?.status !== "review"
+      (
+        run?.status !== "review"
+        && !(allowApproved && run?.status === "approved")
+      )
       || !run.currentPdfSha256
       || selectedIteration?.revision !== run.revision
       || selectedIteration.pdfSha256 !== run.currentPdfSha256
@@ -931,7 +934,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   };
 
   const submitEdit = async (comments: string): Promise<RunDto> => {
-    const expectedPdfSha256 = currentReviewPdfHash();
+    const expectedPdfSha256 = currentActionPdfHash(true);
     return await submitRunMutation(
       "edit",
       () => editRun(runId, comments, expectedPdfSha256),
@@ -940,7 +943,7 @@ export function RunDetail({ runId }: RunDetailProps) {
 
 
   const submitApproval = async (acknowledgeVisualIssues: boolean): Promise<RunDto> => {
-    const expectedPdfSha256 = currentReviewPdfHash();
+    const expectedPdfSha256 = currentActionPdfHash(false);
     return await submitRunMutation(
       "approve",
       () => approveRun(runId, expectedPdfSha256, acknowledgeVisualIssues),
