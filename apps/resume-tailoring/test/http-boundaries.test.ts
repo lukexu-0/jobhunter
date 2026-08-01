@@ -12,15 +12,144 @@ describe("HTTP boundary policy", () => {
     expect(await response.json()).toEqual({ status: "ok" });
   });
 
-  test("rejects a mutation from an untrusted origin before routing", async () => {
-    const response = await handler(
-      new Request("http://127.0.0.1:3457/v1/unknown", {
+  test("accepts the localhost alias for a 127.0.0.1 mutation origin", async () => {
+    let routeCalls = 0;
+    const aliasHandler = createApiHandler({
+      webOrigin: WEB_ORIGIN,
+      route: () => {
+        routeCalls += 1;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const response = await aliasHandler(
+      new Request("http://127.0.0.1:3457/v1/known-mutation", {
         method: "POST",
-        headers: { origin: "https://attacker.invalid", "content-type": "application/json" },
+        headers: { origin: "http://localhost:3456", "content-type": "application/json" },
         body: "{}",
       }),
     );
-    expect(response.status).toBe(403);
+
+    expect(response.status).toBe(204);
+    expect(routeCalls).toBe(1);
+  });
+
+  test("accepts the 127.0.0.1 alias for a localhost mutation origin", async () => {
+    let routeCalls = 0;
+    const aliasHandler = createApiHandler({
+      webOrigin: "http://localhost:3456",
+      route: () => {
+        routeCalls += 1;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const response = await aliasHandler(
+      new Request("http://127.0.0.1:3457/v1/known-mutation", {
+        method: "POST",
+        headers: { origin: WEB_ORIGIN, "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+
+    expect(response.status).toBe(204);
+    expect(routeCalls).toBe(1);
+  });
+
+  test("does not derive an alias from a normalized configured hostname", async () => {
+    let routeCalls = 0;
+    const configuredOrigins = [
+      ["http://127.1:3456", "http://localhost:3456"],
+      ["http://2130706433:3456", "http://localhost:3456"],
+      ["http://%6cocalhost:3456", WEB_ORIGIN],
+    ] as const;
+
+    for (const [webOrigin, origin] of configuredOrigins) {
+      const guardedHandler = createApiHandler({
+        webOrigin,
+        route: () => {
+          routeCalls += 1;
+          return new Response(null, { status: 204 });
+        },
+      });
+      const response = await guardedHandler(
+        new Request("http://127.0.0.1:3457/v1/known-mutation", {
+          method: "POST",
+          headers: { origin, "content-type": "application/json" },
+          body: "{}",
+        }),
+      );
+
+      expect(response.status).toBe(403);
+    }
+
+    expect(routeCalls).toBe(0);
+  });
+
+  test("continues to accept the exact configured mutation origin", async () => {
+    let routeCalls = 0;
+    const exactOriginHandler = createApiHandler({
+      webOrigin: WEB_ORIGIN,
+      route: () => {
+        routeCalls += 1;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const response = await exactOriginHandler(
+      new Request("http://127.0.0.1:3457/v1/known-mutation", {
+        method: "POST",
+        headers: { origin: WEB_ORIGIN, "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+
+    expect(response.status).toBe(204);
+    expect(routeCalls).toBe(1);
+  });
+
+  test("rejects mismatched and malformed mutation origins before routing", async () => {
+    let routeCalls = 0;
+    const guardedHandler = createApiHandler({
+      webOrigin: WEB_ORIGIN,
+      route: () => {
+        routeCalls += 1;
+        return new Response(null, { status: 204 });
+      },
+    });
+    const rejectedOrigins = [
+      "https://localhost:3456",
+      "http://localhost:3457",
+      "http://localhost.evil:3456",
+      "http://127.0.0.2:3456",
+      "https://attacker.invalid",
+      "not an origin",
+      "http://localhost:3456/",
+      "null",
+      null,
+    ] as const;
+
+    for (const origin of rejectedOrigins) {
+      const headers = new Headers({ "content-type": "application/json" });
+      if (origin !== null) headers.set("origin", origin);
+      const response = await guardedHandler(
+        new Request("http://127.0.0.1:3457/v1/known-mutation", {
+          method: "POST",
+          headers,
+          body: "{}",
+        }),
+      );
+
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        error: {
+          code: "ORIGIN_REJECTED",
+          message: "Mutation origin is not allowed",
+        },
+      });
+    }
+
+    expect(routeCalls).toBe(0);
   });
 
   test("requires JSON for mutation bodies", async () => {

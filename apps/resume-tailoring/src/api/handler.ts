@@ -15,6 +15,33 @@ const MUTATION_METHODS: Readonly<Record<string, true>> = {
   DELETE: true,
 };
 
+const LOOPBACK_ORIGIN_PATTERN =
+  /^[a-z][a-z0-9+.-]*:\/\/(127\.0\.0\.1|localhost)(?::\d+)?$/;
+
+function loopbackAliasOrigin(origin: string): string | undefined {
+  const match = LOOPBACK_ORIGIN_PATTERN.exec(origin);
+  if (!match) return undefined;
+  try {
+    const url = new URL(origin);
+    if (
+      url.origin === "null" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.pathname !== "/" ||
+      url.search !== "" ||
+      url.hash !== "" ||
+      url.hostname !== match[1]
+    ) {
+      return undefined;
+    }
+
+    const aliasHost = url.hostname === "127.0.0.1" ? "localhost" : "127.0.0.1";
+    return `${url.protocol}//${aliasHost}${url.port === "" ? "" : `:${url.port}`}`;
+  } catch {
+    return undefined;
+  }
+}
+
 function json(body: unknown, status = 200): Response {
   return Response.json(body, {
     status,
@@ -30,13 +57,15 @@ function error(code: string, message: string, status: number): Response {
 }
 
 export function createApiHandler(options: ApiHandlerOptions) {
+  const loopbackAlias = loopbackAliasOrigin(options.webOrigin);
   return async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const internalResponse = await options.internalRoute?.(request, url);
     if (internalResponse) return internalResponse;
     const isMutation = MUTATION_METHODS[request.method] === true;
 
-    if (isMutation && request.headers.get("origin") !== options.webOrigin) {
+    const origin = request.headers.get("origin");
+    if (isMutation && origin !== options.webOrigin && origin !== loopbackAlias) {
       return error("ORIGIN_REJECTED", "Mutation origin is not allowed", 403);
     }
 

@@ -1534,6 +1534,64 @@ test("a failed submitted-run refresh is retryable without resubmitting", async (
   expect(mock.commands).toEqual([]);
 });
 
+test("an approved initial revision with a cancelled application permits exact-hash resume edits", async ({ page }) => {
+  const initialApprovedRun = runFixture({
+    status: "approved",
+    revision: 1,
+    origin: "initial",
+    pdfSha256: pdfHash1,
+  });
+  const editingRun = runFixture({
+    status: "editing",
+    revision: 2,
+    origin: "human-comments",
+    pdfSha256: null,
+  });
+  const cancelled = snapshotFixture({
+    bridgeState: "cancelled",
+    submissionPhase: "not_attempted",
+  });
+  const mock = await installPipeline(page, {
+    run: initialApprovedRun,
+    iterations: iterationList(iteration(1, "initial", pdfHash1, "approved")),
+    application: cancelled,
+  });
+  mock.editReply = editingRun;
+
+  await page.goto(`/runs/${runId}`);
+
+  await expect(page.getByLabel("Displayed resume")).toHaveValue("1");
+  await expect(page.getByLabel("Selected resume PDF for Public Role 1")).toHaveAttribute(
+    "data",
+    `${pipelineRunPath}/iterations/1/artifacts/resume-r1`,
+  );
+  await expect(page.getByRole("status").filter({ hasText: "Cancelled" })).toBeVisible();
+  const editInstructions = page.getByLabel("Edit instructions");
+  const requestEdits = page.getByRole("button", { name: "Request edits" });
+  await expect(editInstructions).toBeVisible();
+  await expect(editInstructions).toBeEnabled();
+  await expect(requestEdits).toBeVisible();
+  await expect(requestEdits).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Regenerate" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Approve and apply" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+
+  await editInstructions.fill("  Strengthen initial platform ownership.  ");
+  await requestEdits.click();
+
+  await expect.poll(
+    () => mock.requests.filter((request) => request.path === `${pipelineRunPath}/edit`).length,
+  ).toBe(1);
+  expect(mock.requests.find((request) => request.path === `${pipelineRunPath}/edit`)).toEqual({
+    method: "POST",
+    path: `${pipelineRunPath}/edit`,
+    body: {
+      comments: "Strengthen initial platform ownership.",
+      expectedPdfSha256: pdfHash1,
+    },
+  });
+});
+
 test("a reserved generation resumes, running cancel is a command, and cancelled application permits resume edits", async ({ page }) => {
   const reserved = snapshotFixture({ bridgeState: "reserved" });
   const running = snapshotFixture({ bridgeState: "running", updatedAt: createdAt + 200 });
