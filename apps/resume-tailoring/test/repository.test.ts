@@ -158,17 +158,19 @@ describe("run listing", () => {
 });
 
 describe("persisted workflow commands", () => {
-  test("persists immutable run modes and independently managed application status", () => {
+  test("persists independent immutable run modes and independently managed application status", () => {
     const { db, repo, tick, now } = fixture();
     expect(repo.createRun("Default JD", "default-setting")).toMatchObject({
       generateKeywordMap: true,
-      autoApply: false,
+      skipReview: false,
+      autoSubmit: false,
     });
-    const created = repo.createRun("JD", "enabled-setting", true, true);
+    const created = repo.createRun("JD", "enabled-setting", true, true, true);
     expect(created).toMatchObject({
       applicationStatus: "pending",
       generateKeywordMap: true,
-      autoApply: true,
+      skipReview: true,
+      autoSubmit: true,
     });
     const eventCount = repo.timeline(created.id).events.length;
 
@@ -179,8 +181,11 @@ describe("persisted workflow commands", () => {
     expect(updated.applicationStatus).toBe("interview");
     expect(repo.getRun(created.id)?.applicationStatus).toBe("interview");
     expect(secondRepo.getRun(created.id)?.applicationStatus).toBe("interview");
-    expect(secondRepo.getRun(created.id)?.generateKeywordMap).toBe(true);
-    expect(secondRepo.getRun(created.id)?.autoApply).toBe(true);
+    expect(secondRepo.getRun(created.id)).toMatchObject({
+      generateKeywordMap: true,
+      skipReview: true,
+      autoSubmit: true,
+    });
     expect(updated.status).toBe("queued");
     expect(updated.updatedAt).toBeGreaterThan(created.updatedAt);
     expect(repo.timeline(created.id).events).toHaveLength(eventCount);
@@ -524,6 +529,56 @@ describe("persisted workflow commands", () => {
     expect(approved.approvedPdfSha256).toBe(hash);
     expect(approved.visualAcknowledgementRequired).toBe(false);
   });
+
+  test("claim-fenced clean visual completion approves atomically with ordinary automatic evidence", () => {
+    const { db, repo } = fixture();
+    const hash = "6".repeat(64);
+    const run = repo.createRun("JD", "automatic-approval", false, true, false);
+    const claim = repo.acquire()!;
+    reachStage(repo, claim, ["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
+    const attempt = repo.startAttempt(claim, "visual_qa");
+    repo.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "compiled-pdf",
+      sha256: hash,
+      path: "/tmp/automatic-approval.pdf",
+      byteSize: 10,
+    });
+    repo.finishAttempt(claim, attempt.id, "succeeded");
+
+    expect(() => repo.completeVisualQa(
+      { runId: run.id, token: "not-the-live-token" },
+      hash,
+      false,
+    )).toThrow(ClaimRejectedError);
+    const approved = repo.completeVisualQa(claim, hash, false);
+
+    expect(approved).toMatchObject({
+      status: "approved",
+      approvedPdfSha256: hash,
+      visualAcknowledgementRequired: false,
+    });
+    expect(db.query<{ run_status: string; revision_status: string; approved_pdf_sha256: string }, []>(`
+      SELECT runs.status AS run_status, revisions.status AS revision_status, runs.approved_pdf_sha256
+      FROM runs
+      JOIN revisions ON revisions.run_id = runs.id AND revisions.revision = runs.current_revision
+      WHERE runs.id = 'automatic-approval'
+    `).get()).toEqual({
+      run_status: "approved",
+      revision_status: "approved",
+      approved_pdf_sha256: hash,
+    });
+    expect(repo.timeline(run.id).events.at(-1)).toMatchObject({
+      kind: "run.approved",
+      revision: 1,
+      payload: {
+        pdfSha256: hash,
+        visualAcknowledged: false,
+        automatic: true,
+      },
+    });
+  });
 });
 
 describe("application session ledger", () => {
@@ -561,6 +616,68 @@ describe("application session ledger", () => {
       "22222222-2222-4222-8222-222222222222",
       hash,
     )).toThrow(/changed/);
+  });
+
+  test("selects the oldest unstarted skip-review approval only when no application session is live", () => {
+    const { repo } = fixture();
+    const hash = "5".repeat(64);
+    const manualRunId = createReview(repo, hash, false, "manual-approved");
+    repo.approve(manualRunId, hash);
+
+    const createAutomaticApproval = (id: string, autoSubmit: boolean): string => {
+      const run = repo.createRun("JD", id, false, true, autoSubmit);
+      const claim = repo.acquire()!;
+      expect(claim.runId).toBe(run.id);
+      reachStage(repo, claim, ["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
+      const attempt = repo.startAttempt(claim, "visual_qa");
+      repo.finalizeArtifact(claim, {
+        attemptId: attempt.id,
+        stage: "visual_qa",
+        kind: "compiled-pdf",
+        sha256: hash,
+        path: `/tmp/${id}.pdf`,
+        byteSize: 10,
+      });
+      repo.finishAttempt(claim, attempt.id, "succeeded");
+      repo.completeVisualQa(claim, hash, false);
+      repo.release(claim);
+      return run.id;
+    };
+    const oldest = createAutomaticApproval("automatic-oldest", false);
+    const next = createAutomaticApproval("automatic-next", true);
+
+    expect(repo.getNextAutomaticApplicationStart()).toEqual({
+      runId: oldest,
+      approvedPdfSha256: hash,
+    });
+
+    const manualSessionId = "12121212-1212-4212-8212-121212121212";
+    repo.reserveApplicationSession(manualRunId, null, manualSessionId, hash);
+    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+    repo.recordApplicationSnapshot(manualRunId, {
+      generation: 1,
+      sessionId: manualSessionId,
+      bridgeState: "closed",
+      publicSnapshot: { state: "closed" },
+    });
+    expect(repo.getNextAutomaticApplicationStart()?.runId).toBe(oldest);
+
+    const automaticSessionId = "13131313-1313-4313-8313-131313131313";
+    repo.reserveApplicationSession(oldest, null, automaticSessionId, hash);
+    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+    repo.recordApplicationSnapshot(oldest, {
+      generation: 1,
+      sessionId: automaticSessionId,
+      bridgeState: "closed",
+      publicSnapshot: { state: "closed" },
+    });
+    expect(repo.getNextAutomaticApplicationStart()).toEqual({
+      runId: next,
+      approvedPdfSha256: hash,
+    });
+
+    repo.deleteRun(next);
+    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
   });
 
   test("claims before submission and finalizes one durable outcome atomically", () => {

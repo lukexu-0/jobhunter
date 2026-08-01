@@ -233,7 +233,7 @@ describe("RunApplicationService", () => {
       iterations: [{ ...iteration, privatePath: "/tmp/resume.pdf" }],
     }).success).toBeFalse();
   });
-  test("creates a runnable run with one atomic four-source snapshot and immutable queued input", async () => {
+  test("creates a runnable run with one atomic four-source snapshot and independent default-off modes", async () => {
     const target = fixture();
     const jobDescription = JOB_DESCRIPTION;
     const run = await target.service.createRun(JOB_URL);
@@ -243,15 +243,23 @@ describe("RunApplicationService", () => {
       status: "queued",
       revision: 1,
       origin: "initial",
-      autoApply: false,
+      skipReview: false,
+      autoSubmit: false,
     });
     expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(true);
     expect(target.repository.getRunJobUrl(run.id)).toBe(JOB_URL);
     expect(run.jobUrl).toBe(JOB_URL);
-    const enabled = await target.service.createRun(JOB_URL, false, true);
-    expect(target.repository.getRun(enabled.id)).toMatchObject({
+    const skipOnly = await target.service.createRun(JOB_URL, false, true, false);
+    expect(target.repository.getRun(skipOnly.id)).toMatchObject({
       generateKeywordMap: false,
-      autoApply: true,
+      skipReview: true,
+      autoSubmit: false,
+    });
+    const submitOnly = await target.service.createRun(JOB_URL, true, false, true);
+    expect(target.repository.getRun(submitOnly.id)).toMatchObject({
+      generateKeywordMap: true,
+      skipReview: false,
+      autoSubmit: true,
     });
     expect(Object.keys(target.repository.getSourceSnapshot(run.id)!.sourceHashes)).toHaveLength(4);
     const input = target.repository.getArtifact(run.id, "job-description");
@@ -261,27 +269,30 @@ describe("RunApplicationService", () => {
   });
   test("exposes durable run modes and canonical job URLs on created, listed, and retrieved DTOs", async () => {
     const target = fixture();
-    const created = await target.service.createRun(JOB_URL, false, true);
+    const created = await target.service.createRun(JOB_URL, false, true, true);
     const listed = await target.service.listRuns();
     const retrieved = await target.service.getRun(created.id);
 
     expect(created).toMatchObject({
       queueSequence: 1,
       generateKeywordMap: false,
-      autoApply: true,
+      skipReview: true,
+      autoSubmit: true,
       jobUrl: JOB_URL,
     });
     expect(listed).toHaveLength(1);
     expect(listed[0]).toMatchObject({
       queueSequence: 1,
       generateKeywordMap: false,
-      autoApply: true,
+      skipReview: true,
+      autoSubmit: true,
       jobUrl: JOB_URL,
     });
     expect(retrieved).toMatchObject({
       queueSequence: 1,
       generateKeywordMap: false,
-      autoApply: true,
+      skipReview: true,
+      autoSubmit: true,
       jobUrl: JOB_URL,
     });
   });
@@ -315,7 +326,7 @@ describe("RunApplicationService", () => {
       },
     });
 
-    const run = await target.service.createRun(JOB_URL, controller.signal);
+    const run = await target.service.createRun(JOB_URL, true, false, false, controller.signal);
 
     expect(observed).toEqual({
       loader: { jobUrl: JOB_URL, signal: controller.signal },
@@ -434,7 +445,13 @@ describe("RunApplicationService", () => {
         return { kind: "description", jobDescription: JOB_DESCRIPTION };
       },
     });
-    await expect(beforeLoadTarget.service.createRun(JOB_URL, beforeLoadController.signal)).rejects.toBe(beforeLoadReason);
+    await expect(beforeLoadTarget.service.createRun(
+      JOB_URL,
+      true,
+      false,
+      false,
+      beforeLoadController.signal,
+    )).rejects.toBe(beforeLoadReason);
     expect(loadCalls).toBe(0);
     expectNoPersistence(beforeLoadTarget);
 
@@ -448,7 +465,13 @@ describe("RunApplicationService", () => {
         return loading.promise;
       },
     });
-    const loadingRun = loadingTarget.service.createRun(JOB_URL, loadingController.signal);
+    const loadingRun = loadingTarget.service.createRun(
+      JOB_URL,
+      true,
+      false,
+      false,
+      loadingController.signal,
+    );
     expect(loaderSignal).toBe(loadingController.signal);
     loadingController.abort(loadingReason);
     loading.resolve({ kind: "description", jobDescription: JOB_DESCRIPTION });
@@ -468,7 +491,13 @@ describe("RunApplicationService", () => {
         return extracting.promise;
       },
     });
-    const extractingRun = extractingTarget.service.createRun(JOB_URL, extractingController.signal);
+    const extractingRun = extractingTarget.service.createRun(
+      JOB_URL,
+      true,
+      false,
+      false,
+      extractingController.signal,
+    );
     await extractorStarted.promise;
     expect(extractorSignal).toBe(extractingController.signal);
     extractingController.abort(extractingReason);
@@ -488,7 +517,13 @@ describe("RunApplicationService", () => {
         return snapshot.promise;
       },
     });
-    const snapshotRun = snapshotTarget.service.createRun(JOB_URL, snapshotController.signal);
+    const snapshotRun = snapshotTarget.service.createRun(
+      JOB_URL,
+      true,
+      false,
+      false,
+      snapshotController.signal,
+    );
     await snapshotStarted.promise;
     snapshotController.abort(snapshotReason);
     snapshot.resolve(resolvedSnapshot!);
@@ -505,7 +540,13 @@ describe("RunApplicationService", () => {
       },
     });
     await expect(
-      afterSnapshotTarget.service.createRun(JOB_URL, afterSnapshotController.signal),
+      afterSnapshotTarget.service.createRun(
+        JOB_URL,
+        true,
+        false,
+        false,
+        afterSnapshotController.signal,
+      ),
     ).rejects.toBe(afterSnapshotReason);
     expectNoPersistence(afterSnapshotTarget);
   });

@@ -19,7 +19,8 @@ export interface RunRouteService {
   createRun(
     jobUrl: string,
     generateKeywordMap: boolean,
-    autoApply: boolean,
+    skipReview: boolean,
+    autoSubmit: boolean,
     signal?: AbortSignal,
   ): Promise<RunDto>;
   updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto>;
@@ -98,7 +99,8 @@ export function createRunRoutes(service: RunRouteService) {
         const run = checkedRun(await service.createRun(
           body.data.jobUrl,
           body.data.generateKeywordMap,
-          body.data.autoApply,
+          body.data.skipReview,
+          body.data.autoSubmit,
           request.signal,
         ));
         service.kick();

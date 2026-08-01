@@ -84,7 +84,8 @@ interface RunRow {
   status: RunStatus;
   application_status: ApplicationStatus;
   generate_keyword_map: number;
-  auto_apply: number;
+  skip_review: number;
+  auto_submit: number;
   title_override: string | null;
   organization_override: string | null;
   deleted_at: number | null;
@@ -138,7 +139,8 @@ export interface PublicRun {
   readonly titleOverride?: string;
   readonly organizationOverride?: string;
   readonly generateKeywordMap: boolean;
-  readonly autoApply: boolean;
+  readonly skipReview: boolean;
+  readonly autoSubmit: boolean;
   readonly queueSequence: number;
   readonly currentRevision: number;
   readonly failedStage: ActiveStage | null;
@@ -252,7 +254,8 @@ function publicRun(row: RunRow): PublicRun {
     ...(row.title_override !== null ? { titleOverride: row.title_override } : {}),
     ...(row.organization_override !== null ? { organizationOverride: row.organization_override } : {}),
     generateKeywordMap: row.generate_keyword_map === 1,
-    autoApply: row.auto_apply === 1,
+    skipReview: row.skip_review === 1,
+    autoSubmit: row.auto_submit === 1,
     queueSequence: row.queue_sequence,
     currentRevision: row.current_revision,
     failedStage: row.failed_stage,
@@ -449,7 +452,8 @@ export class PipelineRepository {
     id = this.#idFactory(),
     generateKeywordMap = true,
     queueSequence?: number,
-    autoApply = false,
+    skipReview = false,
+    autoSubmit = false,
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     if (jobUrl.length < 1 || jobUrl.length > 2_048 || jobUrl.trim() !== jobUrl) {
@@ -474,7 +478,8 @@ export class PipelineRepository {
       throw new Error("queued input artifact metadata is invalid");
     }
     if (typeof generateKeywordMap !== "boolean") throw new Error("generate keyword map setting must be boolean");
-    if (typeof autoApply !== "boolean") throw new Error("auto-apply setting must be boolean");
+    if (typeof skipReview !== "boolean") throw new Error("skip-review setting must be boolean");
+    if (typeof autoSubmit !== "boolean") throw new Error("auto-submit setting must be boolean");
     if (queueSequence !== undefined && (!Number.isSafeInteger(queueSequence) || queueSequence < 1)) {
       throw new Error("queue sequence must be a positive integer");
     }
@@ -482,8 +487,8 @@ export class PipelineRepository {
     return this.#immediate(() => {
       const now = this.#now();
       const sequence = queueSequence ?? this.nextQueueSequence();
-      this.#db.query("INSERT INTO runs(id, job_description, job_url, status, generate_keyword_map, auto_apply, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, 1, ?, ?, ?)")
-        .run(id, jobDescription, jobUrl, generateKeywordMap ? 1 : 0, autoApply ? 1 : 0, sequence, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, job_url, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, ?, ?, ?)")
+        .run(id, jobDescription, jobUrl, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, sequence, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#db.query("INSERT INTO run_source_snapshots(run_id,manifest_sha256,baseline_sha256,source_hashes_json,created_at) VALUES (?,?,?,?,?)")
         .run(id, snapshot.manifestSha256, snapshot.baselineSha256, JSON.stringify(sourceHashes), now);
@@ -506,15 +511,17 @@ export class PipelineRepository {
     jobDescription: string,
     id = this.#idFactory(),
     generateKeywordMap = true,
-    autoApply = false,
+    skipReview = false,
+    autoSubmit = false,
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     if (typeof generateKeywordMap !== "boolean") throw new Error("generate keyword map setting must be boolean");
-    if (typeof autoApply !== "boolean") throw new Error("auto-apply setting must be boolean");
+    if (typeof skipReview !== "boolean") throw new Error("skip-review setting must be boolean");
+    if (typeof autoSubmit !== "boolean") throw new Error("auto-submit setting must be boolean");
     return this.#immediate(() => {
       const now = this.#now();
-      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, auto_apply, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', ?, ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs")
-        .run(id, jobDescription, generateKeywordMap ? 1 : 0, autoApply ? 1 : 0, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', ?, ?, ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs")
+        .run(id, jobDescription, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#event(id, 1, "run.created", { status: "queued", origin: "initial" }, now);
       return publicRun(this.#run(id));
@@ -535,6 +542,38 @@ export class PipelineRepository {
       LIMIT 1
     `).get(runId);
     return row ? publicApplicationSession(row) : null;
+  }
+
+  getNextAutomaticApplicationStart(): {
+    readonly runId: string;
+    readonly approvedPdfSha256: string;
+  } | null {
+    const row = this.#db.query<{
+      run_id: string;
+      approved_pdf_sha256: string;
+    }, []>(`
+      SELECT runs.id AS run_id, runs.approved_pdf_sha256
+      FROM runs
+      WHERE runs.deleted_at IS NULL
+        AND runs.status = 'approved'
+        AND runs.skip_review = 1
+        AND runs.approved_pdf_sha256 IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM run_application_sessions
+          WHERE run_application_sessions.run_id = runs.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM run_application_sessions
+          WHERE bridge_state NOT IN ('cancelled', 'failed', 'closed', 'lost')
+        )
+      ORDER BY runs.queue_sequence
+      LIMIT 1
+    `).get();
+    return row
+      ? { runId: row.run_id, approvedPdfSha256: row.approved_pdf_sha256 }
+      : null;
   }
 
   reserveApplicationSession(
@@ -1460,6 +1499,63 @@ export class PipelineRepository {
         .run(target, failedStage, options.visualAcknowledgementRequired ? 1 : 0, now, run.id);
       this.#db.query("UPDATE revisions SET status=? WHERE run_id=? AND revision=?").run(target, run.id, run.current_revision);
       this.#event(run.id, run.current_revision, "run.transitioned", { from: run.status, to: target, failedStage }, now);
+      return publicRun(this.#run(run.id));
+    });
+  }
+
+  completeVisualQa(
+    claim: Pick<RunClaim, "runId" | "token">,
+    expectedPdfSha256: string,
+    visualAcknowledgementRequired: boolean,
+  ): PublicRun {
+    if (!/^[a-f0-9]{64}$/.test(expectedPdfSha256)) {
+      throw new Error("review PDF hash must be a lowercase SHA-256 value");
+    }
+    if (typeof visualAcknowledgementRequired !== "boolean") {
+      throw new Error("visual acknowledgement setting must be boolean");
+    }
+    return this.#immediate(() => {
+      const now = this.#now();
+      this.#assertClaim(claim, now);
+      const run = this.#run(claim.runId);
+      if (run.status !== "visual_qa") {
+        throw new RepositoryConflictError(`run is ${run.status}, not visual_qa`);
+      }
+      const pdf = this.getArtifact(run.id, "compiled-pdf", run.current_revision);
+      if (!pdf || pdf.sha256 !== expectedPdfSha256) {
+        throw new RepositoryConflictError("review PDF hash is stale");
+      }
+      if (run.skip_review === 1 && !visualAcknowledgementRequired) {
+        this.#db.query(`
+          UPDATE runs
+          SET status = 'approved', failed_stage = NULL, visual_ack_required = 0,
+              approved_pdf_sha256 = ?, updated_at = ?
+          WHERE id = ?
+        `).run(expectedPdfSha256, now, run.id);
+        this.#db.query(
+          "UPDATE revisions SET status='approved' WHERE run_id=? AND revision=?",
+        ).run(run.id, run.current_revision);
+        this.#event(run.id, run.current_revision, "run.approved", {
+          pdfSha256: expectedPdfSha256,
+          visualAcknowledged: false,
+          automatic: true,
+        }, now);
+      } else {
+        this.#db.query(`
+          UPDATE runs
+          SET status = 'review', failed_stage = NULL, visual_ack_required = ?,
+              approved_pdf_sha256 = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(visualAcknowledgementRequired ? 1 : 0, now, run.id);
+        this.#db.query(
+          "UPDATE revisions SET status='review' WHERE run_id=? AND revision=?",
+        ).run(run.id, run.current_revision);
+        this.#event(run.id, run.current_revision, "run.transitioned", {
+          from: "visual_qa",
+          to: "review",
+          failedStage: null,
+        }, now);
+      }
       return publicRun(this.#run(run.id));
     });
   }

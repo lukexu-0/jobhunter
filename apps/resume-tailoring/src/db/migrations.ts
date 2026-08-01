@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 14;
+export const PIPELINE_SCHEMA_VERSION = 15;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -560,6 +560,15 @@ ADD COLUMN auto_apply INTEGER NOT NULL DEFAULT 0
   CHECK (auto_apply IN (0,1));
 `;
 
+const migration15 = `
+ALTER TABLE runs
+RENAME COLUMN auto_apply TO auto_submit;
+
+ALTER TABLE runs
+ADD COLUMN skip_review INTEGER NOT NULL DEFAULT 0
+  CHECK (skip_review IN (0,1));
+`;
+
 
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
@@ -620,6 +629,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 14) {
         db.exec(migration14);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(14, now);
+      }
+      if (version < 15) {
+        db.exec(migration15);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(15, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

@@ -263,12 +263,12 @@ export class RunApplicationService {
 
   async createRun(
     jobUrl: string,
-    generateKeywordMapOrSignal: boolean | AbortSignal = true,
-    autoApply = false,
+    generateKeywordMap = true,
+    skipReview = false,
+    autoSubmit = false,
     requestSignal?: AbortSignal,
   ): Promise<RunDto> {
-    const generateKeywordMap = typeof generateKeywordMapOrSignal === "boolean" ? generateKeywordMapOrSignal : true;
-    const signal = typeof generateKeywordMapOrSignal === "boolean" ? requestSignal : generateKeywordMapOrSignal;
+    const signal = requestSignal;
     signal?.throwIfAborted();
     let source: LoadedJobSource;
     try {
@@ -341,7 +341,7 @@ export class RunApplicationService {
         sha256: input.sha256,
         path: input.path,
         byteSize: input.bytes,
-      }, runId, generateKeywordMap, reservation.run, autoApply);
+      }, runId, generateKeywordMap, reservation.run, skipReview, autoSubmit);
     } catch (error) {
       try {
         await this.dependencies.artifacts.removeRun(reservation.run);
@@ -592,7 +592,8 @@ export class RunApplicationService {
       ...(run.titleOverride !== undefined ? { titleOverride: run.titleOverride } : {}),
       ...(run.organizationOverride !== undefined ? { organizationOverride: run.organizationOverride } : {}),
       generateKeywordMap: run.generateKeywordMap,
-      autoApply: run.autoApply,
+      skipReview: run.skipReview,
+      autoSubmit: run.autoSubmit,
       queueSequence: run.queueSequence,
       revision: run.currentRevision,
       origin: publicOrigin(repository.resolveRevisionOrigin(run.id, run.currentRevision)),

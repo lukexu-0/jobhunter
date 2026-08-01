@@ -666,7 +666,7 @@ export class PipelineStageProcessor {
     const reportMeta = await this.#artifacts.write(join(root, "visual-qa.json"), json(visual), JSON_LIMIT);
     this.#finalize(claim, attempt, "visual-qa", reportMeta, pdf.id);
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
-    this.#repository.transition(claim, "review", { visualAcknowledgementRequired: visual.status !== "pass" });
+    this.#repository.completeVisualQa(claim, pdf.sha256, visual.status !== "pass");
   }
 
   async #recordFailure(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, error: unknown): Promise<void> {

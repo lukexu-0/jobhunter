@@ -26,6 +26,11 @@ export interface StageRepository {
     target: RunStatus,
     options?: { failedStage?: ActiveStage; visualAcknowledgementRequired?: boolean },
   ): PublicRun;
+  completeVisualQa(
+    claim: ClaimIdentity,
+    expectedPdfSha256: string,
+    visualAcknowledgementRequired: boolean,
+  ): PublicRun;
   startAttempt(
     claim: ClaimIdentity,
     stage: ActiveStage,

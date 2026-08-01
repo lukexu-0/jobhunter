@@ -283,6 +283,7 @@ interface HarnessOptions {
   readonly editAgent?: PipelineStageDependencies["editAgent"];
   readonly repairAgent?: PipelineStageDependencies["repairAgent"];
   readonly generateKeywordMap?: boolean;
+  readonly skipReview?: boolean;
   readonly keywordMapRenderer?: PipelineStageDependencies["keywordMapRenderer"];
 }
 
@@ -331,7 +332,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     sha256: input.sha256,
     path: input.path,
     byteSize: input.bytes,
-  }, "stage-run", options.generateKeywordMap ?? false, queueSequence);
+  }, "stage-run", options.generateKeywordMap ?? false, queueSequence, options.skipReview ?? false);
   const compileOutcomes = [...(options.compileOutcomes ?? ["success"])] ;
   const compileModes: string[] = [];
   const keywordMapCalls: { count: number; requests: KeywordMapRequest[] } = {
@@ -583,6 +584,27 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(JSON.stringify(harness.repository.listResolvedArtifacts(harness.runId))).not.toContain("Strong TypeScript engineer");
     expect(harness.keywordMapCalls.count).toBe(0);
     expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+  });
+
+  test("automatically approves a skip-review run only after clean visual QA", async () => {
+    const harness = await createHarness({ skipReview: true });
+    await processToStop(harness);
+
+    const pdf = harness.repository.getArtifact(harness.runId, "compiled-pdf");
+    expect(pdf).not.toBeNull();
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "approved",
+      approvedPdfSha256: pdf!.sha256,
+      visualAcknowledgementRequired: false,
+    });
+    expect(harness.repository.timeline(harness.runId).events.at(-1)).toMatchObject({
+      kind: "run.approved",
+      payload: {
+        pdfSha256: pdf!.sha256,
+        visualAcknowledged: false,
+        automatic: true,
+      },
+    });
   });
 
   test("rejects missing active directives before analysis artifacts finalize", async () => {
@@ -1139,7 +1161,14 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(deterministic.repository.getArtifact(deterministic.runId, "one-page-correction")).toBeNull();
 
     for (const status of ["issue", "uncertain"] as const) {
-      const visual = await createHarness({ visual: { status, summary: "Needs human judgement", findings: [{ severity: "warning", description: "Possible crowding", page: 1 }] } });
+      const visual = await createHarness({
+        skipReview: true,
+        visual: {
+          status,
+          summary: "Needs human judgement",
+          findings: [{ severity: "warning", description: "Possible crowding", page: 1 }],
+        },
+      });
       await processToStop(visual);
       expect(visual.repository.getRun(visual.runId)).toMatchObject({ status: "review", visualAcknowledgementRequired: true });
       expect(visual.repository.getArtifact(visual.runId, "visual-qa")).not.toBeNull();
