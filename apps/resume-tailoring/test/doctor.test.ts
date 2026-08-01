@@ -19,22 +19,6 @@ const CODEX_DESCRIPTOR = {
   thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh", "max"] },
 } as const;
 
-const GEMINI_DESCRIPTOR = {
-  id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", api: "google-gemini-cli", provider: "google-antigravity",
-  baseUrl: "https://daily-cloudcode-pa.googleapis.com", reasoning: true, input: ["text", "image"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_048_576, maxTokens: 65_536,
-  requestModelId: "gemini-3.5-flash-extra-low",
-  thinking: {
-    mode: "budget", efforts: ["minimal", "low", "medium", "high"],
-    effortBudgets: { minimal: 1_000, low: 1_000, medium: 4_000, high: 10_000 },
-    effortRouting: {
-      off: "gemini-3.5-flash-extra-low", minimal: "gemini-3.5-flash-extra-low", low: "gemini-3.5-flash-extra-low",
-      medium: "gemini-3.5-flash-low", high: "gemini-3-flash-agent",
-    },
-    suppressWhenOff: true,
-  },
-} as const;
-
 const LUNA_DESCRIPTOR = {
   id: "gpt-5.6-luna", name: "GPT-5.6 Luna", api: "openai-codex-responses", provider: "openai-codex",
   baseUrl: "https://chatgpt.com/backend-api", reasoning: true, input: ["text", "image"],
@@ -50,12 +34,10 @@ function healthyDependencies(overrides: Partial<DoctorDependencies> = {}): Docto
     now: () => 1_234,
     authStatus: async () => ({ providers: [
       { provider: "openai-codex", state: "connected" },
-      { provider: "google-antigravity", state: "connected" },
     ] }),
     contextStatus: () => ({ state: "fresh" }),
     modelDescriptors: () => ({
       "gpt-5.6-sol": CODEX_DESCRIPTOR,
-      "gemini-3.5-flash": GEMINI_DESCRIPTOR,
       "gpt-5.6-luna": LUNA_DESCRIPTOR,
     }),
     process: {
@@ -82,13 +64,12 @@ describe("doctor public service", () => {
 
     expect(report).toMatchObject({ ok: true, checkedAt: 1_234 });
     expect(report.checks.map((check) => check.id)).toEqual([
-      "bun", "context", "auth-openai", "auth-gemini",
-      "model-openai", "model-gemini", "model-luna",
+      "bun", "context", "auth-openai",
+      "model-openai", "model-luna",
       "latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm",
     ]);
     expect(probes).toEqual([
       ["openai-codex", "gpt-5.6-sol"],
-      ["google-antigravity", "gemini-3.5-flash"],
       ["openai-codex", "gpt-5.6-luna"],
     ]);
     expect(report.checks.every((check) => check.status === "ok")).toBe(true);
@@ -127,7 +108,6 @@ describe("doctor public service", () => {
     const report = await runDoctor(healthyDependencies({
       modelDescriptors: () => ({
         "gpt-5.6-sol": { ...CODEX_DESCRIPTOR, id: "gpt-5.6-sol-preview" },
-        "gemini-3.5-flash": GEMINI_DESCRIPTOR,
         "gpt-5.6-luna": LUNA_DESCRIPTOR,
       }),
       probeEntitlement: async (provider, modelId) => { probes.push([provider, modelId]); },
@@ -135,7 +115,6 @@ describe("doctor public service", () => {
 
     expect(byId(report.checks, "model-openai")).toMatchObject({ status: "error", classification: "model_descriptor_invalid" });
     expect(probes).toEqual([
-      ["google-antigravity", "gemini-3.5-flash"],
       ["openai-codex", "gpt-5.6-luna"],
     ]);
     expect(doctorExitCode(report)).toBe(1);
@@ -150,7 +129,6 @@ describe("doctor public service", () => {
       const report = await runDoctor(healthyDependencies({
         modelDescriptors: () => ({
           "gpt-5.6-sol": CODEX_DESCRIPTOR,
-          "gemini-3.5-flash": GEMINI_DESCRIPTOR,
           "gpt-5.6-luna": luna,
         }),
         probeEntitlement: async (provider, modelId) => { probes.push([provider, modelId]); },
@@ -162,7 +140,6 @@ describe("doctor public service", () => {
       });
       expect(probes).toEqual([
         ["openai-codex", "gpt-5.6-sol"],
-        ["google-antigravity", "gemini-3.5-flash"],
       ]);
     }
   });
@@ -172,64 +149,38 @@ describe("doctor public service", () => {
     const report = await runDoctor(healthyDependencies({
       authStatus: async () => ({ providers: [
         { provider: "openai-codex", state: "disconnected" },
-        { provider: "google-antigravity", state: "disconnected" },
       ] }),
       probeEntitlement: async (provider, modelId) => { probes.push([provider, modelId]); },
     }));
 
     expect(byId(report.checks, "auth-openai")).toMatchObject({ status: "warning", classification: "auth_absent" });
-    expect(byId(report.checks, "auth-gemini")).toMatchObject({ status: "warning", classification: "auth_absent" });
     expect(byId(report.checks, "model-openai").classification).toBe("auth_absent");
-    expect(byId(report.checks, "model-gemini").classification).toBe("auth_absent");
     expect(byId(report.checks, "model-luna").classification).toBe("auth_absent");
     expect(probes).toEqual([]);
     expect(report.ok).toBe(true);
     expect(doctorExitCode(report)).toBe(0);
   });
 
-  test("shares OpenAI absent or expired auth across Sol and Luna while keeping Gemini independent", async () => {
-    const cases = [
-      {
-        expiredProvider: "openai-codex",
-        authId: "auth-openai",
-        modelIds: ["model-openai", "model-luna"],
-        expectedProbes: [["google-antigravity", "gemini-3.5-flash"]],
-      },
-      {
-        expiredProvider: "google-antigravity",
-        authId: "auth-gemini",
-        modelIds: ["model-gemini"],
-        expectedProbes: [
-          ["openai-codex", "gpt-5.6-sol"],
-          ["openai-codex", "gpt-5.6-luna"],
-        ],
-      },
-    ] as const;
-    for (const { expiredProvider, authId, modelIds, expectedProbes } of cases) {
-      const probes: Array<[DoctorProvider, string]> = [];
-      const report = await runDoctor(healthyDependencies({
-        authStatus: async () => ({ providers: [
-          { provider: "openai-codex", state: expiredProvider === "openai-codex" ? "expired" : "connected" },
-          { provider: "google-antigravity", state: expiredProvider === "google-antigravity" ? "expired" : "connected" },
-        ] }),
-        probeEntitlement: async (provider, modelId) => { probes.push([provider, modelId]); },
-      }));
+  test("shares expired OpenAI auth across Sol and Luna", async () => {
+    const probes: Array<[DoctorProvider, string]> = [];
+    const report = await runDoctor(healthyDependencies({
+      authStatus: async () => ({ providers: [
+        { provider: "openai-codex", state: "expired" },
+      ] }),
+      probeEntitlement: async (provider, modelId) => { probes.push([provider, modelId]); },
+    }));
 
-      expect(byId(report.checks, authId).classification).toBe("auth_expired");
-      for (const modelId of modelIds) expect(byId(report.checks, modelId).classification).toBe("auth_expired");
-      expect(probes).toEqual(
-        (expectedProbes as readonly (readonly [DoctorProvider, string])[])
-          .map(([provider, modelId]) => [provider, modelId] as [DoctorProvider, string]),
-      );
-      expect(report.ok).toBe(true);
-    }
+    expect(byId(report.checks, "auth-openai").classification).toBe("auth_expired");
+    expect(byId(report.checks, "model-openai").classification).toBe("auth_expired");
+    expect(byId(report.checks, "model-luna").classification).toBe("auth_expired");
+    expect(probes).toEqual([]);
+    expect(report.ok).toBe(true);
   });
 
   test("keeps provider-plus-model probe failures independently classified", async () => {
     const classifications = ["callback_port_conflict", "network_failure", "model_unentitled"] as const;
     const models = [
       ["openai-codex", "gpt-5.6-sol", "model-openai"],
-      ["google-antigravity", "gemini-3.5-flash", "model-gemini"],
       ["openai-codex", "gpt-5.6-luna", "model-luna"],
     ] as const;
     for (const classification of classifications) {
@@ -256,7 +207,6 @@ describe("doctor public service", () => {
     const json = renderDoctorJson(report);
 
     expect(byId(report.checks, "model-openai").classification).toBe("network_failure");
-    expect(byId(report.checks, "model-gemini").classification).toBe("network_failure");
     expect(byId(report.checks, "model-luna").classification).toBe("network_failure");
     expect(json).not.toContain("secret");
     expect(json).not.toContain("provider-response-body");
@@ -276,13 +226,12 @@ describe("doctor public service", () => {
     now += 599_999;
     const cached = await runDoctor(dependencies);
     expect(byId(cached.checks, "model-openai").classification).toBe("entitled_cached");
-    expect(byId(cached.checks, "model-gemini").classification).toBe("entitled_cached");
     expect(byId(cached.checks, "model-luna").classification).toBe("entitled_cached");
-    expect(calls).toBe(3);
+    expect(calls).toBe(2);
 
     now += 1;
     await runDoctor(dependencies);
-    expect(calls).toBe(6);
+    expect(calls).toBe(4);
   });
 
   test("does not cache failed entitlement probes", async () => {
@@ -290,15 +239,14 @@ describe("doctor public service", () => {
     const dependencies = healthyDependencies({
       probeEntitlement: async () => {
         calls += 1;
-        if (calls <= 3) throw new DoctorProbeError("network_failure");
+        if (calls <= 2) throw new DoctorProbeError("network_failure");
       },
     });
 
     await runDoctor(dependencies);
     const recovered = await runDoctor(dependencies);
-    expect(calls).toBe(6);
+    expect(calls).toBe(4);
     expect(byId(recovered.checks, "model-openai").classification).toBe("entitled");
-    expect(byId(recovered.checks, "model-gemini").classification).toBe("entitled");
     expect(byId(recovered.checks, "model-luna").classification).toBe("entitled");
   });
 
@@ -322,7 +270,6 @@ describe("doctor public service", () => {
     const json = renderDoctorJson(report);
 
     expect(byId(report.checks, "auth-openai")).toMatchObject({ status: "error", classification: "auth_configuration_invalid" });
-    expect(byId(report.checks, "auth-gemini")).toMatchObject({ status: "error", classification: "auth_configuration_invalid" });
     expect(doctorExitCode(report)).toBe(1);
     expect(json).not.toContain("/private/auth.sqlite");
     expect(json).not.toContain("secret");

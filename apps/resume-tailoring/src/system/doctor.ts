@@ -3,15 +3,14 @@ import { getAuthStatus } from "../auth/service.ts";
 import { openContextDatabase } from "../context/database.ts";
 import { loadContextManifest } from "../context/manifest.ts";
 import { checkContextFreshness } from "../context/service.ts";
-import { GEMINI_MODEL_NAME } from "../models/gemini-inspector.ts";
 import { LUNA_MODEL_NAME } from "../models/luna-job-extractor.ts";
 import { MODEL_NAME, OMP_CODEX_MODEL } from "../models/oauth-codex-model.ts";
 
 export type DoctorCheckStatus = "ok" | "warning" | "error";
 
 export interface DoctorCheck {
-  id: "bun" | "context" | "auth-openai" | "auth-gemini"
-    | "model-openai" | "model-gemini" | "model-luna"
+  id: "bun" | "context" | "auth-openai"
+    | "model-openai" | "model-luna"
     | "latexmk" | "pdfinfo" | "pdftotext" | "pdffonts" | "pdftoppm";
   status: DoctorCheckStatus;
   classification: string;
@@ -24,8 +23,8 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
-export type DoctorProvider = "openai-codex" | "google-antigravity";
-export type DoctorModelId = typeof MODEL_NAME | typeof GEMINI_MODEL_NAME | typeof LUNA_MODEL_NAME;
+export type DoctorProvider = "openai-codex";
+export type DoctorModelId = typeof MODEL_NAME | typeof LUNA_MODEL_NAME;
 export type DoctorModelDescriptors = Readonly<Record<DoctorModelId, unknown>>;
 export type DoctorAuthState = "connected" | "disconnected" | "expired";
 
@@ -89,22 +88,6 @@ const EXPECTED_CODEX_DESCRIPTOR = Object.freeze({
   thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh", "max"] },
 });
 
-const EXPECTED_GEMINI_DESCRIPTOR = Object.freeze({
-  id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", api: "google-gemini-cli", provider: "google-antigravity",
-  baseUrl: "https://daily-cloudcode-pa.googleapis.com", reasoning: true, input: ["text", "image"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_048_576, maxTokens: 65_536,
-  requestModelId: "gemini-3.5-flash-extra-low",
-  thinking: {
-    mode: "budget", efforts: ["minimal", "low", "medium", "high"],
-    effortBudgets: { minimal: 1_000, low: 1_000, medium: 4_000, high: 10_000 },
-    effortRouting: {
-      off: "gemini-3.5-flash-extra-low", minimal: "gemini-3.5-flash-extra-low", low: "gemini-3.5-flash-extra-low",
-      medium: "gemini-3.5-flash-low", high: "gemini-3-flash-agent",
-    },
-    suppressWhenOff: true,
-  },
-});
-
 const EXPECTED_LUNA_DESCRIPTOR = Object.freeze({
   id: "gpt-5.6-luna", name: "GPT-5.6 Luna", api: "openai-codex-responses", provider: "openai-codex",
   baseUrl: "https://chatgpt.com/backend-api", reasoning: true, input: ["text", "image"],
@@ -164,7 +147,6 @@ function defaultContextStatus(): ContextDoctorStatus {
 function defaultModelDescriptors(): DoctorModelDescriptors {
   return {
     [MODEL_NAME]: OMP_CODEX_MODEL,
-    [GEMINI_MODEL_NAME]: getBundledModel("google-antigravity", GEMINI_MODEL_NAME),
     [LUNA_MODEL_NAME]: getBundledModel("openai-codex", LUNA_MODEL_NAME),
   };
 }
@@ -213,15 +195,14 @@ function contextCheck(status: ContextDoctorStatus): DoctorCheck {
   }
 }
 
-function authCheck(id: "auth-openai" | "auth-gemini", state: DoctorAuthState): DoctorCheck {
+function authCheck(id: "auth-openai", state: DoctorAuthState): DoctorCheck {
   if (state === "connected") return check(id, "ok", "connected");
   if (state === "expired") return check(id, "warning", "auth_expired");
   return check(id, "warning", "auth_absent");
 }
 
-
 async function modelCheck(
-  id: "model-openai" | "model-gemini" | "model-luna",
+  id: "model-openai" | "model-luna",
   provider: DoctorProvider,
   modelId: DoctorModelId,
   expectedDescriptor: unknown,
@@ -279,14 +260,12 @@ export async function runDoctor(dependencies: DoctorDependencies, options: Docto
   const authByProvider: Partial<Record<DoctorProvider, DoctorAuthState>> = {};
   for (const provider of authStatus.providers) authByProvider[provider.provider] = provider.state;
   const openaiAuth = authByProvider["openai-codex"] ?? "disconnected";
-  const geminiAuth = authByProvider["google-antigravity"] ?? "disconnected";
-  const lunaAuth = openaiAuth;
 
   let descriptors: DoctorModelDescriptors;
   try {
     descriptors = (dependencies.modelDescriptors ?? defaultModelDescriptors)();
   } catch {
-    descriptors = { [MODEL_NAME]: undefined, [GEMINI_MODEL_NAME]: undefined, [LUNA_MODEL_NAME]: undefined };
+    descriptors = { [MODEL_NAME]: undefined, [LUNA_MODEL_NAME]: undefined };
   }
 
   const bun = await toolCheck("bun", processProbe);
@@ -294,18 +273,13 @@ export async function runDoctor(dependencies: DoctorDependencies, options: Docto
   const authOpenai = authConfigurationInvalid
     ? check("auth-openai", "error", "auth_configuration_invalid")
     : authCheck("auth-openai", openaiAuth);
-  const authGemini = authConfigurationInvalid
-    ? check("auth-gemini", "error", "auth_configuration_invalid")
-    : authCheck("auth-gemini", geminiAuth);
   const modelOpenai = await modelCheck("model-openai", "openai-codex", MODEL_NAME, EXPECTED_CODEX_DESCRIPTOR,
     descriptors[MODEL_NAME], undefined, openaiAuth, dependencies, now, options.probeModels !== false);
-  const modelGemini = await modelCheck("model-gemini", "google-antigravity", GEMINI_MODEL_NAME, EXPECTED_GEMINI_DESCRIPTOR,
-    descriptors[GEMINI_MODEL_NAME], undefined, geminiAuth, dependencies, now, options.probeModels !== false);
   const modelLuna = await modelCheck("model-luna", "openai-codex", LUNA_MODEL_NAME, EXPECTED_LUNA_DESCRIPTOR,
-    descriptors[LUNA_MODEL_NAME], LUNA_MODEL_NAME, lunaAuth, dependencies, now, options.probeModels !== false);
+    descriptors[LUNA_MODEL_NAME], LUNA_MODEL_NAME, openaiAuth, dependencies, now, options.probeModels !== false);
   const remainingTools = await Promise.all(TOOL_IDS.slice(1).map((id) => toolCheck(id, processProbe)));
   const checks: DoctorCheck[] = [
-    bun, context, authOpenai, authGemini, modelOpenai, modelGemini, modelLuna, ...remainingTools,
+    bun, context, authOpenai, modelOpenai, modelLuna, ...remainingTools,
   ];
   return Object.freeze({ ok: checks.every((item) => item.status !== "error"), checkedAt: now, checks });
 }

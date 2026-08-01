@@ -10,7 +10,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { getBundledModel, resolveWireModelId, type Effort } from "@oh-my-pi/pi-catalog";
 import { OAuthRequiredError } from "../src/auth/oauth-only-resolver";
-import { inspectResumePng } from "../src/models/gemini-inspector";
+import { inspectResumePng } from "../src/models/visual-inspector";
 import { mapAgentsRequest } from "../src/models/agents-mapping";
 import { MODEL_NAME, OAuthCodexModel, type CodexTransport } from "../src/models/oauth-codex-model";
 import { OAuthCodexModelProvider } from "../src/models/oauth-codex-provider";
@@ -438,10 +438,10 @@ describe("OAuth Codex Agents model bridge", () => {
   });
 });
 
-describe("direct Gemini visual inspector", () => {
+describe("direct visual inspector", () => {
   const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-  test("accepts PNG only, passes exact Antigravity OAuth identity/signal, and strictly parses JSON", async () => {
+  test("accepts PNG only, passes exact Codex OAuth identity/signal, and strictly parses JSON", async () => {
     const signal = new AbortController().signal;
     let providerSeen = "";
     let sessionSeen = "";
@@ -453,18 +453,22 @@ describe("direct Gemini visual inspector", () => {
         providerSeen = provider; sessionSeen = session; modelSeen = model; expect(passedSignal).toBe(signal);
         return inertResolver();
       },
-      transport: async (model: OmpModel<"google-gemini-cli">, context, options) => {
-        expect(model.provider).toBe("google-antigravity");
-        expect(model.id).toBe("gemini-3.5-flash");
+      transport: async (model: OmpModel<"openai-codex-responses">, context, options) => {
+        expect(model).toMatchObject({
+          api: "openai-codex-responses",
+          provider: "openai-codex",
+          id: "gpt-5.6-sol",
+          input: ["text", "image"],
+        });
         contextSeen = context; optionsSeen = options;
         return {
-          role: "assistant", api: "google-gemini-cli", provider: "google-antigravity", model: "gemini-3.5-flash",
+          role: "assistant", api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol",
           content: [{ type: "text", text: "```json\n{\"status\":\"pass\",\"summary\":\"Layout is clean\",\"findings\":[]}\n```" }],
           usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: ZERO_COST }, stopReason: "stop", timestamp: 1,
         };
       },
     });
-    expect({ providerSeen, sessionSeen, modelSeen }).toEqual({ providerSeen: "google-antigravity", sessionSeen: "visual-attempt", modelSeen: "gemini-3.5-flash" });
+    expect({ providerSeen, sessionSeen, modelSeen }).toEqual({ providerSeen: "openai-codex", sessionSeen: "visual-attempt", modelSeen: "gpt-5.6-sol" });
     expect(result).toEqual({ status: "pass", summary: "Layout is clean", findings: [] });
     expect(contextSeen?.messages).toHaveLength(1);
     const user = contextSeen?.messages[0];
@@ -476,13 +480,13 @@ describe("direct Gemini visual inspector", () => {
     expect(optionsSeen).toMatchObject({ signal, reasoning: "medium" });
   });
 
-  test("rejects non-PNG and non-strict Gemini results", async () => {
+  test("rejects non-PNG and non-strict visual inspection results", async () => {
     const neverTransport = async (): Promise<AssistantMessage> => { throw new Error("transport must not run"); };
     await expect(inspectResumePng(new Uint8Array([0xff, 0xd8, 0xff]), "visual", undefined, { transport: neverTransport })).rejects.toThrow("PNG only");
     await expect(inspectResumePng(png, "visual", undefined, {
       resolverFactory: () => inertResolver(),
       transport: async () => ({
-        role: "assistant", api: "google-gemini-cli", provider: "google-antigravity", model: "gemini-3.5-flash",
+        role: "assistant", api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol",
         content: [{ type: "text", text: "{\"status\":\"pass\",\"summary\":\"ok\",\"findings\":[],\"extra\":true}" }],
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: ZERO_COST }, stopReason: "stop", timestamp: 1,
       }),
@@ -490,7 +494,7 @@ describe("direct Gemini visual inspector", () => {
     await expect(inspectResumePng(png, "visual", undefined, {
       resolverFactory: () => inertResolver(),
       transport: async () => ({
-        role: "assistant", api: "google-gemini-cli", provider: "google-antigravity", model: "gemini-3.5-flash",
+        role: "assistant", api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol",
         content: [{ type: "text", text: "commentary\n```json\n{\"status\":\"pass\",\"summary\":\"ok\",\"findings\":[]}\n```" }],
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: ZERO_COST }, stopReason: "stop", timestamp: 1,
       }),

@@ -16,7 +16,7 @@ import type { ContextSnapshot } from "../context/types.ts";
 import { isMustIncludeEvidenceBlock } from "../context/directives.ts";
 import { ResumeDiffSchema } from "../contracts/index.ts";
 import { ClaimRejectedError, type PublicArtifact, type PublicAttempt, type PublicRun } from "../db/repository.ts";
-import { inspectResumePng, type GeminiInspectorOptions } from "../models/gemini-inspector.ts";
+import { inspectResumePng, type VisualInspectorOptions } from "../models/visual-inspector.ts";
 import { compileResume, type CompileResult } from "../resume/compiler.ts";
 import { renderKeywordMapPdf } from "../resume/keyword-map.ts";
 import {
@@ -102,7 +102,7 @@ export interface PipelineStageDependencies {
   readonly loadSourceContext: (runId: string) => Promise<StageSourceContext> | StageSourceContext;
   readonly agentRuntime?: AgentRuntimeDependencies;
   readonly processBoundary?: ProcessBoundary;
-  readonly gemini?: GeminiInspectorOptions;
+  readonly visualInspectorOptions?: VisualInspectorOptions;
   readonly analysisAgent?: typeof runAnalysisAgent;
   readonly atsKeywordExtractionAgent?: typeof runAtsKeywordExtractionAgent;
   readonly tailoringAgent?: typeof runTailoringAgent;
@@ -150,7 +150,7 @@ export class PipelineStageProcessor {
   readonly #loadSourceContext: PipelineStageDependencies["loadSourceContext"];
   readonly #agentRuntime: AgentRuntimeDependencies | undefined;
   readonly #processBoundary: ProcessBoundary | undefined;
-  readonly #gemini: GeminiInspectorOptions | undefined;
+  readonly #visualInspectorOptions: VisualInspectorOptions | undefined;
   readonly #analysisAgent: typeof runAnalysisAgent;
   readonly #atsKeywordExtractionAgent: typeof runAtsKeywordExtractionAgent;
   readonly #tailoringAgent: typeof runTailoringAgent;
@@ -168,7 +168,7 @@ export class PipelineStageProcessor {
     this.#loadSourceContext = dependencies.loadSourceContext;
     this.#agentRuntime = dependencies.agentRuntime;
     this.#processBoundary = dependencies.processBoundary;
-    this.#gemini = dependencies.gemini;
+    this.#visualInspectorOptions = dependencies.visualInspectorOptions;
     this.#analysisAgent = dependencies.analysisAgent ?? runAnalysisAgent;
     this.#atsKeywordExtractionAgent =
       dependencies.atsKeywordExtractionAgent ?? runAtsKeywordExtractionAgent;
@@ -660,7 +660,7 @@ export class PipelineStageProcessor {
     };
     this.#finalize(claim, attempt, "page-image", pngMeta, pdf.id);
     await this.#verifyAgain(run.id, signal);
-    const visual = await this.#visualInspector(png, attempt.attemptSessionId, signal, this.#gemini);
+    const visual = await this.#visualInspector(png, attempt.attemptSessionId, signal, this.#visualInspectorOptions);
     signal.throwIfAborted();
     await this.#verifyAgain(run.id, signal);
     const reportMeta = await this.#artifacts.write(join(root, "visual-qa.json"), json(visual), JSON_LIMIT);

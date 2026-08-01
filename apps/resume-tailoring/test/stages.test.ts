@@ -12,7 +12,7 @@ import { ResumeDiffSchema } from "../src/contracts/index.ts";
 import type { ContextSnapshot, EvidenceBlock, IndexedContextSource } from "../src/context/types.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
 import { ClaimRejectedError, PipelineRepository, type RunSourceSnapshotInput } from "../src/db/repository.ts";
-import type { GeminiVisualInspection } from "../src/models/gemini-inspector.ts";
+import type { VisualInspection } from "../src/models/visual-inspector.ts";
 import type { CompileRequest, CompileResult } from "../src/resume/compiler.ts";
 import {
   buildResumeDiff,
@@ -274,7 +274,7 @@ interface HarnessOptions {
   readonly compileOutcomes?: readonly ("success" | "repairable" | "terminal")[];
   readonly deterministicPass?: boolean;
   readonly deterministicReports?: readonly DeterministicQaReport[];
-  readonly visual?: GeminiVisualInspection;
+  readonly visual?: VisualInspection;
   readonly deterministicQa?: PipelineStageDependencies["deterministicQa"];
   readonly loadSourceContext?: PipelineStageDependencies["loadSourceContext"];
   readonly atsKeywordExtractionAgent?: PipelineStageDependencies["atsKeywordExtractionAgent"];
