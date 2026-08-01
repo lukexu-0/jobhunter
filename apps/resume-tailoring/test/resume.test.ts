@@ -215,15 +215,30 @@ describe("strict resume contracts", () => {
 
   test("parses canonical sections, entities, bullets, and stable IDs", () => {
     const again = parseBaselineResume(baseline);
-    expect(parsedBaseline.entities.filter((item) => item.section === "projects").map((item) => item.entityId)).toEqual([
-      "Sample Project Archive",
+    const projects = parsedBaseline.entities.filter((item) => item.section === "projects");
+    const projectTitles = projects.map((item) => item.entityId);
+    expect(projectTitles).toEqual([
+      "Resume Tailoring and Application Agent",
       "Sample Project",
     ]);
+    expect(projectTitles).not.toContain("Sample Project Archive");
     const legacyBaseline = baseline.replaceAll("\\enspace\\textbar\\enspace", () => "$|$");
     expect(parseBaselineResume(legacyBaseline).entities.filter((item) => item.section === "projects").map((item) => item.entityId)).toEqual([
-      "Sample Project Archive",
+      "Resume Tailoring and Application Agent",
       "Sample Project",
     ]);
+    const jobhunter = projects.find((item) => item.entityId === "Resume Tailoring and Application Agent");
+    expect(jobhunter?.headingArguments[1]).toBe("Jan 2020 -- Present");
+    expect(jobhunter?.bullets).toHaveLength(3);
+    expect(jobhunter?.bullets[0]?.text).toBe(
+      "Built a local resume-tailoring and application agent that turns job postings into evidence-backed, ATS-aligned one-page resumes and human-reviewed application workflows.",
+    );
+    const jobhunterContent = [
+      ...(jobhunter?.headingArguments ?? []),
+      ...(jobhunter?.bullets.map((item) => item.text) ?? []),
+    ].join(" ");
+    expect(jobhunterContent).toContain("OpenAI Agents SDK");
+    expect(jobhunterContent).toContain("Browser Use");
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");
     expect(competition?.headingArguments).toEqual(["Semifinalist", "Jan 2020 -- Jun 2020", "Example Engineering Competition", ""]);
