@@ -154,7 +154,7 @@ describe("ApplicationSessionPanel", () => {
     expect(closedSubmitted).not.toContain("Close browser");
   });
 
-  test("renders navigation and exact canonical origin gates", () => {
+  test("renders navigation and keeps legacy origin snapshots non-actionable", () => {
     const navigation = {
       type: "human_navigation",
       instruction: "Complete the account sign-in, then return here.",
@@ -177,10 +177,6 @@ describe("ApplicationSessionPanel", () => {
       type: "origin_approval",
       origin: "https://apply.example.com",
     } as const;
-    expect(simpleApplicationGateCommand(origin)).toEqual({
-      type: "approve_origin",
-      origin: "https://apply.example.com",
-    });
     const originMarkup = renderToStaticMarkup(
       <ApplicationSessionPanel
         {...callbacks}
@@ -192,7 +188,8 @@ describe("ApplicationSessionPanel", () => {
       />,
     );
     expect(originMarkup).toContain("https://apply.example.com");
-    expect(originMarkup).toContain("Approve origin");
+    expect(originMarkup).toContain("Restart required");
+    expect(originMarkup).not.toContain("Approve origin");
   });
 
   test("renders every additional-information question as an accessible choice group", () => {

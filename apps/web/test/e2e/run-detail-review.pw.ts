@@ -1218,7 +1218,7 @@ test("a definite submit conflict releases the approval latch", async ({ page }) 
   await expect(submitButton).toBeEnabled();
 });
 
-test("navigation, origin approval, human review, submit approval, and close use exact public commands", async ({ page }) => {
+test("navigation, human review, submit approval, and close use exact public commands", async ({ page }) => {
   const navigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
     pendingAction: { type: "human_navigation", instruction: "Complete the public sign-in checkpoint." },
@@ -1229,11 +1229,6 @@ test("navigation, origin approval, human review, submit approval, and close use 
     pendingAction: { type: "human_navigation", instruction: "Complete the public sign-in checkpoint." },
     updatedAt: createdAt + 150,
     company: "Unrelated progress company",
-  });
-  const origin = snapshotFixture({
-    bridgeState: "awaiting_origin_approval",
-    pendingAction: { type: "origin_approval", origin: "https://accounts.example.test" },
-    updatedAt: createdAt + 200,
   });
   const review = snapshotFixture({
     bridgeState: "awaiting_human_review",
@@ -1274,8 +1269,6 @@ test("navigation, origin approval, human review, submit approval, and close use 
   const unrelatedFrame = deferred();
   const continueFrame = deferred();
   const continueResponse = deferred();
-  const originResponse = deferred();
-  const originFrame = deferred();
   const reviseFrame = deferred();
   const submittedFrame = deferred();
   const closeFrame = deferred();
@@ -1286,16 +1279,12 @@ test("navigation, origin approval, human review, submit approval, and close use 
   });
   mock.commandReplies.push(
     { status: 202, waitFor: continueResponse.promise },
-    { status: 202, waitFor: originResponse.promise },
   );
   queueSse(mock, eventFixture("snapshot", unrelatedNavigation, {}), 2, unrelatedFrame.promise);
-  queueSse(mock, eventFixture("origin_approval_required", origin, {
-    origin: "https://accounts.example.test",
-  }), 3, continueFrame.promise);
-  queueSse(mock, eventFixture("review_required", review, {}), 4, originFrame.promise);
-  queueSse(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), 5, reviseFrame.promise);
-  queueSse(mock, eventFixture("application_submitted", submitted, {}), 6, submittedFrame.promise);
-  queueSse(mock, eventFixture("closed", closed, {}), 7, closeFrame.promise);
+  queueSse(mock, eventFixture("review_required", review, {}), 3, continueFrame.promise);
+  queueSse(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), 4, reviseFrame.promise);
+  queueSse(mock, eventFixture("application_submitted", submitted, {}), 5, submittedFrame.promise);
+  queueSse(mock, eventFixture("closed", closed, {}), 6, closeFrame.promise);
 
   await page.goto(`/runs/${runId}`);
   const workflow = page.getByRole("list", { name: "Workflow progress" });
@@ -1324,18 +1313,6 @@ test("navigation, origin approval, human review, submit approval, and close use 
   await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
   continueFrame.resolve();
 
-  await expect(page.getByText("https://accounts.example.test", { exact: true })).toBeVisible();
-  const approveOriginButton = page.getByRole("button", { name: "Approve origin" });
-  mock.application = origin;
-  await expect(approveOriginButton).toBeEnabled();
-  await page.getByRole("button", { name: "Approve origin" }).click();
-  await expect.poll(() => mock.commands.length).toBe(2);
-  expect(mock.commands[1]).toEqual({
-    type: "approve_origin",
-    origin: "https://accounts.example.test",
-  });
-  await expect(page.getByRole("button", { name: "Approving…" })).toBeDisabled();
-  originFrame.resolve();
 
   await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
   await expect(applyingStage).toHaveAttribute("aria-current", "step");
@@ -1346,23 +1323,12 @@ test("navigation, origin approval, human review, submit approval, and close use 
   const requestRevisionButton = page.getByRole("button", { name: "Request application revision" });
   const submitButton = page.getByRole("button", { name: "Approve and submit" }).first();
   await expect(requestRevisionButton).toBeDisabled();
-  await expect(submitButton).toBeDisabled();
-  const originAccepted = page.waitForResponse((response) =>
-    new URL(response.url()).pathname === `${pipelineRunPath}/application/commands`
-    && response.request().method() === "POST"
-    && response.status() === 202
-  );
-  originResponse.resolve();
-  await originAccepted;
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
-  }));
   await expect(submitButton).toBeEnabled();
   mock.application = review;
   await page.getByLabel("Revision instructions").fill("  Correct the public salary field.  ");
   await page.getByRole("button", { name: "Request application revision" }).click();
-  await expect.poll(() => mock.commands.length).toBe(3);
-  expect(mock.commands[2]).toEqual({
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands[1]).toEqual({
     type: "revise",
     context: "Correct the public salary field.",
   });
@@ -1379,8 +1345,8 @@ test("navigation, origin approval, human review, submit approval, and close use 
     "This action is irreversible. The application assistant will submit the completed application in the headed browser. Continue only after you have reviewed every field and warning.",
   );
   await submitDialog.getByRole("button", { name: "Approve and submit" }).click();
-  await expect.poll(() => mock.commands.length).toBe(4);
-  expect(mock.commands[3]).toEqual({ type: "submit" });
+  await expect.poll(() => mock.commands.length).toBe(3);
+  expect(mock.commands[2]).toEqual({ type: "submit" });
   await expect(page.getByRole("button", { name: "Approving submission…" })).toBeDisabled();
   mock.run = {
     ...mock.run,
@@ -1410,7 +1376,6 @@ test("navigation, origin approval, human review, submit approval, and close use 
   await expect(page.getByRole("button", { name: "Retry applying" })).toHaveCount(0);
   expect(mock.commands).toEqual([
     { type: "continue" },
-    { type: "approve_origin", origin: "https://accounts.example.test" },
     { type: "revise", context: "Correct the public salary field." },
     { type: "submit" },
   ]);
