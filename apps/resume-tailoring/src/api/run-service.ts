@@ -476,10 +476,13 @@ export class RunApplicationService {
     if (!artifact) return undefined;
     const kind = PUBLIC_ARTIFACT_KINDS[artifact.kind];
     if (!kind) return undefined;
-    const isCurrentResolvedArtifact = (run.status === "review" || run.status === "approved")
-      && this.dependencies.repository
-        .listResolvedArtifacts(runId)
-        .some((candidate) => candidate.id === artifact.id);
+    const isCurrentResolvedArtifact = (
+      kind === "job-analysis"
+      || run.status === "review"
+      || run.status === "approved"
+    ) && this.dependencies.repository
+      .listResolvedArtifacts(runId)
+      .some((candidate) => candidate.id === artifact.id);
     if (!isCurrentResolvedArtifact) return undefined;
 
     return await this.#verifiedArtifactResponse(runId, artifact, kind);
@@ -597,8 +600,16 @@ export class RunApplicationService {
     }));
     const attemptById = new Map(history.attempts.map((attempt) => [attempt.id, attempt.attemptNo]));
     const artifactsRetained = repository.areRunArtifactsRetained(run.id);
-    const visibleArtifacts = artifactsRetained && (run.status === "review" || run.status === "approved")
-      ? repository.listResolvedArtifacts(run.id).map((artifact) => artifactDto(run.id, artifact, attemptById)).filter((artifact): artifact is ArtifactDto => artifact !== null)
+    const visibleArtifacts = artifactsRetained
+      ? repository
+          .listResolvedArtifacts(run.id)
+          .filter((artifact) =>
+            run.status === "review"
+            || run.status === "approved"
+            || artifact.kind === "job-analysis"
+          )
+          .map((artifact) => artifactDto(run.id, artifact, attemptById))
+          .filter((artifact): artifact is ArtifactDto => artifact !== null)
       : [];
     const pdf = artifactsRetained ? repository.getArtifact(run.id, "compiled-pdf") : null;
     return {

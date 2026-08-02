@@ -823,6 +823,94 @@ describe("RunApplicationService", () => {
     expect(serialized).not.toContain("jobDescription");
   });
 
+  test("exposes only the inherited current job analysis for a retained failed revision", async () => {
+    const target = fixture();
+    const run = await target.service.createRun(JOB_URL);
+    const claim = target.repository.acquire()!;
+    target.repository.transition(claim, "analyzing");
+    const analysisAttempt = target.repository.startAttempt(claim, "analyzing");
+    const analysisRoot = await target.artifacts.createAttempt({
+      run: target.repository.getRun(run.id)!.queueSequence,
+      revision: "1",
+      stage: "analyzing",
+      attempt: analysisAttempt.attemptNo,
+    });
+    const analysisBody = JSON.stringify({
+      jobTitle: "Platform Engineer",
+      organization: "Example Labs",
+    });
+    const storedAnalysis = await target.artifacts.write(
+      join(analysisRoot, "analysis.json"),
+      analysisBody,
+      1024 * 1024,
+    );
+    const analysisArtifact = target.repository.finalizeArtifact(claim, {
+      attemptId: analysisAttempt.id,
+      stage: "analyzing",
+      kind: "job-analysis",
+      sha256: storedAnalysis.sha256,
+      path: storedAnalysis.path,
+      byteSize: storedAnalysis.bytes,
+    });
+    const extractionBody = JSON.stringify({
+      keywords: [{ id: "keyword-typescript", phrase: "TypeScript", jdQuote: "TypeScript" }],
+    });
+    const storedExtraction = await target.artifacts.write(
+      join(analysisRoot, "ats-keyword-extraction.json"),
+      extractionBody,
+      1024 * 1024,
+    );
+    const extractionArtifact = target.repository.finalizeArtifact(claim, {
+      attemptId: analysisAttempt.id,
+      stage: "analyzing",
+      kind: "ats-keyword-extraction",
+      sha256: storedExtraction.sha256,
+      path: storedExtraction.path,
+      byteSize: storedExtraction.bytes,
+    });
+    target.repository.finishAttempt(claim, analysisAttempt.id, "succeeded");
+    transition(target.repository, claim, ["tailoring", "compiling"]);
+    target.repository.transition(claim, "failed", { failedStage: "compiling" });
+    target.repository.release(claim);
+
+    await target.service.retryRun(run.id);
+    const revisedClaim = target.repository.acquire()!;
+    target.repository.transition(revisedClaim, "failed", { failedStage: "compiling" });
+    target.repository.release(revisedClaim);
+
+    const failedDto = RunDtoSchema.parse(await target.service.getRun(run.id));
+    expect(failedDto).toMatchObject({ status: "failed", revision: 2 });
+    expect(failedDto.artifacts).toEqual([
+      expect.objectContaining({
+        id: analysisArtifact.id,
+        kind: "job-analysis",
+        revision: 1,
+        href: `/v1/runs/${run.id}/artifacts/${analysisArtifact.id}`,
+      }),
+    ]);
+    expect(failedDto.artifacts.some((artifact) => artifact.id === extractionArtifact.id)).toBeFalse();
+
+    const analysisResponse = await target.service.getArtifact(run.id, analysisArtifact.id);
+    expect(analysisResponse?.status).toBe(200);
+    expect(analysisResponse?.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(analysisResponse?.headers.get("x-content-sha256")).toBe(analysisArtifact.sha256);
+    expect(await analysisResponse?.json()).toEqual({
+      jobTitle: "Platform Engineer",
+      organization: "Example Labs",
+    });
+    expect(await target.service.getArtifact(run.id, extractionArtifact.id)).toBeUndefined();
+
+    target.pipelineDatabase.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at)
+      VALUES (?, 'pruning', 100)
+    `).run(run.id);
+    expect(RunDtoSchema.parse(await target.service.getRun(run.id)).artifacts).toEqual([]);
+    await expect(target.service.getArtifact(run.id, analysisArtifact.id)).rejects.toMatchObject({
+      code: "RUN_ARTIFACTS_PRUNED",
+      status: 410,
+    });
+  });
+
   test("enforces review/hash/source invariants and preserves exact inert edit comments", async () => {
     const target = fixture();
     const run = await target.service.createRun(JOB_URL);
