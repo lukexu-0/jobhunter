@@ -33,8 +33,6 @@ from jobhunter_browser_harness.models import (
     FieldResult,
     HarnessConfig,
     HarnessServiceError,
-    SubmitApplicationResultRuntimeActionResponse,
-    SubmitApplicationRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
@@ -1259,43 +1257,62 @@ async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
     assert service.runtime_action_calls == []
 
 
-def test_submit_application_runtime_action_accepts_only_bounded_selector() -> None:
-    action = RUNTIME_ACTION_ADAPTER.validate_python(
-        {"type": "submit_application", "selector": "button[type='submit']"}
-    )
-    assert isinstance(action, SubmitApplicationRuntimeAction)
-    assert action.selector == "button[type='submit']"
-
-    invalid_payloads = (
-        {"type": "submit_application", "selector": " "},
-        {"type": "submit_application", "selector": "x" * 2_001},
-        {"type": "submit_application", "code": "click_at_xy(10, 10)"},
-    )
-    for payload in invalid_payloads:
-        with pytest.raises(ValidationError):
-            RUNTIME_ACTION_ADAPTER.validate_python(payload)
-
-    result = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
-        {
-            "type": "submit_application_result",
-            "pre_click_dom": "button Final submit",
-            "exit_code": 0,
-            "timed_out": False,
-            "stdout": "",
-            "stderr": "",
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-            "observation": {
-                "url": "https://ats.example/confirmation",
-                "title": "Application received",
-                "tabs": [],
-                "dom": "Application received",
-                "page_info": None,
-                "screenshot": None,
+@pytest.mark.parametrize(
+    ("adapter", "payload"),
+    [
+        (
+            RUNTIME_ACTION_ADAPTER,
+            {"type": "submit_application", "selector": "button[type='submit']"},
+        ),
+        (
+            RUNTIME_ACTION_RESPONSE_ADAPTER,
+            {
+                "type": "submit_application_result",
+                "pre_click_dom": "button Final submit",
+                "exit_code": 0,
+                "timed_out": False,
+                "stdout": "",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "observation": {
+                    "url": "https://ats.example/confirmation",
+                    "title": "Application received",
+                    "tabs": [],
+                    "dom": "Application received",
+                    "page_info": None,
+                    "screenshot": None,
+                },
             },
-        }
-    )
-    assert isinstance(result, SubmitApplicationResultRuntimeActionResponse)
+        ),
+    ],
+)
+def test_runtime_unions_reject_removed_selector_submission_contract(
+    adapter: TypeAdapter[Any],
+    payload: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        adapter.validate_python(payload)
+
+
+def test_submit_runtime_action_response_requires_exact_permission() -> None:
+    payload = {
+        "type": "submit",
+        "instruction": "You're good to submit.",
+        "result": _application_result_payload(),
+    }
+    response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(payload)
+    assert isinstance(response, SubmitRuntimeActionResponse)
+    assert response.instruction == "You're good to submit."
+
+    for invalid_instruction in (None, "You may submit.", "You're good to submit. "):
+        invalid = dict(payload)
+        if invalid_instruction is None:
+            invalid.pop("instruction")
+        else:
+            invalid["instruction"] = invalid_instruction
+        with pytest.raises(ValidationError):
+            RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(invalid)
 
 
 def test_rejects_removed_candidate_question_preflight_contract() -> None:
@@ -1375,7 +1392,11 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
             ],
         },
         {"type": "revise", "context": "Use the corrected date.", "revision_count": 1},
-        {"type": "submit", "result": _application_result_payload()},
+        {
+            "type": "submit",
+            "instruction": "You're good to submit.",
+            "result": _application_result_payload(),
+        },
         {"type": "cancel", "result": _application_result_payload("cancelled")},
         {"type": "application_mismatch"},
         {
