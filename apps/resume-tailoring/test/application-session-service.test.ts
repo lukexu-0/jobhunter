@@ -72,11 +72,13 @@ class FakeHarness implements ApplicationHarnessClient {
   readonly createCalls: ApplicationHarnessCreateInput[] = [];
   readonly getCalls: string[] = [];
   readonly streamCalls: Array<{ sessionId: string; lastEventId: number | undefined }> = [];
+  readonly streamSignals: AbortSignal[] = [];
   readonly commandCalls: Array<{ sessionId: string; command: ApplicationSessionCommand }> = [];
   readonly deleteCalls: string[] = [];
   readonly snapshots = new Map<string, ApplicationHarnessSnapshot>();
   events: ApplicationHarnessEvent[] = [];
   readonly getReplies: Array<Promise<ApplicationHarnessSnapshot>> = [];
+  readonly streamReplies: Array<Promise<AsyncIterable<ApplicationHarnessEvent>>> = [];
   createError: ApplicationHarnessError | null = null;
   commandError: ApplicationHarnessError | null = null;
   deleteError: ApplicationHarnessError | null = null;
@@ -110,9 +112,13 @@ class FakeHarness implements ApplicationHarnessClient {
   async stream(
     sessionId: string,
     lastEventId: number | undefined,
+    signal: AbortSignal,
   ): Promise<AsyncIterable<ApplicationHarnessEvent>> {
+    this.streamSignals.push(signal);
     this.streamCalls.push({ sessionId, lastEventId });
     if (this.streamError) throw this.streamError;
+    const queued = this.streamReplies.shift();
+    if (queued) return await queued;
     const events = this.events;
     return {
       async *[Symbol.asyncIterator]() {
@@ -323,6 +329,104 @@ describe("application session service", () => {
       bridgeState: "running",
       pdfSha256: second.pdf.sha256,
     });
+  });
+
+  test("restores cleanup observation for an unreleased live session after restart", async () => {
+    const released = deferred<void>();
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      skipReview: true,
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+    });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true },
+    );
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+
+    const cleanupStream = deferred<AsyncIterable<ApplicationHarnessEvent>>();
+    target.harness!.streamReplies.push(cleanupStream.promise);
+    const restarted = new ApplicationSessionService({
+      repository: target.repository,
+      artifacts: target.artifacts,
+      harness: target.harness!,
+      uuidFactory: () => SECOND_SESSION_ID,
+      profileReader: () => PROFILE,
+      onApplicationSessionReleased: () => {
+        availabilityKicks++;
+        released.resolve();
+      },
+    });
+    const previousStreamCalls = target.harness!.streamCalls.length;
+
+    expect(await restarted.startNextAutomaticApplication(signal())).toBe(false);
+    expect(target.harness!.streamCalls).toHaveLength(previousStreamCalls + 1);
+    expect(target.harness!.streamCalls.at(-1)).toEqual({
+      sessionId: FIRST_SESSION_ID,
+      lastEventId: undefined,
+    });
+
+    target.harness!.snapshots.delete(FIRST_SESSION_ID);
+    cleanupStream.resolve({
+      async *[Symbol.asyncIterator]() {
+        throw new ApplicationHarnessError("session_not_found");
+      },
+    });
+    await released.promise;
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "lost",
+      slotReleased: true,
+    });
+    expect(availabilityKicks).toBe(1);
+
+    expect(await restarted.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+      bridgeState: "running",
+      slotReleased: false,
+    });
+    await restarted.dispose();
+  });
+
+  test("releases a never-observed reservation after restart when the harness is missing", async () => {
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      skipReview: true,
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+    });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true },
+    );
+    target.repository.reserveApplicationSession(
+      target.runId,
+      null,
+      FIRST_SESSION_ID,
+      target.pdf.sha256,
+    );
+    const restarted = new ApplicationSessionService({
+      repository: target.repository,
+      artifacts: target.artifacts,
+      harness: target.harness!,
+      uuidFactory: () => SECOND_SESSION_ID,
+      profileReader: () => PROFILE,
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+    });
+
+    expect(await restarted.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "closed",
+      slotReleased: true,
+    });
+    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+      bridgeState: "running",
+      slotReleased: false,
+    });
+    expect(availabilityKicks).toBe(1);
+    await restarted.dispose();
   });
 
   test("keeps an automatic-start failure approved and recoverable through the existing start path", async () => {
@@ -780,7 +884,6 @@ describe("application session service", () => {
     };
     const releasedTimeout: ApplicationHarnessSnapshot = {
       ...earlyTimeout,
-      updatedAt: 10_201,
       slotReleased: true,
     };
     target.harness!.events = [{
@@ -810,12 +913,321 @@ describe("application session service", () => {
     });
     expect(JSON.stringify(early.value)).not.toContain("slotReleased");
     expect(availabilityKicks).toBe(0);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: false,
+    });
 
     expect((await iterator.next()).done).toBeFalse();
     expect(availabilityKicks).toBe(1);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: true,
+    });
     expect((await iterator.next()).done).toBeFalse();
     expect(availabilityKicks).toBe(1);
     expect((await iterator.next()).done).toBeTrue();
+  });
+
+  test("signals a durable slot release only once before a later lost transition", async () => {
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+    });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.harness!.events = [{
+      id: 1,
+      event: "failed",
+      session: {
+        ...harnessSnapshot("failed"),
+        slotReleased: true,
+        error: {
+          code: "browser_failed",
+          message: "The browser session failed",
+        },
+      },
+      detail: {},
+    }];
+    for await (const _event of await target.service.events(
+      target.runId,
+      undefined,
+      signal(),
+    )) {
+      // A stale terminal projection releases the physical slot but retains the live view.
+    }
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "running",
+      slotReleased: true,
+    });
+    expect(availabilityKicks).toBe(1);
+
+    target.harness!.streamError = new ApplicationHarnessError("session_not_found");
+    await expect(target.service.events(target.runId, undefined, signal()))
+      .rejects.toMatchObject({ code: "RUN_CONFLICT", status: 409 });
+
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "lost",
+      slotReleased: true,
+    });
+    expect(availabilityKicks).toBe(1);
+  });
+
+  test("reconciles a persisted terminal slot before starting the next automatic run", async () => {
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      skipReview: true,
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+    });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true },
+    );
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+
+    const earlyTimeout: ApplicationHarnessSnapshot = {
+      ...harnessSnapshot("failed"),
+      updatedAt: 10_200,
+      slotReleased: false,
+      error: {
+        code: "session_timeout",
+        message: "The application session expired",
+      },
+    };
+    target.harness!.events = [{
+      id: 1,
+      event: "failed",
+      session: earlyTimeout,
+      detail: {},
+    }];
+    const stream = await target.service.events(target.runId, undefined, signal());
+    const observerStream = deferred<AsyncIterable<ApplicationHarnessEvent>>();
+    target.harness!.streamReplies.push(observerStream.promise);
+    for await (const _event of stream) {
+      // Consume the terminal event so the unreleased latch is durable.
+    }
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: false,
+    });
+    expect(target.repository.getNextAutomaticApplicationStart()).toBeNull();
+    expect(availabilityKicks).toBe(0);
+
+    target.harness!.snapshots.set(FIRST_SESSION_ID, {
+      ...earlyTimeout,
+      slotReleased: true,
+    });
+    const recovered = new ApplicationSessionService({
+      repository: target.repository,
+      artifacts: target.artifacts,
+      harness: target.harness!,
+      uuidFactory: () => SECOND_SESSION_ID,
+      profileReader: () => PROFILE,
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+    });
+    const previousReleaseReads = target.harness!.getCalls.filter(
+      (sessionId) => sessionId === FIRST_SESSION_ID,
+    ).length;
+
+    expect(await recovered.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.harness!.getCalls.filter(
+      (sessionId) => sessionId === FIRST_SESSION_ID,
+    )).toHaveLength(previousReleaseReads + 1);
+    expect(target.harness!.createCalls.map(({ sessionId }) => sessionId)).toEqual([
+      FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
+    ]);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: true,
+    });
+    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+      bridgeState: "running",
+      slotReleased: false,
+    });
+    expect(availabilityKicks).toBe(1);
+    observerStream.resolve({
+      async *[Symbol.asyncIterator]() {
+        // Let the retired service observer see the durable release and exit.
+      },
+    });
+    await Promise.resolve();
+  });
+
+  test("keeps observing cleanup after the client event stream ends", async () => {
+    const released = deferred<void>();
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      skipReview: true,
+      onApplicationSessionReleased: () => {
+        availabilityKicks++;
+        released.resolve();
+      },
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+    });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true },
+    );
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+
+    const earlyTimeout: ApplicationHarnessSnapshot = {
+      ...harnessSnapshot("failed"),
+      updatedAt: 10_200,
+      slotReleased: false,
+      error: {
+        code: "session_timeout",
+        message: "The application session expired",
+      },
+    };
+    const releasedTimeout: ApplicationHarnessSnapshot = {
+      ...earlyTimeout,
+      slotReleased: true,
+    };
+    target.harness!.events = [{
+      id: 1,
+      event: "failed",
+      session: earlyTimeout,
+      detail: {},
+    }];
+    const clientStream = await target.service.events(target.runId, undefined, signal());
+    const cleanupEvents = deferred<AsyncIterable<ApplicationHarnessEvent>>();
+    target.harness!.streamReplies.push(cleanupEvents.promise);
+    for await (const _event of clientStream) {
+      // The simulated client stream ends after the early terminal event.
+    }
+
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: false,
+    });
+    expect(target.harness!.streamCalls.at(-1)).toEqual({
+      sessionId: FIRST_SESSION_ID,
+      lastEventId: 1,
+    });
+    cleanupEvents.resolve({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          id: 2,
+          event: "snapshot",
+          session: releasedTimeout,
+          detail: {},
+        };
+      },
+    });
+    await released.promise;
+
+    expect(availabilityKicks).toBe(1);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: true,
+      lastUpstreamEventId: 2,
+    });
+    expect(target.repository.getNextAutomaticApplicationStart()).toEqual({
+      runId: second.run.id,
+      approvedPdfSha256: second.pdf.sha256,
+    });
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.harness!.createCalls.map(({ sessionId }) => sessionId)).toEqual([
+      FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
+    ]);
+  });
+
+  test("stops cleanup observers without releasing the slot during service disposal", async () => {
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+    });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const earlyTimeout: ApplicationHarnessSnapshot = {
+      ...harnessSnapshot("failed"),
+      updatedAt: 10_200,
+      slotReleased: false,
+      error: {
+        code: "session_timeout",
+        message: "The application session expired",
+      },
+    };
+    target.harness!.events = [{
+      id: 1,
+      event: "failed",
+      session: earlyTimeout,
+      detail: {},
+    }];
+    const clientStream = await target.service.events(target.runId, undefined, signal());
+    const observerStream = deferred<AsyncIterable<ApplicationHarnessEvent>>();
+    target.harness!.streamReplies.push(observerStream.promise);
+    for await (const _event of clientStream) {
+      // The client disconnects after persisting the early terminal snapshot.
+    }
+    const observerSignal = target.harness!.streamSignals.at(-1);
+    expect(observerSignal?.aborted).toBeFalse();
+
+    const disposal = target.service.dispose();
+    expect(observerSignal?.aborted).toBeTrue();
+    observerStream.resolve({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          id: 2,
+          event: "snapshot",
+          session: { ...earlyTimeout, slotReleased: true },
+          detail: {},
+        };
+      },
+    });
+    await disposal;
+
+    expect(availabilityKicks).toBe(0);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: false,
+    });
+  });
+
+  test("releases a retained submitted slot when the harness session is missing", async () => {
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+    });
+    target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
+    target.repository.finalizeApplicationSubmission(FIRST_SESSION_ID, "submitted");
+    target.harness!.events = [{
+      id: 1,
+      event: "application_submitted",
+      session: { ...harnessSnapshot("submitted"), updatedAt: 10_200 },
+      detail: {},
+    }];
+    for await (const _event of await target.service.events(
+      target.runId,
+      undefined,
+      signal(),
+    )) {
+      // Persist the final submission projection while cleanup is still pending.
+    }
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "submitted",
+      submissionPhase: "submitted",
+      slotReleased: false,
+    });
+    expect(availabilityKicks).toBe(0);
+
+    target.harness!.streamError = new ApplicationHarnessError("session_not_found");
+    await expect(target.service.events(target.runId, undefined, signal()))
+      .rejects.toMatchObject({ code: "RUN_CONFLICT", status: 409 });
+
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "submitted",
+      submissionPhase: "submitted",
+      slotReleased: true,
+    });
+    expect(availabilityKicks).toBe(1);
   });
 
 
@@ -1127,6 +1539,7 @@ describe("application session service", () => {
     const current = target.repository.getLatestApplicationSession(target.runId);
     if (!current || current.publicSnapshot === null) throw new Error("snapshot missing");
     target.repository.recordApplicationSnapshot(target.runId, {
+      slotReleased: false,
       generation: 1,
       sessionId: FIRST_SESSION_ID,
       bridgeState: "running",
@@ -1168,6 +1581,7 @@ describe("application session service", () => {
     const current = target.repository.getLatestApplicationSession(target.runId);
     if (!current || current.publicSnapshot === null) throw new Error("snapshot missing");
     target.repository.recordApplicationSnapshot(target.runId, {
+      slotReleased: false,
       generation: 1,
       sessionId: FIRST_SESSION_ID,
       bridgeState: "running",
@@ -1243,6 +1657,7 @@ describe("application session service", () => {
     const current = target.repository.getLatestApplicationSession(target.runId);
     if (!current || current.publicSnapshot === null) throw new Error("snapshot missing");
     target.repository.recordApplicationSnapshot(target.runId, {
+      slotReleased: false,
       generation: 1,
       sessionId: FIRST_SESSION_ID,
       bridgeState: "submitting",
@@ -1356,7 +1771,9 @@ describe("application session service", () => {
       status: 409,
     });
 
-    expect(target.harness!.getCalls.slice(getCallCount)).toEqual([FIRST_SESSION_ID]);
+    const reconciliationReads = target.harness!.getCalls.slice(getCallCount);
+    expect(reconciliationReads.length).toBeGreaterThanOrEqual(1);
+    expect(reconciliationReads.every((sessionId) => sessionId === FIRST_SESSION_ID)).toBeTrue();
     expect(await target.service.get(target.runId)).toMatchObject({
       generation: 1,
       bridgeState: "failed",
@@ -1387,7 +1804,7 @@ describe("application session service", () => {
     await target.service.start(target.runId, target.pdf.sha256, signal());
     const harness = target.harness!;
     harness.commandError = new ApplicationHarnessError("command_conflict");
-    target.repository.recordApplicationSnapshot = () => {
+    target.repository.recordApplicationSnapshotWithSlotTransition = () => {
       throw new RepositoryConflictError("application session changed");
     };
 

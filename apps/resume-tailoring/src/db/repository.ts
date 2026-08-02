@@ -121,6 +121,7 @@ interface ApplicationSessionRow {
   bridge_state: ApplicationSessionBridgeState;
   submission_phase: ApplicationSubmissionPhase;
   automatic_review_ready: 0 | 1;
+  slot_released: 0 | 1;
   submission_attempted_at: number | null;
   submission_confirmed_at: number | null;
   public_snapshot_json: string | null;
@@ -195,11 +196,26 @@ export interface PublicApplicationSession {
   readonly pdfSha256: string;
   readonly bridgeState: ApplicationSessionBridgeState;
   readonly submissionPhase: ApplicationSubmissionPhase;
+  readonly slotReleased: boolean;
   readonly publicSnapshot: unknown | null;
   readonly lastUpstreamEventId: number | null;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly terminalAt: number | null;
+}
+
+interface ApplicationSnapshotRecordInput {
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly bridgeState: HarnessSessionState;
+  readonly publicSnapshot: unknown;
+  readonly slotReleased: boolean;
+  readonly lastUpstreamEventId?: number;
+}
+
+export interface ApplicationSessionSlotTransitionResult {
+  readonly session: PublicApplicationSession;
+  readonly slotReleasedTransitioned: boolean;
 }
 
 export interface RepositoryOptions {
@@ -279,6 +295,7 @@ function publicApplicationSession(row: ApplicationSessionRow): PublicApplication
     pdfSha256: row.pdf_sha256,
     bridgeState: row.bridge_state,
     submissionPhase: row.submission_phase,
+    slotReleased: row.slot_released === 1,
     publicSnapshot: row.public_snapshot_json === null ? null : JSON.parse(row.public_snapshot_json) as unknown,
     lastUpstreamEventId: row.last_upstream_event_id,
     createdAt: row.created_at,
@@ -574,6 +591,7 @@ export class PipelineRepository {
                 WHERE run_id = runs.id
               )
               AND latest_session.resume_revision < runs.current_revision
+              AND latest_session.slot_released = 1
               AND latest_session.bridge_state IN ('cancelled', 'failed', 'closed', 'lost')
               AND latest_session.submission_phase = 'not_attempted'
           )
@@ -581,7 +599,7 @@ export class PipelineRepository {
         AND NOT EXISTS (
           SELECT 1
           FROM run_application_sessions
-          WHERE bridge_state NOT IN ('cancelled', 'failed', 'closed', 'lost')
+          WHERE slot_released = 0
         )
       ORDER BY runs.queue_sequence
       LIMIT 1
@@ -634,13 +652,22 @@ export class PipelineRepository {
       if (latest && TERMINAL_APPLICATION_SESSION_STATES[latest.bridge_state] !== true) {
         throw new RepositoryConflictError("application session is active");
       }
+      const occupyingSession = this.#db.query<{ session_id: string }, []>(`
+        SELECT session_id
+        FROM run_application_sessions
+        WHERE slot_released = 0
+      `).get();
+      if (occupyingSession) {
+        throw new RepositoryConflictError("application browser slot is active");
+      }
       const generation = (latest?.generation ?? 0) + 1;
       const now = this.#now();
       this.#db.query(`
         INSERT INTO run_application_sessions(
           run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
-          public_snapshot_json, last_upstream_event_id, created_at, updated_at, terminal_at
-        ) VALUES (?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?, ?, NULL)
+          slot_released, public_snapshot_json, last_upstream_event_id,
+          created_at, updated_at, terminal_at
+        ) VALUES (?, ?, ?, ?, ?, 'reserved', 0, NULL, NULL, ?, ?, NULL)
       `).run(
         runId,
         generation,
@@ -867,16 +894,20 @@ export class PipelineRepository {
   }
   recordApplicationSnapshot(
     runId: string,
-    input: {
-      readonly generation: number;
-      readonly sessionId: string;
-      readonly bridgeState: HarnessSessionState;
-      readonly publicSnapshot: unknown;
-      readonly lastUpstreamEventId?: number;
-    },
+    input: ApplicationSnapshotRecordInput,
   ): PublicApplicationSession {
+    return this.recordApplicationSnapshotWithSlotTransition(runId, input).session;
+  }
+
+  recordApplicationSnapshotWithSlotTransition(
+    runId: string,
+    input: ApplicationSnapshotRecordInput,
+  ): ApplicationSessionSlotTransitionResult {
     if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
       throw new Error("application session generation must be positive");
+    }
+    if (typeof input.slotReleased !== "boolean") {
+      throw new Error("application slot release must be boolean");
     }
     if (
       input.lastUpstreamEventId !== undefined
@@ -886,44 +917,53 @@ export class PipelineRepository {
     }
     const publicSnapshotJson = serializePublicApplicationSnapshot(input.publicSnapshot);
     const snapshotUpdatedAt = publicApplicationSnapshotUpdatedAt(input.publicSnapshot);
-    return this.#immediate(() => {
+    let slotWasReleased = true;
+    const session = this.#immediate(() => {
       const current = this.#currentApplicationSession(runId, input.generation, input.sessionId);
+      slotWasReleased = current.slot_released === 1;
       const currentSnapshot = current.public_snapshot_json === null
         ? null
         : JSON.parse(current.public_snapshot_json) as unknown;
       const currentSnapshotUpdatedAt = publicApplicationSnapshotUpdatedAt(currentSnapshot);
-      const retainSnapshotAndAdvanceCursor = (): PublicApplicationSession => {
-        if (input.lastUpstreamEventId === undefined) {
+      const retainSnapshotAndAdvanceMetadata = (): PublicApplicationSession => {
+        const cursor = input.lastUpstreamEventId === undefined
+          || (
+            current.last_upstream_event_id !== null
+            && input.lastUpstreamEventId <= current.last_upstream_event_id
+          )
+          ? current.last_upstream_event_id
+          : input.lastUpstreamEventId;
+        const slotReleased = current.slot_released === 1 || input.slotReleased ? 1 : 0;
+        if (
+          current.last_upstream_event_id === cursor
+          && current.slot_released === slotReleased
+        ) {
           return publicApplicationSession(current);
         }
-        const cursorResult = this.#db.query(`
+        const metadataResult = this.#db.query(`
           UPDATE run_application_sessions
-          SET last_upstream_event_id = ?
+          SET last_upstream_event_id = ?, slot_released = ?
           WHERE run_id = ? AND generation = ? AND session_id = ?
-            AND (
-              last_upstream_event_id IS NULL
-              OR last_upstream_event_id < ?
-            )
             AND generation = (
               SELECT max(generation)
               FROM run_application_sessions
               WHERE run_id = ?
             )
         `).run(
-          input.lastUpstreamEventId,
+          cursor,
+          slotReleased,
           runId,
           input.generation,
           input.sessionId,
-          input.lastUpstreamEventId,
           runId,
         );
-        if (cursorResult.changes !== 1) {
+        if (metadataResult.changes !== 1) {
           throw new RepositoryConflictError("application session is not the current generation");
         }
         const advanced = this.#db.query<ApplicationSessionRow, [string, number]>(
           "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
         ).get(runId, input.generation);
-        if (!advanced) throw new Error("application session cursor update failed");
+        if (!advanced) throw new Error("application session metadata update failed");
         return publicApplicationSession(advanced);
       };
       if (
@@ -931,7 +971,7 @@ export class PipelineRepository {
         && input.lastUpstreamEventId !== undefined
         && input.lastUpstreamEventId <= current.last_upstream_event_id
       ) {
-        return publicApplicationSession(current);
+        return retainSnapshotAndAdvanceMetadata();
       }
       if (
         snapshotUpdatedAt !== null
@@ -944,7 +984,7 @@ export class PipelineRepository {
           )
         )
       ) {
-        return retainSnapshotAndAdvanceCursor();
+        return retainSnapshotAndAdvanceMetadata();
       }
       const bridgeMatchesSubmissionPhase =
         (
@@ -988,9 +1028,7 @@ export class PipelineRepository {
         current.bridge_state === input.bridgeState
         && current.public_snapshot_json === publicSnapshotJson
       ) {
-        return current.last_upstream_event_id === cursor
-          ? publicApplicationSession(current)
-          : retainSnapshotAndAdvanceCursor();
+        return retainSnapshotAndAdvanceMetadata();
       }
       const updatedAt = Math.max(current.updated_at + 1, this.#now());
       const terminalAt = TERMINAL_APPLICATION_SESSION_STATES[input.bridgeState] === true
@@ -999,7 +1037,7 @@ export class PipelineRepository {
       const result = this.#db.query(`
         UPDATE run_application_sessions
         SET bridge_state = ?, public_snapshot_json = ?, last_upstream_event_id = ?,
-            updated_at = ?, terminal_at = ?
+            slot_released = ?, updated_at = ?, terminal_at = ?
         WHERE run_id = ? AND generation = ? AND session_id = ?
           AND generation = (
             SELECT max(generation)
@@ -1010,6 +1048,7 @@ export class PipelineRepository {
         input.bridgeState,
         publicSnapshotJson,
         cursor,
+        current.slot_released === 1 || input.slotReleased ? 1 : 0,
         updatedAt,
         terminalAt,
         runId,
@@ -1026,6 +1065,57 @@ export class PipelineRepository {
       if (!recorded) throw new Error("application session snapshot update failed");
       return publicApplicationSession(recorded);
     });
+    return {
+      session,
+      slotReleasedTransitioned: !slotWasReleased && session.slotReleased,
+    };
+  }
+
+  getUnreleasedApplicationSession(): PublicApplicationSession | null {
+    const row = this.#db.query<ApplicationSessionRow, []>(`
+      SELECT *
+      FROM run_application_sessions
+      WHERE slot_released = 0
+      ORDER BY created_at, run_id, generation
+      LIMIT 1
+    `).get();
+    return row ? publicApplicationSession(row) : null;
+  }
+
+  releaseApplicationSessionSlot(
+    runId: string,
+    generation: number,
+    sessionId: string,
+  ): PublicApplicationSession {
+    return this.releaseApplicationSessionSlotWithTransition(runId, generation, sessionId).session;
+  }
+
+  releaseApplicationSessionSlotWithTransition(
+    runId: string,
+    generation: number,
+    sessionId: string,
+  ): ApplicationSessionSlotTransitionResult {
+    let slotReleasedTransitioned = false;
+    const session = this.#immediate(() => {
+      const current = this.#currentApplicationSession(runId, generation, sessionId);
+      if (current.slot_released === 1) return publicApplicationSession(current);
+      const result = this.#db.query(`
+        UPDATE run_application_sessions
+        SET slot_released = 1
+        WHERE run_id = ? AND generation = ? AND session_id = ?
+          AND slot_released = 0
+      `).run(runId, generation, sessionId);
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("application slot release conflicted");
+      }
+      slotReleasedTransitioned = true;
+      const released = this.#db.query<ApplicationSessionRow, [string, number]>(
+        "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
+      ).get(runId, generation);
+      if (!released) throw new Error("application slot release failed");
+      return publicApplicationSession(released);
+    });
+    return { session, slotReleasedTransitioned };
   }
 
   markApplicationSessionLost(
@@ -1036,9 +1126,22 @@ export class PipelineRepository {
       readonly publicSnapshot: unknown;
     },
   ): PublicApplicationSession {
+    return this.markApplicationSessionLostWithTransition(runId, input).session;
+  }
+
+  markApplicationSessionLostWithTransition(
+    runId: string,
+    input: {
+      readonly generation: number;
+      readonly sessionId: string;
+      readonly publicSnapshot: unknown;
+    },
+  ): ApplicationSessionSlotTransitionResult {
     const publicSnapshotJson = serializePublicApplicationSnapshot(input.publicSnapshot);
-    return this.#immediate(() => {
+    let slotWasReleased = true;
+    const session = this.#immediate(() => {
       const current = this.#currentApplicationSession(runId, input.generation, input.sessionId);
+      slotWasReleased = current.slot_released === 1;
       if (current.submission_phase !== "not_attempted") {
         throw new RepositoryConflictError("application submission is already final or attempting");
       }
@@ -1049,17 +1152,25 @@ export class PipelineRepository {
         throw new RepositoryConflictError("application session was not observed live");
       }
       const updatedAt = Math.max(current.updated_at + 1, this.#now());
-      this.#db.query(`
+      const result = this.#db.query(`
         UPDATE run_application_sessions
-        SET bridge_state = 'lost', public_snapshot_json = ?, updated_at = ?, terminal_at = ?
+        SET bridge_state = 'lost', slot_released = 1,
+            public_snapshot_json = ?, updated_at = ?, terminal_at = ?
         WHERE run_id = ? AND generation = ? AND session_id = ?
       `).run(publicSnapshotJson, updatedAt, updatedAt, runId, input.generation, input.sessionId);
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("application session lost transition conflicted");
+      }
       const lost = this.#db.query<ApplicationSessionRow, [string, number]>(
         "SELECT * FROM run_application_sessions WHERE run_id = ? AND generation = ?",
       ).get(runId, input.generation);
       if (!lost) throw new Error("application session lost transition failed");
       return publicApplicationSession(lost);
     });
+    return {
+      session,
+      slotReleasedTransitioned: !slotWasReleased && session.slotReleased,
+    };
   }
 
   closeLostApplicationSession(
@@ -1191,17 +1302,20 @@ export class PipelineRepository {
             SELECT 1
             FROM run_application_sessions
             WHERE run_application_sessions.run_id = runs.id
-              AND run_application_sessions.bridge_state IN (
-                'reserved',
-                'starting',
-                'running',
-                'awaiting_human_navigation',
-                'awaiting_origin_approval',
-                'awaiting_additional_info',
-                'awaiting_human_review',
-                'submitting',
-                'submitted',
-                'submission_uncertain'
+              AND (
+                run_application_sessions.slot_released = 0
+                OR run_application_sessions.bridge_state IN (
+                  'reserved',
+                  'starting',
+                  'running',
+                  'awaiting_human_navigation',
+                  'awaiting_origin_approval',
+                  'awaiting_additional_info',
+                  'awaiting_human_review',
+                  'submitting',
+                  'submitted',
+                  'submission_uncertain'
+                )
               )
           )
         ON CONFLICT(run_id) DO NOTHING
@@ -1289,17 +1403,20 @@ export class PipelineRepository {
           SELECT 1
           FROM run_application_sessions
           WHERE run_id = ?
-            AND bridge_state IN (
-              'reserved',
-              'starting',
-              'running',
-              'awaiting_human_navigation',
-              'awaiting_origin_approval',
-              'awaiting_additional_info',
-              'awaiting_human_review',
-              'submitting',
-              'submitted',
-              'submission_uncertain'
+            AND (
+              slot_released = 0
+              OR bridge_state IN (
+                'reserved',
+                'starting',
+                'running',
+                'awaiting_human_navigation',
+                'awaiting_origin_approval',
+                'awaiting_additional_info',
+                'awaiting_human_review',
+                'submitting',
+                'submitted',
+                'submission_uncertain'
+              )
             )
         ) AS active
       `).get(runId)?.active === 1;

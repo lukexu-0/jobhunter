@@ -220,6 +220,7 @@ test("parks submitted artifacts until browser close, then releases only liveness
   const sessionId = "70707070-7070-4070-8070-707070707070";
   repository.reserveApplicationSession(runId, null, sessionId, pdf.sha256);
   repository.recordApplicationSnapshot(runId, {
+    slotReleased: false,
     generation: 1,
     sessionId,
     bridgeState: "awaiting_human_review",
@@ -228,6 +229,7 @@ test("parks submitted artifacts until browser close, then releases only liveness
   repository.claimApplicationSubmission(sessionId);
   repository.finalizeApplicationSubmission(sessionId, "submitted");
   repository.recordApplicationSnapshot(runId, {
+    slotReleased: false,
     generation: 1,
     sessionId,
     bridgeState: "submitted",
@@ -239,6 +241,7 @@ test("parks submitted artifacts until browser close, then releases only liveness
   expect(existsSync(join(artifacts.root, String(records[1]!.queueSequence)))).toBeFalse();
 
   repository.recordApplicationSnapshot(runId, {
+    slotReleased: true,
     generation: 1,
     sessionId,
     bridgeState: "closed",

@@ -50,6 +50,7 @@ export interface PipelineWorkerHandle {
 
 export interface PipelineApplicationSessionService extends ApplicationSessionRouteService {
   startNextAutomaticApplication(signal: AbortSignal): Promise<boolean>;
+  dispose?(): void | Promise<void>;
 }
 
 export interface PipelineApplicationOptions {
@@ -215,6 +216,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     close: () => {
       closePromise ??= closeAll([
         () => worker.close(),
+        () => applicationSessions.dispose?.(),
         () => closeAuth(),
         () => context.close?.(),
         ...(pipelineDatabase ? [() => pipelineDatabase.close()] : []),
