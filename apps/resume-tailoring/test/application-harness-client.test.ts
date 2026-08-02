@@ -17,6 +17,7 @@ function rawSnapshot(overrides: Record<string, unknown> = {}): Record<string, un
     created_at: "2026-07-21T10:00:00Z",
     updated_at: "2026-07-21T10:00:01Z",
     expires_at: "2026-07-21T11:00:00Z",
+    slot_released: false,
     job_url: "https://jobs.private.example/roles/123",
     company: "Example Corp",
     role: "Software Engineer",
@@ -81,6 +82,7 @@ describe("HttpApplicationHarnessClient", () => {
       createdAt: Date.parse("2026-07-21T10:00:00Z"),
       updatedAt: Date.parse("2026-07-21T10:00:01Z"),
       expiresAt: Date.parse("2026-07-21T11:00:00Z"),
+      slotReleased: false,
       company: "Example Corp",
       role: "Software Engineer",
       fieldsFilled: [{ label: "Full name", fieldType: "text", valuePresent: true, note: "" }],
@@ -126,6 +128,28 @@ describe("HttpApplicationHarnessClient", () => {
     expect(JSON.stringify(snapshot)).not.toContain("jobs.private.example");
     expect(JSON.stringify(snapshot)).not.toContain("ats.private.example");
     expect(JSON.stringify(snapshot)).not.toContain("model");
+  });
+  test("projects slot release only after terminal cleanup", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json(rawSnapshot({
+        state: "failed",
+        slot_released: true,
+        pending_action: null,
+        error: {
+          code: "session_timeout",
+          message: "The application session expired",
+        },
+      })),
+    });
+
+    await expect(
+      client.get(SESSION_ID, new AbortController().signal),
+    ).resolves.toMatchObject({
+      state: "failed",
+      slotReleased: true,
+    });
   });
   test("accepts only a bare loopback HTTP origin", () => {
     expect(() => new HttpApplicationHarnessClient({ token: TOKEN })).not.toThrow();
@@ -313,6 +337,7 @@ describe("HttpApplicationHarnessClient", () => {
     const invalidResponses = [
       Response.json(rawSnapshot({ session_id: otherSessionId })),
       Response.json(rawSnapshot({ current_url: "https://private.example/current" })),
+      Response.json(rawSnapshot({ slot_released: true })),
       Response.json(rawSnapshot({
         state: "awaiting_origin_approval",
         pending_action: {

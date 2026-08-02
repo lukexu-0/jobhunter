@@ -17,7 +17,11 @@ import {
 } from "../src/api/application-session-service.ts";
 import type { ApplicationSessionCommand, ApplicationSessionEventDto } from "../src/contracts/index.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
-import { PipelineRepository, type ActiveStage } from "../src/db/repository.ts";
+import {
+  PipelineRepository,
+  RepositoryConflictError,
+  type ActiveStage,
+} from "../src/db/repository.ts";
 import { ArtifactStore } from "../src/system/artifacts.ts";
 
 const JOB_URL = "https://jobs.example.test/roles/123?source=private";
@@ -43,6 +47,7 @@ function harnessSnapshot(
     createdAt: 10_000,
     updatedAt: 10_100,
     expiresAt: 20_000,
+    slotReleased: state === "cancelled" || state === "failed" || state === "closed",
     company: "Example Corp",
     role: "Platform Engineer",
     fieldsFilled: [],
@@ -758,6 +763,61 @@ describe("application session service", () => {
     }
   });
 
+  test("signals availability only after terminal harness cleanup releases the slot", async () => {
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      onApplicationSessionReleased: () => { availabilityKicks++; },
+    });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const earlyTimeout: ApplicationHarnessSnapshot = {
+      ...harnessSnapshot("failed"),
+      updatedAt: 10_200,
+      slotReleased: false,
+      error: {
+        code: "session_timeout",
+        message: "The application session expired",
+      },
+    };
+    const releasedTimeout: ApplicationHarnessSnapshot = {
+      ...earlyTimeout,
+      updatedAt: 10_201,
+      slotReleased: true,
+    };
+    target.harness!.events = [{
+      id: 1,
+      event: "failed",
+      session: earlyTimeout,
+      detail: {},
+    }, {
+      id: 2,
+      event: "snapshot",
+      session: releasedTimeout,
+      detail: {},
+    }, {
+      id: 3,
+      event: "snapshot",
+      session: releasedTimeout,
+      detail: {},
+    }];
+
+    const stream = await target.service.events(target.runId, undefined, signal());
+    const iterator = stream[Symbol.asyncIterator]();
+    const early = await iterator.next();
+    expect(early.done).toBeFalse();
+    expect(early.value?.event.session).toMatchObject({
+      bridgeState: "failed",
+      error: { code: "session_timeout" },
+    });
+    expect(JSON.stringify(early.value)).not.toContain("slotReleased");
+    expect(availabilityKicks).toBe(0);
+
+    expect((await iterator.next()).done).toBeFalse();
+    expect(availabilityKicks).toBe(1);
+    expect((await iterator.next()).done).toBeFalse();
+    expect(availabilityKicks).toBe(1);
+    expect((await iterator.next()).done).toBeTrue();
+  });
+
 
   test("returns an existing terminal snapshot before source and configuration checks", async () => {
     const harness = new FakeHarness();
@@ -1273,7 +1333,94 @@ describe("application session service", () => {
     }]);
   });
 
-  test("forwards live commands without persistence and closes active, reserved, and lost sessions", async () => {
+  test("persists an expired terminal snapshot before returning command conflict", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const expiredSnapshot: ApplicationHarnessSnapshot = {
+      ...harnessSnapshot("failed"),
+      updatedAt: 20_000,
+      slotReleased: false,
+      error: {
+        code: "session_timeout",
+        message: "The application session expired",
+      },
+    };
+    target.harness!.snapshots.set(FIRST_SESSION_ID, expiredSnapshot);
+    target.harness!.commandError = new ApplicationHarnessError("session_terminal");
+    const getCallCount = target.harness!.getCalls.length;
+
+    await expect(
+      target.service.command(target.runId, { type: "cancel" }, signal()),
+    ).rejects.toMatchObject({
+      code: "APPLICATION_COMMAND_CONFLICT",
+      status: 409,
+    });
+
+    expect(target.harness!.getCalls.slice(getCallCount)).toEqual([FIRST_SESSION_ID]);
+    expect(await target.service.get(target.runId)).toMatchObject({
+      generation: 1,
+      bridgeState: "failed",
+      harnessState: "failed",
+      updatedAt: 20_000,
+      terminalAt: expect.any(Number),
+      pendingAction: null,
+      error: {
+        code: "session_timeout",
+        message: "The application session expired",
+      },
+    });
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "failed",
+      publicSnapshot: expect.objectContaining({
+        bridgeState: "failed",
+        harnessState: "failed",
+        error: {
+          code: "session_timeout",
+          message: "The application session expired",
+        },
+      }),
+    });
+  });
+
+  test("preserves a repository conflict while reconciling a command", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const harness = target.harness!;
+    harness.commandError = new ApplicationHarnessError("command_conflict");
+    target.repository.recordApplicationSnapshot = () => {
+      throw new RepositoryConflictError("application session changed");
+    };
+
+    await expect(
+      target.service.command(target.runId, { type: "cancel" }, signal()),
+    ).rejects.toMatchObject({
+      code: "RUN_CONFLICT",
+      status: 409,
+    });
+    expect(harness.getCalls.at(-1)).toBe(FIRST_SESSION_ID);
+  });
+
+  test("marks a missing harness session lost while reconciling a command", async () => {
+    const target = await createTarget();
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const harness = target.harness!;
+    harness.commandError = new ApplicationHarnessError("command_conflict");
+    harness.snapshots.delete(FIRST_SESSION_ID);
+
+    await expect(
+      target.service.command(target.runId, { type: "cancel" }, signal()),
+    ).rejects.toMatchObject({
+      code: "APPLICATION_COMMAND_CONFLICT",
+      status: 409,
+    });
+    await expect(target.service.get(target.runId)).resolves.toMatchObject({
+      generation: 1,
+      bridgeState: "lost",
+      pendingAction: null,
+    });
+  });
+
+  test("forwards accepted live commands without persistence and closes active, reserved, and lost sessions", async () => {
     const commandHarness = new FakeHarness();
     commandHarness.snapshotAfterCreate = {
       ...harnessSnapshot("awaiting_additional_info"),
@@ -1307,6 +1454,7 @@ describe("application session service", () => {
       commandTarget.repository.getLatestApplicationSession(commandTarget.runId)?.publicSnapshot,
     )).not.toContain(privateAnswer);
 
+    const getCallCountBeforeConflict = commandHarness.getCalls.length;
     commandHarness.commandError = new ApplicationHarnessError("command_conflict");
     await expect(
       commandTarget.service.command(commandTarget.runId, command, signal()),
@@ -1315,6 +1463,9 @@ describe("application session service", () => {
       message: "The application state changed; review the latest session state",
       status: 409,
     });
+    expect(commandHarness.getCalls.slice(getCallCountBeforeConflict)).toEqual([
+      FIRST_SESSION_ID,
+    ]);
     commandHarness.commandError = null;
     await commandTarget.service.close(commandTarget.runId, signal());
     expect(commandHarness.deleteCalls).toEqual([FIRST_SESSION_ID]);
