@@ -35,7 +35,6 @@ from jobhunter_browser_harness.models import (
     ApplicationRunResult,
     ReviewApplicationResult,
     SubmittedApplicationResult,
-    ApproveOriginCommand,
     ApproveRuntimeActionResponse,
     BrowserUseResultRuntimeActionResponse,
     BrowserUseRuntimeAction,
@@ -454,39 +453,21 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert "Reliability Engineer" in posting.observation.dom
             assert posting.observation.screenshot is not None
 
-            approval_task = asyncio.create_task(
-                manager.runtime_action(
-                    created.session_id,
-                    RequestOriginApprovalRuntimeAction(
-                        type="request_origin_approval",
-                        origin=fixture.form_origin,
-                    ),
-                )
-            )
-            await _wait_for_state(
-                manager,
+            approval = await manager.runtime_action(
                 created.session_id,
-                "awaiting_origin_approval",
-            )
-            origin_pending = manager.get_snapshot(created.session_id).pending_action
-            assert origin_pending is not None
-            assert origin_pending.model_dump(mode="json") == {
-                "type": "origin_approval",
-                "origin": fixture.form_origin,
-            }
-            await manager.command(
-                created.session_id,
-                ApproveOriginCommand(
-                    type="approve_origin",
+                RequestOriginApprovalRuntimeAction(
+                    type="request_origin_approval",
                     origin=fixture.form_origin,
                 ),
             )
-            approval = await approval_task
             assert isinstance(approval, ApproveRuntimeActionResponse)
             assert approval.approved_origins == [
                 fixture.posting_origin,
                 fixture.form_origin,
             ]
+            automatic_origin_snapshot = manager.get_snapshot(created.session_id)
+            assert automatic_origin_snapshot.state == "running"
+            assert automatic_origin_snapshot.pending_action is None
 
             fill = await manager.runtime_action(
                 created.session_id,

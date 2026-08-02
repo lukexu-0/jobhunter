@@ -38,6 +38,7 @@ import {
 const MAX_PROFILE_BYTES = 1024 * 1024;
 const PROFILE_RELATIVE_PATH = "apps/user-info/current-context/personal/applicant-profile.md";
 const LOST_WARNING = "Verify whether the application was submitted before retrying.";
+const RELEASED_SESSION_HISTORY_LIMIT = 64;
 
 const LIVE_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
   reserved: true,
@@ -303,6 +304,7 @@ export class ApplicationSessionService {
     string,
     Set<Promise<ApplicationSessionSnapshotDto>>
   >();
+  readonly #releasedSessionIds = new Set<string>();
 
   constructor(private readonly dependencies: ApplicationSessionServiceDependencies) {
     this.#uuidFactory = dependencies.uuidFactory ?? randomUUID;
@@ -783,10 +785,34 @@ export class ApplicationSessionService {
       if (signal.aborted) signal.throwIfAborted();
       if (
         error instanceof ApplicationHarnessError
+        && (error.code === "command_conflict" || error.code === "session_terminal")
+      ) {
+        try {
+          const snapshot = await harness.get(session.sessionId, signal);
+          this.#recordHarnessSnapshot(runId, session, snapshot);
+        } catch (reconciliationError) {
+          if (signal.aborted) signal.throwIfAborted();
+          if (
+            reconciliationError instanceof ApplicationHarnessError
+            && reconciliationError.code === "session_not_found"
+          ) {
+            if (session.publicSnapshot !== null) this.#markLost(runId, session);
+            throw new ApplicationSessionServiceError("APPLICATION_COMMAND_CONFLICT");
+          }
+          if (
+            reconciliationError instanceof RunServiceError
+            || reconciliationError instanceof ApplicationSessionServiceError
+          ) {
+            throw reconciliationError;
+          }
+          this.#throwHarnessError(reconciliationError);
+        }
+        throw new ApplicationSessionServiceError("APPLICATION_COMMAND_CONFLICT");
+      }
+      if (
+        error instanceof ApplicationHarnessError
         && (
-          error.code === "command_conflict"
-          || error.code === "session_terminal"
-          || error.code === "invalid_request"
+          error.code === "invalid_request"
           || error.code === "session_not_found"
         )
       ) {
@@ -897,7 +923,7 @@ export class ApplicationSessionService {
         bridgeState: "closed",
         publicSnapshot: closed,
       });
-      this.#notifyApplicationSessionReleased(session, recorded);
+      this.#notifyApplicationSessionReleased(recorded, true);
     } catch (error) {
       mapRepositoryError(error);
     }
@@ -1123,7 +1149,7 @@ export class ApplicationSessionService {
         publicSnapshot: projected,
         ...(lastUpstreamEventId !== undefined ? { lastUpstreamEventId } : {}),
       });
-      this.#notifyApplicationSessionReleased(current, recorded);
+      this.#notifyApplicationSessionReleased(recorded, snapshot.slotReleased);
       return this.#storedView(recorded);
     } catch (error) {
       mapRepositoryError(error);
@@ -1194,7 +1220,7 @@ export class ApplicationSessionService {
         sessionId: current.sessionId,
         publicSnapshot: lost,
       });
-      this.#notifyApplicationSessionReleased(current, recorded);
+      this.#notifyApplicationSessionReleased(recorded, true);
       return this.#storedView(recorded);
     } catch (error) {
       mapRepositoryError(error);
@@ -1229,19 +1255,29 @@ export class ApplicationSessionService {
         bridgeState: "closed",
         publicSnapshot: closed,
       });
-      this.#notifyApplicationSessionReleased(session, recorded);
+      this.#notifyApplicationSessionReleased(recorded, true);
     } catch (error) {
       mapRepositoryError(error);
     }
   }
 
   #notifyApplicationSessionReleased(
-    previous: PublicApplicationSession,
     current: PublicApplicationSession,
+    slotReleased: boolean,
   ): void {
-    if (isLive(previous) && isTerminal(current)) {
-      this.dependencies.onApplicationSessionReleased?.();
+    if (
+      !slotReleased
+      || !isTerminal(current)
+      || this.#releasedSessionIds.has(current.sessionId)
+    ) {
+      return;
     }
+    this.#releasedSessionIds.add(current.sessionId);
+    if (this.#releasedSessionIds.size > RELEASED_SESSION_HISTORY_LIMIT) {
+      const oldest = this.#releasedSessionIds.values().next().value;
+      if (oldest !== undefined) this.#releasedSessionIds.delete(oldest);
+    }
+    this.dependencies.onApplicationSessionReleased?.();
   }
 
   #storedView(session: PublicApplicationSession): ApplicationSessionSnapshotDto {

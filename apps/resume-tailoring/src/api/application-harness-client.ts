@@ -82,6 +82,7 @@ export interface ApplicationHarnessSnapshot {
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly expiresAt: number;
+  readonly slotReleased: boolean;
   readonly company: string | null;
   readonly role: string | null;
   readonly browserUseDiagnostics: ApplicationBrowserUseDiagnostic[];
@@ -121,6 +122,11 @@ const PENDING_TYPE_BY_STATE: Partial<
   awaiting_additional_info: "additional_info",
   awaiting_human_review: "human_review",
 };
+const SLOT_RELEASED_STATES: Partial<Record<HarnessSessionState, true>> = {
+  cancelled: true,
+  failed: true,
+  closed: true,
+};
 
 
 const RawBrowserUseDiagnosticSchema = z.object({
@@ -149,6 +155,7 @@ const RawSnapshotSchema = z.object({
   created_at: TimestampSchema,
   updated_at: TimestampSchema,
   expires_at: TimestampSchema,
+  slot_released: z.boolean(),
   job_url: z.string().max(4_096).refine(isSanitizedHttpUrl),
   company: z.string().refine((value) => codePointLength(value, 0, 500)).nullable(),
   role: z.string().refine((value) => codePointLength(value, 0, 500)).nullable(),
@@ -176,6 +183,13 @@ const RawSnapshotSchema = z.object({
   }
   if (expiresAt < createdAt) {
     context.addIssue({ code: "custom", path: ["expires_at"], message: "expires_at precedes created_at" });
+  }
+  if (snapshot.slot_released && SLOT_RELEASED_STATES[snapshot.state] !== true) {
+    context.addIssue({
+      code: "custom",
+      path: ["slot_released"],
+      message: "only cleaned terminal sessions may release the slot",
+    });
   }
   if ((snapshot.state === "failed") !== (snapshot.error !== null)) {
     context.addIssue({ code: "custom", path: ["error"], message: "error does not match state" });
@@ -614,6 +628,7 @@ function projectSnapshot(snapshot: RawSnapshot): ApplicationHarnessSnapshot {
     createdAt: Date.parse(snapshot.created_at),
     updatedAt: Date.parse(snapshot.updated_at),
     expiresAt: Date.parse(snapshot.expires_at),
+    slotReleased: snapshot.slot_released,
     company: snapshot.company,
     role: snapshot.role,
     fieldsFilled: snapshot.fields_filled.map(projectField),

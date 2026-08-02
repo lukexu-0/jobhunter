@@ -18,7 +18,7 @@ export type ApplicationPanelAction =
 
 type SimpleApplicationPendingAction = Extract<
   ApplicationPendingAction,
-  { readonly type: "human_navigation" | "origin_approval" }
+  { readonly type: "human_navigation" }
 >;
 
 export interface ApplicationSessionPanelProps {
@@ -72,11 +72,9 @@ function formatTimestamp(timestamp: number): string {
 }
 
 export function simpleApplicationGateCommand(
-  action: SimpleApplicationPendingAction,
+  _action: SimpleApplicationPendingAction,
 ): ApplicationSessionCommand {
-  return action.type === "human_navigation"
-    ? { type: "continue" }
-    : { type: "approve_origin", origin: action.origin };
+  return { type: "continue" };
 }
 
 function FieldList({ fields }: { readonly fields: readonly ApplicationFieldResult[] }) {
@@ -129,9 +127,8 @@ export function ApplicationSessionPanel({
     : STATE_LABELS[snapshot.bridgeState];
 
   return (
-    <section className={styles.workspaceSection} aria-labelledby="application-session-heading">
+    <section className={styles.workspaceSection} aria-label="Application">
       <p className={styles.eyebrow}>Application</p>
-      <h2 id="application-session-heading">Application assistant</h2>
       <p
         aria-atomic="true"
         aria-live="polite"
@@ -204,17 +201,12 @@ export function ApplicationSessionPanel({
         </div>
       ) : pendingAction?.type === "origin_approval" ? (
         <div className={styles.applicationGate}>
-          <h3>Approve a new site</h3>
-          <p>The application flow needs permission to continue on this exact origin:</p>
+          <h3>Restart required</h3>
+          <p>
+            This session was created by an older browser harness that required
+            manual origin approval. Cancel or close it, then retry the application.
+          </p>
           <code>{pendingAction.origin}</code>
-          <button
-            className={styles.primaryButton}
-            disabled={busy}
-            onClick={() => void onCommand(simpleApplicationGateCommand(pendingAction))}
-            type="button"
-          >
-            {actionBusy === "approve_origin" ? "Approving…" : "Approve origin"}
-          </button>
         </div>
       ) : pendingAction?.type === "additional_info" ? (
         <ApplicationAdditionalInfoForm

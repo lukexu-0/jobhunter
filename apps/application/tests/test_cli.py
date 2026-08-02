@@ -417,6 +417,23 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
     assert stat.S_IMODE(profile.stat().st_mode) == 0o700
 
 
+
+def test_default_session_timeout_is_four_hours(
+    fake_bubblewrap: Path,
+) -> None:
+    config, _launch = cli_module.parse_config(
+        [
+            "--bubblewrap-executable",
+            str(fake_bubblewrap),
+            "--cdp-url",
+            LOOPBACK_CDP_URL,
+        ],
+        environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
+    )
+
+    assert config.session_timeout == 14_400
+    assert HarnessConfig(bearer_token=TOKEN).session_timeout == 14_400
+
 @pytest.mark.parametrize(
     ("provided", "canonical"),
     [

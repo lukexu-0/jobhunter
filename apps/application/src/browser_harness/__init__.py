@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import os
 
-os.environ["ANONYMIZED_TELEMETRY"] = "false"
-os.environ["BROWSER_USE_ACTION_TIMEOUT_S"] = "3600"
+DEFAULT_SESSION_TIMEOUT_SECONDS = 14_400
 
-__all__: tuple[str, ...] = ()
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["BROWSER_USE_ACTION_TIMEOUT_S"] = str(
+    DEFAULT_SESSION_TIMEOUT_SECONDS
+)
+
+__all__ = ("DEFAULT_SESSION_TIMEOUT_SECONDS",)

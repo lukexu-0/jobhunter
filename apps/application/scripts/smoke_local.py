@@ -987,23 +987,14 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 "Concurrent session create did not identify the active singleton",
             )
 
-            await event_stream.wait_for("session_started")
-            approval = await event_stream.wait_for("origin_approval_required")
-            require(
-                approval.get("detail") == {"origin": fixture.form_origin},
-                "Harness requested approval for an origin other than the exact fixture form origin",
-            )
-            await post_command(
-                client,
-                capture,
-                commands_url,
-                headers,
-                {"type": "approve_origin", "origin": fixture.form_origin},
-                "Harness rejected exact dynamic form-origin approval",
-            )
-
+            started = await event_stream.wait_for("session_started")
             additional_info = await event_stream.wait_for(
-                "additional_info_required", after_id=int(approval["id"])
+                "additional_info_required", after_id=int(started["id"])
+            )
+            require(
+                fixture.form_origin
+                in additional_info.get("session", {}).get("approved_origins", []),
+                "Harness did not automatically register the exact fixture form origin",
             )
             initial_progress = await wait_fixture_values(
                 fixture,
@@ -1173,7 +1164,6 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 event_names,
                 [
                     "session_started",
-                    "origin_approval_required",
                     "additional_info_required",
                     "additional_info_saved",
                     "human_navigation_required",
@@ -1184,9 +1174,12 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                     "application_submitted",
                 ],
             )
+            require(
+                "origin_approval_required" not in event_names,
+                "Harness unexpectedly paused for manual origin approval",
+            )
             expected_states = {
                 "session_started": "running",
-                "origin_approval_required": "awaiting_origin_approval",
                 "additional_info_required": "awaiting_additional_info",
                 "additional_info_saved": "running",
                 "human_navigation_required": "awaiting_human_navigation",
@@ -1247,31 +1240,16 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 raise SmokeFailure("Follow-up create returned an invalid session id") from None
             active_session_id = followup_session_id
             followup_events_url = followup_created.get("events_url")
-            followup_commands_url = followup_created.get("commands_url")
             require(
-                isinstance(followup_events_url, str)
-                and isinstance(followup_commands_url, str),
-                "Follow-up create omitted gate URLs",
+                isinstance(followup_events_url, str),
+                "Follow-up create omitted its events URL",
             )
             event_stream = EventStream(client, followup_events_url, headers, capture)
             event_stream.start()
-            await event_stream.wait_for("session_started")
-            followup_approval = await event_stream.wait_for("origin_approval_required")
-            require(
-                followup_approval.get("detail") == {"origin": fixture.form_origin},
-                "Follow-up session requested the wrong application origin",
-            )
-            await post_command(
-                client,
-                capture,
-                followup_commands_url,
-                headers,
-                {"type": "approve_origin", "origin": fixture.form_origin},
-                "Harness rejected follow-up origin approval",
-            )
+            followup_started = await event_stream.wait_for("session_started")
             followup_gate = await event_stream.wait_for_one_of(
                 ("human_navigation_required", "additional_info_required"),
-                after_id=int(followup_approval["id"]),
+                after_id=int(followup_started["id"]),
             )
             require(
                 followup_gate.get("event") == "human_navigation_required",

@@ -18,6 +18,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
@@ -492,7 +493,11 @@ class HarnessConfig(FrozenPrivateModel):
     ]
     pipeline_url: StrictText = "http://127.0.0.1:3457"
     port: int = Field(default=8765, ge=1, le=65_535)
-    session_timeout: int = Field(default=3_600, ge=1, le=86_400)
+    session_timeout: int = Field(
+        default=DEFAULT_SESSION_TIMEOUT_SECONDS,
+        ge=1,
+        le=86_400,
+    )
     bubblewrap_executable: Path = Path("/usr/bin/bwrap")
     browser_skill_workspace: Path = Path(
         "~/.jobhunter/application/browser-skill/agent-workspace"
@@ -677,6 +682,7 @@ class SessionSnapshot(PublicModel):
     created_at: datetime
     updated_at: datetime
     expires_at: datetime
+    slot_released: bool = False
     job_url: StrictText
     company: Annotated[str, StringConstraints(strict=True, max_length=500)] | None = None
     role: Annotated[str, StringConstraints(strict=True, max_length=500)] | None = None
@@ -720,6 +726,8 @@ class SessionSnapshot(PublicModel):
             raise ValueError("updated_at must not precede created_at")
         if self.expires_at < self.created_at:
             raise ValueError("expires_at must not precede created_at")
+        if self.slot_released and self.state not in {"cancelled", "failed", "closed"}:
+            raise ValueError("only cleaned terminal sessions may release the slot")
         if self.state == "failed" and self.error is None:
             raise ValueError("failed sessions require an error")
         if self.state != "failed" and self.error is not None:
