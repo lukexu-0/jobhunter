@@ -104,9 +104,10 @@ function collectAnalysisAgainstAtsKeywordExtractionIssues(
   return issues;
 }
 
-export function validateAnalysisAgainstAtsKeywordExtraction(
+function validateAnalysisKeywordLineage(
   analysis: JobAnalysis,
   extraction: AtsKeywordExtraction,
+  requireCurrentExtractionWorkflow: boolean,
 ): JobAnalysis {
   const parsedAnalysis = JobAnalysisSchema.parse(analysis);
   const parsedExtraction = AtsKeywordExtractionSchema.parse(extraction);
@@ -114,14 +115,29 @@ export function validateAnalysisAgainstAtsKeywordExtraction(
     throw new Error("job analysis and ATS keyword extraction job description hashes do not match");
   }
   if (
-    parsedExtraction.keywordExtractionWorkflowSha256
-    !== ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256
+    requireCurrentExtractionWorkflow
+    && parsedExtraction.keywordExtractionWorkflowSha256
+      !== ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256
   ) {
     throw new Error("ATS keyword extraction does not match the configured workflow");
   }
   const issues = collectAnalysisAgainstAtsKeywordExtractionIssues(parsedAnalysis, parsedExtraction);
   if (issues.length > 0) throw new AnalysisSemanticValidationError(issues);
   return parsedAnalysis;
+}
+
+export function validateAnalysisAgainstAtsKeywordExtraction(
+  analysis: JobAnalysis,
+  extraction: AtsKeywordExtraction,
+): JobAnalysis {
+  return validateAnalysisKeywordLineage(analysis, extraction, true);
+}
+
+export function validatePersistedAnalysisAgainstAtsKeywordExtraction(
+  analysis: JobAnalysis,
+  extraction: AtsKeywordExtraction,
+): JobAnalysis {
+  return validateAnalysisKeywordLineage(analysis, extraction, false);
 }
 
 function nestedError(

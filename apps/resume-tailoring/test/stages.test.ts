@@ -691,6 +691,41 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     ]));
   });
 
+  test("generates a keyword map after a human edit from a revision-one historical ATS extraction", async () => {
+    const harness = await createHarness({ generateKeywordMap: true });
+    await processToStop(harness);
+
+    const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
+    const extractionArtifact = harness.repository.getArtifact(
+      harness.runId,
+      "ats-keyword-extraction",
+    )!;
+    const historicalExtraction: AtsKeywordExtraction = {
+      ...harness.fixtures.atsKeywordExtraction,
+      keywordExtractionWorkflowSha256: "f".repeat(64),
+    };
+    await Bun.write(extractionArtifact.path, JSON.stringify(historicalExtraction));
+
+    harness.repository.editRun(
+      harness.runId,
+      "shorten the second experience bullet",
+      firstPdf.sha256,
+      harness.fixtures.snapshotInput,
+    );
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "review",
+      currentRevision: 2,
+    });
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")?.revision)
+      .toBe(1);
+    expect(harness.keywordMapCalls.count).toBe(2);
+    expect(harness.keywordMapCalls.requests[1]?.atsKeywordExtraction)
+      .toEqual(historicalExtraction);
+  });
+
   test("routes multi-page PDFs back to same-revision tailoring with or without a keyword map request", async () => {
     for (const generateKeywordMap of [false, true]) {
       const harness = await createHarness({

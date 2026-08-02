@@ -9,6 +9,8 @@ import {
   runRepairAgent,
   runTailoringAgent,
   validateAtsKeywordExtractionAgainstJobDescription,
+  validatePersistedAnalysisAgainstAtsKeywordExtraction,
+  validatePersistedAtsKeywordExtractionAgainstJobDescription,
   type AgentRuntimeDependencies,
   type OnePageCorrection,
 } from "../agents/index.ts";
@@ -610,14 +612,14 @@ export class PipelineStageProcessor {
       const atsKeywordExtraction = AtsKeywordExtractionSchema.parse(
         await this.#readJson(this.#requiredArtifact(run.id, "ats-keyword-extraction")),
       );
-      validateAtsKeywordExtractionAgainstJobDescription(
+      validatePersistedAtsKeywordExtractionAgainstJobDescription(
         atsKeywordExtraction,
         run.jobDescription,
       );
       const analysis = JobAnalysisSchema.parse(
         await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")),
       );
-      validateAnalysisAgainstAtsKeywordExtraction(analysis, atsKeywordExtraction);
+      validatePersistedAnalysisAgainstAtsKeywordExtraction(analysis, atsKeywordExtraction);
       const keywordMap = await this.#keywordMapRenderer({
         artifacts: this.#artifacts,
         compiledPdf: {

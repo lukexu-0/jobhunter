@@ -132,9 +132,10 @@ function formatAtsKeywordExtractionValidationError(error: unknown): string {
   return finishValidationFeedback(["Validation issues:", "- $: must satisfy the supplied ATS extraction constraints"]);
 }
 
-export function validateAtsKeywordExtractionAgainstJobDescription(
+function validateAtsKeywordExtraction(
   extraction: AtsKeywordExtraction,
   rawJobDescription: string,
+  requireCurrentWorkflow: boolean,
 ): AtsKeywordExtraction {
   const parsed = AtsKeywordExtractionSchema.parse(extraction);
   const jobDescriptionSha256 = createHash("sha256").update(rawJobDescription).digest("hex");
@@ -144,7 +145,10 @@ export function validateAtsKeywordExtractionAgainstJobDescription(
       "must match the supplied job description hash",
     );
   }
-  if (parsed.keywordExtractionWorkflowSha256 !== ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256) {
+  if (
+    requireCurrentWorkflow
+    && parsed.keywordExtractionWorkflowSha256 !== ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256
+  ) {
     throw new AtsKeywordExtractionValidationError(
       ["keywordExtractionWorkflowSha256"],
       "must match the supplied keyword extraction workflow hash",
@@ -165,6 +169,20 @@ export function validateAtsKeywordExtractionAgainstJobDescription(
     }
   }
   return parsed;
+}
+
+export function validateAtsKeywordExtractionAgainstJobDescription(
+  extraction: AtsKeywordExtraction,
+  rawJobDescription: string,
+): AtsKeywordExtraction {
+  return validateAtsKeywordExtraction(extraction, rawJobDescription, true);
+}
+
+export function validatePersistedAtsKeywordExtractionAgainstJobDescription(
+  extraction: AtsKeywordExtraction,
+  rawJobDescription: string,
+): AtsKeywordExtraction {
+  return validateAtsKeywordExtraction(extraction, rawJobDescription, false);
 }
 
 export interface AtsKeywordExtractionAgentInput {

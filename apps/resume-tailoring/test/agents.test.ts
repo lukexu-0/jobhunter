@@ -39,12 +39,16 @@ import {
   ANALYSIS_VALIDATION_FEEDBACK_MAX_CHARS,
   ANALYSIS_TASK,
   ANALYSIS_WORKFLOW_SHA256,
+  validateAnalysisAgainstAtsKeywordExtraction,
+  validatePersistedAnalysisAgainstAtsKeywordExtraction,
 } from "../src/agents/analysis-agent.ts";
 import {
   ATS_KEYWORD_EXTRACTION_INSTRUCTIONS,
   ATS_KEYWORD_EXTRACTION_TASK,
   ATS_KEYWORD_EXTRACTION_VALIDATION_FEEDBACK_MAX_CHARS,
   ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256,
+  validateAtsKeywordExtractionAgainstJobDescription,
+  validatePersistedAtsKeywordExtractionAgainstJobDescription,
 } from "../src/agents/ats-keyword-extraction-agent.ts";
 import {
   buildMechanicalTailoringPlan,
@@ -235,6 +239,71 @@ describe("guarded agents", () => {
     ]) {
       expect(prompts).not.toContain(legacySection);
     }
+  });
+
+  test("keeps live ATS workflow validators strict while accepting an otherwise valid persisted extraction", () => {
+    const historicalExtraction = {
+      ...ATS_KEYWORD_EXTRACTION,
+      keywordExtractionWorkflowSha256: "f".repeat(64),
+    };
+
+    expect(() =>
+      validateAtsKeywordExtractionAgainstJobDescription(
+        historicalExtraction,
+        RAW_JOB_DESCRIPTION,
+      )).toThrow("must match the supplied keyword extraction workflow hash");
+    expect(() =>
+      validateAnalysisAgainstAtsKeywordExtraction(
+        ANALYSIS,
+        historicalExtraction,
+      )).toThrow("does not match the configured workflow");
+    expect(validatePersistedAtsKeywordExtractionAgainstJobDescription(
+      historicalExtraction,
+      RAW_JOB_DESCRIPTION,
+    )).toEqual(historicalExtraction);
+    expect(validatePersistedAnalysisAgainstAtsKeywordExtraction(
+      ANALYSIS,
+      historicalExtraction,
+    )).toEqual(ANALYSIS);
+  });
+
+  test("persisted ATS validators retain description grounding and exact analysis lineage", () => {
+    const historicalExtraction = {
+      ...ATS_KEYWORD_EXTRACTION,
+      keywordExtractionWorkflowSha256: "f".repeat(64),
+    };
+    const [keyword] = historicalExtraction.keywords;
+
+    expect(() => validatePersistedAtsKeywordExtractionAgainstJobDescription({
+      ...historicalExtraction,
+      keywords: [{ ...keyword!, jdQuote: "TypeScript absent from the JD" }],
+    }, RAW_JOB_DESCRIPTION)).toThrow("must occur verbatim in the supplied job description");
+    expect(() => validatePersistedAtsKeywordExtractionAgainstJobDescription({
+      ...historicalExtraction,
+      keywords: [{ ...keyword!, phrase: "Rust" }],
+    }, RAW_JOB_DESCRIPTION)).toThrow("must occur case-insensitively in its exact JD quote");
+    expect(() => validatePersistedAnalysisAgainstAtsKeywordExtraction({
+      ...ANALYSIS,
+      jobDescriptionSha256: "e".repeat(64),
+    }, historicalExtraction)).toThrow("job description hashes do not match");
+    expect(() => validatePersistedAnalysisAgainstAtsKeywordExtraction({
+      ...ANALYSIS,
+      jdKeywords: ANALYSIS.jdKeywords.map((candidate, index) =>
+        index === 0 ? { ...candidate, phrase: candidate.phrase.toUpperCase() } : candidate),
+    }, historicalExtraction)).toThrow("analysis semantic validation failed");
+    expect(() => validatePersistedAnalysisAgainstAtsKeywordExtraction(
+      ANALYSIS,
+      {
+        ...historicalExtraction,
+        keywords: historicalExtraction.keywords.map((candidate, index) =>
+          index === 0 ? { ...candidate, id: "keyword-replaced" } : candidate),
+      },
+    )).toThrow("analysis semantic validation failed");
+    expect(() => validatePersistedAnalysisAgainstAtsKeywordExtraction({
+      ...ANALYSIS,
+      jdKeywords: ANALYSIS.jdKeywords.map((candidate, index) =>
+        index === 0 ? { ...candidate, jdQuote: `${candidate.jdQuote} altered` } : candidate),
+    }, historicalExtraction)).toThrow("analysis semantic validation failed");
   });
 
   test("extracts strict JD-grounded keywords through one guarded Sol submission", async () => {
