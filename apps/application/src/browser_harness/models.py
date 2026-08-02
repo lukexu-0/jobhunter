@@ -1054,19 +1054,6 @@ class BrowserUseRuntimeAction(PublicModel):
         return value
 
 
-class SubmitApplicationRuntimeAction(PublicModel):
-    type: Literal["submit_application"]
-    selector: Annotated[
-        str,
-        StringConstraints(
-            strict=True,
-            strip_whitespace=True,
-            min_length=1,
-            max_length=2_000,
-        ),
-    ]
-
-
 class RequestHumanNavigationRuntimeAction(PublicModel):
     type: Literal["request_human_navigation"]
     instruction: Annotated[
@@ -1113,7 +1100,6 @@ class ReportApplicationMismatchRuntimeAction(PublicModel):
 
 RuntimeActionRequest: TypeAlias = Annotated[
     BrowserUseRuntimeAction
-    | SubmitApplicationRuntimeAction
     | RequestHumanNavigationRuntimeAction
     | RequestOriginApprovalRuntimeAction
     | RequestAdditionalInfoRuntimeAction
@@ -1123,18 +1109,8 @@ RuntimeActionRequest: TypeAlias = Annotated[
 ]
 
 
-
-
 class BrowserUseResultRuntimeActionResponse(BrowserUseExecutionResult):
     type: Literal["browser_use_result"]
-
-
-class SubmitApplicationResultRuntimeActionResponse(BrowserUseExecutionResult):
-    type: Literal["submit_application_result"]
-    pre_click_dom: Annotated[
-        str,
-        StringConstraints(strict=True, max_length=40_000),
-    ]
 
 
 class ContinueRuntimeActionResponse(PublicModel):
@@ -1182,6 +1158,7 @@ class ReviseRuntimeActionResponse(PublicModel):
 
 class SubmitRuntimeActionResponse(PublicModel):
     type: Literal["submit"]
+    instruction: Literal["You're good to submit."]
     result: ReviewApplicationResult
 
 
@@ -1201,7 +1178,6 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 
 RuntimeActionResponse: TypeAlias = Annotated[
     BrowserUseResultRuntimeActionResponse
-    | SubmitApplicationResultRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | ApproveRuntimeActionResponse
     | ReviseRuntimeActionResponse

@@ -17,7 +17,6 @@ from fastapi import UploadFile
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-import jobhunter_browser_harness.sessions as sessions_module
 from fixtures.local_application import LocalApplicationFixture
 from jobhunter_browser_harness.browser import ResolvedBrowserLaunch
 from jobhunter_browser_harness.models import (
@@ -43,8 +42,6 @@ from jobhunter_browser_harness.models import (
     HarnessConfig,
     ProvideAdditionalInfoCommand,
     SubmitRuntimeActionResponse,
-    SubmitApplicationRuntimeAction,
-    SubmitApplicationResultRuntimeActionResponse,
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
@@ -816,71 +813,30 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
                 ),
             )
             assert isinstance(approved, SubmitRuntimeActionResponse)
+            assert approved.instruction == "You're good to submit."
             assert approved.result.revision_count == 0
             assert approved.result.submit_attempted is False
             assert manager.get_snapshot(created.session_id).pending_action is None
             assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
-            runtime = record.skill_runtime
-            assert runtime is not None
-            probe_setup = await runtime.execute(
-                "js(\"\"\"(() => {"
-                "const wrapper = document.createElement('div');"
-                "wrapper.id = 'submit-container-probe';"
-                "wrapper.style.cssText = 'position:fixed;left:20px;top:20px;"
-                "width:240px;height:120px;z-index:2147483647;background:white';"
-                "const button = document.createElement('button');"
-                "button.id = 'submit-child-probe';"
-                "button.type = 'button';"
-                "button.innerHTML = '<span style=\"display:none\">Submit</span>';"
-                "button.style.cssText = 'width:100%;height:100%';"
-                "wrapper.append(button);"
-                "document.body.append(wrapper);"
-                "})()\"\"\")"
-            )
-            assert probe_setup.exit_code == 0, probe_setup.stderr
-            container_probe = await runtime.execute(
-                sessions_module._submit_application_source(
-                    "#submit-container-probe"
-                )
-            )
-            assert container_probe.exit_code != 0
-            semantic_probe = await runtime.execute(
-                sessions_module._submit_application_source("#submit-child-probe")
-            )
-            assert semantic_probe.exit_code != 0
-            disabled_setup = await runtime.execute(
-                "js(\"document.getElementById('submit-container-probe')"
-                ".setAttribute('aria-disabled', ' true ')\")"
-            )
-            assert disabled_setup.exit_code == 0, disabled_setup.stderr
-            disabled_probe = await runtime.execute(
-                sessions_module._submit_application_source("#submit-child-probe")
-            )
-            assert disabled_probe.exit_code != 0
-            probe_cleanup = await runtime.execute(
-                "js(\"\"\"(() => {"
-                "document.getElementById('submit-container-probe').remove();"
-                "document.getElementById('final-submit')"
-                ".scrollIntoView({block:'center'});"
-                "})()\"\"\")"
-            )
-            assert probe_cleanup.exit_code == 0, probe_cleanup.stderr
-            assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
-
 
             submission = await manager.runtime_action(
                 created.session_id,
-                SubmitApplicationRuntimeAction(type="submit_application", selector="#final-submit"),
+                BrowserUseRuntimeAction(
+                    type="browser_use",
+                    code=(
+                        "js(\"document.getElementById('final-submit').click()\")\n"
+                        "wait(0.5)\n"
+                        "wait_for_load(timeout=15.0)\n"
+                        "wait_for_network_idle(timeout=10.0, idle_ms=500)\n"
+                        "print(page_info())"
+                    ),
+                ),
             )
-            assert isinstance(
-                submission,
-                SubmitApplicationResultRuntimeActionResponse,
-            )
+            assert isinstance(submission, BrowserUseResultRuntimeActionResponse)
             assert submission.exit_code == 0, submission.stderr
             assert submission.timed_out is False
             assert submission.observation.url == fixture.form_url
-            assert "Submit application" in submission.pre_click_dom
-            assert "Submitted 1 time(s)" not in submission.pre_click_dom
+            assert "Submitted 1 time(s)" not in applied_late_info.observation.dom
             assert "Submitted 1 time(s)" in submission.observation.dom
             agent.finish(
                 SubmittedApplicationResult.model_validate(

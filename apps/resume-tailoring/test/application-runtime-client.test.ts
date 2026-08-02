@@ -18,10 +18,9 @@ import {
   ApplicationRuntimeError,
   HttpApplicationRuntimeClient,
   RequestAdditionalInfoRuntimeActionSchema,
-  SubmitApplicationRuntimeActionSchema,
-  SubmitApplicationResultRuntimeActionResponseSchema,
   RuntimeActionRequestSchema,
   RuntimeActionResponseSchema,
+  SubmitRuntimeActionResponseSchema,
   type RuntimeActionRequest,
   type RuntimeActionResponse,
   type BrowserUseExecutionResult,
@@ -67,6 +66,12 @@ const SUBMIT_EXECUTION_RESULT: BrowserUseExecutionResult = {
     screenshot: null,
   },
 };
+const SUBMISSION_PERMISSION_RESPONSE = {
+  type: "submit" as const,
+  instruction: "You're good to submit." as const,
+  result: READY_RESULT,
+};
+
 
 test("separates review data from terminal submission outcomes", () => {
   expect(ReviewApplicationResultSchema.parse(READY_RESULT)).toEqual(READY_RESULT);
@@ -120,33 +125,6 @@ test("separates review data from terminal submission outcomes", () => {
       value_present: true,
     }],
   }).success).toBe(false);
-
-  const request = { type: "submit_application" as const, selector: "button[type='submit']" };
-  expect(SubmitApplicationRuntimeActionSchema.parse(request)).toEqual(request);
-  expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
-  expect(SubmitApplicationRuntimeActionSchema.safeParse({
-    type: "submit_application",
-    selector: " ",
-  }).success).toBe(false);
-  expect(SubmitApplicationRuntimeActionSchema.safeParse({
-    type: "submit_application",
-    selector: "x".repeat(2_001),
-  }).success).toBe(false);
-  expect(SubmitApplicationRuntimeActionSchema.safeParse({
-    type: "submit_application",
-    selector: "😀".repeat(2_000),
-  }).success).toBe(true);
-  expect(SubmitApplicationRuntimeActionSchema.safeParse({
-    type: "submit_application",
-    code: "click_at_xy(10, 10)",
-  }).success).toBe(false);
-  const response = {
-    type: "submit_application_result" as const,
-    pre_click_dom: "button Final submit",
-    ...SUBMIT_EXECUTION_RESULT,
-  };
-  expect(SubmitApplicationResultRuntimeActionResponseSchema.parse(response)).toEqual(response);
-  expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
 });
 
 
@@ -642,11 +620,6 @@ describe("HttpApplicationRuntimeClient", () => {
           screenshot: { media_type: "image/png", data: "iVBORw0KGgo=" },
         },
       },
-      {
-        type: "submit_application_result",
-        pre_click_dom: "button Submit",
-        ...SUBMIT_EXECUTION_RESULT,
-      },
       { type: "continue" },
       {
         type: "approve",
@@ -665,7 +638,7 @@ describe("HttpApplicationRuntimeClient", () => {
           value: "June through August 2027",
         }],
       },
-      { type: "submit", result: READY_RESULT },
+      SUBMISSION_PERMISSION_RESPONSE,
       { type: "cancel", result: cancelledResult },
       { type: "application_mismatch" },
     ] satisfies RuntimeActionResponse[];
@@ -729,12 +702,15 @@ describe("HttpApplicationRuntimeClient", () => {
       ...browserResponse,
       stdout: character.repeat(20_001),
     }).success).toBe(false);
+    expect(SubmitRuntimeActionResponseSchema.parse(
+      SUBMISSION_PERMISSION_RESPONSE,
+    )).toEqual(SUBMISSION_PERMISSION_RESPONSE);
     expect(RuntimeActionResponseSchema.safeParse({
-      type: "submit",
-      result: unicodeReady,
-    }).success).toBe(true);
+      ...SUBMISSION_PERMISSION_RESPONSE,
+      instruction: "Submit the application.",
+    }).success).toBe(false);
     expect(RuntimeActionResponseSchema.safeParse({
-      type: "submit",
+      ...SUBMISSION_PERMISSION_RESPONSE,
       result: { ...unicodeReady, company: character.repeat(501) },
     }).success).toBe(false);
     expect(RuntimeActionResponseSchema.safeParse({
@@ -754,6 +730,18 @@ describe("HttpApplicationRuntimeClient", () => {
     expect(RuntimeActionRequestSchema.safeParse({
       type: "request_human_navigation",
       instruction: character.repeat(2_001),
+    }).success).toBe(false);
+  });
+
+  test("removes selector submission runtime requests and responses", () => {
+    expect(RuntimeActionRequestSchema.safeParse({
+      type: "submit_application",
+      selector: "#final-submit",
+    }).success).toBe(false);
+    expect(RuntimeActionResponseSchema.safeParse({
+      type: "submit_application_result",
+      pre_click_dom: "button Submit",
+      ...SUBMIT_EXECUTION_RESULT,
     }).success).toBe(false);
   });
 

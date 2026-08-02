@@ -410,8 +410,6 @@ class HumanGate:
         capped = False
         already_approved = False
         async with self._lock:
-            if self._submission_approved:
-                raise self._conflict("Final submission was already approved")
             if self._cancelled:
                 cancelled = True
             elif self._pending is not None and not self._pending.future.done():
@@ -520,10 +518,7 @@ class HumanGate:
             if decision == "submit":
                 return ActionResult(
                     extracted_content=review_result.model_dump_json(),
-                    long_term_memory=(
-                        "Final submission was approved. Use submit_application "
-                        "exactly once."
-                    ),
+                    long_term_memory="You're good to submit.",
                 )
             return await self._cancelled_result(browser_session, review_result)
         if review_result.fields_needing_human:
@@ -540,9 +535,7 @@ class HumanGate:
             return await self._cancelled_result(browser_session, review_result)
         return ActionResult(
             extracted_content=review_result.model_dump_json(),
-            long_term_memory=(
-                "Final submission was approved. Use submit_application exactly once."
-            ),
+            long_term_memory="You're good to submit.",
         )
 
     async def continue_navigation(self) -> None:
@@ -633,7 +626,7 @@ class HumanGate:
         storage_questions: tuple[AdditionalInfoQuestion, ...] = (),
     ) -> GateDecision:
         async with self._lock:
-            if self._submission_approved:
+            if self._submission_approved and kind not in {"navigation", "origin"}:
                 raise self._conflict("Final submission was already approved")
             if self._cancelled:
                 return "cancel", None
