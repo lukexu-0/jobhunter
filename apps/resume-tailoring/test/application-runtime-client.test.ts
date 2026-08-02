@@ -610,7 +610,6 @@ describe("HttpApplicationRuntimeClient", () => {
     const actions: RuntimeActionRequest[] = [
       { type: "playwright_cli", command: "eval", args: ["document.body.innerText"] },
       { type: "request_human_navigation", instruction: "Complete the CAPTCHA" },
-      { type: "request_origin_approval", origin: "https://ats.example.test" },
       { type: "request_additional_info", questions: [...ADDITIONAL_INFO_QUESTIONS] },
       { type: "request_human_review", result: READY_RESULT },
       { type: "report_application_mismatch" },
@@ -655,12 +654,6 @@ describe("HttpApplicationRuntimeClient", () => {
         },
       },
       { type: "continue" },
-      {
-        type: "approve",
-        origin: "https://ats.example.test",
-        approved_origins: ["https://jobs.example.test", "https://ats.example.test"],
-      },
-      { type: "revise", context: "Use the revised answer.", revision_count: 1 },
       {
         type: "additional_info",
         answers: [{
@@ -868,7 +861,7 @@ describe("HttpApplicationRuntimeClient", () => {
       { type: "request_human_navigation", instruction: "   " },
       {
         type: "request_origin_approval",
-        origin: "http://not-loopback.example.test",
+        origin: "https://ats.example.test",
       },
       { type: "request_additional_info", questions: [] },
       {
@@ -1044,36 +1037,6 @@ describe("HttpApplicationRuntimeClient", () => {
     }
   });
 
-  test("rejects an out-of-range loopback IPv4 origin before fetching", async () => {
-    let fetchCalls = 0;
-    const client = new HttpApplicationRuntimeClient(
-      RUNTIME_URL,
-      SESSION_ID,
-      TOKEN,
-      async () => {
-        fetchCalls += 1;
-        return jsonResponse({ type: "continue" });
-      },
-    );
-
-    let failure: unknown;
-    try {
-      await client.action(
-        {
-          type: "request_origin_approval",
-          origin: "http://127.999.1.1",
-        },
-        new AbortController().signal,
-        1_000,
-      );
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(ApplicationRuntimeError);
-    expect((failure as ApplicationRuntimeError).code).toBe("model_failed");
-    expect((failure as Error).message).toBe("The model request failed");
-    expect(fetchCalls).toBe(0);
-  });
 
   test("rejects invalid timeout values before fetching", async () => {
     let fetchCalls = 0;
@@ -1110,7 +1073,7 @@ describe("HttpApplicationRuntimeClient", () => {
       jsonResponse({
         type: "approve",
         origin: "https://ats.example.test",
-        approved_origins: ["https://ats.example.test", "https://ats.example.test"],
+        approved_origins: ["https://ats.example.test"],
       }),
       jsonResponse({
         type: "submit",

@@ -44,7 +44,6 @@ from .models import (
     SubmittedApplicationResult,
     SubmissionUncertainApplicationResult,
     ApplicationMismatchRuntimeActionResponse,
-    ApproveRuntimeActionResponse,
     ApproveOriginCommand,
     CancelCommand,
     PlaywrightCliResultRuntimeActionResponse,
@@ -66,7 +65,6 @@ from .models import (
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
-    RequestOriginApprovalRuntimeAction,
     ReviseRuntimeActionResponse,
     RuntimeActionRequest,
     RuntimeActionResponse,
@@ -803,14 +801,13 @@ class ApplicationSessionManager:
                     (
                         PlaywrightCliRuntimeAction,
                         RequestHumanNavigationRuntimeAction,
-                        RequestOriginApprovalRuntimeAction,
                     ),
                 ):
                     raise HarnessServiceError(
                         409,
                         "command_conflict",
-                        "Only browser execution and approved navigation gates may "
-                        "run after submission approval",
+                        "Only browser execution and human navigation may run "
+                        "after submission approval",
                     )
                 if record.runtime_action_pending:
                     raise HarnessServiceError(
@@ -846,13 +843,7 @@ class ApplicationSessionManager:
                 response = await self._dispatch_runtime_action(record, action)
                 if (
                     submission_attempt_active
-                    and isinstance(
-                        action,
-                        (
-                            RequestHumanNavigationRuntimeAction,
-                            RequestOriginApprovalRuntimeAction,
-                        ),
-                    )
+                    and isinstance(action, RequestHumanNavigationRuntimeAction)
                     and record.snapshot.state
                     not in {"submitted", "submission_uncertain", "closed"}
                 ):
@@ -977,7 +968,6 @@ class ApplicationSessionManager:
                 )
 
         if isinstance(action, RequestHumanNavigationRuntimeAction):
-            before = gate.approved_origins
             gate_result = await gate.request_human_navigation(
                 action.instruction,
                 runtime,
@@ -985,28 +975,7 @@ class ApplicationSessionManager:
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
                 return terminal
-            approved = gate.approved_origins
-            if approved != before:
-                return ApproveRuntimeActionResponse(
-                    type="approve",
-                    origin=approved[-1],
-                    approved_origins=list(approved),
-                )
             return ContinueRuntimeActionResponse(type="continue")
-
-        if isinstance(action, RequestOriginApprovalRuntimeAction):
-            gate_result = await gate.request_origin_approval(
-                action.origin,
-                runtime,
-            )
-            terminal = self._runtime_gate_terminal_response(gate_result)
-            if terminal is not None:
-                return terminal
-            return ApproveRuntimeActionResponse(
-                type="approve",
-                origin=action.origin,
-                approved_origins=list(gate.approved_origins),
-            )
 
         if isinstance(action, RequestAdditionalInfoRuntimeAction):
             if record.playwright_cli_action_count < 1:

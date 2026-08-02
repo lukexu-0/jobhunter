@@ -50,7 +50,6 @@ from jobhunter_browser_harness.models import (
     SubmittedApplicationResult,
     SubmissionUncertainApplicationResult,
     ApplicationMismatchRuntimeActionResponse,
-    ApproveRuntimeActionResponse,
     ApproveOriginCommand,
     BrowserTab,
     BrowserObservation,
@@ -69,7 +68,6 @@ from jobhunter_browser_harness.models import (
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
-    RequestOriginApprovalRuntimeAction,
     ReviseCommand,
     SESSION_ERROR_MESSAGES,
 )
@@ -3453,23 +3451,12 @@ async def test_runtime_navigation_registers_exact_origin_automatically(
     await wait_until(lambda: record.human_gate.pending_kind == "navigation")
     record.playwright_runtime.current_url = "https://ats.example/application/42?private=value"
     await manager.command(created.session_id, ContinueCommand(type="continue"))
-    approved = await navigation
-    assert isinstance(approved, ApproveRuntimeActionResponse)
-    assert approved.origin == "https://ats.example"
-    assert approved.approved_origins == [
+    continued = await navigation
+    assert isinstance(continued, ContinueRuntimeActionResponse)
+    assert manager.get_snapshot(created.session_id).approved_origins == [
         "https://jobs.example",
         "https://ats.example",
     ]
-
-    already_approved = await manager.runtime_action(
-        created.session_id,
-        RequestOriginApprovalRuntimeAction(
-            type="request_origin_approval",
-            origin="https://ats.example",
-        ),
-    )
-    assert isinstance(already_approved, ApproveRuntimeActionResponse)
-    assert already_approved == approved
     await manager.delete(created.session_id)
 
 
@@ -3560,14 +3547,6 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
     assert record.human_gate.submission_approved is True
     assert manager.get_snapshot(created.session_id).state == "running"
 
-    approved_origin = await manager.runtime_action(
-        created.session_id,
-        RequestOriginApprovalRuntimeAction(
-            type="request_origin_approval",
-            origin="https://jobs.example",
-        ),
-    )
-    assert isinstance(approved_origin, ApproveRuntimeActionResponse)
 
     navigation = asyncio.create_task(
         manager.runtime_action(
@@ -3622,7 +3601,7 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
             raised.value,
             409,
             "command_conflict",
-            "Only browser execution and approved navigation gates may run after "
+            "Only browser execution and human navigation may run after "
             "submission approval",
         )
 

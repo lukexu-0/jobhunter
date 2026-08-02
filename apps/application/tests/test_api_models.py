@@ -18,7 +18,6 @@ from jobhunter_browser_harness.models import (
     AdditionalInfoRuntimeActionResponse,
     ApplicationRunResult,
     ReviewApplicationResult,
-    ApproveRuntimeActionResponse,
     PlaywrightCliDiagnostic,
     PlaywrightCliExecutionResult,
     PlaywrightCliResultRuntimeActionResponse,
@@ -37,7 +36,6 @@ from jobhunter_browser_harness.models import (
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
-    RequestOriginApprovalRuntimeAction,
     ReportApplicationMismatchRuntimeAction,
     PostSubmitConfirmation,
     ReviseRuntimeActionResponse,
@@ -1330,13 +1328,6 @@ def test_playwright_cli_runtime_action_rejects_prohibited_commands(
         ),
         (
             {
-                "type": "request_origin_approval",
-                "origin": "https://ats.example",
-            },
-            RequestOriginApprovalRuntimeAction,
-        ),
-        (
-            {
                 "type": "request_human_review",
                 "result": _application_result_payload(),
             },
@@ -1407,7 +1398,7 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
             "token": "secret",
         },
         {"type": "request_human_navigation", "instruction": " "},
-        {"type": "request_origin_approval", "origin": "https://ats.example/path"},
+        {"type": "request_origin_approval", "origin": "https://ats.example"},
         {"type": "request_human_review", "result": {"status": "cancelled"}},
         {
             "type": "request_additional_info",
@@ -1576,14 +1567,6 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
             },
         },
         {"type": "continue"},
-        {
-            "type": "approve",
-            "origin": "https://ats.example",
-            "approved_origins": [
-                "https://jobs.example",
-                "https://ats.example",
-            ],
-        },
         {"type": "revise", "context": "Use the corrected date.", "revision_count": 1},
         {
             "type": "submit",
@@ -1632,6 +1615,14 @@ def test_runtime_action_unions_reject_unknown_properties() -> None:
     with pytest.raises(ValidationError):
         RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
             {"type": "continue", "unexpected": True}
+        )
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {
+                "type": "approve",
+                "origin": "https://ats.example",
+                "approved_origins": ["https://ats.example"],
+            }
         )
 
 

@@ -407,7 +407,7 @@ class HumanGate:
             except (RuntimeError, ValueError):
                 return await self._cancelled_result(runtime)
             if current_origin not in self._approved_origins:
-                origin_result = await self.request_origin_approval(
+                origin_result = await self.register_origin(
                     current_origin,
                     runtime,
                 )
@@ -424,7 +424,7 @@ class HumanGate:
         finally:
             await runtime.set_approved_origins(self._approved_origins)
 
-    async def request_origin_approval(
+    async def register_origin(
         self,
         origin: str,
         runtime: BrowserGateRuntime,
@@ -460,12 +460,13 @@ class HumanGate:
         except (RuntimeError, ValueError):
             return await self._cancelled_result(runtime)
         if current_origin not in self._approved_origins:
-            return await self.request_origin_approval(current_origin, runtime)
+            return await self.register_origin(current_origin, runtime)
         await self._publish("running", None, {})
         return GateResult(
             extracted_content="Origin approved.",
             long_term_memory="The requested and current origins are approved.",
         )
+
     async def request_additional_info(
         self,
         questions: Sequence[AdditionalInfoQuestion],

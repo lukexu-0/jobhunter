@@ -1120,16 +1120,6 @@ class RequestHumanNavigationRuntimeAction(PublicModel):
     ]
 
 
-class RequestOriginApprovalRuntimeAction(PublicModel):
-    type: Literal["request_origin_approval"]
-    origin: StrictText
-
-    @field_validator("origin")
-    @classmethod
-    def _validate_origin(cls, value: str) -> str:
-        return validate_approved_origin(value)
-
-
 class RequestAdditionalInfoRuntimeAction(PublicModel):
     type: Literal["request_additional_info"]
     questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
@@ -1154,7 +1144,6 @@ class ReportApplicationMismatchRuntimeAction(PublicModel):
 RuntimeActionRequest: TypeAlias = Annotated[
     PlaywrightCliRuntimeAction
     | RequestHumanNavigationRuntimeAction
-    | RequestOriginApprovalRuntimeAction
     | RequestAdditionalInfoRuntimeAction
     | RequestHumanReviewRuntimeAction
     | ReportApplicationMismatchRuntimeAction,
@@ -1168,31 +1157,6 @@ class PlaywrightCliResultRuntimeActionResponse(PlaywrightCliExecutionResult):
 
 class ContinueRuntimeActionResponse(PublicModel):
     type: Literal["continue"]
-
-
-class ApproveRuntimeActionResponse(PublicModel):
-    type: Literal["approve"]
-    origin: StrictText
-    approved_origins: list[StrictText] = Field(min_length=1, max_length=20)
-
-    @field_validator("origin")
-    @classmethod
-    def _validate_origin(cls, value: str) -> str:
-        return validate_approved_origin(value)
-
-    @field_validator("approved_origins")
-    @classmethod
-    def _validate_approved_origins(cls, values: list[str]) -> list[str]:
-        canonical = [validate_approved_origin(value) for value in values]
-        if len(set(canonical)) != len(canonical):
-            raise ValueError("approved_origins must not contain duplicates")
-        return canonical
-
-    @model_validator(mode="after")
-    def _validate_origin_is_approved(self) -> ApproveRuntimeActionResponse:
-        if self.origin not in self.approved_origins:
-            raise ValueError("origin must be present in approved_origins")
-        return self
 
 
 class ReviseRuntimeActionResponse(PublicModel):
@@ -1232,7 +1196,6 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 RuntimeActionResponse: TypeAlias = Annotated[
     PlaywrightCliResultRuntimeActionResponse
     | ContinueRuntimeActionResponse
-    | ApproveRuntimeActionResponse
     | ReviseRuntimeActionResponse
     | SubmitRuntimeActionResponse
     | CancelRuntimeActionResponse

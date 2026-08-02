@@ -36,7 +36,6 @@ from jobhunter_browser_harness.models import (
     ApplicationRunResult,
     ReviewApplicationResult,
     SubmittedApplicationResult,
-    ApproveRuntimeActionResponse,
     PlaywrightCliResultRuntimeActionResponse,
     PlaywrightCliCommand,
     PlaywrightCliRuntimeAction,
@@ -48,7 +47,6 @@ from jobhunter_browser_harness.models import (
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
-    RequestOriginApprovalRuntimeAction,
 )
 from jobhunter_browser_harness.sessions import ApplicationSessionManager
 
@@ -393,7 +391,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
         created = await manager.create_session(
             session_id=_CALLER_SESSION_ID,
             job_url=fixture.posting_url,
-            allow_domains=[],
+            allow_domains=[fixture.form_origin],
             auto_submit=True,
             max_steps=20,
             personal_information=personal,
@@ -432,21 +430,6 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert "Reliability Engineer" in posting.observation.dom
             assert posting.observation.screenshot is not None
 
-            approval = await manager.runtime_action(
-                created.session_id,
-                RequestOriginApprovalRuntimeAction(
-                    type="request_origin_approval",
-                    origin=fixture.form_origin,
-                ),
-            )
-            assert isinstance(approval, ApproveRuntimeActionResponse)
-            assert approval.approved_origins == [
-                fixture.posting_origin,
-                fixture.form_origin,
-            ]
-            automatic_origin_snapshot = manager.get_snapshot(created.session_id)
-            assert automatic_origin_snapshot.state == "running"
-            assert automatic_origin_snapshot.pending_action is None
 
             form = await _cli(
                 manager,

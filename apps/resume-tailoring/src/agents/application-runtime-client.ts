@@ -249,7 +249,6 @@ export const PlaywrightCliRuntimeActionSchema = z.object({
 }).strict().superRefine(validatePlaywrightCliInvocation);
 export type PlaywrightCliRuntimeAction = z.infer<typeof PlaywrightCliRuntimeActionSchema>;
 
-
 export const RequestHumanNavigationRuntimeActionSchema = z.object({
   type: z.literal("request_human_navigation"),
   instruction: z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
@@ -257,15 +256,6 @@ export const RequestHumanNavigationRuntimeActionSchema = z.object({
 export type RequestHumanNavigationRuntimeAction = z.infer<
   typeof RequestHumanNavigationRuntimeActionSchema
 >;
-
-export const RequestOriginApprovalRuntimeActionSchema = z.object({
-  type: z.literal("request_origin_approval"),
-  origin: z.string().refine(isApprovedOrigin),
-}).strict();
-export type RequestOriginApprovalRuntimeAction = z.infer<
-  typeof RequestOriginApprovalRuntimeActionSchema
->;
-
 
 function validateAdditionalInfoQuestionBatch(
   questions: readonly z.infer<typeof AdditionalInfoQuestionSchema>[],
@@ -279,7 +269,6 @@ function validateAdditionalInfoQuestionBatch(
     context.addIssue({ code: "custom", message: "question scope and key pairs must be unique" });
   }
 }
-
 
 export const RequestAdditionalInfoRuntimeActionSchema = z.object({
   type: z.literal("request_additional_info"),
@@ -309,7 +298,6 @@ export type ReportApplicationMismatchRuntimeAction = z.infer<
 export const RuntimeActionRequestSchema = z.discriminatedUnion("type", [
   PlaywrightCliRuntimeActionSchema,
   RequestHumanNavigationRuntimeActionSchema,
-  RequestOriginApprovalRuntimeActionSchema,
   RequestAdditionalInfoRuntimeActionSchema,
   RequestHumanReviewRuntimeActionSchema,
   ReportApplicationMismatchRuntimeActionSchema,
@@ -360,22 +348,11 @@ export type PlaywrightCliResultRuntimeActionResponse = z.infer<
   typeof PlaywrightCliResultRuntimeActionResponseSchema
 >;
 
-
-
 export const ContinueRuntimeActionResponseSchema = z.object({
   type: z.literal("continue"),
 }).strict();
 export type ContinueRuntimeActionResponse = z.infer<
   typeof ContinueRuntimeActionResponseSchema
->;
-
-export const ApproveRuntimeActionResponseSchema = z.object({
-  type: z.literal("approve"),
-  origin: z.string().refine(isApprovedOrigin),
-  approved_origins: z.array(z.string().refine(isApprovedOrigin)).min(1).max(20),
-}).strict();
-export type ApproveRuntimeActionResponse = z.infer<
-  typeof ApproveRuntimeActionResponseSchema
 >;
 
 export const ReviseRuntimeActionResponseSchema = z.object({
@@ -470,21 +447,13 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   PlaywrightCliResultRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
-  ApproveRuntimeActionResponseSchema,
   ReviseRuntimeActionResponseSchema,
   SubmitRuntimeActionResponseSchema,
   AdditionalInfoRuntimeActionResponseSchema,
   CancelRuntimeActionResponseSchema,
   ApplicationMismatchRuntimeActionResponseSchema,
 ]).superRefine((value, context) => {
-  if (value.type === "approve") {
-    if (new Set(value.approved_origins).size !== value.approved_origins.length) {
-      context.addIssue({ code: "custom", message: "approved origins must be unique" });
-    }
-    if (!value.approved_origins.includes(value.origin)) {
-      context.addIssue({ code: "custom", message: "origin must be approved" });
-    }
-  } else if (value.type === "submit" && value.result.status !== "ready_for_submission") {
+  if (value.type === "submit" && value.result.status !== "ready_for_submission") {
     context.addIssue({ code: "custom", message: "review result required" });
   } else if (value.type === "cancel" && value.result.status !== "cancelled") {
     context.addIssue({ code: "custom", message: "cancelled result required" });
@@ -503,34 +472,12 @@ function parsedHttpUrl(value: string): URL | undefined {
   }
 }
 
-function normalizedHostname(url: URL): string {
-  return url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-}
-
-function isLoopbackHostname(hostname: string): boolean {
-  return hostname === "localhost" || hostname === "::1" || /^127(?:\.\d{1,3}){3}$/.test(hostname);
-}
 
 function isAbsoluteHttpUrl(value: string): boolean {
   const url = parsedHttpUrl(value);
   return url !== undefined && url.hostname !== "" && !url.hostname.includes("*");
 }
 
-function isApprovedOrigin(value: string): boolean {
-  const url = parsedHttpUrl(value);
-  if (
-    url === undefined
-    || url.hostname.includes("*")
-    || url.username !== ""
-    || url.password !== ""
-    || url.pathname !== "/"
-    || url.search !== ""
-    || url.hash !== ""
-  ) {
-    return false;
-  }
-  return url.protocol === "https:" || isLoopbackHostname(normalizedHostname(url));
-}
 
 function isSanitizedBasename(value: string): boolean {
   return hasCodePointLength(value, 1, 255)

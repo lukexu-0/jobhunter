@@ -410,7 +410,7 @@ async def test_origin_registration_installs_the_exact_expanded_origin_set() -> N
     gate, publisher = make_gate()
     runtime = FakeRuntime()
 
-    approved = await gate.request_origin_approval(ATS_ORIGIN, runtime)
+    approved = await gate.register_origin(ATS_ORIGIN, runtime)
 
     assert approved.extracted_content == "Origin approved."
     assert gate.pending_kind is None
@@ -438,7 +438,7 @@ async def test_origin_registration_does_not_commit_a_failed_guard_update() -> No
     runtime = FailingRuntime()
 
     with pytest.raises(RuntimeError, match="guard update failed"):
-        await gate.request_origin_approval(ATS_ORIGIN, runtime)
+        await gate.register_origin(ATS_ORIGIN, runtime)
 
     assert gate.approved_origins == (JOB_ORIGIN,)
     assert runtime.approved_origin_sets == [(JOB_ORIGIN, ATS_ORIGIN)]
@@ -450,7 +450,7 @@ async def test_origin_registration_rechecks_and_registers_the_live_origin() -> N
     runtime = FakeRuntime(f"{second_origin}/apply")
     gate, publisher = make_gate()
 
-    result = await gate.request_origin_approval(ATS_ORIGIN, runtime)
+    result = await gate.register_origin(ATS_ORIGIN, runtime)
 
     assert result.extracted_content == "Origin approved."
     assert gate.pending_kind is None
@@ -477,10 +477,10 @@ async def test_origin_cap_existing_origin_and_cancel_are_deterministic() -> None
     runtime = FakeRuntime()
     gate, publisher = make_gate(approved_origins=origins)
 
-    existing = await gate.request_origin_approval(origins[5], runtime)
+    existing = await gate.register_origin(origins[5], runtime)
     assert existing.is_done is False
     assert existing.extracted_content == "Origin is already approved."
-    capped = await gate.request_origin_approval("https://twenty-first.example", runtime)
+    capped = await gate.register_origin("https://twenty-first.example", runtime)
     payload = CancelledApplicationResult.model_validate_json(capped.extracted_content)
     assert capped.is_done is True
     assert capped.success is False
