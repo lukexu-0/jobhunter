@@ -7,15 +7,17 @@ import os
 import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from shutil import which
 
 import uvicorn
 from pydantic import ValidationError
 from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 
 from .api import HarnessDependencies, create_app
-from .browser import (
+from .playwright_cli import (
     BrowserConfigurationError,
     ResolvedBrowserLaunch,
+    default_playwright_cli_script,
     resolve_browser_launch,
 )
 from .models import BrowserLaunchConfig, HarnessConfig
@@ -26,7 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jobhunter-browser-harness",
         description=(
-            "Run the authenticated Browser Use application harness on loopback."
+            "Run the authenticated Playwright CLI application harness on loopback."
         ),
         allow_abbrev=False,
     )
@@ -51,16 +53,19 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--bubblewrap-executable",
+        "--node-executable",
         type=Path,
-        default=Path("/usr/bin/bwrap"),
-        help="Bubblewrap executable (default: /usr/bin/bwrap)",
+        default=None,
+        help="Node.js executable; resolved from PATH when omitted",
     )
     parser.add_argument(
-        "--browser-skill-workspace",
+        "--playwright-cli-script",
         type=Path,
-        default=Path("~/.jobhunter/application/browser-skill/agent-workspace"),
-        help="persistent Browser Use helper workspace",
+        default=None,
+        help=(
+            "Playwright CLI script "
+            "(default: apps/node_modules/@playwright/cli/playwright-cli.js)"
+        ),
     )
     parser.add_argument(
         "--user-info-json",
@@ -90,14 +95,19 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_regular_executable(path: Path) -> Path:
+def _resolve_regular_file(
+    path: Path,
+    *,
+    description: str,
+    executable: bool = False,
+) -> Path:
     try:
-        executable = path.expanduser().resolve(strict=True)
-    except OSError:
-        raise ValueError("The Bubblewrap executable is unavailable") from None
-    if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise ValueError("The Bubblewrap executable is unavailable")
-    return executable
+        resolved = path.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError(f"The {description} is unavailable") from None
+    if not resolved.is_file() or (executable and not os.access(resolved, os.X_OK)):
+        raise ValueError(f"The {description} is unavailable")
+    return resolved
 
 _DEFAULT_TOKEN_PATH = Path("~/.jobhunter/browser-harness/token")
 _MAX_TOKEN_FILE_BYTES = 4096
@@ -218,8 +228,23 @@ def parse_config(
             browser_values["chrome_user_data_dir"] = args.chrome_user_data_dir
 
     try:
-        bubblewrap_executable = _resolve_regular_executable(
-            args.bubblewrap_executable
+        node_path = args.node_executable
+        if node_path is None:
+            detected_node = which("node")
+            if detected_node is None:
+                raise ValueError("The Node.js executable is unavailable")
+            node_path = Path(detected_node)
+        node_executable = _resolve_regular_file(
+            node_path,
+            description="Node.js executable",
+            executable=True,
+        )
+        cli_path = args.playwright_cli_script
+        if cli_path is None:
+            cli_path = default_playwright_cli_script()
+        playwright_cli_script = _resolve_regular_file(
+            cli_path,
+            description="Playwright CLI script",
         )
         browser = BrowserLaunchConfig.model_validate(browser_values)
         config = HarnessConfig(
@@ -227,8 +252,8 @@ def parse_config(
             pipeline_url=args.pipeline_url,
             port=args.port,
             session_timeout=args.session_timeout,
-            bubblewrap_executable=bubblewrap_executable,
-            browser_skill_workspace=args.browser_skill_workspace,
+            node_executable=node_executable,
+            playwright_cli_script=playwright_cli_script,
             user_info_json=(
                 Path("apps/user-info/current-context/personal/user-info.json")
                 if args.user_info_json is None
@@ -243,7 +268,6 @@ def parse_config(
 
 
 def _configure_logging() -> None:
-    logging.getLogger("browser_use").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 

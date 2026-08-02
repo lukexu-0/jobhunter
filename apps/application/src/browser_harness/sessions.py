@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import stat
-import subprocess
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -14,23 +11,24 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
-from browser_use.browser import BrowserSession
 from fastapi import UploadFile
 from pydantic import ValidationError
 
 from .agent import ApplicationRunRequest, build_application_task
 from .artifacts import (
     StoredCandidateArtifacts,
+    cleanup_orphaned_session_artifacts,
     cleanup_session_artifacts,
     retry_pending_cleanup,
     store_uploads,
 )
-from .browser import (
+from .playwright_cli import (
     BrowserConfigurationError,
+    PlaywrightCliRuntime,
+    PlaywrightCliRuntimeError,
     ResolvedBrowserLaunch,
-    create_browser,
+    recover_stale_playwright_cli_sessions,
     resolve_browser_launch,
-    resolve_resume_upload_path,
 )
 from .context import CandidateContext, CandidateContextProcess
 from .models import (
@@ -38,8 +36,8 @@ from .models import (
     AdditionalInfoRuntimeActionResponse,
     AdditionalInfoSavedDetail,
     AgentStepDetail,
-    BrowserUseDiagnostic,
-    BrowserUseExecutionResult,
+    PlaywrightCliDiagnostic,
+    PlaywrightCliExecutionResult,
     ApplicationRunResult,
     CancelledApplicationResult,
     ReviewApplicationResult,
@@ -49,8 +47,8 @@ from .models import (
     ApproveRuntimeActionResponse,
     ApproveOriginCommand,
     CancelCommand,
-    BrowserUseResultRuntimeActionResponse,
-    BrowserUseRuntimeAction,
+    PlaywrightCliResultRuntimeActionResponse,
+    PlaywrightCliRuntimeAction,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     ContinueCommand,
@@ -89,10 +87,6 @@ from .pipeline_agent import (
     PipelineApplicationAgentClient,
     PipelineApplicationAgentError,
 )
-from .skill_runtime import (
-    BrowserSkillRuntime,
-    BrowserSkillRuntimeError,
-)
 from .tools import (
     HumanGate,
     redact_public_url,
@@ -110,31 +104,53 @@ _SUBMISSION_UNCERTAIN_WARNING = (
     "if it is still available, then close this session."
 )
 _MAX_APPLICATION_TASK_BYTES = 1024 * 1024
-_BROWSER_USE_DIAGNOSTIC_LIMIT = 100
-_BROWSER_USE_TIMEOUT_MESSAGE = (
-    "Browser Use execution timed out after 120 seconds."
+_PLAYWRIGHT_CLI_DIAGNOSTIC_LIMIT = 100
+_PLAYWRIGHT_CLI_TIMEOUT_MESSAGE = (
+    "Playwright CLI execution timed out after 120 seconds."
 )
 _BROWSER_RUNTIME_ERROR_MESSAGE = "Browser runtime failed."
 _SESSION_TIMEOUT_DIAGNOSTIC_MESSAGE = "Application session expired."
 _REDACTED_STDERR_EXCERPT = "[redacted]"
+_READ_ONLY_PLAYWRIGHT_CLI_COMMANDS = frozenset(
+    {
+        "snapshot",
+        "screenshot",
+        "pdf",
+        "tab-list",
+        "generate-locator",
+        "highlight",
+        "video-chapter",
+        "video-show-actions",
+        "video-hide-actions",
+    }
+)
+
+
+def _redact_playwright_cli_url(
+    value: str,
+    private_values: Sequence[str],
+) -> str:
+    if value == "about:blank":
+        return value
+    try:
+        return redact_public_url(value, private_values)
+    except ValueError:
+        return "[redacted]"
 
 
 ModelFactory = Callable[[UUID, str, str], PipelineApplicationAgentClient]
-BrowserFactory = Callable[
-    [ResolvedBrowserLaunch, tuple[str, ...] | list[str], Path], BrowserSession
-]
 ApplicationRunner = Callable[
     [
         ApplicationRunRequest,
         Any,
-        BrowserSession,
+        PlaywrightCliRuntime,
         HumanGate,
         Callable[[int, str], Awaitable[None]],
     ],
     Awaitable[ApplicationRunResult],
 ]
 ContextProcessFactory = Callable[[StoredCandidateArtifacts], CandidateContextProcess]
-SkillRuntimeFactory = Callable[..., BrowserSkillRuntime]
+RuntimeFactory = Callable[..., PlaywrightCliRuntime]
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,12 +173,12 @@ class _ApplicationSession:
     request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     runtime_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     runtime_action_pending: bool = False
-    browser_action_count: int = 0
+    runtime_action_task: asyncio.Task[Any] | None = None
+    playwright_cli_action_count: int = 0
     additional_info_question_count: int = 0
     submission_action_started: bool = False
     setup_task: asyncio.Task[Any] | None = None
     context_process: CandidateContextProcess | None = None
-    resume_path_task: asyncio.Task[str] | None = None
     resume_upload_path: str | None = None
     request: SessionCreateRequest | None = None
     user_info: UserInfoSnapshot | None = None
@@ -170,13 +186,11 @@ class _ApplicationSession:
     stored: StoredCandidateArtifacts | None = None
     candidate: CandidateContext | None = None
     model: PipelineApplicationAgentClient | None = None
-    browser: BrowserSession | None = None
     human_gate: HumanGate | None = None
-    skill_runtime: BrowserSkillRuntime | None = None
+    playwright_runtime: PlaywrightCliRuntime | None = None
     agent_task: asyncio.Task[None] | None = None
     ttl_task: asyncio.Task[None] | None = None
     finalizer_task: asyncio.Task[None] | None = None
-    browser_kill_task: asyncio.Task[None] | None = None
     runtime_close_task: asyncio.Task[None] | None = None
     model_close_task: asyncio.Task[None] | None = None
     final_request: _TerminalRequest | None = None
@@ -246,7 +260,6 @@ def _pending_action_for_state(
     return None
 
 
-
 def _saved_private_values(snapshot: UserInfoSnapshot) -> frozenset[str]:
     values: set[str] = set()
     for facts in (snapshot.saved_global, snapshot.saved_application):
@@ -260,102 +273,6 @@ def _saved_private_values(snapshot: UserInfoSnapshot) -> frozenset[str]:
     return frozenset(values)
 
 
-
-def _require_private_directory(path: Path, *, description: str) -> Path:
-    try:
-        details = path.lstat()
-    except OSError:
-        raise BrowserConfigurationError(f"The {description} is unavailable") from None
-    if (
-        not stat.S_ISDIR(details.st_mode)
-        or stat.S_ISLNK(details.st_mode)
-        or details.st_uid != os.getuid()
-        or stat.S_IMODE(details.st_mode) != 0o700
-    ):
-        raise BrowserConfigurationError(f"The {description} must be a private directory")
-    return path.resolve(strict=True)
-
-
-def _prepare_skill_workspace(configured: Path) -> Path:
-    workspace = configured.expanduser().absolute()
-    parent = workspace.parent
-    try:
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        workspace.mkdir(mode=0o700, exist_ok=True)
-    except OSError:
-        raise BrowserConfigurationError(
-            "The Browser Use skill workspace is unavailable"
-        ) from None
-
-    _require_private_directory(parent, description="Browser Use skill workspace parent")
-    resolved = _require_private_directory(
-        workspace, description="Browser Use skill workspace"
-    )
-    try:
-        entries = tuple(resolved.iterdir())
-        for entry in entries:
-            details = entry.lstat()
-            if details.st_uid != os.getuid() or stat.S_ISLNK(details.st_mode):
-                raise BrowserConfigurationError(
-                    "The Browser Use skill workspace contains an unsafe entry"
-                )
-            if entry.name == "agent_helpers.py" and stat.S_ISREG(details.st_mode):
-                continue
-            if entry.name == "domain-skills" and stat.S_ISDIR(details.st_mode):
-                continue
-            raise BrowserConfigurationError(
-                "The Browser Use skill workspace contains an unexpected entry"
-            )
-    except BrowserConfigurationError:
-        raise
-    except OSError:
-        raise BrowserConfigurationError(
-            "The Browser Use skill workspace is unavailable"
-        ) from None
-    return resolved
-
-
-def _probe_bubblewrap(executable: Path) -> None:
-    command = (
-        str(executable),
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-cgroup",
-        "--share-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--",
-        "/usr/bin/true",
-    )
-    try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise BrowserConfigurationError(
-            "Bubblewrap namespace isolation is unavailable"
-        ) from None
-    if completed.returncode != 0:
-        raise BrowserConfigurationError(
-            "Bubblewrap namespace isolation is unavailable"
-        )
-
-
-
 class ApplicationSessionManager:
     """Own exactly one application session and a bounded terminal history."""
 
@@ -367,9 +284,8 @@ class ApplicationSessionManager:
         browser_launch: ResolvedBrowserLaunch | None = None,
         model_factory: ModelFactory = PipelineApplicationAgentClient,
         context_process_factory: ContextProcessFactory = CandidateContextProcess,
-        browser_factory: BrowserFactory = create_browser,
         application_runner: ApplicationRunner | None = None,
-        skill_runtime_factory: SkillRuntimeFactory = BrowserSkillRuntime,
+        runtime_factory: RuntimeFactory = PlaywrightCliRuntime,
         user_info_store: UserInfoStore | None = None,
     ) -> None:
         self._config = config
@@ -379,18 +295,39 @@ class ApplicationSessionManager:
         self._browser_launch = browser_launch or resolve_browser_launch(config.browser)
         self._model_factory = model_factory
         self._context_process_factory = context_process_factory
-        self._browser_factory = browser_factory
         self._application_runner = application_runner
-        self._skill_runtime_factory = skill_runtime_factory
+        self._runtime_factory = runtime_factory
         self._user_info_store = user_info_store or UserInfoStore(config.user_info_json)
-        self._browser_skill_workspace = _prepare_skill_workspace(
-            config.browser_skill_workspace
-        )
-        _probe_bubblewrap(config.bubblewrap_executable)
         self._lock = asyncio.Lock()
+        self._startup_lock = asyncio.Lock()
+        self._startup_complete = False
         self._active: _ApplicationSession | None = None
         self._tombstones: OrderedDict[UUID, _Tombstone] = OrderedDict()
         self._shutting_down = False
+
+    async def startup(self) -> None:
+        async with self._startup_lock:
+            if self._startup_complete:
+                return
+            await recover_stale_playwright_cli_sessions(
+                artifacts_root=self._artifacts_root,
+                node_executable=self._config.node_executable,
+                cli_script=self._config.playwright_cli_script,
+            )
+            retry_delay = 0.05
+            while not await asyncio.to_thread(
+                cleanup_orphaned_session_artifacts,
+                self._artifacts_root,
+            ):
+                logger.warning(
+                    "Orphaned artifact cleanup failed; retrying before startup"
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(
+                    retry_delay * 2,
+                    _CLEANUP_RETRY_MAX_SECONDS,
+                )
+            self._startup_complete = True
 
     async def create_session(
         self,
@@ -405,6 +342,7 @@ class ApplicationSessionManager:
         context: Sequence[UploadFile],
         anecdotes: Sequence[UploadFile],
     ) -> SessionCreateResponse:
+        await self.startup()
         try:
             validated_job_url = validate_job_url(job_url)
             origins = [_job_origin(validated_job_url)]
@@ -528,18 +466,11 @@ class ApplicationSessionManager:
                 direct_fields=tuple(candidate.direct_fields.items()),
             )
             record.request = request
-            record.resume_path_task = asyncio.create_task(
-                asyncio.to_thread(
-                    resolve_resume_upload_path,
-                    request.artifacts.resume,
-                    self._browser_launch,
-                ),
-                name=f"browser-harness-resume-path-{session_id}",
-            )
-            record.resume_upload_path = await asyncio.shield(
-                record.resume_path_task
-            )
-            record.resume_path_task = None
+            if not request.artifacts.resume.is_absolute():
+                raise BrowserConfigurationError(
+                    "The stored resume path is unavailable"
+                )
+            record.resume_upload_path = str(request.artifacts.resume)
             run_request = ApplicationRunRequest(
                 session=request,
                 candidate=candidate,
@@ -562,21 +493,17 @@ class ApplicationSessionManager:
             record.model = model
             await model.check_ready()
 
-            browser = self._browser_factory(
-                self._browser_launch,
-                origins,
-                stored.session_directory / "downloads",
-            )
-            record.browser = browser
-            runtime = self._skill_runtime_factory(
-                browser=browser,
+            runtime = self._runtime_factory(
+                session_id=session_id,
+                launch=self._browser_launch,
                 session_directory=stored.session_directory,
-                workspace=self._browser_skill_workspace,
-                bubblewrap_executable=self._config.bubblewrap_executable,
                 deadline=record.deadline_monotonic,
+                node_executable=self._config.node_executable,
+                cli_script=self._config.playwright_cli_script,
             )
-            record.skill_runtime = runtime
-            await runtime.start()
+            record.playwright_runtime = runtime
+            await runtime.start(validated_job_url)
+            await runtime.set_approved_origins(origins)
 
             async def publish_gate(
                 state: SessionState,
@@ -661,9 +588,22 @@ class ApplicationSessionManager:
             )
             await self._join_finalizer(record)
             raise
+        except PlaywrightCliRuntimeError as error:
+            record.setup_task = None
+            await self._begin_finalization(
+                record,
+                _TerminalRequest("failed", "failed", error.code),
+                duplicate_ok=True,
+            )
+            await self._join_finalizer(record)
+            public = session_error(error.code)
+            raise HarnessServiceError(
+                504 if error.code == "session_timeout" else 503,
+                public.code,
+                public.message,
+            ) from None
         except (
             BrowserConfigurationError,
-            BrowserSkillRuntimeError,
             OSError,
             ValidationError,
         ):
@@ -820,6 +760,7 @@ class ApplicationSessionManager:
             raise self._not_found()
 
         owns_pending = False
+        current_task = asyncio.current_task()
         submission_attempt_active = False
         try:
             async with record.request_lock:
@@ -849,9 +790,8 @@ class ApplicationSessionManager:
                     )
                 if (
                     record.snapshot.state == "starting"
-                    or record.skill_runtime is None
+                    or record.playwright_runtime is None
                     or record.human_gate is None
-                    or record.browser is None
                     or record.request is None
                 ):
                     raise HarnessServiceError(
@@ -861,7 +801,7 @@ class ApplicationSessionManager:
                 if gate.submission_approved and not isinstance(
                     action,
                     (
-                        BrowserUseRuntimeAction,
+                        PlaywrightCliRuntimeAction,
                         RequestHumanNavigationRuntimeAction,
                         RequestOriginApprovalRuntimeAction,
                     ),
@@ -879,16 +819,18 @@ class ApplicationSessionManager:
                         "A runtime action is already pending",
                     )
                 record.runtime_action_pending = True
+                record.runtime_action_task = current_task
                 owns_pending = True
+                starts_submission = isinstance(
+                    action,
+                    RequestHumanNavigationRuntimeAction,
+                ) or (
+                    isinstance(action, PlaywrightCliRuntimeAction)
+                    and action.command not in _READ_ONLY_PLAYWRIGHT_CLI_COMMANDS
+                )
                 if (
                     gate.submission_approved
-                    and isinstance(
-                        action,
-                        (
-                            BrowserUseRuntimeAction,
-                            RequestHumanNavigationRuntimeAction,
-                        ),
-                    )
+                    and starts_submission
                     and not record.submission_action_started
                 ):
                     record.submission_action_started = True
@@ -917,7 +859,7 @@ class ApplicationSessionManager:
                     await self._publish_gate(record, "submitting", None, {})
                 if (
                     submission_attempt_active
-                    and isinstance(response, BrowserUseResultRuntimeActionResponse)
+                    and isinstance(response, PlaywrightCliResultRuntimeActionResponse)
                     and (response.exit_code != 0 or response.timed_out)
                 ):
                     await self._park_submission_uncertain(record)
@@ -933,37 +875,41 @@ class ApplicationSessionManager:
         finally:
             if owns_pending:
                 async with record.request_lock:
-                    record.runtime_action_pending = False
+                    if record.runtime_action_task is current_task:
+                        record.runtime_action_task = None
+                        record.runtime_action_pending = False
 
     async def _dispatch_runtime_action(
         self,
         record: _ApplicationSession,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse:
-        runtime = record.skill_runtime
+        runtime = record.playwright_runtime
         gate = record.human_gate
-        browser = record.browser
         request = record.request
-        if runtime is None or gate is None or browser is None or request is None:
+        if runtime is None or gate is None or request is None:
             raise HarnessServiceError(
                 409, "command_conflict", "The session is still starting"
             )
 
-        if isinstance(action, BrowserUseRuntimeAction):
-            if record.browser_action_count >= request.max_steps:
-                error = session_error("step_limit")
-                raise HarnessServiceError(
-                    409,
-                    error.code,
-                    error.message,
-                )
+        if isinstance(action, PlaywrightCliRuntimeAction):
+            async with record.request_lock:
+                if record.playwright_cli_action_count >= request.max_steps:
+                    error = session_error("step_limit")
+                    raise HarnessServiceError(
+                        409,
+                        error.code,
+                        error.message,
+                    )
+                record.playwright_cli_action_count += 1
+                step = record.playwright_cli_action_count
             try:
-                result = await runtime.execute(action.code)
-            except BrowserSkillRuntimeError as error:
+                result = await runtime.execute(action.command, action.args)
+            except PlaywrightCliRuntimeError as error:
                 async with record.request_lock:
-                    self._append_browser_use_diagnostic(
+                    self._append_playwright_cli_diagnostic(
                         record,
-                        record.browser_action_count + 1,
+                        step,
                         error,
                     )
                 public = session_error(error.code)
@@ -980,10 +926,9 @@ class ApplicationSessionManager:
                     record.finalized or record.final_request is not None
                 ) and not approved_submission_action:
                     raise asyncio.CancelledError
-                record.browser_action_count += 1
-                self._append_browser_use_diagnostic(
+                self._append_playwright_cli_diagnostic(
                     record,
-                    record.browser_action_count,
+                    step,
                     result,
                 )
                 if record.snapshot.state not in {
@@ -993,30 +938,41 @@ class ApplicationSessionManager:
                 }:
                     await self._agent_step(
                         record,
-                        record.browser_action_count,
+                        step,
                         result.observation.url,
                         state=(
                             "submitting" if gate.submission_approved else "running"
                         ),
                     )
-                public_result = result
-                if gate.submission_approved:
-                    public_result = result.model_copy(
+                public_tabs = [
+                    tab.model_copy(
                         update={
-                            "observation": result.observation.model_copy(
-                                update={
-                                    "url": redact_public_url(
-                                        result.observation.url,
-                                        gate.redaction_values,
-                                    ),
-                                    "tabs": [],
-                                    "page_info": None,
-                                }
+                            "url": _redact_playwright_cli_url(
+                                tab.url,
+                                gate.redaction_values,
                             )
                         }
                     )
-                return BrowserUseResultRuntimeActionResponse(
-                    type="browser_use_result",
+                    for tab in result.observation.tabs
+                ]
+                if gate.submission_approved:
+                    public_tabs = []
+                public_result = result.model_copy(
+                    update={
+                        "observation": result.observation.model_copy(
+                            update={
+                                "url": _redact_playwright_cli_url(
+                                    result.observation.url,
+                                    gate.redaction_values,
+                                ),
+                                "tabs": public_tabs,
+                                "page_info": None,
+                            }
+                        )
+                    }
+                )
+                return PlaywrightCliResultRuntimeActionResponse(
+                    type="playwright_cli_result",
                     **public_result.model_dump(),
                 )
 
@@ -1024,7 +980,7 @@ class ApplicationSessionManager:
             before = gate.approved_origins
             gate_result = await gate.request_human_navigation(
                 action.instruction,
-                browser,
+                runtime,
             )
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
@@ -1041,7 +997,7 @@ class ApplicationSessionManager:
         if isinstance(action, RequestOriginApprovalRuntimeAction):
             gate_result = await gate.request_origin_approval(
                 action.origin,
-                browser,
+                runtime,
             )
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
@@ -1053,7 +1009,7 @@ class ApplicationSessionManager:
             )
 
         if isinstance(action, RequestAdditionalInfoRuntimeAction):
-            if record.browser_action_count < 1:
+            if record.playwright_cli_action_count < 1:
                 raise HarnessServiceError(
                     409,
                     "command_conflict",
@@ -1071,7 +1027,7 @@ class ApplicationSessionManager:
             record.additional_info_question_count += len(action.questions)
             gate_result = await gate.request_additional_info(
                 action.questions,
-                browser,
+                runtime,
             )
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
@@ -1094,7 +1050,7 @@ class ApplicationSessionManager:
                 )
             gate_result = await gate.request_human_review(
                 action.result,
-                browser,
+                runtime,
             )
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
@@ -1219,13 +1175,13 @@ class ApplicationSessionManager:
         request = record.request
         candidate = record.candidate
         model = record.model
-        browser = record.browser
+        runtime = record.playwright_runtime
         gate = record.human_gate
         if (
             request is None
             or candidate is None
             or model is None
-            or browser is None
+            or runtime is None
             or gate is None
             or record.stored is None
             or record.resume_upload_path is None
@@ -1287,7 +1243,7 @@ class ApplicationSessionManager:
                         resume_upload_path=record.resume_upload_path,
                     ),
                     model,
-                    browser,
+                    runtime,
                     gate,
                     lambda step, url: self._agent_step(record, step, url),
                 )
@@ -1424,22 +1380,24 @@ class ApplicationSessionManager:
         )
         try:
             await asyncio.sleep(delay)
-            if record.submission_action_started and record.snapshot.state not in {
-                "submitted",
-                "submission_uncertain",
-            }:
-                await self._park_submission_uncertain(record)
-            terminal = (
-                _TerminalRequest("closed", "closed")
-                if record.snapshot.state in {"submitted", "submission_uncertain"}
-                else _TerminalRequest("failed", "failed", "session_timeout")
-            )
-            await self._request_terminal(
-                record,
-                terminal,
-                wait=False,
-                duplicate_ok=True,
-            )
+            async with record.request_lock:
+                if record.finalized or record.final_request is not None:
+                    return
+                if record.submission_action_started and record.snapshot.state not in {
+                    "submitted",
+                    "submission_uncertain",
+                }:
+                    await self._park_submission_uncertain(record)
+                terminal = (
+                    _TerminalRequest("closed", "closed")
+                    if record.snapshot.state in {"submitted", "submission_uncertain"}
+                    else _TerminalRequest("failed", "failed", "session_timeout")
+                )
+                await self._begin_finalization_locked(
+                    record,
+                    terminal,
+                    duplicate_ok=True,
+                )
         except asyncio.CancelledError:
             return
 
@@ -1580,13 +1538,6 @@ class ApplicationSessionManager:
             else:
                 record.context_process = None
 
-        resume_path_task = record.resume_path_task
-        if resume_path_task is not None:
-            try:
-                await asyncio.shield(resume_path_task)
-            except Exception:
-                pass
-            record.resume_path_task = None
 
         agent_task = record.agent_task
         if agent_task is not None and agent_task is not asyncio.current_task() and not agent_task.done():
@@ -1596,19 +1547,37 @@ class ApplicationSessionManager:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        while record.skill_runtime is not None:
+        async with record.request_lock:
+            runtime_action_task = record.runtime_action_task
+        if (
+            runtime_action_task is not None
+            and runtime_action_task is not asyncio.current_task()
+        ):
+            if not runtime_action_task.done():
+                runtime_action_task.cancel()
+            try:
+                await asyncio.shield(runtime_action_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+            async with record.request_lock:
+                if record.runtime_action_task is runtime_action_task:
+                    record.runtime_action_task = None
+                    record.runtime_action_pending = False
+
+        while record.playwright_runtime is not None:
             if record.runtime_close_task is None:
                 record.runtime_close_task = asyncio.create_task(
-                    record.skill_runtime.close()
+                    record.playwright_runtime.close()
                 )
             try:
                 await self._await_owned_cleanup(
                     record.runtime_close_task,
-                    "Browser skill runtime",
+                    "Playwright CLI runtime",
                 )
             except Exception:
                 logger.warning(
-                    "Browser-skill runtime cleanup failed; retaining ownership and retrying"
+                    "Playwright CLI runtime cleanup failed; retaining ownership "
+                    "and retrying"
                 )
                 record.runtime_close_task = None
                 await asyncio.sleep(retry_delay)
@@ -1616,28 +1585,8 @@ class ApplicationSessionManager:
                     retry_delay * 2, _CLEANUP_RETRY_MAX_SECONDS
                 )
             else:
-                record.skill_runtime = None
+                record.playwright_runtime = None
                 record.runtime_close_task = None
-
-        while record.browser is not None:
-            if record.browser_kill_task is None:
-                record.browser_kill_task = asyncio.create_task(record.browser.kill())
-            try:
-                await self._await_owned_cleanup(
-                    record.browser_kill_task,
-                    "Browser",
-                )
-            except Exception:
-                logger.warning(
-                    "Browser cleanup failed; retaining ownership and retrying"
-                )
-                record.browser_kill_task = None
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(
-                    retry_delay * 2, _CLEANUP_RETRY_MAX_SECONDS
-                )
-            else:
-                record.browser = None
 
         while record.model is not None:
             if record.model_close_task is None:
@@ -1706,15 +1655,11 @@ class ApplicationSessionManager:
                     else record.snapshot.revision_count
                 ),
             )
+            await self._publish_event(record, event, {})
+            record.finalized = True
             async with self._lock:
                 if self._active is record:
                     self._active = None
-                record.finalized = True
-                self._tombstones[record.session_id] = _Tombstone(
-                    SessionSnapshot.model_validate(record.snapshot.model_dump()),
-                    tuple(record.events),
-                )
-                await self._publish_event(record, event, {})
                 self._tombstones[record.session_id] = _Tombstone(
                     SessionSnapshot.model_validate(record.snapshot.model_dump()),
                     tuple(record.events),
@@ -1766,15 +1711,15 @@ class ApplicationSessionManager:
         elif snapshot_changed:
             await self._publish_event(record, "snapshot", {})
 
-    def _append_browser_use_diagnostic(
+    def _append_playwright_cli_diagnostic(
         self,
         record: _ApplicationSession,
         step: int,
-        outcome: BrowserUseExecutionResult | BrowserSkillRuntimeError,
+        outcome: PlaywrightCliExecutionResult | PlaywrightCliRuntimeError,
     ) -> None:
-        if isinstance(outcome, BrowserSkillRuntimeError):
+        if isinstance(outcome, PlaywrightCliRuntimeError):
             session_timed_out = outcome.code == "session_timeout"
-            diagnostic = BrowserUseDiagnostic(
+            diagnostic = PlaywrightCliDiagnostic(
                 step=step,
                 status="timed_out" if session_timed_out else "failed",
                 exit_code=-1,
@@ -1793,7 +1738,7 @@ class ApplicationSessionManager:
             if outcome.timed_out:
                 status = "timed_out"
                 error_category = "execution_timeout"
-                stderr_excerpt = _BROWSER_USE_TIMEOUT_MESSAGE
+                stderr_excerpt = _PLAYWRIGHT_CLI_TIMEOUT_MESSAGE
             elif outcome.exit_code != 0:
                 status = "failed"
                 error_category = "process_exit"
@@ -1806,7 +1751,7 @@ class ApplicationSessionManager:
                 stderr_excerpt = (
                     _REDACTED_STDERR_EXCERPT if outcome.stderr else None
                 )
-            diagnostic = BrowserUseDiagnostic(
+            diagnostic = PlaywrightCliDiagnostic(
                 step=step,
                 status=status,
                 exit_code=outcome.exit_code,
@@ -1816,13 +1761,13 @@ class ApplicationSessionManager:
                 stderr_truncated=outcome.stderr_truncated,
             )
 
-        diagnostics = list(record.snapshot.browser_use_diagnostics)
+        diagnostics = list(record.snapshot.playwright_cli_diagnostics)
         diagnostics.append(diagnostic)
-        if len(diagnostics) > _BROWSER_USE_DIAGNOSTIC_LIMIT:
-            del diagnostics[:-_BROWSER_USE_DIAGNOSTIC_LIMIT]
+        if len(diagnostics) > _PLAYWRIGHT_CLI_DIAGNOSTIC_LIMIT:
+            del diagnostics[:-_PLAYWRIGHT_CLI_DIAGNOSTIC_LIMIT]
         record.snapshot = self._updated_snapshot(
             record.snapshot,
-            browser_use_diagnostics=diagnostics,
+            playwright_cli_diagnostics=diagnostics,
         )
 
     async def _agent_step(

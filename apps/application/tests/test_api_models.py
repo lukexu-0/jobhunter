@@ -19,9 +19,10 @@ from jobhunter_browser_harness.models import (
     ApplicationRunResult,
     ReviewApplicationResult,
     ApproveRuntimeActionResponse,
-    BrowserUseResultRuntimeActionResponse,
-    BrowserUseExecutionResult,
-    BrowserUseRuntimeAction,
+    PlaywrightCliDiagnostic,
+    PlaywrightCliExecutionResult,
+    PlaywrightCliResultRuntimeActionResponse,
+    PlaywrightCliRuntimeAction,
     CancelledApplicationResult,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
@@ -87,7 +88,7 @@ def make_snapshot(**overrides: Any) -> SessionSnapshot:
         ],
         "fields_needing_human": [],
         "files_attached": ["resume.pdf"],
-        "browser_use_diagnostics": [
+        "playwright_cli_diagnostics": [
             {
                 "step": 1,
                 "status": "failed",
@@ -124,7 +125,11 @@ class FakeSessionService:
         default_factory=lambda: ContinueRuntimeActionResponse(type="continue")
     )
     delete_calls: list[UUID] = field(default_factory=list)
+    startup_calls: int = 0
     shutdown_calls: int = 0
+
+    async def startup(self) -> None:
+        self.startup_calls += 1
 
     async def create_session(
         self,
@@ -797,8 +802,10 @@ async def test_application_lifespan_shuts_down_session_service() -> None:
         HarnessDependencies(sessions=service),
     )
     async with app.router.lifespan_context(app):
+        assert service.startup_calls == 1
         assert service.shutdown_calls == 0
     assert service.shutdown_calls == 1
+    assert service.startup_calls == 1
 
 
 async def test_missing_and_wrong_bearer_are_identical_and_cors_is_absent(
@@ -1011,7 +1018,7 @@ async def test_snapshot_get_returns_sanitized_public_model(
     assert response.json()["model_provider"] == "openai-codex"
     assert response.json()["model"] == "gpt-5.6-sol"
     assert response.json()["reasoning"] == "high"
-    assert response.json()["browser_use_diagnostics"] == [
+    assert response.json()["playwright_cli_diagnostics"] == [
         {
             "step": 1,
             "status": "failed",
@@ -1022,6 +1029,10 @@ async def test_snapshot_get_returns_sanitized_public_model(
             "stderr_truncated": True,
         }
     ]
+    assert isinstance(
+        service.snapshot.playwright_cli_diagnostics[0],
+        PlaywrightCliDiagnostic,
+    )
     assert service.snapshot_calls == [SESSION_ID]
 
 
@@ -1139,13 +1150,176 @@ def _application_result_payload(
         **({"submission_confirmation": None} if status == "cancelled" else {}),
     }
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "goto",
+        "snapshot",
+        "eval",
+        "click",
+        "dblclick",
+        "type",
+        "press",
+        "fill",
+        "drag",
+        "drop",
+        "hover",
+        "select",
+        "upload",
+        "check",
+        "uncheck",
+        "dialog-accept",
+        "dialog-dismiss",
+        "resize",
+        "go-back",
+        "go-forward",
+        "reload",
+        "keydown",
+        "keyup",
+        "mousemove",
+        "mousedown",
+        "mouseup",
+        "mousewheel",
+        "screenshot",
+        "pdf",
+        "tab-list",
+        "tab-new",
+        "tab-close",
+        "tab-select",
+        "generate-locator",
+        "highlight",
+        "video-chapter",
+        "video-show-actions",
+        "video-hide-actions",
+    ],
+)
+def test_playwright_cli_runtime_action_accepts_approved_commands(
+    command: str,
+) -> None:
+    action = RUNTIME_ACTION_ADAPTER.validate_python(
+        {"type": "playwright_cli", "command": command}
+    )
+
+    assert isinstance(action, PlaywrightCliRuntimeAction)
+    assert action.command == command
+    assert action.args == []
+
+
+def test_playwright_cli_runtime_action_enforces_argument_boundaries() -> None:
+    sixty_four = PlaywrightCliRuntimeAction.model_validate(
+        {
+            "type": "playwright_cli",
+            "command": "eval",
+            "args": [""] * 64,
+        }
+    )
+    exact_utf8_limit = PlaywrightCliRuntimeAction.model_validate(
+        {
+            "type": "playwright_cli",
+            "command": "eval",
+            "args": ["é" * 4_096],
+        }
+    )
+    exact_invocation_limit = PlaywrightCliRuntimeAction.model_validate(
+        {
+            "type": "playwright_cli",
+            "command": "eval",
+            "args": [*["x" * 8_192] * 7, "x" * 8_188],
+        }
+    )
+
+    assert len(sixty_four.args) == 64
+    assert len(exact_utf8_limit.args[0].encode("utf-8")) == 8_192
+    assert (
+        len(exact_invocation_limit.command.encode("utf-8"))
+        + sum(len(argument.encode("utf-8")) for argument in exact_invocation_limit.args)
+        == 65_536
+    )
+
+    for invalid_args in (
+        [""] * 65,
+        ["é" * 4_096 + "a"],
+        [*["x" * 8_192] * 7, "x" * 8_189],
+    ):
+        with pytest.raises(ValidationError):
+            PlaywrightCliRuntimeAction.model_validate(
+                {
+                    "type": "playwright_cli",
+                    "command": "eval",
+                    "args": invalid_args,
+                }
+            )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "open",
+        "attach",
+        "detach",
+        "close",
+        "delete-data",
+        "close-all",
+        "kill-all",
+        "show",
+        "install",
+        "dashboard",
+        "video-start",
+        "video-stop",
+        "session-list",
+        "session-new",
+        "session-close",
+        "session-select",
+        "run-code",
+        "cookie-list",
+        "cookie-get",
+        "cookie-set",
+        "cookie-delete",
+        "cookie-clear",
+        "localstorage-list",
+        "localstorage-get",
+        "localstorage-set",
+        "localstorage-delete",
+        "localstorage-clear",
+        "sessionstorage-list",
+        "sessionstorage-get",
+        "sessionstorage-set",
+        "sessionstorage-delete",
+        "sessionstorage-clear",
+        "requests",
+        "request",
+        "request-headers",
+        "request-body",
+        "response-headers",
+        "response-body",
+        "route",
+        "route-list",
+        "unroute",
+        "network-state-set",
+        "console",
+        "tracing-start",
+        "tracing-stop",
+    ],
+)
+def test_playwright_cli_runtime_action_rejects_prohibited_commands(
+    command: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_ADAPTER.validate_python(
+            {"type": "playwright_cli", "command": command}
+        )
+
 
 @pytest.mark.parametrize(
     ("payload", "action_type"),
     [
         (
-            {"type": "browser_use", "code": "print(page_info())"},
-            BrowserUseRuntimeAction,
+            {
+                "type": "playwright_cli",
+                "command": "eval",
+                "args": ["() => document.title"],
+            },
+            PlaywrightCliRuntimeAction,
         ),
         (
             {
@@ -1226,7 +1400,12 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
     "payload",
     [
         {"type": "unknown"},
-        {"type": "browser_use", "code": "print('ok')", "token": "secret"},
+        {
+            "type": "playwright_cli",
+            "command": "eval",
+            "args": ["() => document.title"],
+            "token": "secret",
+        },
         {"type": "request_human_navigation", "instruction": " "},
         {"type": "request_origin_approval", "origin": "https://ats.example/path"},
         {"type": "request_human_review", "result": {"status": "cancelled"}},
@@ -1338,7 +1517,7 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
         "answer_type": "text",
     }
     with pytest.raises(ValidationError):
-        BrowserUseExecutionResult.model_validate(
+        PlaywrightCliExecutionResult.model_validate(
             {
                 "exit_code": 0,
                 "timed_out": False,
@@ -1370,7 +1549,7 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
     "payload",
     [
         {
-            "type": "browser_use_result",
+            "type": "playwright_cli_result",
             "exit_code": 0,
             "timed_out": False,
             "stdout": "ok",
@@ -1439,6 +1618,8 @@ def test_runtime_action_response_union_is_strict_and_round_trips(
     payload: dict[str, Any],
 ) -> None:
     parsed = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(payload)
+    if payload["type"] == "playwright_cli_result":
+        assert isinstance(parsed, PlaywrightCliResultRuntimeActionResponse)
 
     assert parsed.model_dump(mode="json") == payload
 

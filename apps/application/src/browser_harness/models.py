@@ -498,10 +498,8 @@ class HarnessConfig(FrozenPrivateModel):
         ge=1,
         le=86_400,
     )
-    bubblewrap_executable: Path = Path("/usr/bin/bwrap")
-    browser_skill_workspace: Path = Path(
-        "~/.jobhunter/application/browser-skill/agent-workspace"
-    )
+    node_executable: Path | None = None
+    playwright_cli_script: Path | None = None
     user_info_json: Path = Path(
         "apps/user-info/current-context/personal/user-info.json"
     )
@@ -580,7 +578,7 @@ class SessionError(PublicModel):
         return self
 
 
-class BrowserUseDiagnostic(PublicModel):
+class PlaywrightCliDiagnostic(PublicModel):
     step: int = Field(ge=1, le=500)
     status: Literal["succeeded", "failed", "timed_out"]
     exit_code: int
@@ -593,14 +591,14 @@ class BrowserUseDiagnostic(PublicModel):
     ] | None
     stderr_excerpt: Literal[
         "[redacted]",
-        "Browser Use execution timed out after 120 seconds.",
+        "Playwright CLI execution timed out after 120 seconds.",
         "Browser runtime failed.",
         "Application session expired.",
     ] | None
     stderr_truncated: bool
 
     @model_validator(mode="after")
-    def _validate_outcome(self) -> BrowserUseDiagnostic:
+    def _validate_outcome(self) -> PlaywrightCliDiagnostic:
         expected_status = (
             "timed_out"
             if self.timed_out
@@ -611,7 +609,7 @@ class BrowserUseDiagnostic(PublicModel):
         if self.status != expected_status:
             raise ValueError("status does not match the browser outcome")
         if self.error_category == "execution_timeout":
-            expected_excerpt = "Browser Use execution timed out after 120 seconds."
+            expected_excerpt = "Playwright CLI execution timed out after 120 seconds."
             valid_category = self.timed_out
         elif self.error_category == "session_timeout":
             expected_excerpt = "Application session expired."
@@ -693,7 +691,7 @@ class SessionSnapshot(PublicModel):
     fields_needing_human: list[FieldResult] = Field(default_factory=list, max_length=500)
     files_attached: list[StrictText] = Field(default_factory=list, max_length=20)
     warnings: list[WarningText] = Field(default_factory=list, max_length=100)
-    browser_use_diagnostics: list[BrowserUseDiagnostic] = Field(
+    playwright_cli_diagnostics: list[PlaywrightCliDiagnostic] = Field(
         default_factory=list,
         max_length=100,
     )
@@ -943,7 +941,7 @@ class BrowserObservation(PublicModel):
     screenshot: BrowserScreenshot | None
 
 
-class BrowserUseExecutionResult(PublicModel):
+class PlaywrightCliExecutionResult(PublicModel):
     exit_code: int
     timed_out: bool
     stdout: Annotated[str, StringConstraints(strict=True, max_length=20_000)]
@@ -1039,19 +1037,74 @@ ApplicationRunResult: TypeAlias = Annotated[
 ]
 
 
-class BrowserUseRuntimeAction(PublicModel):
-    type: Literal["browser_use"]
-    code: Annotated[
-        str,
-        StringConstraints(strict=True, max_length=65_536),
-    ]
+PlaywrightCliCommand: TypeAlias = Literal[
+    "goto",
+    "snapshot",
+    "eval",
+    "click",
+    "dblclick",
+    "type",
+    "press",
+    "fill",
+    "drag",
+    "drop",
+    "hover",
+    "select",
+    "upload",
+    "check",
+    "uncheck",
+    "dialog-accept",
+    "dialog-dismiss",
+    "resize",
+    "go-back",
+    "go-forward",
+    "reload",
+    "keydown",
+    "keyup",
+    "mousemove",
+    "mousedown",
+    "mouseup",
+    "mousewheel",
+    "screenshot",
+    "pdf",
+    "tab-list",
+    "tab-new",
+    "tab-close",
+    "tab-select",
+    "generate-locator",
+    "highlight",
+    "video-chapter",
+    "video-show-actions",
+    "video-hide-actions",
+]
 
-    @field_validator("code")
+
+class PlaywrightCliRuntimeAction(PublicModel):
+    type: Literal["playwright_cli"]
+    command: PlaywrightCliCommand
+    args: list[StrictText] = Field(default_factory=list, max_length=64)
+
+    @field_validator("args")
     @classmethod
-    def _validate_code_size(cls, value: str) -> str:
-        if len(value.encode("utf-8")) > 65_536:
-            raise ValueError("code must be at most 65,536 UTF-8 bytes")
-        return value
+    def _validate_argument_sizes(cls, values: list[str]) -> list[str]:
+        try:
+            oversized = any(
+                len(value.encode("utf-8")) > 8_192 for value in values
+            )
+        except UnicodeEncodeError:
+            raise ValueError("arguments must be valid UTF-8 text") from None
+        if oversized:
+            raise ValueError("each argument must be at most 8,192 UTF-8 bytes")
+        return values
+
+    @model_validator(mode="after")
+    def _validate_invocation_size(self) -> PlaywrightCliRuntimeAction:
+        invocation_size = len(self.command.encode("utf-8")) + sum(
+            len(value.encode("utf-8")) for value in self.args
+        )
+        if invocation_size > 65_536:
+            raise ValueError("invocation must be at most 65,536 UTF-8 bytes")
+        return self
 
 
 class RequestHumanNavigationRuntimeAction(PublicModel):
@@ -1099,7 +1152,7 @@ class ReportApplicationMismatchRuntimeAction(PublicModel):
 
 
 RuntimeActionRequest: TypeAlias = Annotated[
-    BrowserUseRuntimeAction
+    PlaywrightCliRuntimeAction
     | RequestHumanNavigationRuntimeAction
     | RequestOriginApprovalRuntimeAction
     | RequestAdditionalInfoRuntimeAction
@@ -1109,8 +1162,8 @@ RuntimeActionRequest: TypeAlias = Annotated[
 ]
 
 
-class BrowserUseResultRuntimeActionResponse(BrowserUseExecutionResult):
-    type: Literal["browser_use_result"]
+class PlaywrightCliResultRuntimeActionResponse(PlaywrightCliExecutionResult):
+    type: Literal["playwright_cli_result"]
 
 
 class ContinueRuntimeActionResponse(PublicModel):
@@ -1177,7 +1230,7 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 
 
 RuntimeActionResponse: TypeAlias = Annotated[
-    BrowserUseResultRuntimeActionResponse
+    PlaywrightCliResultRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | ApproveRuntimeActionResponse
     | ReviseRuntimeActionResponse

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from collections.abc import Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -41,20 +41,23 @@ JOB_ORIGIN = "https://jobs.example"
 ATS_ORIGIN = "https://ats.example"
 
 
-@dataclass(slots=True)
-class FakeBrowserProfile:
-    allowed_domains: list[str]
-
-
-class FakeBrowserSession:
-    def __init__(self, url: str = JOB_URL, domains: list[str] | None = None) -> None:
+class FakeRuntime:
+    def __init__(self, url: str = JOB_URL) -> None:
         self.current_url = url
-        self.browser_profile = FakeBrowserProfile(
-            domains if domains is not None else [f"{JOB_ORIGIN}/"]
-        )
+        self.calls: list[tuple[str, tuple[str, ...] | None]] = []
+        self.approved_origin_sets: list[tuple[str, ...]] = []
 
     async def get_current_page_url(self) -> str:
+        self.calls.append(("get_current_page_url", None))
         return self.current_url
+
+    async def set_approved_origins(self, origins: Sequence[str]) -> None:
+        approved = tuple(origins)
+        self.calls.append(("set_approved_origins", approved))
+        self.approved_origin_sets.append(approved)
+
+    async def suspend_navigation_guard(self) -> None:
+        self.calls.append(("suspend_navigation_guard", None))
 
 
 class EventPublisher:
@@ -281,11 +284,11 @@ def assert_conflict(error: BaseException) -> None:
 
 
 @pytest.mark.asyncio
-async def test_navigation_continue_publishes_gate_then_resumes() -> None:
+async def test_navigation_suspends_guard_before_gate_and_reinstalls_it_afterward() -> None:
     gate, publisher = make_gate()
-    browser = FakeBrowserSession()
+    runtime = FakeRuntime()
     pending = asyncio.create_task(
-        gate.request_human_navigation("Complete CAPTCHA and return.", browser)
+        gate.request_human_navigation("Complete CAPTCHA and return.", runtime)
     )
 
     assert await publisher.next_event() == (
@@ -293,6 +296,7 @@ async def test_navigation_continue_publishes_gate_then_resumes() -> None:
         "human_navigation_required",
         {"instruction": "Complete CAPTCHA and return."},
     )
+    assert runtime.calls == [("suspend_navigation_guard", None)]
     assert gate.pending_kind == "navigation"
     await gate.continue_navigation()
     result = await pending
@@ -300,6 +304,12 @@ async def test_navigation_continue_publishes_gate_then_resumes() -> None:
     assert result.is_done is False
     assert result.extracted_content == "Human navigation completed."
     assert publisher.events[-1] == ("running", None, {})
+    assert runtime.calls == [
+        ("suspend_navigation_guard", None),
+        ("get_current_page_url", None),
+        ("set_approved_origins", (JOB_ORIGIN,)),
+    ]
+    assert runtime.approved_origin_sets == [(JOB_ORIGIN,)]
     assert gate.pending_kind is None
 
 
@@ -317,11 +327,11 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
         approved_origins=[JOB_ORIGIN],
         publish=publisher,
     )
-    browser = FakeBrowserSession(
+    runtime = FakeRuntime(
         "https://jobs.example/apply/private-person@example.test"
         "?secret=Ada%20Secret-Value#fragment"
     )
-    pending = asyncio.create_task(gate.request_human_navigation("Log in.", browser))
+    pending = asyncio.create_task(gate.request_human_navigation("Log in.", runtime))
     await publisher.next_event()
     await gate.cancel()
     cancelled = await pending
@@ -335,10 +345,10 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
     assert all(value not in cancelled.extracted_content for value in private_values)
     assert payload.submit_attempted is False
 
-    browser.current_url = "https://jobs.example:99999/private"
+    runtime.current_url = "https://jobs.example:99999/private"
 
     timeout_gate, timeout_publisher = make_gate(action_timeout=0.001)
-    timed_out = await timeout_gate.request_human_navigation("Wait for human.", browser)
+    timed_out = await timeout_gate.request_human_navigation("Wait for human.", runtime)
     timeout_payload = CancelledApplicationResult.model_validate_json(
         timed_out.extracted_content
     )
@@ -353,23 +363,36 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
 
 
 @pytest.mark.asyncio
-async def test_post_navigation_origin_is_allowed_without_manual_approval() -> None:
-    domains = [f"{JOB_ORIGIN}/"]
-    browser = FakeBrowserSession("https://ats.example/apply?token=private", domains)
+async def test_post_navigation_origin_is_registered_without_manual_approval() -> None:
+    runtime = FakeRuntime("https://ats.example/apply?token=private")
     gate, publisher = make_gate()
     pending = asyncio.create_task(
-        gate.request_human_navigation("Complete the ATS login.", browser)
+        gate.request_human_navigation("Complete the ATS login.", runtime)
     )
 
-    await publisher.next_event(0)
+    assert await publisher.next_event(0) == (
+        "awaiting_human_navigation",
+        "human_navigation_required",
+        {"instruction": "Complete the ATS login."},
+    )
+    assert runtime.calls == [("suspend_navigation_guard", None)]
     await gate.continue_navigation()
-    result = await asyncio.wait_for(pending, timeout=0.1)
+    result = await pending
 
     assert result.is_done is False
     assert gate.pending_kind is None
     assert gate.approved_origins == (JOB_ORIGIN, ATS_ORIGIN)
-    assert browser.browser_profile.allowed_domains is domains
-    assert domains == [f"{JOB_ORIGIN}/", f"{ATS_ORIGIN}/"]
+    assert runtime.calls == [
+        ("suspend_navigation_guard", None),
+        ("get_current_page_url", None),
+        ("set_approved_origins", (JOB_ORIGIN, ATS_ORIGIN)),
+        ("get_current_page_url", None),
+        ("set_approved_origins", (JOB_ORIGIN, ATS_ORIGIN)),
+    ]
+    assert runtime.approved_origin_sets == [
+        (JOB_ORIGIN, ATS_ORIGIN),
+        (JOB_ORIGIN, ATS_ORIGIN),
+    ]
     assert publisher.events == [
         (
             "awaiting_human_navigation",
@@ -383,41 +406,67 @@ async def test_post_navigation_origin_is_allowed_without_manual_approval() -> No
 
 
 @pytest.mark.asyncio
-async def test_pre_navigation_origin_is_allowed_without_manual_command() -> None:
+async def test_origin_registration_installs_the_exact_expanded_origin_set() -> None:
     gate, publisher = make_gate()
-    browser = FakeBrowserSession()
+    runtime = FakeRuntime()
 
-    approved = await gate.request_origin_approval(ATS_ORIGIN, browser)
+    approved = await gate.request_origin_approval(ATS_ORIGIN, runtime)
 
     assert approved.extracted_content == "Origin approved."
     assert gate.pending_kind is None
     assert gate.approved_origins == (JOB_ORIGIN, ATS_ORIGIN)
-    assert browser.browser_profile.allowed_domains == [
-        f"{JOB_ORIGIN}/",
-        f"{ATS_ORIGIN}/",
+    assert runtime.calls == [
+        ("set_approved_origins", (JOB_ORIGIN, ATS_ORIGIN)),
+        ("get_current_page_url", None),
     ]
+    assert runtime.approved_origin_sets == [(JOB_ORIGIN, ATS_ORIGIN)]
     assert publisher.events == [("running", None, {})]
     with pytest.raises(HarnessServiceError) as disabled:
         await gate.approve_origin(ATS_ORIGIN)
     assert_conflict(disabled.value)
 
 
+
 @pytest.mark.asyncio
-async def test_origin_registration_rechecks_live_origin_without_second_gate() -> None:
+async def test_origin_registration_does_not_commit_a_failed_guard_update() -> None:
+    class FailingRuntime(FakeRuntime):
+        async def set_approved_origins(self, origins: Sequence[str]) -> None:
+            await super().set_approved_origins(origins)
+            raise RuntimeError("guard update failed")
+
+    gate, publisher = make_gate()
+    runtime = FailingRuntime()
+
+    with pytest.raises(RuntimeError, match="guard update failed"):
+        await gate.request_origin_approval(ATS_ORIGIN, runtime)
+
+    assert gate.approved_origins == (JOB_ORIGIN,)
+    assert runtime.approved_origin_sets == [(JOB_ORIGIN, ATS_ORIGIN)]
+    assert publisher.events == []
+
+@pytest.mark.asyncio
+async def test_origin_registration_rechecks_and_registers_the_live_origin() -> None:
     second_origin = "https://second-ats.example"
-    domains = [f"{JOB_ORIGIN}/"]
-    browser = FakeBrowserSession(f"{second_origin}/apply", domains)
+    runtime = FakeRuntime(f"{second_origin}/apply")
     gate, publisher = make_gate()
 
-    result = await gate.request_origin_approval(ATS_ORIGIN, browser)
+    result = await gate.request_origin_approval(ATS_ORIGIN, runtime)
 
     assert result.extracted_content == "Origin approved."
     assert gate.pending_kind is None
     assert gate.approved_origins == (JOB_ORIGIN, ATS_ORIGIN, second_origin)
-    assert domains == [
-        f"{JOB_ORIGIN}/",
-        f"{ATS_ORIGIN}/",
-        f"{second_origin}/",
+    assert runtime.calls == [
+        ("set_approved_origins", (JOB_ORIGIN, ATS_ORIGIN)),
+        ("get_current_page_url", None),
+        (
+            "set_approved_origins",
+            (JOB_ORIGIN, ATS_ORIGIN, second_origin),
+        ),
+        ("get_current_page_url", None),
+    ]
+    assert runtime.approved_origin_sets == [
+        (JOB_ORIGIN, ATS_ORIGIN),
+        (JOB_ORIGIN, ATS_ORIGIN, second_origin),
     ]
     assert publisher.events == [("running", None, {})]
 
@@ -425,26 +474,26 @@ async def test_origin_registration_rechecks_live_origin_without_second_gate() ->
 @pytest.mark.asyncio
 async def test_origin_cap_existing_origin_and_cancel_are_deterministic() -> None:
     origins = [f"https://approved-{index}.example" for index in range(20)]
-    browser = FakeBrowserSession(domains=[f"{origin}/" for origin in origins])
+    runtime = FakeRuntime()
     gate, publisher = make_gate(approved_origins=origins)
 
-    existing = await gate.request_origin_approval(origins[5], browser)
+    existing = await gate.request_origin_approval(origins[5], runtime)
     assert existing.is_done is False
     assert existing.extracted_content == "Origin is already approved."
-    capped = await gate.request_origin_approval("https://twenty-first.example", browser)
+    capped = await gate.request_origin_approval("https://twenty-first.example", runtime)
     payload = CancelledApplicationResult.model_validate_json(capped.extracted_content)
     assert capped.is_done is True
     assert capped.success is False
     assert payload.status == "cancelled"
     assert len(gate.approved_origins) == 20
-    assert len(browser.browser_profile.allowed_domains) == 20
+    assert runtime.approved_origin_sets == []
     assert publisher.events == []
 
 
 @pytest.mark.asyncio
 async def test_duplicate_and_wrong_state_commands_conflict_without_changing_gate() -> None:
     gate, publisher = make_gate()
-    browser = FakeBrowserSession()
+    runtime = FakeRuntime()
 
     for command in (
         gate.continue_navigation,
@@ -456,7 +505,7 @@ async def test_duplicate_and_wrong_state_commands_conflict_without_changing_gate
             await command()
         assert_conflict(error.value)
 
-    pending = asyncio.create_task(gate.request_human_navigation("Continue.", browser))
+    pending = asyncio.create_task(gate.request_human_navigation("Continue.", runtime))
     await publisher.next_event()
     await gate.continue_navigation()
     with pytest.raises(HarnessServiceError) as duplicate:
@@ -465,7 +514,7 @@ async def test_duplicate_and_wrong_state_commands_conflict_without_changing_gate
     await pending
 
     await gate.cancel()
-    cancelled_after_cancel = await gate.request_human_navigation("Never blocks.", browser)
+    cancelled_after_cancel = await gate.request_human_navigation("Never blocks.", runtime)
     assert cancelled_after_cancel.is_done is True
     assert cancelled_after_cancel.success is False
 
@@ -473,9 +522,9 @@ async def test_duplicate_and_wrong_state_commands_conflict_without_changing_gate
 @pytest.mark.asyncio
 async def test_manual_review_waits_and_supports_revise_then_submit() -> None:
     gate, publisher = make_gate()
-    browser = FakeBrowserSession()
+    runtime = FakeRuntime()
 
-    first_review = asyncio.create_task(gate.request_human_review(make_result(), browser))
+    first_review = asyncio.create_task(gate.request_human_review(make_result(), runtime))
     await publisher.next_event()
     assert not first_review.done()
     assert gate.pending_kind == "review"
@@ -487,7 +536,7 @@ async def test_manual_review_waits_and_supports_revise_then_submit() -> None:
     assert first.metadata == {"revision_count": 1}
     assert gate.submission_approved is False
 
-    second_review = asyncio.create_task(gate.request_human_review(make_result(), browser))
+    second_review = asyncio.create_task(gate.request_human_review(make_result(), runtime))
     await publisher.next_event(2)
     assert not second_review.done()
     await gate.submit()
@@ -515,10 +564,10 @@ async def test_auto_review_immediately_authorizes_only_fully_resolved_applicatio
         auto_submit=True,
         review_snapshot=capture_snapshot,
     )
-    browser = FakeBrowserSession("https://jobs.example/apply?secret=yes")
+    runtime = FakeRuntime("https://jobs.example/apply?secret=yes")
 
     approved = await asyncio.wait_for(
-        gate.request_human_review(make_result(), browser),
+        gate.request_human_review(make_result(), runtime),
         timeout=0.1,
     )
     approved_payload = ReviewApplicationResult.model_validate_json(
@@ -562,7 +611,7 @@ async def test_auto_review_immediately_authorizes_only_fully_resolved_applicatio
     )
 
     with pytest.raises(HarnessServiceError) as rejected:
-        await unresolved_gate.request_human_review(unresolved, browser)
+        await unresolved_gate.request_human_review(unresolved, runtime)
 
     assert rejected.value.status_code == 422
     assert rejected.value.code == "invalid_request"
@@ -575,10 +624,10 @@ async def test_auto_review_immediately_authorizes_only_fully_resolved_applicatio
 @pytest.mark.asyncio
 async def test_manual_review_after_cancellation_returns_terminal_json() -> None:
     gate, publisher = make_gate()
-    browser = FakeBrowserSession("https://jobs.example/apply?secret=yes")
+    runtime = FakeRuntime("https://jobs.example/apply?secret=yes")
     await gate.cancel()
 
-    cancelled = await gate.request_human_review(make_result(), browser)
+    cancelled = await gate.request_human_review(make_result(), runtime)
     cancelled_payload = CancelledApplicationResult.model_validate_json(
         cancelled.extracted_content
     )
@@ -602,7 +651,7 @@ async def test_additional_info_gate_redacts_public_questions_and_persists_origin
 ) -> None:
     store = UserInfoStore(tmp_path / "user-info.json")
     gate, publisher = make_gate(user_info_store=store)
-    browser = FakeBrowserSession()
+    runtime = FakeRuntime()
     questions = (
         AdditionalInfoTextQuestion(
             id="availability",
@@ -629,7 +678,7 @@ async def test_additional_info_gate_redacts_public_questions_and_persists_origin
             ],
         ),
     )
-    pending = asyncio.create_task(gate.request_additional_info(questions, browser))
+    pending = asyncio.create_task(gate.request_additional_info(questions, runtime))
 
     state, event, detail = await publisher.next_event()
     assert (state, event) == (
@@ -716,7 +765,7 @@ async def test_additional_info_invalid_and_failed_commands_leave_gate_pending(
             raise HarnessServiceError(500, "internal_error", "Request failed")
 
     gate, publisher = make_gate(user_info_store=FailingStore())
-    browser = FakeBrowserSession()
+    runtime = FakeRuntime()
     questions = (
         AdditionalInfoTextQuestion(
             id="first",
@@ -733,7 +782,7 @@ async def test_additional_info_invalid_and_failed_commands_leave_gate_pending(
             answer_type="text",
         ),
     )
-    pending = asyncio.create_task(gate.request_additional_info(questions, browser))
+    pending = asyncio.create_task(gate.request_additional_info(questions, runtime))
     await publisher.next_event()
 
     with pytest.raises(HarnessServiceError) as partial:
@@ -786,7 +835,7 @@ async def test_additional_info_public_redaction_respects_wire_length_limits(
         approved_origins=[JOB_ORIGIN],
         publish=publisher,
     )
-    browser = FakeBrowserSession()
+    runtime = FakeRuntime()
     pending = asyncio.create_task(
         gate.request_additional_info(
             (
@@ -802,7 +851,7 @@ async def test_additional_info_public_redaction_respects_wire_length_limits(
                     ],
                 ),
             ),
-            browser,
+            runtime,
         )
     )
 

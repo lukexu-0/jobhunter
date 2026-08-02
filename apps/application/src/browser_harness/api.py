@@ -25,6 +25,8 @@ from .models import (
 
 
 class HarnessSessionService(Protocol):
+    async def startup(self) -> None: ...
+
     async def create_session(
         self,
         *,
@@ -72,6 +74,7 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
 def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await dependencies.sessions.startup()
         try:
             yield
         finally:

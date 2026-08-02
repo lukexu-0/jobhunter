@@ -1,11 +1,9 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import Literal, Protocol, TypeAlias
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from browser_use.agent.views import ActionResult
-from browser_use.browser import BrowserSession
 
 from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 from .models import (
@@ -54,15 +52,32 @@ DecisionKind = Literal[
 GatePayload: TypeAlias = str | tuple[AcceptedAdditionalInfoAnswer, ...] | None
 GateDecision: TypeAlias = tuple[DecisionKind, GatePayload]
 
+class BrowserGateRuntime(Protocol):
+    async def get_current_page_url(self) -> str: ...
+
+    async def set_approved_origins(self, origins: Sequence[str]) -> None: ...
+
+    async def suspend_navigation_guard(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GateResult:
+    is_done: bool = False
+    success: bool | None = None
+    extracted_content: str | None = None
+    long_term_memory: str | None = None
+    metadata: dict[str, object] | None = None
+
 
 @dataclass(slots=True)
 class _PendingGate:
     kind: GateKind
     future: asyncio.Future[GateDecision]
-    browser_session: BrowserSession
+    runtime: BrowserGateRuntime
     origin: str | None = None
     questions: tuple[AdditionalInfoQuestion, ...] = ()
     storage_questions: tuple[AdditionalInfoQuestion, ...] = ()
+
 
 def _origin_from_url(value: str) -> str:
     parsed = urlsplit(value)
@@ -366,45 +381,54 @@ class HumanGate:
     async def request_human_navigation(
         self,
         instruction: str,
-        browser_session: BrowserSession,
-    ) -> ActionResult:
-        decision, _ = await self._wait_for_gate(
-            kind="navigation",
-            browser_session=browser_session,
-            state="awaiting_human_navigation",
-            event="human_navigation_required",
-            detail={
-                "instruction": redact_public_text(instruction, self._redaction_values)
-                or "Human action is required"
-            },
-        )
-        if decision == "cancel":
-            return await self._cancelled_result(browser_session)
+        runtime: BrowserGateRuntime,
+    ) -> GateResult:
+        await runtime.suspend_navigation_guard()
         try:
-            current_origin = _origin_from_url(await browser_session.get_current_page_url())
-        except (RuntimeError, ValueError):
-            return await self._cancelled_result(browser_session)
-        origin_allowed = False
-        if current_origin not in self._approved_origins:
-            origin_result = await self.request_origin_approval(
-                current_origin,
-                browser_session,
+            decision, _ = await self._wait_for_gate(
+                kind="navigation",
+                runtime=runtime,
+                state="awaiting_human_navigation",
+                event="human_navigation_required",
+                detail={
+                    "instruction": redact_public_text(
+                        instruction,
+                        self._redaction_values,
+                    )
+                    or "Human action is required"
+                },
             )
-            if origin_result.is_done:
-                return origin_result
-            origin_allowed = True
-        if not origin_allowed:
-            await self._publish("running", None, {})
-        return ActionResult(
-            extracted_content="Human navigation completed.",
-            long_term_memory="Human navigation completed; re-scan the current page before acting.",
-        )
+            if decision == "cancel":
+                return await self._cancelled_result(runtime)
+            try:
+                current_origin = _origin_from_url(
+                    await runtime.get_current_page_url()
+                )
+            except (RuntimeError, ValueError):
+                return await self._cancelled_result(runtime)
+            if current_origin not in self._approved_origins:
+                origin_result = await self.request_origin_approval(
+                    current_origin,
+                    runtime,
+                )
+                if origin_result.is_done:
+                    return origin_result
+            else:
+                await self._publish("running", None, {})
+            return GateResult(
+                extracted_content="Human navigation completed.",
+                long_term_memory=(
+                    "Human navigation completed; re-scan the current page before acting."
+                ),
+            )
+        finally:
+            await runtime.set_approved_origins(self._approved_origins)
 
     async def request_origin_approval(
         self,
         origin: str,
-        browser_session: BrowserSession,
-    ) -> ActionResult:
+        runtime: BrowserGateRuntime,
+    ) -> GateResult:
         canonical_origin = validate_approved_origin(origin)
         cancelled = False
         capped = False
@@ -419,51 +443,41 @@ class HumanGate:
             elif len(self._approved_origins) >= MAX_APPROVED_ORIGINS:
                 capped = True
             else:
-                domains = browser_session.browser_profile.allowed_domains
-                if not isinstance(domains, list) or not domains:
-                    raise RuntimeError(
-                        "Browser allowlist is not a mutable nonempty list"
-                    )
-                pattern = f"{canonical_origin}/"
-                if pattern not in domains:
-                    domains.append(pattern)
+                approved_origins = [*self._approved_origins, canonical_origin]
+                await runtime.set_approved_origins(approved_origins)
                 self._approved_origins.append(canonical_origin)
         if cancelled or capped:
-            return await self._cancelled_result(browser_session)
+            return await self._cancelled_result(runtime)
         if already_approved:
-            return ActionResult(
+            return GateResult(
                 extracted_content="Origin is already approved.",
                 long_term_memory="The requested origin is approved.",
             )
         try:
             current_origin = _origin_from_url(
-                await browser_session.get_current_page_url()
+                await runtime.get_current_page_url()
             )
         except (RuntimeError, ValueError):
-            return await self._cancelled_result(browser_session)
+            return await self._cancelled_result(runtime)
         if current_origin not in self._approved_origins:
-            return await self.request_origin_approval(
-                current_origin,
-                browser_session,
-            )
+            return await self.request_origin_approval(current_origin, runtime)
         await self._publish("running", None, {})
-        return ActionResult(
+        return GateResult(
             extracted_content="Origin approved.",
             long_term_memory="The requested and current origins are approved.",
         )
-
     async def request_additional_info(
         self,
         questions: Sequence[AdditionalInfoQuestion],
-        browser_session: BrowserSession,
-    ) -> ActionResult:
+        runtime: BrowserGateRuntime,
+    ) -> GateResult:
         public_questions, storage_questions = _prepare_additional_info_questions(
             questions,
             self._redaction_values,
         )
         decision, payload = await self._wait_for_gate(
             kind="additional_info",
-            browser_session=browser_session,
+            runtime=runtime,
             state="awaiting_additional_info",
             event="additional_info_required",
             detail={"questions": list(public_questions)},
@@ -471,14 +485,14 @@ class HumanGate:
             storage_questions=storage_questions,
         )
         if decision == "cancel":
-            return await self._cancelled_result(browser_session)
+            return await self._cancelled_result(runtime)
         if decision != "additional_info" or not isinstance(payload, tuple):
             raise RuntimeError("Additional-information gate returned an invalid result")
         response = AdditionalInfoRuntimeActionResponse(
             type="additional_info",
             answers=list(payload),
         )
-        return ActionResult(
+        return GateResult(
             extracted_content=response.model_dump_json(),
             long_term_memory=(
                 "Human-provided information was saved. Apply it, re-scan the "
@@ -489,8 +503,8 @@ class HumanGate:
     async def request_human_review(
         self,
         result: ReviewApplicationResult,
-        browser_session: BrowserSession,
-    ) -> ActionResult:
+        runtime: BrowserGateRuntime,
+    ) -> GateResult:
         review_result = sanitize_application_result(
             result,
             self._redaction_values,
@@ -501,13 +515,13 @@ class HumanGate:
         if not self._auto_submit:
             decision, context = await self._wait_for_gate(
                 kind="review",
-                browser_session=browser_session,
+                runtime=runtime,
                 state="awaiting_human_review",
                 event="review_required",
                 detail={},
             )
             if decision == "revise" and context is not None:
-                return ActionResult(
+                return GateResult(
                     extracted_content=(
                         "Human revision received. Apply it, re-scan the form, "
                         "then request review again."
@@ -516,11 +530,11 @@ class HumanGate:
                     metadata={"revision_count": self._revision_count},
                 )
             if decision == "submit":
-                return ActionResult(
+                return GateResult(
                     extracted_content=review_result.model_dump_json(),
                     long_term_memory="You're good to submit.",
                 )
-            return await self._cancelled_result(browser_session, review_result)
+            return await self._cancelled_result(runtime, review_result)
         if review_result.fields_needing_human:
             raise HarnessServiceError(422, "invalid_request", "Request is invalid")
         async with self._lock:
@@ -532,8 +546,8 @@ class HumanGate:
                     raise RuntimeError("A human gate is already pending")
                 self._submission_approved = True
         if cancelled:
-            return await self._cancelled_result(browser_session, review_result)
-        return ActionResult(
+            return await self._cancelled_result(runtime, review_result)
+        return GateResult(
             extracted_content=review_result.model_dump_json(),
             long_term_memory="You're good to submit.",
         )
@@ -548,16 +562,15 @@ class HumanGate:
         async with self._lock:
             pending = self._require_pending("origin")
             if pending.origin != canonical_origin:
-                raise self._conflict("The approved origin does not match the pending origin")
+                raise self._conflict(
+                    "The approved origin does not match the pending origin"
+                )
             if len(self._approved_origins) >= MAX_APPROVED_ORIGINS:
                 raise self._conflict("The approved-origin limit was reached")
-            domains = pending.browser_session.browser_profile.allowed_domains
-            if not isinstance(domains, list) or not domains:
-                raise RuntimeError("Browser allowlist is not a mutable nonempty list")
-            pattern = f"{canonical_origin}/"
-            if pattern in domains or canonical_origin in self._approved_origins:
+            if canonical_origin in self._approved_origins:
                 raise self._conflict("The origin is already approved")
-            domains.append(pattern)
+            approved_origins = [*self._approved_origins, canonical_origin]
+            await pending.runtime.set_approved_origins(approved_origins)
             self._approved_origins.append(canonical_origin)
             pending.future.set_result(("approve", None))
 
@@ -617,7 +630,7 @@ class HumanGate:
         self,
         *,
         kind: GateKind,
-        browser_session: BrowserSession,
+        runtime: BrowserGateRuntime,
         state: SessionState,
         event: str,
         detail: Mapping[str, object],
@@ -638,7 +651,7 @@ class HumanGate:
             pending = _PendingGate(
                 kind=kind,
                 future=future,
-                browser_session=browser_session,
+                runtime=runtime,
                 origin=origin,
                 questions=questions,
                 storage_questions=storage_questions,
@@ -646,7 +659,10 @@ class HumanGate:
             self._pending = pending
             await self._publish(state, event, detail)
         try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=self._action_timeout)
+            return await asyncio.wait_for(
+                asyncio.shield(future),
+                timeout=self._action_timeout,
+            )
         except TimeoutError:
             async with self._lock:
                 self._cancelled = True
@@ -669,12 +685,12 @@ class HumanGate:
 
     async def _cancelled_result(
         self,
-        browser_session: BrowserSession,
+        runtime: BrowserGateRuntime,
         result: ReviewApplicationResult | None = None,
-    ) -> ActionResult:
+    ) -> GateResult:
         try:
             current_url = redact_public_url(
-                await browser_session.get_current_page_url(),
+                await runtime.get_current_page_url(),
                 self._redaction_values,
             )
         except Exception:
@@ -701,7 +717,7 @@ class HumanGate:
                 submit_attempted=False,
                 submission_confirmation=None,
             )
-        return ActionResult(
+        return GateResult(
             is_done=True,
             success=False,
             extracted_content=cancelled.model_dump_json(),

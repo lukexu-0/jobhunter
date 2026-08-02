@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import jobhunter_browser_harness.user_info as user_info_module
-from jobhunter_browser_harness.browser import BrowserConfigurationError
+from jobhunter_browser_harness.playwright_cli import BrowserConfigurationError
 from jobhunter_browser_harness.models import (
     AdditionalInfoOption,
     AdditionalInfoDeclinedCommandAnswer,

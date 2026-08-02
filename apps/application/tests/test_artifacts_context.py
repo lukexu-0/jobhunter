@@ -15,6 +15,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 import jobhunter_browser_harness.artifacts as artifacts_module
 from jobhunter_browser_harness.artifacts import (
+    cleanup_orphaned_session_artifacts,
     PersonalInformation,
     StoredCandidateArtifacts,
     StoredUpload,
@@ -422,6 +423,26 @@ async def test_failed_cleanup_is_retained_and_retried(
     artifacts_module.retry_pending_cleanup()
     assert attempts == 2
     assert not session_directory.exists()
+
+
+def test_startup_cleanup_reclaims_only_orphaned_uuid_session_trees(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / str(SESSION_ID)
+    second = tmp_path / "00000000-0000-0000-0000-000000000012"
+    (first / "nested").mkdir(parents=True)
+    second.mkdir()
+    (first / "nested" / "private.txt").write_text("private", encoding="utf-8")
+    (second / "private.txt").write_text("private", encoding="utf-8")
+    unrelated = tmp_path / "operator-notes"
+    unrelated.mkdir()
+    (unrelated / "keep.txt").write_text("keep", encoding="utf-8")
+
+    assert cleanup_orphaned_session_artifacts(tmp_path)
+
+    assert not first.exists()
+    assert not second.exists()
+    assert (unrelated / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
 class PausingPdfUpload(UploadFile):

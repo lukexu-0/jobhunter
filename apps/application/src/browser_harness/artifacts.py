@@ -467,6 +467,42 @@ def retry_pending_cleanup() -> bool:
     return not _PENDING_CLEANUP
 
 
+def cleanup_orphaned_session_artifacts(root: Path) -> bool:
+    """Remove UUID-named session trees left without an in-memory owner."""
+
+    try:
+        root_descriptor, absolute_root = _open_directory_chain(root, create=False)
+    except FileNotFoundError:
+        return retry_pending_cleanup()
+    candidates: list[Path] = []
+    cleanup_ok = True
+    try:
+        with os.scandir(root_descriptor) as entries:
+            for entry in entries:
+                try:
+                    session_id = UUID(entry.name)
+                except ValueError:
+                    continue
+                if str(session_id) != entry.name:
+                    continue
+                candidate = absolute_root / entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    candidates.append(candidate)
+                    continue
+                try:
+                    os.unlink(entry.name, dir_fd=root_descriptor)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    _PENDING_CLEANUP.add(candidate)
+                    cleanup_ok = False
+    finally:
+        os.close(root_descriptor)
+    for candidate in candidates:
+        cleanup_ok = _best_effort_remove(candidate) and cleanup_ok
+    return retry_pending_cleanup() and cleanup_ok
+
+
 def _best_effort_remove(path: Path | None) -> bool:
     if path is None:
         return True
@@ -607,6 +643,7 @@ __all__ = [
     "PersonalInformation",
     "StoredCandidateArtifacts",
     "StoredUpload",
+    "cleanup_orphaned_session_artifacts",
     "cleanup_session_artifacts",
     "remove_session_artifacts",
     "retry_pending_cleanup",

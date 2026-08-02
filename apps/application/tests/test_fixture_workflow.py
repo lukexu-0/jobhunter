@@ -3,22 +3,24 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
-import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
-from browser_use import Browser
 from fastapi import UploadFile
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from fixtures.local_application import LocalApplicationFixture
-from jobhunter_browser_harness.browser import ResolvedBrowserLaunch
+from jobhunter_browser_harness.playwright_cli import (
+    PlaywrightCliRuntime,
+    ResolvedBrowserLaunch,
+)
 from jobhunter_browser_harness.models import (
     AdditionalInfoBooleanCommandAnswer,
     AdditionalInfoBooleanQuestion,
@@ -35,8 +37,9 @@ from jobhunter_browser_harness.models import (
     ReviewApplicationResult,
     SubmittedApplicationResult,
     ApproveRuntimeActionResponse,
-    BrowserUseResultRuntimeActionResponse,
-    BrowserUseRuntimeAction,
+    PlaywrightCliResultRuntimeActionResponse,
+    PlaywrightCliCommand,
+    PlaywrightCliRuntimeAction,
     ContinueCommand,
     ContinueRuntimeActionResponse,
     HarnessConfig,
@@ -121,6 +124,33 @@ def _chromium_executable() -> Path:
     return executable
 
 
+def _node_executable() -> Path:
+    configured = os.environ.get("JOBHUNTER_TEST_NODE_EXECUTABLE")
+    resolved = configured or shutil.which("node")
+    if resolved is None:
+        pytest.skip("Node.js is unavailable")
+    candidate = Path(resolved).expanduser()
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        pytest.skip("JOBHUNTER_TEST_NODE_EXECUTABLE does not name an executable file")
+    return candidate.resolve()
+
+
+def _playwright_cli_script() -> Path:
+    configured = os.environ.get("JOBHUNTER_TEST_PLAYWRIGHT_CLI_SCRIPT")
+    candidate = (
+        Path(configured).expanduser()
+        if configured
+        else Path(__file__).resolve().parents[2]
+        / "node_modules"
+        / "@playwright"
+        / "cli"
+        / "playwright-cli.js"
+    )
+    if not candidate.is_file():
+        pytest.skip("The Playwright CLI script is unavailable")
+    return candidate.resolve()
+
+
 def _upload(filename: str, content: bytes) -> UploadFile:
     return UploadFile(file=BytesIO(content), filename=filename)
 
@@ -183,43 +213,76 @@ async def _wait_for_state(
             await asyncio.sleep(0.02)
 
 
-async def _human_click(browser: Browser, element_id: str) -> None:
-    state = await browser.get_browser_state_summary(
-        include_screenshot=False,
-        cached=False,
-    )
-    assert state.dom_state is not None
-    index = await browser.get_index_by_id(element_id)
-    assert index is not None, f"Browser Use did not index human control #{element_id}"
-    node = state.dom_state.selector_map[index]
-    page = await browser.must_get_current_page()
-    element = await page.get_element(node.backend_node_id)
-    await element.click()
+def _element_ref(dom: str, accessible_name: str) -> str:
+    for line in dom.splitlines():
+        if f'"{accessible_name}"' not in line:
+            continue
+        match = re.search(r"\[ref=((?:f\d+)?e\d+)\]", line)
+        if match is not None:
+            return match.group(1)
+    raise AssertionError(f"No CLI element reference for {accessible_name!r} in:\n{dom}")
 
 
-async def _page_values(browser: Browser) -> dict[str, Any]:
-    page = await browser.must_get_current_page()
-    serialized = await page.evaluate(
-        """() => JSON.stringify({
-          fullName: document.querySelector('#full-name').value,
-          email: document.querySelector('#email').value,
-          incident: document.querySelector('#incident-answer').value,
-          workStyle: document.querySelector('#work-style').value,
-          focus: document.querySelector('input[name=focus]:checked')?.value || '',
-          truthful: document.querySelector('#truthful').checked,
-          years: document.querySelector('#years').value,
-          summerAvailability: document.querySelector('#summer-availability').value,
-          referralSource: document.querySelector('#referral-source').value,
-          resume: document.querySelector('#resume').files[0]?.name || '',
-          intermediateClick: document.querySelector('#intermediate-click').dataset.completed || '',
-          intermediateEnter: document.querySelector('#keypress-target').dataset.completed || '',
-          custom: document.querySelector('#custom-value').value,
-          humanNext: document.querySelector('#human-next').dataset.completed || '',
-          review: document.querySelector('#review-answer').value,
-          reviewVisible: !document.querySelector('#review-panel').hidden
-        })"""
+async def _cli(
+    manager: ApplicationSessionManager,
+    session_id: UUID,
+    command: PlaywrightCliCommand,
+    *args: str,
+) -> PlaywrightCliResultRuntimeActionResponse:
+    response = await manager.runtime_action(
+        session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command=command,
+            args=list(args),
+        ),
     )
-    return json.loads(serialized)
+    assert isinstance(response, PlaywrightCliResultRuntimeActionResponse)
+    assert response.exit_code == 0, response.stderr
+    assert response.timed_out is False
+    return response
+
+
+async def _human_click(runtime: PlaywrightCliRuntime, element_ref: str) -> None:
+    result = await runtime._invoke("click", [element_ref], timeout=120)
+    assert result.exit_code == 0, result.stderr
+    assert result.timed_out is False
+    assert runtime._reported_cli_error(result) is False
+
+
+async def _page_values(runtime: PlaywrightCliRuntime) -> dict[str, Any]:
+    result = await runtime.execute(
+        "eval",
+        [
+            """() => JSON.stringify({
+              fullName: document.querySelector('#full-name').value,
+              email: document.querySelector('#email').value,
+              incident: document.querySelector('#incident-answer').value,
+              workStyle: document.querySelector('#work-style').value,
+              focus: document.querySelector('input[name=focus]:checked')?.value || '',
+              truthful: document.querySelector('#truthful').checked,
+              years: document.querySelector('#years').value,
+              summerAvailability: document.querySelector('#summer-availability').value,
+              referralSource: document.querySelector('#referral-source').value,
+              resume: document.querySelector('#resume').files[0]?.name || '',
+              intermediateClick: document.querySelector('#intermediate-click').dataset.completed || '',
+              intermediateEnter: document.querySelector('#keypress-target').dataset.completed || '',
+              custom: document.querySelector('#custom-value').value,
+              humanNext: document.querySelector('#human-next').dataset.completed || '',
+              review: document.querySelector('#review-answer').value,
+              reviewVisible: !document.querySelector('#review-panel').hidden
+            })"""
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    serialized: object = payload["result"]
+    for _ in range(3):
+        if not isinstance(serialized, str):
+            break
+        serialized = json.loads(serialized)
+    assert isinstance(serialized, dict)
+    return serialized
 
 
 async def _wait_for_progress(
@@ -278,107 +341,30 @@ def _review_result(
     )
 
 
-def _fill_form_code(form_url: str, resume_path: str) -> str:
-    values = {
-        "full-name": "Ada Fixture",
-        "email": "ada.fixture@example.test",
-        "incident-answer": _RELEVANT_ANSWER,
-        "work-style": "remote",
-        "years": "7",
-        "keypress-target": "armed",
-    }
-    script = f"""(() => {{
-  const values = {json.dumps(values)};
-  const setValue = (id, value) => {{
-    const element = document.getElementById(id);
-    element.value = value;
-    element.dispatchEvent(new Event('input', {{bubbles: true}}));
-    element.dispatchEvent(new Event('change', {{bubbles: true}}));
-  }};
-  Object.entries(values).forEach(([id, value]) => setValue(id, value));
-  document.getElementById('focus-deployment').click();
-  document.getElementById('truthful').click();
-  document.getElementById('intermediate-click').click();
-  const checkpoint = document.getElementById('keypress-target');
-  checkpoint.dispatchEvent(new KeyboardEvent(
-    'keydown',
-    {{key: 'Enter', bubbles: true, cancelable: true}}
-  ));
-  window.setCustomWidget('evaluation-set');
-  return document.title;
-}})()"""
-    return (
-        f"new_tab({form_url!r})\n"
-        "wait_for_load()\n"
-        f"script = {script!r}\n"
-        "print(js(script))\n"
-        "document = cdp('DOM.getDocument', depth=0)\n"
-        "resume = cdp("
-        "'DOM.querySelector', "
-        "nodeId=document['root']['nodeId'], "
-        "selector='#resume'"
-        ")\n"
-        f"cdp('DOM.setFileInputFiles', files=[{resume_path!r}], "
-        "nodeId=resume['nodeId'])\n"
-        "js(\"document.getElementById('resume').dispatchEvent("
-        "new Event('change', {bubbles: true}))\")\n"
-        "print(page_info())"
-    )
-
-
-def _fill_additional_info_code(
-    summer_availability: str,
-    referral_source: str,
-) -> str:
-    values = {
-        "summer-availability": summer_availability,
-        "referral-source": referral_source,
-    }
-    script = f"""(() => {{
-  const values = {json.dumps(values)};
-  for (const [id, value] of Object.entries(values)) {{
-    const element = document.getElementById(id);
-    element.value = value;
-    element.dispatchEvent(new Event('input', {{bubbles: true}}));
-    element.dispatchEvent(new Event('change', {{bubbles: true}}));
-  }}
-}})()"""
-    return f"js({script!r})\nprint(page_info())"
-
-
-def _set_review_code(value: str) -> str:
-    script = (
-        "(() => { "
-        "const element = document.getElementById('review-answer'); "
-        f"element.value = {json.dumps(value)}; "
-        "element.dispatchEvent(new Event('input', {bubbles: true})); "
-        "})()"
-    )
-    return f"js({script!r})\nprint(page_info())"
-
-
-
-
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="Bubblewrap namespace execution requires Linux",
-)
 @pytest.mark.asyncio
 async def test_real_fixture_submits_once_after_automatic_review_approval(
     tmp_path: Path,
 ) -> None:
     executable = _chromium_executable()
+    node_executable = _node_executable()
+    playwright_cli_script = _playwright_cli_script()
     profile = tmp_path / "chromium-profile"
     profile.mkdir(mode=0o700)
     agent = _BlockingApplicationAgent()
+    runtimes: list[PlaywrightCliRuntime] = []
+
+    def runtime_factory(**kwargs: Any) -> PlaywrightCliRuntime:
+        runtime = PlaywrightCliRuntime(**kwargs)
+        runtimes.append(runtime)
+        return runtime
 
     with LocalApplicationFixture() as fixture:
         manager = ApplicationSessionManager(
             HarnessConfig(
                 bearer_token="fixture-token-0123456789abcdef-0123456789",
-                session_timeout=120,
-                browser_skill_workspace=tmp_path / "browser-skill" / "agent-workspace",
-                bubblewrap_executable=Path("/usr/bin/bwrap"),
+                session_timeout=240,
+                node_executable=node_executable,
+                playwright_cli_script=playwright_cli_script,
                 user_info_json=tmp_path / "user-info.json",
             ),
             artifacts_root=tmp_path / "sessions",
@@ -388,6 +374,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
                 user_data_dir=profile,
             ),
             model_factory=lambda *_args: agent,
+            runtime_factory=runtime_factory,
         )
         personal = _upload(
             "profile.md",
@@ -426,27 +413,22 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             await _wait_for_state(manager, created.session_id, "running")
             await asyncio.wait_for(agent.started.wait(), timeout=5)
             record = manager._active
-            assert record is not None and isinstance(record.browser, Browser)
+            assert record is not None
+            assert len(runtimes) == 1
+            runtime = record.playwright_runtime
+            assert runtime is runtimes[0]
             assert record.stored is not None
             initial_snapshot = manager.get_snapshot(created.session_id)
             assert (
                 initial_snapshot.expires_at - initial_snapshot.created_at
-            ).total_seconds() == 120
+            ).total_seconds() == 240
 
-            posting = await manager.runtime_action(
-                created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code=(
-                        f"new_tab({fixture.posting_url!r})\n"
-                        "wait_for_load()\n"
-                        "print(page_info())"
-                    ),
-                ),
-            )
-            assert isinstance(posting, BrowserUseResultRuntimeActionResponse)
-            assert posting.exit_code == 0
+            posting = await _cli(manager, created.session_id, "snapshot")
             assert posting.observation.url == fixture.posting_url
+            assert (
+                await runtime.get_current_page_url()
+                == fixture.posting_url
+            )
             assert "Reliability Engineer" in posting.observation.dom
             assert posting.observation.screenshot is not None
 
@@ -466,20 +448,100 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert automatic_origin_snapshot.state == "running"
             assert automatic_origin_snapshot.pending_action is None
 
-            fill = await manager.runtime_action(
+            form = await _cli(
+                manager,
                 created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code=_fill_form_code(
-                        fixture.form_url,
-                        str(record.stored.resume.path),
-                    ),
-                ),
+                "goto",
+                fixture.form_url,
             )
-            assert isinstance(fill, BrowserUseResultRuntimeActionResponse)
-            assert fill.exit_code == 0, fill.stderr
+            assert form.observation.url == fixture.form_url
+            assert "Human Next" in form.observation.dom
+            form_dom = form.observation.dom
+            await _cli(
+                manager,
+                created.session_id,
+                "fill",
+                _element_ref(form_dom, "Full name"),
+                "Ada Fixture",
+            )
+            await _cli(
+                manager,
+                created.session_id,
+                "fill",
+                _element_ref(form_dom, "Email"),
+                "ada.fixture@example.test",
+            )
+            await _cli(
+                manager,
+                created.session_id,
+                "fill",
+                _element_ref(form_dom, "Relevant incident"),
+                _RELEVANT_ANSWER,
+            )
+            await _cli(
+                manager,
+                created.session_id,
+                "select",
+                _element_ref(form_dom, "Preferred work style"),
+                "remote",
+            )
+            await _cli(
+                manager,
+                created.session_id,
+                "check",
+                _element_ref(form_dom, "Deployment systems"),
+            )
+            await _cli(
+                manager,
+                created.session_id,
+                "check",
+                _element_ref(form_dom, "I confirm these answers are truthful"),
+            )
+            await _cli(
+                manager,
+                created.session_id,
+                "fill",
+                _element_ref(form_dom, "Years of relevant experience"),
+                "7",
+            )
+            revealed_checkpoint = await _cli(
+                manager,
+                created.session_id,
+                "click",
+                _element_ref(form_dom, "Enable keyboard checkpoint"),
+            )
+            await _cli(
+                manager,
+                created.session_id,
+                "fill",
+                _element_ref(
+                    revealed_checkpoint.observation.dom,
+                    "Keyboard checkpoint",
+                ),
+                "armed",
+            )
+            await _cli(manager, created.session_id, "press", "Enter")
+            await _cli(
+                manager,
+                created.session_id,
+                "eval",
+                "() => window.setCustomWidget('evaluation-set')",
+            )
+            resume_path = record.stored.resume.path.resolve()
+            assert resume_path.is_absolute()
+            await _cli(
+                manager,
+                created.session_id,
+                "click",
+                _element_ref(form_dom, "Résumé"),
+            )
+            fill = await _cli(
+                manager,
+                created.session_id,
+                "upload",
+                str(resume_path),
+            )
             assert fill.observation.url == fixture.form_url
-            assert "Human Next" in fill.observation.dom
 
             before_additional_info = {
                 "fullName": "Ada Fixture",
@@ -671,18 +733,20 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             ] == "declined"
             assert "value" not in application_facts["compensation.expectation"]
 
-            applied_info = await manager.runtime_action(
+            await _cli(
+                manager,
                 created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code=_fill_additional_info_code(
-                        str(additional_info.answers[0].value),
-                        str(additional_info.answers[1].value),
-                    ),
-                ),
+                "fill",
+                _element_ref(form_dom, "Summer 2027 availability"),
+                str(additional_info.answers[0].value),
             )
-            assert isinstance(applied_info, BrowserUseResultRuntimeActionResponse)
-            assert applied_info.exit_code == 0, applied_info.stderr
+            applied_info = await _cli(
+                manager,
+                created.session_id,
+                "select",
+                _element_ref(form_dom, "Referral source"),
+                str(additional_info.answers[1].value),
+            )
             before_human = before_additional_info | {
                 "summerAvailability": _SUMMER_AVAILABILITY,
                 "referralSource": _REFERRAL_SOURCE,
@@ -715,28 +779,29 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
                     "Please inspect the completed first page and click Human Next."
                 ),
             }
-            await _human_click(record.browser, "human-next")
+            await _human_click(
+                runtime,
+                _element_ref(form_dom, "Human Next"),
+            )
+            assert (
+                await runtime.get_current_page_url()
+                == fixture.form_url
+            )
             await manager.command(
                 created.session_id,
                 ContinueCommand(type="continue"),
             )
             continued = await navigation_task
             assert isinstance(continued, ContinueRuntimeActionResponse)
-            inspected_review = await manager.runtime_action(
+            inspected_review = await _cli(
+                manager,
                 created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code="result = page_info()",
-                ),
+                "snapshot",
             )
-            assert isinstance(
-                inspected_review,
-                BrowserUseResultRuntimeActionResponse,
-            )
-            assert inspected_review.exit_code == 0, inspected_review.stderr
-            assert (await _page_values(record.browser))["review"] == (
-                "Initial perspective"
-            )
+            assert "Final review" in inspected_review.observation.dom
+            assert (
+                await _page_values(runtime)
+            )["review"] == "Initial perspective"
             question = AdditionalInfoTextQuestion(
                 id="review_emphasis",
                 key="application.review_emphasis",
@@ -784,21 +849,19 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert isinstance(late_info, AdditionalInfoRuntimeActionResponse)
             assert len(late_info.answers) == 1
             assert late_info.answers[0].value == _INITIAL_REVIEW_REPLY
-            applied_late_info = await manager.runtime_action(
+            applied_late_info = await _cli(
+                manager,
                 created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code=_set_review_code(_INITIAL_REVIEW_REPLY),
+                "fill",
+                _element_ref(
+                    inspected_review.observation.dom,
+                    "Review emphasis",
                 ),
+                _INITIAL_REVIEW_REPLY,
             )
-            assert isinstance(
-                applied_late_info,
-                BrowserUseResultRuntimeActionResponse,
-            )
-            assert applied_late_info.exit_code == 0, applied_late_info.stderr
-            assert (await _page_values(record.browser))["review"] == (
-                _INITIAL_REVIEW_REPLY
-            )
+            assert (
+                await _page_values(runtime)
+            )["review"] == _INITIAL_REVIEW_REPLY
 
 
             approved = await manager.runtime_action(
@@ -819,22 +882,15 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert manager.get_snapshot(created.session_id).pending_action is None
             assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
 
-            submission = await manager.runtime_action(
+            submission = await _cli(
+                manager,
                 created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code=(
-                        "js(\"document.getElementById('final-submit').click()\")\n"
-                        "wait(0.5)\n"
-                        "wait_for_load(timeout=15.0)\n"
-                        "wait_for_network_idle(timeout=10.0, idle_ms=500)\n"
-                        "print(page_info())"
-                    ),
+                "click",
+                _element_ref(
+                    inspected_review.observation.dom,
+                    "Submit application",
                 ),
             )
-            assert isinstance(submission, BrowserUseResultRuntimeActionResponse)
-            assert submission.exit_code == 0, submission.stderr
-            assert submission.timed_out is False
             assert submission.observation.url == fixture.form_url
             assert "Submitted 1 time(s)" not in applied_late_info.observation.dom
             assert "Submitted 1 time(s)" in submission.observation.dom
@@ -860,6 +916,14 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             submitted_snapshot = manager.get_snapshot(created.session_id)
             assert submitted_snapshot.pending_action is None
             assert submitted_snapshot.expires_at == initial_snapshot.expires_at
+            assert submitted_snapshot.playwright_cli_diagnostics
+            assert len(submitted_snapshot.playwright_cli_diagnostics) == (
+                record.playwright_cli_action_count
+            )
+            assert all(
+                diagnostic.status == "succeeded"
+                for diagnostic in submitted_snapshot.playwright_cli_diagnostics
+            )
             public_session_data = json.dumps(
                 {
                     "snapshot": submitted_snapshot.model_dump(mode="json"),
@@ -873,7 +937,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert _SUMMER_AVAILABILITY not in public_session_data
             assert '"status": "answered"' not in public_session_data
 
-            values = await _page_values(record.browser)
+            values = await _page_values(runtime)
             assert values == before_human | {
                 "humanNext": "true",
                 "review": _INITIAL_REVIEW_REPLY,
@@ -887,3 +951,4 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert submitted["last_submission"]["resume"] == "resume.pdf"
         finally:
             await manager.delete(created.session_id)
+            assert manager.get_snapshot(created.session_id).state == "closed"

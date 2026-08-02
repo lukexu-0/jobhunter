@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from threading import Event as ThreadEvent
 from types import SimpleNamespace
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -28,8 +27,9 @@ from jobhunter_browser_harness.context import (
     CandidateContextProcess,
     load_candidate_context,
 )
-from jobhunter_browser_harness.browser import (
+from jobhunter_browser_harness.playwright_cli import (
     BrowserConfigurationError,
+    PlaywrightCliRuntimeError,
     ResolvedBrowserLaunch,
 )
 from jobhunter_browser_harness.models import (
@@ -54,9 +54,9 @@ from jobhunter_browser_harness.models import (
     ApproveOriginCommand,
     BrowserTab,
     BrowserObservation,
-    BrowserUseExecutionResult,
-    BrowserUseResultRuntimeActionResponse,
-    BrowserUseRuntimeAction,
+    PlaywrightCliExecutionResult,
+    PlaywrightCliResultRuntimeActionResponse,
+    PlaywrightCliRuntimeAction,
     ContinueRuntimeActionResponse,
     CancelCommand,
     ContinueCommand,
@@ -74,7 +74,6 @@ from jobhunter_browser_harness.models import (
     SESSION_ERROR_MESSAGES,
 )
 from jobhunter_browser_harness.pipeline_agent import PipelineApplicationAgentError
-from jobhunter_browser_harness.skill_runtime import BrowserSkillRuntimeError
 from jobhunter_browser_harness.sessions import ApplicationSessionManager
 from jobhunter_browser_harness.tools import HumanGate
 
@@ -83,19 +82,6 @@ TOKEN = "test-token-0123456789abcdef-0123456789"
 AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
 JOB_URL = "https://jobs.example/openings/42?candidate=private-secret"
 PROFILE_SECRET = "ada.private@example.test"
-
-
-def _fake_bubblewrap(tmp_path: Path) -> Path:
-    executable = tmp_path / "fake-bwrap"
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o700)
-    return executable
-
-
-@pytest.fixture
-def fake_bubblewrap(tmp_path: Path) -> Path:
-    return _fake_bubblewrap(tmp_path)
-
 
 def upload(filename: str, content: bytes) -> UploadFile:
     return UploadFile(file=BytesIO(content), filename=filename)
@@ -272,40 +258,86 @@ class FakeModel:
 
 
 @dataclass(slots=True)
-class FakeBrowser:
-    origins: Sequence[str]
-    order: list[str]
+class FakePlaywrightRuntime:
+    order: list[str] = field(default_factory=list)
+    result: PlaywrightCliExecutionResult = field(
+        default_factory=lambda: playwright_execution_result()
+    )
+    results: list[PlaywrightCliExecutionResult] | None = None
+    blocker: asyncio.Event | None = None
+    error: PlaywrightCliRuntimeError | None = None
+    start_error: PlaywrightCliRuntimeError | None = None
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    commands: list[tuple[str, list[str]]] = field(default_factory=list)
+    close_failures: int = 0
+    close_cancels_active: bool = True
+    close_blocker: asyncio.Event | None = None
+    close_started: asyncio.Event = field(default_factory=asyncio.Event)
+    runtime_started: bool = False
+    closed: bool = False
+    active_task: asyncio.Task[Any] | None = None
+    job_url: str | None = None
     current_url: str = JOB_URL
-    killed: bool = False
-    browser_profile: SimpleNamespace = field(init=False)
-    kill_failures: int = 0
-    kill_started: asyncio.Event = field(default_factory=asyncio.Event)
-    kill_blocker: asyncio.Event | None = None
+    approved_origins: tuple[str, ...] = ()
+    navigation_guard_suspended: bool = False
 
-    def __post_init__(self) -> None:
-        self.browser_profile = SimpleNamespace(
-            allowed_domains=[f"{origin}/" for origin in self.origins]
-        )
+    async def start(self, job_url: str) -> None:
+        self.order.append("runtime.start")
+        self.job_url = job_url
+        self.current_url = job_url
+        self.runtime_started = True
+        if self.start_error is not None:
+            raise self.start_error
+
+    async def execute(
+        self, command: str, args: Sequence[str]
+    ) -> PlaywrightCliExecutionResult:
+        self.active_task = asyncio.current_task()
+        self.commands.append((command, list(args)))
+        self.started.set()
+        try:
+            if self.blocker is not None:
+                await self.blocker.wait()
+            if self.error is not None:
+                raise self.error
+            if self.results is not None:
+                if not self.results:
+                    raise AssertionError("No synthetic runtime result remains")
+                return self.results.pop(0)
+            return self.result
+        finally:
+            self.active_task = None
 
     async def get_current_page_url(self) -> str:
         return self.current_url
 
-    async def kill(self) -> None:
-        self.order.append("browser.kill")
-        self.kill_started.set()
-        if self.kill_failures:
-            self.kill_failures -= 1
-            raise RuntimeError("synthetic browser cleanup failure")
-        if self.kill_blocker is not None:
-            await self.kill_blocker.wait()
-        self.killed = True
+    async def set_approved_origins(self, origins: Sequence[str]) -> None:
+        self.approved_origins = tuple(origins)
+        self.navigation_guard_suspended = False
+
+    async def suspend_navigation_guard(self) -> None:
+        self.navigation_guard_suspended = True
+
+    async def close(self) -> None:
+        self.order.append("runtime.close")
+        self.close_started.set()
+        if self.close_failures:
+            self.close_failures -= 1
+            raise RuntimeError("synthetic Playwright cleanup failure")
+        active = self.active_task
+        if active is not None and active is not asyncio.current_task() and not active.done():
+            if self.close_cancels_active:
+                active.cancel()
+            await asyncio.gather(active, return_exceptions=True)
+        if self.close_blocker is not None:
+            await self.close_blocker.wait()
+        self.closed = True
 
 
-
-def browser_execution_result(
+def playwright_execution_result(
     url: str = "https://jobs.example/openings/42?private=value",
-) -> BrowserUseExecutionResult:
-    return BrowserUseExecutionResult(
+) -> PlaywrightCliExecutionResult:
+    return PlaywrightCliExecutionResult(
         exit_code=0,
         timed_out=False,
         stdout="completed",
@@ -323,52 +355,6 @@ def browser_execution_result(
     )
 
 
-@dataclass(slots=True)
-class FakeSkillRuntime:
-    result: BrowserUseExecutionResult = field(
-        default_factory=browser_execution_result
-    )
-    results: list[BrowserUseExecutionResult] | None = None
-    blocker: asyncio.Event | None = None
-    error: BrowserSkillRuntimeError | None = None
-    started: asyncio.Event = field(default_factory=asyncio.Event)
-    codes: list[str] = field(default_factory=list)
-    order: list[str] | None = None
-    runtime_started: bool = False
-    closed: bool = False
-    active_task: asyncio.Task[Any] | None = None
-
-    async def start(self) -> None:
-        if self.order is not None:
-            self.order.append("runtime.start")
-        self.runtime_started = True
-
-    async def execute(self, code: str) -> BrowserUseExecutionResult:
-        self.active_task = asyncio.current_task()
-        self.codes.append(code)
-        self.started.set()
-        try:
-            if self.blocker is not None:
-                await self.blocker.wait()
-            if self.error is not None:
-                raise self.error
-            if self.results is not None:
-                if not self.results:
-                    raise AssertionError("No synthetic runtime result remains")
-                return self.results.pop(0)
-            return self.result
-        finally:
-            self.active_task = None
-
-    async def close(self) -> None:
-        if self.order is not None:
-            self.order.append("runtime.close")
-        active = self.active_task
-        if active is not None and active is not asyncio.current_task() and not active.done():
-            active.cancel()
-            await asyncio.gather(active, return_exceptions=True)
-        self.closed = True
-
 class Fakes:
     def __init__(
         self,
@@ -376,8 +362,10 @@ class Fakes:
         order: list[str] | None = None,
         ready_error: PipelineApplicationAgentError | None = None,
         check_blocker: asyncio.Event | None = None,
-        browser_kill_failures: int = 0,
-        browser_kill_blocker: asyncio.Event | None = None,
+        runtime_start_error: PlaywrightCliRuntimeError | None = None,
+        runtime_close_failures: int = 0,
+        runtime_close_cancels_active: bool = True,
+        runtime_close_blocker: asyncio.Event | None = None,
         model_close_failures: int = 0,
         model_close_blocker: asyncio.Event | None = None,
         agent_result: ApplicationRunResult | None = None,
@@ -386,15 +374,17 @@ class Fakes:
         self.order = order if order is not None else []
         self.ready_error = ready_error
         self.check_blocker = check_blocker
-        self.browser_kill_failures = browser_kill_failures
-        self.browser_kill_blocker = browser_kill_blocker
+        self.runtime_start_error = runtime_start_error
+        self.runtime_close_failures = runtime_close_failures
+        self.runtime_close_cancels_active = runtime_close_cancels_active
+        self.runtime_close_blocker = runtime_close_blocker
         self.model_close_failures = model_close_failures
         self.model_close_blocker = model_close_blocker
         self.agent_result = agent_result
         self.agent_error = agent_error
         self.models: list[FakeModel] = []
-        self.browsers: list[FakeBrowser] = []
-        self.runtimes: list[FakeSkillRuntime] = []
+        self.runtimes: list[FakePlaywrightRuntime] = []
+        self.runtime_factory_calls: list[dict[str, Any]] = []
 
     def model_factory(
         self, _session_id: UUID, _pipeline_url: str, _token: str
@@ -411,26 +401,16 @@ class Fakes:
         self.models.append(model)
         return model
 
-    def browser_factory(
-        self,
-        _launch: ResolvedBrowserLaunch,
-        origins: Sequence[str],
-        downloads_path: Path,
-    ) -> FakeBrowser:
-        self.order.append("browser.factory")
-        downloads_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        browser = FakeBrowser(
-            tuple(origins),
-            self.order,
-            kill_failures=self.browser_kill_failures,
-            kill_blocker=self.browser_kill_blocker,
-        )
-        self.browsers.append(browser)
-        return browser
-
-    def skill_runtime_factory(self, **_kwargs: Any) -> FakeSkillRuntime:
+    def runtime_factory(self, **kwargs: Any) -> FakePlaywrightRuntime:
         self.order.append("runtime.factory")
-        runtime = FakeSkillRuntime(order=self.order)
+        self.runtime_factory_calls.append(kwargs)
+        runtime = FakePlaywrightRuntime(
+            order=self.order,
+            start_error=self.runtime_start_error,
+            close_cancels_active=self.runtime_close_cancels_active,
+            close_failures=self.runtime_close_failures,
+            close_blocker=self.runtime_close_blocker,
+        )
         self.runtimes.append(runtime)
         return runtime
 
@@ -451,7 +431,7 @@ Runner = Callable[
     [
         ApplicationRunRequest,
         FakeModel,
-        FakeBrowser,
+        FakePlaywrightRuntime,
         HumanGate,
         Callable[[int, str], Awaitable[None]],
     ],
@@ -473,8 +453,8 @@ def make_manager(
         HarnessConfig(
             bearer_token=TOKEN,
             session_timeout=timeout,
-            bubblewrap_executable=_fake_bubblewrap(tmp_path),
-            browser_skill_workspace=tmp_path / "browser-skill" / "agent-workspace",
+            node_executable=tmp_path / "node",
+            playwright_cli_script=tmp_path / "playwright-cli.js",
             user_info_json=tmp_path / "user-info.json",
         ),
         artifacts_root=root,
@@ -485,92 +465,91 @@ def make_manager(
         ),
         model_factory=doubles.model_factory,
         context_process_factory=context_process_factory,
-        browser_factory=doubles.browser_factory,
         application_runner=runner,
-        skill_runtime_factory=doubles.skill_runtime_factory,
+        runtime_factory=doubles.runtime_factory,
     )
     return manager, doubles, root
 
 
-def test_manager_probes_bubblewrap_and_creates_private_skill_workspace(
+@pytest.mark.asyncio
+async def test_startup_reclaims_daemons_and_orphaned_artifacts_once(
     tmp_path: Path,
-    fake_bubblewrap: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workspace = tmp_path / "browser-skill" / "agent-workspace"
+    manager, _fakes, root = make_manager(tmp_path, blocked_runner)
+    recovery_calls: list[dict[str, object]] = []
+    cleanup_calls: list[Path] = []
 
-    ApplicationSessionManager(
-        HarnessConfig(
-            bearer_token=TOKEN,
-            bubblewrap_executable=fake_bubblewrap,
-            browser_skill_workspace=workspace,
-            user_info_json=tmp_path / "user-info.json",
-        ),
-        artifacts_root=tmp_path / "sessions",
-        browser_launch=ResolvedBrowserLaunch(
-            cdp_url=None,
-            executable_path=tmp_path / "fake-chrome",
-            user_data_dir=tmp_path / "profile",
-        ),
+    async def recover(**kwargs: object) -> None:
+        recovery_calls.append(kwargs)
+
+    def cleanup(path: Path) -> bool:
+        cleanup_calls.append(path)
+        return True
+
+    monkeypatch.setattr(
+        sessions_module,
+        "recover_stale_playwright_cli_sessions",
+        recover,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "cleanup_orphaned_session_artifacts",
+        cleanup,
+        raising=False,
     )
 
-    assert workspace.is_dir()
-    assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
+    await manager.startup()
+    await manager.startup()
+
+    assert recovery_calls == [
+        {
+            "artifacts_root": root,
+            "node_executable": tmp_path / "node",
+            "cli_script": tmp_path / "playwright-cli.js",
+        }
+    ]
+    assert cleanup_calls == [root]
 
 
-def test_manager_rejects_workspace_env_file(
+async def test_manager_passes_resolved_cli_config_to_one_runtime(
     tmp_path: Path,
-    fake_bubblewrap: Path,
 ) -> None:
-    workspace = tmp_path / "browser-skill" / "agent-workspace"
-    workspace.mkdir(mode=0o700, parents=True)
-    workspace.parent.chmod(0o700)
-    (workspace / ".env").write_text("BROWSER_USE_API_KEY=must-not-load\n")
+    manager, fakes, root = make_manager(tmp_path, blocked_runner)
 
-    with pytest.raises(
-        BrowserConfigurationError,
-        match="Browser Use skill workspace contains an unexpected entry",
-    ):
-        ApplicationSessionManager(
-            HarnessConfig(
-                bearer_token=TOKEN,
-                browser_skill_workspace=workspace,
-                bubblewrap_executable=fake_bubblewrap,
-                user_info_json=tmp_path / "user-info.json",
-            ),
-            artifacts_root=tmp_path / "sessions",
-            browser_launch=ResolvedBrowserLaunch(
-                cdp_url=None,
-                executable_path=tmp_path / "fake-chrome",
-                user_data_dir=tmp_path / "profile",
-            ),
-        )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
 
+    assert len(fakes.runtimes) == 1
+    runtime = fakes.runtimes[0]
+    assert runtime.runtime_started is True
+    assert runtime.job_url == JOB_URL
+    assert runtime.approved_origins == ("https://jobs.example",)
+    assert len(fakes.runtime_factory_calls) == 1
+    call = fakes.runtime_factory_calls[0]
+    assert set(call) == {
+        "session_id",
+        "launch",
+        "session_directory",
+        "deadline",
+        "node_executable",
+        "cli_script",
+    }
+    assert call["session_id"] == created.session_id
+    assert call["launch"] == ResolvedBrowserLaunch(
+        cdp_url=None,
+        executable_path=tmp_path / "fake-chrome",
+        user_data_dir=tmp_path / "profile",
+    )
+    assert call["session_directory"].parent == root
+    assert call["node_executable"] == tmp_path / "node"
+    assert call["cli_script"] == tmp_path / "playwright-cli.js"
+    assert isinstance(call["deadline"], float)
+    record = manager._active
+    assert record is not None and record.playwright_runtime is runtime
 
-def test_manager_rejects_unusable_bubblewrap_without_fallback(tmp_path: Path) -> None:
-    bubblewrap = tmp_path / "broken-bwrap"
-    bubblewrap.write_text("#!/bin/sh\nexit 7\n")
-    bubblewrap.chmod(0o700)
-
-    with pytest.raises(
-        BrowserConfigurationError,
-        match="Bubblewrap namespace isolation is unavailable",
-    ):
-        ApplicationSessionManager(
-            HarnessConfig(
-                bearer_token=TOKEN,
-                bubblewrap_executable=bubblewrap,
-                browser_skill_workspace=(
-                    tmp_path / "browser-skill" / "agent-workspace"
-                ),
-                user_info_json=tmp_path / "user-info.json",
-            ),
-            artifacts_root=tmp_path / "sessions",
-            browser_launch=ResolvedBrowserLaunch(
-                cdp_url=None,
-                executable_path=tmp_path / "fake-chrome",
-                user_data_dir=tmp_path / "profile",
-            ),
-        )
+    await manager.delete(created.session_id)
 
 
 async def create_valid(
@@ -624,7 +603,7 @@ def decode_frame(frame: str) -> dict[str, Any]:
 async def blocked_runner(
     _request: ApplicationRunRequest,
     _model: FakeModel,
-    _browser: FakeBrowser,
+    playwright_runtime: FakePlaywrightRuntime,
     _gate: HumanGate,
     _step: Callable[[int, str], Awaitable[None]],
 ) -> ApplicationRunResult:
@@ -675,11 +654,11 @@ async def test_invalid_create_values_fail_before_storage(
     assert_service_error(caught.value, 422, "invalid_request", "Request is invalid")
     assert storage_called is False
     assert fakes.models == []
-    assert fakes.browsers == []
+    assert fakes.runtimes == []
     assert not root.exists()
 
 
-async def test_preflight_completes_before_browser_and_create_contract_is_public_safe(
+async def test_preflight_completes_before_playwright_runtime_and_create_contract_is_public_safe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -691,7 +670,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
     async def runner(
         request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -726,7 +705,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
     assert response.state == "starting"
     assert response.events_url == f"http://127.0.0.1:8765/v1/sessions/{response.session_id}/events"
     assert response.commands_url == f"http://127.0.0.1:8765/v1/sessions/{response.session_id}/commands"
-    assert order[:2] == ["model.check_ready", "browser.factory"]
+    assert order[:2] == ["model.check_ready", "runtime.factory"]
     assert snapshot.state == "starting"
     assert snapshot.job_url == "https://jobs.example/[redacted]/42"
     assert snapshot.approved_origins == ["https://jobs.example"]
@@ -762,7 +741,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
     }
 
     await manager.delete(response.session_id)
-    assert fakes.browsers[0].killed
+    assert fakes.runtimes[0].closed
     assert fakes.models[0].closed
 
 
@@ -773,7 +752,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
         ("pipeline_unavailable", "The local pipeline model service is unavailable", 503),
     ],
 )
-async def test_preflight_errors_cleanup_before_browser_factory(
+async def test_preflight_errors_cleanup_before_playwright_runtime_factory(
     tmp_path: Path, code: str, message: str, status: int
 ) -> None:
     fakes = Fakes(ready_error=PipelineApplicationAgentError(code, message))
@@ -783,7 +762,42 @@ async def test_preflight_errors_cleanup_before_browser_factory(
         await create_valid(manager)
 
     assert_service_error(caught.value, status, code, message)
-    assert fakes.browsers == []
+    assert fakes.runtimes == []
+    assert fakes.models[0].closed
+    assert manager._active is None
+    assert not root.exists() or tuple(root.iterdir()) == ()
+
+
+async def test_runtime_start_session_timeout_preserves_timeout_failure(
+    tmp_path: Path,
+) -> None:
+    session_id = UUID("18e0c59f-5808-437b-b508-f2411b08fca5")
+    fakes = Fakes(
+        runtime_start_error=PlaywrightCliRuntimeError("session_timeout")
+    )
+    manager, fakes, root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=fakes,
+    )
+
+    with pytest.raises(HarnessServiceError) as caught:
+        await create_valid(manager, session_id=session_id)
+
+    assert_service_error(
+        caught.value,
+        504,
+        "session_timeout",
+        SESSION_ERROR_MESSAGES["session_timeout"],
+    )
+    tombstone = manager._tombstones[session_id]
+    assert tombstone.snapshot.state == "failed"
+    assert tombstone.snapshot.error is not None
+    assert tombstone.snapshot.error.model_dump() == {
+        "code": "session_timeout",
+        "message": SESSION_ERROR_MESSAGES["session_timeout"],
+    }
+    assert fakes.runtimes[0].closed
     assert fakes.models[0].closed
     assert manager._active is None
     assert not root.exists() or tuple(root.iterdir()) == ()
@@ -940,19 +954,19 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
         await step(1, f"https://jobs.example/openings/42?email={PROFILE_SECRET}")
         navigation = await gate.request_human_navigation(
-            f"Complete verification for {PROFILE_SECRET}", browser
+            f"Complete verification for {PROFILE_SECRET}", playwright_runtime
         )
         if navigation.is_done:
             return CancelledApplicationResult.model_validate_json(
                 navigation.extracted_content
             )
-        review = await gate.request_human_review(review_result(), browser)
+        review = await gate.request_human_review(review_result(), playwright_runtime)
         if review.is_done:
             return CancelledApplicationResult.model_validate_json(
                 review.extracted_content
@@ -965,7 +979,7 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
     record = manager._active
-    assert record is not None and record.browser is not None and record.human_gate is not None
+    assert record is not None and record.playwright_runtime is not None and record.human_gate is not None
     navigation_snapshot = manager.get_snapshot(created.session_id)
     assert navigation_snapshot.pending_action is not None
     assert navigation_snapshot.pending_action.model_dump(mode="json") == {
@@ -979,7 +993,7 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     )[0].session
     assert navigation_replay.pending_action == navigation_snapshot.pending_action
     assert navigation_replay.expires_at == navigation_snapshot.expires_at
-    record.browser.current_url = "https://ats.example/application/42?token=private"
+    record.playwright_runtime.current_url = "https://ats.example/application/42?token=private"
 
     await manager.command(created.session_id, ContinueCommand(type="continue"))
     await wait_until(
@@ -1011,12 +1025,13 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     assert submit.value.code == "command_conflict"
     submission_response = await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(
-            type="browser_use",
-            code="click_at_xy(10, 10)",
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="click",
+            args=["button#submit"],
         ),
     )
-    assert isinstance(submission_response, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(submission_response, PlaywrightCliResultRuntimeActionResponse)
     submission_executed.set()
     await wait_state(manager, created.session_id, "submitted")
     assert manager.get_snapshot(created.session_id).pending_action is None
@@ -1039,10 +1054,10 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
         "https://jobs.example",
         "https://ats.example",
     )
-    assert record.browser.browser_profile.allowed_domains == [
-        "https://jobs.example/",
-        "https://ats.example/",
-    ]
+    assert record.playwright_runtime.approved_origins == (
+        "https://jobs.example",
+        "https://ats.example",
+    )
     event_names = [event.event for event in record.events]
     assert event_names == [
         "session_started",
@@ -1054,12 +1069,12 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
         "application_submitted",
     ]
     assert [event.id for event in record.events] == list(range(1, 8))
-    assert record.events[3].session.pending_action is None
+    assert record.events[4].session.pending_action is None
     public_events = json.dumps([event.model_dump(mode="json") for event in record.events])
     assert PROFILE_SECRET not in public_events
     assert "token=private" not in public_events
     assert "Application received." not in public_events
-    assert record.browser.killed is False
+    assert record.playwright_runtime.closed is False
     assert record.model is not None and record.model.closed is False
     assert record.stored is not None and record.stored.session_directory.exists()
     assert any(root.iterdir())
@@ -1070,7 +1085,7 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     with pytest.raises(HarnessServiceError) as submitted_runtime:
         await manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="print('late')"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('late')"]),
         )
     assert submitted_runtime.value.code == "command_conflict"
 
@@ -1099,12 +1114,12 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     async def gated_runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
         try:
-            action = await gate.request_human_navigation("Continue in the browser", browser)
+            action = await gate.request_human_navigation("Continue in the browser", playwright_runtime)
             return CancelledApplicationResult.model_validate_json(
                 action.extracted_content
             )
@@ -1125,7 +1140,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
         current_record: Any, event: str, detail: dict[str, object]
     ) -> None:
         if event == "closed":
-            assert manager._active is None
+            assert manager._active is current_record
             assert current_record.snapshot.slot_released is True
             assert not artifact_directory.exists()
             order.append("event.closed")
@@ -1137,8 +1152,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
 
     assert order.index("gate.cancel") < order.index("runner.done")
     assert order.index("runner.done") < order.index("runtime.close")
-    assert order.index("runtime.close") < order.index("browser.kill")
-    assert order.index("browser.kill") < order.index("model.aclose")
+    assert order.index("runtime.close") < order.index("model.aclose")
     assert order.index("model.aclose") < order.index("artifacts.cleanup")
     assert order.index("artifacts.cleanup") < order.index("event.closed")
     assert not artifact_directory.exists()
@@ -1148,7 +1162,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     tombstone = manager._tombstones[created.session_id]
     assert tombstone.events[-1].event == "closed"
     assert manager._active is None
-    assert fakes.browsers[0].killed and fakes.models[0].closed
+    assert fakes.runtimes[0].closed and fakes.models[0].closed
     assert fakes.runtimes[0].closed
 
     event_count = len(tombstone.events)
@@ -1160,6 +1174,59 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     replacement = await create_valid(manager)
     assert replacement.session_id != created.session_id
     await manager.delete(replacement.session_id)
+
+
+async def test_terminal_event_is_published_before_tombstone_exposure(
+    tmp_path: Path,
+) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    last_event_id = record.events[-1].id
+    original_publish = manager._publish_event
+    terminal_publish_started = asyncio.Event()
+    allow_terminal_publish = asyncio.Event()
+
+    async def blocked_publish(
+        current_record: Any, event: str, detail: dict[str, object]
+    ) -> None:
+        if event == "closed":
+            terminal_publish_started.set()
+            await allow_terminal_publish.wait()
+        await original_publish(current_record, event, detail)
+
+    manager._publish_event = blocked_publish  # type: ignore[method-assign]
+    deletion = asyncio.create_task(manager.delete(created.session_id))
+    stream = None
+    next_frame: asyncio.Task[str] | None = None
+    try:
+        await asyncio.wait_for(terminal_publish_started.wait(), timeout=1)
+        assert manager._active is record
+        assert created.session_id not in manager._tombstones
+
+        stream = manager.stream_events(created.session_id, last_event_id)
+        next_frame = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        assert next_frame.done() is False
+
+        allow_terminal_publish.set()
+        payload = decode_frame(await asyncio.wait_for(next_frame, timeout=1))
+        assert payload["event"] == "closed"
+        await asyncio.wait_for(deletion, timeout=1)
+    finally:
+        allow_terminal_publish.set()
+        if not deletion.done():
+            await asyncio.wait_for(deletion, timeout=1)
+        if next_frame is not None and not next_frame.done():
+            next_frame.cancel()
+            await asyncio.gather(next_frame, return_exceptions=True)
+        if stream is not None:
+            await stream.aclose()
+
+    tombstone = manager._tombstones[created.session_id]
+    assert tombstone.events[-1].event == "closed"
 
 
 @pytest.mark.parametrize(
@@ -1221,7 +1288,7 @@ async def test_runner_failure_mappings_are_sanitized_and_cleanup(
     async def failing_runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -1239,7 +1306,7 @@ async def test_runner_failure_mappings_are_sanitized_and_cleanup(
     }
     public = snapshot.model_dump_json()
     assert "raw provider secret" not in public
-    assert fakes.browsers[0].killed and fakes.models[0].closed
+    assert fakes.runtimes[0].closed and fakes.models[0].closed
     assert manager._active is None
     assert manager._tombstones[created.session_id].events[-1].event == "failed"
 
@@ -1248,7 +1315,7 @@ async def test_cancelled_runner_result_has_no_error_and_releases_slot(tmp_path: 
     async def cancelled_runner(
         request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -1283,7 +1350,7 @@ async def test_cancelled_runner_result_has_no_error_and_releases_slot(tmp_path: 
     assert PROFILE_SECRET not in snapshot.model_dump_json()
     assert manager._tombstones[created.session_id].events[-1].event == "cancelled"
     assert manager._active is None
-    assert fakes.browsers[0].killed and fakes.models[0].closed
+    assert fakes.runtimes[0].closed and fakes.models[0].closed
 
 
 async def test_cancel_command_interrupts_active_model_call_before_cleanup(tmp_path: Path) -> None:
@@ -1292,7 +1359,7 @@ async def test_cancel_command_interrupts_active_model_call_before_cleanup(tmp_pa
     async def model_runner(
         _request: ApplicationRunRequest,
         model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -1311,11 +1378,11 @@ async def test_cancel_command_interrupts_active_model_call_before_cleanup(tmp_pa
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.state == "cancelled" and snapshot.error is None
     assert fakes.models[0].active_finished.is_set()
-    assert order.index("model.active_finished") < order.index("browser.kill")
-    assert order.index("browser.kill") < order.index("model.aclose")
+    assert order.index("model.active_finished") < order.index("runtime.close")
+    assert order.index("runtime.close") < order.index("model.aclose")
 
 
-async def test_delete_during_blocked_preflight_cancels_setup_and_cleans_without_browser(
+async def test_delete_during_blocked_preflight_cancels_setup_and_cleans_without_playwright_runtime(
     tmp_path: Path,
 ) -> None:
     blocker = asyncio.Event()
@@ -1330,7 +1397,7 @@ async def test_delete_during_blocked_preflight_cancels_setup_and_cleans_without_
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(creation, timeout=1)
-    assert fakes.browsers == []
+    assert fakes.runtimes == []
     assert fakes.models[0].closed
     assert manager.get_snapshot(record.session_id).state == "closed"
     assert manager._tombstones[record.session_id].events[-1].event == "closed"
@@ -1360,17 +1427,56 @@ async def test_absolute_ttl_maps_to_session_timeout_without_real_sleep(tmp_path:
         "message": "The application session expired",
     }
     await asyncio.wait_for(record.closed_event.wait(), timeout=1)
-    assert fakes.browsers[0].killed and fakes.models[0].closed
+    assert fakes.runtimes[0].closed and fakes.models[0].closed
+
+
+async def test_expiry_cannot_publish_after_concurrent_delete_tombstones_session(
+    tmp_path: Path,
+) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.ttl_task is not None
+    record.ttl_task.cancel()
+    await asyncio.gather(record.ttl_task, return_exceptions=True)
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
+    record.submission_action_started = True
+    original_park = manager._park_submission_uncertain
+    allow_park = asyncio.Event()
+
+    async def delayed_park(current_record: Any) -> None:
+        await allow_park.wait()
+        await original_park(current_record)
+
+    manager._park_submission_uncertain = delayed_park  # type: ignore[method-assign]
+    await record.request_lock.acquire()
+    deletion = asyncio.create_task(manager.delete(created.session_id))
+    await asyncio.sleep(0)
+    expiry = asyncio.create_task(manager._expire_session(record))
+    await asyncio.sleep(0)
+    record.request_lock.release()
+
+    await asyncio.wait_for(deletion, timeout=1)
+    terminal_events = tuple(record.events)
+    allow_park.set()
+    await asyncio.wait_for(expiry, timeout=1)
+
+    assert record.snapshot.state == "closed"
+    assert tuple(record.events) == terminal_events
+    tombstone = manager._tombstones[created.session_id]
+    assert tombstone.snapshot.state == "closed"
+    assert tombstone.events == terminal_events
 
 async def test_expired_setup_cannot_publish_running_after_timeout(
     tmp_path: Path,
 ) -> None:
     preflight_release = asyncio.Event()
     ttl_release = asyncio.Event()
-    browser_kill_release = asyncio.Event()
+    runtime_close_release = asyncio.Event()
     fakes = Fakes(
         check_blocker=preflight_release,
-        browser_kill_blocker=browser_kill_release,
+        runtime_close_blocker=runtime_close_release,
     )
     manager, _fakes, _root = make_manager(
         tmp_path,
@@ -1403,7 +1509,7 @@ async def test_expired_setup_cannot_publish_running_after_timeout(
         assert snapshot.slot_released is False
         assert [event.event for event in record.events] == ["failed"]
     finally:
-        browser_kill_release.set()
+        runtime_close_release.set()
         await asyncio.wait_for(record.closed_event.wait(), timeout=1)
 
     tombstone = manager._tombstones[created.session_id]
@@ -1417,19 +1523,19 @@ async def test_expired_agent_result_cannot_beat_absolute_timeout(
 ) -> None:
     result_release = asyncio.Event()
     ttl_release = asyncio.Event()
-    browser_kill_release = asyncio.Event()
+    runtime_close_release = asyncio.Event()
 
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
         await result_release.wait()
         return cancelled_result()
 
-    fakes = Fakes(browser_kill_blocker=browser_kill_release)
+    fakes = Fakes(runtime_close_blocker=runtime_close_release)
     manager, _fakes, _root = make_manager(
         tmp_path,
         runner,
@@ -1464,7 +1570,7 @@ async def test_expired_agent_result_cannot_beat_absolute_timeout(
         assert snapshot.error.code == "session_timeout"
         assert [event.event for event in record.events][-1] == "failed"
     finally:
-        browser_kill_release.set()
+        runtime_close_release.set()
         await asyncio.wait_for(record.closed_event.wait(), timeout=1)
 
     tombstone = manager._tombstones[created.session_id]
@@ -1481,7 +1587,7 @@ async def test_expired_agent_error_cannot_beat_absolute_timeout(
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -1533,13 +1639,13 @@ async def test_continue_at_absolute_deadline_fails_before_resuming_gate(
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
         navigation = await gate.request_human_navigation(
             "Complete verification in the browser",
-            browser,
+            playwright_runtime,
         )
         if not navigation.is_done:
             navigation_resumed.set()
@@ -1551,7 +1657,7 @@ async def test_continue_at_absolute_deadline_fails_before_resuming_gate(
     manager, fakes, _root = make_manager(
         tmp_path,
         runner,
-        fakes=Fakes(browser_kill_blocker=cleanup_blocker),
+        fakes=Fakes(runtime_close_blocker=cleanup_blocker),
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
@@ -1583,8 +1689,8 @@ async def test_continue_at_absolute_deadline_fails_before_resuming_gate(
         assert not navigation_resumed.is_set()
         assert record.events[-1].event == "failed"
         assert record.events[-1].session.state == "failed"
-        await wait_until(lambda: fakes.browsers[0].kill_started.is_set())
-        assert not fakes.browsers[0].killed
+        await wait_until(lambda: fakes.runtimes[0].close_started.is_set())
+        assert not fakes.runtimes[0].closed
     finally:
         cleanup_blocker.set()
         if record.final_request is None:
@@ -1592,7 +1698,7 @@ async def test_continue_at_absolute_deadline_fails_before_resuming_gate(
         else:
             await asyncio.wait_for(record.closed_event.wait(), timeout=1)
 
-    assert fakes.browsers[0].killed
+    assert fakes.runtimes[0].closed
     assert manager._tombstones[created.session_id].events[-1].event == "snapshot"
     assert manager._tombstones[created.session_id].snapshot.slot_released is True
     assert sum(
@@ -1610,11 +1716,11 @@ async def test_submission_action_cannot_start_after_absolute_deadline(
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
-        review = await gate.request_human_review(review_result(), browser)
+        review = await gate.request_human_review(review_result(), playwright_runtime)
         if review.is_done:
             return CancelledApplicationResult.model_validate_json(
                 review.extracted_content
@@ -1626,7 +1732,7 @@ async def test_submission_action_cannot_start_after_absolute_deadline(
     manager, fakes, _root = make_manager(
         tmp_path,
         runner,
-        fakes=Fakes(browser_kill_blocker=cleanup_blocker),
+        fakes=Fakes(runtime_close_blocker=cleanup_blocker),
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "awaiting_human_review")
@@ -1642,10 +1748,7 @@ async def test_submission_action_cannot_start_after_absolute_deadline(
         with pytest.raises(HarnessServiceError) as caught:
             await manager.runtime_action(
                 created.session_id,
-                BrowserUseRuntimeAction(
-                    type="browser_use",
-                    code="click_at_xy(10, 10)",
-                ),
+                PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
             )
         assert_service_error(
             caught.value,
@@ -1675,7 +1778,7 @@ async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_pa
 
     assert manager.get_snapshot(created.session_id).state == "closed"
     assert manager._tombstones[created.session_id].events[-1].event == "closed"
-    assert fakes.browsers[0].killed and fakes.models[0].closed
+    assert fakes.runtimes[0].closed and fakes.models[0].closed
     personal, resume = valid_uploads()
     with pytest.raises(HarnessServiceError) as caught:
         await manager.create_session(
@@ -1699,7 +1802,7 @@ async def test_tombstones_are_bounded_to_32_and_oldest_id_is_evicted(tmp_path: P
     async def immediate_cancelled(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -1759,7 +1862,7 @@ async def test_event_buffer_replay_eviction_snapshot_and_monotonic_ids(tmp_path:
     await manager.delete(created.session_id)
 
 
-async def test_agent_step_uses_job_url_for_internal_browser_page(tmp_path: Path) -> None:
+async def test_agent_step_uses_job_url_for_internal_runtime_page(tmp_path: Path) -> None:
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
@@ -1793,7 +1896,7 @@ async def test_sse_heartbeat_and_disconnect_do_not_cancel_work(
 
     assert manager._active is record
     assert record.agent_task is not None and not record.agent_task.done()
-    assert fakes.browsers[0].killed is False
+    assert fakes.runtimes[0].closed is False
     await manager.delete(created.session_id)
 
 
@@ -1861,15 +1964,15 @@ async def test_api_unknown_and_terminal_command_responses(tmp_path: Path) -> Non
 async def test_duplicate_cancel_conflicts_while_first_finalizer_is_pending(
     tmp_path: Path,
 ) -> None:
-    kill_blocker = asyncio.Event()
-    fakes = Fakes(browser_kill_blocker=kill_blocker)
+    close_blocker = asyncio.Event()
+    fakes = Fakes(runtime_close_blocker=close_blocker)
     manager, fakes, _root = make_manager(tmp_path, blocked_runner, fakes=fakes)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
 
     await manager.command(created.session_id, CancelCommand(type="cancel"))
     await wait_until(
-        lambda: bool(fakes.browsers) and fakes.browsers[0].kill_started.is_set()
+        lambda: bool(fakes.runtimes) and fakes.runtimes[0].close_started.is_set()
     )
     assert manager._active is not None
     assert manager.get_snapshot(created.session_id).state == "running"
@@ -1882,7 +1985,7 @@ async def test_duplicate_cancel_conflicts_while_first_finalizer_is_pending(
         "A terminal command is already pending",
     )
 
-    kill_blocker.set()
+    close_blocker.set()
     await wait_state(manager, created.session_id, "cancelled")
     assert manager._active is None
 
@@ -1890,21 +1993,21 @@ async def test_duplicate_cancel_conflicts_while_first_finalizer_is_pending(
 async def test_delete_during_natural_finalization_joins_shielded_owner_and_closes(
     tmp_path: Path,
 ) -> None:
-    kill_blocker = asyncio.Event()
+    close_blocker = asyncio.Event()
 
     async def failing_runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
         raise RuntimeError("synthetic runner failure")
 
-    fakes = Fakes(browser_kill_blocker=kill_blocker)
+    fakes = Fakes(runtime_close_blocker=close_blocker)
     manager, fakes, _root = make_manager(tmp_path, failing_runner, fakes=fakes)
     created = await create_valid(manager)
-    await wait_until(lambda: fakes.browsers[0].kill_started.is_set())
+    await wait_until(lambda: fakes.runtimes[0].close_started.is_set())
     record = manager._active
     assert record is not None and record.finalizer_task is not None
 
@@ -1919,7 +2022,7 @@ async def test_delete_during_natural_finalization_joins_shielded_owner_and_close
     joined_delete = asyncio.create_task(manager.delete(created.session_id))
     await asyncio.sleep(0)
     assert not joined_delete.done()
-    kill_blocker.set()
+    close_blocker.set()
     await asyncio.wait_for(joined_delete, timeout=1)
 
     snapshot = manager.get_snapshot(created.session_id)
@@ -1945,11 +2048,11 @@ async def test_cleanup_observation_timeouts_do_not_cancel_owned_tasks_or_release
                 raise TimeoutError
         return await original_wait_for(awaitable, timeout)
 
-    kill_blocker = asyncio.Event()
-    close_blocker = asyncio.Event()
+    runtime_close_blocker = asyncio.Event()
+    model_close_blocker = asyncio.Event()
     fakes = Fakes(
-        browser_kill_blocker=kill_blocker,
-        model_close_blocker=close_blocker,
+        runtime_close_blocker=runtime_close_blocker,
+        model_close_blocker=model_close_blocker,
     )
     manager, fakes, _root = make_manager(tmp_path, blocked_runner, fakes=fakes)
     created = await create_valid(manager)
@@ -1957,14 +2060,14 @@ async def test_cleanup_observation_timeouts_do_not_cancel_owned_tasks_or_release
     monkeypatch.setattr(sessions_module.asyncio, "wait_for", observing_wait_for)
 
     await manager.command(created.session_id, CancelCommand(type="cancel"))
-    await original_wait_for(fakes.browsers[0].kill_started.wait(), timeout=1)
+    await original_wait_for(fakes.runtimes[0].close_started.wait(), timeout=1)
     await original_sleep(0)
     record = manager._active
-    assert record is not None and record.browser_kill_task is not None
-    assert not record.browser_kill_task.cancelled()
-    assert fakes.browsers[0].killed is False
+    assert record is not None and record.runtime_close_task is not None
+    assert not record.runtime_close_task.cancelled()
+    assert fakes.runtimes[0].closed is False
 
-    kill_blocker.set()
+    runtime_close_blocker.set()
     await original_wait_for(fakes.models[0].close_started.wait(), timeout=1)
     await original_sleep(0)
     assert manager._active is record
@@ -1972,15 +2075,13 @@ async def test_cleanup_observation_timeouts_do_not_cancel_owned_tasks_or_release
     assert not record.model_close_task.cancelled()
     assert fakes.models[0].closed is False
 
-    close_blocker.set()
+    model_close_blocker.set()
     await wait_state(manager, created.session_id, "cancelled")
     assert timed_out == {30}
-    assert observations == 5
+    assert observations == 4
     assert manager._active is None
-    assert fakes.browsers[0].killed and fakes.models[0].closed
-    assert fakes.runtimes[0].closed
+    assert fakes.runtimes[0].closed and fakes.models[0].closed
     assert fakes.order.count("runtime.close") == 1
-    assert fakes.order.count("browser.kill") == 1
     assert fakes.order.count("model.aclose") == 1
 
 
@@ -2068,7 +2169,7 @@ async def test_absolute_ttl_begins_during_model_preflight_setup(tmp_path: Path) 
     await wait_state(manager, record.session_id, "failed")
     assert manager.get_snapshot(record.session_id).error is not None
     assert manager.get_snapshot(record.session_id).error.code == "session_timeout"
-    assert fakes.browsers == []
+    assert fakes.runtimes == []
     await asyncio.wait_for(record.closed_event.wait(), timeout=1)
     assert fakes.models[0].closed
 
@@ -2149,7 +2250,7 @@ async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
     async def stepping_runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -2193,8 +2294,8 @@ async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
 async def test_concurrent_cancel_commands_are_serialized_by_request_lock(
     tmp_path: Path,
 ) -> None:
-    kill_blocker = asyncio.Event()
-    fakes = Fakes(browser_kill_blocker=kill_blocker)
+    close_blocker = asyncio.Event()
+    fakes = Fakes(runtime_close_blocker=close_blocker)
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner, fakes=fakes)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
@@ -2214,7 +2315,7 @@ async def test_concurrent_cancel_commands_are_serialized_by_request_lock(
         "A terminal command is already pending",
     )
     assert manager._active is not None
-    kill_blocker.set()
+    close_blocker.set()
     await wait_state(manager, created.session_id, "cancelled")
 
 
@@ -2226,7 +2327,7 @@ async def test_delete_closes_session_that_moves_from_active_to_tombstone_mid_req
     async def naturally_cancelled(
         request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -2310,8 +2411,8 @@ async def test_pending_cleanup_false_blocks_terminal_publish_and_slot_release(
 @pytest.mark.parametrize(
     ("resource", "operation"),
     [
-        ("browser", "delete"),
-        ("browser", "shutdown"),
+        ("playwright_runtime", "delete"),
+        ("playwright_runtime", "shutdown"),
         ("model", "delete"),
         ("model", "shutdown"),
     ],
@@ -2329,8 +2430,8 @@ async def test_transient_cleanup_failure_retries_while_retaining_ownership(
 
     blocker = asyncio.Event()
     fakes = Fakes(
-        browser_kill_failures=1 if resource == "browser" else 0,
-        browser_kill_blocker=blocker if resource == "browser" else None,
+        runtime_close_failures=1 if resource == "playwright_runtime" else 0,
+        runtime_close_blocker=blocker if resource == "playwright_runtime" else None,
         model_close_failures=1 if resource == "model" else 0,
         model_close_blocker=blocker if resource == "model" else None,
     )
@@ -2346,7 +2447,7 @@ async def test_transient_cleanup_failure_retries_while_retaining_ownership(
         if operation == "delete"
         else manager.shutdown()
     )
-    cleanup_name = "browser.kill" if resource == "browser" else "model.aclose"
+    cleanup_name = "runtime.close" if resource == "playwright_runtime" else "model.aclose"
     await wait_until(lambda: fakes.order.count(cleanup_name) >= 2)
 
     assert not caller.done()
@@ -2363,45 +2464,24 @@ async def test_transient_cleanup_failure_retries_while_retaining_ownership(
     assert manager._tombstones[created.session_id].events[-1].event == "closed"
 
 
-async def test_resume_path_resolution_is_joined_before_artifacts_without_creating_browser(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_application_task_preserves_absolute_stored_resume_path(
+    tmp_path: Path,
 ) -> None:
-    started = ThreadEvent()
-    release = ThreadEvent()
-    order: list[str] = []
-    original_resolver = sessions_module.resolve_resume_upload_path
-
-    def slow_resolver(path: Path, launch: ResolvedBrowserLaunch) -> str:
-        started.set()
-        if not release.wait(timeout=2):
-            raise RuntimeError("test did not release resume path resolution")
-        resolved = original_resolver(path, launch)
-        order.append("resume.resolved")
-        return resolved
-
-    monkeypatch.setattr(sessions_module, "resolve_resume_upload_path", slow_resolver)
-    fakes = Fakes(order=order)
-    manager, fakes, _root = make_manager(tmp_path, blocked_runner, fakes=fakes)
-    creation = asyncio.create_task(create_valid(manager))
-    await wait_until(started.is_set)
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
     record = manager._active
-    assert record is not None and record.resume_path_task is not None
+
+    assert record is not None
     assert record.stored is not None
-    artifact_directory = record.stored.session_directory
+    assert record.application_task is not None
+    stored_resume = record.stored.resume.path
+    task = json.loads(record.application_task)
+    task_resume = Path(task["job"]["resume"]["path"])
+    assert stored_resume.is_absolute()
+    assert task_resume == stored_resume
 
-    deletion = asyncio.create_task(manager.delete(record.session_id))
-    await asyncio.sleep(0)
-    assert not deletion.done()
-    assert artifact_directory.exists()
-    assert fakes.browsers == []
-    release.set()
-    await asyncio.wait_for(deletion, timeout=1)
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(creation, timeout=1)
-
-    assert order == ["resume.resolved"]
-    assert not artifact_directory.exists()
-    assert manager.get_snapshot(record.session_id).state == "closed"
+    await manager.delete(created.session_id)
 
 
 async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
@@ -2427,7 +2507,7 @@ async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
     async def stepping(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -2505,13 +2585,13 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     async def gated(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
-        navigation = await gate.request_human_navigation(encoded_secret, browser)
+        navigation = await gate.request_human_navigation(encoded_secret, playwright_runtime)
         assert not navigation.is_done
-        review = await gate.request_human_review(private_result(), browser)
+        review = await gate.request_human_review(private_result(), playwright_runtime)
         assert not review.is_done
         await asyncio.Future()
         raise AssertionError("unreachable")
@@ -2686,7 +2766,7 @@ async def test_context_terminate_failure_retries_before_other_cleanup(
     assert not deletion.done()
     assert manager._active is record
     assert artifact_directory.exists()
-    assert fakes.browsers == []
+    assert fakes.runtimes == []
     assert fakes.models == []
     instances[0].release.set()
     await asyncio.wait_for(deletion, timeout=1)
@@ -2707,7 +2787,7 @@ async def test_shutdown_upgrades_active_to_terminal_race_tombstone_to_closed(
     async def naturally_cancelled(
         request: ApplicationRunRequest,
         _model: FakeModel,
-        _browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         _gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
@@ -2758,7 +2838,7 @@ async def test_shutdown_upgrades_active_to_terminal_race_tombstone_to_closed(
     assert [event.event for event in tombstone.events][-2:] == ["cancelled", "closed"]
 
 
-async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_limit(
+async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces_step_limit(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -2775,29 +2855,29 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None
-    runtime = FakeSkillRuntime(
-        result=browser_execution_result().model_copy(
+    runtime = FakePlaywrightRuntime(
+        result=playwright_execution_result().model_copy(
             update={"exit_code": 124, "timed_out": True}
         )
     )
-    record.skill_runtime = runtime
+    record.playwright_runtime = runtime
 
     result = await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(type="browser_use", code="print(page_info())"),
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
 
-    assert isinstance(result, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(result, PlaywrightCliResultRuntimeActionResponse)
     assert result.stdout == "completed"
     assert result.exit_code == 124
     assert result.timed_out is True
-    assert record.browser_action_count == 1
-    assert runtime.codes == ["print(page_info())"]
+    assert record.playwright_cli_action_count == 1
+    assert runtime.commands == [('snapshot', [])]
     step = record.events[-1]
     assert step.event == "agent_step"
     assert step.detail.step_number == 1
     assert step.detail.current_url == "https://jobs.example/openings/42"
-    diagnostic = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    diagnostic = manager.get_snapshot(created.session_id).playwright_cli_diagnostics
     assert [item.model_dump() for item in diagnostic] == [
         {
             "step": 1,
@@ -2805,16 +2885,16 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
             "exit_code": 124,
             "timed_out": True,
             "error_category": "execution_timeout",
-            "stderr_excerpt": "Browser Use execution timed out after 120 seconds.",
+            "stderr_excerpt": "Playwright CLI execution timed out after 120 seconds.",
             "stderr_truncated": False,
         }
     ]
-    assert record.events[-1].session.browser_use_diagnostics == diagnostic
+    assert record.events[-1].session.playwright_cli_diagnostics == diagnostic
 
     with pytest.raises(HarnessServiceError) as raised:
         await manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="print('again')"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('again')"]),
         )
 
     assert_service_error(
@@ -2823,11 +2903,116 @@ async def test_runtime_browser_action_counts_completed_calls_and_enforces_step_l
         "step_limit",
         SESSION_ERROR_MESSAGES["step_limit"],
     )
-    assert record.browser_action_count == 1
+    assert record.playwright_cli_action_count == 1
     await manager.delete(created.session_id)
 
 
-async def test_runtime_browser_action_persists_only_redacted_process_diagnostics(
+async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
+    tmp_path: Path,
+) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    private_url = (
+        f"https://jobs.example/openings/{PROFILE_SECRET}?candidate=private"
+    )
+    execution = playwright_execution_result(private_url)
+    execution = execution.model_copy(
+        update={
+            "observation": execution.observation.model_copy(
+                update={
+                    "tabs": [
+                        BrowserTab(
+                            url=private_url,
+                            title="Application",
+                            tab_id="tab-1",
+                        ),
+                        BrowserTab(
+                            url="about:blank",
+                            title="Empty tab",
+                            tab_id="tab-2",
+                        ),
+                    ],
+                    "page_info": {"url": private_url},
+                }
+            )
+        }
+    )
+    record.playwright_runtime = FakePlaywrightRuntime(result=execution)
+
+    response = await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+
+    assert isinstance(response, PlaywrightCliResultRuntimeActionResponse)
+    assert response.observation.url == "https://jobs.example/openings/[redacted]"
+    assert response.observation.tabs[0].url == response.observation.url
+    assert response.observation.tabs[1].url == "about:blank"
+    assert response.observation.page_info is None
+    serialized = response.model_dump_json()
+    assert PROFILE_SECRET not in serialized
+    assert "candidate=private" not in serialized
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_playwright_cli_errors_count_toward_step_limit(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    personal, resume = valid_uploads()
+    created = await manager.create_session(
+        job_url=JOB_URL,
+        allow_domains=[],
+        max_steps=2,
+        personal_information=personal,
+        resume=resume,
+        context=[],
+        anecdotes=[],
+    )
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    runtime = FakePlaywrightRuntime(error=PlaywrightCliRuntimeError("browser_failed"))
+    record.playwright_runtime = runtime
+    action = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="snapshot",
+        args=[],
+    )
+
+    for _attempt in range(2):
+        with pytest.raises(HarnessServiceError) as raised:
+            await manager.runtime_action(created.session_id, action)
+        assert raised.value.code == "browser_failed"
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.runtime_action(created.session_id, action)
+
+    assert_service_error(
+        raised.value,
+        409,
+        "step_limit",
+        SESSION_ERROR_MESSAGES["step_limit"],
+    )
+    assert record.playwright_cli_action_count == 2
+    assert runtime.commands == [("snapshot", []), ("snapshot", [])]
+    assert [
+        diagnostic.step
+        for diagnostic in manager.get_snapshot(
+            created.session_id
+        ).playwright_cli_diagnostics
+    ] == [1, 2]
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_playwright_cli_action_persists_only_redacted_process_diagnostics(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -2835,8 +3020,8 @@ async def test_runtime_browser_action_persists_only_redacted_process_diagnostics
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None
-    record.skill_runtime = FakeSkillRuntime(
-        result=browser_execution_result().model_copy(
+    record.playwright_runtime = FakePlaywrightRuntime(
+        result=playwright_execution_result().model_copy(
             update={
                 "exit_code": 7,
                 "stderr": "private selector and provider detail",
@@ -2847,10 +3032,10 @@ async def test_runtime_browser_action_persists_only_redacted_process_diagnostics
 
     await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(type="browser_use", code="print('private code')"),
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('private code')"]),
     )
 
-    diagnostics = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    diagnostics = manager.get_snapshot(created.session_id).playwright_cli_diagnostics
     assert [item.model_dump() for item in diagnostics] == [
         {
             "step": 1,
@@ -2868,7 +3053,7 @@ async def test_runtime_browser_action_persists_only_redacted_process_diagnostics
     await manager.delete(created.session_id)
     assert (
         manager._tombstones[created.session_id]
-        .snapshot.browser_use_diagnostics
+        .snapshot.playwright_cli_diagnostics
         == diagnostics
     )
 
@@ -2898,7 +3083,7 @@ async def test_runtime_browser_action_persists_only_redacted_process_diagnostics
         ),
     ],
 )
-async def test_runtime_browser_action_persists_fixed_runtime_error_diagnostics(
+async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagnostics(
     tmp_path: Path,
     error_code: Literal["browser_failed", "session_timeout"],
     expected_status: Literal["failed", "timed_out"],
@@ -2911,16 +3096,16 @@ async def test_runtime_browser_action_persists_fixed_runtime_error_diagnostics(
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None
-    record.skill_runtime = FakeSkillRuntime(error=BrowserSkillRuntimeError(error_code))
+    record.playwright_runtime = FakePlaywrightRuntime(error=PlaywrightCliRuntimeError(error_code))
 
     with pytest.raises(HarnessServiceError) as raised:
         await manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="print('private code')"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('private code')"]),
         )
 
     assert raised.value.code == error_code
-    diagnostics = manager.get_snapshot(created.session_id).browser_use_diagnostics
+    diagnostics = manager.get_snapshot(created.session_id).playwright_cli_diagnostics
     assert [item.model_dump() for item in diagnostics] == [
         {
             "step": 1,
@@ -2939,7 +3124,7 @@ async def test_runtime_browser_action_persists_fixed_runtime_error_diagnostics(
     await manager.delete(created.session_id)
 
 
-async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
+async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same_run(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -2947,7 +3132,7 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
-    record.skill_runtime = FakeSkillRuntime()
+    record.playwright_runtime = FakePlaywrightRuntime()
     action = RequestAdditionalInfoRuntimeAction(
         type="request_additional_info",
         questions=[
@@ -2998,10 +3183,10 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
         ],
     )
 
-    with pytest.raises(HarnessServiceError) as before_browser:
+    with pytest.raises(HarnessServiceError) as before_playwright_runtime:
         await manager.runtime_action(created.session_id, action)
     assert_service_error(
-        before_browser.value,
+        before_playwright_runtime.value,
         409,
         "command_conflict",
         "Inspect the application before requesting additional information",
@@ -3009,7 +3194,7 @@ async def test_runtime_additional_info_requires_browser_then_resumes_same_run(
 
     await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(type="browser_use", code="print(page_info())"),
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
     pending = asyncio.create_task(
         manager.runtime_action(created.session_id, action)
@@ -3212,12 +3397,12 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     record = manager._active
     assert record is not None
     blocker = asyncio.Event()
-    runtime = FakeSkillRuntime(blocker=blocker)
-    record.skill_runtime = runtime
+    runtime = FakePlaywrightRuntime(blocker=blocker)
+    record.playwright_runtime = runtime
     active = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="print('blocked')"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('blocked')"]),
         )
     )
     await runtime.started.wait()
@@ -3238,11 +3423,11 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     )
     assert not active.done()
     blocker.set()
-    assert isinstance(await active, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(await active, PlaywrightCliResultRuntimeActionResponse)
     await manager.delete(created.session_id)
 
 
-async def test_runtime_navigation_returns_automatic_origin_registration(
+async def test_runtime_navigation_registers_exact_origin_automatically(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -3251,10 +3436,10 @@ async def test_runtime_navigation_returns_automatic_origin_registration(
     record = manager._active
     assert (
         record is not None
-        and record.browser is not None
+        and record.playwright_runtime is not None
         and record.human_gate is not None
     )
-    record.skill_runtime = FakeSkillRuntime()
+    record.playwright_runtime = FakePlaywrightRuntime()
 
     navigation = asyncio.create_task(
         manager.runtime_action(
@@ -3266,10 +3451,8 @@ async def test_runtime_navigation_returns_automatic_origin_registration(
         )
     )
     await wait_until(lambda: record.human_gate.pending_kind == "navigation")
-    record.browser.current_url = "https://ats.example/application/42?private=value"
+    record.playwright_runtime.current_url = "https://ats.example/application/42?private=value"
     await manager.command(created.session_id, ContinueCommand(type="continue"))
-    assert record.human_gate.pending_kind is None
-
     approved = await navigation
     assert isinstance(approved, ApproveRuntimeActionResponse)
     assert approved.origin == "https://ats.example"
@@ -3298,7 +3481,7 @@ async def test_runtime_review_rejects_a_result_for_another_job_before_gate(
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
-    record.skill_runtime = FakeSkillRuntime()
+    record.playwright_runtime = FakePlaywrightRuntime()
     mismatched_result = review_result().model_copy(
         update={"job_url": "https://other.example/jobs/42"}
     )
@@ -3322,7 +3505,7 @@ async def test_runtime_review_rejects_a_result_for_another_job_before_gate(
     await manager.delete(created.session_id)
 
 
-async def test_runtime_review_auto_approves_explicit_browser_submission_actions(
+async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_actions(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -3331,10 +3514,10 @@ async def test_runtime_review_auto_approves_explicit_browser_submission_actions(
     record = manager._active
     assert (
         record is not None
-        and record.browser is not None
+        and record.playwright_runtime is not None
         and record.human_gate is not None
     )
-    first_execution = browser_execution_result()
+    first_execution = playwright_execution_result()
     first_execution = first_execution.model_copy(
         update={
             "observation": first_execution.observation.model_copy(
@@ -3355,11 +3538,9 @@ async def test_runtime_review_auto_approves_explicit_browser_submission_actions(
             )
         }
     )
-    second_execution = browser_execution_result(
-        "https://jobs.example/openings/42?second=private"
-    )
-    runtime = FakeSkillRuntime(results=[first_execution, second_execution])
-    record.skill_runtime = runtime
+    second_execution = playwright_execution_result("about:blank")
+    runtime = FakePlaywrightRuntime(results=[first_execution, second_execution])
+    record.playwright_runtime = runtime
 
     approved = await asyncio.wait_for(
         manager.runtime_action(
@@ -3445,35 +3626,30 @@ async def test_runtime_review_auto_approves_explicit_browser_submission_actions(
             "submission approval",
         )
 
-    first_code = (
-        "js(\"document.getElementById('final-submit').click()\")\n"
-        "print(page_info())"
-    )
     first = await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(type="browser_use", code=first_code),
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["#final-submit"]),
     )
-    assert isinstance(first, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(first, PlaywrightCliResultRuntimeActionResponse)
     assert first.observation.url == "https://jobs.example/openings/42"
     assert first.observation.tabs == []
     assert first.observation.page_info is None
     assert "?private=value" not in first.model_dump_json()
     assert manager.get_snapshot(created.session_id).state == "submitting"
 
-    second_code = "wait_for_load()\nprint(page_info())"
     second = await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(type="browser_use", code=second_code),
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
-    assert isinstance(second, BrowserUseResultRuntimeActionResponse)
-    assert second.observation.url == "https://jobs.example/openings/42"
+    assert isinstance(second, PlaywrightCliResultRuntimeActionResponse)
+    assert second.observation.url == "about:blank"
     assert second.observation.tabs == []
     assert second.observation.page_info is None
-    assert "?second=private" not in second.model_dump_json()
+    assert "?private=value" not in second.model_dump_json()
     assert manager.get_snapshot(created.session_id).state == "submitting"
-    assert runtime.codes == [first_code, second_code]
-    assert record.browser_action_count == 2
-    assert len(record.snapshot.browser_use_diagnostics) == 2
+    assert runtime.commands == [('click', ['#final-submit']), ('snapshot', [])]
+    assert record.playwright_cli_action_count == 2
+    assert len(record.snapshot.playwright_cli_diagnostics) == 2
     assert [event.event for event in record.events].count("submission_started") == 1
     assert all(
         event.session.state == "submitting"
@@ -3511,7 +3687,7 @@ async def test_manual_review_returns_exact_submit_permission(
     await manager.delete(created.session_id)
 
 
-async def test_first_approved_browser_execution_failure_parks_uncertainty_without_cleanup(
+async def test_first_approved_playwright_cli_execution_failure_parks_uncertainty_without_cleanup(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
@@ -3519,8 +3695,10 @@ async def test_first_approved_browser_execution_failure_parks_uncertainty_withou
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
-    runtime = FakeSkillRuntime(error=BrowserSkillRuntimeError("browser_failed"))
-    record.skill_runtime = runtime
+    runtime = FakePlaywrightRuntime(
+        error=PlaywrightCliRuntimeError("browser_failed")
+    )
+    record.playwright_runtime = runtime
 
     review = await manager.runtime_action(
         created.session_id,
@@ -3535,7 +3713,7 @@ async def test_first_approved_browser_execution_failure_parks_uncertainty_withou
     with pytest.raises(HarnessServiceError) as failed:
         await manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="click_at_xy(10, 10)"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
     assert failed.value.code == "browser_failed"
 
@@ -3555,7 +3733,7 @@ async def test_first_approved_browser_execution_failure_parks_uncertainty_withou
     assert record.final_request is None
     assert record.finalized is False
     assert runtime.closed is False
-    assert fakes.browsers[0].killed is False
+    assert fakes.runtimes[0].closed is False
     assert fakes.models[0].closed is False
 
     with pytest.raises(HarnessServiceError) as close_only:
@@ -3586,7 +3764,7 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     submission = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="click_at_xy(10, 10)"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
     )
     await asyncio.sleep(0)
@@ -3597,22 +3775,23 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     record.request_lock.release()
 
     completed = await submission
-    assert isinstance(completed, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(completed, PlaywrightCliResultRuntimeActionResponse)
     assert completed.observation.url == "https://jobs.example/openings/42"
     assert completed.observation.tabs == []
     assert completed.observation.page_info is None
     await cancellation
     await wait_state(manager, created.session_id, "submission_uncertain")
     assert record.finalized is False
-    assert fakes.runtimes[0].codes == ["click_at_xy(10, 10)"]
-    assert record.browser_action_count == 1
-    assert len(record.snapshot.browser_use_diagnostics) == 1
+    assert fakes.runtimes[0].commands == [
+        ("click", ["button#submit"]),
+    ]
+    assert record.playwright_cli_action_count == 1
+    assert len(record.snapshot.playwright_cli_diagnostics) == 1
     assert [event.event for event in record.events][-2:] == [
         "submission_started",
         "submission_uncertain",
     ]
     assert fakes.runtimes[0].closed is False
-    assert fakes.browsers[0].killed is False
     await manager.delete(created.session_id)
 
 
@@ -3638,7 +3817,7 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     submission = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="click_at_xy(10, 10)"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
     )
     await asyncio.sleep(0)
@@ -3658,7 +3837,7 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     record.request_lock.release()
 
     completed = await submission
-    assert isinstance(completed, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(completed, PlaywrightCliResultRuntimeActionResponse)
     assert completed.observation.tabs == []
     assert completed.observation.page_info is None
     await expiry
@@ -3669,11 +3848,12 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
         "submission_uncertain",
         "closed",
     ]
-    assert fakes.runtimes[0].codes == ["click_at_xy(10, 10)"]
-    assert record.browser_action_count == 1
-    assert len(record.snapshot.browser_use_diagnostics) == 1
+    assert fakes.runtimes[0].commands == [
+        ("click", ["button#submit"]),
+    ]
+    assert record.playwright_cli_action_count == 1
+    assert len(record.snapshot.playwright_cli_diagnostics) == 1
     assert fakes.runtimes[0].closed is True
-    assert fakes.browsers[0].killed is True
 
 
 async def test_submit_latch_wins_a_queued_model_failure(
@@ -3684,11 +3864,11 @@ async def test_submit_latch_wins_a_queued_model_failure(
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
-        approved = await gate.request_human_review(review_result(), browser)
+        approved = await gate.request_human_review(review_result(), playwright_runtime)
         assert approved.is_done is False
         await fail_model.wait()
         raise PipelineApplicationAgentError(
@@ -3710,7 +3890,7 @@ async def test_submit_latch_wins_a_queued_model_failure(
     submission = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(type="browser_use", code="click_at_xy(10, 10)"),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
     )
     await asyncio.sleep(0)
@@ -3719,20 +3899,21 @@ async def test_submit_latch_wins_a_queued_model_failure(
     record.request_lock.release()
 
     completed = await submission
-    assert isinstance(completed, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(completed, PlaywrightCliResultRuntimeActionResponse)
     assert completed.observation.tabs == []
     assert completed.observation.page_info is None
     await wait_state(manager, created.session_id, "submission_uncertain")
     assert record.finalized is False
-    assert fakes.runtimes[0].codes == ["click_at_xy(10, 10)"]
-    assert record.browser_action_count == 1
-    assert len(record.snapshot.browser_use_diagnostics) == 1
+    assert fakes.runtimes[0].commands == [
+        ("click", ["button#submit"]),
+    ]
+    assert record.playwright_cli_action_count == 1
+    assert len(record.snapshot.playwright_cli_diagnostics) == 1
     assert [event.event for event in record.events][-2:] == [
         "submission_started",
         "submission_uncertain",
     ]
     assert fakes.runtimes[0].closed is False
-    assert fakes.browsers[0].killed is False
     await manager.delete(created.session_id)
 
 
@@ -3746,11 +3927,11 @@ async def test_post_action_model_failures_park_uncertainty(
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
-        approved = await gate.request_human_review(review_result(), browser)
+        approved = await gate.request_human_review(review_result(), playwright_runtime)
         assert approved.is_done is False
         await release.wait()
         if failure_kind == "model_transport":
@@ -3768,7 +3949,7 @@ async def test_post_action_model_failures_park_uncertainty(
     await wait_until(lambda: record.human_gate.submission_approved)
     await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(type="browser_use", code="click_at_xy(10, 10)"),
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
     )
     if failure_kind == "model_transport":
         release.set()
@@ -3779,7 +3960,7 @@ async def test_post_action_model_failures_park_uncertainty(
     await wait_state(manager, created.session_id, "submission_uncertain")
     assert record.finalized is False
     assert fakes.runtimes[0].closed is False
-    assert fakes.browsers[0].killed is False
+    assert fakes.runtimes[0].closed is False
     await manager.delete(created.session_id)
 
 
@@ -3789,11 +3970,11 @@ async def test_failure_after_approval_but_before_submit_action_is_ordinary_faile
     async def runner(
         _request: ApplicationRunRequest,
         _model: FakeModel,
-        browser: FakeBrowser,
+        playwright_runtime: FakePlaywrightRuntime,
         gate: HumanGate,
         _step: Callable[[int, str], Awaitable[None]],
     ) -> ApplicationRunResult:
-        approved = await gate.request_human_review(review_result(), browser)
+        approved = await gate.request_human_review(review_result(), playwright_runtime)
         assert approved.is_done is False
         raise PipelineApplicationAgentError(
             "model_failed",
@@ -3807,9 +3988,8 @@ async def test_failure_after_approval_but_before_submit_action_is_ordinary_faile
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.error is not None
     assert snapshot.error.code == "model_failed"
-    assert fakes.runtimes[0].codes == []
+    assert fakes.runtimes[0].commands == []
     assert fakes.runtimes[0].closed is True
-    assert fakes.browsers[0].killed is True
 
 
 async def test_runtime_review_rejects_unresolved_fields_without_approval(
@@ -3820,7 +4000,7 @@ async def test_runtime_review_rejects_unresolved_fields_without_approval(
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None and record.human_gate is not None
-    record.skill_runtime = FakeSkillRuntime()
+    record.playwright_runtime = FakePlaywrightRuntime()
     unresolved = ReviewApplicationResult.model_validate(
         {
             **review_result().model_dump(),
@@ -3860,7 +4040,7 @@ async def test_runtime_mismatch_is_typed_and_unknown_session_is_not_found(
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None
-    record.skill_runtime = FakeSkillRuntime()
+    record.playwright_runtime = FakePlaywrightRuntime()
 
     mismatch = await manager.runtime_action(
         created.session_id,
@@ -3914,7 +4094,7 @@ async def test_runtime_action_rejects_starting_and_terminal_sessions(
     preflight_release.set()
     created = await creation
     await wait_state(manager, created.session_id, "running")
-    record.skill_runtime = FakeSkillRuntime()
+    record.playwright_runtime = FakePlaywrightRuntime()
     await manager.delete(created.session_id)
 
     with pytest.raises(HarnessServiceError) as terminal:
@@ -3927,7 +4107,7 @@ async def test_runtime_action_rejects_starting_and_terminal_sessions(
     )
 
 
-async def test_create_starts_skill_runtime_before_accepting_runtime_actions(
+async def test_create_starts_playwright_runtime_before_accepting_runtime_actions(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
@@ -3937,27 +4117,29 @@ async def test_create_starts_skill_runtime_before_accepting_runtime_actions(
     record = manager._active
 
     assert record is not None
-    assert record.skill_runtime is fakes.runtimes[0]
+    assert record.playwright_runtime is fakes.runtimes[0]
     assert fakes.runtimes[0].runtime_started is True
-    assert fakes.order.index("browser.factory") < fakes.order.index("runtime.factory")
     assert fakes.order.index("runtime.factory") < fakes.order.index("runtime.start")
 
     response = await manager.runtime_action(
         created.session_id,
-        BrowserUseRuntimeAction(type="browser_use", code="print('connected')"),
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('connected')"]),
     )
-    assert isinstance(response, BrowserUseResultRuntimeActionResponse)
+    assert isinstance(response, PlaywrightCliResultRuntimeActionResponse)
     await manager.delete(created.session_id)
 
 
-async def test_terminal_cleanup_cancels_active_runtime_action_before_browser_cleanup(
+async def test_terminal_cleanup_cancels_active_runtime_action_before_playwright_runtime_cleanup(
     tmp_path: Path,
 ) -> None:
     order: list[str] = []
     manager, fakes, _ = make_manager(
         tmp_path,
         blocked_runner,
-        fakes=Fakes(order=order),
+        fakes=Fakes(
+            order=order,
+            runtime_close_cancels_active=False,
+        ),
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
@@ -3968,20 +4150,29 @@ async def test_terminal_cleanup_cancels_active_runtime_action_before_browser_cle
     action = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            BrowserUseRuntimeAction(
-                type="browser_use",
-                code="import time; time.sleep(30)",
-            ),
+            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["new Promise(r => setTimeout(r, 30000))"]),
         )
     )
     await runtime.started.wait()
+    assert record.runtime_action_task is action
 
-    await manager.delete(created.session_id)
+    try:
+        await asyncio.wait_for(
+            manager.delete(created.session_id),
+            timeout=0.2,
+        )
+    except BaseException:
+        action.cancel()
+        await asyncio.gather(action, return_exceptions=True)
+        await asyncio.wait_for(record.closed_event.wait(), timeout=1)
+        raise
 
     with pytest.raises(asyncio.CancelledError):
         await action
     assert runtime.closed
-    assert order.index("runtime.close") < order.index("browser.kill")
+    assert record.runtime_action_task is None
+    assert record.runtime_action_pending is False
+    assert order.index("runtime.close") < order.index("model.aclose")
     events = manager._tombstones[created.session_id].events
     assert all(event.event != "agent_step" for event in events)
 
@@ -4062,12 +4253,12 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     assert call["max_turns"] == 100
     assert 1_000 <= call["deadline_ms"] <= 14_400_000
     assert fakes.order.index("model.check_ready") < fakes.order.index(
-        "browser.factory"
+        "runtime.factory"
     )
     assert fakes.order.count("model.run") == 1
 
 
-async def test_oversized_data_task_fails_before_preflight_and_browser(
+async def test_oversized_data_task_fails_before_preflight_and_playwright_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4088,7 +4279,7 @@ async def test_oversized_data_task_fails_before_preflight_and_browser(
         "Request is invalid",
     )
     assert fakes.models == []
-    assert fakes.browsers == []
+    assert fakes.runtimes == []
     assert fakes.runtimes == []
     assert manager._active is None
     assert not root.exists() or tuple(root.iterdir()) == ()
@@ -4126,7 +4317,7 @@ async def test_full_agent_result_requires_matching_job_and_accepted_review(
     assert snapshot.error.code == expected_code
     assert len(fakes.models[0].run_calls) == 1
     assert fakes.runtimes[0].closed
-    assert fakes.browsers[0].killed
+    assert fakes.runtimes[0].closed
     assert fakes.models[0].closed
 
 

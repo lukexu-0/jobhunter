@@ -13,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
-from .browser import BrowserConfigurationError
+from .playwright_cli import BrowserConfigurationError
 from .models import (
     AcceptedAdditionalInfoAnswer,
     AdditionalInfoBooleanCommandAnswer,
