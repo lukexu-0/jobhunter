@@ -587,7 +587,7 @@ const PENDING_ACTION_BY_STATE: Readonly<
   awaiting_additional_info: "additional_info",
   awaiting_human_review: "human_review",
 };
-export const ApplicationBrowserUseDiagnosticSchema = z.object({
+export const ApplicationPlaywrightCliDiagnosticSchema = z.object({
   step: z.number().int().min(1).max(500),
   status: z.enum(["succeeded", "failed", "timed_out"]),
   exitCode: z.number().int(),
@@ -600,7 +600,7 @@ export const ApplicationBrowserUseDiagnosticSchema = z.object({
   ]).nullable(),
   stderrExcerpt: z.union([
     z.literal("[redacted]"),
-    z.literal("Browser Use execution timed out after 120 seconds."),
+    z.literal("Playwright CLI execution timed out after 120 seconds."),
     z.literal("Browser runtime failed."),
     z.literal("Application session expired."),
   ]).nullable(),
@@ -621,7 +621,7 @@ export const ApplicationBrowserUseDiagnosticSchema = z.object({
   let expectedExcerpt: typeof diagnostic.stderrExcerpt = null;
   let validCategory = false;
   if (diagnostic.errorCategory === "execution_timeout") {
-    expectedExcerpt = "Browser Use execution timed out after 120 seconds.";
+    expectedExcerpt = "Playwright CLI execution timed out after 120 seconds.";
     validCategory = diagnostic.timedOut;
   } else if (diagnostic.errorCategory === "session_timeout") {
     expectedExcerpt = "Application session expired.";
@@ -663,8 +663,8 @@ export const ApplicationBrowserUseDiagnosticSchema = z.object({
     });
   }
 });
-export type ApplicationBrowserUseDiagnostic = z.infer<
-  typeof ApplicationBrowserUseDiagnosticSchema
+export type ApplicationPlaywrightCliDiagnostic = z.infer<
+  typeof ApplicationPlaywrightCliDiagnosticSchema
 >;
 
 
@@ -686,7 +686,7 @@ export const ApplicationSessionSnapshotDtoSchema = z.object({
     z.string().refine((value) => hasCodePointLength(value, 1, 1_000)),
   ).max(100),
   revisionCount: z.number().int().min(0).max(100),
-  browserUseDiagnostics: z.array(ApplicationBrowserUseDiagnosticSchema).max(100).default([]),
+  playwrightCliDiagnostics: z.array(ApplicationPlaywrightCliDiagnosticSchema).max(100).default([]),
   pendingAction: ApplicationPendingActionSchema.nullable(),
   error: ApplicationSessionErrorSchema.nullable(),
 }).strict().superRefine((snapshot, context) => {

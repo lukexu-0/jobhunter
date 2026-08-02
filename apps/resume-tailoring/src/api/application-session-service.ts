@@ -1213,7 +1213,7 @@ export class ApplicationSessionService {
       fieldsFilled: snapshot.fieldsFilled,
       fieldsNeedingHuman: snapshot.fieldsNeedingHuman,
       filesAttached: snapshot.filesAttached,
-      browserUseDiagnostics: snapshot.browserUseDiagnostics,
+      playwrightCliDiagnostics: snapshot.playwrightCliDiagnostics,
       warnings: current.submissionPhase === "uncertain"
         ? [...uncertainWarnings, APPLICATION_SUBMISSION_UNCERTAIN_WARNING]
         : snapshot.warnings,
@@ -1612,7 +1612,7 @@ export class ApplicationSessionService {
       fieldsFilled: [],
       fieldsNeedingHuman: [],
       filesAttached: [],
-      browserUseDiagnostics: [],
+      playwrightCliDiagnostics: [],
       warnings: session.submissionPhase === "uncertain"
         ? [APPLICATION_SUBMISSION_UNCERTAIN_WARNING]
         : bridgeState === "lost"

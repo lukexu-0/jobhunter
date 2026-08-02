@@ -9,12 +9,12 @@ import { MAX_AGENT_TRANSCRIPT_BYTES } from "../src/agents/runner.ts";
 type FunctionCallItem = Extract<AgentInputItem, { type: "function_call" }>;
 type FunctionCallResultItem = Extract<AgentInputItem, { type: "function_call_result" }>;
 
-function isBrowserCall(item: AgentInputItem): item is FunctionCallItem {
-  return item.type === "function_call" && item.name === "browser_use";
+function isPlaywrightCliCall(item: AgentInputItem): item is FunctionCallItem {
+  return item.type === "function_call" && item.name === "playwright_cli";
 }
 
-function isBrowserResult(item: AgentInputItem): item is FunctionCallResultItem {
-  return item.type === "function_call_result" && item.name === "browser_use";
+function isPlaywrightCliResult(item: AgentInputItem): item is FunctionCallResultItem {
+  return item.type === "function_call_result" && item.name === "playwright_cli";
 }
 
 
@@ -30,25 +30,38 @@ function otherResult(callId: string): AgentInputItem {
   return { type: "function_call_result", name: "other_tool", callId, output: "ok", status: "completed" };
 }
 
-function browserCall(callId: string, payload = ""): AgentInputItem {
+function playwrightCliCall(callId: string, payload = ""): AgentInputItem {
   return {
     type: "function_call",
-    name: "browser_use",
+    name: "playwright_cli",
     callId,
-    arguments: JSON.stringify({ code: payload }),
+    arguments: JSON.stringify({
+      command: "snapshot",
+      args: payload === "" ? [] : [payload],
+    }),
     status: "completed",
   };
 }
 
-function browserResult(
+function playwrightCliResult(
   callId: string,
   output = "ok",
   status: "completed" | "in_progress" | "incomplete" = "completed",
 ): AgentInputItem {
-  return { type: "function_call_result", name: "browser_use", callId, output, status };
+  return { type: "function_call_result", name: "playwright_cli", callId, output, status };
 }
 
 describe("projectApplicationHistory", () => {
+  test("names the pruned Playwright CLI history in the model-visible notice", () => {
+    expect(APPLICATION_HISTORY_PRUNED_NOTICE).toEqual({
+      role: "user",
+      content: [{
+        type: "input_text",
+        text: "Earlier playwright_cli calls and results were omitted to keep the application history within limits.",
+      }],
+    });
+  });
+
   test("preserves non-browser items in order without mutating the input", () => {
     const first = user("first");
     const call = otherCall("other-1");
@@ -67,26 +80,26 @@ describe("projectApplicationHistory", () => {
     expect(history).toEqual([first, call, result, last]);
   });
 
-  test("keeps only unambiguous completed browser call/result pairs", () => {
+  test("keeps only unambiguous completed Playwright CLI call/result pairs", () => {
     const before = user("before");
-    const validCall = browserCall("valid");
+    const validCall = playwrightCliCall("valid");
     const between = user("between");
-    const validResult = browserResult("valid");
+    const validResult = playwrightCliResult("valid");
     const after = user("after");
     const history = [
-      browserResult("before-call"),
+      playwrightCliResult("before-call"),
       before,
-      browserCall("orphan-call"),
-      browserResult("orphan-result"),
-      browserCall("incomplete"),
-      browserResult("incomplete", "not done", "incomplete"),
-      browserCall("duplicate-call"),
-      browserCall("duplicate-call"),
-      browserResult("duplicate-call"),
-      browserCall("duplicate-result"),
-      browserResult("duplicate-result", "first"),
-      browserResult("duplicate-result", "second"),
-      browserCall("before-call"),
+      playwrightCliCall("orphan-call"),
+      playwrightCliResult("orphan-result"),
+      playwrightCliCall("incomplete"),
+      playwrightCliResult("incomplete", "not done", "incomplete"),
+      playwrightCliCall("duplicate-call"),
+      playwrightCliCall("duplicate-call"),
+      playwrightCliResult("duplicate-call"),
+      playwrightCliCall("duplicate-result"),
+      playwrightCliResult("duplicate-result", "first"),
+      playwrightCliResult("duplicate-result", "second"),
+      playwrightCliCall("before-call"),
       validCall,
       between,
       validResult,
@@ -107,19 +120,19 @@ describe("projectApplicationHistory", () => {
     expect(history).toHaveLength(17);
   });
 
-  test("retains the newest sixteen complete browser pairs", () => {
+  test("retains the newest sixteen complete Playwright CLI pairs", () => {
     const marker = user("preserved");
     const history: AgentInputItem[] = [marker];
     for (let index = 0; index < 18; index += 1) {
-      history.push(browserCall(`call-${index}`), browserResult(`call-${index}`));
+      history.push(playwrightCliCall(`call-${index}`), playwrightCliResult(`call-${index}`));
     }
 
     const projected = projectApplicationHistory(history);
     const retainedCallIds = projected
-      .filter(isBrowserCall)
+      .filter(isPlaywrightCliCall)
       .map((item) => item.callId);
     const retainedResultIds = projected
-      .filter(isBrowserResult)
+      .filter(isPlaywrightCliResult)
       .map((item) => item.callId);
 
     expect(retainedCallIds).toEqual([
@@ -132,12 +145,12 @@ describe("projectApplicationHistory", () => {
     expect(projected).toHaveLength(34);
   });
 
-  test("prunes oldest browser pairs atomically to the byte limit with one notice", () => {
+  test("prunes oldest Playwright CLI pairs atomically to the byte limit with one notice", () => {
     const largeOutput = "ø".repeat(275_000);
-    const oldestCall = browserCall("oldest", largeOutput);
-    const oldestResult = browserResult("oldest", largeOutput);
-    const newestCall = browserCall("newest", largeOutput);
-    const newestResult = browserResult("newest", largeOutput);
+    const oldestCall = playwrightCliCall("oldest", largeOutput);
+    const oldestResult = playwrightCliResult("oldest", largeOutput);
+    const newestCall = playwrightCliCall("newest", largeOutput);
+    const newestResult = playwrightCliResult("newest", largeOutput);
     const marker = user("preserve me");
     const history = [
       oldestCall,

@@ -34,7 +34,7 @@ function rawSnapshot(overrides: Record<string, unknown> = {}): Record<string, un
     files_attached: ["resume.pdf"],
     warnings: ["Review before submitting."],
     revision_count: 1,
-    browser_use_diagnostics: [{
+    playwright_cli_diagnostics: [{
       step: 1,
       status: "failed",
       exit_code: 1,
@@ -90,7 +90,7 @@ describe("HttpApplicationHarnessClient", () => {
       filesAttached: ["resume.pdf"],
       warnings: ["Review before submitting."],
       revisionCount: 1,
-      browserUseDiagnostics: [{
+      playwrightCliDiagnostics: [{
         step: 1,
         status: "failed",
         exitCode: 1,
@@ -128,6 +128,18 @@ describe("HttpApplicationHarnessClient", () => {
     expect(JSON.stringify(snapshot)).not.toContain("jobs.private.example");
     expect(JSON.stringify(snapshot)).not.toContain("ats.private.example");
     expect(JSON.stringify(snapshot)).not.toContain("model");
+  });
+  test("defaults omitted Playwright CLI diagnostics to an empty public list", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json(rawSnapshot({
+        playwright_cli_diagnostics: undefined,
+      })),
+    });
+
+    await expect(client.get(SESSION_ID, new AbortController().signal))
+      .resolves.toMatchObject({ playwrightCliDiagnostics: [] });
   });
   test("projects slot release only after terminal cleanup", async () => {
     const client = new HttpApplicationHarnessClient({

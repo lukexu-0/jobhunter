@@ -82,11 +82,172 @@ export const ApplicationRunResultSchema = z.discriminatedUnion("status", [
 ]);
 export type ApplicationRunResult = z.infer<typeof ApplicationRunResultSchema>;
 
-export const BrowserUseRuntimeActionSchema = z.object({
-  type: z.literal("browser_use"),
-  code: z.string().refine((value) => Buffer.byteLength(value, "utf8") <= 65_536),
-}).strict();
-export type BrowserUseRuntimeAction = z.infer<typeof BrowserUseRuntimeActionSchema>;
+export const PLAYWRIGHT_CLI_COMMANDS = Object.freeze([
+  "goto",
+  "snapshot",
+  "click",
+  "dblclick",
+  "type",
+  "press",
+  "fill",
+  "drag",
+  "drop",
+  "hover",
+  "select",
+  "upload",
+  "check",
+  "uncheck",
+  "dialog-accept",
+  "dialog-dismiss",
+  "resize",
+  "go-back",
+  "go-forward",
+  "reload",
+  "keydown",
+  "keyup",
+  "mousemove",
+  "mousedown",
+  "mouseup",
+  "mousewheel",
+  "screenshot",
+  "pdf",
+  "tab-list",
+  "tab-new",
+  "tab-close",
+  "tab-select",
+  "generate-locator",
+  "highlight",
+  "eval",
+  "video-chapter",
+  "video-show-actions",
+  "video-hide-actions",
+] as const);
+
+export const PlaywrightCliCommandSchema = z.enum(PLAYWRIGHT_CLI_COMMANDS);
+export type PlaywrightCliCommand = z.infer<typeof PlaywrightCliCommandSchema>;
+export const PLAYWRIGHT_CLI_READ_ONLY_COMMANDS: readonly PlaywrightCliCommand[] =
+  Object.freeze([
+    "snapshot",
+    "screenshot",
+    "pdf",
+    "tab-list",
+    "generate-locator",
+    "highlight",
+    "video-chapter",
+    "video-show-actions",
+    "video-hide-actions",
+  ]);
+
+export function isPlaywrightCliReadOnlyCommand(command: PlaywrightCliCommand): boolean {
+  return PLAYWRIGHT_CLI_READ_ONLY_COMMANDS.includes(command);
+}
+
+function hasOnlyPairedUtf16Surrogates(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      index += 1;
+      if (index >= value.length) return false;
+      const trailingCodeUnit = value.charCodeAt(index);
+      if (trailingCodeUnit < 0xDC00 || trailingCodeUnit > 0xDFFF) return false;
+    } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const PlaywrightCliArgsSchema = z.array(
+  z.string().refine((value) =>
+    !value.includes("\u0000")
+    && hasOnlyPairedUtf16Surrogates(value)
+    && Buffer.byteLength(value, "utf8") <= 8_192
+  ),
+).max(64).default([]);
+const PLAYWRIGHT_CLI_RESERVED_ARGS: Readonly<Record<string, true>> = Object.freeze({
+  "-s": true,
+  "--s": true,
+  "-h": true,
+  "--help": true,
+  "-v": true,
+  "--version": true,
+  "--session": true,
+  "--json": true,
+  "--raw": true,
+  "--config": true,
+  "--profile": true,
+  "--persistent": true,
+  "--headed": true,
+  "--browser": true,
+  "--cdp": true,
+  "--endpoint": true,
+  "--extension": true,
+});
+const PLAYWRIGHT_CLI_RESERVED_ARG_PREFIXES = Object.freeze([
+  "-s=",
+  "--s=",
+  "-h=",
+  "--help=",
+  "-v=",
+  "--version=",
+  "--session=",
+  "--json=",
+  "--raw=",
+  "--config=",
+  "--profile=",
+  "--persistent=",
+  "--headed=",
+  "--browser=",
+  "--cdp=",
+  "--endpoint=",
+  "--extension=",
+] as const);
+
+function validatePlaywrightCliInvocation(
+  value: { readonly command: string; readonly args: readonly string[] },
+  context: z.RefinementCtx,
+): void {
+  if (value.args.some((argument) =>
+    PLAYWRIGHT_CLI_RESERVED_ARGS[argument] === true
+    || (
+      argument.length > 2
+      && argument.startsWith("-s")
+      && !argument.startsWith("--")
+    )
+    || PLAYWRIGHT_CLI_RESERVED_ARG_PREFIXES.some(
+      (prefix) => argument.startsWith(prefix),
+    )
+  )) {
+    context.addIssue({
+      code: "custom",
+      path: ["args"],
+      message: "lifecycle, session, output, help, and version arguments are reserved",
+    });
+  }
+  if (value.args.some((argument) => !hasOnlyPairedUtf16Surrogates(argument))) {
+    return;
+  }
+  const invocationBytes = Buffer.byteLength(value.command, "utf8")
+    + value.args.reduce((total, argument) => total + Buffer.byteLength(argument, "utf8"), 0);
+  if (invocationBytes > 65_536) {
+    context.addIssue({
+      code: "custom",
+      message: "combined invocation must not exceed 65536 UTF-8 bytes",
+    });
+  }
+}
+
+export const PlaywrightCliToolParametersSchema = z.object({
+  command: PlaywrightCliCommandSchema,
+  args: PlaywrightCliArgsSchema,
+}).strict().superRefine(validatePlaywrightCliInvocation);
+
+export const PlaywrightCliRuntimeActionSchema = z.object({
+  type: z.literal("playwright_cli"),
+  command: PlaywrightCliCommandSchema,
+  args: PlaywrightCliArgsSchema,
+}).strict().superRefine(validatePlaywrightCliInvocation);
+export type PlaywrightCliRuntimeAction = z.infer<typeof PlaywrightCliRuntimeActionSchema>;
 
 
 export const RequestHumanNavigationRuntimeActionSchema = z.object({
@@ -146,7 +307,7 @@ export type ReportApplicationMismatchRuntimeAction = z.infer<
 >;
 
 export const RuntimeActionRequestSchema = z.discriminatedUnion("type", [
-  BrowserUseRuntimeActionSchema,
+  PlaywrightCliRuntimeActionSchema,
   RequestHumanNavigationRuntimeActionSchema,
   RequestOriginApprovalRuntimeActionSchema,
   RequestAdditionalInfoRuntimeActionSchema,
@@ -179,7 +340,7 @@ export const BrowserObservationSchema = z.object({
 }).strict();
 export type BrowserObservation = z.infer<typeof BrowserObservationSchema>;
 
-export const BrowserUseExecutionResultSchema = z.object({
+export const PlaywrightCliExecutionResultSchema = z.object({
   exit_code: z.number().int(),
   timed_out: z.boolean(),
   stdout: z.string().refine((value) => hasCodePointLength(value, 0, 20_000)),
@@ -188,15 +349,15 @@ export const BrowserUseExecutionResultSchema = z.object({
   stderr_truncated: z.boolean(),
   observation: BrowserObservationSchema,
 }).strict();
-export type BrowserUseExecutionResult = z.infer<
-  typeof BrowserUseExecutionResultSchema
+export type PlaywrightCliExecutionResult = z.infer<
+  typeof PlaywrightCliExecutionResultSchema
 >;
 
-export const BrowserUseResultRuntimeActionResponseSchema = BrowserUseExecutionResultSchema.extend({
-  type: z.literal("browser_use_result"),
+export const PlaywrightCliResultRuntimeActionResponseSchema = PlaywrightCliExecutionResultSchema.extend({
+  type: z.literal("playwright_cli_result"),
 }).strict();
-export type BrowserUseResultRuntimeActionResponse = z.infer<
-  typeof BrowserUseResultRuntimeActionResponseSchema
+export type PlaywrightCliResultRuntimeActionResponse = z.infer<
+  typeof PlaywrightCliResultRuntimeActionResponseSchema
 >;
 
 
@@ -307,7 +468,7 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 >;
 
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
-  BrowserUseResultRuntimeActionResponseSchema,
+  PlaywrightCliResultRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   ApproveRuntimeActionResponseSchema,
   ReviseRuntimeActionResponseSchema,

@@ -26,7 +26,7 @@ const event: ApplicationSessionEventDto = {
     filesAttached: ["resume.pdf"],
     warnings: [],
     revisionCount: 0,
-    browserUseDiagnostics: [],
+    playwrightCliDiagnostics: [],
     pendingAction: null,
     error: null,
   },

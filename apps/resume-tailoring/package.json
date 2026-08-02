@@ -4,12 +4,13 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./contracts": "./src/contracts/index.ts"
+    "./contracts": "./src/contracts/index.ts",
+    "./package.json": "./package.json"
   },
   "scripts": {
     "dev": "bun --watch src/index.ts",
-    "build": "bun build src/index.ts scripts/context-sync.ts scripts/doctor.ts --target bun --outdir dist",
-    "start": "bun dist/index.js",
+    "build": "bun build src/index.ts scripts/context-sync.ts scripts/doctor.ts --target bun --packages external --outdir dist",
+    "start": "bun dist/src/index.js",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "context:sync": "bun scripts/context-sync.ts",

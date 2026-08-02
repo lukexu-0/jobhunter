@@ -1,9 +1,14 @@
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ContextManifest, ContextSourceDefinition } from "./types.ts";
 import { sha256 } from "./sha256.ts";
 
-export const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");
+const PACKAGE_ROOT = dirname(
+  fileURLToPath(import.meta.resolve("@jobhunter/pipeline/package.json")),
+);
+
+export const REPOSITORY_ROOT = resolve(PACKAGE_ROOT, "../..");
 export const DEFAULT_CONTEXT_MANIFEST_PATH = resolve(REPOSITORY_ROOT, "apps/resume-tailoring/context-sources.json");
 
 export const CONTEXT_SOURCE_ALLOWLIST = Object.freeze([

@@ -2,7 +2,7 @@ import { z } from "zod";
 import {
   AdditionalInfoQuestionSchema,
   ApplicationAdditionalInfoQuestionSchema,
-  ApplicationBrowserUseDiagnosticSchema,
+  ApplicationPlaywrightCliDiagnosticSchema,
   ApplicationFieldResultSchema,
   ApplicationPendingActionSchema,
   ApplicationSessionCommandSchema,
@@ -10,7 +10,7 @@ import {
   FieldResultSchema,
   HarnessSessionStateSchema,
   type ApplicationAdditionalInfoQuestion,
-  type ApplicationBrowserUseDiagnostic,
+  type ApplicationPlaywrightCliDiagnostic,
   type ApplicationFieldResult,
   type ApplicationPendingAction,
   type ApplicationSessionCommand,
@@ -85,7 +85,7 @@ export interface ApplicationHarnessSnapshot {
   readonly slotReleased: boolean;
   readonly company: string | null;
   readonly role: string | null;
-  readonly browserUseDiagnostics: ApplicationBrowserUseDiagnostic[];
+  readonly playwrightCliDiagnostics: ApplicationPlaywrightCliDiagnostic[];
   readonly fieldsFilled: ApplicationFieldResult[];
   readonly fieldsNeedingHuman: ApplicationFieldResult[];
   readonly filesAttached: string[];
@@ -129,7 +129,7 @@ const SLOT_RELEASED_STATES: Partial<Record<HarnessSessionState, true>> = {
 };
 
 
-const RawBrowserUseDiagnosticSchema = z.object({
+const RawPlaywrightCliDiagnosticSchema = z.object({
   step: z.number().int().min(1).max(500),
   status: z.enum(["succeeded", "failed", "timed_out"]),
   exit_code: z.number().int(),
@@ -142,7 +142,7 @@ const RawBrowserUseDiagnosticSchema = z.object({
   ]).nullable(),
   stderr_excerpt: z.union([
     z.literal("[redacted]"),
-    z.literal("Browser Use execution timed out after 120 seconds."),
+    z.literal("Playwright CLI execution timed out after 120 seconds."),
     z.literal("Browser runtime failed."),
     z.literal("Application session expired."),
   ]).nullable(),
@@ -169,7 +169,7 @@ const RawSnapshotSchema = z.object({
     z.string().refine((value) => codePointLength(value, 1, 1_000)),
   ).max(100),
   revision_count: z.number().int().min(0).max(100),
-  browser_use_diagnostics: z.array(RawBrowserUseDiagnosticSchema).max(100).default([]),
+  playwright_cli_diagnostics: z.array(RawPlaywrightCliDiagnosticSchema).max(100).default([]),
   pending_action: RawPendingActionSchema.nullable(),
   approved_origins: z.array(z.string().refine(isCanonicalHttpOrigin)).max(20)
     .refine((origins) => new Set(origins).size === origins.length),
@@ -608,10 +608,10 @@ function projectField(field: z.infer<typeof FieldResultSchema>): ApplicationFiel
   });
 }
 
-function projectBrowserUseDiagnostic(
-  diagnostic: z.infer<typeof RawBrowserUseDiagnosticSchema>,
-): ApplicationBrowserUseDiagnostic {
-  return ApplicationBrowserUseDiagnosticSchema.parse({
+function projectPlaywrightCliDiagnostic(
+  diagnostic: z.infer<typeof RawPlaywrightCliDiagnosticSchema>,
+): ApplicationPlaywrightCliDiagnostic {
+  return ApplicationPlaywrightCliDiagnosticSchema.parse({
     step: diagnostic.step,
     status: diagnostic.status,
     exitCode: diagnostic.exit_code,
@@ -635,7 +635,7 @@ function projectSnapshot(snapshot: RawSnapshot): ApplicationHarnessSnapshot {
     fieldsNeedingHuman: snapshot.fields_needing_human.map(projectField),
     filesAttached: snapshot.files_attached,
     warnings: snapshot.warnings,
-    browserUseDiagnostics: snapshot.browser_use_diagnostics.map(projectBrowserUseDiagnostic),
+    playwrightCliDiagnostics: snapshot.playwright_cli_diagnostics.map(projectPlaywrightCliDiagnostic),
     revisionCount: snapshot.revision_count,
     pendingAction: projectPendingAction(snapshot.pending_action),
     error: snapshot.error,

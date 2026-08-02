@@ -18,12 +18,14 @@ import {
   ApplicationRuntimeError,
   HttpApplicationRuntimeClient,
   RequestAdditionalInfoRuntimeActionSchema,
+  PLAYWRIGHT_CLI_READ_ONLY_COMMANDS,
+  PlaywrightCliToolParametersSchema,
   RuntimeActionRequestSchema,
   RuntimeActionResponseSchema,
   SubmitRuntimeActionResponseSchema,
   type RuntimeActionRequest,
   type RuntimeActionResponse,
-  type BrowserUseExecutionResult,
+  type PlaywrightCliExecutionResult,
 } from "../src/agents/application-runtime-client";
 
 const RUNTIME_URL = "http://127.0.0.1:8765";
@@ -50,7 +52,7 @@ const READY_RESULT = {
   submit_attempted: false as const,
 };
 
-const SUBMIT_EXECUTION_RESULT: BrowserUseExecutionResult = {
+const SUBMIT_EXECUTION_RESULT: PlaywrightCliExecutionResult = {
   exit_code: 0,
   timed_out: false,
   stdout: "",
@@ -192,7 +194,7 @@ const PUBLIC_APPLICATION_SNAPSHOT = {
   ],
   fieldsNeedingHuman: [],
   filesAttached: ["Alex_Example_Resume.pdf"],
-  browserUseDiagnostics: [],
+  playwrightCliDiagnostics: [],
   warnings: ["Review the application before submitting."],
   revisionCount: 1,
   pendingAction: {
@@ -525,6 +527,20 @@ test("rejects malformed additional-information questions, batches, and accepted 
   }).success).toBe(false);
 });
 
+test("exports the exact Playwright CLI commands that are read-only for submission claiming", () => {
+  expect(PLAYWRIGHT_CLI_READ_ONLY_COMMANDS).toEqual([
+    "snapshot",
+    "screenshot",
+    "pdf",
+    "tab-list",
+    "generate-locator",
+    "highlight",
+    "video-chapter",
+    "video-show-actions",
+    "video-hide-actions",
+  ]);
+});
+
 describe("HttpApplicationRuntimeClient", () => {
   test("posts an authenticated action to the exact session runtime endpoint", async () => {
     const requests: Array<{ url: string; init: RequestInit }> = [];
@@ -563,6 +579,24 @@ describe("HttpApplicationRuntimeClient", () => {
     expect(requests[0]?.init.signal).toBeInstanceOf(AbortSignal);
   });
   test("validates and serializes every runtime action variant", async () => {
+    expect(RuntimeActionRequestSchema.parse({
+      type: "playwright_cli",
+      command: "snapshot",
+    })).toEqual({
+      type: "playwright_cli",
+      command: "snapshot",
+      args: [],
+    });
+    const exactInvocationLimitArgs = Array.from(
+      { length: 7 },
+      () => "x".repeat(8_192),
+    );
+    exactInvocationLimitArgs.push("x".repeat(8_184));
+    expect(RuntimeActionRequestSchema.safeParse({
+      type: "playwright_cli",
+      command: "snapshot",
+      args: exactInvocationLimitArgs,
+    }).success).toBe(true);
     const bodies: unknown[] = [];
     const client = new HttpApplicationRuntimeClient(
       RUNTIME_URL,
@@ -574,7 +608,7 @@ describe("HttpApplicationRuntimeClient", () => {
       },
     );
     const actions: RuntimeActionRequest[] = [
-      { type: "browser_use", code: "print(page_info())" },
+      { type: "playwright_cli", command: "eval", args: ["document.body.innerText"] },
       { type: "request_human_navigation", instruction: "Complete the CAPTCHA" },
       { type: "request_origin_approval", origin: "https://ats.example.test" },
       { type: "request_additional_info", questions: [...ADDITIONAL_INFO_QUESTIONS] },
@@ -597,7 +631,7 @@ describe("HttpApplicationRuntimeClient", () => {
     };
     const responses = [
       {
-        type: "browser_use_result",
+        type: "playwright_cli_result",
         exit_code: 0,
         timed_out: false,
         stdout: "filled name",
@@ -663,7 +697,7 @@ describe("HttpApplicationRuntimeClient", () => {
   test("matches Python character bounds by Unicode code point", () => {
     const character = "😀";
     const browserResponse = {
-      type: "browser_use_result",
+      type: "playwright_cli_result",
       exit_code: 0,
       timed_out: false,
       stdout: character.repeat(20_000),
@@ -744,6 +778,47 @@ describe("HttpApplicationRuntimeClient", () => {
       ...SUBMIT_EXECUTION_RESULT,
     }).success).toBe(false);
   });
+  test("rejects unpaired UTF-16 surrogates in Playwright CLI arguments and accepts a valid pair", () => {
+    for (const invalidArgument of ["\uD800", "\uDC00"]) {
+      expect(PlaywrightCliToolParametersSchema.safeParse({
+        command: "snapshot",
+        args: [invalidArgument],
+      }).success).toBe(false);
+      expect(RuntimeActionRequestSchema.safeParse({
+        type: "playwright_cli",
+        command: "snapshot",
+        args: [invalidArgument],
+      }).success).toBe(false);
+    }
+
+    const validPair = "\uD83D\uDE00";
+    expect(PlaywrightCliToolParametersSchema.safeParse({
+      command: "snapshot",
+      args: [validPair],
+    }).success).toBe(true);
+    expect(RuntimeActionRequestSchema.safeParse({
+      type: "playwright_cli",
+      command: "snapshot",
+      args: [validPair],
+    }).success).toBe(true);
+  });
+
+  test("rejects attached short session options without reserving other short options", () => {
+    expect(PlaywrightCliToolParametersSchema.safeParse({
+      command: "snapshot",
+      args: ["-sother-session"],
+    }).success).toBe(false);
+    expect(RuntimeActionRequestSchema.safeParse({
+      type: "playwright_cli",
+      command: "snapshot",
+      args: ["-sother-session"],
+    }).success).toBe(false);
+    expect(PlaywrightCliToolParametersSchema.safeParse({
+      command: "snapshot",
+      args: ["-xother-session"],
+    }).success).toBe(true);
+  });
+
 
 
   test("rejects invalid and non-strict runtime action inputs before fetching", async () => {
@@ -758,7 +833,38 @@ describe("HttpApplicationRuntimeClient", () => {
       },
     );
     const invalidInputs: unknown[] = [
-      { type: "browser_use", code: "x".repeat(65_537) },
+      { type: "playwright_cli", command: "open", args: [] },
+      { type: "playwright_cli", command: "snapshot", args: [], unexpected: true },
+      { type: "playwright_cli", command: "snapshot", args: ["--session=other"] },
+      { type: "playwright_cli", command: "snapshot", args: ["-s=other"] },
+      { type: "playwright_cli", command: "snapshot", args: ["-s"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--s"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--s=other"] },
+      { type: "playwright_cli", command: "snapshot", args: ["-h"] },
+      { type: "playwright_cli", command: "snapshot", args: ["-h=true"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--help"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--help=true"] },
+      { type: "playwright_cli", command: "snapshot", args: ["-v"] },
+      { type: "playwright_cli", command: "snapshot", args: ["-v=true"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--version"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--version=true"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--json"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--raw=true"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--config=other.json"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--profile", "/tmp/profile"] },
+      { type: "playwright_cli", command: "snapshot", args: ["--browser=firefox"] },
+      {
+        type: "playwright_cli",
+        command: "snapshot",
+        args: Array.from({ length: 65 }, () => "x"),
+      },
+      { type: "playwright_cli", command: "snapshot", args: ["é".repeat(4_097)] },
+      { type: "playwright_cli", command: "snapshot", args: ["bad\u0000argument"] },
+      {
+        type: "playwright_cli",
+        command: "snapshot",
+        args: Array.from({ length: 9 }, () => "x".repeat(8_192)),
+      },
       { type: "request_human_navigation", instruction: "   " },
       {
         type: "request_origin_approval",
@@ -1023,7 +1129,7 @@ describe("HttpApplicationRuntimeClient", () => {
         }],
       }),
       jsonResponse({
-        type: "browser_use_result",
+        type: "playwright_cli_result",
         exit_code: 0,
         timed_out: false,
         stdout: "",
