@@ -88,13 +88,6 @@ export const BrowserUseRuntimeActionSchema = z.object({
 }).strict();
 export type BrowserUseRuntimeAction = z.infer<typeof BrowserUseRuntimeActionSchema>;
 
-export const SubmitApplicationRuntimeActionSchema = z.object({
-  type: z.literal("submit_application"),
-  selector: z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
-}).strict();
-export type SubmitApplicationRuntimeAction = z.infer<
-  typeof SubmitApplicationRuntimeActionSchema
->;
 
 export const RequestHumanNavigationRuntimeActionSchema = z.object({
   type: z.literal("request_human_navigation"),
@@ -154,7 +147,6 @@ export type ReportApplicationMismatchRuntimeAction = z.infer<
 
 export const RuntimeActionRequestSchema = z.discriminatedUnion("type", [
   BrowserUseRuntimeActionSchema,
-  SubmitApplicationRuntimeActionSchema,
   RequestHumanNavigationRuntimeActionSchema,
   RequestOriginApprovalRuntimeActionSchema,
   RequestAdditionalInfoRuntimeActionSchema,
@@ -208,16 +200,6 @@ export type BrowserUseResultRuntimeActionResponse = z.infer<
 >;
 
 
-export const SubmitApplicationResultRuntimeActionResponseSchema =
-  BrowserUseExecutionResultSchema.extend({
-    type: z.literal("submit_application_result"),
-    pre_click_dom: z.string().refine(
-      (value) => hasCodePointLength(value, 0, 40_000),
-    ),
-  }).strict();
-export type SubmitApplicationResultRuntimeActionResponse = z.infer<
-  typeof SubmitApplicationResultRuntimeActionResponseSchema
->;
 
 export const ContinueRuntimeActionResponseSchema = z.object({
   type: z.literal("continue"),
@@ -246,6 +228,7 @@ export type ReviseRuntimeActionResponse = z.infer<
 
 export const SubmitRuntimeActionResponseSchema = z.object({
   type: z.literal("submit"),
+  instruction: z.literal("You're good to submit."),
   result: ReviewApplicationResultSchema,
 }).strict();
 export type SubmitRuntimeActionResponse = z.infer<
@@ -325,7 +308,6 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   BrowserUseResultRuntimeActionResponseSchema,
-  SubmitApplicationResultRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   ApproveRuntimeActionResponseSchema,
   ReviseRuntimeActionResponseSchema,
