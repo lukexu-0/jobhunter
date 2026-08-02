@@ -118,6 +118,7 @@ function reserveSmokeSession(
     SMOKE_PDF_SHA256,
   );
   return repository.recordApplicationSnapshot(run.id, {
+    slotReleased: false,
     generation: reserved.generation,
     sessionId,
     bridgeState: "awaiting_human_review",

@@ -571,12 +571,16 @@ describe("pipeline application bootstrap", () => {
 
   test("closes worker, auth, context, and owned databases in order exactly once", async () => {
     const fixture = createFixture();
+    fixture.app.services.applicationSessions.dispose = async () => {
+      fixture.calls.close.push("application-sessions");
+    };
     const first = fixture.app.close();
     const second = fixture.app.close();
     expect(second).toBe(first);
     await Promise.all([first, second]);
     expect(fixture.calls.close).toEqual([
       "worker",
+      "application-sessions",
       "auth",
       "context",
       "pipeline-database",
@@ -585,6 +589,6 @@ describe("pipeline application bootstrap", () => {
     expect(() => fixture.pipelineDatabase.query("SELECT 1").get()).toThrow();
     expect(() => fixture.contextDatabase.query("SELECT 1").get()).toThrow();
     await fixture.app.close();
-    expect(fixture.calls.close).toHaveLength(5);
+    expect(fixture.calls.close).toHaveLength(6);
   });
 });

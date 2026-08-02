@@ -48,6 +48,7 @@ function recordApplicationReview(
   sessionId: string,
 ): void {
   repo.recordApplicationSnapshot(runId, {
+    slotReleased: false,
     generation: 1,
     sessionId,
     bridgeState: "awaiting_human_review",
@@ -526,6 +527,7 @@ describe("persisted workflow commands", () => {
     repo.approve(runId, hash);
     repo.reserveApplicationSession(runId, null, sessionId, hash);
     repo.recordApplicationSnapshot(runId, {
+      slotReleased: true,
       generation: 1,
       sessionId,
       bridgeState: "cancelled",
@@ -575,6 +577,7 @@ describe("persisted workflow commands", () => {
           `02020202-0202-4202-8202-${String(index * 2 + 2).padStart(12, "0")}`;
         repo.reserveApplicationSession(runId, null, cancelledSessionId, hash);
         repo.recordApplicationSnapshot(runId, {
+          slotReleased: true,
           generation: 1,
           sessionId: cancelledSessionId,
           bridgeState: "cancelled",
@@ -583,6 +586,7 @@ describe("persisted workflow commands", () => {
         repo.reserveApplicationSession(runId, cancelledSessionId, latestSessionId, hash);
         if (latestState === "lost") {
           repo.recordApplicationSnapshot(runId, {
+            slotReleased: false,
             generation: 2,
             sessionId: latestSessionId,
             bridgeState: "running",
@@ -595,6 +599,7 @@ describe("persisted workflow commands", () => {
           });
         } else {
           repo.recordApplicationSnapshot(runId, {
+            slotReleased: true,
             generation: 2,
             sessionId: latestSessionId,
             bridgeState: latestState,
@@ -640,6 +645,7 @@ describe("persisted workflow commands", () => {
       const sessionId = "03030303-0303-4303-8303-030303030301";
       repo.reserveApplicationSession(runId, null, sessionId, approvedHash);
       repo.recordApplicationSnapshot(runId, {
+        slotReleased: true,
         generation: 1,
         sessionId,
         bridgeState: "cancelled",
@@ -666,6 +672,7 @@ describe("persisted workflow commands", () => {
       repo.approve(runId, hash);
       repo.reserveApplicationSession(runId, null, sessionId, hash);
       repo.recordApplicationSnapshot(runId, {
+        slotReleased: true,
         generation: 1,
         sessionId,
         bridgeState: "cancelled",
@@ -694,6 +701,7 @@ describe("persisted workflow commands", () => {
     repo.approve(runId, hash);
     repo.reserveApplicationSession(runId, null, sessionId, hash);
     repo.recordApplicationSnapshot(runId, {
+      slotReleased: true,
       generation: 1,
       sessionId,
       bridgeState: "cancelled",
@@ -795,6 +803,7 @@ describe("application session ledger", () => {
       pdfSha256: hash,
       bridgeState: "reserved",
       submissionPhase: "not_attempted",
+      slotReleased: false,
       publicSnapshot: null,
       lastUpstreamEventId: null,
       createdAt: 1_000,
@@ -849,8 +858,31 @@ describe("application session ledger", () => {
     repo.recordApplicationSnapshot(manualRunId, {
       generation: 1,
       sessionId: manualSessionId,
-      bridgeState: "closed",
-      publicSnapshot: { state: "closed" },
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+      slotReleased: false,
+    });
+    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+    expect(() => repo.reserveApplicationSession(
+      oldest,
+      null,
+      "14141414-1414-4414-8414-141414141414",
+      hash,
+    )).toThrow(/slot|active/i);
+    expect(repo.getLatestApplicationSession(manualRunId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: false,
+    });
+    repo.recordApplicationSnapshot(manualRunId, {
+      generation: 1,
+      sessionId: manualSessionId,
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+      slotReleased: true,
+    });
+    expect(repo.getLatestApplicationSession(manualRunId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: true,
     });
     expect(repo.getNextAutomaticApplicationStart()?.runId).toBe(oldest);
 
@@ -862,6 +894,7 @@ describe("application session ledger", () => {
       sessionId: automaticSessionId,
       bridgeState: "closed",
       publicSnapshot: { state: "closed" },
+      slotReleased: true,
     });
     expect(repo.getNextAutomaticApplicationStart()).toEqual({
       runId: next,
@@ -901,6 +934,7 @@ describe("application session ledger", () => {
     const originalSessionId = "14141414-1414-4414-8414-141414141414";
     repo.reserveApplicationSession(run.id, null, originalSessionId, originalHash);
     repo.recordApplicationSnapshot(run.id, {
+      slotReleased: true,
       generation: 1,
       sessionId: originalSessionId,
       bridgeState: "cancelled",
@@ -908,6 +942,7 @@ describe("application session ledger", () => {
     });
     repo.editRun(run.id, "Emphasize platform ownership.", originalHash);
     repo.recordApplicationSnapshot(run.id, {
+      slotReleased: true,
       generation: 1,
       sessionId: originalSessionId,
       bridgeState: "closed",
@@ -937,6 +972,7 @@ describe("application session ledger", () => {
     repo.reserveApplicationSession(blockerRunId, null, blockerSessionId, blockerHash);
     expect(repo.getNextAutomaticApplicationStart()).toBeNull();
     repo.recordApplicationSnapshot(blockerRunId, {
+      slotReleased: true,
       generation: 1,
       sessionId: blockerSessionId,
       bridgeState: "closed",
@@ -957,6 +993,7 @@ describe("application session ledger", () => {
     const sessionId = "22222222-2222-4222-8222-222222222222";
     repo.reserveApplicationSession(runId, null, sessionId, hash);
     repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId,
       bridgeState: "awaiting_human_review",
@@ -1025,6 +1062,7 @@ describe("application session ledger", () => {
         `50505050-5050-4050-8050-${String(index + 1).padStart(12, "0")}`;
       repo.reserveApplicationSession(runId, null, sessionId, hash);
       repo.recordApplicationSnapshot(runId, {
+        slotReleased: bridgeState === "cancelled",
         generation: 1,
         sessionId,
         bridgeState,
@@ -1037,6 +1075,15 @@ describe("application session ledger", () => {
         bridgeState,
         submissionPhase: "not_attempted",
       });
+      if (bridgeState === "running") {
+        repo.recordApplicationSnapshot(runId, {
+          slotReleased: true,
+          generation: 1,
+          sessionId,
+          bridgeState: "closed",
+          publicSnapshot: { state: "closed" },
+        });
+      }
     }
   });
 
@@ -1048,6 +1095,7 @@ describe("application session ledger", () => {
     const sessionId = "60606060-6060-4060-8060-000000000001";
     repo.reserveApplicationSession(runId, null, sessionId, hash);
     repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId,
       bridgeState: "running",
@@ -1077,6 +1125,7 @@ describe("application session ledger", () => {
     repo.reserveApplicationSession(runId, null, sessionId, hash);
     repo.markAutomaticApplicationReviewReady(sessionId);
     repo.recordApplicationSnapshot(runId, {
+      slotReleased: true,
       generation: 1,
       sessionId,
       bridgeState: "cancelled",
@@ -1111,6 +1160,13 @@ describe("application session ledger", () => {
       repo.claimApplicationSubmission(sessionId);
       repo.finalizeApplicationSubmission(sessionId, outcome);
       expect(repo.getRun(runId)?.applicationStatus).toBe(expected);
+      repo.recordApplicationSnapshot(runId, {
+        slotReleased: true,
+        generation: 1,
+        sessionId,
+        bridgeState: "closed",
+        publicSnapshot: { state: "closed" },
+      });
     }
   });
 
@@ -1128,6 +1184,7 @@ describe("application session ledger", () => {
       repo.finalizeApplicationSubmission(sessionId, outcome);
       const finalState = outcome === "submitted" ? "submitted" : "submission_uncertain";
       repo.recordApplicationSnapshot(runId, {
+        slotReleased: false,
         generation: 1,
         sessionId,
         bridgeState: finalState,
@@ -1135,12 +1192,14 @@ describe("application session ledger", () => {
       });
 
       expect(() => repo.recordApplicationSnapshot(runId, {
+        slotReleased: false,
         generation: 1,
         sessionId,
         bridgeState: "running",
         publicSnapshot: { state: "running" },
       })).toThrow(/submission phase/);
       const closed = repo.recordApplicationSnapshot(runId, {
+        slotReleased: true,
         generation: 1,
         sessionId,
         bridgeState: "closed",
@@ -1166,6 +1225,7 @@ describe("application session ledger", () => {
       repo.reserveApplicationSession(runId, null, sessionId, hash);
       if (index === 0) {
         repo.recordApplicationSnapshot(runId, {
+          slotReleased: false,
           generation: 1,
           sessionId,
           bridgeState: "awaiting_human_review",
@@ -1198,6 +1258,7 @@ describe("application session ledger", () => {
           "UPDATE run_application_sessions SET public_snapshot_json = NULL WHERE session_id = ?",
         ).run(sessionId);
       }
+      repo.releaseApplicationSessionSlot(runId, 1, sessionId);
     }
     tick(25);
 
@@ -1231,6 +1292,7 @@ describe("application session ledger", () => {
         expect(projection.company).toBeNull();
       }
       repo.recordApplicationSnapshot(runId, {
+        slotReleased: true,
         generation: 1,
         sessionId,
         bridgeState: "closed",
@@ -1307,6 +1369,7 @@ describe("application session ledger", () => {
       pendingAction: { type: "human_navigation", instruction: "Complete login" },
     };
     const recorded = repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId,
       bridgeState: "awaiting_human_navigation",
@@ -1324,6 +1387,7 @@ describe("application session ledger", () => {
     });
     tick(50);
     const replayed = repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId,
       bridgeState: "running",
@@ -1337,6 +1401,7 @@ describe("application session ledger", () => {
       updatedAt: 1_050,
     });
     const stale = repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId,
       bridgeState: "running",
@@ -1364,6 +1429,7 @@ describe("application session ledger", () => {
       pendingAction: { type: "human_navigation", instruction: "Complete login" },
     };
     repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId,
       bridgeState: "awaiting_human_navigation",
@@ -1373,6 +1439,7 @@ describe("application session ledger", () => {
     const before = repo.getLatestApplicationSession(runId);
 
     const coalesced = repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId,
       bridgeState: "running",
@@ -1397,6 +1464,7 @@ describe("application session ledger", () => {
     const firstSessionId = "44444444-4444-4444-8444-444444444444";
     repo.reserveApplicationSession(runId, null, firstSessionId, hash);
     repo.recordApplicationSnapshot(runId, {
+      slotReleased: false,
       generation: 1,
       sessionId: firstSessionId,
       bridgeState: "running",
@@ -1451,6 +1519,7 @@ describe("application session ledger", () => {
         : "88888888-8888-4888-8888-888888888888";
       repo.reserveApplicationSession(runId, null, sessionId, hash);
       const terminal = repo.recordApplicationSnapshot(runId, {
+        slotReleased: bridgeState === "cancelled" || bridgeState === "failed" || bridgeState === "closed" || bridgeState === "lost",
         generation: 1,
         sessionId,
         bridgeState,
@@ -1459,6 +1528,7 @@ describe("application session ledger", () => {
       tick(10);
 
       const closed = repo.recordApplicationSnapshot(runId, {
+        slotReleased: true,
         generation: 1,
         sessionId,
         bridgeState: "closed",
@@ -1471,6 +1541,7 @@ describe("application session ledger", () => {
       });
       expect(closed.updatedAt).toBeGreaterThan(terminal.updatedAt);
       expect(() => repo.recordApplicationSnapshot(runId, {
+        slotReleased: false,
         generation: 1,
         sessionId,
         bridgeState: "running",
@@ -1519,7 +1590,7 @@ describe("artifact retention reservations", () => {
   });
 
 
-  test("every live application state blocks deletion and pruning until every terminal state unblocks", () => {
+  test("live states block deletion and pruning while released terminal states unblock", () => {
     const liveStates = [
       "reserved",
       "starting",
@@ -1560,6 +1631,7 @@ describe("artifact retention reservations", () => {
           );
         }
         live.recordApplicationSnapshot(runId, {
+          slotReleased: false,
           generation: 1,
           sessionId: currentSessionId,
           bridgeState,
@@ -1567,12 +1639,14 @@ describe("artifact retention reservations", () => {
         });
       } else if (bridgeState !== "reserved") {
         live.recordApplicationSnapshot(runId, {
+          slotReleased: false,
           generation: 1,
           sessionId: currentSessionId,
           bridgeState,
           publicSnapshot: { state: bridgeState },
         });
       }
+      live.releaseApplicationSessionSlot(runId, 1, currentSessionId);
       expect(() => live.deleteRun(runId)).toThrow(/close the browser session first/);
     }
     expect(live.reserveArtifactPruneCandidates(10)).toEqual([]);
@@ -1584,6 +1658,7 @@ describe("artifact retention reservations", () => {
       terminal.reserveApplicationSession(runId, null, sessionId(20 + index), hash);
       if (bridgeState === "lost") {
         terminal.recordApplicationSnapshot(runId, {
+          slotReleased: false,
           generation: 1,
           sessionId: sessionId(20 + index),
           bridgeState: "running",
@@ -1596,6 +1671,7 @@ describe("artifact retention reservations", () => {
         });
       } else {
         terminal.recordApplicationSnapshot(runId, {
+          slotReleased: bridgeState === "cancelled" || bridgeState === "failed" || bridgeState === "closed" || bridgeState === "lost",
           generation: 1,
           sessionId: sessionId(20 + index),
           bridgeState,
@@ -1620,6 +1696,7 @@ describe("artifact retention reservations", () => {
       terminal.reserveApplicationSession(runId, null, sessionId(30 + index), hash);
       if (bridgeState === "lost") {
         terminal.recordApplicationSnapshot(runId, {
+          slotReleased: false,
           generation: 1,
           sessionId: sessionId(30 + index),
           bridgeState: "running",
@@ -1632,6 +1709,7 @@ describe("artifact retention reservations", () => {
         });
       } else {
         terminal.recordApplicationSnapshot(runId, {
+          slotReleased: bridgeState === "cancelled" || bridgeState === "failed" || bridgeState === "closed" || bridgeState === "lost",
           generation: 1,
           sessionId: sessionId(30 + index),
           bridgeState,
@@ -1643,6 +1721,59 @@ describe("artifact retention reservations", () => {
       terminalRunIds.slice(0, terminalStates.length),
     );
   });
+  test("blocks deletion and pruning until a terminal session releases its slot", () => {
+    const hash = "3".repeat(64);
+    const deletion = fixture().repo;
+    const deletionRunId = createReview(deletion, hash, false, "terminal-delete-pending");
+    deletion.approve(deletionRunId, hash);
+    const deletionSessionId = "45454545-4545-4545-8545-454545454545";
+    deletion.reserveApplicationSession(deletionRunId, null, deletionSessionId, hash);
+    deletion.recordApplicationSnapshot(deletionRunId, {
+      generation: 1,
+      sessionId: deletionSessionId,
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+      slotReleased: false,
+    });
+    expect(() => deletion.deleteRun(deletionRunId)).toThrow(/close the browser session first/);
+    deletion.recordApplicationSnapshot(deletionRunId, {
+      generation: 1,
+      sessionId: deletionSessionId,
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+      slotReleased: true,
+    });
+    deletion.deleteRun(deletionRunId);
+    expect(deletion.getRun(deletionRunId)).toBeNull();
+
+    const retention = fixture().repo;
+    const retentionRunIds = Array.from(
+      { length: 12 },
+      (_, index) => `terminal-prune-pending-${index}`,
+    );
+    for (const runId of retentionRunIds) createReview(retention, hash, false, runId);
+    const retentionRunId = retentionRunIds[0]!;
+    retention.approve(retentionRunId, hash);
+    const retentionSessionId = "46464646-4646-4646-8646-464646464646";
+    retention.reserveApplicationSession(retentionRunId, null, retentionSessionId, hash);
+    retention.recordApplicationSnapshot(retentionRunId, {
+      generation: 1,
+      sessionId: retentionSessionId,
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+      slotReleased: false,
+    });
+    expect(retention.reserveArtifactPruneCandidates(10)).toEqual([retentionRunIds[1]!]);
+    retention.recordApplicationSnapshot(retentionRunId, {
+      generation: 1,
+      sessionId: retentionSessionId,
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+      slotReleased: true,
+    });
+    expect(retention.reserveArtifactPruneCandidates(10)).toEqual(retentionRunIds.slice(0, 2));
+  });
+
   test("excludes tombstoned runs from retention selection and reservations", () => {
     const { db, repo } = fixture();
     const ids = Array.from({ length: 13 }, (_, index) => `tombstone-retention-${index}`);

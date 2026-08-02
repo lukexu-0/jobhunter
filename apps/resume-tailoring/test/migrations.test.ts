@@ -230,9 +230,50 @@ function versionFourteenDatabase(): Database {
       id TEXT PRIMARY KEY,
       auto_apply INTEGER NOT NULL DEFAULT 0 CHECK (auto_apply IN (0,1))
     ) STRICT;
+    CREATE TABLE run_application_sessions (
+      bridge_state TEXT NOT NULL
+    ) STRICT;
     INSERT INTO runs(id, auto_apply) VALUES ('automatic-run', 1);
     INSERT INTO schema_migrations(version, applied_at) VALUES (14, 1400);
     PRAGMA user_version = 14;
+  `);
+  return db;
+}
+
+function versionFifteenApplicationDatabase(): Database {
+  const db = new Database(":memory:");
+  databases.push(db);
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE run_application_sessions (
+      run_id TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      session_id TEXT NOT NULL UNIQUE,
+      resume_revision INTEGER NOT NULL,
+      pdf_sha256 TEXT NOT NULL,
+      bridge_state TEXT NOT NULL,
+      submission_phase TEXT NOT NULL DEFAULT 'not_attempted',
+      automatic_review_ready INTEGER NOT NULL DEFAULT 0,
+      submission_attempted_at INTEGER,
+      submission_confirmed_at INTEGER,
+      public_snapshot_json TEXT,
+      last_upstream_event_id INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_at INTEGER,
+      PRIMARY KEY (run_id, generation)
+    ) STRICT;
+    INSERT INTO run_application_sessions(
+      run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
+      created_at, updated_at, terminal_at
+    ) VALUES
+      ('active-run', 1, '11111111-1111-4111-8111-111111111111', 1, '${"a".repeat(64)}', 'running', 1000, 1100, NULL),
+      ('terminal-run', 1, '22222222-2222-4222-8222-222222222222', 1, '${"b".repeat(64)}', 'failed', 1000, 1200, 1200);
+    INSERT INTO schema_migrations(version, applied_at) VALUES (15, 1500);
+    PRAGMA user_version = 15;
   `);
   return db;
 }
@@ -311,7 +352,7 @@ test("migration twelve preserves the live claim and adds four unique empty claim
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   expect(db.query<{
     id: number;
     run_id: string | null;
@@ -710,6 +751,31 @@ test("migration fifteen preserves automatic submission values and defaults skip 
   ).get()).toEqual({ version: 15, applied_at: 2_000 });
 });
 
+test("migration sixteen preserves physical application slot ownership", () => {
+  const db = versionFifteenApplicationDatabase();
+
+  migratePipelineDatabase(db, 2_000);
+
+  expect(db.query<{
+    run_id: string;
+    slot_released: number;
+  }, []>(
+    "SELECT run_id, slot_released FROM run_application_sessions ORDER BY run_id",
+  ).all()).toEqual([
+    { run_id: "active-run", slot_released: 0 },
+    { run_id: "terminal-run", slot_released: 1 },
+  ]);
+  expect(db.query<{ version: number; applied_at: number }, []>(
+    "SELECT version, applied_at FROM schema_migrations WHERE version = 16",
+  ).get()).toEqual({ version: 16, applied_at: 2_000 });
+  expect(db.query<{ name: string }, []>(
+    "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'run_application_sessions_unreleased_slot'",
+  ).get()).toEqual({ name: "run_application_sessions_unreleased_slot" });
+  expect(() => db.query(
+    "UPDATE run_application_sessions SET slot_released = 2 WHERE run_id = 'active-run'",
+  ).run()).toThrow();
+});
+
 test("migrates version seven defaults without changing existing statuses", () => {
   const db = versionSevenDatabase();
 
@@ -719,7 +785,7 @@ test("migrates version seven defaults without changing existing statuses", () =>
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -750,6 +816,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 13, applied_at: 2000 },
     { version: 14, applied_at: 2000 },
     { version: 15, applied_at: 2000 },
+    { version: 16, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -791,7 +858,7 @@ test("migrates existing runs to application status applied atomically", () => {
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   expect(migrated.query<{
     application_status: string;
     generate_keyword_map: number;
@@ -825,7 +892,7 @@ test("migrates version two retention state atomically without changing history",
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

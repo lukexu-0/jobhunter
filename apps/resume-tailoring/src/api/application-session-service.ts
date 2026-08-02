@@ -38,7 +38,7 @@ import {
 const MAX_PROFILE_BYTES = 1024 * 1024;
 const PROFILE_RELATIVE_PATH = "apps/user-info/current-context/personal/applicant-profile.md";
 const LOST_WARNING = "Verify whether the application was submitted before retrying.";
-const RELEASED_SESSION_HISTORY_LIMIT = 64;
+const SLOT_RELEASE_RETRY_DELAY_MS = 250;
 
 const LIVE_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
   reserved: true,
@@ -52,6 +52,12 @@ const LIVE_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
   submitted: true,
   submission_uncertain: true,
 });
+
+function waitForSlotReleaseRetry(): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, SLOT_RELEASE_RETRY_DELAY_MS).unref();
+  return promise;
+}
 
 const TERMINAL_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
   cancelled: true,
@@ -304,16 +310,32 @@ export class ApplicationSessionService {
     string,
     Set<Promise<ApplicationSessionSnapshotDto>>
   >();
-  readonly #releasedSessionIds = new Set<string>();
+  readonly #slotReleaseObservers = new Map<string, Promise<void>>();
+  readonly #slotReleaseAbortController = new AbortController();
+  #disposed = false;
+  #disposePromise: Promise<void> | undefined;
 
   constructor(private readonly dependencies: ApplicationSessionServiceDependencies) {
     this.#uuidFactory = dependencies.uuidFactory ?? randomUUID;
     this.#now = dependencies.now ?? Date.now;
     this.#profileReader = dependencies.profileReader ?? (() => readApplicantProfileMarkdown());
   }
+  dispose(): Promise<void> {
+    if (this.#disposePromise) return this.#disposePromise;
+    this.#disposed = true;
+    this.#slotReleaseAbortController.abort();
+    this.#disposePromise = Promise.allSettled(
+      [...this.#slotReleaseObservers.values()],
+    ).then(() => {
+      this.#slotReleaseObservers.clear();
+    });
+    return this.#disposePromise;
+  }
+
 
   async startNextAutomaticApplication(signal: AbortSignal): Promise<boolean> {
     signal.throwIfAborted();
+    await this.#reconcileApplicationSlot(signal);
     const candidate = this.dependencies.repository.getNextAutomaticApplicationStart();
     if (!candidate) return false;
     await this.start(candidate.runId, candidate.approvedPdfSha256, signal);
@@ -377,6 +399,7 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
+    await this.#reconcileApplicationSlot(signal, runId);
     let latest: PublicApplicationSession | null;
     try {
       latest = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -463,6 +486,7 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
+    await this.#reconcileApplicationSlot(signal);
     let previous: PublicApplicationSession | null;
     try {
       previous = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -573,6 +597,7 @@ export class ApplicationSessionService {
   ): AsyncGenerator<ApplicationSessionStreamItem> {
     let session = initialSession;
     let lastDeliveredUpstreamEventId = clientUpstreamEventId ?? -1;
+    let cleanupPending = false;
     const replaySnapshot = session.publicSnapshot === null
       ? null
       : ApplicationSessionSnapshotDtoSchema.safeParse(session.publicSnapshot);
@@ -601,22 +626,55 @@ export class ApplicationSessionService {
     try {
       for await (const event of upstreamEvents) {
         signal.throwIfAborted();
+        if (
+          TERMINAL_APPLICATION_STATES[event.session.state] === true
+          && !event.session.slotReleased
+        ) {
+          cleanupPending = true;
+        }
         const durable = this.dependencies.repository.getLatestApplicationSession(runId);
         if (!durable || durable.generation !== session.generation) {
           throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
         }
         session = durable;
-        if (
-          session.lastUpstreamEventId !== null
-          && event.id <= session.lastUpstreamEventId
-        ) {
+        const persistedCursor = session.lastUpstreamEventId;
+        if (persistedCursor !== null && event.id <= persistedCursor) {
           if (
-            session.lastUpstreamEventId > lastDeliveredUpstreamEventId
+            session.publicSnapshot !== null
+            && session.bridgeState !== "reserved"
+            && session.bridgeState !== "lost"
+          ) {
+            try {
+              const recorded =
+                this.dependencies.repository.recordApplicationSnapshotWithSlotTransition(
+                  runId,
+                  {
+                    generation: session.generation,
+                    sessionId: session.sessionId,
+                    bridgeState: session.bridgeState,
+                    publicSnapshot: session.publicSnapshot,
+                    slotReleased: event.session.slotReleased,
+                    lastUpstreamEventId: event.id,
+                  },
+                );
+              session = recorded.session;
+              this.#notifyApplicationSessionReleased(
+                recorded.slotReleasedTransitioned,
+              );
+              if (session.slotReleased) cleanupPending = false;
+            } catch (error) {
+              mapRepositoryError(error);
+            }
+          }
+          const replayCursor = session.lastUpstreamEventId;
+          if (
+            replayCursor !== null
+            && replayCursor > lastDeliveredUpstreamEventId
             && session.publicSnapshot !== null
           ) {
-            lastDeliveredUpstreamEventId = session.lastUpstreamEventId;
+            lastDeliveredUpstreamEventId = replayCursor;
             yield {
-              id: `${session.generation}:${session.lastUpstreamEventId}`,
+              id: `${session.generation}:${replayCursor}`,
               event: ApplicationSessionEventDtoSchema.parse({
                 generation: session.generation,
                 event: "snapshot",
@@ -669,13 +727,23 @@ export class ApplicationSessionService {
             ) {
               throw applicationHarnessUnavailable();
             }
-            session = this.dependencies.repository.recordApplicationSnapshot(runId, {
-              generation: session.generation,
-              sessionId: session.sessionId,
-              bridgeState: retainedProjection.bridgeState,
-              publicSnapshot: retainedProjection,
-              lastUpstreamEventId: event.id,
-            });
+            const recorded =
+              this.dependencies.repository.recordApplicationSnapshotWithSlotTransition(
+                runId,
+                {
+                  generation: session.generation,
+                  sessionId: session.sessionId,
+                  bridgeState: retainedProjection.bridgeState,
+                  publicSnapshot: retainedProjection,
+                  slotReleased: event.session.slotReleased,
+                  lastUpstreamEventId: event.id,
+                },
+              );
+            session = recorded.session;
+            this.#notifyApplicationSessionReleased(
+              recorded.slotReleasedTransitioned,
+            );
+            if (session.slotReleased) cleanupPending = false;
           } catch (error) {
             mapRepositoryError(error);
           }
@@ -698,12 +766,14 @@ export class ApplicationSessionService {
           session,
           event.session,
           event.id,
+          false,
         );
         const recorded = this.dependencies.repository.getLatestApplicationSession(runId);
         if (!recorded || recorded.generation !== session.generation) {
           throw new RunServiceError("RUN_CONFLICT", "application session changed", 409);
         }
         session = recorded;
+        if (session.slotReleased) cleanupPending = false;
         if (recorded.lastUpstreamEventId !== event.id) {
           if (
             recorded.lastUpstreamEventId !== null
@@ -747,6 +817,10 @@ export class ApplicationSessionService {
         }
       }
       this.#throwHarnessError(error);
+    } finally {
+      if (cleanupPending && !session.slotReleased) {
+        this.#ensureSlotReleaseObserver(runId, session);
+      }
     }
   }
 
@@ -917,13 +991,18 @@ export class ApplicationSessionService {
     }
     const closed = this.#closedProjection(session, "closed");
     try {
-      const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
-        generation: session.generation,
-        sessionId: session.sessionId,
-        bridgeState: "closed",
-        publicSnapshot: closed,
-      });
-      this.#notifyApplicationSessionReleased(recorded, true);
+      const recorded =
+        this.dependencies.repository.recordApplicationSnapshotWithSlotTransition(
+          runId,
+          {
+            generation: session.generation,
+            sessionId: session.sessionId,
+            bridgeState: "closed",
+            publicSnapshot: closed,
+            slotReleased: true,
+          },
+        );
+      this.#notifyApplicationSessionReleased(recorded.slotReleasedTransitioned);
     } catch (error) {
       mapRepositoryError(error);
     }
@@ -1085,6 +1164,7 @@ export class ApplicationSessionService {
     session: PublicApplicationSession,
     snapshot: ApplicationHarnessSnapshot,
     lastUpstreamEventId?: number,
+    observeSlotRelease = true,
   ): ApplicationSessionSnapshotDto {
     let current = this.dependencies.repository.getLatestApplicationSession(runId);
     if (
@@ -1142,14 +1222,27 @@ export class ApplicationSessionService {
       error: bridgeState === "failed" ? snapshot.error : null,
     });
     try {
-      const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
-        generation: current.generation,
-        sessionId: current.sessionId,
-        bridgeState,
-        publicSnapshot: projected,
-        ...(lastUpstreamEventId !== undefined ? { lastUpstreamEventId } : {}),
-      });
-      this.#notifyApplicationSessionReleased(recorded, snapshot.slotReleased);
+      const result =
+        this.dependencies.repository.recordApplicationSnapshotWithSlotTransition(
+          runId,
+          {
+            generation: current.generation,
+            sessionId: current.sessionId,
+            bridgeState,
+            publicSnapshot: projected,
+            slotReleased: snapshot.slotReleased,
+            ...(lastUpstreamEventId !== undefined ? { lastUpstreamEventId } : {}),
+          },
+        );
+      const recorded = result.session;
+      this.#notifyApplicationSessionReleased(result.slotReleasedTransitioned);
+      if (
+        observeSlotRelease
+        && TERMINAL_APPLICATION_STATES[snapshot.state] === true
+        && !recorded.slotReleased
+      ) {
+        this.#ensureSlotReleaseObserver(runId, recorded);
+      }
       return this.#storedView(recorded);
     } catch (error) {
       mapRepositoryError(error);
@@ -1186,18 +1279,38 @@ export class ApplicationSessionService {
         }
         const uncertain = this.#storedView(finalized);
         if (finalized.bridgeState === "closed") return uncertain;
-        const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
-          generation: finalized.generation,
-          sessionId: finalized.sessionId,
-          bridgeState: "submission_uncertain",
-          publicSnapshot: uncertain,
-        });
+        const result =
+          this.dependencies.repository.recordApplicationSnapshotWithSlotTransition(
+            runId,
+            {
+              generation: finalized.generation,
+              sessionId: finalized.sessionId,
+              bridgeState: "submission_uncertain",
+              publicSnapshot: uncertain,
+              slotReleased: true,
+            },
+          );
+        const recorded = result.session;
+        this.#notifyApplicationSessionReleased(result.slotReleasedTransitioned);
         return this.#storedView(recorded);
       } catch (error) {
         mapRepositoryError(error);
       }
     }
-    if (retainedSubmissionFinal(current)) return this.#storedView(current);
+    if (retainedSubmissionFinal(current)) {
+      try {
+        const released =
+          this.dependencies.repository.releaseApplicationSessionSlotWithTransition(
+            current.runId,
+            current.generation,
+            current.sessionId,
+          );
+        this.#notifyApplicationSessionReleased(released.slotReleasedTransitioned);
+        return this.#storedView(released.session);
+      } catch (error) {
+        mapRepositoryError(error);
+      }
+    }
 
     const previous = this.#storedView(current);
     const updatedAt = this.#nextProjectionUpdatedAt(current);
@@ -1215,13 +1328,14 @@ export class ApplicationSessionService {
         : [...previous.warnings, LOST_WARNING],
     });
     try {
-      const recorded = this.dependencies.repository.markApplicationSessionLost(runId, {
-        generation: current.generation,
-        sessionId: current.sessionId,
-        publicSnapshot: lost,
-      });
-      this.#notifyApplicationSessionReleased(recorded, true);
-      return this.#storedView(recorded);
+      const result =
+        this.dependencies.repository.markApplicationSessionLostWithTransition(runId, {
+          generation: current.generation,
+          sessionId: current.sessionId,
+          publicSnapshot: lost,
+        });
+      this.#notifyApplicationSessionReleased(result.slotReleasedTransitioned);
+      return this.#storedView(result.session);
     } catch (error) {
       mapRepositoryError(error);
     }
@@ -1249,35 +1363,202 @@ export class ApplicationSessionService {
   #recordLocalClosed(runId: string, session: PublicApplicationSession): void {
     const closed = this.#closedProjection(session, null);
     try {
-      const recorded = this.dependencies.repository.recordApplicationSnapshot(runId, {
-        generation: session.generation,
-        sessionId: session.sessionId,
-        bridgeState: "closed",
-        publicSnapshot: closed,
-      });
-      this.#notifyApplicationSessionReleased(recorded, true);
+      const recorded =
+        this.dependencies.repository.recordApplicationSnapshotWithSlotTransition(
+          runId,
+          {
+            generation: session.generation,
+            sessionId: session.sessionId,
+            bridgeState: "closed",
+            publicSnapshot: closed,
+            slotReleased: true,
+          },
+        );
+      this.#notifyApplicationSessionReleased(recorded.slotReleasedTransitioned);
     } catch (error) {
       mapRepositoryError(error);
     }
   }
 
-  #notifyApplicationSessionReleased(
-    current: PublicApplicationSession,
-    slotReleased: boolean,
-  ): void {
+  async #reconcileApplicationSlot(
+    signal: AbortSignal,
+    resumableRunId?: string,
+  ): Promise<void> {
+    let session: PublicApplicationSession | null;
+    try {
+      session = this.dependencies.repository.getUnreleasedApplicationSession();
+    } catch (error) {
+      mapRepositoryError(error);
+    }
     if (
-      !slotReleased
-      || !isTerminal(current)
-      || this.#releasedSessionIds.has(current.sessionId)
+      session
+      && session.runId === resumableRunId
+      && session.publicSnapshot === null
+      && (session.bridgeState === "reserved" || session.bridgeState === "starting")
     ) {
       return;
     }
-    this.#releasedSessionIds.add(current.sessionId);
-    if (this.#releasedSessionIds.size > RELEASED_SESSION_HISTORY_LIMIT) {
-      const oldest = this.#releasedSessionIds.values().next().value;
-      if (oldest !== undefined) this.#releasedSessionIds.delete(oldest);
+    if (!session) return;
+    const harness = this.dependencies.harness;
+    if (!harness) return;
+    try {
+      const snapshot = await harness.get(session.sessionId, signal);
+      this.#recordHarnessSnapshot(session.runId, session, snapshot);
+      const current =
+        this.dependencies.repository.getLatestApplicationSession(session.runId);
+      if (
+        current
+        && current.generation === session.generation
+        && current.sessionId === session.sessionId
+        && !current.slotReleased
+      ) {
+        this.#ensureSlotReleaseObserver(current.runId, current);
+      }
+    } catch (error) {
+      if (signal.aborted) signal.throwIfAborted();
+      if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
+        this.#reconcileMissingHarnessSession(session);
+        return;
+      }
+      this.#throwHarnessError(error);
     }
-    this.dependencies.onApplicationSessionReleased?.();
+  }
+
+  #ensureSlotReleaseObserver(
+    runId: string,
+    session: PublicApplicationSession,
+  ): void {
+    if (
+      this.#disposed
+      ||
+      session.slotReleased
+      || this.#slotReleaseObservers.has(session.sessionId)
+      || !this.dependencies.harness
+    ) {
+      return;
+    }
+    const observer = this.#observeSlotRelease(runId, session);
+    this.#slotReleaseObservers.set(session.sessionId, observer);
+    const cleanup = () => {
+      if (this.#slotReleaseObservers.get(session.sessionId) === observer) {
+        this.#slotReleaseObservers.delete(session.sessionId);
+      }
+    };
+    void observer.then(cleanup, cleanup);
+  }
+
+  async #observeSlotRelease(
+    runId: string,
+    session: PublicApplicationSession,
+  ): Promise<void> {
+    const harness = this.dependencies.harness;
+    if (!harness) return;
+    const signal = this.#slotReleaseAbortController.signal;
+    let cursor = session.lastUpstreamEventId ?? undefined;
+    for (;;) {
+      if (signal.aborted) return;
+      let current: PublicApplicationSession | null;
+      try {
+        current = this.dependencies.repository.getLatestApplicationSession(runId);
+      } catch {
+        return;
+      }
+      if (
+        !current
+        || current.generation !== session.generation
+        || current.sessionId !== session.sessionId
+        || current.slotReleased
+      ) {
+        return;
+      }
+      try {
+        const events = await harness.stream(session.sessionId, cursor, signal);
+        for await (const event of events) {
+          if (signal.aborted) return;
+          current = this.dependencies.repository.getLatestApplicationSession(runId);
+          if (
+            !current
+            || current.generation !== session.generation
+            || current.sessionId !== session.sessionId
+          ) {
+            return;
+          }
+          this.#recordHarnessSnapshot(
+            runId,
+            current,
+            event.session,
+            event.id,
+            false,
+          );
+          current = this.dependencies.repository.getLatestApplicationSession(runId);
+          if (!current || current.generation !== session.generation) return;
+          cursor = current.lastUpstreamEventId ?? cursor;
+          if (current.slotReleased) return;
+        }
+        if (signal.aborted) return;
+        current = this.dependencies.repository.getLatestApplicationSession(runId);
+        if (
+          !current
+          || current.generation !== session.generation
+          || current.sessionId !== session.sessionId
+          || current.slotReleased
+        ) {
+          return;
+        }
+        const snapshot = await harness.get(session.sessionId, signal);
+        this.#recordHarnessSnapshot(runId, current, snapshot, undefined, false);
+        current = this.dependencies.repository.getLatestApplicationSession(runId);
+        if (!current || current.generation !== session.generation || current.slotReleased) {
+          return;
+        }
+      } catch (error) {
+        if (signal.aborted) return;
+        if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
+          this.#reconcileMissingHarnessSession(session);
+          return;
+        }
+      }
+      if (signal.aborted) return;
+      await waitForSlotReleaseRetry();
+    }
+  }
+
+  #reconcileMissingHarnessSession(session: PublicApplicationSession): void {
+    const current =
+      this.dependencies.repository.getLatestApplicationSession(session.runId);
+    if (
+      !current
+      || current.generation !== session.generation
+      || current.sessionId !== session.sessionId
+      || current.slotReleased
+    ) {
+      return;
+    }
+    if (current.publicSnapshot === null) {
+      this.#recordLocalClosed(current.runId, current);
+      return;
+    }
+    if (TERMINAL_APPLICATION_STATES[current.bridgeState] !== true) {
+      this.#markLost(current.runId, current);
+      return;
+    }
+    try {
+      const released =
+        this.dependencies.repository.releaseApplicationSessionSlotWithTransition(
+          current.runId,
+          current.generation,
+          current.sessionId,
+        );
+      this.#notifyApplicationSessionReleased(released.slotReleasedTransitioned);
+    } catch (error) {
+      mapRepositoryError(error);
+    }
+  }
+
+  #notifyApplicationSessionReleased(slotReleasedTransitioned: boolean): void {
+    if (slotReleasedTransitioned && !this.#disposed) {
+      this.dependencies.onApplicationSessionReleased?.();
+    }
   }
 
   #storedView(session: PublicApplicationSession): ApplicationSessionSnapshotDto {
