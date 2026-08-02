@@ -7,6 +7,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
 
+from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 from .models import (
     AcceptedAdditionalInfoAnswer,
     AdditionalInfoBooleanCommandAnswer,
@@ -312,7 +313,7 @@ class HumanGate:
         publish: GateEventPublisher,
         review_snapshot: ReviewSnapshotSink | None = None,
         auto_submit: bool = False,
-        action_timeout: float = 3_600,
+        action_timeout: float = DEFAULT_SESSION_TIMEOUT_SECONDS,
     ) -> None:
         canonical_origins = [validate_approved_origin(origin) for origin in approved_origins]
         if not canonical_origins or len(canonical_origins) > MAX_APPROVED_ORIGINS:
@@ -383,11 +384,17 @@ class HumanGate:
             current_origin = _origin_from_url(await browser_session.get_current_page_url())
         except (RuntimeError, ValueError):
             return await self._cancelled_result(browser_session)
+        origin_allowed = False
         if current_origin not in self._approved_origins:
-            origin_result = await self.request_origin_approval(current_origin, browser_session)
+            origin_result = await self.request_origin_approval(
+                current_origin,
+                browser_session,
+            )
             if origin_result.is_done:
                 return origin_result
-        await self._publish("running", None, {})
+            origin_allowed = True
+        if not origin_allowed:
+            await self._publish("running", None, {})
         return ActionResult(
             extracted_content="Human navigation completed.",
             long_term_memory="Human navigation completed; re-scan the current page before acting.",
@@ -399,23 +406,37 @@ class HumanGate:
         browser_session: BrowserSession,
     ) -> ActionResult:
         canonical_origin = validate_approved_origin(origin)
-        if canonical_origin in self._approved_origins:
+        cancelled = False
+        capped = False
+        already_approved = False
+        async with self._lock:
+            if self._submission_approved:
+                raise self._conflict("Final submission was already approved")
+            if self._cancelled:
+                cancelled = True
+            elif self._pending is not None and not self._pending.future.done():
+                raise RuntimeError("A human gate is already pending")
+            elif canonical_origin in self._approved_origins:
+                already_approved = True
+            elif len(self._approved_origins) >= MAX_APPROVED_ORIGINS:
+                capped = True
+            else:
+                domains = browser_session.browser_profile.allowed_domains
+                if not isinstance(domains, list) or not domains:
+                    raise RuntimeError(
+                        "Browser allowlist is not a mutable nonempty list"
+                    )
+                pattern = f"{canonical_origin}/"
+                if pattern not in domains:
+                    domains.append(pattern)
+                self._approved_origins.append(canonical_origin)
+        if cancelled or capped:
+            return await self._cancelled_result(browser_session)
+        if already_approved:
             return ActionResult(
                 extracted_content="Origin is already approved.",
-                long_term_memory="The current origin is approved.",
+                long_term_memory="The requested origin is approved.",
             )
-        if len(self._approved_origins) >= MAX_APPROVED_ORIGINS:
-            return await self._cancelled_result(browser_session)
-        decision, _ = await self._wait_for_gate(
-            kind="origin",
-            browser_session=browser_session,
-            state="awaiting_origin_approval",
-            event="origin_approval_required",
-            detail={"origin": canonical_origin},
-            origin=canonical_origin,
-        )
-        if decision == "cancel":
-            return await self._cancelled_result(browser_session)
         try:
             current_origin = _origin_from_url(
                 await browser_session.get_current_page_url()
@@ -423,11 +444,14 @@ class HumanGate:
         except (RuntimeError, ValueError):
             return await self._cancelled_result(browser_session)
         if current_origin not in self._approved_origins:
-            return await self.request_origin_approval(current_origin, browser_session)
+            return await self.request_origin_approval(
+                current_origin,
+                browser_session,
+            )
         await self._publish("running", None, {})
         return ActionResult(
             extracted_content="Origin approved.",
-            long_term_memory="The new origin is approved; re-scan the page before entering data.",
+            long_term_memory="The requested and current origins are approved.",
         )
 
     async def request_additional_info(

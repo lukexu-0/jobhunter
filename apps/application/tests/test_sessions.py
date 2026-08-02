@@ -467,7 +467,7 @@ def make_manager(
     runner: Runner | None,
     *,
     fakes: Fakes | None = None,
-    timeout: int = 3600,
+    timeout: int = 14_400,
     context_process_factory: Callable[[Any], Any] = ImmediateContextProcess,
 ) -> tuple[ApplicationSessionManager, Fakes, Path]:
     doubles = fakes or Fakes()
@@ -733,7 +733,7 @@ async def test_preflight_completes_before_browser_and_create_contract_is_public_
     assert snapshot.state == "starting"
     assert snapshot.job_url == "https://jobs.example/[redacted]/42"
     assert snapshot.approved_origins == ["https://jobs.example"]
-    assert (snapshot.expires_at - snapshot.created_at).total_seconds() == 3600
+    assert (snapshot.expires_at - snapshot.created_at).total_seconds() == 14_400
 
     await asyncio.wait_for(runner_started.wait(), timeout=1)
     await wait_until(lambda: len(manager._active.events) >= 2)  # type: ignore[union-attr]
@@ -987,39 +987,19 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     record.browser.current_url = "https://ats.example/application/42?token=private"
 
     await manager.command(created.session_id, ContinueCommand(type="continue"))
-    await wait_state(manager, created.session_id, "awaiting_origin_approval")
-    origin_snapshot = manager.get_snapshot(created.session_id)
-    assert origin_snapshot.pending_action is not None
-    assert origin_snapshot.pending_action.model_dump(mode="json") == {
-        "type": "origin_approval",
-        "origin": "https://ats.example",
-    }
-    origin_replay = manager._replay_events(
-        origin_snapshot,
-        tuple(record.events),
-        999,
-    )[0].session
-    assert origin_replay.pending_action == origin_snapshot.pending_action
-    assert origin_replay.expires_at == origin_snapshot.expires_at
-    with pytest.raises(HarnessServiceError) as wrong_origin:
-        await manager.command(
-            created.session_id,
-            ApproveOriginCommand(type="approve_origin", origin="https://wrong.example"),
-        )
-    assert_service_error(
-        wrong_origin.value,
-        409,
-        "command_conflict",
-        "The approved origin does not match the pending origin",
-    )
-    await manager.command(
-        created.session_id,
-        ApproveOriginCommand(type="approve_origin", origin="https://ats.example"),
-    )
     await wait_until(
         lambda: record.human_gate is not None
         and record.human_gate.submission_approved
     )
+    with pytest.raises(HarnessServiceError) as disabled_origin_command:
+        await manager.command(
+            created.session_id,
+            ApproveOriginCommand(
+                type="approve_origin",
+                origin="https://ats.example",
+            ),
+        )
+    assert disabled_origin_command.value.code == "command_conflict"
     review_snapshot = manager.get_snapshot(created.session_id)
     assert review_snapshot.state == "running"
     assert review_snapshot.pending_action is None
@@ -1073,13 +1053,12 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
         "session_started",
         "agent_step",
         "human_navigation_required",
-        "origin_approval_required",
         "snapshot",
         "submission_started",
         "application_submitted",
     ]
-    assert [event.id for event in record.events] == list(range(1, 8))
-    assert record.events[4].session.pending_action is None
+    assert [event.id for event in record.events] == list(range(1, 7))
+    assert record.events[3].session.pending_action is None
     public_events = json.dumps([event.model_dump(mode="json") for event in record.events])
     assert PROFILE_SECRET not in public_events
     assert "token=private" not in public_events
@@ -1150,7 +1129,8 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
         current_record: Any, event: str, detail: dict[str, object]
     ) -> None:
         if event == "closed":
-            assert manager._active is record
+            assert manager._active is None
+            assert current_record.snapshot.slot_released is True
             assert not artifact_directory.exists()
             order.append("event.closed")
         await original_publish(current_record, event, detail)
@@ -1168,6 +1148,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     assert not artifact_directory.exists()
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.state == "closed" and snapshot.error is None
+    assert snapshot.slot_released is True
     tombstone = manager._tombstones[created.session_id]
     assert tombstone.events[-1].event == "closed"
     assert manager._active is None
@@ -1382,7 +1363,311 @@ async def test_absolute_ttl_maps_to_session_timeout_without_real_sleep(tmp_path:
         "code": "session_timeout",
         "message": "The application session expired",
     }
+    await asyncio.wait_for(record.closed_event.wait(), timeout=1)
     assert fakes.browsers[0].killed and fakes.models[0].closed
+
+async def test_expired_setup_cannot_publish_running_after_timeout(
+    tmp_path: Path,
+) -> None:
+    preflight_release = asyncio.Event()
+    ttl_release = asyncio.Event()
+    browser_kill_release = asyncio.Event()
+    fakes = Fakes(
+        check_blocker=preflight_release,
+        browser_kill_blocker=browser_kill_release,
+    )
+    manager, _fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=fakes,
+        timeout=1,
+    )
+    expire_session = manager._expire_session
+
+    async def controlled_expiration(record: Any) -> None:
+        await ttl_release.wait()
+        await expire_session(record)
+
+    manager._expire_session = controlled_expiration  # type: ignore[method-assign]
+    creation = asyncio.create_task(create_valid(manager))
+    await wait_until(lambda: bool(fakes.models) and fakes.models[0].check_started.is_set())
+    record = manager._active
+    assert record is not None
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
+    ttl_release.set()
+    preflight_release.set()
+    created = await asyncio.wait_for(creation, timeout=1)
+
+    try:
+        await asyncio.sleep(0)
+        snapshot = manager.get_snapshot(created.session_id)
+        assert snapshot.state == "failed"
+        assert snapshot.error is not None
+        assert snapshot.error.code == "session_timeout"
+        assert snapshot.slot_released is False
+        assert [event.event for event in record.events] == ["failed"]
+    finally:
+        browser_kill_release.set()
+        await asyncio.wait_for(record.closed_event.wait(), timeout=1)
+
+    tombstone = manager._tombstones[created.session_id]
+    assert tombstone.snapshot.state == "failed"
+    assert tombstone.snapshot.slot_released is True
+    assert [event.event for event in tombstone.events] == ["failed", "snapshot"]
+    assert tombstone.events[-1].session.slot_released is True
+
+async def test_expired_agent_result_cannot_beat_absolute_timeout(
+    tmp_path: Path,
+) -> None:
+    result_release = asyncio.Event()
+    ttl_release = asyncio.Event()
+    browser_kill_release = asyncio.Event()
+
+    async def runner(
+        _request: ApplicationRunRequest,
+        _model: FakeModel,
+        _browser: FakeBrowser,
+        _gate: HumanGate,
+        _step: Callable[[int, str], Awaitable[None]],
+    ) -> ApplicationRunResult:
+        await result_release.wait()
+        return cancelled_result()
+
+    fakes = Fakes(browser_kill_blocker=browser_kill_release)
+    manager, _fakes, _root = make_manager(
+        tmp_path,
+        runner,
+        fakes=fakes,
+        timeout=1,
+    )
+    expire_session = manager._expire_session
+
+    async def controlled_expiration(record: Any) -> None:
+        await ttl_release.wait()
+        await expire_session(record)
+
+    manager._expire_session = controlled_expiration  # type: ignore[method-assign]
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
+    result_release.set()
+    ttl_release.set()
+
+    try:
+        await wait_until(lambda: record.final_request is not None)
+        assert record.final_request is not None
+        assert (
+            record.final_request.state,
+            record.final_request.error_code,
+        ) == ("failed", "session_timeout")
+        snapshot = manager.get_snapshot(created.session_id)
+        assert snapshot.state == "failed"
+        assert snapshot.error is not None
+        assert snapshot.error.code == "session_timeout"
+        assert [event.event for event in record.events][-1] == "failed"
+    finally:
+        browser_kill_release.set()
+        await asyncio.wait_for(record.closed_event.wait(), timeout=1)
+
+    tombstone = manager._tombstones[created.session_id]
+    assert tombstone.snapshot.state == "failed"
+    assert tombstone.snapshot.error is not None
+    assert tombstone.snapshot.error.code == "session_timeout"
+
+async def test_expired_agent_error_cannot_beat_absolute_timeout(
+    tmp_path: Path,
+) -> None:
+    error_release = asyncio.Event()
+    ttl_release = asyncio.Event()
+
+    async def runner(
+        _request: ApplicationRunRequest,
+        _model: FakeModel,
+        _browser: FakeBrowser,
+        _gate: HumanGate,
+        _step: Callable[[int, str], Awaitable[None]],
+    ) -> ApplicationRunResult:
+        await error_release.wait()
+        raise PipelineApplicationAgentError(
+            "model_timeout",
+            SESSION_ERROR_MESSAGES["model_timeout"],
+        )
+
+    manager, _fakes, _root = make_manager(
+        tmp_path,
+        runner,
+        timeout=1,
+    )
+    expire_session = manager._expire_session
+
+    async def controlled_expiration(record: Any) -> None:
+        await ttl_release.wait()
+        await expire_session(record)
+
+    manager._expire_session = controlled_expiration  # type: ignore[method-assign]
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
+    error_release.set()
+    ttl_release.set()
+
+    await wait_until(lambda: record.final_request is not None)
+    assert record.final_request is not None
+    assert (
+        record.final_request.state,
+        record.final_request.error_code,
+    ) == ("failed", "session_timeout")
+    await asyncio.wait_for(record.closed_event.wait(), timeout=1)
+    tombstone = manager._tombstones[created.session_id]
+    assert tombstone.snapshot.state == "failed"
+    assert tombstone.snapshot.error is not None
+    assert tombstone.snapshot.error.code == "session_timeout"
+
+
+async def test_continue_at_absolute_deadline_fails_before_resuming_gate(
+    tmp_path: Path,
+) -> None:
+    cleanup_blocker = asyncio.Event()
+    navigation_resumed = asyncio.Event()
+
+    async def runner(
+        _request: ApplicationRunRequest,
+        _model: FakeModel,
+        browser: FakeBrowser,
+        gate: HumanGate,
+        _step: Callable[[int, str], Awaitable[None]],
+    ) -> ApplicationRunResult:
+        navigation = await gate.request_human_navigation(
+            "Complete verification in the browser",
+            browser,
+        )
+        if not navigation.is_done:
+            navigation_resumed.set()
+            await asyncio.Future()
+        return CancelledApplicationResult.model_validate_json(
+            navigation.extracted_content
+        )
+
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        runner,
+        fakes=Fakes(browser_kill_blocker=cleanup_blocker),
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "awaiting_human_navigation")
+    record = manager._active
+    assert record is not None and record.ttl_task is not None
+    record.ttl_task.cancel()
+    await asyncio.gather(record.ttl_task, return_exceptions=True)
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
+
+    try:
+        with pytest.raises(HarnessServiceError) as caught:
+            await manager.command(
+                created.session_id,
+                ContinueCommand(type="continue"),
+            )
+        assert_service_error(
+            caught.value,
+            409,
+            "session_terminal",
+            "The application session has already ended",
+        )
+        snapshot = manager.get_snapshot(created.session_id)
+        assert snapshot.state == "failed"
+        assert snapshot.error is not None
+        assert snapshot.error.model_dump() == {
+            "code": "session_timeout",
+            "message": "The application session expired",
+        }
+        assert not navigation_resumed.is_set()
+        assert record.events[-1].event == "failed"
+        assert record.events[-1].session.state == "failed"
+        await wait_until(lambda: fakes.browsers[0].kill_started.is_set())
+        assert not fakes.browsers[0].killed
+    finally:
+        cleanup_blocker.set()
+        if record.final_request is None:
+            await manager.delete(created.session_id)
+        else:
+            await asyncio.wait_for(record.closed_event.wait(), timeout=1)
+
+    assert fakes.browsers[0].killed
+    assert manager._tombstones[created.session_id].events[-1].event == "snapshot"
+    assert manager._tombstones[created.session_id].snapshot.slot_released is True
+    assert sum(
+        event.event == "failed"
+        for event in manager._tombstones[created.session_id].events
+    ) == 1
+
+
+async def test_submission_action_cannot_start_after_absolute_deadline(
+    tmp_path: Path,
+) -> None:
+    cleanup_blocker = asyncio.Event()
+    review_released = asyncio.Event()
+
+    async def runner(
+        _request: ApplicationRunRequest,
+        _model: FakeModel,
+        browser: FakeBrowser,
+        gate: HumanGate,
+        _step: Callable[[int, str], Awaitable[None]],
+    ) -> ApplicationRunResult:
+        review = await gate.request_human_review(review_result(), browser)
+        if review.is_done:
+            return CancelledApplicationResult.model_validate_json(
+                review.extracted_content
+            )
+        review_released.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        runner,
+        fakes=Fakes(browser_kill_blocker=cleanup_blocker),
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "awaiting_human_review")
+    await manager.command(created.session_id, SubmitCommand(type="submit"))
+    await asyncio.wait_for(review_released.wait(), timeout=1)
+    record = manager._active
+    assert record is not None and record.ttl_task is not None
+    record.ttl_task.cancel()
+    await asyncio.gather(record.ttl_task, return_exceptions=True)
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
+
+    try:
+        with pytest.raises(HarnessServiceError) as caught:
+            await manager.runtime_action(
+                created.session_id,
+                SubmitApplicationRuntimeAction(
+                    type="submit_application",
+                    selector="#final-submit",
+                ),
+            )
+        assert_service_error(
+            caught.value,
+            504,
+            "session_timeout",
+            "The application session expired",
+        )
+        assert record.submission_action_started is False
+        assert manager.get_snapshot(created.session_id).state == "failed"
+        assert [event.event for event in record.events].count("submission_started") == 0
+    finally:
+        cleanup_blocker.set()
+        if record.final_request is None:
+            await manager.delete(created.session_id)
+        else:
+            await asyncio.wait_for(record.closed_event.wait(), timeout=1)
+
+    assert manager.get_snapshot(created.session_id).state == "failed"
 
 
 async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_path: Path) -> None:
@@ -1788,6 +2073,7 @@ async def test_absolute_ttl_begins_during_model_preflight_setup(tmp_path: Path) 
     assert manager.get_snapshot(record.session_id).error is not None
     assert manager.get_snapshot(record.session_id).error.code == "session_timeout"
     assert fakes.browsers == []
+    await asyncio.wait_for(record.closed_event.wait(), timeout=1)
     assert fakes.models[0].closed
 
 
@@ -2960,7 +3246,7 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     await manager.delete(created.session_id)
 
 
-async def test_runtime_navigation_releases_command_lock_and_returns_nested_approval(
+async def test_runtime_navigation_returns_automatic_origin_registration(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -2986,11 +3272,7 @@ async def test_runtime_navigation_releases_command_lock_and_returns_nested_appro
     await wait_until(lambda: record.human_gate.pending_kind == "navigation")
     record.browser.current_url = "https://ats.example/application/42?private=value"
     await manager.command(created.session_id, ContinueCommand(type="continue"))
-    await wait_until(lambda: record.human_gate.pending_kind == "origin")
-    await manager.command(
-        created.session_id,
-        ApproveOriginCommand(type="approve_origin", origin="https://ats.example"),
-    )
+    assert record.human_gate.pending_kind is None
 
     approved = await navigation
     assert isinstance(approved, ApproveRuntimeActionResponse)
@@ -3753,7 +4035,7 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     assert task["evidence"][0]["category"] == "resume"
     assert "workflow" not in call["task"].lower()
     assert call["max_turns"] == 100
-    assert 1_000 <= call["deadline_ms"] <= 3_600_000
+    assert 1_000 <= call["deadline_ms"] <= 14_400_000
     assert fakes.order.index("model.check_ready") < fakes.order.index(
         "browser.factory"
     )

@@ -353,7 +353,7 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
 
 
 @pytest.mark.asyncio
-async def test_post_navigation_new_current_origin_requires_exact_approval_and_mutates_browser_state() -> None:
+async def test_post_navigation_origin_is_allowed_without_manual_approval() -> None:
     domains = [f"{JOB_ORIGIN}/"]
     browser = FakeBrowserSession("https://ats.example/apply?token=private", domains)
     gate, publisher = make_gate()
@@ -363,87 +363,63 @@ async def test_post_navigation_new_current_origin_requires_exact_approval_and_mu
 
     await publisher.next_event(0)
     await gate.continue_navigation()
-    assert await publisher.next_event(1) == (
-        "awaiting_origin_approval",
-        "origin_approval_required",
-        {"origin": ATS_ORIGIN},
-    )
-    assert gate.pending_kind == "origin"
-
-    await gate.approve_origin(ATS_ORIGIN)
-    result = await pending
+    result = await asyncio.wait_for(pending, timeout=0.1)
 
     assert result.is_done is False
+    assert gate.pending_kind is None
     assert gate.approved_origins == (JOB_ORIGIN, ATS_ORIGIN)
     assert browser.browser_profile.allowed_domains is domains
     assert domains == [f"{JOB_ORIGIN}/", f"{ATS_ORIGIN}/"]
-    assert publisher.events[-1] == ("running", None, {})
+    assert publisher.events == [
+        (
+            "awaiting_human_navigation",
+            "human_navigation_required",
+            {"instruction": "Complete the ATS login."},
+        ),
+        ("running", None, {}),
+    ]
+
+
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "wrong_origin",
-    ["https://other.example", "https://ats.example.evil"],
-)
-async def test_pre_navigation_target_approval_rejects_mismatch_and_lookalike(
-    wrong_origin: str,
-) -> None:
+async def test_pre_navigation_origin_is_allowed_without_manual_command() -> None:
     gate, publisher = make_gate()
     browser = FakeBrowserSession()
-    pending = asyncio.create_task(gate.request_origin_approval(ATS_ORIGIN, browser))
-    assert await publisher.next_event() == (
-        "awaiting_origin_approval",
-        "origin_approval_required",
-        {"origin": ATS_ORIGIN},
-    )
 
-    with pytest.raises(HarnessServiceError) as error:
-        await gate.approve_origin(wrong_origin)
-    assert_conflict(error.value)
-    assert gate.pending_kind == "origin"
-    assert browser.browser_profile.allowed_domains == [f"{JOB_ORIGIN}/"]
+    approved = await gate.request_origin_approval(ATS_ORIGIN, browser)
 
-    await gate.approve_origin(ATS_ORIGIN)
-    with pytest.raises(HarnessServiceError) as duplicate:
-        await gate.approve_origin(ATS_ORIGIN)
-    assert_conflict(duplicate.value)
-    approved = await pending
     assert approved.extracted_content == "Origin approved."
-    assert browser.browser_profile.allowed_domains == [f"{JOB_ORIGIN}/", f"{ATS_ORIGIN}/"]
+    assert gate.pending_kind is None
+    assert gate.approved_origins == (JOB_ORIGIN, ATS_ORIGIN)
+    assert browser.browser_profile.allowed_domains == [
+        f"{JOB_ORIGIN}/",
+        f"{ATS_ORIGIN}/",
+    ]
+    assert publisher.events == [("running", None, {})]
+    with pytest.raises(HarnessServiceError) as disabled:
+        await gate.approve_origin(ATS_ORIGIN)
+    assert_conflict(disabled.value)
 
 
 @pytest.mark.asyncio
-async def test_origin_approval_rechecks_live_origin_and_opens_a_second_gate() -> None:
+async def test_origin_registration_rechecks_live_origin_without_second_gate() -> None:
     second_origin = "https://second-ats.example"
     domains = [f"{JOB_ORIGIN}/"]
-    browser = FakeBrowserSession(JOB_URL, domains)
+    browser = FakeBrowserSession(f"{second_origin}/apply", domains)
     gate, publisher = make_gate()
-    pending = asyncio.create_task(gate.request_origin_approval(ATS_ORIGIN, browser))
-    assert await publisher.next_event(0) == (
-        "awaiting_origin_approval",
-        "origin_approval_required",
-        {"origin": ATS_ORIGIN},
-    )
 
-    await gate.approve_origin(ATS_ORIGIN)
-    browser.current_url = f"{second_origin}/apply"
-    assert await publisher.next_event(1) == (
-        "awaiting_origin_approval",
-        "origin_approval_required",
-        {"origin": second_origin},
-    )
-    assert gate.pending_kind == "origin"
-    await gate.approve_origin(second_origin)
-    result = await pending
+    result = await gate.request_origin_approval(ATS_ORIGIN, browser)
 
     assert result.extracted_content == "Origin approved."
+    assert gate.pending_kind is None
     assert gate.approved_origins == (JOB_ORIGIN, ATS_ORIGIN, second_origin)
     assert domains == [
         f"{JOB_ORIGIN}/",
         f"{ATS_ORIGIN}/",
         f"{second_origin}/",
     ]
-    assert publisher.events[-1] == ("running", None, {})
+    assert publisher.events == [("running", None, {})]
 
 
 @pytest.mark.asyncio

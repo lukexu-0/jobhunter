@@ -697,6 +697,20 @@ def test_session_snapshot_requires_a_nonnegative_absolute_expiry() -> None:
         make_snapshot(expires_at=NOW - timedelta(microseconds=1))
 
 
+def test_session_snapshot_releases_slot_only_after_terminal_cleanup() -> None:
+    assert make_snapshot().slot_released is False
+    released = make_snapshot(
+        state="failed",
+        pending_action=None,
+        error=session_error("session_timeout"),
+        slot_released=True,
+    )
+    assert released.slot_released is True
+
+    with pytest.raises(ValidationError):
+        make_snapshot(slot_released=True)
+
+
 @pytest.mark.parametrize(
     ("payload", "command_type"),
     [

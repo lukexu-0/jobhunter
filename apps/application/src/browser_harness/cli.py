@@ -10,6 +10,7 @@ from pathlib import Path
 
 import uvicorn
 from pydantic import ValidationError
+from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 
 from .api import HarnessDependencies, create_app
 from .browser import (
@@ -43,8 +44,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--session-timeout",
         type=int,
-        default=3600,
-        help="absolute session lifetime in seconds (default: 3600)",
+        default=DEFAULT_SESSION_TIMEOUT_SECONDS,
+        help=(
+            "absolute session lifetime in seconds "
+            f"(default: {DEFAULT_SESSION_TIMEOUT_SECONDS})"
+        ),
     )
     parser.add_argument(
         "--bubblewrap-executable",
