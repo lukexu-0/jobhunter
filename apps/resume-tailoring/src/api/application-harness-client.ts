@@ -896,7 +896,7 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     );
     form.set(
       "resume",
-      new File([Uint8Array.from(input.resumePdf).buffer], "resume.pdf", { type: "application/pdf" }),
+      new File([Uint8Array.from(input.resumePdf).buffer], "Alex_Example_Resume.pdf", { type: "application/pdf" }),
     );
     form.set("max_steps", "100");
     const response = await this.#request(
