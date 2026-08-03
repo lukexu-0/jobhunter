@@ -80,6 +80,7 @@ describe("deterministic PDF QA", () => {
     });
 
     expect(report.pass).toBe(true);
+    expect(report.overflowLineCount).toBe(0);
     expect(report.checks.map(({ id, status }) => [id, status])).toEqual([
       ["pdfinfo-output", "pass"],
       ["unencrypted", "pass"],
@@ -94,7 +95,7 @@ describe("deterministic PDF QA", () => {
     expect(report.warnings).toEqual(["LaTeX Warning: Label changed.", "Overfull \\hbox (1.2pt too wide)"]);
     expect(contracts.map(({ command, args }) => [command, args])).toEqual([
       ["pdfinfo", ["-f", "1", "-l", "1", "-box", pdf]],
-      ["pdftotext", ["-f", "1", "-l", "1", "-bbox-layout", "-enc", "UTF-8", pdf, "-"]],
+      ["pdftotext", ["-bbox-layout", "-enc", "UTF-8", pdf, "-"]],
       ["pdffonts", ["-f", "1", "-l", "1", pdf]],
     ]);
     for (const contract of contracts) {
@@ -102,6 +103,120 @@ describe("deterministic PDF QA", () => {
       expect(contract.shell).toBe(false);
       expect(contract.env).toEqual({ PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TZ: "UTC", SOURCE_DATE_EPOCH: "0" });
     }
+  });
+
+  test("inspects all pages for required headings and counts visible overflow lines", async () => {
+    const { root, pdf } = await fixture();
+    const contracts: SpawnContract[] = [];
+    const twoPageBbox = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <title></title>
+  <meta name="Producer" content="pdfTeX-1.40.26"/>
+</head>
+<body>
+<doc>
+  <page width="612.000000" height="792.000000">
+    <flow>
+      <block>
+        <line xMin="72.000000" yMin="72.000000" xMax="130.000000" yMax="84.000000">
+          <word xMin="72.000000" yMin="72.000000" xMax="130.000000" yMax="84.000000">Experience</word>
+        </line>
+      </block>
+    </flow>
+  </page>
+  <page width="612.000000" height="792.000000">
+    <flow>
+      <block>
+        <line xMin="72.000000" yMin="72.000000" xMax="125.000000" yMax="84.000000">
+          <word xMin="72.000000" yMin="72.000000" xMax="125.000000" yMax="84.000000">Education</word>
+        </line>
+        <line xMin="72.000000" yMin="96.000000" xMax="221.000000" yMax="108.000000">
+          <word xMin="72.000000" yMin="96.000000" xMax="105.000000" yMax="108.000000">Master</word>
+          <word xMin="110.000000" yMin="96.000000" xMax="125.000000" yMax="108.000000">of</word>
+          <word xMin="130.000000" yMin="96.000000" xMax="181.000000" yMax="108.000000">Science</word>
+        </line>
+        <line xMin="72.000000" yMin="120.000000" xMax="260.000000" yMax="132.000000">
+          <word xMin="72.000000" yMin="120.000000" xMax="138.000000" yMax="132.000000">University</word>
+          <word xMin="143.000000" yMin="120.000000" xMax="158.000000" yMax="132.000000">of</word>
+          <word xMin="163.000000" yMin="120.000000" xMax="218.000000" yMax="132.000000">Colorado</word>
+        </line>
+        <line xMin="72.000000" yMin="144.000000" xMax="205.000000" yMax="156.000000">
+          <word xMin="72.000000" yMin="144.000000" xMax="131.000000" yMax="156.000000">Projects</word>
+        </line>
+        <line xMin="72.000000" yMin="168.000000" xMax="310.000000" yMax="180.000000">
+          <word xMin="72.000000" yMin="168.000000" xMax="101.000000" yMax="180.000000">Built</word>
+          <word xMin="106.000000" yMin="168.000000" xMax="151.000000" yMax="180.000000">reliable</word>
+          <word xMin="156.000000" yMin="168.000000" xMax="208.000000" yMax="180.000000">pipelines</word>
+        </line>
+        <line xMin="72.000000" yMin="192.000000" xMax="290.000000" yMax="204.000000">
+          <word xMin="72.000000" yMin="192.000000" xMax="128.000000" yMax="204.000000">Improved</word>
+          <word xMin="133.000000" yMin="192.000000" xMax="189.000000" yMax="204.000000">delivery</word>
+          <word xMin="194.000000" yMin="192.000000" xMax="228.000000" yMax="204.000000">speed</word>
+        </line>
+      </block>
+    </flow>
+  </page>
+</doc>
+</body>
+</html>`;
+    const report = await runDeterministicPdfQa({
+      pdfPath: pdf,
+      cwd: root,
+      requiredHeadings: ["Education"],
+      boundary: fakeBoundary([
+        { stdout: [PDFINFO.replace("Pages:           1", "Pages:           2")] },
+        { stdout: [twoPageBbox] },
+        { stdout: [FONTS] },
+      ], contracts),
+    });
+
+    expect(report.pass).toBe(false);
+    expect(report.checks.filter(({ status }) => status === "fail").map(({ id }) => id)).toEqual(["one-page"]);
+    expect(report.checks.find(({ id }) => id === "text-output")?.status).toBe("pass");
+    expect(report.checks.find(({ id }) => id === "required-headings")?.status).toBe("pass");
+    expect(report.overflowLineCount).toBe(6);
+    expect(contracts.find(({ command }) => command === "pdftotext")?.args).toEqual([
+      "-bbox-layout",
+      "-enc",
+      "UTF-8",
+      pdf,
+      "-",
+    ]);
+  });
+
+  test("does not match a required heading across a page boundary", async () => {
+    const { root, pdf } = await fixture();
+    const twoPageBbox = `<doc>
+  <page width="612.000000" height="792.000000">
+    <line xMin="72.000000" yMin="768.000000" xMax="125.000000" yMax="780.000000">
+      <word xMin="72.000000" yMin="768.000000" xMax="125.000000" yMax="780.000000">Technical</word>
+    </line>
+  </page>
+  <page width="612.000000" height="792.000000">
+    <line xMin="72.000000" yMin="72.000000" xMax="103.000000" yMax="84.000000">
+      <word xMin="72.000000" yMin="72.000000" xMax="103.000000" yMax="84.000000">Skills</word>
+    </line>
+  </page>
+</doc>`;
+    const report = await runDeterministicPdfQa({
+      pdfPath: pdf,
+      cwd: root,
+      requiredHeadings: ["Technical Skills"],
+      boundary: fakeBoundary([
+        { stdout: [PDFINFO.replace("Pages:           1", "Pages:           2")] },
+        { stdout: [twoPageBbox] },
+        { stdout: [FONTS] },
+      ]),
+    });
+
+    expect(report.pass).toBe(false);
+    expect(report.checks.filter(({ status }) => status === "fail").map(({ id }) => id)).toEqual([
+      "one-page",
+      "required-headings",
+    ]);
+    expect(report.overflowLineCount).toBe(1);
   });
 
   test("keeps encrypted, page-count, and page-size failures independent", async () => {

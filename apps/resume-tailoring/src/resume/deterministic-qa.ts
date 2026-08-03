@@ -22,6 +22,7 @@ export interface DeterministicQaCheck {
 
 export interface DeterministicQaReport {
   readonly pass: boolean;
+  readonly overflowLineCount: number | null;
   readonly checks: readonly DeterministicQaCheck[];
   readonly warnings: readonly string[];
 }
@@ -53,10 +54,11 @@ interface PdfInfo {
 }
 
 interface TextOutput {
-  readonly text: string;
+  readonly pageTexts: readonly string[];
   readonly pageWidth: number;
   readonly pageHeight: number;
   readonly words: readonly WordBox[];
+  readonly overflowLineCount: number | null;
 }
 
 interface WordBox {
@@ -64,6 +66,11 @@ interface WordBox {
   readonly yMin: number;
   readonly xMax: number;
   readonly yMax: number;
+}
+
+interface WordRange {
+  readonly start: number;
+  readonly end: number;
 }
 
 const TOOL_TIMEOUT_MS = 60_000;
@@ -199,28 +206,110 @@ function normalizeVisibleText(value: string): string {
   return value.normalize("NFKC").replace(/---/g, "—").replace(/--/g, "–").replace(/([$€£¥])\s+(?=\d)/g, "$1").replace(/\s+/g, " ").trim();
 }
 
-function parseTextOutput(value: string): TextOutput | null {
-  const pages = [...value.matchAll(/<page\b([^>]*)>([\s\S]*?)<\/page>/g)];
-  if (pages.length !== 1 || (value.match(/<page\b/g) ?? []).length !== 1) return null;
-  const pageWidth = attribute(pages[0]![1]!, "width");
-  const pageHeight = attribute(pages[0]![1]!, "height");
-  if (pageWidth === null || pageHeight === null || pageWidth <= 0 || pageHeight <= 0) return null;
-  const body = pages[0]![2]!;
-  const matches = [...body.matchAll(/<word\b([^>]*)>([\s\S]*?)<\/word>/g)];
-  if (matches.length === 0 || matches.length !== (body.match(/<word\b/g) ?? []).length) return null;
-  const words: WordBox[] = [];
-  const text: string[] = [];
-  for (const match of matches) {
-    const xMin = attribute(match[1]!, "xMin");
-    const yMin = attribute(match[1]!, "yMin");
-    const xMax = attribute(match[1]!, "xMax");
-    const yMax = attribute(match[1]!, "yMax");
-    const decoded = decodeXmlText(match[2]!);
-    if ([xMin, yMin, xMax, yMax].some((number) => number === null) || decoded === null) return null;
-    words.push({ xMin: xMin!, yMin: yMin!, xMax: xMax!, yMax: yMax! });
-    text.push(decoded);
+function countTags(value: string, tag: "page" | "word" | "line", closing = false): number {
+  const pattern = new RegExp(`<${closing ? "/" : ""}${tag}\\b`, "g");
+  let count = 0;
+  while (pattern.exec(value) !== null) count += 1;
+  return count;
+}
+
+function countOverflowLines(body: string, words: readonly WordRange[]): number | null {
+  const linePattern = /<line\b[^>]*>([\s\S]*?)<\/line>/g;
+  let parsedLineCount = 0;
+  let visibleLineCount = 0;
+  let wordIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = linePattern.exec(body)) !== null) {
+    parsedLineCount += 1;
+    const contentStart = match.index + match[0].indexOf(">") + 1;
+    const contentEnd = contentStart + match[1]!.length;
+    if (words[wordIndex] && words[wordIndex]!.start < contentStart) return null;
+    let hasWord = false;
+    while (words[wordIndex] && words[wordIndex]!.start < contentEnd) {
+      if (words[wordIndex]!.end > contentEnd) return null;
+      hasWord = true;
+      wordIndex += 1;
+    }
+    if (hasWord) visibleLineCount += 1;
   }
-  return { text: normalizeVisibleText(text.join(" ")), pageWidth, pageHeight, words };
+  if (
+    parsedLineCount === 0
+    || parsedLineCount !== countTags(body, "line")
+    || parsedLineCount !== countTags(body, "line", true)
+    || wordIndex !== words.length
+  ) return null;
+  return visibleLineCount;
+}
+
+function parseTextOutput(value: string): TextOutput | null {
+  const pagePattern = /<page\b([^>]*)>([\s\S]*?)<\/page>/g;
+  const pageTexts: string[] = [];
+  const words: WordBox[] = [];
+  let pageCount = 0;
+  let pageWidth: number | null = null;
+  let pageHeight: number | null = null;
+  let overflowLineCount = 0;
+  let overflowLinesAvailable = true;
+  let pageMatch: RegExpExecArray | null;
+  while ((pageMatch = pagePattern.exec(value)) !== null) {
+    const firstPage = pageCount === 0;
+    pageCount += 1;
+    if (firstPage) {
+      pageWidth = attribute(pageMatch[1]!, "width");
+      pageHeight = attribute(pageMatch[1]!, "height");
+      if (pageWidth === null || pageHeight === null || pageWidth <= 0 || pageHeight <= 0) return null;
+    }
+
+    const body = pageMatch[2]!;
+    const wordPattern = /<word\b([^>]*)>([\s\S]*?)<\/word>/g;
+    const pageWords: string[] = [];
+    const overflowWords: WordRange[] = [];
+    let parsedWordCount = 0;
+    let wordMatch: RegExpExecArray | null;
+    while ((wordMatch = wordPattern.exec(body)) !== null) {
+      const xMin = attribute(wordMatch[1]!, "xMin");
+      const yMin = attribute(wordMatch[1]!, "yMin");
+      const xMax = attribute(wordMatch[1]!, "xMax");
+      const yMax = attribute(wordMatch[1]!, "yMax");
+      const decoded = decodeXmlText(wordMatch[2]!);
+      if ([xMin, yMin, xMax, yMax].some((number) => number === null) || decoded === null) return null;
+      parsedWordCount += 1;
+      pageWords.push(decoded);
+      if (firstPage) {
+        words.push({ xMin: xMin!, yMin: yMin!, xMax: xMax!, yMax: yMax! });
+      } else {
+        overflowWords.push({ start: wordMatch.index, end: wordPattern.lastIndex });
+      }
+    }
+    if (
+      parsedWordCount !== countTags(body, "word")
+      || parsedWordCount !== countTags(body, "word", true)
+      || (firstPage && parsedWordCount === 0)
+    ) return null;
+    pageTexts.push(normalizeVisibleText(pageWords.join(" ")));
+    if (!firstPage) {
+      const pageOverflowLineCount = countOverflowLines(body, overflowWords);
+      if (pageOverflowLineCount === null) {
+        overflowLinesAvailable = false;
+      } else {
+        overflowLineCount += pageOverflowLineCount;
+      }
+    }
+  }
+  if (
+    pageCount === 0
+    || pageCount !== countTags(value, "page")
+    || pageCount !== countTags(value, "page", true)
+    || pageWidth === null
+    || pageHeight === null
+  ) return null;
+  return {
+    pageTexts,
+    pageWidth,
+    pageHeight,
+    words,
+    overflowLineCount: pageCount === 1 ? 0 : overflowLinesAvailable ? overflowLineCount : null,
+  };
 }
 
 function parseEmbeddedFonts(value: string): { readonly valid: boolean; readonly embedded: boolean } {
@@ -280,11 +369,11 @@ function boundedWarnings(log: string | Uint8Array | undefined): readonly string[
   return Object.freeze(warnings);
 }
 
-function findMissingHeadings(haystack: string, headings: readonly string[]): readonly string[] {
-  const searchable = normalizeVisibleText(haystack).toLocaleLowerCase("en-US");
+function findMissingHeadings(pageTexts: readonly string[], headings: readonly string[]): readonly string[] {
+  const searchablePages = pageTexts.map((text) => text.toLocaleLowerCase("en-US"));
   return headings.filter((heading) => {
     const needle = normalizeVisibleText(heading).toLocaleLowerCase("en-US");
-    return !needle || !searchable.includes(needle);
+    return !needle || searchablePages.every((text) => !text.includes(needle));
   });
 }
 
@@ -292,13 +381,13 @@ export async function runDeterministicPdfQa(options: DeterministicQaOptions): Pr
   const pdfPath = await validatePdfInput(options.pdfPath);
   const [infoTool, textTool, fontTool] = await Promise.all([
     runTextTool("pdfinfo", ["-f", "1", "-l", "1", "-box", pdfPath], options),
-    runTextTool("pdftotext", ["-f", "1", "-l", "1", "-bbox-layout", "-enc", "UTF-8", pdfPath, "-"], options),
+    runTextTool("pdftotext", ["-bbox-layout", "-enc", "UTF-8", pdfPath, "-"], options),
     runTextTool("pdffonts", ["-f", "1", "-l", "1", pdfPath], options),
   ]);
   const info = infoTool.ok ? parsePdfInfo(infoTool.text) : null;
   const text = textTool.ok ? parseTextOutput(textTool.text) : null;
   const fonts = fontTool.ok ? parseEmbeddedFonts(fontTool.text) : { valid: false, embedded: false };
-  const missingHeadings = text ? findMissingHeadings(text.text, options.requiredHeadings) : options.requiredHeadings;
+  const missingHeadings = text ? findMissingHeadings(text.pageTexts, options.requiredHeadings) : options.requiredHeadings;
   const checks: DeterministicQaCheck[] = [
     check("pdfinfo-output", info !== null, "pdfinfo output parsed", infoTool.ok ? "pdfinfo output was malformed" : infoTool.reason),
     check("unencrypted", info?.encrypted === "no", "PDF is unencrypted", info ? "PDF is encrypted or encryption status is unsupported" : "encryption could not be verified"),
@@ -310,5 +399,10 @@ export async function runDeterministicPdfQa(options: DeterministicQaOptions): Pr
     check("embedded-fonts", fonts.valid && fonts.embedded, "all fonts are embedded and non-Type 3", fonts.valid ? "an unembedded or Type 3 font is present" : "font embedding could not be verified"),
     check("word-bounds", info !== null && text !== null && boxesAreBounded(text, info), "all word boxes are within page bounds", info && text ? "a word box or text page lies outside media/crop bounds" : "word bounds could not be verified"),
   ];
-  return Object.freeze({ pass: checks.every(({ status }) => status === "pass"), checks: Object.freeze(checks), warnings: boundedWarnings(options.latexLog) });
+  return Object.freeze({
+    pass: checks.every(({ status }) => status === "pass"),
+    overflowLineCount: text?.overflowLineCount ?? null,
+    checks: Object.freeze(checks),
+    warnings: boundedWarnings(options.latexLog),
+  });
 }

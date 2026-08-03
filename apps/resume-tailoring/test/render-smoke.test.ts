@@ -53,6 +53,7 @@ function healthyDependencies(overrides: Partial<RenderSmokeDependencies> = {}): 
         { id: "required-headings", status: "pass", detail: "all required headings are visible" },
       ],
       warnings: [],
+      overflowLineCount: 0,
     }),
     rasterize: async () => ({ mediaType: "image/png", page: 1, dpi: 200, byteSize: 5, path: pngPath }),
     readArtifact: async (path) => path === pngPath ? Buffer.from("hello") : new Uint8Array(),
@@ -82,6 +83,7 @@ describe("render smoke public boundary", () => {
           pass: true,
           checks: [{ id: "required-headings", status: "pass", detail: "all required headings are visible" }],
           warnings: ["bounded warning"],
+          overflowLineCount: 0,
         };
       },
       rasterize: async (request) => {

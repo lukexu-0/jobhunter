@@ -981,7 +981,7 @@ describe("guarded agents", () => {
     const bullet = BASELINE_INVENTORY.bullets.at(-1);
     expect(bullet).toBeDefined();
     const onePageCorrection: OnePageCorrection = {
-      note: "The compiled resume MUST be exactly one page. Cut lower-priority content as needed while preserving truthfulness and readability.",
+      note: "1 visible line over one page. Remove lower-priority content until it fits.",
       failureCount: 1,
       requiredOmissionCount: 1,
       candidates: [{
@@ -998,8 +998,8 @@ describe("guarded agents", () => {
       runOptionsAreFresh(options, 5);
       const parsedInput = JSON.parse(input);
       expect(parsedInput.onePageCorrection).toEqual(onePageCorrection);
-      expect(input).toContain("MUST be exactly one page");
-      expect(input).toContain("Cut lower-priority content");
+      expect(input).toContain("1 visible line over one page.");
+      expect(input).toContain("Remove lower-priority content until it fits.");
       await invoke(agent, "read_working_tex", {});
       await invoke(agent, "apply_analysis_edits", {});
       expect(await invoke(agent, "read_working_tex", {})).toBe(correctedTex);

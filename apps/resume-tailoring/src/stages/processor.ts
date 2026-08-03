@@ -48,8 +48,12 @@ import type { StageRepository, StageSourceContext } from "./types.ts";
 const JSON_LIMIT = 2 * 1024 * 1024;
 const JOB_DESCRIPTION_LIMIT = 1024 * 1024;
 const REQUIRED_HEADINGS = ["Education", "Experience", "Projects", "Competitions & Other", "Technical Skills"] as const;
-const ONE_PAGE_CORRECTION_NOTE =
-  "The compiled resume MUST be exactly one page. Cut lower-priority content as needed while preserving truthfulness and readability.";
+const MAX_ONE_PAGE_CORRECTIONS = 5;
+
+function onePageCorrectionNote(overflowLineCount: number): string {
+  const noun = overflowLineCount === 1 ? "line" : "lines";
+  return `${overflowLineCount} visible ${noun} over one page. Remove lower-priority content until it fits.`;
+}
 const SECTION_OMISSION_PRIORITY: Readonly<Record<OnePageCorrection["candidates"][number]["section"], number>> = {
   "competitions-other": 0,
   projects: 1,
@@ -65,17 +69,29 @@ function mustIncludeSectionEvidenceIds(snapshot: ContextSnapshot): readonly stri
 
 interface OnePageCorrectionArtifact {
   readonly failureCount: number;
+  readonly overflowLineCount: number;
   readonly note: string;
 }
 
 function parseOnePageCorrectionArtifact(value: unknown): OnePageCorrectionArtifact {
   if (!value || typeof value !== "object") throw new Error("one-page correction artifact is invalid");
   const candidate = value as Partial<OnePageCorrectionArtifact>;
-  if (!Number.isSafeInteger(candidate.failureCount) || candidate.failureCount! < 1) {
+  if (!Number.isSafeInteger(candidate.failureCount)
+    || candidate.failureCount! < 1
+    || candidate.failureCount! > MAX_ONE_PAGE_CORRECTIONS) {
     throw new Error("one-page correction failure count is invalid");
   }
-  if (candidate.note !== ONE_PAGE_CORRECTION_NOTE) throw new Error("one-page correction note is invalid");
-  return { failureCount: candidate.failureCount!, note: candidate.note };
+  if (!Number.isSafeInteger(candidate.overflowLineCount) || candidate.overflowLineCount! < 1) {
+    throw new Error("one-page correction overflow line count is invalid");
+  }
+  if (candidate.note !== onePageCorrectionNote(candidate.overflowLineCount!)) {
+    throw new Error("one-page correction note is invalid");
+  }
+  return {
+    failureCount: candidate.failureCount!,
+    overflowLineCount: candidate.overflowLineCount!,
+    note: candidate.note,
+  };
 }
 
 function validateOnePageCorrectionPlan(
@@ -565,43 +581,46 @@ export class PipelineStageProcessor {
     const artifact = await this.#artifacts.write(join(root, "deterministic-qa.json"), json(report), JSON_LIMIT);
     const deterministicArtifact = this.#finalize(claim, attempt, "deterministic-qa", artifact, pdf.id);
     const onePageCheck = report.checks.find((check) => check.id === "one-page");
-    const failedOnePage = onePageCheck?.status === "fail";
-    const failedOtherCheck = report.checks.some((check) =>
-      check.id !== "one-page" && check.status === "fail");
-    if (failedOnePage && !failedOtherCheck) {
+    const failedChecks = report.checks.filter((check) => check.status === "fail");
+    const pureOnePageFailure = !report.pass
+      && failedChecks.length === 1
+      && failedChecks[0]?.id === "one-page";
+    const hasPositiveOverflowLineCount = Number.isSafeInteger(report.overflowLineCount)
+      && report.overflowLineCount! > 0;
+    if (pureOnePageFailure && hasPositiveOverflowLineCount) {
       const priorArtifact = this.#currentRevisionArtifact(run, "one-page-correction");
       const prior = priorArtifact
         ? parseOnePageCorrectionArtifact(await this.#readJson(priorArtifact))
         : undefined;
-      if (priorArtifact && prior) {
-        const analysis = JobAnalysisSchema.parse(await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")));
-        const currentCorrection = await this.#onePageCorrection(
-          priorArtifact,
+      const priorFailureCount = prior?.failureCount ?? 0;
+      if (priorFailureCount < MAX_ONE_PAGE_CORRECTIONS) {
+        const analysis = JobAnalysisSchema.parse(
+          await this.#readJson(this.#requiredArtifact(run.id, "job-analysis")),
+        );
+        const candidates = this.#onePageCorrectionCandidates(
           sources,
           analysis,
           new Set(mustIncludeSectionEvidenceIds(sources.snapshot)),
         );
-        if (currentCorrection.requiredOmissionCount >= currentCorrection.candidates.length) {
+        if (priorFailureCount < candidates.length) {
+          const correction: OnePageCorrectionArtifact = {
+            failureCount: priorFailureCount + 1,
+            overflowLineCount: report.overflowLineCount!,
+            note: onePageCorrectionNote(report.overflowLineCount!),
+          };
+          const correctionMeta = await this.#artifacts.write(
+            join(root, "one-page-correction.json"),
+            json(correction),
+            JSON_LIMIT,
+          );
+          this.#finalize(claim, attempt, "one-page-correction", correctionMeta, deterministicArtifact.id);
+          signal.throwIfAborted();
+          await this.#verifyAgain(run.id, signal);
           this.#repository.finishAttempt(claim, attempt.id, "failed", audit);
-          this.#repository.transition(claim, "failed", { failedStage: "deterministic_qa" });
+          this.#repository.transition(claim, "tailoring");
           return;
         }
       }
-      const correction: OnePageCorrectionArtifact = {
-        failureCount: (prior?.failureCount ?? 0) + 1,
-        note: ONE_PAGE_CORRECTION_NOTE,
-      };
-      const correctionMeta = await this.#artifacts.write(
-        join(root, "one-page-correction.json"),
-        json(correction),
-        JSON_LIMIT,
-      );
-      this.#finalize(claim, attempt, "one-page-correction", correctionMeta, deterministicArtifact.id);
-      signal.throwIfAborted();
-      await this.#verifyAgain(run.id, signal);
-      this.#repository.finishAttempt(claim, attempt.id, "failed", audit);
-      this.#repository.transition(claim, "tailoring");
-      return;
     }
     if (!report.pass || onePageCheck?.status !== "pass") {
       this.#repository.finishAttempt(claim, attempt.id, "failed", audit);
@@ -714,6 +733,27 @@ export class PipelineStageProcessor {
     mustIncludeEvidenceIds: ReadonlySet<string>,
   ): Promise<OnePageCorrection> {
     const state = parseOnePageCorrectionArtifact(await this.#readJson(artifact));
+    const candidates = this.#onePageCorrectionCandidates(
+      sources,
+      analysis,
+      mustIncludeEvidenceIds,
+    );
+    if (candidates.length === 0) {
+      throw new Error("one-page correction has no evidence-backed omission candidates");
+    }
+    return {
+      note: state.note,
+      failureCount: state.failureCount,
+      requiredOmissionCount: Math.min(state.failureCount, candidates.length),
+      candidates,
+    };
+  }
+
+  #onePageCorrectionCandidates(
+    sources: StageSourceContext,
+    analysis: JobAnalysis,
+    mustIncludeEvidenceIds: ReadonlySet<string>,
+  ): OnePageCorrection["candidates"] {
     const baseline = parseBaselineResume(sources.baseline);
     const baselineSourceIds = new Set(
       sources.snapshot.sources.filter((source) => source.kind === "baseline").map((source) => source.id),
@@ -728,7 +768,7 @@ export class PipelineStageProcessor {
           && edit.evidenceIds.some((evidenceId) => directiveEvidenceIds.has(evidenceId)))
         .map((edit) => edit.baselineItemId),
     );
-    const candidates = baseline.bullets
+    return baseline.bullets
       .map((bullet, index) => {
         if (mustIncludeEditTargets.has(bullet.id)) return undefined;
         const evidence = sources.snapshot.evidence.find((candidate) =>
@@ -761,13 +801,6 @@ export class PipelineStageProcessor {
         text,
         evidenceIds,
       }));
-    if (candidates.length === 0) throw new Error("one-page correction has no evidence-backed omission candidates");
-    return {
-      note: state.note,
-      failureCount: state.failureCount,
-      requiredOmissionCount: Math.min(state.failureCount, candidates.length),
-      candidates,
-    };
   }
 
   #currentRevisionArtifact(run: PublicRun, kind: string): PublicArtifact | null {

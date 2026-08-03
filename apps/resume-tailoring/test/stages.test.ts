@@ -439,7 +439,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     }),
     deterministicQa: options.deterministicQa ?? (async () => deterministicReports.shift()
       ?? (options.deterministicPass === false
-        ? { pass: false, checks: [], warnings: [] }
+        ? { pass: false, checks: [], warnings: [], overflowLineCount: null }
         : ONE_PAGE_QA)),
     rasterizer: async (request) => {
       const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
@@ -481,16 +481,20 @@ async function reportUnexpectedFailure(harness: Harness): Promise<void> {
 }
 
 
-const MULTI_PAGE_QA: DeterministicQaReport = {
-  pass: false,
-  checks: [{ id: "one-page", status: "fail", detail: "PDF does not have exactly one page" }],
-  warnings: [],
-};
+function multiPageQa(overflowLineCount: number): DeterministicQaReport {
+  return {
+    pass: false,
+    checks: [{ id: "one-page", status: "fail", detail: "PDF does not have exactly one page" }],
+    warnings: [],
+    overflowLineCount,
+  };
+}
 
 const ONE_PAGE_QA: DeterministicQaReport = {
   pass: true,
   checks: [{ id: "one-page", status: "pass", detail: "PDF has exactly one page" }],
   warnings: [],
+  overflowLineCount: 0,
 };
 
 describe.skipIf(process.platform !== "linux")("pipeline stage processor cases requiring Linux /proc process identity", () => {
@@ -730,7 +734,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     for (const generateKeywordMap of [false, true]) {
       const harness = await createHarness({
         generateKeywordMap,
-        deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
+        deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
       });
       await processToStop(harness);
       await reportUnexpectedFailure(harness);
@@ -743,7 +747,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       expect(harness.agentInputs.tailoring).toHaveLength(2);
       expect(harness.agentInputs.tailoring[0]?.onePageCorrection).toBeUndefined();
       expect(harness.agentInputs.tailoring[1]?.onePageCorrection).toMatchObject({
-        note: "The compiled resume MUST be exactly one page. Cut lower-priority content as needed while preserving truthfulness and readability.",
+        note: "6 visible lines over one page. Remove lower-priority content until it fits.",
         failureCount: 1,
         requiredOmissionCount: 1,
       });
@@ -882,7 +886,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     };
     const harness = await createHarness({
       fixtures,
-      deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
     });
 
     await processToStop(harness);
@@ -905,7 +909,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       && edit.evidenceIds.includes(ACTIVE_DIRECTIVE_EVIDENCE_ID))!;
     const harness = await createHarness({
       fixtures,
-      deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
     });
 
     await processToStop(harness);
@@ -920,7 +924,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
   test("repeats progressively stronger one-page corrections until deterministic QA passes", async () => {
     const harness = await createHarness({
       generateKeywordMap: true,
-      deterministicReports: [MULTI_PAGE_QA, MULTI_PAGE_QA, ONE_PAGE_QA],
+      deterministicReports: [multiPageQa(6), multiPageQa(1), ONE_PAGE_QA],
     });
     await processToStop(harness);
     await reportUnexpectedFailure(harness);
@@ -928,6 +932,12 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
     expect(harness.agentInputs.tailoring.map((input) =>
       input.onePageCorrection?.failureCount ?? 0)).toEqual([0, 1, 2]);
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.note)).toEqual([
+      undefined,
+      "6 visible lines over one page. Remove lower-priority content until it fits.",
+      "1 visible line over one page. Remove lower-priority content until it fits.",
+    ]);
     expect(harness.agentInputs.tailoring.map((input) =>
       input.onePageCorrection?.requiredOmissionCount ?? 0)).toEqual([0, 1, 2]);
     expect(harness.tailoringResults.map((result) => result.plan.omissions.length)).toEqual([0, 1, 2]);
@@ -946,6 +956,42 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       .toBe(compilingAttempts[2]?.id);
     expect(harness.keywordMapCalls.count).toBe(1);
     expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).not.toBeNull();
+  });
+
+  test("allows exactly five automatic one-page correction cycles after the initial attempt", async () => {
+    const harness = await createHarness({
+      deterministicReports: [
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+      ],
+    });
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "deterministic_qa",
+      currentRevision: 1,
+    });
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.failureCount ?? 0)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.requiredOmissionCount ?? 0)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(harness.tailoringResults.map((result) => result.plan.omissions.length))
+      .toEqual([0, 1, 2, 3, 4, 5]);
+
+    const deterministicAttempts = harness.repository.timeline(harness.runId).attempts
+      .filter((attempt) => attempt.stage === "deterministic_qa");
+    expect(deterministicAttempts.map((attempt) => attempt.status))
+      .toEqual(["failed", "failed", "failed", "failed", "failed", "failed"]);
+    const correction = harness.repository.getArtifact(harness.runId, "one-page-correction");
+    expect(correction?.attemptId).toBe(deterministicAttempts[4]?.id);
+    expect(await Bun.file(correction!.path).json()).toMatchObject({ failureCount: 5 });
+    expect(harness.repository.getArtifact(harness.runId, "deterministic-qa")?.attemptId)
+      .toBe(deterministicAttempts[5]?.id);
   });
 
   test("fails deterministic QA when an eligible requested keyword map cannot be generated", async () => {
@@ -1049,6 +1095,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       pass: false,
       checks: [{ id: "text-output", status: "fail", detail: "Synthetic deterministic failure" }],
       warnings: [],
+      overflowLineCount: null,
     };
     const harness = await createHarness({
       deterministicReports: [deterministicFailure, ONE_PAGE_QA],
@@ -1188,6 +1235,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
         pass: false,
         checks: [{ id: "letter-size", status: "fail", detail: "page is not US Letter" }],
         warnings: [],
+        overflowLineCount: null,
       }],
     });
     await processToStop(deterministic);
@@ -1256,7 +1304,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
   test("human and machine edits reuse revision-one analysis and receive exact immutable prior QA", async () => {
     const editInputs: EditAgentInput[] = [];
     const harness = await createHarness({
-      deterministicReports: [MULTI_PAGE_QA, ONE_PAGE_QA],
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
       editAgent: async (attempt) => {
         editInputs.push(attempt.input);
         return {
