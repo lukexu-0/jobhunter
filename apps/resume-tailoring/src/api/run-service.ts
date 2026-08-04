@@ -35,6 +35,7 @@ import {
 import {
   JobSourceError,
   loadJobSourceFromUrl,
+  validatePublicHttpDestination,
   type LoadedJobSource,
   type LoadJobSource,
 } from "./job-source.ts";
@@ -92,6 +93,8 @@ export interface RunScheduler {
   kick(): void;
 }
 
+export type ValidatePublicJobUrl = (jobUrl: string, signal?: AbortSignal) => Promise<void>;
+
 export interface RunApplicationDependencies {
   readonly repository: PipelineRepository;
   readonly context: RunContextSnapshotService;
@@ -100,6 +103,7 @@ export interface RunApplicationDependencies {
   readonly idFactory?: () => string;
   readonly loadJobSource?: LoadJobSource;
   readonly extractJobDescription?: ExtractJobDescription;
+  readonly validatePublicJobUrl?: ValidatePublicJobUrl;
 }
 
 export class RunServiceError extends Error {
@@ -242,11 +246,16 @@ export class RunApplicationService {
   readonly #idFactory: () => string;
   readonly #loadJobSource: LoadJobSource;
   readonly #extractJobDescription: ExtractJobDescription;
+  readonly #validatePublicJobUrl: ValidatePublicJobUrl;
 
   constructor(private readonly dependencies: RunApplicationDependencies) {
     this.#idFactory = dependencies.idFactory ?? randomUUID;
     this.#loadJobSource = dependencies.loadJobSource ?? loadJobSourceFromUrl;
     this.#extractJobDescription = dependencies.extractJobDescription ?? extractJobDescriptionWithLuna;
+    this.#validatePublicJobUrl = dependencies.validatePublicJobUrl
+      ?? (async (jobUrl, signal) => {
+        await validatePublicHttpDestination(jobUrl, signal);
+      });
   }
 
   kick(): void {
@@ -317,6 +326,49 @@ export class RunApplicationService {
     if (jobDescription === null) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
     const validated = JobDescriptionSchema.parse(jobDescription);
 
+    return await this.#persistRun(
+      jobUrl,
+      validated,
+      generateKeywordMap,
+      skipReview,
+      autoSubmit,
+      signal,
+    );
+  }
+
+  async createRunFromDescription(
+    discoveryJobId: string,
+    jobUrl: string,
+    jobDescription: string,
+    generateKeywordMap = true,
+    skipReview = false,
+    autoSubmit = false,
+    requestSignal?: AbortSignal,
+  ): Promise<RunDto> {
+    requestSignal?.throwIfAborted();
+    await this.#validatePublicJobUrl(jobUrl, requestSignal);
+    requestSignal?.throwIfAborted();
+    const validated = JobDescriptionSchema.parse(jobDescription);
+    return await this.#persistRun(
+      jobUrl,
+      validated,
+      generateKeywordMap,
+      skipReview,
+      autoSubmit,
+      requestSignal,
+      discoveryJobId,
+    );
+  }
+
+  async #persistRun(
+    jobUrl: string,
+    jobDescription: string,
+    generateKeywordMap: boolean,
+    skipReview: boolean,
+    autoSubmit: boolean,
+    signal?: AbortSignal,
+    discoveryJobId?: string,
+  ): Promise<RunDto> {
     signal?.throwIfAborted();
     let freshSnapshot: ContextSnapshot;
     try {
@@ -336,14 +388,38 @@ export class RunApplicationService {
     try {
       const input = await this.dependencies.artifacts.write(
         join(reservation.path, "job-description.txt"),
-        validated,
+        jobDescription,
         MAX_JOB_DESCRIPTION_BYTES,
       );
-      run = this.dependencies.repository.createQueuedRun(validated, jobUrl, snapshot, {
+      const queuedInput = {
         sha256: input.sha256,
         path: input.path,
         byteSize: input.bytes,
-      }, runId, generateKeywordMap, reservation.run, skipReview, autoSubmit);
+      };
+      run = discoveryJobId === undefined
+        ? this.dependencies.repository.createQueuedRun(
+            jobDescription,
+            jobUrl,
+            snapshot,
+            queuedInput,
+            runId,
+            generateKeywordMap,
+            reservation.run,
+            skipReview,
+            autoSubmit,
+          )
+        : this.dependencies.repository.createDiscoveryQueuedRun(
+            discoveryJobId,
+            jobDescription,
+            jobUrl,
+            snapshot,
+            queuedInput,
+            runId,
+            generateKeywordMap,
+            reservation.run,
+            skipReview,
+            autoSubmit,
+          );
     } catch (error) {
       try {
         await this.dependencies.artifacts.removeRun(reservation.run);

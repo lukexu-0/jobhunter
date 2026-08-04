@@ -499,6 +499,17 @@ describe("application session service", () => {
       blockedReason: "job_url_requires_https",
     });
 
+    const privateHttps = await createTarget({ jobUrl: "https://127.0.0.1/private" });
+    expect(await privateHttps.service.get(privateHttps.runId)).toMatchObject({
+      state: "not_started",
+      blockedReason: "job_url_requires_https",
+    });
+    const localHttps = await createTarget({ jobUrl: "https://jobs.localhost/private" });
+    expect(await localHttps.service.get(localHttps.runId)).toMatchObject({
+      state: "not_started",
+      blockedReason: "job_url_requires_https",
+    });
+
     const unconfigured = await createTarget({ harness: null });
     expect(await unconfigured.service.get(unconfigured.runId)).toMatchObject({
       state: "not_started",
@@ -544,6 +555,12 @@ describe("application session service", () => {
     ).rejects.toMatchObject({ code: "APPLICATION_SOURCE_UNAVAILABLE", status: 409 });
     await expect(
       insecure.service.start(insecure.runId, insecure.pdf.sha256, signal()),
+    ).rejects.toMatchObject({ code: "APPLICATION_SOURCE_UNAVAILABLE", status: 409 });
+    await expect(
+      privateHttps.service.start(privateHttps.runId, privateHttps.pdf.sha256, signal()),
+    ).rejects.toMatchObject({ code: "APPLICATION_SOURCE_UNAVAILABLE", status: 409 });
+    await expect(
+      localHttps.service.start(localHttps.runId, localHttps.pdf.sha256, signal()),
     ).rejects.toMatchObject({ code: "APPLICATION_SOURCE_UNAVAILABLE", status: 409 });
     await expect(
       review.service.start(review.runId, "f".repeat(64), signal()),

@@ -47,6 +47,15 @@ export class RepositoryConflictError extends Error {
   }
 }
 
+export type DiscoveryJobQueueConflictReason = "already_queued" | "not_found" | "closed";
+
+export class DiscoveryJobQueueConflictError extends RepositoryConflictError {
+  constructor(readonly reason: DiscoveryJobQueueConflictReason) {
+    super(`discovery job cannot be queued: ${reason}`);
+    this.name = "DiscoveryJobQueueConflictError";
+  }
+}
+
 export class ClaimRejectedError extends RepositoryConflictError {
   constructor(message = "claim is stale, expired, or not the current owner") {
     super(message);
@@ -471,6 +480,7 @@ export class PipelineRepository {
     queueSequence?: number,
     skipReview = false,
     autoSubmit = false,
+    discoveryJobId?: string,
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     if (jobUrl.length < 1 || jobUrl.length > 2_048 || jobUrl.trim() !== jobUrl) {
@@ -501,9 +511,28 @@ export class PipelineRepository {
       throw new Error("queue sequence must be a positive integer");
     }
     const sourceHashes = this.#validateSnapshot(snapshot);
+    if (discoveryJobId !== undefined && discoveryJobId.length === 0) {
+      throw new Error("discovery job id is required");
+    }
     return this.#immediate(() => {
       const now = this.#now();
       const sequence = queueSequence ?? this.nextQueueSequence();
+      if (discoveryJobId !== undefined) {
+        const discoveryJob = this.#db.query<{
+          closed: number;
+          run_id: string | null;
+        }, [string]>(`
+          SELECT jobs.closed, links.run_id
+          FROM discovery_jobs jobs
+          LEFT JOIN discovery_run_links links ON links.job_id = jobs.id
+          WHERE jobs.id = ?
+        `).get(discoveryJobId);
+        if (!discoveryJob) throw new DiscoveryJobQueueConflictError("not_found");
+        if (discoveryJob.run_id !== null) {
+          throw new DiscoveryJobQueueConflictError("already_queued");
+        }
+        if (discoveryJob.closed === 1) throw new DiscoveryJobQueueConflictError("closed");
+      }
       this.#db.query("INSERT INTO runs(id, job_description, job_url, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, ?, ?, ?)")
         .run(id, jobDescription, jobUrl, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, sequence, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
@@ -512,6 +541,11 @@ export class PipelineRepository {
       const artifactId = input.id ?? this.#idFactory();
       this.#db.query("INSERT INTO artifacts(id,run_id,revision,attempt_id,stage,kind,sha256,path,byte_size,created_at) VALUES (?, ?, 1, '', 'input', 'job-description', ?, ?, ?, ?)")
         .run(artifactId, id, input.sha256, input.path, input.byteSize, now);
+      if (discoveryJobId !== undefined) {
+        this.#db.query(
+          "INSERT INTO discovery_run_links(job_id, run_id, created_at) VALUES (?, ?, ?)",
+        ).run(discoveryJobId, id, now);
+      }
       this.#event(id, 1, "run.created", { status: "queued", origin: "initial" }, now);
       this.#event(id, 1, "run.sources_snapshotted", {
         manifestSha256: snapshot.manifestSha256,
@@ -521,6 +555,32 @@ export class PipelineRepository {
       this.#event(id, 1, "artifact.finalized", { artifactId, kind: "job-description", sha256: input.sha256, byteSize: input.byteSize }, now);
       return publicRun(this.#run(id));
     });
+  }
+
+  createDiscoveryQueuedRun(
+    discoveryJobId: string,
+    jobDescription: string,
+    jobUrl: string,
+    snapshot: RunSourceSnapshotInput,
+    input: QueuedInputArtifact,
+    id = this.#idFactory(),
+    generateKeywordMap = true,
+    queueSequence?: number,
+    skipReview = false,
+    autoSubmit = false,
+  ): PublicRun {
+    return this.createQueuedRun(
+      jobDescription,
+      jobUrl,
+      snapshot,
+      input,
+      id,
+      generateKeywordMap,
+      queueSequence,
+      skipReview,
+      autoSubmit,
+      discoveryJobId,
+    );
   }
 
 
@@ -1431,6 +1491,7 @@ export class PipelineRepository {
         ) AS pruning
       `).get(runId)?.pruning === 1;
       if (pruning) throw new RepositoryConflictError("run artifacts are being pruned");
+      this.#db.query("DELETE FROM discovery_run_links WHERE run_id = ?").run(runId);
       this.#db.query("UPDATE runs SET deleted_at=?, updated_at=? WHERE id=? AND deleted_at IS NULL")
         .run(now, now, runId);
     });

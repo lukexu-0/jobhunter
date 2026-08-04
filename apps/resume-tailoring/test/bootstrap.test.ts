@@ -189,6 +189,18 @@ describe("pipeline application bootstrap", () => {
     expect(syncResponse.status).toBe(200);
     expect((await syncResponse.json()).fresh).toBe(true);
 
+    expect(fixture.app.services.discoveryRepository).toBeDefined();
+    expect(fixture.app.services.discovery).toBeDefined();
+    const discoveryResponse = await fixture.app.fetch(new Request(
+      "http://127.0.0.1:3457/v1/discovery?maxAgeDays=all",
+    ));
+    expect(discoveryResponse.status).toBe(200);
+    expect(await discoveryResponse.json()).toEqual({
+      jobs: [],
+      total: 0,
+      lastSyncAt: null,
+    });
+
     const request = mutation("/v1/runs", {
       jobUrl: JOB_URL,
     });

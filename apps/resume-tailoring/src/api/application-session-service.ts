@@ -34,6 +34,7 @@ import {
   readVerifiedArtifactBytes,
   RunServiceError,
 } from "./run-service.ts";
+import { canonicalizePublicHttpUrl } from "./job-source.ts";
 
 const MAX_PROFILE_BYTES = 1024 * 1024;
 const PROFILE_RELATIVE_PATH = "apps/user-info/current-context/personal/applicant-profile.md";
@@ -198,10 +199,10 @@ function isHarnessCompatibleJobUrl(value: string): boolean {
   try {
     if (value.length < 1 || value.length > 2_048) return false;
     const url = new URL(value);
-    return (url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHostname(url.hostname)))
-      && url.username === ""
-      && url.password === ""
-      && url.hash === "";
+    if (url.username !== "" || url.password !== "" || url.hash !== "") return false;
+    if (url.protocol === "http:") return isLoopbackHostname(url.hostname);
+    return url.protocol === "https:"
+      && canonicalizePublicHttpUrl(url).protocol === "https:";
   } catch {
     return false;
   }

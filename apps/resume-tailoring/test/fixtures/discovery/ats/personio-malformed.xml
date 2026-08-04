@@ -1,0 +1,12 @@
+<workzag-jobs>
+  <position>
+    <id>unclosed-position</id>
+    <name>Malformed Engineer</name>
+    <office>Berlin</office>
+    <jobDescriptions>
+      <jobDescription>
+        <name>Role</name>
+        <value><![CDATA[<p>Build reliable systems and improve engineering workflows across the organization.</p>]]></value>
+      </jobDescription>
+    </jobDescriptions>
+</workzag-jobs>

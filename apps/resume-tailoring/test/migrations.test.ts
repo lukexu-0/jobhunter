@@ -278,6 +278,24 @@ function versionFifteenApplicationDatabase(): Database {
   return db;
 }
 
+function versionSixteenDatabase(): Database {
+  const db = new Database(":memory:");
+  databases.push(db);
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY
+    ) STRICT;
+    INSERT INTO runs(id) VALUES ('existing-run');
+    INSERT INTO schema_migrations(version, applied_at) VALUES (16, 1600);
+    PRAGMA user_version = 16;
+  `);
+  return db;
+}
+
 const SUBMISSION_UNCERTAIN_WARNING =
   "The application submission could not be verified. Check the headed browser if it is still available, then close this session.";
 
@@ -352,7 +370,7 @@ test("migration twelve preserves the live claim and adds four unique empty claim
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   expect(db.query<{
     id: number;
     run_id: string | null;
@@ -695,6 +713,9 @@ test("fresh databases default to pending while accepting applied", () => {
   `);
 
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
+  expect(db.query<{ name: string }, []>(
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'discovery_jobs'",
+  ).get()).toEqual({ name: "discovery_jobs" });
   expect(db.query<{ application_status: string }, []>(
     "SELECT application_status FROM runs ORDER BY queue_sequence",
   ).all()).toEqual([
@@ -776,6 +797,30 @@ test("migration sixteen preserves physical application slot ownership", () => {
   ).run()).toThrow();
 });
 
+test("migration seventeen adds the normalized discovery catalog to version sixteen databases", () => {
+  const db = versionSixteenDatabase();
+
+  migratePipelineDatabase(db, 2_000);
+
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version)
+    .toBe(PIPELINE_SCHEMA_VERSION);
+  expect(db.query<{ version: number; applied_at: number }, []>(
+    "SELECT version, applied_at FROM schema_migrations WHERE version = 17",
+  ).get()).toEqual({ version: 17, applied_at: 2_000 });
+  expect(db.query<{ name: string }, []>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'table' AND name LIKE 'discovery_%'
+    ORDER BY name
+  `).all().map((row) => row.name)).toEqual([
+    "discovery_dedupe_keys",
+    "discovery_jobs",
+    "discovery_observations",
+    "discovery_run_links",
+    "discovery_sources",
+  ]);
+});
+
 test("migrates version seven defaults without changing existing statuses", () => {
   const db = versionSevenDatabase();
 
@@ -785,7 +830,7 @@ test("migrates version seven defaults without changing existing statuses", () =>
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -817,6 +862,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 14, applied_at: 2000 },
     { version: 15, applied_at: 2000 },
     { version: 16, applied_at: 2000 },
+    { version: 17, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -858,7 +904,7 @@ test("migrates existing runs to application status applied atomically", () => {
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   expect(migrated.query<{
     application_status: string;
     generate_keyword_map: number;
@@ -892,7 +938,7 @@ test("migrates version two retention state atomically without changing history",
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

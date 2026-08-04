@@ -1,0 +1,24 @@
+{
+  "offers": [
+    {
+      "id": 601,
+      "title": "Frontend Engineer",
+      "city": "Amsterdam",
+      "country": "Netherlands",
+      "published_at": "2026-01-19T08:00:00Z",
+      "requisition_id": "REC-601",
+      "company_name": "Acme Systems",
+      "description": "<p>Build accessible product interfaces and maintain a dependable frontend platform for customer-facing teams.</p>",
+      "requirements": "<ul><li>Strong TypeScript and web platform experience.</li></ul><script>secret()</script>",
+      "careers_url": "https://acme.recruitee.com/o/frontend-engineer?utm_source=test",
+      "careers_apply_url": "https://acme.recruitee.com/o/frontend-engineer/c/new"
+    },
+    {
+      "id": 602,
+      "title": "Posting Without Description",
+      "city": "Remote",
+      "careers_url": "https://acme.recruitee.com/o/missing-description",
+      "careers_apply_url": "https://acme.recruitee.com/o/missing-description/c/new"
+    }
+  ]
+}

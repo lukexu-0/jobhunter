@@ -1,0 +1,23 @@
+{
+  "jobs": [
+    {
+      "id": 101,
+      "internal_job_id": 5001,
+      "requisition_id": "GH-5001",
+      "title": "Platform Engineer",
+      "company_name": "Acme Systems",
+      "location": { "name": "Toronto, ON" },
+      "absolute_url": "https://boards.greenhouse.io/acme/jobs/101?utm_source=test",
+      "first_published": "2026-01-15T12:00:00Z",
+      "content": "&lt;h2&gt;The role&lt;/h2&gt;&lt;p&gt;Build reliable public infrastructure and improve developer tooling across the engineering organization.&lt;/p&gt;&lt;script&gt;secret()&lt;/script&gt;"
+    },
+    {
+      "id": 102,
+      "title": "Posting Without Description",
+      "company_name": "Acme Systems",
+      "location": { "name": "Remote" },
+      "absolute_url": "https://boards.greenhouse.io/acme/jobs/102",
+      "content": ""
+    }
+  ]
+}

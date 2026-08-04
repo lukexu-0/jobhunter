@@ -14,6 +14,7 @@ import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
 import { createApiHandler } from "./api/handler.ts";
 import { createRunRoutes } from "./api/run-routes.ts";
+import { createDiscoveryRoutes } from "./api/discovery-routes.ts";
 import { RunApplicationService } from "./api/run-service.ts";
 import type { LoadJobSource } from "./api/job-source.ts";
 import type { ExtractJobDescription } from "./models/luna-job-extractor.ts";
@@ -22,6 +23,10 @@ import { createContextApplicationService, type ContextApplicationService } from 
 import { openContextDatabase } from "./context/database.ts";
 import { openPipelineDatabase } from "./db/database.ts";
 import { PipelineRepository } from "./db/repository.ts";
+import { createDiscoveryConnectorsFromEnvironment } from "./discovery/connectors/index.ts";
+import { DiscoveryRepository } from "./discovery/repository.ts";
+import { DiscoveryService } from "./discovery/service.ts";
+import type { DiscoveryConnector } from "./discovery/types.ts";
 import { ArtifactStore, DEFAULT_ARTIFACT_ROOT } from "./system/artifacts.ts";
 import { migrateRunOutputLayout } from "./system/run-output-migration.ts";
 import { enforceRunArtifactRetention } from "./system/run-retention.ts";
@@ -65,6 +70,10 @@ export interface PipelineApplicationOptions {
   readonly runs?: RunApplicationService;
   readonly loadJobSource?: LoadJobSource;
   readonly extractJobDescription?: ExtractJobDescription;
+  readonly discoveryRepository?: DiscoveryRepository;
+  readonly discovery?: DiscoveryService;
+  readonly discoveryConnectors?: readonly DiscoveryConnector[];
+  readonly createDiscoveryConnectors?: () => readonly DiscoveryConnector[];
   readonly auth?: ClosableAuthRouteService;
   readonly closeAuth?: () => void | Promise<void>;
   readonly browserHarnessToken?: string;
@@ -83,6 +92,8 @@ export interface PipelineApplicationServices {
   readonly context: ClosableContextRouteService;
   readonly worker: PipelineWorkerHandle;
   readonly runs: RunApplicationService;
+  readonly discoveryRepository?: DiscoveryRepository;
+  readonly discovery?: DiscoveryService;
   readonly auth: ClosableAuthRouteService;
   readonly applicationSessions: PipelineApplicationSessionService;
 }
@@ -163,6 +174,20 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     ...(options.loadJobSource ? { loadJobSource: options.loadJobSource } : {}),
     ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
   });
+  const discoveryRepository = options.discoveryRepository
+    ?? (pipelineDatabase === undefined ? undefined : new DiscoveryRepository(pipelineDatabase));
+  const discovery = options.discovery
+    ?? (
+      discoveryRepository === undefined
+        ? undefined
+        : new DiscoveryService({
+            repository: discoveryRepository,
+            runs,
+            connectors: options.discoveryConnectors
+              ?? options.createDiscoveryConnectors?.()
+              ?? createDiscoveryConnectorsFromEnvironment(),
+          })
+    );
   const auth = options.auth ?? defaultAuthService;
   const applicationAgent = options.applicationAgent
     ?? (browserHarnessToken === undefined
@@ -187,6 +212,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeAuth = createAuthRoutes(auth);
   const routeContext = createContextRoutes(context);
   const routeRuns = createRunRoutes(runs);
+  const routeDiscovery = discovery === undefined ? undefined : createDiscoveryRoutes(discovery);
   const routeApplicationSessions = createApplicationSessionRoutes(applicationSessions);
   const fetch = createApiHandler({
     internalRoute: routeApplicationAgent,
@@ -195,6 +221,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       (await routeAuth(request, url))
       ?? (await routeContext(request, url))
       ?? (await routeApplicationSessions(request, url))
+      ?? (await routeDiscovery?.(request, url))
       ?? (await routeRuns(request, url)),
   });
   const services = Object.freeze({
@@ -205,6 +232,8 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     context,
     worker,
     runs,
+    ...(discoveryRepository === undefined ? {} : { discoveryRepository }),
+    ...(discovery === undefined ? {} : { discovery }),
     auth,
     applicationSessions,
   });

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "lever-loopback",
+    "text": "Loopback Source Engineer",
+    "categories": { "location": "Remote" },
+    "description": "<p>Build reliable production services and developer tooling for engineering teams across the company.</p>",
+    "hostedUrl": "https://127.0.0.1/internal-job",
+    "applyUrl": "https://jobs.lever.co/acme/lever-loopback/apply"
+  },
+  {
+    "id": "lever-off-origin",
+    "text": "Off-origin Apply Engineer",
+    "categories": { "location": "Remote" },
+    "description": "<p>Build reliable production services and developer tooling for engineering teams across the company.</p>",
+    "hostedUrl": "https://jobs.lever.co/acme/lever-off-origin",
+    "applyUrl": "https://attacker.example/collect-applicant-data"
+  }
+]

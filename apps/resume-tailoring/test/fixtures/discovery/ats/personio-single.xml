@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<workzag-jobs>
+  <position>
+    <id>701</id>
+    <subcompany>Acme Systems &amp; Labs</subcompany>
+    <office>Berlin</office>
+    <name>Site Reliability Engineer</name>
+    <jobDescriptions>
+      <jobDescription>
+        <name>The role</name>
+        <value><![CDATA[<p>Operate reliable production services and improve delivery tooling with software and infrastructure teams.</p>]]></value>
+      </jobDescription>
+    </jobDescriptions>
+    <createdAt>2026-01-20T11:00:00Z</createdAt>
+  </position>
+</workzag-jobs>

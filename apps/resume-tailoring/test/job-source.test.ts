@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   JobSourceError,
+  fetchPinnedPublicHttp,
   loadJobSourceFromUrl,
   type JobSourceFetch,
   type ResolveHost,
@@ -348,6 +349,32 @@ describe("job source loading", () => {
       ],
     })).rejects.toMatchObject({ code: "JOB_SOURCE_UNAVAILABLE" });
     expect(calls).toEqual(["1.1.1.1"]);
+  });
+
+  test("runs the attempt hook immediately before each resolved-address transport call", async () => {
+    const events: string[] = [];
+    const { response: fetched } = await fetchPinnedPublicHttp("https://jobs.example.test/role", {
+      signal: new AbortController().signal,
+      beforeFetchAttempt: () => events.push("before"),
+      resolveHost: async () => [
+        { address: "1.1.1.1", family: 4 },
+        { address: "8.8.8.8", family: 4 },
+      ],
+      fetchImpl: async (input) => {
+        const hostname = new URL(input).hostname;
+        events.push(`fetch:${hostname}`);
+        if (hostname === "1.1.1.1") throw new Error("connection failed");
+        return response(VALID_TEXT);
+      },
+    });
+
+    expect(await fetched.text()).toBe(VALID_TEXT);
+    expect(events).toEqual([
+      "before",
+      "fetch:1.1.1.1",
+      "before",
+      "fetch:8.8.8.8",
+    ]);
   });
 
   test("omits DNS SNI for an IP-literal logical host while keeping verification enabled", async () => {
