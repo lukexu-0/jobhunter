@@ -560,12 +560,12 @@ async function collectJsonLdScripts(html: string): Promise<string[]> {
 async function deterministicHtmlDescription(
   html: string,
   opportunityKindHint?: OpportunityKind,
-): Promise<Extract<LoadedJobSource, { kind: "description" }> | undefined> {
+): Promise<LoadedJobSource | "too-large" | undefined> {
   const opportunities: JsonLdOpportunity[] = [];
   for (const script of await collectJsonLdScripts(html)) {
     try { visitJson(JSON.parse(script), opportunities); } catch { /* Ignore each malformed block independently. */ }
   }
-  const candidates = new Map<string, Extract<LoadedJobSource, { kind: "description" }>>();
+  const candidates = new Map<string, string>();
   for (const { opportunityKind, value } of opportunities) {
     const organization = value.hiringOrganization ?? value.organizer ?? value.sponsor;
     const values = [
@@ -590,16 +590,14 @@ async function deterministicHtmlDescription(
     }
     const candidate = JobDescriptionSchema.safeParse(normalized.join("\n\n"));
     if (candidate.success) {
-      const selectedOpportunityKind = opportunityKindHint ?? opportunityKind;
-      const loaded = {
-        kind: "description",
-        opportunityKind: selectedOpportunityKind,
-        jobDescription: candidate.data,
-      } as const;
-      candidates.set(`${selectedOpportunityKind}\0${candidate.data}`, loaded);
+      const deduplicationKind = opportunityKindHint ?? opportunityKind;
+      candidates.set(`${deduplicationKind}\0${candidate.data}`, candidate.data);
     }
   }
-  return candidates.size === 1 ? candidates.values().next().value : undefined;
+  if (candidates.size !== 1) return undefined;
+  const jobDescription = candidates.values().next().value!;
+  if (opportunityKindHint === undefined) return buildFallbackCandidate(jobDescription);
+  return { kind: "description", opportunityKind: opportunityKindHint, jobDescription };
 }
 
 function buildFallbackCandidate(candidate: string): LoadedJobSource | "too-large" | undefined {
@@ -841,22 +839,29 @@ async function loadJobSourceWithSignal(
   );
   if (loaded.mediaType === "plain") {
     const jobDescription = normalizeText(loaded.body);
-    const parsed = JobDescriptionSchema.safeParse(jobDescription);
-    if (parsed.success) {
-      return {
-        kind: "description",
-        opportunityKind: opportunityKindHint ?? "job",
-        jobDescription: parsed.data,
-      };
+    if (opportunityKindHint !== undefined) {
+      const parsed = JobDescriptionSchema.safeParse(jobDescription);
+      if (parsed.success) {
+        return {
+          kind: "description",
+          opportunityKind: opportunityKindHint,
+          jobDescription: parsed.data,
+        };
+      }
+      throw new JobSourceError(
+        jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
+          ? "JOB_SOURCE_TOO_LARGE"
+          : "JOB_DESCRIPTION_UNAVAILABLE",
+      );
     }
-    throw new JobSourceError(
-      jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
-        ? "JOB_SOURCE_TOO_LARGE"
-        : "JOB_DESCRIPTION_UNAVAILABLE",
-    );
+    const fallback = buildFallbackCandidate(jobDescription);
+    if (fallback === "too-large") throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+    if (fallback !== undefined) return fallback;
+    throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
   }
 
   const deterministic = await deterministicHtmlDescription(loaded.body, opportunityKindHint);
+  if (deterministic === "too-large") throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
   if (deterministic !== undefined) return deterministic;
   return htmlFallback(loaded.body);
 }
