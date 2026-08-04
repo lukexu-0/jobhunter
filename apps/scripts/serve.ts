@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { resolveLaunchConfiguration } from "./launch-config.ts";
 
 const mode = process.argv[2];
 if (mode !== "dev" && mode !== "start") {
@@ -6,12 +7,24 @@ if (mode !== "dev" && mode !== "start") {
 }
 
 const appsRoot = resolve(import.meta.dir, "..");
+const configuration = resolveLaunchConfiguration(mode, appsRoot);
+const childEnvironment = {
+  ...process.env,
+  PORT: String(configuration.webPort),
+  JOBHUNTER_PIPELINE_PORT: String(configuration.pipelinePort),
+  JOBHUNTER_PIPELINE_ORIGIN: configuration.pipelineOrigin,
+  JOBHUNTER_WEB_ORIGIN: configuration.webOrigin,
+  JOBHUNTER_PIPELINE_DATABASE: configuration.pipelineDatabase,
+  JOBHUNTER_CONTEXT_DATABASE: configuration.contextDatabase,
+  JOBHUNTER_AUTH_DATABASE: configuration.authDatabase,
+  JOBHUNTER_ARTIFACT_ROOT: configuration.artifactRoot,
+};
 const pipeline = Bun.spawn(["bun", "run", "--cwd", "resume-tailoring", mode], {
   cwd: appsRoot,
   stdin: "inherit",
   stdout: "inherit",
   stderr: "inherit",
-  env: process.env,
+  env: childEnvironment,
 });
 
 let web: Bun.Subprocess | undefined;
@@ -36,7 +49,7 @@ while (true) {
     throw new Error(`Pipeline exited before it became healthy (${pipeline.exitCode})`);
   }
   try {
-    const response = await fetch("http://127.0.0.1:3457/v1/health", {
+    const response = await fetch(`${configuration.pipelineOrigin}/v1/health`, {
       signal: AbortSignal.timeout(1_000),
     });
     if (response.ok) break;
@@ -54,7 +67,7 @@ web = Bun.spawn(["bun", "run", "--cwd", "web", mode], {
   stdin: "inherit",
   stdout: "inherit",
   stderr: "inherit",
-  env: process.env,
+  env: childEnvironment,
 });
 
 const [name, exitCode] = await Promise.race([

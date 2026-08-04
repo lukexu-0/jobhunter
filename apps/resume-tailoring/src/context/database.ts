@@ -57,7 +57,9 @@ CREATE TRIGGER IF NOT EXISTS evidence_blocks_no_delete
 BEFORE DELETE ON evidence_blocks BEGIN SELECT RAISE(ABORT, 'evidence_blocks are immutable'); END;
 `;
 
-export function openContextDatabase(path = DEFAULT_CONTEXT_DATABASE_PATH): Database {
+export function openContextDatabase(
+  path = process.env.JOBHUNTER_CONTEXT_DATABASE ?? DEFAULT_CONTEXT_DATABASE_PATH,
+): Database {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const database = new Database(path, { create: true, strict: true });
   database.exec("PRAGMA journal_mode = WAL");

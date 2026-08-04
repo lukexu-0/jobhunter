@@ -96,7 +96,7 @@ export const LEGACY_ARTIFACT_ROOT = resolve(import.meta.dir, "../../data/runs");
 export class ArtifactStore {
   readonly root: string;
 
-  constructor(root = DEFAULT_ARTIFACT_ROOT) {
+  constructor(root = process.env.JOBHUNTER_ARTIFACT_ROOT ?? DEFAULT_ARTIFACT_ROOT) {
     this.root = resolve(root);
   }
 

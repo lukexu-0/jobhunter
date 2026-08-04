@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { access, chmod, mkdir } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import {
   AuthStorage,
   type OAuthAccess,
@@ -134,8 +134,7 @@ const defaultStorageFactory: StorageFactory = async (path) => {
   return AuthStorage.create(path);
 };
 
-const oauthDirectory = resolve(import.meta.dir, "../../data/oauth");
-export const authDatabasePath = resolve(oauthDirectory, "auth.sqlite");
+export const authDatabasePath = resolve(import.meta.dir, "../../data/oauth/auth.sqlite");
 let factory: StorageFactory = defaultStorageFactory;
 let storagePromise: Promise<AuthStorageLike> | undefined;
 
@@ -184,13 +183,15 @@ export function assertProviderOAuthConnected(storage: AuthStorageLike, provider:
 }
 
 async function createStorage(): Promise<AuthStorageLike> {
+  const databasePath = process.env.JOBHUNTER_AUTH_DATABASE ?? authDatabasePath;
+  const oauthDirectory = dirname(databasePath);
   await mkdir(oauthDirectory, { recursive: true, mode: 0o700 });
   await chmod(oauthDirectory, 0o700);
-  const storage = await factory(authDatabasePath);
+  const storage = await factory(databasePath);
   try {
     await storage.reload();
     assertOAuthOnlyStorage(storage);
-    await chmod(authDatabasePath, 0o600).catch((error: NodeJS.ErrnoException) => {
+    await chmod(databasePath, 0o600).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "ENOENT") throw error;
     });
     return storage;

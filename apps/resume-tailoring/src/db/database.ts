@@ -9,7 +9,7 @@ export interface PipelineDatabaseOptions {
 }
 
 export function openPipelineDatabase(
-  path = resolve(import.meta.dir, "../../data/state/pipeline.sqlite"),
+  path = process.env.JOBHUNTER_PIPELINE_DATABASE ?? resolve(import.meta.dir, "../../data/state/pipeline.sqlite"),
   options: PipelineDatabaseOptions = {},
 ): Database {
   if (path !== ":memory:" && (options.createParent ?? true)) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });

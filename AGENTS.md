@@ -97,6 +97,7 @@ TypeScript is configured with strict mode, `noUncheckedIndexedAccess`, and `exac
 | --- | --- |
 | `apps/package.json` | Bun workspace membership and aggregate dev/start/test/typecheck/build commands. |
 | `apps/scripts/serve.ts` | Pipeline-first watched or stable startup, health wait, signal forwarding, and coordinated shutdown. |
+| `apps/scripts/launch-config.ts` | Fixed production/development loopback ports and isolated writable storage paths. |
 | `apps/resume-tailoring/src/index.ts` | Pipeline process entry point. |
 | `apps/resume-tailoring/src/bootstrap.ts` | Composition root and lifecycle boundary. |
 | `apps/resume-tailoring/src/contracts/index.ts` | Shared strict public/API contracts consumed by pipeline and web. |

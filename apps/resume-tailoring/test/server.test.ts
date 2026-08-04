@@ -1,6 +1,17 @@
 import { expect, test } from "bun:test";
 import { APPLICATION_AGENT_PATH } from "../src/api/application-agent-routes";
-import { startPipelineHttpServer } from "../src/index";
+import { resolvePipelinePort, startPipelineHttpServer } from "../src/index";
+
+test("pipeline port accepts the isolated development port", () => {
+  expect(resolvePipelinePort("3557")).toBe(3557);
+});
+
+test("pipeline port defaults safely and rejects malformed values", () => {
+  expect(resolvePipelinePort(undefined)).toBe(3457);
+  for (const value of ["", "0", "3.5", "3467x", "65536"]) {
+    expect(() => resolvePipelinePort(value)).toThrow("JOBHUNTER_PIPELINE_PORT");
+  }
+});
 
 test("only long-lived application routes disable Bun's default idle timeout", async () => {
   const server = startPipelineHttpServer(

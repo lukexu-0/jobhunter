@@ -6,7 +6,19 @@ import { APPLICATION_EVENT_STREAM_PATH } from "./api/application-session-routes.
 import { resolveBrowserHarnessToken } from "./system/harness-token.ts";
 
 const hostname = "127.0.0.1";
-const port = 3457;
+const DEFAULT_PIPELINE_PORT = 3457;
+
+export function resolvePipelinePort(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_PIPELINE_PORT;
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error("JOBHUNTER_PIPELINE_PORT must be an integer from 1 through 65535");
+  }
+  const resolved = Number(value);
+  if (resolved > 65_535) {
+    throw new Error("JOBHUNTER_PIPELINE_PORT must be an integer from 1 through 65535");
+  }
+  return resolved;
+}
 
 export interface PipelineHttpServerOptions {
   readonly hostname?: string;
@@ -19,7 +31,7 @@ export function startPipelineHttpServer(
 ) {
   return Bun.serve({
     hostname: options.hostname ?? hostname,
-    port: options.port ?? port,
+    port: options.port ?? DEFAULT_PIPELINE_PORT,
     fetch(request, server) {
       const url = new URL(request.url);
       if (
@@ -42,10 +54,11 @@ export function startPipelineHttpServer(
 export async function main(): Promise<void> {
   bootstrapAgentRuntime();
   const browserHarnessToken = await resolveBrowserHarnessToken();
+  const port = resolvePipelinePort(process.env.JOBHUNTER_PIPELINE_PORT);
   const app = createPipelineApplication(
     browserHarnessToken === undefined ? {} : { browserHarnessToken },
   );
-  const server = startPipelineHttpServer(app);
+  const server = startPipelineHttpServer(app, { port });
   app.kick();
   console.log(`Resume pipeline listening on http://${hostname}:${port}`);
 
