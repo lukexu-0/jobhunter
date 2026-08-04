@@ -34,13 +34,14 @@ function run(opportunityKind: RunDto["opportunityKind"]): RunDto {
 }
 
 describe("opportunity-kind presentation", () => {
-  test("exhaustively defines distinct non-job presentation copy", () => {
+  test("exhaustively defines opportunity presentation copy", () => {
     expect(Object.keys(OPPORTUNITY_PRESENTATION).sort()).toEqual(
       [...OpportunityKindSchema.options].sort(),
     );
 
     const job = opportunityPresentation("job");
     expect(job).toMatchObject({
+      detailKindLabel: "Job",
       visibleKindLabel: null,
       summaryLabel: "Application summary and keyword comparison",
       titleFallback: "Application",
@@ -109,7 +110,7 @@ describe("opportunity-kind presentation", () => {
     expect(detailMarkup).toContain("Platform Engineer");
     expect(detailMarkup).toContain("Example Labs");
     expect(detailMarkup).toContain("View job posting");
-    expect(detailMarkup).not.toContain(">Job</p>");
+    expect(detailMarkup).toContain(">Job</p>");
     expect(dashboardMarkup).toContain('aria-label="Open Platform Engineer job-run"');
     expect(dashboardMarkup).not.toContain("Job · ");
   });

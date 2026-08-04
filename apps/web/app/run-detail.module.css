@@ -629,6 +629,16 @@
   font-size: var(--font-size-sm);
 }
 
+.identityStatusRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.opportunityKind {
+  color: var(--color-text);
+}
+
 
 .applicationBadge {
   --application-badge-color: var(--color-muted);

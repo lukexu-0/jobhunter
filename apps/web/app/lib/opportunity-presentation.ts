@@ -2,6 +2,7 @@ import type { OpportunityKind } from "@jobhunter/pipeline/contracts";
 
 export interface OpportunityPresentation {
   readonly visibleKindLabel: string | null;
+  readonly detailKindLabel: string;
   readonly summaryLabel: string;
   readonly titleFallback: string;
   readonly organizationFallback: string;
@@ -14,6 +15,7 @@ export interface OpportunityPresentation {
 
 export const OPPORTUNITY_PRESENTATION = {
   job: {
+    detailKindLabel: "Job",
     visibleKindLabel: null,
     summaryLabel: "Application summary and keyword comparison",
     titleFallback: "Application",
@@ -26,6 +28,7 @@ export const OPPORTUNITY_PRESENTATION = {
   },
   hackathon: {
     visibleKindLabel: "Hackathon",
+    detailKindLabel: "Hackathon",
     summaryLabel: "Hackathon summary and keyword comparison",
     titleFallback: "Hackathon",
     organizationFallback: "Organizer unavailable",
@@ -37,6 +40,7 @@ export const OPPORTUNITY_PRESENTATION = {
   },
   competition: {
     visibleKindLabel: "Competition",
+    detailKindLabel: "Competition",
     summaryLabel: "Competition summary and keyword comparison",
     titleFallback: "Competition",
     organizationFallback: "Organizer unavailable",
@@ -48,6 +52,7 @@ export const OPPORTUNITY_PRESENTATION = {
   },
   event: {
     visibleKindLabel: "Event",
+    detailKindLabel: "Event",
     summaryLabel: "Event summary and keyword comparison",
     titleFallback: "Event",
     organizationFallback: "Organizer unavailable",

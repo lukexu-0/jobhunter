@@ -187,12 +187,14 @@ export function RunIdentitySummary({
 
   return (
     <section className={styles.paneSection}>
-      {presentation.visibleKindLabel ? (
-        <p className={styles.eyebrow}>{presentation.visibleKindLabel}</p>
-      ) : null}
-      <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>
-        {APPLICATION_STATUS_LABELS[run.applicationStatus]}
-      </p>
+      <div className={styles.identityStatusRow}>
+        <p className={`${styles.eyebrow} ${styles.opportunityKind}`}>
+          {presentation.detailKindLabel}
+        </p>
+        <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>
+          {APPLICATION_STATUS_LABELS[run.applicationStatus]}
+        </p>
+      </div>
       <h1 className={styles.runTitle}>{title}</h1>
       <p className={styles.runSubtitle}>{subtitle}</p>
       {run.jobUrl ? (
