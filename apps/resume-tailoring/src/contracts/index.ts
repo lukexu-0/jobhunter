@@ -589,24 +589,24 @@ export type TimelineEvent = z.infer<typeof TimelineEventSchema>;
 export const JOB_URL_MAX_CHARS = 2_048;
 export const JobUrlSchema = z.string().trim().transform((value, ctx) => {
   try {
-    if (value.length > JOB_URL_MAX_CHARS) throw new Error("Job URL exceeds the input limit");
+    if (value.length > JOB_URL_MAX_CHARS) throw new Error("Opportunity URL exceeds the input limit");
 
     const url = new URL(value);
     if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("Job URL uses an unsupported protocol");
+      throw new Error("Opportunity URL uses an unsupported protocol");
     }
-    if (url.username || url.password) throw new Error("Job URL contains credentials");
+    if (url.username || url.password) throw new Error("Opportunity URL contains credentials");
 
     url.hash = "";
     const canonicalUrl = url.href;
     if (canonicalUrl.length > JOB_URL_MAX_CHARS) {
-      throw new Error("Canonical job URL exceeds the input limit");
+      throw new Error("Canonical opportunity URL exceeds the input limit");
     }
     return canonicalUrl;
   } catch {
     ctx.addIssue({
       code: "custom",
-      message: "Job URL must be a valid HTTP(S) URL",
+      message: "Opportunity URL must be a valid HTTP(S) URL",
     });
     return z.NEVER;
   }
@@ -1241,6 +1241,7 @@ export const JobDescriptionSchema = z
 export const RunListResponseSchema = z.object({ runs: z.array(RunDtoSchema) }).strict();
 export const CreateRunRequestSchema = z.object({
   jobUrl: JobUrlSchema,
+  opportunityKind: OpportunityKindSchema.optional(),
   generateKeywordMap: z.boolean().default(true),
   skipReview: z.boolean().default(false),
   autoSubmit: z.boolean().default(false),

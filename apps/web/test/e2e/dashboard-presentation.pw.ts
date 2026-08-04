@@ -300,7 +300,7 @@ test("uses five application columns in every table state", async ({ page }) => {
     contentType: "application/json",
     body: JSON.stringify({ runs: [] }),
   });
-  await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.", { exact: true })).toBeVisible();
+  await expect(page.getByText("No applications yet. Enter an opportunity URL above to initialize one.", { exact: true })).toBeVisible();
   await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "5");
 
   await page.unroute("**/api/pipeline/runs");
@@ -826,6 +826,6 @@ test("requires delete confirmation and removes a run only after a successful bod
   await expect(row).toHaveCount(0);
   await expect(trigger).toHaveCount(0);
   await expect(page.getByRole("searchbox", { name: "Search applications" })).toBeFocused();
-  await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.")).toBeVisible();
+  await expect(page.getByText("No applications yet. Enter an opportunity URL above to initialize one.")).toBeVisible();
   expect(deleteBodies).toEqual([null, null]);
 });

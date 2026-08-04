@@ -15,7 +15,11 @@ export type LoadedJobSource = Readonly<
   | { kind: "description"; opportunityKind: OpportunityKind; jobDescription: string }
   | { kind: "model-fallback"; lines: readonly string[] }
 >;
-export type LoadJobSource = (jobUrl: string, signal?: AbortSignal) => Promise<LoadedJobSource>;
+export type LoadJobSource = (
+  jobUrl: string,
+  signal?: AbortSignal,
+  opportunityKindHint?: OpportunityKind,
+) => Promise<LoadedJobSource>;
 export interface LoadedPublicWebSource {
   readonly url: string;
   readonly mediaType: "html" | "plain";
@@ -46,11 +50,11 @@ export type JobSourceErrorCode =
   | "JOB_DESCRIPTION_UNAVAILABLE";
 
 const ERROR_DETAILS = {
-  JOB_URL_BLOCKED: [400, "Job URL must resolve to a public HTTP(S) address"],
-  JOB_SOURCE_UNAVAILABLE: [422, "The job posting could not be loaded"],
-  JOB_SOURCE_UNSUPPORTED: [422, "The job posting response is not HTML or plain text"],
-  JOB_SOURCE_TOO_LARGE: [413, "The job posting is too large to import"],
-  JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable job description"],
+  JOB_URL_BLOCKED: [400, "Opportunity URL must resolve to a public HTTP(S) address"],
+  JOB_SOURCE_UNAVAILABLE: [422, "The opportunity page could not be loaded"],
+  JOB_SOURCE_UNSUPPORTED: [422, "The opportunity page response is not HTML or plain text"],
+  JOB_SOURCE_TOO_LARGE: [413, "The opportunity page is too large to import"],
+  JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable opportunity description"],
 } as const satisfies Record<JobSourceErrorCode, readonly [400 | 413 | 422, string]>;
 
 export class JobSourceError extends Error {
@@ -560,12 +564,13 @@ async function collectJsonLdScripts(html: string): Promise<string[]> {
 
 async function deterministicHtmlDescription(
   html: string,
-): Promise<Extract<LoadedJobSource, { kind: "description" }> | undefined> {
+  opportunityKindHint?: OpportunityKind,
+): Promise<LoadedJobSource | "too-large" | undefined> {
   const opportunities: JsonLdOpportunity[] = [];
   for (const script of await collectJsonLdScripts(html)) {
     try { visitJson(JSON.parse(script), opportunities); } catch { /* Ignore each malformed block independently. */ }
   }
-  const candidates = new Map<string, Extract<LoadedJobSource, { kind: "description" }>>();
+  const candidates = new Map<string, string>();
   for (const { opportunityKind, value } of opportunities) {
     const organization = value.hiringOrganization ?? value.organizer ?? value.sponsor;
     const values = [
@@ -590,11 +595,14 @@ async function deterministicHtmlDescription(
     }
     const candidate = JobDescriptionSchema.safeParse(normalized.join("\n\n"));
     if (candidate.success) {
-      const loaded = { kind: "description", opportunityKind, jobDescription: candidate.data } as const;
-      candidates.set(`${opportunityKind}\0${candidate.data}`, loaded);
+      const deduplicationKind = opportunityKindHint ?? opportunityKind;
+      candidates.set(`${deduplicationKind}\0${candidate.data}`, candidate.data);
     }
   }
-  return candidates.size === 1 ? candidates.values().next().value : undefined;
+  if (candidates.size !== 1) return undefined;
+  const jobDescription = candidates.values().next().value!;
+  if (opportunityKindHint === undefined) return buildFallbackCandidate(jobDescription);
+  return { kind: "description", opportunityKind: opportunityKindHint, jobDescription };
 }
 
 function buildFallbackCandidate(candidate: string): LoadedJobSource | "too-large" | undefined {
@@ -925,6 +933,7 @@ async function loadJobSourceWithSignal(
   signal: AbortSignal,
   fetchImpl: JobSourceFetch,
   resolveHost: ResolveHost,
+  opportunityKindHint?: OpportunityKind,
 ): Promise<LoadedJobSource> {
   const loaded = await loadPublicWebSourceWithSignal(
     jobUrl,
@@ -934,18 +943,29 @@ async function loadJobSourceWithSignal(
   );
   if (loaded.mediaType === "plain") {
     const jobDescription = normalizeText(loaded.body);
-    const parsed = JobDescriptionSchema.safeParse(jobDescription);
-    if (parsed.success) {
-      return { kind: "description", opportunityKind: "job", jobDescription: parsed.data };
+    if (opportunityKindHint !== undefined) {
+      const parsed = JobDescriptionSchema.safeParse(jobDescription);
+      if (parsed.success) {
+        return {
+          kind: "description",
+          opportunityKind: opportunityKindHint,
+          jobDescription: parsed.data,
+        };
+      }
+      throw new JobSourceError(
+        jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
+          ? "JOB_SOURCE_TOO_LARGE"
+          : "JOB_DESCRIPTION_UNAVAILABLE",
+      );
     }
-    throw new JobSourceError(
-      jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
-        ? "JOB_SOURCE_TOO_LARGE"
-        : "JOB_DESCRIPTION_UNAVAILABLE",
-    );
+    const fallback = buildFallbackCandidate(jobDescription);
+    if (fallback === "too-large") throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+    if (fallback !== undefined) return fallback;
+    throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
   }
 
-  const deterministic = await deterministicHtmlDescription(loaded.body);
+  const deterministic = await deterministicHtmlDescription(loaded.body, opportunityKindHint);
+  if (deterministic === "too-large") throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
   if (deterministic !== undefined) return deterministic;
   const oracleCandidate = await loadOracleCandidateExperienceFallback(
     loaded.url,
@@ -961,6 +981,7 @@ export async function loadJobSourceFromUrl(
   jobUrl: string,
   signal?: AbortSignal,
   options: JobSourceLoadOptions = {},
+  opportunityKindHint?: OpportunityKind,
 ): Promise<LoadedJobSource> {
   signal?.throwIfAborted();
   const controller = new AbortController();
@@ -976,6 +997,7 @@ export async function loadJobSourceFromUrl(
       controller.signal,
       options.fetchImpl ?? fetch,
       options.resolveHost ?? defaultResolveHost,
+      opportunityKindHint,
     );
   } catch (error) {
     if (signal?.aborted) throw cancellationReason(signal);

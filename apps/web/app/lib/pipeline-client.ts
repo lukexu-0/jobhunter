@@ -41,6 +41,7 @@ import {
   type RecruitingEventDashboardResponse,
   type RecruitingEventPreferences,
   type RecruitingEventScrapeResponse,
+  type OpportunityKind,
   type RunDto,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
@@ -59,8 +60,8 @@ const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   INVALID_MODEL_OUTPUT: "The model returned invalid output",
   MODEL_PROVIDER_FAILED: "The model request failed",
   MODEL_TIMEOUT: "The model request timed out",
-  JOB_EXTRACTION_UNAVAILABLE: "Job description extraction failed",
-  JOB_EXTRACTION_TIMEOUT: "Job description extraction timed out",
+  JOB_EXTRACTION_UNAVAILABLE: "Opportunity description extraction failed",
+  JOB_EXTRACTION_TIMEOUT: "Opportunity description extraction timed out",
 });
 const JsonValueSchema = z.json();
 
@@ -365,9 +366,11 @@ export function createRun(
   generateKeywordMap = true,
   skipReview = false,
   autoSubmit = false,
+  opportunityKind?: OpportunityKind,
 ): Promise<RunDto> {
   const parsed = CreateRunRequestSchema.safeParse({
     jobUrl,
+    ...(opportunityKind === undefined ? {} : { opportunityKind }),
     generateKeywordMap,
     skipReview,
     autoSubmit,

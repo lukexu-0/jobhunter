@@ -446,7 +446,16 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
   await expect(initializer).toBeVisible();
   await expect(heading.locator("xpath=..").locator("+ form")).toHaveCount(1);
-  await expect(initializer.getByLabel("Job posting URLs")).toHaveAttribute("id", "job-url");
+  await expect(initializer.getByLabel("Opportunity URLs")).toHaveAttribute("id", "job-url");
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
+  await expect(opportunityType).toHaveValue("auto");
+  await expect(opportunityType.locator("option")).toHaveText([
+    "Auto-detect",
+    "Job",
+    "Hackathon",
+    "Competition",
+    "Event",
+  ]);
   const options = initializer.getByRole("group", { name: "Run options" });
   await expect(options.getByRole("checkbox", { name: "Skip résumé review", exact: true })).not.toBeChecked();
   await expect(options.getByRole("checkbox", { name: "Auto-submit application", exact: true })).not.toBeChecked();
@@ -461,7 +470,7 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
   await expect(initializer.getByText("Generate resume-to-job-description keyword map", { exact: true })).toHaveCount(0);
   await expect(initializer.getByRole("textbox")).toHaveCount(1);
   await expect(initializer.getByRole("button", { name: "Initialize" })).toBeDisabled();
-  await expect(page.getByText("No applications yet. Enter a job posting URL above to initialize one.", { exact: true })).toBeVisible();
+  await expect(page.getByText("No applications yet. Enter an opportunity URL above to initialize one.", { exact: true })).toBeVisible();
 
   await expect(page.getByRole("button", { name: /^(New|Close|Create run|Create first application|Cancel)$/ })).toHaveCount(0);
   await expect(page.locator(".run-composer")).toHaveCount(0);
@@ -475,7 +484,8 @@ test("uses shared request eligibility and remains usable without overflow", asyn
     await page.goto("/");
 
     const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-    const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+    const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+    const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
     const initialize = initializer.getByRole("button", { name: "Initialize" });
     await expect(input).toHaveAttribute("type", "text");
     await expect(input).toHaveAttribute("inputmode", "url");
@@ -484,7 +494,7 @@ test("uses shared request eligibility and remains usable without overflow", asyn
     await expect(input).toHaveAttribute("spellcheck", "false");
     await expect(input).toHaveAttribute(
       "placeholder",
-      "https://company.com/jobs/role, https://company.com/jobs/another-role",
+      "https://example.com/opportunities/ship-it, https://example.com/events/demo-day",
     );
 
     for (const invalidUrl of [
@@ -503,23 +513,30 @@ test("uses shared request eligibility and remains usable without overflow", asyn
 
     const formBox = await initializer.boundingBox();
     const inputBox = await input.boundingBox();
+    const opportunityTypeBox = await opportunityType.locator("xpath=..").boundingBox();
     const buttonBox = await initialize.boundingBox();
-    if (!formBox || !inputBox || !buttonBox) throw new Error("Initializer geometry is unavailable");
+    if (!formBox || !inputBox || !opportunityTypeBox || !buttonBox) {
+      throw new Error("Initializer geometry is unavailable");
+    }
     expect(inputBox.x).toBe(formBox.x);
     if (width > 560) {
       expect(buttonBox.x + buttonBox.width).toBe(formBox.x + formBox.width);
-      expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(buttonBox.x);
+      expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(opportunityTypeBox.x);
+      expect(opportunityTypeBox.x + opportunityTypeBox.width).toBeLessThanOrEqual(buttonBox.x);
     } else {
       expect(buttonBox.x).toBe(formBox.x);
       expect(buttonBox.width).toBe(formBox.width);
-      expect(buttonBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height);
+      expect(opportunityTypeBox.x).toBe(formBox.x);
+      expect(opportunityTypeBox.width).toBe(formBox.width);
+      expect(opportunityTypeBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height);
+      expect(buttonBox.y).toBeGreaterThanOrEqual(opportunityTypeBox.y + opportunityTypeBox.height);
     }
     await expectNoDocumentOverflow(page);
   }
 });
 
 
-test("posts both selected run options with the canonical URL, disables while pending, and navigates on success", async ({ page }) => {
+test("omits the Auto-detect opportunity type, posts selected run options, and navigates on success", async ({ page }) => {
   const initializedRun = {
     ...runFixture("initialized-run", "applied", "failed"),
     skipReview: true,
@@ -549,10 +566,12 @@ test("posts both selected run options with the canonical URL, disables while pen
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
   const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
   const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await expect(opportunityType).toHaveValue("auto");
   await expect(skipReview).not.toBeChecked();
   await expect(autoSubmit).not.toBeChecked();
   await skipReview.check();
@@ -568,6 +587,7 @@ test("posts both selected run options with the canonical URL, disables while pen
     autoSubmit: true,
   }));
   await expect(input).toBeDisabled();
+  await expect(opportunityType).toBeDisabled();
   await expect(skipReview).toBeDisabled();
   await expect(autoSubmit).toBeDisabled();
   await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
@@ -615,13 +635,13 @@ test("preserves both run options while confirming a duplicate canonical URL", as
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
   const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
   const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
   const dialog = page.getByRole("dialog", { name: "Initialize duplicate application?" });
   const description =
-    "This job posting URL has already been used. Initialize another application anyway?";
+    "This opportunity URL has already been used. Initialize another application anyway?";
 
   await input.fill(enteredJobUrl);
   await skipReview.check();
@@ -710,7 +730,7 @@ test("confirms duplicate URLs before starting a multi-URL batch", async ({ page 
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
   await input.fill([
     "HTTPS://Jobs.Example.Test:443/roles/existing#details,",
     "https://jobs.example.test/roles/new",
@@ -720,7 +740,7 @@ test("confirms duplicate URLs before starting a multi-URL batch", async ({ page 
   const dialog = page.getByRole("dialog", { name: "Initialize duplicate applications?" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText(
-    "One or more job posting URLs have already been used. Initialize these applications anyway?",
+    "One or more opportunity URLs have already been used. Initialize these applications anyway?",
     { exact: true },
   )).toBeVisible();
   expect(postedUrls).toEqual([]);
@@ -732,7 +752,7 @@ test("confirms duplicate URLs before starting a multi-URL batch", async ({ page 
   await expect(page.locator("tbody tr")).toHaveCount(3);
 });
 
-test("initializes mixed comma and whitespace URLs concurrently, stays on the dashboard, and adds every run", async ({ page }) => {
+test("sends an explicit Hackathon type for a batch and resets it only after full success", async ({ page }) => {
   const expectedUrls = [
     "https://jobs.example.test/roles/alpha",
     "https://jobs.example.test/roles/bravo?source=board",
@@ -744,7 +764,7 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
   const initializedRuns = new Map<string, RunDto>(
     expectedUrls.map((url, index) => [
       url,
-      runFixture(`initialized-${index + 1}`, "pending", "approved"),
+      { ...runFixture(`initialized-${index + 1}`, "pending", "approved"), opportunityKind: "hackathon" },
     ]),
   );
   const existingRun = runFixture("existing-run", "pending", "approved");
@@ -781,11 +801,13 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
     expect(request.headers()["content-type"]).toContain("application/json");
     const body = request.postDataJSON() as {
       jobUrl: string;
+      opportunityKind: string;
       generateKeywordMap: boolean;
       skipReview: boolean;
       autoSubmit: boolean;
     };
     expect(body).toMatchObject({
+      opportunityKind: "hackathon",
       generateKeywordMap: true,
       skipReview: true,
       autoSubmit: false,
@@ -804,10 +826,12 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
   await initialListStarted;
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
   const initialize = initializer.getByRole("button", { name: "Initialize" });
   const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
   const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await opportunityType.selectOption("hackathon");
   await skipReview.check();
   await input.fill([
     " HTTPS://Jobs.Example.Test:443/roles/alpha#overview,",
@@ -828,6 +852,7 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
   expect(activePosts).toBe(5);
   expect(maxActivePosts).toBe(5);
   await expect(input).toBeDisabled();
+  await expect(opportunityType).toBeDisabled();
   await expect(page.getByRole("button", { name: "Initializing…" })).toBeDisabled();
 
   const firstPending = pendingPosts.entries().next().value;
@@ -860,6 +885,8 @@ test("initializes mixed comma and whitespace URLs concurrently, stays on the das
   await expect(page).toHaveURL(/\/$/);
   await expect(input).toHaveValue("");
   await expect(input).toBeEnabled();
+  await expect(opportunityType).toHaveValue("auto");
+  await expect(opportunityType).toBeEnabled();
   await expect(skipReview).not.toBeChecked();
   await expect(autoSubmit).not.toBeChecked();
   await expect(initialize).toBeDisabled();
@@ -892,7 +919,7 @@ test("keeps successful rows and only failed canonical URLs after a partial initi
   ]);
   const pendingPosts = new Map<string, Route>();
   const postedUrls: string[] = [];
-  const firstPublicFailure = `The page does not contain a usable job description. ${"Try another public posting URL. ".repeat(10)}`;
+  const firstPublicFailure = `The page does not contain a usable opportunity description. ${"Try another public opportunity URL. ".repeat(10)}`;
   const laterPublicFailure = "A later public failure must not replace the first.";
   const expectedAlert = `2 of 4 applications initialized. ${firstPublicFailure}`.slice(0, 240);
   let listRequestCount = 0;
@@ -914,11 +941,13 @@ test("keeps successful rows and only failed canonical URLs after a partial initi
     expect(request.method()).toBe("POST");
     const body = request.postDataJSON() as {
       jobUrl: string;
+      opportunityKind: string;
       generateKeywordMap: boolean;
       skipReview: boolean;
       autoSubmit: boolean;
     };
     expect(body).toMatchObject({
+      opportunityKind: "hackathon",
       generateKeywordMap: true,
       skipReview: true,
       autoSubmit: true,
@@ -933,9 +962,11 @@ test("keeps successful rows and only failed canonical URLs after a partial initi
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
   const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
   const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await opportunityType.selectOption("hackathon");
   await skipReview.check();
   await autoSubmit.check();
   await input.fill([
@@ -977,6 +1008,7 @@ test("keeps successful rows and only failed canonical URLs after a partial initi
   await expect(page).toHaveURL(/\/$/);
   await expect(input).toHaveValue(failedUrls.join(", "));
   await expect(input).toBeEnabled();
+  await expect(opportunityType).toHaveValue("hackathon");
   await expect(input).toHaveAttribute("aria-invalid", "true");
   await expect(input).toHaveAttribute("aria-describedby", "job-url-error");
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
@@ -995,7 +1027,7 @@ test("retains every canonical URL when a multi-URL initialization fails", async 
     "https://jobs.example.test/roles/second",
   ];
   const pendingPosts = new Map<string, Route>();
-  const firstPublicFailure = "The first job posting could not be imported.";
+  const firstPublicFailure = "The first opportunity could not be imported.";
   const laterPublicFailure = "The later failure must not replace the first.";
   const { promise: allPostsStarted, resolve: markAllPostsStarted } = Promise.withResolvers<void>();
 
@@ -1028,7 +1060,7 @@ test("retains every canonical URL when a multi-URL initialization fails", async 
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-  const input = initializer.getByRole("textbox", { name: "Job posting URLs" });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
   const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
   const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
   await skipReview.check();
@@ -1080,7 +1112,7 @@ test("disables a batch larger than the newest-run window", async ({ page }) => {
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
-  await initializer.getByRole("textbox", { name: "Job posting URLs" }).fill(
+  await initializer.getByRole("textbox", { name: "Opportunity URLs" }).fill(
     Array.from(
       { length: 101 },
       (_, index) => `https://jobs.example.test/roles/over-limit-${index + 1}`,
@@ -1091,9 +1123,9 @@ test("disables a batch larger than the newest-run window", async ({ page }) => {
   expect(postCount).toBe(0);
 });
 
-test("retains the URL and independently selected run options after initialization failures", async ({ page }) => {
-  const submittedUrl = "https://jobs.example.test/unavailable#details";
-  const retryUrl = "https://jobs.example.test/another-role";
+test("retains the URL, opportunity type, and independently selected run options after initialization failures", async ({ page }) => {
+  const submittedUrl = "https://events.example.test/hackathons/ship-it#details";
+  const retryUrl = "https://events.example.test/hackathons/another-project";
   let postCount = 0;
   await page.route("**/api/pipeline/runs", async (route) => {
     const request = route.request();
@@ -1108,10 +1140,11 @@ test("retains the URL and independently selected run options after initializatio
     expect(request.method()).toBe("POST");
     postCount += 1;
     expect(request.postDataJSON()).toEqual({
-      jobUrl: postCount === 1 ? "https://jobs.example.test/unavailable" : retryUrl,
+      jobUrl: postCount === 1 ? "https://events.example.test/hackathons/ship-it" : retryUrl,
       generateKeywordMap: true,
       skipReview: false,
       autoSubmit: postCount === 2,
+      opportunityKind: "hackathon",
     });
     await route.fulfill({
       status: 422,
@@ -1119,24 +1152,28 @@ test("retains the URL and independently selected run options after initializatio
       body: JSON.stringify({
         error: {
           code: "JOB_DESCRIPTION_UNAVAILABLE",
-          message: "The page does not contain a usable job description",
+          message: "The page does not contain a usable opportunity description",
         },
       }),
     });
   });
   await page.goto("/");
 
-  const input = page.getByRole("textbox", { name: "Job posting URLs" });
+  const input = page.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = page.getByRole("combobox", { name: "Opportunity type" });
   const skipReview = page.getByRole("checkbox", { name: "Skip résumé review" });
   const autoSubmit = page.getByRole("checkbox", { name: "Auto-submit application" });
+  await opportunityType.selectOption("hackathon");
   await input.fill(submittedUrl);
   await page.getByRole("button", { name: "Initialize" }).click();
 
   const alert = page.locator("#job-url-error");
   await expect(alert).toHaveAttribute("id", "job-url-error");
-  await expect(alert).toHaveText("The page does not contain a usable job description");
+  await expect(alert).toHaveText("The page does not contain a usable opportunity description");
   await expect(input).toHaveValue(submittedUrl);
   await expect(input).toBeEnabled();
+  await expect(opportunityType).toHaveValue("hackathon");
+  await expect(opportunityType).toBeEnabled();
   await expect(skipReview).not.toBeChecked();
   await expect(autoSubmit).not.toBeChecked();
   await expect(skipReview).toBeEnabled();
@@ -1154,9 +1191,11 @@ test("retains the URL and independently selected run options after initializatio
   await expect(page.getByRole("button", { name: "Initialize" })).toBeEnabled();
 
   await page.getByRole("button", { name: "Initialize" }).click();
-  await expect(alert).toHaveText("The page does not contain a usable job description");
+  await expect(alert).toHaveText("The page does not contain a usable opportunity description");
   await expect(input).toHaveValue(retryUrl);
   await expect(input).toBeEnabled();
+  await expect(opportunityType).toHaveValue("hackathon");
+  await expect(opportunityType).toBeEnabled();
   await expect(skipReview).not.toBeChecked();
   await expect(autoSubmit).toBeChecked();
   await expect(skipReview).toBeEnabled();

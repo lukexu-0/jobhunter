@@ -507,6 +507,38 @@ describe("pipeline application bootstrap", () => {
     expect(created.jobUrl).toBe(JOB_URL);
     await fixture.app.close();
   });
+  test("creates an explicit hackathon run from a project submission page through the public boundary", async () => {
+    const projectSubmission = [
+      "Climate resilience project submission",
+      "This prototype uses open data to help communities prepare for extreme weather events.",
+    ].join("\n");
+    const fixture = createFixture(false, {
+      loadJobSource: async () => ({
+        kind: "description",
+        opportunityKind: "job",
+        jobDescription: projectSubmission,
+      }),
+    });
+    expect((await fixture.app.fetch(mutation("/v1/context/sync", {}))).status).toBe(200);
+
+    const response = await fixture.app.fetch(mutation("/v1/runs", {
+      jobUrl: "https://hackathons.example.test/projects/climate-resilience/submissions/1",
+      opportunityKind: "hackathon",
+    }));
+
+    expect(response.status).toBe(201);
+    const created = await response.json();
+    expect(created).toMatchObject({
+      opportunityKind: "hackathon",
+      jobUrl: "https://hackathons.example.test/projects/climate-resilience/submissions/1",
+      status: "queued",
+    });
+    expect(fixture.pipelineDatabase.query<{ opportunity_kind: string }, [string]>(
+      "SELECT opportunity_kind FROM runs WHERE id = ?",
+    ).get(created.id)?.opportunity_kind).toBe("hackathon");
+    await fixture.app.close();
+  });
+
 
   test("keeps a supplied run service authoritative over default ingestion options", async () => {
     const fixture = createFixture(true);

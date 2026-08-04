@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent } from "react";
-import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
+import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type OpportunityKind, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
 import { PipelineClientError, createRun, deleteRun, listRuns, readJsonArtifact, updateApplicationStatus, updateRunIdentity } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
@@ -44,6 +44,7 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 type SortDirection = "newest" | "oldest";
 type IdentityField = "title" | "organization";
+type OpportunityKindSelection = OpportunityKind | "auto";
 
 interface EffectiveIdentity {
   readonly title?: string;
@@ -72,6 +73,7 @@ type RunDialog =
 
 interface ValidatedCreateRunRequest {
   readonly jobUrl: string;
+  readonly opportunityKind?: OpportunityKind;
   readonly generateKeywordMap: boolean;
   readonly skipReview: boolean;
   readonly autoSubmit: boolean;
@@ -97,6 +99,7 @@ function publicMessage(error: unknown, fallback: string): string {
 
 function parseCreateRunRequests(
   value: string,
+  opportunityKind: OpportunityKindSelection,
   skipReview: boolean,
   autoSubmit: boolean,
 ): ValidatedCreateRunRequest[] | null {
@@ -107,6 +110,7 @@ function parseCreateRunRequests(
   for (const token of tokens) {
     const parsed = CreateRunRequestSchema.safeParse({
       jobUrl: token,
+      ...(opportunityKind === "auto" ? {} : { opportunityKind }),
       generateKeywordMap: true,
       skipReview,
       autoSubmit,
@@ -155,7 +159,7 @@ function mergeRuns(current: readonly RunDto[] | undefined, incoming: readonly Ru
 }
 
 function batchFailureMessage(successCount: number, totalCount: number, error: unknown): string {
-  const failure = publicMessage(error, "An application could not be initialized. Try again.");
+  const failure = publicMessage(error, "An opportunity could not be initialized. Try again.");
   return `${successCount} of ${totalCount} applications initialized. ${failure}`.slice(
     0,
     MAX_PUBLIC_MESSAGE_LENGTH,
@@ -251,6 +255,7 @@ export function RunDashboard() {
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [jobUrl, setJobUrl] = useState("");
+  const [opportunityKind, setOpportunityKind] = useState<OpportunityKindSelection>("auto");
   const [skipReview, setSkipReview] = useState(false);
   const [autoSubmit, setAutoSubmit] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -296,8 +301,8 @@ export function RunDashboard() {
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequests = useMemo(
-    () => parseCreateRunRequests(jobUrl, skipReview, autoSubmit),
-    [autoSubmit, jobUrl, skipReview],
+    () => parseCreateRunRequests(jobUrl, opportunityKind, skipReview, autoSubmit),
+    [autoSubmit, jobUrl, opportunityKind, skipReview],
   );
   const isCreateRequestValid = createRunRequests !== null;
 
@@ -610,13 +615,15 @@ export function RunDashboard() {
           request.generateKeywordMap,
           request.skipReview,
           request.autoSubmit,
+          request.opportunityKind,
         );
         setJobUrl("");
+        setOpportunityKind("auto");
         setSkipReview(false);
         setAutoSubmit(false);
         router.push(`/runs/${encodeURIComponent(run.id)}`);
       } catch (error) {
-        setCreateError(publicMessage(error, "The application could not be initialized. Try again."));
+        setCreateError(publicMessage(error, "The opportunity could not be initialized. Try again."));
         setIsCreating(false);
       }
       return;
@@ -634,6 +641,7 @@ export function RunDashboard() {
               request.generateKeywordMap,
               request.skipReview,
               request.autoSubmit,
+              request.opportunityKind,
             ),
           };
         } catch (error) {
@@ -657,6 +665,7 @@ export function RunDashboard() {
 
     if (failures.length === 0) {
       setJobUrl("");
+      setOpportunityKind("auto");
       setSkipReview(false);
       setAutoSubmit(false);
       setCreateSuccess(`${successfulRuns.length} applications initialized.`);
@@ -737,7 +746,7 @@ export function RunDashboard() {
         onSubmit={(event) => void submitRun(event)}
       >
         <div className="run-initializer__field">
-          <label className="run-initializer__label" htmlFor="job-url">Job posting URLs</label>
+          <label className="run-initializer__label" htmlFor="job-url">Opportunity URLs</label>
           <input
             id="job-url"
             type="text"
@@ -745,7 +754,7 @@ export function RunDashboard() {
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
-            placeholder="https://company.com/jobs/role, https://company.com/jobs/another-role"
+            placeholder="https://example.com/opportunities/ship-it, https://example.com/events/demo-day"
             value={jobUrl}
             disabled={isCreating}
             aria-invalid={createError ? true : undefined}
@@ -758,6 +767,26 @@ export function RunDashboard() {
             }}
           />
         </div>
+
+        <label className="select-control run-initializer__kind">
+          <span>Opportunity type</span>
+          <select
+            aria-label="Opportunity type"
+            value={opportunityKind}
+            disabled={isCreating}
+            onChange={(event) => {
+              setOpportunityKind(event.currentTarget.value as OpportunityKindSelection);
+              setCreateError(null);
+              setCreateSuccess(null);
+            }}
+          >
+            <option value="auto">Auto-detect</option>
+            <option value="job">Job</option>
+            <option value="hackathon">Hackathon</option>
+            <option value="competition">Competition</option>
+            <option value="event">Event</option>
+          </select>
+        </label>
 
         <fieldset className="run-initializer__options">
           <legend className="run-initializer__label">Run options</legend>
@@ -906,7 +935,7 @@ export function RunDashboard() {
                     <tr>
                       <td colSpan={5}>
                         <div className="applications-state applications-state--table">
-                          <p>No applications yet. Enter a job posting URL above to initialize one.</p>
+                          <p>No applications yet. Enter an opportunity URL above to initialize one.</p>
                         </div>
                       </td>
                     </tr>
@@ -1074,8 +1103,8 @@ export function RunDashboard() {
           <div className="run-action-dialog__body">
             <p id="duplicate-application-dialog-description">
               {duplicateCreateRequests && duplicateCreateRequests.length > 1
-                ? "One or more job posting URLs have already been used. Initialize these applications anyway?"
-                : "This job posting URL has already been used. Initialize another application anyway?"}
+                ? "One or more opportunity URLs have already been used. Initialize these applications anyway?"
+                : "This opportunity URL has already been used. Initialize another application anyway?"}
             </p>
           </div>
           <footer className="run-action-dialog__actions">

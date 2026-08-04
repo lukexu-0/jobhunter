@@ -10,6 +10,7 @@ import {
   type RunDto,
   type ResumeIterationListResponse,
   type ApplicationStatus,
+  type OpportunityKind,
 } from "../contracts";
 import { apiResponse } from "./handler";
 
@@ -22,6 +23,7 @@ export interface RunRouteService {
     skipReview: boolean,
     autoSubmit: boolean,
     signal?: AbortSignal,
+    opportunityKind?: OpportunityKind,
   ): Promise<RunDto>;
   updateApplicationStatus(id: string, applicationStatus: ApplicationStatus): Promise<RunDto>;
   updateRunIdentity(
@@ -56,9 +58,9 @@ function mappedError(error: unknown): Response {
     if (status < 500 && "message" in error && typeof error.message === "string") {
       message = error.message;
     } else if (code === "JOB_EXTRACTION_UNAVAILABLE") {
-      message = "Job description extraction failed";
+      message = "Opportunity description extraction failed";
     } else if (code === "JOB_EXTRACTION_TIMEOUT") {
-      message = "Job description extraction timed out";
+      message = "Opportunity description extraction timed out";
     } else if (code === "CONTEXT_SYNC_FAILED") {
       message = "Context synchronization failed";
     }
@@ -104,6 +106,7 @@ export function createRunRoutes(service: RunRouteService) {
           body.data.skipReview,
           body.data.autoSubmit,
           request.signal,
+          body.data.opportunityKind,
         ));
         service.kick();
         return apiResponse.json(run, 201);

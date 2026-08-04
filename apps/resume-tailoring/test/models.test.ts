@@ -624,6 +624,38 @@ describe("direct Luna job extractor", () => {
       jobDescription: "Example Labs Hackathon\nBuild a climate solution with the supplied API and submit it by Friday.",
     });
   });
+  test("uses an enumerated extraction hint as the authoritative opportunity kind", async () => {
+    let contextSeen: Context | undefined;
+    const sourceLines = [
+      "Climate resilience project submission",
+      "This prototype uses open data to help communities prepare for extreme weather events.",
+    ] as const;
+    const result = await extractJobDescriptionWithLuna(sourceLines, undefined, {
+      opportunityKindHint: "hackathon",
+      resolverFactory: () => inertResolver(),
+      transport: async (_model, context) => {
+        contextSeen = context;
+        return lunaAssistant("{\"kind\":\"job\",\"ranges\":[{\"startLine\":1,\"endLine\":2}]}");
+      },
+    });
+
+    expect(result).toEqual({
+      opportunityKind: "hackathon",
+      jobDescription: sourceLines.join("\n"),
+    });
+    const userMessage = contextSeen?.messages[0];
+    if (userMessage?.role !== "user" || typeof userMessage.content !== "string") {
+      throw new Error("Luna source message missing");
+    }
+    expect(JSON.parse(userMessage.content)).toEqual({
+      opportunityKindHint: "hackathon",
+      sourceLines: [
+        [1, sourceLines[0]],
+        [2, sourceLines[1]],
+      ],
+    });
+  });
+
 
   test("accepts null and valid disjoint ranges while enforcing final description character bounds", async () => {
     const source = [

@@ -61,7 +61,7 @@ function deferred<T>() {
 }
 
 describe("job source loading", () => {
-  test("loads normalized plain-text job descriptions without real network access", async () => {
+  test("returns normalized plain text as model lines when opportunity kind is omitted", async () => {
     const fetchImpl: JobSourceFetch = async () => response(
       "  Senior   Engineer\r\n\r\n Build\tsecure systems and collaborate across the whole team.  ",
     );
@@ -69,10 +69,32 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl,
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "Senior Engineer\n\nBuild secure systems and collaborate across the whole team." });
+    })).resolves.toEqual({
+      kind: "model-fallback",
+      lines: ["Senior Engineer", "", "Build secure systems and collaborate across the whole team."],
+    });
+  });
+  test("uses an explicit hackathon kind for a deterministic project submission page", async () => {
+    const projectSubmission =
+      "Climate resilience project submission\n\nThis prototype uses open data to help communities prepare for extreme weather events.";
+
+    await expect(loadJobSourceFromUrl(
+      "https://hackathons.example.test/projects/climate-resilience/submissions/1",
+      undefined,
+      {
+        fetchImpl: async () => response(projectSubmission),
+        resolveHost: resolvePublic,
+      },
+      "hackathon",
+    )).resolves.toEqual({
+      kind: "description",
+      opportunityKind: "hackathon",
+      jobDescription: projectSubmission,
+    });
   });
 
-  test("enforces plain-text character bounds without falling back to a model", async () => {
+
+  test("keeps deterministic description bounds authoritative for an explicit plain-text kind", async () => {
     for (const [body, code] of [
       ["界".repeat(20), "JOB_DESCRIPTION_UNAVAILABLE"],
       ["x".repeat(50_001), "JOB_SOURCE_TOO_LARGE"],
@@ -80,14 +102,14 @@ describe("job source loading", () => {
       const promise = loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
         fetchImpl: async () => response(body),
         resolveHost: resolvePublic,
-      });
+      }, "job");
       await expect(promise).rejects.toMatchObject({ code });
     }
 
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => response("界".repeat(40)),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "界".repeat(40) });
+    }, "job")).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "界".repeat(40) });
   });
 
   test("rejects a twenty-character CJK HTML page before exposing fallback lines", async () => {
@@ -178,7 +200,7 @@ describe("job source loading", () => {
     }
   });
 
-  test("keeps deterministic JSON-LD ahead of the Oracle adapter", async () => {
+  test("keeps JSON-LD model input ahead of the Oracle adapter in Auto-detect", async () => {
     let fetches = 0;
     await expect(loadJobSourceFromUrl(
       "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
@@ -196,9 +218,14 @@ describe("job source loading", () => {
         },
       },
     )).resolves.toEqual({
-      kind: "description",
-      opportunityKind: "hackathon",
-      jobDescription: "Data for Good Hackathon\n\nJPMorganChase\n\nBuild data and AI solutions for nonprofit organizations with an engineering team.",
+      kind: "model-fallback",
+      lines: [
+        "Data for Good Hackathon",
+        "",
+        "JPMorganChase",
+        "",
+        "Build data and AI solutions for nonprofit organizations with an engineering team.",
+      ],
     });
     expect(fetches).toBe(1);
   });
@@ -266,7 +293,7 @@ describe("job source loading", () => {
     }
   });
 
-  test("extracts one exact valid JSON-LD JobPosting candidate", async () => {
+  test("returns one exact valid JSON-LD JobPosting candidate as model lines", async () => {
     const body = `
       <html><body>
         <script type=" Application/LD+JSON ; charset=utf-8 ">
@@ -278,14 +305,24 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "Senior & Staff Engineer — 界\n\nExample Labs\n\nBuild secure systems.\nCollaborate across the product team." });
+    })).resolves.toEqual({
+      kind: "model-fallback",
+      lines: [
+        "Senior & Staff Engineer — 界",
+        "",
+        "Example Labs",
+        "",
+        "Build secure systems.",
+        "Collaborate across the product team.",
+      ],
+    });
   });
 
-  test("classifies and extracts supported non-job JSON-LD opportunities", async () => {
-    for (const [schemaType, opportunityKind, organizationField] of [
-      ["Hackathon", "hackathon", "organizer"],
-      ["Competition", "competition", "sponsor"],
-      ["Event", "event", "organizer"],
+  test("extracts supported non-job JSON-LD opportunities as deterministic model lines", async () => {
+    for (const [schemaType, organizationField] of [
+      ["Hackathon", "organizer"],
+      ["Competition", "sponsor"],
+      ["Event", "organizer"],
     ] as const) {
       const body = `<script type="application/ld+json">${JSON.stringify({
         "@type": `https://schema.org/${schemaType}`,
@@ -297,9 +334,8 @@ describe("job source loading", () => {
         fetchImpl: async () => htmlResponse(body),
         resolveHost: resolvePublic,
       })).resolves.toEqual({
-        kind: "description",
-        opportunityKind,
-        jobDescription: `${schemaType} title\n\nExample Labs\n\n${VALID_TEXT}`,
+        kind: "model-fallback",
+        lines: [`${schemaType} title`, "", "Example Labs", "", VALID_TEXT],
       });
     }
   });
@@ -314,7 +350,10 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: `Senior &lt;Staff&gt; Engineer\n\n${VALID_TEXT}` });
+    })).resolves.toEqual({
+      kind: "model-fallback",
+      lines: ["Senior &lt;Staff&gt; Engineer", "", VALID_TEXT],
+    });
   });
 
   test("recognizes exact JSON-LD types recursively and rejects near-matches and non-string fields", async () => {
@@ -330,7 +369,7 @@ describe("job source loading", () => {
       await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
         fetchImpl: async () => htmlResponse(body),
         resolveHost: resolvePublic,
-      })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+      })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
     }
 
     for (const rejectedType of ["jobposting", "JobPosting ", "schema:JobPosting", "https://schema.org/JobPosting/"]) {
@@ -364,7 +403,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(duplicateBody),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
 
     const ambiguousBody = [
       `<main><nav>Discard navigation</nav><h1>Role</h1><p>${VALID_TEXT}</p>`,
@@ -399,7 +438,14 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "Platform Engineer\nBuild & operate resilient systems for customers worldwide.\nNested footer remains because only body footer is boilerplate." });
+    })).resolves.toEqual({
+      kind: "model-fallback",
+      lines: [
+        "Platform Engineer",
+        "Build & operate resilient systems for customers worldwide.",
+        "Nested footer remains because only body footer is boilerplate.",
+      ],
+    });
   });
 
   test("returns exact sanitized fallback lines using main, article, then body priority", async () => {
@@ -465,11 +511,11 @@ describe("job source loading", () => {
 
   test("exposes only fixed public error metadata", () => {
     const expected = {
-      JOB_URL_BLOCKED: [400, "Job URL must resolve to a public HTTP(S) address"],
-      JOB_SOURCE_UNAVAILABLE: [422, "The job posting could not be loaded"],
-      JOB_SOURCE_UNSUPPORTED: [422, "The job posting response is not HTML or plain text"],
-      JOB_SOURCE_TOO_LARGE: [413, "The job posting is too large to import"],
-      JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable job description"],
+      JOB_URL_BLOCKED: [400, "Opportunity URL must resolve to a public HTTP(S) address"],
+      JOB_SOURCE_UNAVAILABLE: [422, "The opportunity page could not be loaded"],
+      JOB_SOURCE_UNSUPPORTED: [422, "The opportunity page response is not HTML or plain text"],
+      JOB_SOURCE_TOO_LARGE: [413, "The opportunity page is too large to import"],
+      JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable opportunity description"],
     } as const;
     for (const [code, [status, message]] of Object.entries(expected)) {
       const typedCode = code as keyof typeof expected;
@@ -500,7 +546,7 @@ describe("job source loading", () => {
       },
     });
 
-    expect(result).toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+    expect(result).toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
     expect(attempts).toHaveLength(1);
     expect(attempts[0]!.url.href).toBe(`https://${PUBLIC_V4}/role?q=1`);
     const headers = new Headers(attempts[0]!.init.headers);
@@ -526,7 +572,7 @@ describe("job source loading", () => {
         { address: "1.1.1.1", family: 4 },
         { address: "2606:4700:4700::1111", family: 6 },
       ],
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
     expect(calls).toEqual(["1.1.1.1:false", "[2606:4700:4700::1111]:false"]);
 
     calls.length = 0;
@@ -616,7 +662,7 @@ describe("job source loading", () => {
         }
         return response(VALID_TEXT);
       },
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
     expect(logicalPaths).toEqual([
       "jobs.example.test:/start/path:false",
       "jobs.example.test:/hop-1:false",
@@ -708,7 +754,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       resolveHost: resolvePublic,
       fetchImpl: async () => response(VALID_TEXT, { "content-encoding": " IdEnTiTy " }),
-    })).resolves.toMatchObject({ kind: "description" });
+    })).resolves.toMatchObject({ kind: "model-fallback" });
   });
 
   test("accepts HTML/XHTML media parameters and rejects invalid UTF-8 safely", async () => {
@@ -789,7 +835,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       resolveHost: resolvePublic,
       fetchImpl: async () => htmlResponse(exactBody, { "content-length": String(1024 * 1024) }),
-    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
   });
 
   test("classifies every IANA IPv4 row boundary by the literal registry snapshot", async () => {
@@ -811,7 +857,7 @@ describe("job source loading", () => {
           fetchImpl: async () => response(VALID_TEXT),
         });
         if (globallyReachable) {
-          await expect(result).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+          await expect(result).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
         } else {
           await expect(result).rejects.toMatchObject({ code: "JOB_URL_BLOCKED" });
         }
@@ -837,7 +883,7 @@ describe("job source loading", () => {
           fetchImpl: async () => response(VALID_TEXT),
         });
         if (globallyReachable) {
-          await expect(result).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+          await expect(result).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
         } else {
           await expect(result).rejects.toMatchObject({ code: "JOB_URL_BLOCKED" });
         }
@@ -858,7 +904,7 @@ describe("job source loading", () => {
       const host = address.includes(":") ? `[${address}]` : address;
       await expect(loadJobSourceFromUrl(`http://${host}/job`, undefined, {
         fetchImpl: async () => response(VALID_TEXT),
-      })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+      })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
     }
   });
 
@@ -909,7 +955,7 @@ describe("job source loading", () => {
           transports.push(new URL(input).hostname);
           return response(VALID_TEXT);
         },
-      })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
+      })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
     }
     expect(transports).toEqual(["93.184.216.34", "93.184.216.34"]);
   });
