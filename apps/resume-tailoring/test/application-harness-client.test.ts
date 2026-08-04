@@ -300,7 +300,7 @@ describe("HttpApplicationHarnessClient", () => {
       type: resume.type,
       bytes: new Uint8Array(await resume.arrayBuffer()),
     }).toEqual({
-      name: "resume.pdf",
+      name: "Alex_Example_Resume.pdf",
       type: "application/pdf",
       bytes: resumePdf,
     });
