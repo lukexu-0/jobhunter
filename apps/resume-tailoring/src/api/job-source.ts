@@ -22,6 +22,16 @@ export interface JobSourceLoadOptions {
   readonly deadlineMs?: number;
 }
 
+export interface PinnedPublicHttpRequest {
+  readonly fetchImpl?: JobSourceFetch;
+  readonly resolveHost?: ResolveHost;
+  readonly signal: AbortSignal;
+  readonly beforeFetchAttempt?: () => void;
+  readonly method?: "GET" | "POST";
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly body?: string;
+}
+
 export type JobSourceErrorCode =
   | "JOB_URL_BLOCKED"
   | "JOB_SOURCE_UNAVAILABLE"
@@ -53,6 +63,7 @@ export class JobSourceError extends Error {
 const NETWORK_DEADLINE_MS = 10_000;
 const MAX_REDIRECT_HOPS = 5;
 const MAX_BODY_BYTES = 1024 * 1024;
+const NEVER_ABORTED_SIGNAL = new AbortController().signal;
 const REDIRECT_STATUSES: Readonly<Record<number, true>> = {
   301: true,
   302: true,
@@ -270,7 +281,7 @@ function assignHostname(url: URL, hostname: string, family?: 4 | 6): void {
   url.hostname = family === 6 || hostname.includes(":") ? `[${hostname}]` : hostname;
 }
 
-function canonicalizeLogicalUrl(value: string | URL): URL {
+export function canonicalizePublicHttpUrl(value: string | URL): URL {
   const url = new URL(value);
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new JobSourceError("JOB_URL_BLOCKED");
   if (url.username || url.password) throw new JobSourceError("JOB_URL_BLOCKED");
@@ -282,6 +293,7 @@ function canonicalizeLogicalUrl(value: string | URL): URL {
     throw new JobSourceError("JOB_URL_BLOCKED");
   }
   const ip = parseAddress(hostname, false);
+  if (ip && !isPublicAddress(ip)) throw new JobSourceError("JOB_URL_BLOCKED");
   if (isIP(hostname) !== 0 && !ip) throw new JobSourceError("JOB_URL_BLOCKED");
   assignHostname(url, ip?.address ?? hostname, ip?.family);
   return url;
@@ -310,17 +322,21 @@ async function hardRace<T>(work: PromiseLike<T>, signal: AbortSignal): Promise<T
   }
 }
 
-function cancelBody(response: Response): void {
+export function cancelPublicHttpBody(response: Response): void {
   if (!response.body) return;
   try {
     const cancellation = response.body.cancel();
     void cancellation.catch(() => {});
   } catch {
-    // A locked/already-consumed body has its reader cancelled by readBoundedBody.
+    // A locked/already-consumed body has its reader cancelled by readBoundedPublicHttpBody.
   }
 }
 
-async function readBoundedBody(response: Response, signal: AbortSignal): Promise<Uint8Array> {
+export async function readBoundedPublicHttpBody(
+  response: Response,
+  signal: AbortSignal,
+  maxBodyBytes = MAX_BODY_BYTES,
+): Promise<Uint8Array> {
   const reader = response.body?.getReader();
   if (!reader) return new Uint8Array();
   const chunks: Uint8Array[] = [];
@@ -330,7 +346,7 @@ async function readBoundedBody(response: Response, signal: AbortSignal): Promise
       const item = await hardRace(reader.read(), signal);
       if (item.done) break;
       length += item.value.byteLength;
-      if (length > MAX_BODY_BYTES) throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+      if (length > maxBodyBytes) throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
       chunks.push(item.value);
     }
   } finally {
@@ -381,7 +397,7 @@ const HTML_NAMED_ENTITIES: Readonly<Record<string, string>> = {
   yen: "¥",
 };
 
-function decodeHtmlEntities(value: string): string {
+export function decodeHtmlEntities(value: string): string {
   return value.replace(/&(#(?:x[0-9a-f]+|\d+)|[a-z][a-z0-9]+);/gi, (match, reference: string) => {
     if (!reference.startsWith("#")) return HTML_NAMED_ENTITIES[reference.toLowerCase()] ?? match;
     const hexadecimal = reference[1]?.toLowerCase() === "x";
@@ -583,18 +599,35 @@ async function resolveValidatedAddresses(
   return normalized;
 }
 
-function fetchInit(logicalUrl: URL, hostname: string): BunFetchRequestInit {
+export async function validatePublicHttpDestination(
+  value: string | URL,
+  signal: AbortSignal = NEVER_ABORTED_SIGNAL,
+  resolveHost: ResolveHost = defaultResolveHost,
+): Promise<URL> {
+  signal.throwIfAborted();
+  const logicalUrl = canonicalizePublicHttpUrl(value);
+  await resolveValidatedAddresses(logicalUrl, resolveHost, signal);
+  signal.throwIfAborted();
+  return logicalUrl;
+}
+
+function fetchInit(
+  logicalUrl: URL,
+  hostname: string,
+  request?: Pick<PinnedPublicHttpRequest, "body" | "headers" | "method">,
+): BunFetchRequestInit {
   const literalHost = parseAddress(hostname, false);
+  const headers = new Headers(request?.headers);
+  if (!headers.has("accept")) headers.set("accept", "text/html, application/xhtml+xml, text/plain");
+  headers.set("accept-encoding", "identity");
+  headers.set("host", logicalUrl.host);
   const init: BunFetchRequestInit = {
-    method: "GET",
+    method: request?.method ?? "GET",
     redirect: "manual",
-    headers: {
-      Accept: "text/html, application/xhtml+xml, text/plain",
-      "Accept-Encoding": "identity",
-      Host: logicalUrl.host,
-    },
+    headers,
     decompress: false,
   };
+  if (request?.body !== undefined) init.body = request.body;
   if (logicalUrl.protocol === "https:") {
     init.tls = literalHost
       ? { rejectUnauthorized: true }
@@ -608,6 +641,7 @@ async function fetchPinned(
   addresses: readonly ParsedAddress[],
   fetchImpl: JobSourceFetch,
   signal: AbortSignal,
+  request?: Pick<PinnedPublicHttpRequest, "beforeFetchAttempt" | "body" | "headers" | "method">,
 ): Promise<Response> {
   const hostname = rawHostname(logicalUrl);
   let lastFailure: unknown;
@@ -615,8 +649,9 @@ async function fetchPinned(
     if (signal.aborted) throw cancellationReason(signal);
     const transportUrl = new URL(logicalUrl.href);
     assignHostname(transportUrl, address.address, address.family);
+    request?.beforeFetchAttempt?.();
     try {
-      return await hardRace(fetchImpl(transportUrl, { ...fetchInit(logicalUrl, hostname), signal }), signal);
+      return await hardRace(fetchImpl(transportUrl, { ...fetchInit(logicalUrl, hostname, request), signal }), signal);
     } catch (error) {
       if (signal.aborted) throw cancellationReason(signal);
       if (error instanceof JobSourceError) throw error;
@@ -624,6 +659,26 @@ async function fetchPinned(
     }
   }
   throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: lastFailure });
+}
+
+export async function fetchPinnedPublicHttp(
+  input: string | URL,
+  request: PinnedPublicHttpRequest,
+): Promise<{ readonly logicalUrl: URL; readonly response: Response }> {
+  const logicalUrl = canonicalizePublicHttpUrl(input);
+  const addresses = await resolveValidatedAddresses(
+    logicalUrl,
+    request.resolveHost ?? defaultResolveHost,
+    request.signal,
+  );
+  const response = await fetchPinned(
+    logicalUrl,
+    addresses,
+    request.fetchImpl ?? fetch,
+    request.signal,
+    request,
+  );
+  return { logicalUrl, response };
 }
 
 function terminalMediaType(response: Response): "html" | "plain" {
@@ -644,7 +699,7 @@ async function loadWithSignal(
   fetchImpl: JobSourceFetch,
   resolveHost: ResolveHost,
 ): Promise<LoadedJobSource> {
-  let logicalUrl = canonicalizeLogicalUrl(jobUrl);
+  let logicalUrl = canonicalizePublicHttpUrl(jobUrl);
   const visited = new Set([logicalUrl.href]);
   let redirectHops = 0;
 
@@ -654,7 +709,7 @@ async function loadWithSignal(
     const response = await fetchPinned(logicalUrl, addresses, fetchImpl, signal);
 
     if (REDIRECT_STATUSES[response.status]) {
-      cancelBody(response);
+      cancelPublicHttpBody(response);
       if (redirectHops >= MAX_REDIRECT_HOPS) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
       const location = response.headers.get("location");
       if (!location) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
@@ -666,7 +721,7 @@ async function loadWithSignal(
       }
       let target: URL;
       try {
-        target = canonicalizeLogicalUrl(resolved);
+        target = canonicalizePublicHttpUrl(resolved);
       } catch (error) {
         if (error instanceof JobSourceError) throw error;
         throw new JobSourceError("JOB_URL_BLOCKED", { cause: error });
@@ -679,7 +734,7 @@ async function loadWithSignal(
     }
 
     if (response.status < 200 || response.status > 299) {
-      cancelBody(response);
+      cancelPublicHttpBody(response);
       throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
     }
 
@@ -691,11 +746,11 @@ async function loadWithSignal(
         throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
       }
     } catch (error) {
-      cancelBody(response);
+      cancelPublicHttpBody(response);
       throw error;
     }
 
-    const bytes = await readBoundedBody(response, signal);
+    const bytes = await readBoundedPublicHttpBody(response, signal);
     let body: string;
     try {
       body = new TextDecoder("utf-8", { fatal: true }).decode(bytes);

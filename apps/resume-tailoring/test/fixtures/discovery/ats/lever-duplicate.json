@@ -1,0 +1,18 @@
+[
+  {
+    "id": "lever-201",
+    "text": "Backend Engineer",
+    "categories": { "location": "New York, NY" },
+    "description": "<p>Design and operate reliable services used by customers and internal product teams every day.</p>",
+    "hostedUrl": "https://jobs.lever.co/acme/lever-201",
+    "applyUrl": "https://jobs.lever.co/acme/lever-201/apply"
+  },
+  {
+    "id": "lever-201",
+    "text": "Backend Engineer duplicate",
+    "categories": { "location": "New York, NY" },
+    "description": "<p>Duplicate transport row for the same public posting and stable source identifier.</p>",
+    "hostedUrl": "https://jobs.lever.co/acme/lever-201",
+    "applyUrl": "https://jobs.lever.co/acme/lever-201/apply"
+  }
+]

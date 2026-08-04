@@ -326,7 +326,7 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
   expect(widths.bodyScroll).toBeLessThanOrEqual(widths.rootClient);
 }
 
-async function expectFolderNavigation(page: Page, width: number, currentLabel: "Applications" | "Providers"): Promise<void> {
+async function expectFolderNavigation(page: Page, width: number, currentLabel: "Applications" | "Discovery" | "Providers"): Promise<void> {
   const strip = page.locator("header.app-navigation");
   const stripBox = await strip.boundingBox();
   if (!stripBox) throw new Error("Primary navigation geometry is unavailable");
@@ -348,14 +348,17 @@ async function expectFolderNavigation(page: Page, width: number, currentLabel: "
 
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
   const links = navigation.getByRole("link");
-  await expect(links).toHaveCount(2);
+  await expect(links).toHaveCount(3);
   const firstBox = await links.nth(0).boundingBox();
   const secondBox = await links.nth(1).boundingBox();
-  if (!firstBox || !secondBox) throw new Error("Primary navigation links are unavailable");
+  const thirdBox = await links.nth(2).boundingBox();
+  if (!firstBox || !secondBox || !thirdBox) throw new Error("Primary navigation links are unavailable");
   expect(Math.abs(firstBox.width - secondBox.width)).toBeLessThanOrEqual(1);
+  expect(Math.abs(secondBox.width - thirdBox.width)).toBeLessThanOrEqual(1);
   expect(firstBox.x).toBe(0);
   expect(secondBox.x).toBe(firstBox.width);
-  expect(firstBox.width + secondBox.width).toBe(width);
+  expect(thirdBox.x).toBe(firstBox.width + secondBox.width);
+  expect(firstBox.width + secondBox.width + thirdBox.width).toBeCloseTo(width, 1);
 
   const linkStyles = await links.evaluateAll((elements) => elements.map((element) => {
     const style = getComputedStyle(element);
@@ -365,23 +368,22 @@ async function expectFolderNavigation(page: Page, width: number, currentLabel: "
       whiteSpace: style.whiteSpace,
     };
   }));
-  expect(linkStyles).toEqual([
-    {
-      clipPath: "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)",
-      justifyContent: "center",
-      whiteSpace: "nowrap",
-    },
-    {
-      clipPath: "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)",
-      justifyContent: "center",
-      whiteSpace: "nowrap",
-    },
-  ]);
+  const expectedClipPath = width <= 560
+    ? "polygon(8px 0px, calc(100% - 8px) 0px, 100% 100%, 0px 100%)"
+    : "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)";
+  expect(linkStyles).toEqual(Array.from({ length: 3 }, () => ({
+    clipPath: expectedClipPath,
+    justifyContent: "center",
+    whiteSpace: "nowrap",
+  })));
 
+  const labels = ["Applications", "Discovery", "Providers"] as const;
   const current = navigation.getByRole("link", { name: currentLabel });
-  const inactive = navigation.getByRole("link", {
-    name: currentLabel === "Applications" ? "Providers" : "Applications",
-  });
+  const inactiveLabels = labels.filter((label) => label !== currentLabel);
+  const inactive = navigation.getByRole("link", { name: inactiveLabels[0] });
+  for (const label of inactiveLabels) {
+    await expect(navigation.getByRole("link", { name: label })).not.toHaveAttribute("aria-current");
+  }
   await expect(current).toHaveAttribute("aria-current", "page");
   const currentBox = await current.boundingBox();
   const inactiveBox = await inactive.boundingBox();
@@ -1749,6 +1751,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
+          { provider: "indeed", state: "disconnected" },
         ],
       }),
     });
@@ -1758,14 +1761,14 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
   const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
-  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Providers"]);
+  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Providers"]);
   await expect(applicationCount).toHaveText("7");
 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await expect(page).toHaveURL(/\/providers$/);
   const providerBadges = page.locator(".status-badge");
-  await expect(providerBadges).toHaveText(["connected"]);
-  await expect(page.locator(".provider-row")).toHaveCount(1);
+  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
+  await expect(page.locator(".provider-row")).toHaveCount(2);
   await expect(page.getByText("Google Antigravity", { exact: true })).toHaveCount(0);
 
   holdRunRefresh = true;
@@ -1779,8 +1782,8 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   holdAuthRefresh = true;
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await authRefreshStarted;
-  await expect(providerBadges).toHaveText(["connected"]);
-  await expect(providerBadges).not.toContainText("Checking");
+  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
+  await expect(providerBadges.filter({ hasText: "Checking" })).toHaveCount(0);
   releaseAuthRefresh();
   await authRefreshCompleted;
 });
@@ -1816,6 +1819,7 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
+          { provider: "indeed", state: "connected", identity: { email: "indeed@example.com" } },
         ],
       }),
     });
@@ -1836,12 +1840,19 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
     await page.goto("/providers");
     await expectFolderNavigation(page, width, "Providers");
     await expectNoDocumentOverflow(page);
-    const providerRow = page.locator(".provider-row").first();
-    expect(await providerRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(1);
-    const providerRowBox = await providerRow.boundingBox();
-    const providerWorkspaceBox = await page.locator(".workspace").boundingBox();
-    if (!providerRowBox || !providerWorkspaceBox) throw new Error("Provider layout geometry is unavailable");
-    expect(providerRowBox.x + providerRowBox.width).toBeLessThanOrEqual(providerWorkspaceBox.x + providerWorkspaceBox.width);
+    const providerRows = page.locator(".provider-row");
+    await expect(providerRows).toHaveCount(2);
+    await expect(providerRows).toContainText(["OpenAI Codex", "Indeed Jobs"]);
+    await expect(providerRows.locator(".status-badge")).toHaveText(["disconnected", "connected"]);
+    await expect(providerRows.nth(0).getByRole("button", { name: "Connect OpenAI Codex" })).toBeEnabled();
+    await expect(providerRows.nth(1).getByRole("button", { name: "Logout Indeed Jobs" })).toBeEnabled();
+    for (const providerRow of await providerRows.all()) {
+      expect(await providerRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(1);
+      const providerRowBox = await providerRow.boundingBox();
+      const providerWorkspaceBox = await page.locator(".workspace").boundingBox();
+      if (!providerRowBox || !providerWorkspaceBox) throw new Error("Provider layout geometry is unavailable");
+      expect(providerRowBox.x + providerRowBox.width).toBeLessThanOrEqual(providerWorkspaceBox.x + providerWorkspaceBox.width);
+    }
 
     await page.goto("/runs/lifecycle-detail");
     await expectFullViewportRunDetail(page, width);

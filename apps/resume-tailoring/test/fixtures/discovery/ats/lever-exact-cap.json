@@ -1,0 +1,15 @@
+[
+  {
+    "id": "lever-201",
+    "text": "Backend Engineer",
+    "categories": { "location": "New York, NY" },
+    "createdAt": 1768478400000,
+    "description": "<p>Design and operate reliable services used by customers and internal product teams every day.</p>",
+    "lists": [
+      { "text": "What you will do", "content": "<li>Ship production TypeScript services.</li><li>Improve system observability.</li>" }
+    ],
+    "additional": "<p>Acme is an equal opportunity employer.</p>",
+    "hostedUrl": "https://jobs.lever.co/acme/lever-201?utm_source=test",
+    "applyUrl": "https://jobs.lever.co/acme/lever-201/apply"
+  }
+]

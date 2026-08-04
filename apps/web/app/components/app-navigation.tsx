@@ -3,9 +3,13 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { KeyRound } from "lucide-react";
+import { Compass, KeyRound } from "lucide-react";
 
-function NavIcon({ name }: { readonly name: "applications" | "providers" }): ReactNode {
+function NavIcon({ name }: { readonly name: "applications" | "discovery" | "providers" }): ReactNode {
+  if (name === "discovery") {
+    return <Compass aria-hidden="true" strokeWidth={1.7} />;
+  }
+
   if (name === "providers") {
     return <KeyRound aria-hidden="true" strokeWidth={1.7} />;
   }
@@ -26,10 +30,10 @@ function NavIcon({ name }: { readonly name: "applications" | "providers" }): Rea
   );
 }
 
-export function AppNavigation(): ReactNode {
-  const pathname = usePathname();
+export function AppNavigationView({ pathname }: { readonly pathname: string }): ReactNode {
   if (pathname.startsWith("/runs/")) return null;
   const applicationsCurrent = pathname === "/";
+  const discoveryCurrent = pathname === "/discovery" || pathname.startsWith("/discovery/");
   const providersCurrent = pathname === "/providers" || pathname.startsWith("/providers/");
 
   return (
@@ -43,6 +47,12 @@ export function AppNavigation(): ReactNode {
             </Link>
           </li>
           <li>
+            <Link href="/discovery" aria-current={discoveryCurrent ? "page" : undefined}>
+              <NavIcon name="discovery" />
+              <span>Discovery</span>
+            </Link>
+          </li>
+          <li>
             <Link href="/providers" aria-current={providersCurrent ? "page" : undefined}>
               <NavIcon name="providers" />
               <span>Providers</span>
@@ -52,4 +62,8 @@ export function AppNavigation(): ReactNode {
       </nav>
     </header>
   );
+}
+
+export function AppNavigation(): ReactNode {
+  return <AppNavigationView pathname={usePathname()} />;
 }

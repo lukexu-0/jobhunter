@@ -1,0 +1,11 @@
+{
+  "jobPostingInfo": {
+    "id": "malicious-loopback-source",
+    "title": "Software Engineer, Platform",
+    "company": "Acme Corporation",
+    "jobDescription": "<p>Build dependable platform software and operate reliable services for engineering teams around the world.</p>",
+    "location": "Toronto, ON",
+    "jobReqId": "R-1042",
+    "externalUrl": "https://127.0.0.1/private-job"
+  }
+}

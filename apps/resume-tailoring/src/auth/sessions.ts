@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { OAuthController } from "@oh-my-pi/pi-ai/oauth";
-import { assertProviderOAuthConnected, type AuthProvider, type AuthStorageLike } from "./storage";
+import type { AuthProvider } from "../contracts";
+import { assertProviderOAuthConnected, type AuthStorageLike } from "./storage";
 
 const SESSION_TTL_MS = 10 * 60_000;
 const TERMINAL_RETENTION_MS = 60_000;
@@ -55,10 +56,19 @@ interface InternalSession extends PublicAuthSession {
   startDeferred: Deferred<PublicAuthSession>;
 }
 
+export type AuthProviderLogin = (
+  provider: AuthProvider,
+  controller: OAuthController & {
+    onAuth(info: { url: string; launchUrl?: string; instructions?: string }): void;
+    onPrompt(prompt: { message: string; placeholder?: string; allowEmpty?: boolean }): Promise<string>;
+  },
+) => Promise<void>;
+
 export interface AuthSessionDependencies {
   now?: () => number;
   randomId?: () => string;
   schedule?: (callback: () => void, delayMs: number) => unknown;
+  providerLogin?: AuthProviderLogin;
 }
 
 
@@ -93,14 +103,18 @@ function terminalError(state: TerminalState): Error {
 export class AuthSessionManager {
   readonly #sessions = new Map<string, InternalSession>();
   readonly #activeByProvider = new Map<AuthProvider, string>();
+  readonly #loginByProvider = new Map<AuthProvider, Promise<void>>();
   readonly #now: () => number;
   readonly #randomId: () => string;
   readonly #schedule: (callback: () => void, delayMs: number) => unknown;
+  readonly #providerLogin: AuthProviderLogin;
 
   constructor(private readonly storage: AuthStorageLike, dependencies: AuthSessionDependencies = {}) {
     this.#now = dependencies.now ?? Date.now;
     this.#randomId = dependencies.randomId ?? (() => randomBytes(16).toString("base64url"));
     this.#schedule = dependencies.schedule ?? ((callback, delay) => setTimeout(callback, delay).unref());
+    this.#providerLogin = dependencies.providerLogin
+      ?? ((provider, controller) => storage.login(provider, controller));
   }
 
   start(provider: AuthProvider): Promise<PublicAuthSession> {
@@ -125,7 +139,9 @@ export class AuthSessionManager {
     this.#sessions.set(id, session);
     this.#activeByProvider.set(provider, id);
     this.#schedule(() => this.sweep(), SESSION_TTL_MS);
-    void this.#runLogin(session);
+    const login = this.#runLogin(session);
+    this.#loginByProvider.set(provider, login);
+    void login.catch(() => undefined);
     return session.startDeferred.promise;
   }
 
@@ -165,17 +181,36 @@ export class AuthSessionManager {
     return publicSession(session);
   }
 
-  shutdown(): void {
+  async cancelProvider(provider: AuthProvider): Promise<void> {
+    this.sweep();
+    const sessionId = this.#activeByProvider.get(provider);
+    if (!sessionId) return;
+    const session = this.#sessions.get(sessionId);
+    if (session && session.terminalAt === undefined) this.#finish(session, "cancelled");
+    await this.#loginByProvider.get(provider);
+  }
+
+  async shutdown(): Promise<void> {
     for (const session of this.#sessions.values()) {
       if (session.terminalAt === undefined) this.#finish(session, "cancelled");
     }
+    const results = await Promise.allSettled([...this.#loginByProvider.values()]);
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "OAuth provider shutdown failed");
   }
 
   sweep(): void {
     const now = this.#now();
     for (const session of this.#sessions.values()) {
       if (session.terminalAt === undefined && now >= session.expiresAt) this.#finish(session, "expired");
-      if (session.terminalAt !== undefined && now - session.terminalAt >= TERMINAL_RETENTION_MS) {
+      if (
+        session.terminalAt !== undefined
+        && this.#activeByProvider.get(session.provider) !== session.id
+        && now - session.terminalAt >= TERMINAL_RETENTION_MS
+      ) {
         this.#sessions.delete(session.id);
       }
     }
@@ -213,12 +248,17 @@ export class AuthSessionManager {
         }),
       } satisfies OAuthController;
 
-      await this.storage.login(session.provider, controller);
+      await this.#providerLogin(session.provider, controller);
       assertProviderOAuthConnected(this.storage, session.provider);
       if (session.terminalAt === undefined) this.#finish(session, "succeeded");
     } catch {
-      if (session.terminalAt !== undefined) return;
-      this.#finish(session, "failed", "OAuth sign-in failed");
+      if (session.terminalAt === undefined) this.#finish(session, "failed", "OAuth sign-in failed");
+    } finally {
+      if (session.state !== "succeeded") await this.storage.logout(session.provider);
+      if (this.#activeByProvider.get(session.provider) === session.id) {
+        this.#activeByProvider.delete(session.provider);
+      }
+      this.#loginByProvider.delete(session.provider);
     }
   }
 
@@ -237,11 +277,14 @@ export class AuthSessionManager {
     session.terminalAt = this.#now();
     if (error) session.error = boundedPublicText(error, MAX_PROGRESS_LENGTH);
     else delete session.error;
+    if (session.provider === "indeed") {
+      delete session.url;
+      delete session.launchUrl;
+    }
     delete session.pendingPrompt;
     session.controller.abort(terminalError(state));
     session.promptDeferred?.reject(terminalError(state));
     delete session.promptDeferred;
-    if (this.#activeByProvider.get(session.provider) === session.id) this.#activeByProvider.delete(session.provider);
     session.startDeferred.resolve(publicSession(session));
     this.#schedule(() => this.sweep(), TERMINAL_RETENTION_MS);
   }

@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 16;
+export const PIPELINE_SCHEMA_VERSION = 18;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -583,6 +583,150 @@ CREATE INDEX run_application_sessions_unreleased_slot
   WHERE slot_released = 0;
 `;
 
+const migration17 = `
+CREATE TABLE discovery_jobs (
+  id TEXT PRIMARY KEY,
+  catalog_source_id TEXT NOT NULL CHECK (length(catalog_source_id) BETWEEN 1 AND 200),
+  catalog_source_item_id TEXT NOT NULL CHECK (length(catalog_source_item_id) BETWEEN 1 AND 500),
+  title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 500),
+  company TEXT NOT NULL CHECK (length(company) BETWEEN 1 AND 500),
+  location TEXT CHECK (location IS NULL OR length(location) BETWEEN 1 AND 500),
+  role TEXT NOT NULL CHECK (
+    role IN (
+      'software_engineering',
+      'machine_learning',
+      'data',
+      'security',
+      'product',
+      'hardware',
+      'other'
+    )
+  ),
+  canonical_url TEXT NOT NULL CHECK (length(canonical_url) BETWEEN 1 AND 2048),
+  apply_url TEXT NOT NULL CHECK (length(apply_url) BETWEEN 1 AND 2048),
+  description TEXT NOT NULL CHECK (length(description) BETWEEN 40 AND 50000),
+  posted_at INTEGER,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  closed INTEGER NOT NULL DEFAULT 0 CHECK (closed IN (0,1)),
+  CHECK (posted_at IS NULL OR posted_at >= 0),
+  CHECK (first_seen_at >= 0 AND last_seen_at >= first_seen_at)
+) STRICT;
+
+CREATE TABLE discovery_sources (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),
+  kind TEXT NOT NULL CHECK (
+    kind IN (
+      'simplify',
+      'zapply',
+      'speedyapply',
+      'linkedin',
+      'greenhouse',
+      'lever',
+      'ashby',
+      'smartrecruiters',
+      'workable',
+      'recruitee',
+      'personio',
+      'workday',
+      'job_board'
+    )
+  ),
+  last_sync_at INTEGER,
+  last_success_at INTEGER,
+  last_sync_status TEXT CHECK (
+    last_sync_status IS NULL OR last_sync_status IN ('succeeded','failed')
+  ),
+  last_error TEXT,
+  provenance TEXT
+) STRICT;
+
+CREATE TABLE discovery_observations (
+  source_id TEXT NOT NULL REFERENCES discovery_sources(id) ON DELETE RESTRICT,
+  source_item_id TEXT NOT NULL CHECK (length(source_item_id) BETWEEN 1 AND 500),
+  job_id TEXT NOT NULL REFERENCES discovery_jobs(id) ON DELETE RESTRICT,
+  source_url TEXT NOT NULL CHECK (length(source_url) BETWEEN 1 AND 2048),
+  canonical_url TEXT NOT NULL CHECK (length(canonical_url) BETWEEN 1 AND 2048),
+  apply_url TEXT NOT NULL CHECK (length(apply_url) BETWEEN 1 AND 2048),
+  requisition_id TEXT,
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  PRIMARY KEY (source_id, source_item_id),
+  CHECK (first_seen_at >= 0 AND last_seen_at >= first_seen_at)
+) STRICT;
+
+CREATE TABLE discovery_dedupe_keys (
+  source_id TEXT NOT NULL,
+  source_item_id TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL CHECK (length(dedupe_key) BETWEEN 1 AND 4096),
+  job_id TEXT NOT NULL REFERENCES discovery_jobs(id) ON DELETE RESTRICT,
+  PRIMARY KEY (source_id, source_item_id, dedupe_key),
+  FOREIGN KEY (source_id, source_item_id)
+    REFERENCES discovery_observations(source_id, source_item_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE discovery_run_links (
+  job_id TEXT PRIMARY KEY REFERENCES discovery_jobs(id) ON DELETE RESTRICT,
+  run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+  created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX discovery_jobs_recency
+  ON discovery_jobs(closed, coalesce(posted_at, first_seen_at) DESC, id);
+CREATE INDEX discovery_jobs_role_recency
+  ON discovery_jobs(role, closed, coalesce(posted_at, first_seen_at) DESC, id);
+CREATE INDEX discovery_observations_job
+  ON discovery_observations(job_id, active, source_id);
+CREATE INDEX discovery_dedupe_keys_key
+  ON discovery_dedupe_keys(dedupe_key, job_id);
+CREATE INDEX discovery_dedupe_keys_job
+  ON discovery_dedupe_keys(job_id);
+`;
+
+const migration18 = `
+CREATE TABLE discovery_sources_v18 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),
+  kind TEXT NOT NULL CHECK (
+    kind IN (
+      'simplify',
+      'zapply',
+      'speedyapply',
+      'linkedin',
+      'indeed',
+      'greenhouse',
+      'lever',
+      'ashby',
+      'smartrecruiters',
+      'workable',
+      'recruitee',
+      'personio',
+      'workday',
+      'job_board'
+    )
+  ),
+  last_sync_at INTEGER,
+  last_success_at INTEGER,
+  last_sync_status TEXT CHECK (
+    last_sync_status IS NULL OR last_sync_status IN ('succeeded','failed')
+  ),
+  last_error TEXT,
+  provenance TEXT
+) STRICT;
+
+INSERT INTO discovery_sources_v18(
+  id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+)
+SELECT
+  id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+FROM discovery_sources;
+
+DROP TABLE discovery_sources;
+ALTER TABLE discovery_sources_v18 RENAME TO discovery_sources;
+`;
+
 
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
@@ -651,6 +795,14 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 16) {
         db.exec(migration16);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(16, now);
+      }
+      if (version < 17) {
+        db.exec(migration17);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(17, now);
+      }
+      if (version < 18) {
+        db.exec(migration18);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(18, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

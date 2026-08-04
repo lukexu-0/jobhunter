@@ -5,6 +5,7 @@ import {
   type ArtifactDto,
   type RunDto,
   type ResumeIterationListResponse,
+  type DiscoveryJob,
   type RunStatus,
 } from "@jobhunter/pipeline/contracts";
 import {
@@ -15,6 +16,7 @@ import {
   closeApplicationSession,
   createRun,
   deleteRun,
+  listDiscoveryJobs,
   editRun,
   getApplicationAnswerSuggestions,
   getApplicationSession,
@@ -23,11 +25,13 @@ import {
   listResumeIterations,
   readJsonArtifact,
   professionalizeApplicationAnswer,
+  queueDiscoveryJobs,
   regenerateRun,
   retryApplicationSession,
   retryRun,
   sendApplicationCommand,
   startApplicationSession,
+  syncDiscoveryJobs,
   updateApplicationStatus,
   updateRunIdentity,
 } from "../app/lib/pipeline-client";
@@ -65,6 +69,25 @@ function run(status: RunStatus = "queued"): RunDto {
     attempts: [],
     artifacts: [],
     timeline: [],
+  };
+}
+
+function discoveredJob(overrides: Partial<DiscoveryJob> = {}): DiscoveryJob {
+  return {
+    id: "job-1",
+    title: "Machine Learning Intern",
+    company: "Example Labs",
+    location: null,
+    role: "machine_learning",
+    canonicalUrl: "https://example.com/jobs/ml-intern",
+    applyUrl: "https://example.com/jobs/ml-intern/apply",
+    descriptionPreview: "Build and evaluate production machine learning systems.",
+    postedAt: null,
+    firstSeenAt: 1_775_174_400_000,
+    lastSeenAt: 1_775_174_460_000,
+    status: "open",
+    sourceNames: ["Simplify"],
+    ...overrides,
   };
 }
 
@@ -848,5 +871,115 @@ describe("pipeline artifacts", () => {
 
     setFetchMock(async () => new Response("{}", { headers: { "content-type": "application/json", "content-length": "1048577" } }));
     await expect(readJsonArtifact(artifact())).rejects.toThrow("The artifact is too large to read.");
+  });
+});
+
+describe("pipeline discovery requests", () => {
+  test("builds the complete filtered list query and validates its response", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const response = {
+      jobs: [discoveredJob()],
+      total: 1,
+      lastSyncAt: 1_775_174_460_000,
+    };
+    capture(json(response), requests);
+
+    await expect(listDiscoveryJobs({
+      role: "machine_learning",
+      maxAgeDays: 14,
+      status: "queued",
+      search: "model evaluation",
+      limit: 1_000,
+      offset: 0,
+    })).resolves.toEqual(response);
+    expect(requests).toEqual([{
+      input: "/api/pipeline/discovery?role=machine_learning&maxAgeDays=14&status=queued&search=model+evaluation&limit=1000&offset=0",
+      init: { cache: "no-store", method: "GET" },
+    }]);
+  });
+
+  test("encodes the unbounded recent filter and rejects malformed list responses", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(json({
+      jobs: [{ ...discoveredJob(), description: "Unexpected full description" }],
+      total: 1,
+      lastSyncAt: null,
+    }), requests);
+
+    await expect(listDiscoveryJobs({
+      maxAgeDays: null,
+      status: "all",
+      search: "",
+      limit: 1_000,
+      offset: 0,
+    })).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+    expect(requests[0]?.input).toBe(
+      "/api/pipeline/discovery?maxAgeDays=all&status=all&search=&limit=1000&offset=0",
+    );
+  });
+
+  test("queues selected jobs once with the exact run modes and validates the result", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const response = {
+      queued: [{ jobId: "job-2", run: run() }],
+      skipped: [{ jobId: "job-1", reason: "already_queued" as const }],
+    };
+    capture(json(response), requests);
+
+    await expect(queueDiscoveryJobs({
+      jobIds: ["job-2", "job-1"],
+      generateKeywordMap: false,
+      skipReview: true,
+      autoSubmit: true,
+    })).resolves.toEqual(response);
+    expect(requests).toEqual([{
+      input: "/api/pipeline/discovery/queue",
+      init: {
+        body: JSON.stringify({
+          jobIds: ["job-2", "job-1"],
+          generateKeywordMap: false,
+          skipReview: true,
+          autoSubmit: true,
+        }),
+        cache: "no-store",
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      },
+    }]);
+  });
+
+  test("rejects invalid discovery requests before fetching", () => {
+    let fetchCalls = 0;
+    setFetchMock(async () => {
+      fetchCalls += 1;
+      return json({});
+    });
+
+    expect(() => listDiscoveryJobs({ maxAgeDays: 0 } as never)).toThrow(PipelineClientError);
+    expect(() => syncDiscoveryJobs({ unexpected: true } as never)).toThrow(PipelineClientError);
+    expect(() => queueDiscoveryJobs({ jobIds: ["same", "same"] })).toThrow(PipelineClientError);
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("validates sync and queue responses instead of exposing upstream data", async () => {
+    const syncResponse = {
+      sources: [],
+      totals: { sources: 0, succeeded: 0, failed: 0, received: 0, created: 0, updated: 0, closed: 0 },
+      completedAt: 10,
+    };
+    setFetchMock(async (input) => input.toString().endsWith("/sync")
+      ? json(syncResponse)
+      : json({
+          queued: [],
+          skipped: [{ jobId: "job-1", reason: "closed", upstreamBody: "private" }],
+        }));
+
+    await expect(syncDiscoveryJobs()).resolves.toMatchObject({ completedAt: 10 });
+    await expect(queueDiscoveryJobs({ jobIds: ["job-1"] })).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+
+    setFetchMock(async () => json({ ...syncResponse, upstreamBody: "private" }));
+    await expect(syncDiscoveryJobs()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
   });
 });

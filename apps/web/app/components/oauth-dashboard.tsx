@@ -5,9 +5,9 @@ import {
   ApiErrorSchema,
   AuthSessionSchema,
   AuthStatusResponseSchema,
+  type AuthProvider,
   type AuthSession,
   type AuthStatusResponse,
-  type OAuthProvider,
 } from "@jobhunter/pipeline/contracts";
 import { useDashboardData } from "../providers/dashboard-data-provider";
 
@@ -20,22 +20,81 @@ const PROVIDERS = [
     provider: "openai-codex",
     name: "OpenAI Codex",
   },
+  {
+    provider: "indeed",
+    name: "Indeed Jobs",
+  },
 ] as const satisfies ReadonlyArray<{
-  provider: OAuthProvider;
+  provider: AuthProvider;
   name: string;
 }>;
 
 type BrowserAuthSession = AuthSession & { url?: string };
 type Notice = { tone: "error" | "info" | "success"; text: string };
 type BusyAction = "connect" | "logout" | "cancel" | "prompt";
-type ProviderMap<T> = Partial<Record<OAuthProvider, T>>;
+type ProviderMap<T> = Partial<Record<AuthProvider, T>>;
+
+function closeAuthWindow(authWindow: Window | null): void {
+  if (!authWindow || authWindow.closed) return;
+
+  try {
+    authWindow.close();
+  } catch {
+    // The browser owns the reserved tab once it stops being same-origin.
+  }
+}
+
+function reserveAuthWindow(): Window | null {
+  let authWindow: Window | null = null;
+
+  try {
+    authWindow = window.open("", "_blank");
+    if (!authWindow) return null;
+
+    authWindow.opener = null;
+    const referrerPolicy = authWindow.document.createElement("meta");
+    referrerPolicy.name = "referrer";
+    referrerPolicy.content = "no-referrer";
+    authWindow.document.head.append(referrerPolicy);
+    return authWindow;
+  } catch {
+    closeAuthWindow(authWindow);
+    return null;
+  }
+}
+
+function navigateAuthWindow(authWindow: Window, target: string): boolean {
+  if (authWindow.closed) return false;
+
+  try {
+    const link = authWindow.document.createElement("a");
+    link.href = target;
+    link.target = "_self";
+    link.rel = "noreferrer";
+    link.referrerPolicy = "no-referrer";
+    (authWindow.document.body ?? authWindow.document.documentElement).append(link);
+    link.click();
+    return true;
+  } catch {
+    closeAuthWindow(authWindow);
+    return false;
+  }
+}
 
 function redactPublicText(value: string): string {
   return value
+    .replace(
+      /"((?:(?:access|refresh|id)[_-]?token|api[_-]?key|authorization(?:[_\s-]?code)?|callback(?:[_\s-]?(?:code|token))?|code|state))"\s*:\s*"(?:\\.|[^"\\])*"/gi,
+      '"$1":"[redacted]"',
+    )
     .replace(/\b(?:access|refresh|id)[_-]?token\b\s*[:=]\s*[^\s,;]+/gi, "credential=[redacted]")
     .replace(/\b(?:api[_-]?key|authorization)\b\s*[:=]\s*[^\s,;]+/gi, "credential=[redacted]")
+    .replace(
+      /\b(?:authorization[_\s-]?code|callback(?:[_\s-]?(?:code|token))?|code|state)\b\s*[:=]\s*[^\s,;]+/gi,
+      "credential=[redacted]",
+    )
     .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
-    .replace(/([?&](?:access_token|refresh_token|id_token|code)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/([?&](?:access_token|refresh_token|id_token|code|state)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, MAX_PUBLIC_TEXT_LENGTH);
 }
 
@@ -135,7 +194,7 @@ export function OAuthDashboard() {
     setSessions((current) => ({ ...current, [session.provider]: session }));
   }, []);
 
-  const setNotice = useCallback((provider: OAuthProvider, notice: Notice | undefined) => {
+  const setNotice = useCallback((provider: AuthProvider, notice: Notice | undefined) => {
     setNotices((current) => {
       const next = { ...current };
       if (notice) next[provider] = notice;
@@ -144,7 +203,7 @@ export function OAuthDashboard() {
     });
   }, []);
 
-  const setBusyAction = useCallback((provider: OAuthProvider, action: BusyAction | undefined) => {
+  const setBusyAction = useCallback((provider: AuthProvider, action: BusyAction | undefined) => {
     setBusy((current) => {
       const next = { ...current };
       if (action) next[provider] = action;
@@ -201,7 +260,8 @@ export function OAuthDashboard() {
   }, [refreshAuthStatus, sessions, setNotice, updateSession]);
 
   const startSession = useCallback(
-    async (provider: OAuthProvider) => {
+    async (provider: AuthProvider) => {
+      const authWindow = reserveAuthWindow();
       setBusyAction(provider, "connect");
       setNotice(provider, undefined);
 
@@ -217,20 +277,25 @@ export function OAuthDashboard() {
 
         updateSession(session);
         const target = launchTarget(session);
-        if (target) {
-          const authWindow = window.open(target, "_blank", "noopener,noreferrer");
+        if (target && authWindow && navigateAuthWindow(authWindow, target)) {
           setNotice(provider, {
-            tone: authWindow ? "info" : "error",
-            text: authWindow
-              ? "Sign-in opened in a new tab. Return here when authorization is complete."
-              : "Your browser blocked the sign-in window. Use the Open sign-in link below.",
+            tone: "info",
+            text: "Sign-in opened in a new tab. Return here when authorization is complete.",
+          });
+        } else if (target) {
+          closeAuthWindow(authWindow);
+          setNotice(provider, {
+            tone: "error",
+            text: "Your browser blocked the sign-in window. Use the Open sign-in link below.",
           });
         } else {
+          closeAuthWindow(authWindow);
           setNotice(provider, { tone: "info", text: "Connection session started. Follow the instructions below." });
         }
 
         if (session.state === "succeeded") await refreshAuthStatus();
       } catch (error) {
+        closeAuthWindow(authWindow);
         setNotice(provider, {
           tone: "error",
           text: error instanceof Error ? redactPublicText(error.message) : "The connection could not be started.",
@@ -254,7 +319,6 @@ export function OAuthDashboard() {
         if (!cancelled) throw new Error("The service returned an invalid authorization session.");
 
         updateSession(cancelled);
-        setNotice(session.provider, { tone: "info", text: "Authorization was cancelled." });
       } catch (error) {
         setNotice(session.provider, {
           tone: "error",
@@ -301,7 +365,7 @@ export function OAuthDashboard() {
   );
 
   const logout = useCallback(
-    async (provider: OAuthProvider) => {
+    async (provider: AuthProvider) => {
       setBusyAction(provider, "logout");
       setNotice(provider, undefined);
 
@@ -380,6 +444,7 @@ export function OAuthDashboard() {
                     <button
                       className="control control--quiet"
                       type="button"
+                      aria-label={`${action === "logout" ? "Disconnecting" : "Logout"} ${provider.name}`}
                       onClick={() => void logout(provider.provider)}
                       disabled={Boolean(action) || isPending}
                     >
@@ -389,6 +454,7 @@ export function OAuthDashboard() {
                     <button
                       className="control control--primary"
                       type="button"
+                      aria-label={`${action === "connect" ? "Connecting" : "Connect"} ${provider.name}`}
                       onClick={() => void startSession(provider.provider)}
                       disabled={isLoadingStatus || Boolean(action) || isPending || Boolean(statusError)}
                     >
@@ -400,6 +466,7 @@ export function OAuthDashboard() {
                 {session ? (
                   <SessionDetail
                     session={session}
+                    providerName={provider.name}
                     busyAction={action}
                     promptValue={promptValues[provider.provider] ?? ""}
                     onPromptValueChange={(value) =>
@@ -430,6 +497,7 @@ export function OAuthDashboard() {
 
 function SessionDetail({
   session,
+  providerName,
   busyAction,
   promptValue,
   onPromptValueChange,
@@ -437,6 +505,7 @@ function SessionDetail({
   onCancel,
 }: {
   session: BrowserAuthSession;
+  providerName: string;
   busyAction: BusyAction | undefined;
   promptValue: string;
   onPromptValueChange: (value: string) => void;
@@ -454,7 +523,13 @@ function SessionDetail({
         <p className="kicker">Authorization session</p>
         {session.instructions ? <p className="oauth-session__instructions">{redactPublicText(session.instructions)}</p> : null}
         {target ? (
-          <a className="control control--link" href={target} target="_blank" rel="noreferrer">
+          <a
+            aria-label={`Open ${providerName} sign-in`}
+            className="control control--link"
+            href={target}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
             Open sign-in <span aria-hidden="true">↗</span>
           </a>
         ) : null}
@@ -495,7 +570,12 @@ function SessionDetail({
               disabled={Boolean(busyAction)}
               required
             />
-            <button className="control control--primary" type="submit" disabled={Boolean(busyAction) || !promptValue.trim()}>
+            <button
+              aria-label={`${busyAction === "prompt" ? "Sending" : "Submit"} ${providerName} authorization response`}
+              className="control control--primary"
+              type="submit"
+              disabled={Boolean(busyAction) || !promptValue.trim()}
+            >
               {busyAction === "prompt" ? "Sending…" : "Submit"}
             </button>
           </div>
@@ -509,7 +589,13 @@ function SessionDetail({
           </p>
         ) : null}
         {isPending ? (
-          <button className="control control--quiet" type="button" onClick={onCancel} disabled={Boolean(busyAction)}>
+          <button
+            aria-label={`${busyAction === "cancel" ? "Cancelling" : "Cancel"} ${providerName} authorization`}
+            className="control control--quiet"
+            type="button"
+            onClick={onCancel}
+            disabled={Boolean(busyAction)}
+          >
             {busyAction === "cancel" ? "Cancelling…" : "Cancel"}
           </button>
         ) : null}

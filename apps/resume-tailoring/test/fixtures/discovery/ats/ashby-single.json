@@ -1,0 +1,13 @@
+{
+  "jobs": [
+    {
+      "id": "ashby-301",
+      "title": "Machine Learning Engineer",
+      "location": "San Francisco, CA",
+      "publishedAt": "2026-01-16T09:30:00Z",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/ashby-301",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/ashby-301/application",
+      "descriptionHtml": "<p>Build production machine learning systems, evaluation tools, and dependable data pipelines with the platform team.</p>"
+    }
+  ]
+}

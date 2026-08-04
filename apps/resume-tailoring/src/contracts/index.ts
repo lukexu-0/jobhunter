@@ -68,8 +68,11 @@ export const ApiErrorSchema = z.object({
 });
 export type ApiError = z.infer<typeof ApiErrorSchema>;
 
-export const OAuthProviderSchema = z.literal("openai-codex");
-export type OAuthProvider = z.infer<typeof OAuthProviderSchema>;
+export const AuthProviderSchema = z.enum(["openai-codex", "indeed"]);
+export type AuthProvider = z.infer<typeof AuthProviderSchema>;
+
+export const ModelAuthProviderSchema = z.literal("openai-codex");
+export type ModelAuthProvider = z.infer<typeof ModelAuthProviderSchema>;
 
 export const AuthIdentitySchema = z
   .object({
@@ -81,7 +84,7 @@ export type AuthIdentity = z.infer<typeof AuthIdentitySchema>;
 
 export const AuthProviderStatusSchema = z
   .object({
-    provider: OAuthProviderSchema,
+    provider: AuthProviderSchema,
     state: z.enum(["connected", "disconnected"]),
     identity: AuthIdentitySchema.optional(),
   })
@@ -90,7 +93,10 @@ export type AuthProviderStatus = z.infer<typeof AuthProviderStatusSchema>;
 
 export const AuthStatusResponseSchema = z
   .object({
-    providers: z.array(AuthProviderStatusSchema).length(1),
+    providers: z.tuple([
+      AuthProviderStatusSchema.extend({ provider: z.literal("openai-codex") }),
+      AuthProviderStatusSchema.extend({ provider: z.literal("indeed") }),
+    ]),
   })
   .strict();
 export type AuthStatusResponse = z.infer<typeof AuthStatusResponseSchema>;
@@ -107,7 +113,7 @@ export type AuthPrompt = z.infer<typeof AuthPromptSchema>;
 export const AuthSessionSchema = z
   .object({
     id: z.string().min(1),
-    provider: OAuthProviderSchema,
+    provider: AuthProviderSchema,
     state: z.enum(["pending", "succeeded", "failed", "cancelled", "expired"]),
     launchUrl: z.string().url().optional(),
     url: z.string().url().optional(),
@@ -1045,3 +1051,131 @@ export const ApproveRunRequestSchema = z
     acknowledgeVisualIssues: z.boolean().default(false),
   })
   .strict();
+
+
+export const DiscoveryRoleSchema = z.enum([
+  "software_engineering",
+  "machine_learning",
+  "data",
+  "security",
+  "product",
+  "hardware",
+  "other",
+]);
+export type DiscoveryRole = z.infer<typeof DiscoveryRoleSchema>;
+
+export const DiscoveryStatusSchema = z.enum(["open", "queued", "closed"]);
+export type DiscoveryStatus = z.infer<typeof DiscoveryStatusSchema>;
+export const DiscoveryListStatusSchema = z.enum(["open", "queued", "closed", "all"]);
+
+const DiscoveryHttpUrlSchema = z.string().max(JOB_URL_MAX_CHARS).url().refine((value) => {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:")
+      && url.username === ""
+      && url.password === "";
+  } catch {
+    return false;
+  }
+}, "Discovery URL must be an HTTP(S) URL without credentials");
+
+const DiscoveryIdSchema = z.string().trim().min(1).max(200);
+const DiscoveryDisplayTextSchema = z.string().trim().min(1).max(500);
+
+export const DiscoveryJobSchema = z.object({
+  id: DiscoveryIdSchema,
+  title: DiscoveryDisplayTextSchema,
+  company: DiscoveryDisplayTextSchema,
+  location: z.string().trim().min(1).max(500).nullable(),
+  role: DiscoveryRoleSchema,
+  canonicalUrl: DiscoveryHttpUrlSchema,
+  applyUrl: DiscoveryHttpUrlSchema,
+  descriptionPreview: z.string().max(500),
+  postedAt: z.number().int().nonnegative().nullable(),
+  firstSeenAt: z.number().int().nonnegative(),
+  lastSeenAt: z.number().int().nonnegative(),
+  status: DiscoveryStatusSchema,
+  sourceNames: z.array(DiscoveryDisplayTextSchema).min(1).max(100)
+    .refine((names) => new Set(names).size === names.length, "Source names must be unique"),
+  queuedRunId: DiscoveryIdSchema.optional(),
+}).strict();
+export type DiscoveryJob = z.infer<typeof DiscoveryJobSchema>;
+
+export const DISCOVERY_LIST_MAX_OFFSET = 1_000_000;
+
+export const DiscoveryListRequestSchema = z.object({
+  role: DiscoveryRoleSchema.optional(),
+  maxAgeDays: z.number().int().min(1).max(365).nullable().default(7),
+  status: DiscoveryListStatusSchema.default("open"),
+  search: z.string().trim().max(200).default(""),
+  limit: z.number().int().min(1).max(1_000).default(100),
+  offset: z.number().int().min(0).max(DISCOVERY_LIST_MAX_OFFSET).default(0),
+}).strict();
+export type DiscoveryListRequest = z.infer<typeof DiscoveryListRequestSchema>;
+
+export const DiscoveryListResponseSchema = z.object({
+  jobs: z.array(DiscoveryJobSchema).max(1_000),
+  total: z.number().int().nonnegative(),
+  lastSyncAt: z.number().int().nonnegative().nullable(),
+}).strict();
+export type DiscoveryListResponse = z.infer<typeof DiscoveryListResponseSchema>;
+
+export const DiscoverySyncRequestSchema = z.object({}).strict();
+
+export const DiscoverySourceSyncSummarySchema = z.object({
+  sourceId: DiscoveryIdSchema,
+  sourceName: DiscoveryDisplayTextSchema,
+  status: z.enum(["succeeded", "failed"]),
+  completeSnapshot: z.boolean(),
+  received: z.number().int().nonnegative().max(100_000),
+  created: z.number().int().nonnegative().max(100_000),
+  updated: z.number().int().nonnegative().max(100_000),
+  closed: z.number().int().nonnegative().max(100_000),
+  provenance: z.string().trim().min(1).max(1_000).optional(),
+  error: z.string().trim().min(1).max(500).optional(),
+}).strict();
+export type DiscoverySourceSyncSummary = z.infer<typeof DiscoverySourceSyncSummarySchema>;
+
+export const DiscoverySyncResponseSchema = z.object({
+  sources: z.array(DiscoverySourceSyncSummarySchema).max(100),
+  totals: z.object({
+    sources: z.number().int().nonnegative().max(100),
+    succeeded: z.number().int().nonnegative().max(100),
+    failed: z.number().int().nonnegative().max(100),
+    received: z.number().int().nonnegative().max(10_000_000),
+    created: z.number().int().nonnegative().max(10_000_000),
+    updated: z.number().int().nonnegative().max(10_000_000),
+    closed: z.number().int().nonnegative().max(10_000_000),
+  }).strict(),
+  completedAt: z.number().int().nonnegative(),
+}).strict();
+export type DiscoverySyncResponse = z.infer<typeof DiscoverySyncResponseSchema>;
+
+export const DiscoveryQueueRequestSchema = z.object({
+  jobIds: z.array(DiscoveryIdSchema).min(1).max(1_000)
+    .refine((ids) => new Set(ids).size === ids.length, "Job ids must be unique"),
+  generateKeywordMap: z.boolean().default(true),
+  skipReview: z.boolean().default(false),
+  autoSubmit: z.boolean().default(false),
+}).strict();
+export type DiscoveryQueueRequest = z.infer<typeof DiscoveryQueueRequestSchema>;
+
+export const DiscoveryQueueSkipReasonSchema = z.enum([
+  "already_queued",
+  "not_found",
+  "closed",
+  "queue_failed",
+]);
+export type DiscoveryQueueSkipReason = z.infer<typeof DiscoveryQueueSkipReasonSchema>;
+
+export const DiscoveryQueueResponseSchema = z.object({
+  queued: z.array(z.object({
+    jobId: DiscoveryIdSchema,
+    run: RunDtoSchema,
+  }).strict()).max(1_000),
+  skipped: z.array(z.object({
+    jobId: DiscoveryIdSchema,
+    reason: DiscoveryQueueSkipReasonSchema,
+  }).strict()).max(1_000),
+}).strict();
+export type DiscoveryQueueResponse = z.infer<typeof DiscoveryQueueResponseSchema>;

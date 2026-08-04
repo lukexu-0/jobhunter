@@ -34,6 +34,7 @@ function healthyDependencies(overrides: Partial<DoctorDependencies> = {}): Docto
     now: () => 1_234,
     authStatus: async () => ({ providers: [
       { provider: "openai-codex", state: "connected" },
+      { provider: "indeed", state: "connected" },
     ] }),
     contextStatus: () => ({ state: "fresh" }),
     modelDescriptors: () => ({

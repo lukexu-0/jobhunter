@@ -45,6 +45,7 @@ interface IngestionOverrides {
   readonly applicationAgent?: ApplicationAgentRouteService;
   readonly applicationSessions?: PipelineApplicationSessionService;
   readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
+  readonly webOrigin?: string;
   readonly beforeApplication?: (
     repository: PipelineRepository,
     database: Database,
@@ -63,6 +64,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     close: [] as string[],
     startAuth: 0,
     loadedUrls: [] as string[],
+    authCallbackOrigins: [] as string[],
     loadedSignals: [] as (AbortSignal | undefined)[],
     extractedLines: [] as (readonly string[])[],
     extractedSignals: [] as (AbortSignal | undefined)[],
@@ -74,7 +76,10 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
   };
   const auth: AuthRouteService & { close(): void } = {
     getAuthStatus: ingestion.getAuthStatus ?? (() => ({
-      providers: [{ provider: "openai-codex", state: "disconnected" }],
+      providers: [
+        { provider: "openai-codex", state: "disconnected" },
+        { provider: "indeed", state: "disconnected" },
+      ],
     })),
     startSession: async () => {
       calls.startAuth += 1;
@@ -84,6 +89,8 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     answerPrompt: () => { throw new Error("unexpected prompt"); },
     cancelSession: async () => undefined,
     logout: async () => undefined,
+    completeIndeedCallback: async () => undefined,
+    configureAuthCallbackOrigin: (origin) => { calls.authCallbackOrigins.push(origin); },
     close: () => { calls.close.push("auth"); },
   };
   const context = createContextApplicationService({ database: contextDatabase });
@@ -121,7 +128,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
       })
     : undefined;
   const app = createPipelineApplication({
-    webOrigin: WEB_ORIGIN,
+    webOrigin: ingestion.webOrigin ?? WEB_ORIGIN,
     pipelineDatabase,
     contextDatabase,
     repository,
@@ -193,6 +200,18 @@ describe("pipeline application bootstrap", () => {
     const syncResponse = await fixture.app.fetch(mutation("/v1/context/sync", {}));
     expect(syncResponse.status).toBe(200);
     expect((await syncResponse.json()).fresh).toBe(true);
+
+    expect(fixture.app.services.discoveryRepository).toBeDefined();
+    expect(fixture.app.services.discovery).toBeDefined();
+    const discoveryResponse = await fixture.app.fetch(new Request(
+      "http://127.0.0.1:3457/v1/discovery?maxAgeDays=all",
+    ));
+    expect(discoveryResponse.status).toBe(200);
+    expect(await discoveryResponse.json()).toEqual({
+      jobs: [],
+      total: 0,
+      lastSyncAt: null,
+    });
 
     const request = mutation("/v1/runs", {
       jobUrl: JOB_URL,
@@ -498,7 +517,10 @@ describe("pipeline application bootstrap", () => {
       getAuthStatus: () => {
         authStatusReads += 1;
         return {
-          providers: [{ provider: "openai-codex", state: "connected" }],
+          providers: [
+            { provider: "openai-codex", state: "connected" },
+            { provider: "indeed", state: "disconnected" },
+          ],
         };
       },
     });
@@ -541,12 +563,26 @@ describe("pipeline application bootstrap", () => {
         publicSnapshot: expect.objectContaining({
           bridgeState: "submission_uncertain",
           harnessState: "submission_uncertain",
+
           submissionPhase: "uncertain",
         }),
       });
     await fixture.app.close();
   });
 
+  test("wires the exact validated web origin into the Indeed callback configuration", async () => {
+    const fixture = createFixture();
+    expect(fixture.calls.authCallbackOrigins).toEqual([WEB_ORIGIN]);
+    await fixture.app.close();
+
+    const secureFixture = createFixture(false, { webOrigin: "https://jobhunter.example.test" });
+    expect(secureFixture.calls.authCallbackOrigins).toEqual(["https://jobhunter.example.test"]);
+    await secureFixture.app.close();
+
+    expect(() => createPipelineApplication({
+      webOrigin: "http://jobs.example.test:3456",
+    })).toThrow("JOBHUNTER_WEB_ORIGIN must be an exact HTTPS or loopback HTTP origin");
+  });
   test("rejects a short harness token before constructing dependencies", () => {
     expect(() => createPipelineApplication({
       browserHarnessToken: "too-short",
@@ -572,7 +608,10 @@ describe("pipeline application bootstrap", () => {
     const context = createContextApplicationService({ database: contextDatabase });
     const auth: AuthRouteService & { close(): void } = {
       getAuthStatus: () => ({
-        providers: [{ provider: "openai-codex", state: "disconnected" }],
+        providers: [
+          { provider: "openai-codex", state: "disconnected" },
+          { provider: "indeed", state: "disconnected" },
+        ],
       }),
       startSession: async () => { throw new Error("unexpected authentication"); },
       getSession: () => undefined,
@@ -585,6 +624,7 @@ describe("pipeline application bootstrap", () => {
         expiresAt: 0,
       }),
       logout: async () => undefined,
+      completeIndeedCallback: async () => undefined,
       close: () => undefined,
     };
     const app = createPipelineApplication({

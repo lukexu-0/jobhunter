@@ -55,6 +55,7 @@ interface FixtureOptions {
   readonly createSnapshot?: (defaultSnapshot: () => ContextSnapshot) => ContextSnapshot | Promise<ContextSnapshot>;
   readonly syncContext?: (defaultSync: () => void) => void | Promise<void>;
   readonly idFactory?: () => string;
+  readonly validatePublicJobUrl?: (url: string, signal?: AbortSignal) => Promise<void>;
 }
 
 interface Fixture {
@@ -119,6 +120,7 @@ function fixture(options: FixtureOptions = {}): Fixture {
     loadJobSource: options.loadJobSource
       ?? (async () => ({ kind: "description", jobDescription: JOB_DESCRIPTION })),
     ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
+    validatePublicJobUrl: options.validatePublicJobUrl ?? (async () => undefined),
   });
   return { root, loaded, contextDatabase, pipelineDatabase, repository, artifacts, service, kicks, ids, syncs };
 }
@@ -1281,5 +1283,107 @@ describe("public run and context routes", () => {
     const syncedBody: unknown = await synced.json();
     if (!syncedBody || typeof syncedBody !== "object" || !("fresh" in syncedBody)) throw new Error("invalid context sync response");
     expect(syncedBody.fresh).toBeTrue();
+  });
+});
+
+describe("saved discovery descriptions", () => {
+  test("creates and atomically links a run without loading or extracting the job URL", async () => {
+    let loads = 0;
+    let extractions = 0;
+    const target = fixture({
+      loadJobSource: async () => {
+        loads += 1;
+        throw new Error("the URL loader must not run");
+      },
+      extractJobDescription: async () => {
+        extractions += 1;
+        throw new Error("the Luna extractor must not run");
+      },
+    });
+    target.pipelineDatabase.query(`
+      INSERT INTO discovery_jobs(
+        id, catalog_source_id, catalog_source_item_id,
+        title, company, location, role, canonical_url, apply_url,
+        description, posted_at, first_seen_at, last_seen_at, closed
+      ) VALUES (?, 'fixture-source', 'fixture-item', ?, ?, NULL, 'software_engineering', ?, ?, ?, NULL, 90, 90, 0)
+    `).run(
+      "discovery-job-1",
+      "Software Engineering Intern",
+      "Example",
+      JOB_URL,
+      JOB_URL,
+      JOB_DESCRIPTION,
+    );
+
+    const run = await target.service.createRunFromDescription(
+      "discovery-job-1",
+      JOB_URL,
+      JOB_DESCRIPTION,
+      true,
+      false,
+      false,
+    );
+
+    expect(loads).toBe(0);
+    expect(extractions).toBe(0);
+    expect(target.repository.getRunJobUrl(run.id)).toBe(JOB_URL);
+    expect(target.pipelineDatabase.query<{ run_id: string }, [string]>(
+      "SELECT run_id FROM discovery_run_links WHERE job_id = ?",
+    ).get("discovery-job-1")?.run_id).toBe(run.id);
+    const input = target.repository.listArtifacts(run.id)
+      .find((artifact) => artifact.kind === "job-description");
+    expect(input).toBeDefined();
+    expect(readFileSync(input!.path, "utf8")).toBe(JOB_DESCRIPTION);
+
+    await expect(target.service.createRunFromDescription(
+      "discovery-job-1",
+      JOB_URL,
+      JOB_DESCRIPTION,
+    )).rejects.toMatchObject({ reason: "already_queued" });
+    expect(target.repository.listRuns()).toHaveLength(1);
+    await target.service.deleteRun(run.id);
+    const requeued = await target.service.createRunFromDescription(
+      "discovery-job-1",
+      JOB_URL,
+      JOB_DESCRIPTION,
+    );
+    expect(requeued.id).not.toBe(run.id);
+    expect(target.pipelineDatabase.query<{ run_id: string }, [string]>(
+      "SELECT run_id FROM discovery_run_links WHERE job_id = ?",
+    ).get("discovery-job-1")?.run_id).toBe(requeued.id);
+    expect(target.repository.listRuns()).toHaveLength(1);
+  });
+
+  test("validates a saved discovery destination before reserving run state", async () => {
+    const blocked = new JobSourceError("JOB_URL_BLOCKED");
+    const target = fixture({
+      validatePublicJobUrl: async () => {
+        throw blocked;
+      },
+    });
+    target.pipelineDatabase.query(`
+      INSERT INTO discovery_jobs(
+        id, catalog_source_id, catalog_source_item_id,
+        title, company, location, role, canonical_url, apply_url,
+        description, posted_at, first_seen_at, last_seen_at, closed
+      ) VALUES (?, 'fixture-source', 'fixture-item-blocked', ?, ?, NULL, 'software_engineering', ?, ?, ?, NULL, 90, 90, 0)
+    `).run(
+      "discovery-job-blocked",
+      "Software Engineering Intern",
+      "Example",
+      JOB_URL,
+      JOB_URL,
+      JOB_DESCRIPTION,
+    );
+
+    await expect(target.service.createRunFromDescription(
+      "discovery-job-blocked",
+      JOB_URL,
+      JOB_DESCRIPTION,
+    )).rejects.toBe(blocked);
+    expect(target.repository.listRuns()).toEqual([]);
+    expect(target.pipelineDatabase.query<{ count: number }, []>(
+      "SELECT count(*) AS count FROM discovery_run_links",
+    ).get()?.count).toBe(0);
   });
 });

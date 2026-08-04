@@ -1,0 +1,5 @@
+{
+  "error": "fixture-private-upstream-denial-marker",
+  "status": 403,
+  "challenge": "Authentication required"
+}

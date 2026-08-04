@@ -1,0 +1,11 @@
+{
+  "id": "sr-402",
+  "name": "Posting Without Description",
+  "refNumber": "SR-402",
+  "releasedDate": "2026-01-17T10:00:00Z",
+  "company": { "identifier": "acme", "name": "Acme Systems" },
+  "location": { "fullLocation": "Remote" },
+  "postingUrl": "https://jobs.smartrecruiters.com/acme/sr-402-posting-without-description",
+  "applyUrl": "https://jobs.smartrecruiters.com/acme/sr-402-posting-without-description?oga=true",
+  "jobAd": { "sections": {} }
+}

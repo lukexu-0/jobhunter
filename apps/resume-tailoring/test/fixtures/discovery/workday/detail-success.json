@@ -1,0 +1,15 @@
+{
+  "jobPostingInfo": {
+    "id": "f9e3e5352dcf1001b7d70b7ec0aa0000",
+    "title": "Software Engineer, Platform",
+    "company": "Acme Corporation",
+    "jobDescription": "<div><h2>Build dependable platform software</h2><p>Design, implement, test, and operate production TypeScript services used by engineering teams around the world.</p><script>private fixture marker must not survive</script><p>Collaborate with product partners and improve reliability through thoughtful automation.</p></div>",
+    "location": "  Toronto, ON  ",
+    "additionalLocations": ["Vancouver, BC"],
+    "startDate": "2026-07-31",
+    "postedOn": "Posted 2 Days Ago",
+    "jobReqId": "R-1042",
+    "externalUrl": "https://acme.wd5.myworkdayjobs.com/en-US/External/job/Toronto-ON/Software-Engineer-Platform_R-1042?source=careers",
+    "applyUrl": "https://acme.wd5.myworkdayjobs.com/en-US/External/job/Toronto-ON/Software-Engineer-Platform_R-1042?utm_source=fixture"
+  }
+}

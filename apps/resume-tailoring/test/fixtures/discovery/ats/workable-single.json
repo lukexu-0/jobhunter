@@ -1,0 +1,17 @@
+{
+  "name": "Acme Systems",
+  "jobs": [
+    {
+      "title": "Data Engineer",
+      "shortcode": "WK501",
+      "code": "REQ-501",
+      "url": "https://apply.workable.com/j/WK501?utm_source=test",
+      "application_url": "https://apply.workable.com/j/WK501/apply",
+      "published_on": "2026-01-18",
+      "country": "Canada",
+      "city": "Toronto",
+      "state": "Ontario",
+      "description": "<h2>The role</h2><p>Build trusted data products and reliable batch and streaming pipelines for product engineering teams.</p><script>secret()</script>"
+    }
+  ]
+}

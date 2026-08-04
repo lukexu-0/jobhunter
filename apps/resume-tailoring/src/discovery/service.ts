@@ -1,0 +1,362 @@
+import { z } from "zod";
+import {
+  DiscoveryListResponseSchema,
+  DiscoveryQueueResponseSchema,
+  DiscoveryRoleSchema,
+  DiscoverySyncResponseSchema,
+  JobDescriptionSchema,
+  type DiscoveryListRequest,
+  type DiscoveryListResponse,
+  type DiscoveryQueueRequest,
+  type DiscoveryQueueResponse,
+  type DiscoverySourceSyncSummary,
+  type DiscoverySyncResponse,
+  type RunDto,
+} from "../contracts/index.ts";
+import { canonicalizePublicHttpUrl } from "../api/job-source.ts";
+import { DiscoveryJobQueueConflictError } from "../db/repository.ts";
+import {
+  DiscoveryRepository,
+  type DiscoverySourceDescriptor,
+} from "./repository.ts";
+import { DiscoveryHttpBudget } from "./connectors/http.ts";
+import type { DiscoveryConnector } from "./types.ts";
+
+const PublicDiscoveryUrlSchema = z.string().url().max(2_048).refine((value) => {
+  try {
+    return canonicalizePublicHttpUrl(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}, "Discovery URL must be a public HTTPS destination");
+
+const MAX_DISCOVERY_TIMESTAMP = 8_640_000_000_000_000;
+
+const ConnectorItemSchema = z.object({
+  sourceItemId: z.string().trim().min(1).max(500),
+  sourceUrl: PublicDiscoveryUrlSchema,
+  canonicalUrl: PublicDiscoveryUrlSchema,
+  applyUrl: PublicDiscoveryUrlSchema,
+  title: z.string().trim().min(1).max(500),
+  company: z.string().trim().min(1).max(500),
+  location: z.string().trim().min(1).max(500).nullable().optional(),
+  description: JobDescriptionSchema,
+  postedAt: z.number().int().nonnegative().max(MAX_DISCOVERY_TIMESTAMP).nullable().optional(),
+  role: DiscoveryRoleSchema.optional(),
+  requisitionId: z.string().trim().min(1).max(500).optional(),
+}).strict();
+
+const ConnectorEnvelopeSchema = z.object({
+  items: z.array(z.unknown()).max(100_000),
+  completeSnapshot: z.boolean(),
+  provenance: z.string().trim().min(1).max(1_000).optional(),
+}).strict();
+
+const ConnectorResultSchema = z.object({
+  items: z.array(ConnectorItemSchema).max(100_000)
+    .refine(
+      (items) => new Set(items.map((item) => item.sourceItemId)).size === items.length,
+      "source item ids must be unique",
+    ),
+  completeSnapshot: z.boolean(),
+  provenance: z.string().trim().min(1).max(1_000).optional(),
+}).strict();
+
+const MAX_SYNC_CONCURRENCY = 4;
+const MAX_SYNC_DURATION_MS = 120_000;
+const MAX_SYNC_REQUESTS = 2_500;
+const MAX_SYNC_BYTES = 256 * 1024 * 1024;
+type ConnectorResult = z.infer<typeof ConnectorResultSchema>;
+type ConnectorSyncOutcome =
+  | { readonly connector: DiscoveryConnector; readonly result: ConnectorResult }
+  | { readonly connector: DiscoveryConnector; readonly error: unknown };
+function validatedConnectorResult(value: unknown): ConnectorResult {
+  const envelope = ConnectorEnvelopeSchema.parse(value);
+  const items: Array<z.infer<typeof ConnectorItemSchema>> = [];
+  const sourceItemIds = new Set<string>();
+  let omitted = 0;
+  for (const candidate of envelope.items) {
+    const parsed = ConnectorItemSchema.safeParse(candidate);
+    if (!parsed.success || sourceItemIds.has(parsed.data.sourceItemId)) {
+      omitted += 1;
+      continue;
+    }
+    sourceItemIds.add(parsed.data.sourceItemId);
+    items.push(parsed.data);
+  }
+  if (envelope.items.length > 0 && items.length === 0) {
+    ConnectorResultSchema.parse(envelope);
+  }
+  const omission = omitted === 0 ? undefined : `service omitted invalid records: ${omitted}`;
+  let provenance = envelope.provenance;
+  if (omission !== undefined) {
+    const availablePrefix = 1_000 - omission.length - 2;
+    const prefix = provenance?.slice(0, availablePrefix).trimEnd();
+    provenance = prefix ? `${prefix}; ${omission}` : omission;
+  }
+  return ConnectorResultSchema.parse({
+    items,
+    completeSnapshot: envelope.completeSnapshot && omitted === 0,
+    ...(provenance === undefined ? {} : { provenance }),
+  });
+}
+
+
+async function abortable<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  const { promise: aborted, reject } = Promise.withResolvers<never>();
+  const onAbort = (): void => reject(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function synchronizeConnector(
+  connector: DiscoveryConnector,
+  signal: AbortSignal,
+  budget: DiscoveryHttpBudget,
+): Promise<ConnectorSyncOutcome> {
+  try {
+    const result = validatedConnectorResult(
+      await abortable(() => connector.sync(signal, budget), signal),
+    );
+    return { connector, result };
+  } catch (error) {
+    return { connector, error };
+  }
+}
+
+export class DiscoveryServiceError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly status: 400 | 409 | 500,
+  ) {
+    super(message);
+    this.name = "DiscoveryServiceError";
+  }
+}
+
+export interface DiscoveryRunService {
+  createRunFromDescription(
+    discoveryJobId: string,
+    jobUrl: string,
+    jobDescription: string,
+    generateKeywordMap: boolean,
+    skipReview: boolean,
+    autoSubmit: boolean,
+    signal?: AbortSignal,
+  ): Promise<RunDto>;
+  kick(): void;
+}
+
+export interface DiscoveryServiceDependencies {
+  readonly repository: DiscoveryRepository;
+  readonly runs: DiscoveryRunService;
+  readonly connectors: readonly DiscoveryConnector[];
+  readonly now?: () => number;
+}
+
+
+function publicSourceError(error: unknown): string {
+  if (error instanceof z.ZodError) return "Source returned invalid discovery data";
+  const message = error instanceof Error ? error.message : "Source synchronization failed";
+  return message
+    .replace(/https?:\/\/\S+/gi, "[upstream]")
+    .replace(
+      /\b(token|authorization|cookie|secret|api[-_ ]?key)\b\s*[:=]?\s*\S+/gi,
+      "$1=[redacted]",
+    )
+    .replace(/[\r\n\t]+/g, " ")
+    .slice(0, 500) || "Source synchronization failed";
+}
+
+export class DiscoveryService {
+  readonly #now: () => number;
+  #syncing = false;
+
+  constructor(private readonly dependencies: DiscoveryServiceDependencies) {
+    this.#now = dependencies.now ?? Date.now;
+    if (dependencies.connectors.length > 100) {
+      throw new Error("at most 100 discovery connectors may be configured");
+    }
+    const ids = dependencies.connectors.map((connector) => connector.id);
+    if (new Set(ids).size !== ids.length) {
+      throw new Error("discovery connector ids must be unique");
+    }
+  }
+
+  list(options: DiscoveryListRequest): DiscoveryListResponse {
+    return DiscoveryListResponseSchema.parse(this.dependencies.repository.list(options));
+  }
+
+  async sync(signal: AbortSignal): Promise<DiscoverySyncResponse> {
+    if (this.#syncing) {
+      throw new DiscoveryServiceError(
+        "DISCOVERY_SYNC_IN_PROGRESS",
+        "A discovery synchronization is already running",
+        409,
+      );
+    }
+    this.#syncing = true;
+    try {
+      signal.throwIfAborted();
+      const connectorSignal = AbortSignal.any([
+        signal,
+        AbortSignal.timeout(MAX_SYNC_DURATION_MS),
+      ]);
+      const budget = new DiscoveryHttpBudget({
+        maxRequests: MAX_SYNC_REQUESTS,
+        maxBytes: MAX_SYNC_BYTES,
+      });
+      const pending: Array<ConnectorSyncOutcome | undefined> =
+        new Array(this.dependencies.connectors.length);
+      let nextConnector = 0;
+      const worker = async (): Promise<void> => {
+        while (nextConnector < this.dependencies.connectors.length) {
+          const index = nextConnector;
+          nextConnector += 1;
+          pending[index] = await synchronizeConnector(
+            this.dependencies.connectors[index]!,
+            connectorSignal,
+            budget,
+          );
+        }
+      };
+      await Promise.all(Array.from(
+        {
+          length: Math.min(MAX_SYNC_CONCURRENCY, this.dependencies.connectors.length),
+        },
+        worker,
+      ));
+      signal.throwIfAborted();
+      const outcomes = pending.map((outcome) => {
+        if (outcome === undefined) throw new Error("discovery connector outcome is missing");
+        return outcome;
+      });
+      const sources: DiscoverySourceSyncSummary[] = [];
+      for (const outcome of outcomes) {
+        const descriptor: DiscoverySourceDescriptor = {
+          id: outcome.connector.id,
+          name: outcome.connector.name,
+          kind: outcome.connector.kind,
+        };
+        if ("error" in outcome) {
+          this.dependencies.repository.recordSourceFailure(descriptor, outcome.error);
+          sources.push({
+            sourceId: outcome.connector.id,
+            sourceName: outcome.connector.name,
+            status: "failed",
+            completeSnapshot: false,
+            received: 0,
+            created: 0,
+            updated: 0,
+            closed: 0,
+            error: publicSourceError(outcome.error),
+          });
+          continue;
+        }
+        try {
+          const counts = this.dependencies.repository.reconcileSource({
+            ...descriptor,
+            items: outcome.result.items,
+            completeSnapshot: outcome.result.completeSnapshot,
+            ...(outcome.result.provenance === undefined
+              ? {}
+              : { provenance: outcome.result.provenance }),
+          });
+          sources.push({
+            sourceId: outcome.connector.id,
+            sourceName: outcome.connector.name,
+            status: "succeeded",
+            completeSnapshot: outcome.result.completeSnapshot,
+            ...counts,
+            ...(outcome.result.provenance === undefined
+              ? {}
+              : { provenance: outcome.result.provenance }),
+          });
+        } catch (error) {
+          this.dependencies.repository.recordSourceFailure(descriptor, error);
+          sources.push({
+            sourceId: outcome.connector.id,
+            sourceName: outcome.connector.name,
+            status: "failed",
+            completeSnapshot: false,
+            received: 0,
+            created: 0,
+            updated: 0,
+            closed: 0,
+            error: publicSourceError(error),
+          });
+        }
+      }
+      const response: DiscoverySyncResponse = {
+        sources,
+        totals: {
+          sources: sources.length,
+          succeeded: sources.filter((source) => source.status === "succeeded").length,
+          failed: sources.filter((source) => source.status === "failed").length,
+          received: sources.reduce((total, source) => total + source.received, 0),
+          created: sources.reduce((total, source) => total + source.created, 0),
+          updated: sources.reduce((total, source) => total + source.updated, 0),
+          closed: sources.reduce((total, source) => total + source.closed, 0),
+        },
+        completedAt: this.#now(),
+      };
+      return DiscoverySyncResponseSchema.parse(response);
+    } finally {
+      this.#syncing = false;
+    }
+  }
+
+  async queue(
+    request: DiscoveryQueueRequest,
+    signal?: AbortSignal,
+  ): Promise<DiscoveryQueueResponse> {
+    const queued: DiscoveryQueueResponse["queued"] = [];
+    const skipped: DiscoveryQueueResponse["skipped"] = [];
+    try {
+      for (const jobId of request.jobIds) {
+        signal?.throwIfAborted();
+        const candidate = this.dependencies.repository.getQueueCandidate(jobId);
+        if (!candidate) {
+          skipped.push({ jobId, reason: "not_found" });
+          continue;
+        }
+        if (candidate.queuedRunId !== undefined) {
+          skipped.push({ jobId, reason: "already_queued" });
+          continue;
+        }
+        if (candidate.closed) {
+          skipped.push({ jobId, reason: "closed" });
+          continue;
+        }
+        try {
+          const run = await this.dependencies.runs.createRunFromDescription(
+            jobId,
+            candidate.canonicalUrl,
+            candidate.description,
+            request.generateKeywordMap,
+            request.skipReview,
+            request.autoSubmit,
+            signal,
+          );
+          queued.push({ jobId, run });
+        } catch (error) {
+          signal?.throwIfAborted();
+          if (error instanceof DiscoveryJobQueueConflictError) {
+            skipped.push({ jobId, reason: error.reason });
+          } else {
+            skipped.push({ jobId, reason: "queue_failed" });
+          }
+        }
+      }
+    } finally {
+      if (queued.length > 0) this.dependencies.runs.kick();
+    }
+    return DiscoveryQueueResponseSchema.parse({ queued, skipped });
+  }
+}
