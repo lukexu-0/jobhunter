@@ -15,6 +15,7 @@ const resumePdf = Buffer.from("%PDF-1.4\n% analysis fixture\n%%EOF\n");
 
 const run: RunDto = {
   id: runId,
+  opportunityKind: "job",
   jobUrl,
   status: "approved",
   applicationStatus: "applied",

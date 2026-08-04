@@ -11,6 +11,7 @@ import {
 function runFixture(id: string, applicationStatus: ApplicationStatus, status: RunStatus): RunDto {
   return {
     id,
+    opportunityKind: "job",
     status,
     applicationStatus,
     revision: 1,

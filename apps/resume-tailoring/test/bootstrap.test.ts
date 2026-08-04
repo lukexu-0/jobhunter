@@ -122,7 +122,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
         scheduler: worker,
         loadJobSource: async () => {
           calls.suppliedLoads += 1;
-          return { kind: "description", jobDescription: JOB_DESCRIPTION };
+          return { kind: "description", opportunityKind: "job", jobDescription: JOB_DESCRIPTION };
         },
         extractJobDescription: async () => {
           throw new Error("deterministic source must not invoke extraction");
@@ -164,7 +164,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     extractJobDescription: ingestion.extractJobDescription ?? (async (lines, signal) => {
       calls.extractedLines.push(lines);
       calls.extractedSignals.push(signal);
-      return JOB_DESCRIPTION;
+      return { opportunityKind: "job", jobDescription: JOB_DESCRIPTION };
     }),
   });
   return { app, artifactRoot, calls, pipelineDatabase, contextDatabase };
@@ -448,7 +448,7 @@ describe("pipeline application bootstrap", () => {
             model: LUNA_MODEL_NAME,
             content: [{
               type: "text",
-              text: JSON.stringify({ ranges: [{ startLine: 1, endLine: 3 }] }),
+              text: JSON.stringify({ kind: "job", ranges: [{ startLine: 1, endLine: 3 }] }),
             }],
             usage: {
               input: 1,
@@ -558,6 +558,7 @@ describe("pipeline application bootstrap", () => {
         },
         body: JSON.stringify({
           sessionId: "123e4567-e89b-42d3-a456-426614174000",
+          opportunityKind: "job",
           runtimeUrl: "http://127.0.0.1:8765",
           task: "Complete the application",
           maxTurns: 25,

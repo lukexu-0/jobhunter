@@ -8,6 +8,7 @@ import {
   type AttemptDto,
   type AttemptStage,
   type RevisionOrigin as PublicRevisionOrigin,
+  type OpportunityKind,
   type ResumeIterationListResponse,
   type RunDto,
   type RunStatus,
@@ -290,12 +291,12 @@ export class RunApplicationService {
     }
     signal?.throwIfAborted();
 
-    let jobDescription: string | null;
+    let extracted: { readonly opportunityKind: OpportunityKind; readonly jobDescription: string } | null;
     if (source.kind === "description") {
-      jobDescription = source.jobDescription;
+      extracted = source;
     } else {
       try {
-        jobDescription = await this.#extractJobDescription(source.lines, signal);
+        extracted = await this.#extractJobDescription(source.lines, signal);
       } catch (error) {
         if (signal?.aborted) signal.throwIfAborted();
         if (error instanceof OAuthRequiredError) {
@@ -323,12 +324,13 @@ export class RunApplicationService {
       }
       signal?.throwIfAborted();
     }
-    if (jobDescription === null) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
-    const validated = JobDescriptionSchema.parse(jobDescription);
+    if (extracted === null) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+    const validated = JobDescriptionSchema.parse(extracted.jobDescription);
 
     return await this.#persistRun(
       jobUrl,
       validated,
+      extracted.opportunityKind,
       generateKeywordMap,
       skipReview,
       autoSubmit,
@@ -352,6 +354,7 @@ export class RunApplicationService {
     return await this.#persistRun(
       jobUrl,
       validated,
+      "job",
       generateKeywordMap,
       skipReview,
       autoSubmit,
@@ -363,6 +366,7 @@ export class RunApplicationService {
   async #persistRun(
     jobUrl: string,
     jobDescription: string,
+    opportunityKind: OpportunityKind,
     generateKeywordMap: boolean,
     skipReview: boolean,
     autoSubmit: boolean,
@@ -400,6 +404,7 @@ export class RunApplicationService {
         ? this.dependencies.repository.createQueuedRun(
             jobDescription,
             jobUrl,
+            opportunityKind,
             snapshot,
             queuedInput,
             runId,
@@ -691,6 +696,7 @@ export class RunApplicationService {
     return {
       id: run.id,
       ...(run.jobUrl !== undefined ? { jobUrl: run.jobUrl } : {}),
+      opportunityKind: run.opportunityKind,
       status: run.status,
       applicationStatus: run.applicationStatus,
       ...(run.titleOverride !== undefined ? { titleOverride: run.titleOverride } : {}),

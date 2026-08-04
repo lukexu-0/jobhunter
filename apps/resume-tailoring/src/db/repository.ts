@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { CLAIM_TTL_MS, createClaimToken, isProcessIdentityAlive, type ClaimTokenFactory, type RunClaim } from "../worker/claims.ts";
+import { OpportunityKindSchema, type OpportunityKind } from "../contracts/index.ts";
 
 export const RUN_STATUSES = ["queued", "analyzing", "tailoring", "editing", "compiling", "repairing", "deterministic_qa", "visual_qa", "review", "approved", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
@@ -90,6 +91,7 @@ interface RunRow {
   id: string;
   job_description: string;
   job_url: string | null;
+  opportunity_kind: OpportunityKind;
   status: RunStatus;
   application_status: ApplicationStatus;
   generate_keyword_map: number;
@@ -144,6 +146,7 @@ export interface PublicRun {
   readonly id: string;
   readonly jobDescription: string;
   readonly jobUrl?: string;
+  readonly opportunityKind: OpportunityKind;
   readonly status: RunStatus;
   readonly applicationStatus: ApplicationStatus;
   readonly titleOverride?: string;
@@ -274,6 +277,7 @@ function publicRun(row: RunRow): PublicRun {
     id: row.id,
     jobDescription: row.job_description,
     ...(row.job_url !== null ? { jobUrl: row.job_url } : {}),
+    opportunityKind: row.opportunity_kind,
     status: row.status,
     applicationStatus: row.application_status,
     ...(row.title_override !== null ? { titleOverride: row.title_override } : {}),
@@ -473,6 +477,7 @@ export class PipelineRepository {
   createQueuedRun(
     jobDescription: string,
     jobUrl: string,
+    opportunityKind: OpportunityKind,
     snapshot: RunSourceSnapshotInput,
     input: QueuedInputArtifact,
     id = this.#idFactory(),
@@ -483,6 +488,7 @@ export class PipelineRepository {
     discoveryJobId?: string,
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
+    OpportunityKindSchema.parse(opportunityKind);
     if (jobUrl.length < 1 || jobUrl.length > 2_048 || jobUrl.trim() !== jobUrl) {
       throw new Error("job URL is invalid");
     }
@@ -533,8 +539,8 @@ export class PipelineRepository {
         }
         if (discoveryJob.closed === 1) throw new DiscoveryJobQueueConflictError("closed");
       }
-      this.#db.query("INSERT INTO runs(id, job_description, job_url, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, ?, ?, ?)")
-        .run(id, jobDescription, jobUrl, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, sequence, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, job_url, opportunity_kind, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 1, ?, ?, ?)")
+        .run(id, jobDescription, jobUrl, opportunityKind, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, sequence, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#db.query("INSERT INTO run_source_snapshots(run_id,manifest_sha256,baseline_sha256,source_hashes_json,created_at) VALUES (?,?,?,?,?)")
         .run(id, snapshot.manifestSha256, snapshot.baselineSha256, JSON.stringify(sourceHashes), now);
@@ -572,6 +578,7 @@ export class PipelineRepository {
     return this.createQueuedRun(
       jobDescription,
       jobUrl,
+      "job",
       snapshot,
       input,
       id,
@@ -590,15 +597,17 @@ export class PipelineRepository {
     generateKeywordMap = true,
     skipReview = false,
     autoSubmit = false,
+    opportunityKind: OpportunityKind = "job",
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     if (typeof generateKeywordMap !== "boolean") throw new Error("generate keyword map setting must be boolean");
     if (typeof skipReview !== "boolean") throw new Error("skip-review setting must be boolean");
     if (typeof autoSubmit !== "boolean") throw new Error("auto-submit setting must be boolean");
+    OpportunityKindSchema.parse(opportunityKind);
     return this.#immediate(() => {
       const now = this.#now();
-      this.#db.query("INSERT INTO runs(id, job_description, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, 'queued', ?, ?, ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs")
-        .run(id, jobDescription, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, opportunity_kind, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) SELECT ?, ?, ?, 'queued', ?, ?, ?, 1, coalesce(max(queue_sequence), 0) + 1, ?, ? FROM runs")
+        .run(id, jobDescription, opportunityKind, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#event(id, 1, "run.created", { status: "queued", origin: "initial" }, now);
       return publicRun(this.#run(id));

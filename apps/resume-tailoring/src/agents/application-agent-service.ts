@@ -5,6 +5,7 @@ import {
   ApplicationAgentRunInputSchema,
   ApplicationRunResultSchema,
   runApplicationAgent,
+  runNonJobApplicationAgent,
   type ApplicationAgentDependencies,
   type ApplicationAgentRunInput,
   type ApplicationRunResult,
@@ -57,6 +58,7 @@ export type ApplicationAgentRunner = (
 export interface ApplicationAgentServiceOptions {
   readonly authStatusReader?: ApplicationAgentAuthStatusReader;
   readonly runApplicationAgent?: ApplicationAgentRunner;
+  readonly runNonJobApplicationAgent?: ApplicationAgentRunner;
   readonly runtimeClientFactory?: ApplicationRuntimeClientFactory;
   readonly submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly agentRuntime?: AgentRuntimeDependencies;
@@ -90,6 +92,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
   readonly #harnessToken: string;
   readonly #authStatusReader: ApplicationAgentAuthStatusReader;
   readonly #runApplicationAgent: ApplicationAgentRunner;
+  readonly #runNonJobApplicationAgent: ApplicationAgentRunner;
   readonly #runtimeClientFactory: ApplicationRuntimeClientFactory;
   readonly #submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly #agentRuntime: AgentRuntimeDependencies;
@@ -102,6 +105,8 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
     this.#authStatusReader = options.authStatusReader ?? getAuthStatus;
     this.#runApplicationAgent = options.runApplicationAgent
       ?? runApplicationAgent;
+    this.#runNonJobApplicationAgent = options.runNonJobApplicationAgent
+      ?? runNonJobApplicationAgent;
     this.#runtimeClientFactory = options.runtimeClientFactory
       ?? ((runtimeUrl, sessionId, bearerToken) =>
         new HttpApplicationRuntimeClient(runtimeUrl, sessionId, bearerToken));
@@ -159,7 +164,10 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
         this.#harnessToken,
       );
       const submissionGuard = this.#submissionGuardFactory(input.sessionId);
-      const unparsedResult = await this.#runApplicationAgent(input, signal, {
+      const runner = input.opportunityKind === "job"
+        ? this.#runApplicationAgent
+        : this.#runNonJobApplicationAgent;
+      const unparsedResult = await runner(input, signal, {
         ...this.#agentRuntime,
         runtimeClient,
         submissionGuard,

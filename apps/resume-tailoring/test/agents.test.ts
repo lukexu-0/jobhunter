@@ -47,6 +47,7 @@ import {
   ATS_KEYWORD_EXTRACTION_TASK,
   ATS_KEYWORD_EXTRACTION_VALIDATION_FEEDBACK_MAX_CHARS,
   ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256,
+  ATS_KEYWORD_EXTRACTION_PROFILES,
   validateAtsKeywordExtractionAgainstJobDescription,
   validatePersistedAtsKeywordExtractionAgainstJobDescription,
 } from "../src/agents/ats-keyword-extraction-agent.ts";
@@ -256,6 +257,7 @@ describe("guarded agents", () => {
       validateAnalysisAgainstAtsKeywordExtraction(
         ANALYSIS,
         historicalExtraction,
+        "job",
       )).toThrow("does not match the configured workflow");
     expect(validatePersistedAtsKeywordExtractionAgainstJobDescription(
       historicalExtraction,
@@ -353,11 +355,40 @@ describe("guarded agents", () => {
 
     await expect(runAtsKeywordExtractionAgent({
       attemptSessionId: "ats-extraction",
-      input: { rawJobDescription: RAW_JOB_DESCRIPTION },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION },
       signal: new AbortController().signal,
       runtime,
     })).resolves.toEqual(ATS_KEYWORD_EXTRACTION);
     expect(providerIds).toEqual(["ats-extraction"]);
+  });
+
+  test("routes non-job opportunities to distinct custom keyword extraction agents", async () => {
+    for (const opportunityKind of ["hackathon", "competition", "event"] as const) {
+      const profile = ATS_KEYWORD_EXTRACTION_PROFILES[opportunityKind];
+      const expected = {
+        ...ATS_KEYWORD_EXTRACTION,
+        keywordExtractionWorkflowSha256: profile.workflowSha256,
+      };
+      const runtime = runtimeWith(async (agent, input) => {
+        expect(agent.name).toBe(`ats-${opportunityKind}-keyword-extraction`);
+        expect(agent.instructions).toBe(profile.instructions);
+        expect(JSON.parse(input)).toEqual({
+          task: profile.task,
+          rawJobDescription: RAW_JOB_DESCRIPTION,
+          jobDescriptionSha256: RAW_JOB_DESCRIPTION_SHA256,
+          keywordExtractionWorkflowSha256: profile.workflowSha256,
+        });
+        expect(await invoke(agent, "submit_ats_keyword_extraction", expected)).toEqual(expected);
+        return { finalOutput: expected };
+      });
+
+      await expect(runAtsKeywordExtractionAgent({
+        attemptSessionId: `ats-${opportunityKind}`,
+        input: { opportunityKind, rawJobDescription: RAW_JOB_DESCRIPTION },
+        signal: new AbortController().signal,
+        runtime,
+      })).resolves.toEqual(expected);
+    }
   });
 
   test("returns bounded ATS correction feedback without leaking invalid submitted content", async () => {
@@ -391,7 +422,7 @@ describe("guarded agents", () => {
 
     await expect(runAtsKeywordExtractionAgent({
       attemptSessionId: "ats-correction",
-      input: { rawJobDescription: RAW_JOB_DESCRIPTION },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION },
       signal: new AbortController().signal,
       runtime,
     })).resolves.toEqual(ATS_KEYWORD_EXTRACTION);
@@ -409,7 +440,7 @@ describe("guarded agents", () => {
     });
     await expect(runAtsKeywordExtractionAgent({
       attemptSessionId: "ats-cancelled",
-      input: { rawJobDescription: RAW_JOB_DESCRIPTION },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION },
       signal: controller.signal,
       runtime,
     })).rejects.toBe(reason);
@@ -501,16 +532,37 @@ describe("guarded agents", () => {
       return { finalOutput: ANALYSIS };
     }, providerIds);
     const signal = new AbortController().signal;
-    const input = {
-      rawJobDescription: RAW_JOB_DESCRIPTION,
-      atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
-      canonicalCv: BASELINE,
-      context: CONTEXT,
-    };
+    const input = { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION, atsKeywordExtraction: ATS_KEYWORD_EXTRACTION, canonicalCv: BASELINE, context: CONTEXT } as const;
     await runAnalysisAgent({ attemptSessionId: "attempt-a", input, signal, runtime });
     await runAnalysisAgent({ attemptSessionId: "attempt-b", input, signal, runtime });
     expect(calls).toBe(2);
     expect(providerIds).toEqual(["attempt-a", "attempt-b"]);
+  });
+
+  test("validates completed analysis against the selected opportunity workflow", async () => {
+    const opportunityKind = "competition" as const;
+    const atsKeywordExtraction = {
+      ...ATS_KEYWORD_EXTRACTION,
+      keywordExtractionWorkflowSha256:
+        ATS_KEYWORD_EXTRACTION_PROFILES[opportunityKind].workflowSha256,
+    };
+    const runtime = runtimeWith(async (agent) => {
+      await invoke(agent, "submit_job_analysis", ANALYSIS);
+      return { finalOutput: ANALYSIS };
+    });
+
+    await expect(runAnalysisAgent({
+      attemptSessionId: "competition-analysis",
+      input: {
+        opportunityKind,
+        rawJobDescription: RAW_JOB_DESCRIPTION,
+        atsKeywordExtraction,
+        canonicalCv: BASELINE,
+        context: CONTEXT,
+      },
+      signal: new AbortController().signal,
+      runtime,
+    })).resolves.toEqual(ANALYSIS);
   });
 
   test("separates requirement directives from factual analysis evidence", async () => {
@@ -582,6 +634,7 @@ describe("guarded agents", () => {
     await expect(runAnalysisAgent({
       attemptSessionId: "analysis-requirement-projection",
       input: {
+        opportunityKind: "job",
         rawJobDescription: RAW_JOB_DESCRIPTION,
         atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
         canonicalCv: BASELINE,
@@ -624,12 +677,7 @@ describe("guarded agents", () => {
 
     await expect(runAnalysisAgent({
       attemptSessionId: "schema-correction",
-      input: {
-        rawJobDescription: RAW_JOB_DESCRIPTION,
-        atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
-        canonicalCv: BASELINE,
-        context: CONTEXT,
-      },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION, atsKeywordExtraction: ATS_KEYWORD_EXTRACTION, canonicalCv: BASELINE, context: CONTEXT },
       signal: new AbortController().signal,
       runtime,
     })).resolves.toEqual(ANALYSIS);
@@ -696,12 +744,7 @@ describe("guarded agents", () => {
 
     await expect(runAnalysisAgent({
       attemptSessionId: "runner-correction",
-      input: {
-        rawJobDescription: RAW_JOB_DESCRIPTION,
-        atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
-        canonicalCv: BASELINE,
-        context: CONTEXT,
-      },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION, atsKeywordExtraction: ATS_KEYWORD_EXTRACTION, canonicalCv: BASELINE, context: CONTEXT },
       signal: new AbortController().signal,
       runtime,
     })).resolves.toEqual(ANALYSIS);
@@ -785,12 +828,7 @@ describe("guarded agents", () => {
 
     await expect(runAnalysisAgent({
       attemptSessionId: "analysis-extraction-grounding",
-      input: {
-        rawJobDescription: RAW_JOB_DESCRIPTION,
-        atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
-        canonicalCv: BASELINE,
-        context: CONTEXT,
-      },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION, atsKeywordExtraction: ATS_KEYWORD_EXTRACTION, canonicalCv: BASELINE, context: CONTEXT },
       signal: new AbortController().signal,
       runtime,
     })).resolves.toEqual(ANALYSIS);
@@ -801,12 +839,7 @@ describe("guarded agents", () => {
     const runtime = runtimeWith(async () => ({ finalOutput: "plain text" }));
     await expect(runAnalysisAgent({
       attemptSessionId: "plain",
-      input: {
-        rawJobDescription: RAW_JOB_DESCRIPTION,
-        atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
-        canonicalCv: BASELINE,
-        context: CONTEXT,
-      },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION, atsKeywordExtraction: ATS_KEYWORD_EXTRACTION, canonicalCv: BASELINE, context: CONTEXT },
       signal: new AbortController().signal,
       runtime,
     })).rejects.toThrow("requires exactly one validated terminal call");
@@ -820,12 +853,7 @@ describe("guarded agents", () => {
     });
     await expect(runAnalysisAgent({
       attemptSessionId: "duplicate",
-      input: {
-        rawJobDescription: RAW_JOB_DESCRIPTION,
-        atsKeywordExtraction: ATS_KEYWORD_EXTRACTION,
-        canonicalCv: BASELINE,
-        context: CONTEXT,
-      },
+      input: { opportunityKind: "job", rawJobDescription: RAW_JOB_DESCRIPTION, atsKeywordExtraction: ATS_KEYWORD_EXTRACTION, canonicalCv: BASELINE, context: CONTEXT },
       signal: new AbortController().signal,
       runtime: duplicateRuntime,
     })).rejects.toThrow("exactly once");

@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 19;
+export const PIPELINE_SCHEMA_VERSION = 20;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -847,6 +847,18 @@ function hasCompleteRecruitingEventSchema(db: Database): boolean {
 }
 
 
+const migration20 = `
+ALTER TABLE runs
+ADD COLUMN opportunity_kind TEXT NOT NULL DEFAULT 'job'
+  CHECK (opportunity_kind IN ('job','hackathon','competition','event'));
+`;
+
+function hasOpportunityKindColumn(db: Database): boolean {
+  return db.query<{ name: string }, []>("PRAGMA table_info(runs)")
+    .all()
+    .some(({ name }) => name === "opportunity_kind");
+}
+
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
   const version = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
@@ -927,6 +939,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 19) {
         if (!hasCompleteRecruitingEventSchema(db)) db.exec(migration19);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(19, now);
+      }
+      if (version < 20) {
+        if (!hasOpportunityKindColumn(db)) db.exec(migration20);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(20, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

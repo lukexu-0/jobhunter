@@ -23,6 +23,7 @@ const PDF_HASH = "a".repeat(64);
 const CANONICAL_JOB_URL = "https://jobs.example.test/role?gh_jid=123&source=route";
 const run: RunDto = {
   id: "run-1",
+  opportunityKind: "job",
   status: "queued",
   applicationStatus: "applied",
   queueSequence: 1,

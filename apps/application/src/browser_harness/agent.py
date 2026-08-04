@@ -44,6 +44,7 @@ def build_application_task(request: ApplicationRunRequest) -> str:
     payload = {
         "job": {
             "url": _navigation_url(session.job_url),
+            "opportunity_kind": session.opportunity_kind,
             "approved_origins": list(session.approved_origins),
             "resume": {
                 "display_name": request.resume_display_name,

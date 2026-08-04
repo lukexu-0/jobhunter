@@ -34,6 +34,7 @@ from jobhunter_browser_harness.models import (
     ContinueCommand,
     FieldResult,
     HarnessConfig,
+    OpportunityKind,
     HarnessServiceError,
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
@@ -148,6 +149,7 @@ class FakeSessionService:
         *,
         session_id: UUID | None,
         job_url: str,
+        opportunity_kind: OpportunityKind,
         allow_domains: Sequence[str],
         auto_submit: bool,
         max_steps: int,
@@ -162,6 +164,7 @@ class FakeSessionService:
             {
                 "session_id": session_id,
                 "job_url": job_url,
+                "opportunity_kind": opportunity_kind,
                 "allow_domains": list(allow_domains),
                 "auto_submit": auto_submit,
                 "max_steps": max_steps,
@@ -253,6 +256,7 @@ def multipart_parts(
     anecdotes: int = 0,
     max_steps: int | str = 100,
     session_id: UUID | str | None = None,
+    opportunity_kind: str | None = "job",
     auto_submit: bool | str | None = None,
 ) -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
     parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]] = [
@@ -264,6 +268,8 @@ def multipart_parts(
         ),
         ("resume", ("resume.pdf", b"%PDF-1.7 synthetic", "application/pdf")),
     ]
+    if opportunity_kind is not None:
+        parts.insert(0, ("opportunity_kind", (None, opportunity_kind)))
     if auto_submit is not None:
         parts.insert(0, ("auto_submit", (None, str(auto_submit).lower())))
     if session_id is not None:
@@ -963,6 +969,7 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
     assert len(service.create_calls) == 1
     call = service.create_calls[0]
     assert call["session_id"] == SESSION_ID
+    assert call["opportunity_kind"] == "job"
     assert call["job_url"] == "https://jobs.example/openings/42?source=board"
     assert call["allow_domains"] == ["https://jobs.example", "https://ats.example"]
     assert call["auto_submit"] is True
@@ -980,6 +987,52 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
         ("anecdote-0.txt", b"anecdote 0"),
         ("anecdote-1.txt", b"anecdote 1"),
     ]
+
+
+@pytest.mark.parametrize(
+    "opportunity_kind",
+    ["job", "hackathon", "competition", "event"],
+)
+async def test_multipart_propagates_every_valid_opportunity_kind(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    opportunity_kind: str,
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        "/v1/sessions",
+        headers=AUTHORIZATION,
+        files=multipart_parts(opportunity_kind=opportunity_kind),
+    )
+
+    assert response.status_code == 202
+    assert service.create_calls[0]["opportunity_kind"] == opportunity_kind
+    assert "opportunity_kind" not in response.json()
+
+
+@pytest.mark.parametrize(
+    "opportunity_kind",
+    [None, "", "internship", "Job"],
+    ids=["missing", "empty", "unknown", "wrong-case"],
+)
+async def test_multipart_rejects_missing_or_invalid_opportunity_kind_before_dispatch(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    opportunity_kind: str | None,
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        "/v1/sessions",
+        headers=AUTHORIZATION,
+        files=multipart_parts(opportunity_kind=opportunity_kind),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.create_calls == []
 
 
 async def test_multipart_omits_optional_caller_session_id(

@@ -69,10 +69,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl,
       resolveHost: resolvePublic,
-    })).resolves.toEqual({
-      kind: "description",
-      jobDescription: "Senior Engineer\n\nBuild secure systems and collaborate across the whole team.",
-    });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "Senior Engineer\n\nBuild secure systems and collaborate across the whole team." });
   });
 
   test("enforces plain-text character bounds without falling back to a model", async () => {
@@ -90,7 +87,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => response("界".repeat(40)),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", jobDescription: "界".repeat(40) });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "界".repeat(40) });
   });
 
   test("rejects a twenty-character CJK HTML page before exposing fallback lines", async () => {
@@ -112,10 +109,30 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({
-      kind: "description",
-      jobDescription: "Senior & Staff Engineer — 界\n\nExample Labs\n\nBuild secure systems.\nCollaborate across the product team.",
-    });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "Senior & Staff Engineer — 界\n\nExample Labs\n\nBuild secure systems.\nCollaborate across the product team." });
+  });
+
+  test("classifies and extracts supported non-job JSON-LD opportunities", async () => {
+    for (const [schemaType, opportunityKind, organizationField] of [
+      ["Hackathon", "hackathon", "organizer"],
+      ["Competition", "competition", "sponsor"],
+      ["Event", "event", "organizer"],
+    ] as const) {
+      const body = `<script type="application/ld+json">${JSON.stringify({
+        "@type": `https://schema.org/${schemaType}`,
+        name: `${schemaType} title`,
+        [organizationField]: { name: "Example Labs" },
+        description: VALID_TEXT,
+      })}</script>`;
+      await expect(loadJobSourceFromUrl("https://events.example.test/apply", undefined, {
+        fetchImpl: async () => htmlResponse(body),
+        resolveHost: resolvePublic,
+      })).resolves.toEqual({
+        kind: "description",
+        opportunityKind,
+        jobDescription: `${schemaType} title\n\nExample Labs\n\n${VALID_TEXT}`,
+      });
+    }
   });
 
   test("decodes HTML fragment entities exactly once", async () => {
@@ -128,10 +145,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({
-      kind: "description",
-      jobDescription: `Senior &lt;Staff&gt; Engineer\n\n${VALID_TEXT}`,
-    });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: `Senior &lt;Staff&gt; Engineer\n\n${VALID_TEXT}` });
   });
 
   test("recognizes exact JSON-LD types recursively and rejects near-matches and non-string fields", async () => {
@@ -147,7 +161,7 @@ describe("job source loading", () => {
       await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
         fetchImpl: async () => htmlResponse(body),
         resolveHost: resolvePublic,
-      })).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+      })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
     }
 
     for (const rejectedType of ["jobposting", "JobPosting ", "schema:JobPosting", "https://schema.org/JobPosting/"]) {
@@ -162,6 +176,18 @@ describe("job source loading", () => {
     }
   });
 
+  test("sends conflicting JSON-LD opportunity kinds to model fallback", async () => {
+    const body = `<main>${VALID_TEXT}</main><script type="application/ld+json">${JSON.stringify({
+      "@type": ["JobPosting", "Event"],
+      description: "A conflicting deterministic candidate that must not be classified.",
+    })}</script>`;
+
+    await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+      fetchImpl: async () => htmlResponse(body),
+      resolveHost: resolvePublic,
+    })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
+  });
+
   test("deduplicates equal JSON-LD postings but sends distinct or malformed candidates to sanitized fallback", async () => {
     const posting = { "@type": "JobPosting", description: VALID_TEXT };
     const duplicateBody = `
@@ -169,7 +195,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(duplicateBody),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
 
     const ambiguousBody = [
       `<main><nav>Discard navigation</nav><h1>Role</h1><p>${VALID_TEXT}</p>`,
@@ -204,10 +230,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({
-      kind: "description",
-      jobDescription: "Platform Engineer\nBuild & operate resilient systems for customers worldwide.\nNested footer remains because only body footer is boilerplate.",
-    });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "Platform Engineer\nBuild & operate resilient systems for customers worldwide.\nNested footer remains because only body footer is boilerplate." });
   });
 
   test("returns exact sanitized fallback lines using main, article, then body priority", async () => {
@@ -308,7 +331,7 @@ describe("job source loading", () => {
       },
     });
 
-    expect(result).toEqual({ kind: "description", jobDescription: VALID_TEXT });
+    expect(result).toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
     expect(attempts).toHaveLength(1);
     expect(attempts[0]!.url.href).toBe(`https://${PUBLIC_V4}/role?q=1`);
     const headers = new Headers(attempts[0]!.init.headers);
@@ -334,7 +357,7 @@ describe("job source loading", () => {
         { address: "1.1.1.1", family: 4 },
         { address: "2606:4700:4700::1111", family: 6 },
       ],
-    })).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
     expect(calls).toEqual(["1.1.1.1:false", "[2606:4700:4700::1111]:false"]);
 
     calls.length = 0;
@@ -407,7 +430,7 @@ describe("job source loading", () => {
         }
         return response(VALID_TEXT);
       },
-    })).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
     expect(logicalPaths).toEqual([
       "jobs.example.test:/start/path:false",
       "jobs.example.test:/hop-1:false",
@@ -579,7 +602,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       resolveHost: resolvePublic,
       fetchImpl: async () => htmlResponse(exactBody, { "content-length": String(1024 * 1024) }),
-    })).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+    })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
   });
 
   test("classifies every IANA IPv4 row boundary by the literal registry snapshot", async () => {
@@ -601,7 +624,7 @@ describe("job source loading", () => {
           fetchImpl: async () => response(VALID_TEXT),
         });
         if (globallyReachable) {
-          await expect(result).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+          await expect(result).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
         } else {
           await expect(result).rejects.toMatchObject({ code: "JOB_URL_BLOCKED" });
         }
@@ -627,7 +650,7 @@ describe("job source loading", () => {
           fetchImpl: async () => response(VALID_TEXT),
         });
         if (globallyReachable) {
-          await expect(result).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+          await expect(result).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
         } else {
           await expect(result).rejects.toMatchObject({ code: "JOB_URL_BLOCKED" });
         }
@@ -648,7 +671,7 @@ describe("job source loading", () => {
       const host = address.includes(":") ? `[${address}]` : address;
       await expect(loadJobSourceFromUrl(`http://${host}/job`, undefined, {
         fetchImpl: async () => response(VALID_TEXT),
-      })).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+      })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
     }
   });
 
@@ -699,7 +722,7 @@ describe("job source loading", () => {
           transports.push(new URL(input).hostname);
           return response(VALID_TEXT);
         },
-      })).resolves.toEqual({ kind: "description", jobDescription: VALID_TEXT });
+      })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: VALID_TEXT });
     }
     expect(transports).toEqual(["93.184.216.34", "93.184.216.34"]);
   });

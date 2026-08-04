@@ -59,6 +59,7 @@ from .models import (
     HarnessServiceError,
     HumanNavigationDetail,
     OriginApprovalDetail,
+    OpportunityKind,
     SubmitCommand,
     ReviseCommand,
     SubmitRuntimeActionResponse,
@@ -333,6 +334,7 @@ class ApplicationSessionManager:
         *,
         session_id: UUID | None = None,
         job_url: str,
+        opportunity_kind: OpportunityKind,
         allow_domains: Sequence[str],
         auto_submit: bool = False,
         max_steps: int,
@@ -344,6 +346,13 @@ class ApplicationSessionManager:
         await self.startup()
         try:
             validated_job_url = validate_job_url(job_url)
+            if opportunity_kind not in (
+                "job",
+                "hackathon",
+                "competition",
+                "event",
+            ):
+                raise ValueError("opportunity_kind is invalid")
             origins = [_job_origin(validated_job_url)]
             origins.extend(validate_approved_origin(value) for value in allow_domains)
             if len(origins) > 20 or len(set(origins)) != len(origins):
@@ -458,6 +467,7 @@ class ApplicationSessionManager:
             request = SessionCreateRequest(
                 session_id=session_id,
                 job_url=validated_job_url,
+                opportunity_kind=opportunity_kind,
                 approved_origins=tuple(origins),
                 auto_submit=auto_submit,
                 max_steps=max_steps,
@@ -1246,6 +1256,7 @@ class ApplicationSessionManager:
                     return
                 result = await model.run(
                     runtime_url=f"http://127.0.0.1:{self._config.port}",
+                    opportunity_kind=request.opportunity_kind,
                     auto_submit=request.auto_submit,
                     task=record.application_task,
                     max_turns=request.max_steps,

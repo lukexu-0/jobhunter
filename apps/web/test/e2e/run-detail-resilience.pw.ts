@@ -14,6 +14,7 @@ const inheritedPdfSha256 = "1111111111111111111111111111111111111111111111111111
 
 const reviewRun: RunDto = {
   id: runId,
+  opportunityKind: "job",
   status: "review",
   applicationStatus: "pending",
   revision: 2,

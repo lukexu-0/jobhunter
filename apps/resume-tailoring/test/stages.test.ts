@@ -8,7 +8,7 @@ import type { AnalysisAgentInput } from "../src/agents/analysis-agent.ts";
 import type { AtsKeywordExtractionAgentInput } from "../src/agents/ats-keyword-extraction-agent.ts";
 import type { EditAgentInput } from "../src/agents/edit-agent.ts";
 import { buildMechanicalTailoringPlan, type TailoringAgentInput } from "../src/agents/tailoring-agent.ts";
-import { ResumeDiffSchema } from "../src/contracts/index.ts";
+import { ResumeDiffSchema, type OpportunityKind } from "../src/contracts/index.ts";
 import type { ContextSnapshot, EvidenceBlock, IndexedContextSource } from "../src/context/types.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
 import { ClaimRejectedError, PipelineRepository, type RunSourceSnapshotInput } from "../src/db/repository.ts";
@@ -284,6 +284,7 @@ interface HarnessOptions {
   readonly repairAgent?: PipelineStageDependencies["repairAgent"];
   readonly generateKeywordMap?: boolean;
   readonly skipReview?: boolean;
+  readonly opportunityKind?: OpportunityKind;
   readonly keywordMapRenderer?: PipelineStageDependencies["keywordMapRenderer"];
 }
 
@@ -328,11 +329,21 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   const queueSequence = repository.nextQueueSequence();
   const inputRoot = await artifacts.createRunInput({ run: queueSequence });
   const input = await artifacts.write(join(inputRoot, "job-description.txt"), jobDescription, 1024 * 1024);
-  const run = repository.createQueuedRun(jobDescription, "https://jobs.example.test/stage-run", fixtures.snapshotInput, {
-    sha256: input.sha256,
-    path: input.path,
-    byteSize: input.bytes,
-  }, "stage-run", options.generateKeywordMap ?? false, queueSequence, options.skipReview ?? false);
+  const run = repository.createQueuedRun(
+    jobDescription,
+    "https://jobs.example.test/stage-run",
+    options.opportunityKind ?? "job",
+    fixtures.snapshotInput,
+    {
+      sha256: input.sha256,
+      path: input.path,
+      byteSize: input.bytes,
+    },
+    "stage-run",
+    options.generateKeywordMap ?? false,
+    queueSequence,
+    options.skipReview ?? false,
+  );
   const compileOutcomes = [...(options.compileOutcomes ?? ["success"])] ;
   const compileModes: string[] = [];
   const keywordMapCalls: { count: number; requests: KeywordMapRequest[] } = {
@@ -544,9 +555,11 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     ]);
     expect(harness.agentOrder).toEqual(["ats-keyword-extraction", "analysis"]);
     expect(harness.agentInputs.atsKeywordExtraction).toEqual([{
+      opportunityKind: "job",
       rawJobDescription: "Strong TypeScript engineer",
     }]);
     expect(harness.agentInputs.analysis).toHaveLength(1);
+    expect(harness.agentInputs.analysis[0]?.opportunityKind).toBe("job");
     expect(harness.agentInputs.analysis[0]?.canonicalCv).toBe(baseline);
     expect(harness.agentInputs.analysis[0]?.context).toEqual(harness.fixtures.snapshot);
     expect(harness.agentInputs.analysis[0]?.atsKeywordExtraction)

@@ -16,6 +16,7 @@ import {
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
   type ApplicationSessionView,
+  type OpportunityKind,
 } from "../contracts/index.ts";
 import { REPOSITORY_ROOT } from "../context/manifest.ts";
 import { OAuthRequiredError } from "../auth/oauth-only-resolver.ts";
@@ -338,6 +339,7 @@ function durableBridgeState(
 
 interface PreparedStart {
   readonly jobUrl: string;
+  readonly opportunityKind: OpportunityKind;
   readonly autoSubmit: boolean;
   readonly profile: string;
   readonly pdf: PublicArtifact;
@@ -1260,7 +1262,13 @@ export class ApplicationSessionService {
     signal.throwIfAborted();
     const pdf = this.dependencies.repository.getArtifact(runId, "compiled-pdf", run.currentRevision);
     if (!pdf || pdf.sha256 !== expectedApprovedPdfSha256) throw applicationSourceUnavailable();
-    return { jobUrl, autoSubmit: run.autoSubmit, profile, pdf };
+    return {
+      jobUrl,
+      opportunityKind: run.opportunityKind,
+      autoSubmit: run.autoSubmit,
+      profile,
+      pdf,
+    };
   }
 
   #resume(
@@ -1343,6 +1351,7 @@ export class ApplicationSessionService {
       await harness.create({
         sessionId: session.sessionId,
         jobUrl: prepared.jobUrl,
+        opportunityKind: prepared.opportunityKind,
         autoSubmit: prepared.autoSubmit,
         personalInformationMarkdown: prepared.profile,
         resumePdf,

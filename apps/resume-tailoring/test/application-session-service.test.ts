@@ -20,6 +20,7 @@ import type {
   ApplicationProfessionalizeRequest,
   ApplicationSessionCommand,
   ApplicationSessionEventDto,
+  OpportunityKind,
 } from "../src/contracts/index.ts";
 import { OAuthRequiredError } from "../src/auth/oauth-only-resolver.ts";
 import {
@@ -190,6 +191,7 @@ async function createApprovedRun(
     readonly autoSubmit?: boolean;
     readonly skipReview?: boolean;
     readonly jobUrl?: string | null;
+    readonly opportunityKind?: OpportunityKind;
   },
 ) {
   const run = repository.createRun(
@@ -198,6 +200,7 @@ async function createApprovedRun(
     true,
     options.skipReview ?? false,
     options.autoSubmit ?? false,
+    options.opportunityKind ?? "job",
   );
   database.query("UPDATE runs SET job_url = ? WHERE id = ?").run(
     options.jobUrl === undefined ? JOB_URL : options.jobUrl,
@@ -247,6 +250,7 @@ async function createTarget(options: {
   autoSubmit?: boolean;
   skipReview?: boolean;
   jobUrl?: string | null;
+  opportunityKind?: OpportunityKind;
   profileReader?: () => string | Promise<string>;
   sessionIds?: string[];
   onApplicationSessionReleased?: () => void;
@@ -271,6 +275,7 @@ async function createTarget(options: {
     ...(options.autoSubmit === undefined ? {} : { autoSubmit: options.autoSubmit }),
     ...(options.skipReview === undefined ? {} : { skipReview: options.skipReview }),
     ...(options.jobUrl === undefined ? {} : { jobUrl: options.jobUrl }),
+    ...(options.opportunityKind === undefined ? {} : { opportunityKind: options.opportunityKind }),
   });
 
   const harness = options.harness === undefined ? new FakeHarness() : options.harness;
@@ -503,6 +508,7 @@ describe("application session service", () => {
     expect(target.harness!.createCalls[0]).toEqual({
       sessionId: FIRST_SESSION_ID,
       jobUrl: JOB_URL,
+      opportunityKind: "job",
       personalInformationMarkdown: PROFILE,
       resumePdf: PDF_BYTES,
       autoSubmit: false,
@@ -522,6 +528,15 @@ describe("application session service", () => {
 
     expect(target.harness!.createCalls).toHaveLength(1);
     expect(target.harness!.createCalls[0]?.autoSubmit).toBe(true);
+  });
+
+  test("uploads the persisted non-job opportunity kind without exposing it publicly", async () => {
+    const target = await createTarget({ opportunityKind: "event" });
+
+    const view = await target.service.start(target.runId, target.pdf.sha256, signal());
+
+    expect(target.harness!.createCalls[0]?.opportunityKind).toBe("event");
+    expect(view).not.toHaveProperty("opportunityKind");
   });
 
   test("reports exact eligibility blockers without exposing private sources", async () => {

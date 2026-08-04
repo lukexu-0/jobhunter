@@ -11,6 +11,7 @@ const API_ORIGIN = "http://127.0.0.1:3457";
 const TOKEN = "test-token-0123456789abcdef-0123456789";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const INPUT = {
+  opportunityKind: "job" as const,
   sessionId: "123e4567-e89b-42d3-a456-426614174000",
   runtimeUrl: "http://127.0.0.1:8765",
   task: "Fill the application.",

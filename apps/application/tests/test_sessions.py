@@ -59,6 +59,7 @@ from jobhunter_browser_harness.models import (
     ContinueRuntimeActionResponse,
     CancelCommand,
     ContinueCommand,
+    OpportunityKind,
     HarnessConfig,
     ProvideAdditionalInfoCommand,
     HarnessServiceError,
@@ -122,6 +123,7 @@ def valid_uploads() -> tuple[UploadFile, UploadFile]:
 
 def multipart_parts() -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
     return [
+        ("opportunity_kind", (None, "job")),
         ("job_url", (None, JOB_URL)),
         ("max_steps", (None, "100")),
         (
@@ -555,11 +557,13 @@ async def create_valid(
     *,
     session_id: UUID | None = None,
     auto_submit: bool = False,
+    opportunity_kind: OpportunityKind = "job",
 ):
     personal, resume = valid_uploads()
     return await manager.create_session(
         session_id=session_id,
         job_url=JOB_URL,
+        opportunity_kind=opportunity_kind,
         allow_domains=[],
         auto_submit=auto_submit,
         max_steps=100,
@@ -610,20 +614,29 @@ async def blocked_runner(
 
 
 @pytest.mark.parametrize(
-    ("job_url", "origins", "max_steps"),
+    ("job_url", "opportunity_kind", "origins", "max_steps"),
     [
-        ("not-a-url", [], 100),
-        (JOB_URL, ["https://ats.example/path"], 100),
-        (JOB_URL, ["https://jobs.example"], 100),
-        (JOB_URL, [], 0),
-        (JOB_URL, [], 501),
+        ("not-a-url", "job", [], 100),
+        (JOB_URL, "internship", [], 100),
+        (JOB_URL, "job", ["https://ats.example/path"], 100),
+        (JOB_URL, "job", ["https://jobs.example"], 100),
+        (JOB_URL, "job", [], 0),
+        (JOB_URL, "job", [], 501),
     ],
-    ids=["job-url", "origin", "duplicate-origin", "min-steps", "max-steps"],
+    ids=[
+        "job-url",
+        "opportunity-kind",
+        "origin",
+        "duplicate-origin",
+        "min-steps",
+        "max-steps",
+    ],
 )
 async def test_invalid_create_values_fail_before_storage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     job_url: str,
+    opportunity_kind: Any,
     origins: list[str],
     max_steps: int,
 ) -> None:
@@ -641,6 +654,7 @@ async def test_invalid_create_values_fail_before_storage(
     with pytest.raises(HarnessServiceError) as caught:
         await manager.create_session(
             job_url=job_url,
+            opportunity_kind=opportunity_kind,
             allow_domains=origins,
             max_steps=max_steps,
             personal_information=personal,
@@ -1872,6 +1886,7 @@ async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_pa
     with pytest.raises(HarnessServiceError) as caught:
         await manager.create_session(
             job_url=JOB_URL,
+            opportunity_kind="job",
             allow_domains=[],
             max_steps=100,
             personal_information=personal,
@@ -2354,6 +2369,7 @@ async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
     personal, resume = valid_uploads()
     created = await manager.create_session(
         job_url=private_job_url,
+        opportunity_kind="job",
         allow_domains=[],
         max_steps=100,
         personal_information=personal,
@@ -2610,6 +2626,7 @@ async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
     manager, _fakes, _root = make_manager(tmp_path, stepping)
     created = await manager.create_session(
         job_url=job_url,
+        opportunity_kind="job",
         allow_domains=[],
         max_steps=100,
         personal_information=personal,
@@ -2697,6 +2714,7 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     )
     created = await manager.create_session(
         job_url=private_job_url,
+        opportunity_kind="job",
         allow_domains=[],
         auto_submit=True,
         max_steps=100,
@@ -2934,6 +2952,7 @@ async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces
     personal, resume = valid_uploads()
     created = await manager.create_session(
         job_url=JOB_URL,
+        opportunity_kind="job",
         allow_domains=[],
         max_steps=1,
         personal_information=personal,
@@ -3058,6 +3077,7 @@ async def test_runtime_playwright_cli_errors_count_toward_step_limit(
     personal, resume = valid_uploads()
     created = await manager.create_session(
         job_url=JOB_URL,
+        opportunity_kind="job",
         allow_domains=[],
         max_steps=2,
         personal_information=personal,
@@ -4333,7 +4353,7 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
         ),
     )
 
-    created = await create_valid(manager)
+    created = await create_valid(manager, opportunity_kind="hackathon")
     record = manager._active
     assert record is not None
     assert record.human_gate is not None
@@ -4343,6 +4363,7 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     call = fakes.models[0].run_calls[0]
     assert set(call) == {
         "runtime_url",
+        "opportunity_kind",
         "auto_submit",
         "task",
         "max_turns",
@@ -4352,6 +4373,11 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     assert call["runtime_url"] == "http://127.0.0.1:8765"
     task = json.loads(call["task"])
     assert task["job"]["url"] == JOB_URL
+    assert call["opportunity_kind"] == "hackathon"
+    assert task["job"]["opportunity_kind"] == "hackathon"
+    assert "opportunity_kind" not in manager.get_snapshot(
+        created.session_id
+    ).model_dump(mode="json")
     assert task["user_info"]["explicit"]["email"] == PROFILE_SECRET
     assert task["user_info"]["saved_global"] == {
         "availability.summer_2027": {

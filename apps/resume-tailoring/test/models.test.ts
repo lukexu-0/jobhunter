@@ -546,7 +546,7 @@ describe("direct Luna job extractor", () => {
         model: LUNA_MODEL_NAME,
         content: [
           { type: "thinking", thinking: "selecting coherent source" },
-          { type: "text", text: "{\"ranges\":[{\"startLine\":2,\"endLine\":3}]}" },
+          { type: "text", text: "{\"kind\":\"job\",\"ranges\":[{\"startLine\":2,\"endLine\":3}]}" },
         ],
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: ZERO_COST },
         stopReason: "stop",
@@ -575,7 +575,10 @@ describe("direct Luna job extractor", () => {
 
     const combinedSignal = resolverSignal;
     if (!combinedSignal) throw new Error("Expected the resolver to receive a combined signal");
-    expect(result).toBe("Senior Engineer at Acme Corporation\nBuild reliable distributed systems with a collaborative product team.");
+    expect(result).toEqual({
+      opportunityKind: "job",
+      jobDescription: "Senior Engineer at Acme Corporation\nBuild reliable distributed systems with a collaborative product team.",
+    });
     expect(optionsSeen).toEqual({
       apiKey: resolver,
       signal: combinedSignal,
@@ -605,6 +608,23 @@ describe("direct Luna job extractor", () => {
     });
   });
 
+  test("classifies sanitized fallback selections as opportunity kinds", async () => {
+    const result = await extractJobDescriptionWithLuna([
+      "Example Labs Hackathon",
+      "Build a climate solution with the supplied API and submit it by Friday.",
+    ], undefined, {
+      resolverFactory: () => inertResolver(),
+      transport: async () => lunaAssistant(
+        "{\"kind\":\"hackathon\",\"ranges\":[{\"startLine\":1,\"endLine\":2}]}",
+      ),
+    });
+
+    expect(result).toEqual({
+      opportunityKind: "hackathon",
+      jobDescription: "Example Labs Hackathon\nBuild a climate solution with the supplied API and submit it by Friday.",
+    });
+  });
+
   test("accepts null and valid disjoint ranges while enforcing final description character bounds", async () => {
     const source = [
       "Principal Engineer at Example Incorporated",
@@ -615,16 +635,17 @@ describe("direct Luna job extractor", () => {
       resolverFactory: () => inertResolver(),
       sessionIdFactory: () => "job-ingestion-ranges",
       transport: async () => lunaAssistant(
-        "{\"ranges\":[{\"startLine\":1,\"endLine\":1},{\"startLine\":3,\"endLine\":3}]}",
+        "{\"kind\":\"job\",\"ranges\":[{\"startLine\":1,\"endLine\":1},{\"startLine\":3,\"endLine\":3}]}",
         { content: [
           { type: "redactedThinking", data: "opaque" },
-          { type: "text", text: "{\"ranges\":[{\"startLine\":1,\"endLine\":1},{\"startLine\":3,\"endLine\":3}]}" },
+          { type: "text", text: "{\"kind\":\"job\",\"ranges\":[{\"startLine\":1,\"endLine\":1},{\"startLine\":3,\"endLine\":3}]}" },
         ] },
       ),
     });
-    expect(selected).toBe(
-      "Principal Engineer at Example Incorporated\n\nLead the distributed platform and mentor engineers across the organization.",
-    );
+    expect(selected).toEqual({
+      opportunityKind: "job",
+      jobDescription: "Principal Engineer at Example Incorporated\n\nLead the distributed platform and mentor engineers across the organization.",
+    });
 
     const noPosting = await extractJobDescriptionWithLuna(source, undefined, {
       resolverFactory: () => inertResolver(),
@@ -634,20 +655,20 @@ describe("direct Luna job extractor", () => {
 
     const belowMinimum = await extractJobDescriptionWithLuna(["Short source"], undefined, {
       resolverFactory: () => inertResolver(),
-      transport: async () => lunaAssistant("{\"ranges\":[{\"startLine\":1,\"endLine\":1}]}"),
+      transport: async () => lunaAssistant("{\"kind\":\"job\",\"ranges\":[{\"startLine\":1,\"endLine\":1}]}"),
     });
     expect(belowMinimum).toBeNull();
     for (const boundary of [40, 50_000]) {
       const exactBoundary = "x".repeat(boundary);
       await expect(extractJobDescriptionWithLuna([exactBoundary], undefined, {
         resolverFactory: () => inertResolver(),
-        transport: async () => lunaAssistant("{\"ranges\":[{\"startLine\":1,\"endLine\":1}]}"),
-      })).resolves.toBe(exactBoundary);
+        transport: async () => lunaAssistant("{\"kind\":\"job\",\"ranges\":[{\"startLine\":1,\"endLine\":1}]}"),
+      })).resolves.toEqual({ opportunityKind: "job", jobDescription: exactBoundary });
     }
 
     await expect(extractJobDescriptionWithLuna(["x".repeat(50_001)], undefined, {
       resolverFactory: () => inertResolver(),
-      transport: async () => lunaAssistant("{\"ranges\":[{\"startLine\":1,\"endLine\":1}]}"),
+      transport: async () => lunaAssistant("{\"kind\":\"job\",\"ranges\":[{\"startLine\":1,\"endLine\":1}]}"),
     })).rejects.toMatchObject({ kind: "unavailable" });
   });
 

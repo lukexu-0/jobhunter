@@ -118,7 +118,11 @@ function fixture(options: FixtureOptions = {}): Fixture {
       return options.idFactory?.() ?? `run-${ids.count}`;
     },
     loadJobSource: options.loadJobSource
-      ?? (async () => ({ kind: "description", jobDescription: JOB_DESCRIPTION })),
+      ?? (async () => ({
+        kind: "description",
+        opportunityKind: "job",
+        jobDescription: JOB_DESCRIPTION,
+      })),
     ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
     validatePublicJobUrl: options.validatePublicJobUrl ?? (async () => undefined),
   });
@@ -428,7 +432,7 @@ describe("RunApplicationService", () => {
       },
       extractJobDescription: async (sourceLines, signal) => {
         observed.extractor = { lines: sourceLines, signal };
-        return selected;
+        return { opportunityKind: "competition", jobDescription: selected };
       },
     });
 
@@ -444,6 +448,7 @@ describe("RunApplicationService", () => {
       "SELECT job_description FROM runs WHERE id = ?",
     ).get(run.id)?.job_description).toBe(selected);
     expect(run.jobUrl).toBe(JOB_URL);
+    expect(run.opportunityKind).toBe("competition");
   });
 
   test("bubbles loader failures and maps only fixed fallback failures before persistence", async () => {
@@ -518,7 +523,7 @@ describe("RunApplicationService", () => {
   test("revalidates and outer-trims every final description before the commit point", async () => {
     const padded = `  ${JOB_DESCRIPTION}  `;
     const validTarget = fixture({
-      loadJobSource: async () => ({ kind: "description", jobDescription: padded }),
+      loadJobSource: async () => ({ kind: "description", opportunityKind: "job", jobDescription: padded }),
     });
     const validRun = await validTarget.service.createRun(JOB_URL);
     const input = validTarget.repository.getArtifact(validRun.id, "job-description")!;
@@ -528,10 +533,7 @@ describe("RunApplicationService", () => {
 
     for (const invalidDescription of ["too short", "x".repeat(50_001)]) {
       const invalidTarget = fixture({
-        loadJobSource: async () => ({
-          kind: "description",
-          jobDescription: invalidDescription,
-        }),
+        loadJobSource: async () => ({ kind: "description", opportunityKind: "job", jobDescription: invalidDescription }),
       });
       await expect(invalidTarget.service.createRun(JOB_URL)).rejects.toMatchObject({
         name: "ZodError",
@@ -548,7 +550,7 @@ describe("RunApplicationService", () => {
     const beforeLoadTarget = fixture({
       loadJobSource: async () => {
         loadCalls += 1;
-        return { kind: "description", jobDescription: JOB_DESCRIPTION };
+        return { kind: "description", opportunityKind: "job", jobDescription: JOB_DESCRIPTION };
       },
     });
     await expect(beforeLoadTarget.service.createRun(
@@ -580,11 +582,14 @@ describe("RunApplicationService", () => {
     );
     expect(loaderSignal).toBe(loadingController.signal);
     loadingController.abort(loadingReason);
-    loading.resolve({ kind: "description", jobDescription: JOB_DESCRIPTION });
+    loading.resolve({ kind: "description", opportunityKind: "job", jobDescription: JOB_DESCRIPTION });
     await expect(loadingRun).rejects.toBe(loadingReason);
     expectNoPersistence(loadingTarget);
 
-    const extracting = Promise.withResolvers<string | null>();
+    const extracting = Promise.withResolvers<{
+      readonly opportunityKind: "job";
+      readonly jobDescription: string;
+    } | null>();
     const extractorStarted = Promise.withResolvers<void>();
     const extractingController = new AbortController();
     const extractingReason = new Error("cancelled while extracting");
@@ -607,7 +612,7 @@ describe("RunApplicationService", () => {
     await extractorStarted.promise;
     expect(extractorSignal).toBe(extractingController.signal);
     extractingController.abort(extractingReason);
-    extracting.resolve(JOB_DESCRIPTION);
+    extracting.resolve({ opportunityKind: "job", jobDescription: JOB_DESCRIPTION });
     await expect(extractingRun).rejects.toBe(extractingReason);
     expectNoPersistence(extractingTarget);
 

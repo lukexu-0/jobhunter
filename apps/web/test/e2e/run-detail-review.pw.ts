@@ -275,6 +275,7 @@ function runFixture(options: {
   const pdfSha256 = options.pdfSha256 === undefined ? pdfHash2 : options.pdfSha256;
   return RunDtoSchema.parse({
     id: runId,
+    opportunityKind: "job",
     status: options.status ?? "review",
     applicationStatus: "pending",
     generateKeywordMap: true,

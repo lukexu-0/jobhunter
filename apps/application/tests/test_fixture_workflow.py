@@ -391,6 +391,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
         created = await manager.create_session(
             session_id=_CALLER_SESSION_ID,
             job_url=fixture.posting_url,
+            opportunity_kind="job",
             allow_domains=[fixture.form_origin],
             auto_submit=True,
             max_steps=20,
