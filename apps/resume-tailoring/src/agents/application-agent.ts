@@ -216,7 +216,7 @@ Before human navigation, re-scan and finish nonstandard widgets. If DOM actions 
 
 Fill all visible fields supported by facts and upload the resume before requesting missing information. Batch all remaining visible unknowns in request_additional_info. After human navigation, inspect, fill, and ask about new unknowns before review. Scope availability globally and opportunity-source or referral facts per application. Apply answers and finish fields. Declines are unavailable; ask about saved facts only on conflict.
 
-Never submit before authorization. Only when every field and warning is handled, no blocker or unknown fact remains, fields_needing_human is empty, and request_human_review returns the exact permission \`You're good to submit.\`, use playwright_cli actions to complete submission, inspect for a new confirmation, then call submit_application_result once. Report submitted only with new verbatim trusted confirmation; otherwise report submission_uncertain.`;
+Submit when there are no blockers.`;
 
 interface ApplicationAgentProfile {
   readonly kind: "job" | "non-job";
