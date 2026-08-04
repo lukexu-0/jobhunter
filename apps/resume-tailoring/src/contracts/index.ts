@@ -226,6 +226,42 @@ export const AdditionalInfoQuestionSchema = z.discriminatedUnion("answer_type", 
 ]);
 export type AdditionalInfoQuestion = z.infer<typeof AdditionalInfoQuestionSchema>;
 
+const ApplicationAnswerTextSchema = z.string().trim()
+  .refine((value) => hasCodePointLength(value, 1, 2_000));
+
+export const ApplicationAnswerSuggestionSchema = z.object({
+  question: AdditionalInfoQuestionTextSchema,
+  answer: ApplicationAnswerTextSchema,
+}).strict();
+export type ApplicationAnswerSuggestion = z.infer<
+  typeof ApplicationAnswerSuggestionSchema
+>;
+
+export const ApplicationAnswerSuggestionsResponseSchema = z.object({
+  suggestions: z.array(ApplicationAnswerSuggestionSchema).max(5),
+}).strict();
+export type ApplicationAnswerSuggestionsResponse = z.infer<
+  typeof ApplicationAnswerSuggestionsResponseSchema
+>;
+
+export const ApplicationProfessionalizeRequestSchema = z.object({
+  promptId: z.literal("default"),
+  draft: ApplicationAnswerTextSchema,
+  instruction: z.string().trim()
+    .refine((value) => hasCodePointLength(value, 1, 1_000))
+    .optional(),
+}).strict();
+export type ApplicationProfessionalizeRequest = z.infer<
+  typeof ApplicationProfessionalizeRequestSchema
+>;
+
+export const ApplicationProfessionalizeResponseSchema = z.object({
+  answer: ApplicationAnswerTextSchema,
+}).strict();
+export type ApplicationProfessionalizeResponse = z.infer<
+  typeof ApplicationProfessionalizeResponseSchema
+>;
+
 const ResumeDiffIdSchema = z.string().trim().min(1).max(200);
 const ResumeDiffTextSchema = z.string().trim().min(1).max(2_000);
 
@@ -872,10 +908,6 @@ export type ApplicationSessionEventDto = z.infer<
   typeof ApplicationSessionEventDtoSchema
 >;
 
-const AnsweredTextOrBooleanSchema = z.union([
-  z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
-  z.boolean(),
-]);
 const ApplicationSessionAnswerSchema = z.union([
   z.object({
     id: AdditionalInfoQuestionIdSchema,
@@ -884,7 +916,13 @@ const ApplicationSessionAnswerSchema = z.union([
   z.object({
     id: AdditionalInfoQuestionIdSchema,
     status: z.literal("answered"),
-    value: AnsweredTextOrBooleanSchema,
+    raw_value: ApplicationAnswerTextSchema,
+    value: ApplicationAnswerTextSchema,
+  }).strict(),
+  z.object({
+    id: AdditionalInfoQuestionIdSchema,
+    status: z.literal("answered"),
+    value: z.boolean(),
   }).strict(),
   z.object({
     id: AdditionalInfoQuestionIdSchema,

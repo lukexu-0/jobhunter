@@ -17,6 +17,10 @@ import { createRunRoutes } from "./api/run-routes.ts";
 import { RunApplicationService } from "./api/run-service.ts";
 import type { LoadJobSource } from "./api/job-source.ts";
 import type { ExtractJobDescription } from "./models/luna-job-extractor.ts";
+import {
+  professionalizeApplicationAnswer,
+  type ProfessionalizeApplicationAnswer,
+} from "./models/application-answer-professionalizer.ts";
 import * as defaultAuthService from "./auth/service.ts";
 import { createContextApplicationService, type ContextApplicationService } from "./context/application-service.ts";
 import { openContextDatabase } from "./context/database.ts";
@@ -72,6 +76,7 @@ export interface PipelineApplicationOptions {
   readonly applicationHarnessOrigin?: string;
   readonly applicationHarness?: ApplicationHarnessClient;
   readonly applicationSessions?: PipelineApplicationSessionService;
+  readonly professionalizeAnswer?: ProfessionalizeApplicationAnswer;
 }
 
 /** Internal handles are exposed for typed integration tests, not serialized by any route. */
@@ -127,6 +132,8 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     repository,
     artifacts,
     onApplicationSessionReleased: () => worker?.kick(),
+    professionalizeAnswer:
+      options.professionalizeAnswer ?? professionalizeApplicationAnswer,
     ...(
       options.applicationHarness
         ? { harness: options.applicationHarness }

@@ -1,7 +1,9 @@
 import { z } from "zod";
 import {
+  AdditionalInfoQuestionIdSchema,
   AdditionalInfoQuestionSchema,
   ApplicationAdditionalInfoQuestionSchema,
+  ApplicationAnswerSuggestionsResponseSchema,
   ApplicationPlaywrightCliDiagnosticSchema,
   ApplicationFieldResultSchema,
   ApplicationPendingActionSchema,
@@ -10,6 +12,7 @@ import {
   FieldResultSchema,
   HarnessSessionStateSchema,
   type ApplicationAdditionalInfoQuestion,
+  type ApplicationAnswerSuggestionsResponse,
   type ApplicationPlaywrightCliDiagnostic,
   type ApplicationFieldResult,
   type ApplicationPendingAction,
@@ -362,6 +365,11 @@ export type ApplicationHarnessEvent =
 export interface ApplicationHarnessClient {
   create(input: ApplicationHarnessCreateInput, signal: AbortSignal): Promise<void>;
   get(sessionId: string, signal: AbortSignal): Promise<ApplicationHarnessSnapshot>;
+  suggestions(
+    sessionId: string,
+    questionId: string,
+    signal: AbortSignal,
+  ): Promise<ApplicationAnswerSuggestionsResponse>;
   stream(
     sessionId: string,
     lastEventId: number | undefined,
@@ -965,6 +973,39 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     } catch {
       throw new ApplicationHarnessError("invalid_response");
     }
+  }
+
+  async suggestions(
+    sessionId: string,
+    questionId: string,
+    signal: AbortSignal,
+  ): Promise<ApplicationAnswerSuggestionsResponse> {
+    const parsedSessionId = UUIDSchema.safeParse(sessionId);
+    const parsedQuestionId = AdditionalInfoQuestionIdSchema.safeParse(questionId);
+    if (!parsedSessionId.success || !parsedQuestionId.success) {
+      throw new ApplicationHarnessError("invalid_request");
+    }
+    const response = await this.#request(
+      `/v1/sessions/${parsedSessionId.data}/additional-info/${parsedQuestionId.data}/suggestions`,
+      { method: "GET", headers: { accept: "application/json" } },
+      signal,
+    );
+    if (!response.ok) await mapErrorResponse(response, parsedSessionId.data, signal);
+    if (response.status !== 200) {
+      await cancelResponse(response);
+      throw new ApplicationHarnessError("invalid_response");
+    }
+    let body: unknown;
+    try {
+      body = await readBoundedJson(response, signal, MAX_ERROR_BYTES);
+    } catch (error) {
+      if (signal.aborted) throw abortReason(signal);
+      if (error instanceof ApplicationHarnessError) throw error;
+      throw new ApplicationHarnessError("invalid_response");
+    }
+    const suggestions = ApplicationAnswerSuggestionsResponseSchema.safeParse(body);
+    if (!suggestions.success) throw new ApplicationHarnessError("invalid_response");
+    return suggestions.data;
   }
 
   async stream(

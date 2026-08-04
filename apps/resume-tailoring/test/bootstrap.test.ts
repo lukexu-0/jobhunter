@@ -8,6 +8,7 @@ import type { ApplicationAgentRouteService } from "../src/agents/application-age
 import {
   createPipelineApplication,
   type PipelineApplicationOptions,
+  type PipelineApplicationSessionService,
   type PipelineWorkerHandle,
 } from "../src/bootstrap.ts";
 import {
@@ -42,6 +43,7 @@ interface IngestionOverrides {
   readonly extractJobDescription?: ExtractJobDescription;
   readonly browserHarnessToken?: string;
   readonly applicationAgent?: ApplicationAgentRouteService;
+  readonly applicationSessions?: PipelineApplicationSessionService;
   readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
   readonly beforeApplication?: (
     repository: PipelineRepository,
@@ -135,6 +137,9 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
       : {}),
     ...(ingestion.applicationAgent
       ? { applicationAgent: ingestion.applicationAgent }
+      : {}),
+    ...(ingestion.applicationSessions
+      ? { applicationSessions: ingestion.applicationSessions }
       : {}),
     loadJobSource: ingestion.loadJobSource ?? (async (jobUrl, signal): Promise<LoadedJobSource> => {
       calls.loadedUrls.push(jobUrl);
@@ -235,6 +240,90 @@ describe("pipeline application bootstrap", () => {
     expect(publicBodies).not.toContain(fixture.artifactRoot);
     expect(publicBodies).not.toContain("secret-value");
     expect(publicBodies.toLowerCase()).not.toContain("token");
+    await fixture.app.close();
+  });
+
+  test("composes the injected application answer tools through the public route boundary", async () => {
+    const calls: unknown[] = [];
+    const applicationSessions: PipelineApplicationSessionService = {
+      get: async () => ({
+        state: "not_started",
+        canStart: false,
+        canStartAfterApproval: false,
+        blockedReason: "resume_not_approved",
+      }),
+      start: async () => { throw new Error("unexpected start"); },
+      retry: async () => { throw new Error("unexpected retry"); },
+      suggestions: async (runId, questionId, signal) => {
+        calls.push({ operation: "suggestions", runId, questionId, signal });
+        return {
+          suggestions: [{
+            question: "What impact did you have?",
+            answer: "I improved reliability.",
+          }],
+        };
+      },
+      professionalize: async (runId, questionId, request, signal) => {
+        calls.push({ operation: "professionalize", runId, questionId, request, signal });
+        return { answer: "I improved reliability." };
+      },
+      events: async function* () {},
+      command: async () => {},
+      close: async () => {},
+      startNextAutomaticApplication: async () => false,
+    };
+    const fixture = createFixture(false, { applicationSessions });
+
+    const suggestionsPath =
+      "/v1/runs/run-1/application/additional-info/impact/suggestions";
+    for (const rejectedRequest of [
+      new Request(`http://127.0.0.1:3457${suggestionsPath}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+      mutation(suggestionsPath, {}, "https://attacker.invalid"),
+    ]) {
+      const rejected = await fixture.app.fetch(rejectedRequest);
+      expect(rejected.status).toBe(403);
+      expect(await rejected.json()).toEqual({
+        error: { code: "ORIGIN_REJECTED", message: "Mutation origin is not allowed" },
+      });
+    }
+    expect(calls).toEqual([]);
+
+    const suggestions = await fixture.app.fetch(mutation(suggestionsPath, {}));
+    expect(suggestions.status).toBe(200);
+    expect(await suggestions.json()).toEqual({
+      suggestions: [{
+        question: "What impact did you have?",
+        answer: "I improved reliability.",
+      }],
+    });
+
+    const professionalized = await fixture.app.fetch(mutation(
+      "/v1/runs/run-1/application/additional-info/impact/professionalize",
+      { promptId: "default", draft: "improved reliability" },
+    ));
+    expect(professionalized.status).toBe(200);
+    expect(await professionalized.json()).toEqual({
+      answer: "I improved reliability.",
+    });
+    expect(calls).toEqual([
+      {
+        operation: "suggestions",
+        runId: "run-1",
+        questionId: "impact",
+        signal: expect.any(AbortSignal),
+      },
+      {
+        operation: "professionalize",
+        runId: "run-1",
+        questionId: "impact",
+        request: { promptId: "default", draft: "improved reliability" },
+        signal: expect.any(AbortSignal),
+      },
+    ]);
     await fixture.app.close();
   });
 

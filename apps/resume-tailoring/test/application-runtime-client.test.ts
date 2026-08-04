@@ -307,7 +307,8 @@ test("strictly validates application commands and not-started views", () => {
       {
         id: "summer_availability",
         status: "answered" as const,
-        value: "June through August 2027",
+        raw_value: "June through August 2027",
+        value: "I am available from June through August 2027.",
       },
       {
         id: "work_setting",

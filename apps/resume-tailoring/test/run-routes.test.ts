@@ -581,6 +581,8 @@ function applicationService(
   return {
     get: async () => applicationView,
     start: async () => applicationSnapshot,
+    suggestions: async () => ({ suggestions: [] }),
+    professionalize: async () => ({ answer: "Professional answer." }),
     retry: async () => applicationSnapshot,
     events: async function* (): AsyncGenerator<ApplicationSessionStreamItem> {},
     command: async () => {},
@@ -631,6 +633,193 @@ describe("application session HTTP routes", () => {
       signal: expect.any(AbortSignal),
     });
   });
+
+  test("serves strict current-question suggestions and professionalization DTOs", async () => {
+    const calls: unknown[] = [];
+    const target = applicationService({
+      suggestions: async (runId, questionId, requestSignal) => {
+        calls.push({ operation: "suggestions", runId, questionId, signal: requestSignal });
+        return {
+          suggestions: [{
+            question: "What impact did you have?",
+            answer: "I improved reliability using the supplied evidence.",
+          }],
+        };
+      },
+      professionalize: async (runId, questionId, body, requestSignal) => {
+        calls.push({
+          operation: "professionalize",
+          runId,
+          questionId,
+          body,
+          signal: requestSignal,
+        });
+        return { answer: "I improved reliability using the supplied evidence." };
+      },
+    });
+
+    const suggestions = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/additional-info/impact/suggestions",
+      post({}),
+    );
+    expect(suggestions.status).toBe(200);
+    expect(suggestions.headers.get("cache-control")).toBe("no-store");
+    expect(await suggestions.json()).toEqual({
+      suggestions: [{
+        question: "What impact did you have?",
+        answer: "I improved reliability using the supplied evidence.",
+      }],
+    });
+
+    const professionalized = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/additional-info/impact/professionalize",
+      post({
+        promptId: "default",
+        draft: "  improved reliability  ",
+        instruction: "  Use a complete sentence.  ",
+      }),
+    );
+    expect(professionalized.status).toBe(200);
+    expect(professionalized.headers.get("cache-control")).toBe("no-store");
+    expect(await professionalized.json()).toEqual({
+      answer: "I improved reliability using the supplied evidence.",
+    });
+    expect(calls).toEqual([
+      {
+        operation: "suggestions",
+        runId: "run-1",
+        questionId: "impact",
+        signal: expect.any(AbortSignal),
+      },
+      {
+        operation: "professionalize",
+        runId: "run-1",
+        questionId: "impact",
+        body: {
+          promptId: "default",
+          draft: "improved reliability",
+          instruction: "Use a complete sentence.",
+        },
+        signal: expect.any(AbortSignal),
+      },
+    ]);
+  });
+
+  test("bounds and strictly validates answer-tool route inputs and outputs", async () => {
+    let professionalizeCalls = 0;
+    let suggestionCalls = 0;
+    const target = applicationService({
+      professionalize: async () => {
+        professionalizeCalls += 1;
+        return {
+          answer: "Safe answer.",
+          rawValue: "PRIVATE RAW VALUE",
+        } as never;
+      },
+      suggestions: async () => {
+        suggestionCalls += 1;
+        return {
+          suggestions: [{
+            question: "Question",
+            answer: "Answer",
+            key: "private.storage.key",
+          }],
+        } as never;
+      },
+    });
+
+    const badQuestionId = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/additional-info/INVALID-ID/suggestions",
+      post({}),
+    );
+    expect(badQuestionId.status).toBe(400);
+    expect(await badQuestionId.json()).toEqual({
+      error: { code: "INVALID_REQUEST", message: "Application question is invalid" },
+    });
+
+    const legacyGet = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/additional-info/impact/suggestions",
+    );
+    expect(legacyGet.status).toBe(404);
+    for (const init of [
+      post({ extra: true }),
+      {
+        method: "POST",
+        headers: { origin: ORIGIN, "content-type": "application/json" },
+      },
+    ]) {
+      const response = await applicationRequest(
+        target,
+        "/v1/runs/run-1/application/additional-info/impact/suggestions",
+        init,
+      );
+      expect(response.status).toBe(400);
+    }
+    expect(suggestionCalls).toBe(0);
+
+    for (const body of [
+      {},
+      { promptId: "custom", draft: "draft" },
+      { promptId: "default", draft: "" },
+      { promptId: "default", draft: "draft", extra: true },
+    ]) {
+      const response = await applicationRequest(
+        target,
+        "/v1/runs/run-1/application/additional-info/impact/professionalize",
+        post(body),
+      );
+      expect(response.status).toBe(400);
+    }
+    const oversized = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/additional-info/impact/professionalize",
+      post({
+        promptId: "default",
+        draft: "x".repeat(16 * 1024),
+      }),
+    );
+    expect(oversized.status).toBe(413);
+    expect(professionalizeCalls).toBe(0);
+
+    const privateSuggestions = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/additional-info/impact/suggestions",
+      post({}),
+    );
+    expect(privateSuggestions.status).toBe(500);
+    expect(JSON.stringify(await privateSuggestions.json())).not.toContain("private.storage.key");
+    expect(suggestionCalls).toBe(1);
+
+    const privateProfessionalized = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/additional-info/impact/professionalize",
+      post({ promptId: "default", draft: "draft" }),
+    );
+    expect(privateProfessionalized.status).toBe(500);
+    expect(JSON.stringify(await privateProfessionalized.json())).not.toContain("PRIVATE RAW VALUE");
+    const abortController = new AbortController();
+    const abortReason = new Error("caller closed answer request");
+    const aborting = applicationRequest(
+      applicationService({
+        professionalize: async (_runId, _questionId, _body, requestSignal) => {
+          abortController.abort(abortReason);
+          requestSignal.throwIfAborted();
+          throw new Error("unreachable");
+        },
+      }),
+      "/v1/runs/run-1/application/additional-info/impact/professionalize",
+      {
+        ...post({ promptId: "default", draft: "draft" }),
+        signal: abortController.signal,
+      },
+    );
+    await expect(aborting).rejects.toBe(abortReason);
+  });
+
 
   test("retries, sends a validated command, and closes with empty no-store responses", async () => {
     const calls: string[] = [];
@@ -684,12 +873,17 @@ describe("application session HTTP routes", () => {
 
   test("rejects malformed requests through the public Origin and JSON boundary", async () => {
     let starts = 0;
+    let suggestions = 0;
     let commands = 0;
     let closes = 0;
     const target = applicationService({
       start: async () => {
         starts += 1;
         return applicationSnapshot;
+      },
+      suggestions: async () => {
+        suggestions += 1;
+        return { suggestions: [] };
       },
       command: async () => {
         commands += 1;
@@ -712,6 +906,25 @@ describe("application session HTTP routes", () => {
     expect(await missingOrigin.json()).toEqual({
       error: { code: "ORIGIN_REJECTED", message: "Mutation origin is not allowed" },
     });
+
+    for (const headers of [
+      new Headers({ "content-type": "application/json" }),
+      new Headers({
+        origin: "https://attacker.invalid",
+        "content-type": "application/json",
+      }),
+    ]) {
+      const rejectedSuggestions = await applicationRequest(
+        target,
+        "/v1/runs/run-1/application/additional-info/impact/suggestions",
+        { method: "POST", headers, body: "{}" },
+      );
+      expect(rejectedSuggestions.status).toBe(403);
+      expect(await rejectedSuggestions.json()).toEqual({
+        error: { code: "ORIGIN_REJECTED", message: "Mutation origin is not allowed" },
+      });
+    }
+    expect(suggestions).toBe(0);
 
     const wrongMediaType = await applicationRequest(
       target,
@@ -833,6 +1046,30 @@ describe("application session HTTP routes", () => {
     expect(await conflict.json()).toEqual({
       error: { code: "RUN_CONFLICT", message: "application session is not live" },
     });
+
+    for (const [code, status, message] of [
+      [
+        "APPLICATION_QUESTION_STALE",
+        409,
+        "The application question changed; review the latest session state",
+      ],
+      ["OAUTH_REQUIRED", 409, "Connect OpenAI Codex in Provider access"],
+      ["MODEL_TIMEOUT", 504, "The model request timed out"],
+      ["INVALID_MODEL_OUTPUT", 502, "The model returned invalid output"],
+      ["MODEL_PROVIDER_FAILED", 502, "The model request failed"],
+    ] as const) {
+      const response = await applicationRequest(
+        applicationService({
+          professionalize: async () => {
+            throw new ApplicationSessionServiceError(code);
+          },
+        }),
+        "/v1/runs/run-1/application/additional-info/impact/professionalize",
+        post({ promptId: "default", draft: "draft" }),
+      );
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({ error: { code, message } });
+    }
 
     const unexpected = await applicationRequest(
       applicationService({

@@ -1,9 +1,17 @@
+import { z } from "zod";
 import {
+  AdditionalInfoQuestionIdSchema,
+  ApplicationAnswerSuggestionsResponseSchema,
+  ApplicationProfessionalizeRequestSchema,
+  ApplicationProfessionalizeResponseSchema,
   ApplicationSessionEventDtoSchema,
   ApplicationSessionCommandSchema,
   ApplicationSessionSnapshotDtoSchema,
   ApplicationSessionViewSchema,
   StartApplicationSessionRequestSchema,
+  type ApplicationAnswerSuggestionsResponse,
+  type ApplicationProfessionalizeRequest,
+  type ApplicationProfessionalizeResponse,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
   type ApplicationSessionView,
@@ -16,6 +24,10 @@ import {
 import { apiResponse } from "./handler";
 import { RunServiceError } from "./run-service";
 
+
+const MAX_APPLICATION_ANSWER_REQUEST_BYTES = 16 * 1024;
+class ApplicationAnswerRequestTooLargeError extends Error {}
+const EmptyApplicationSuggestionsRequestSchema = z.object({}).strict();
 export interface ApplicationSessionRouteService {
   get(runId: string): Promise<ApplicationSessionView> | ApplicationSessionView;
   start(
@@ -23,6 +35,17 @@ export interface ApplicationSessionRouteService {
     expectedApprovedPdfSha256: string,
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto>;
+  suggestions(
+    runId: string,
+    questionId: string,
+    signal: AbortSignal,
+  ): Promise<ApplicationAnswerSuggestionsResponse>;
+  professionalize(
+    runId: string,
+    questionId: string,
+    request: ApplicationProfessionalizeRequest,
+    signal: AbortSignal,
+  ): Promise<ApplicationProfessionalizeResponse>;
   retry(
     runId: string,
     expectedApprovedPdfSha256: string,
@@ -52,7 +75,66 @@ async function parseBody(request: Request): Promise<unknown> {
   }
 }
 
+async function parseBoundedApplicationAnswerBody(request: Request): Promise<unknown> {
+  const contentLength = request.headers.get("content-length");
+  if (
+    contentLength !== null
+    && /^\d+$/.test(contentLength.trim())
+    && Number(contentLength) > MAX_APPLICATION_ANSWER_REQUEST_BYTES
+  ) {
+    await request.body?.cancel().catch(() => undefined);
+    throw new ApplicationAnswerRequestTooLargeError();
+  }
+  if (request.body === null) {
+    throw Object.assign(new Error("Request body is not valid JSON"), {
+      code: "INVALID_JSON",
+      status: 400,
+    });
+  }
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytesRead = 0;
+  let json = "";
+  const cancelRead = (): void => {
+    void reader.cancel(request.signal.reason).catch(() => undefined);
+  };
+  if (request.signal.aborted) cancelRead();
+  else request.signal.addEventListener("abort", cancelRead, { once: true });
+  try {
+    while (true) {
+      const item = await reader.read();
+      request.signal.throwIfAborted();
+      if (item.done) break;
+      bytesRead += item.value.byteLength;
+      if (bytesRead > MAX_APPLICATION_ANSWER_REQUEST_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new ApplicationAnswerRequestTooLargeError();
+      }
+      json += decoder.decode(item.value, { stream: true });
+    }
+    json += decoder.decode();
+    return JSON.parse(json);
+  } catch (error) {
+    if (request.signal.aborted) request.signal.throwIfAborted();
+    if (error instanceof ApplicationAnswerRequestTooLargeError) throw error;
+    throw Object.assign(new Error("Request body is not valid JSON"), {
+      code: "INVALID_JSON",
+      status: 400,
+    });
+  } finally {
+    request.signal.removeEventListener("abort", cancelRead);
+    reader.releaseLock();
+  }
+}
+
 function mappedError(error: unknown): Response {
+  if (error instanceof ApplicationAnswerRequestTooLargeError) {
+    return apiResponse.error(
+      "REQUEST_TOO_LARGE",
+      "The application answer request is too large",
+      413,
+    );
+  }
   if (error instanceof ApplicationSessionServiceError || error instanceof RunServiceError) {
     return apiResponse.error(error.code, error.message, error.status);
   }
@@ -175,6 +257,71 @@ export function createApplicationSessionRoutes(service: ApplicationSessionRouteS
       if (request.method === "GET" && segments.length === 4) {
         return apiResponse.json(ApplicationSessionViewSchema.parse(await service.get(runId)));
       }
+      if (
+        segments[4] === "additional-info"
+        && segments[5]
+        && segments.length === 7
+        && segments[6] === "suggestions"
+        && request.method === "POST"
+      ) {
+        const questionId = AdditionalInfoQuestionIdSchema.safeParse(segments[5]);
+        if (!questionId.success) {
+          return apiResponse.error(
+            "INVALID_REQUEST",
+            "Application question is invalid",
+            400,
+          );
+        }
+        const body = EmptyApplicationSuggestionsRequestSchema.safeParse(
+          await parseBody(request),
+        );
+        if (!body.success) {
+          return apiResponse.error(
+            "INVALID_REQUEST",
+            "Application suggestions request is invalid",
+            400,
+          );
+        }
+        const response = await service.suggestions(
+          runId,
+          questionId.data,
+          request.signal,
+        );
+        return apiResponse.json(ApplicationAnswerSuggestionsResponseSchema.parse(response));
+      }
+      if (
+        segments[4] === "additional-info"
+        && segments[5]
+        && segments.length === 7
+        && segments[6] === "professionalize"
+        && request.method === "POST"
+      ) {
+        const questionId = AdditionalInfoQuestionIdSchema.safeParse(segments[5]);
+        if (!questionId.success) {
+          return apiResponse.error(
+            "INVALID_REQUEST",
+            "Application question is invalid",
+            400,
+          );
+        }
+        const body = ApplicationProfessionalizeRequestSchema.safeParse(
+          await parseBoundedApplicationAnswerBody(request),
+        );
+        if (!body.success) {
+          return apiResponse.error(
+            "INVALID_REQUEST",
+            "Application professionalization request is invalid",
+            400,
+          );
+        }
+        const response = await service.professionalize(
+          runId,
+          questionId.data,
+          body.data,
+          request.signal,
+        );
+        return apiResponse.json(ApplicationProfessionalizeResponseSchema.parse(response));
+      }
       if (request.method === "POST" && segments.length === 4) {
         const body = StartApplicationSessionRequestSchema.safeParse(await parseBody(request));
         if (!body.success) {
@@ -246,6 +393,7 @@ export function createApplicationSessionRoutes(service: ApplicationSessionRouteS
       }
       return null;
     } catch (error) {
+      if (request.signal.aborted) throw request.signal.reason;
       return mappedError(error);
     }
   };

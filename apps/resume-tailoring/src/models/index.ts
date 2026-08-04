@@ -1,3 +1,4 @@
+export * from "./application-answer-professionalizer";
 export * from "./agents-mapping";
 export * from "./visual-inspector";
 export * from "./luna-job-extractor";

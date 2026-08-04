@@ -15,7 +15,17 @@ import {
   type ApplicationSessionStreamItem,
   readApplicantProfileMarkdown,
 } from "../src/api/application-session-service.ts";
-import type { ApplicationSessionCommand, ApplicationSessionEventDto } from "../src/contracts/index.ts";
+import type {
+  ApplicationAnswerSuggestionsResponse,
+  ApplicationProfessionalizeRequest,
+  ApplicationSessionCommand,
+  ApplicationSessionEventDto,
+} from "../src/contracts/index.ts";
+import { OAuthRequiredError } from "../src/auth/oauth-only-resolver.ts";
+import {
+  ApplicationAnswerProfessionalizationError,
+  type ProfessionalizeApplicationAnswer,
+} from "../src/models/application-answer-professionalizer.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
 import {
   PipelineRepository,
@@ -68,6 +78,24 @@ function harnessReviewSnapshot(): ApplicationHarnessSnapshot {
   };
 }
 
+function harnessTextQuestionSnapshot(
+  question = "What name should applications use?",
+  id = "preferred_name",
+): ApplicationHarnessSnapshot {
+  return {
+    ...harnessSnapshot("awaiting_additional_info"),
+    pendingAction: {
+      type: "additional_info",
+      questions: [{
+        id,
+        scope: "global",
+        question,
+        answerType: "text",
+      }],
+    },
+  };
+}
+
 class FakeHarness implements ApplicationHarnessClient {
   readonly createCalls: ApplicationHarnessCreateInput[] = [];
   readonly getCalls: string[] = [];
@@ -75,10 +103,13 @@ class FakeHarness implements ApplicationHarnessClient {
   readonly streamSignals: AbortSignal[] = [];
   readonly commandCalls: Array<{ sessionId: string; command: ApplicationSessionCommand }> = [];
   readonly deleteCalls: string[] = [];
+  readonly suggestionCalls: Array<{ sessionId: string; questionId: string }> = [];
   readonly snapshots = new Map<string, ApplicationHarnessSnapshot>();
   events: ApplicationHarnessEvent[] = [];
   readonly getReplies: Array<Promise<ApplicationHarnessSnapshot>> = [];
   readonly streamReplies: Array<Promise<AsyncIterable<ApplicationHarnessEvent>>> = [];
+  readonly suggestionReplies: Array<Promise<ApplicationAnswerSuggestionsResponse>> = [];
+  suggestionsResponse: ApplicationAnswerSuggestionsResponse = { suggestions: [] };
   createError: ApplicationHarnessError | null = null;
   commandError: ApplicationHarnessError | null = null;
   deleteError: ApplicationHarnessError | null = null;
@@ -107,6 +138,16 @@ class FakeHarness implements ApplicationHarnessClient {
     const snapshot = this.snapshots.get(sessionId);
     if (!snapshot) throw new ApplicationHarnessError("session_not_found");
     return snapshot;
+  }
+
+  async suggestions(
+    sessionId: string,
+    questionId: string,
+  ): Promise<ApplicationAnswerSuggestionsResponse> {
+    this.suggestionCalls.push({ sessionId, questionId });
+    const queued = this.suggestionReplies.shift();
+    if (queued) return await queued;
+    return this.suggestionsResponse;
   }
 
   async stream(
@@ -209,6 +250,7 @@ async function createTarget(options: {
   profileReader?: () => string | Promise<string>;
   sessionIds?: string[];
   onApplicationSessionReleased?: () => void;
+  professionalizeAnswer?: ProfessionalizeApplicationAnswer;
 } = {}) {
   let now = 1_000;
   const database = openPipelineDatabase(":memory:", { now: () => now });
@@ -241,6 +283,9 @@ async function createTarget(options: {
     uuidFactory: () => sessionIds[sessionIndex++] ?? SECOND_SESSION_ID,
     now: () => now,
     profileReader: options.profileReader ?? (() => PROFILE),
+    ...(options.professionalizeAnswer
+      ? { professionalizeAnswer: options.professionalizeAnswer }
+      : {}),
     ...(options.onApplicationSessionReleased
       ? { onApplicationSessionReleased: options.onApplicationSessionReleased }
       : {}),
@@ -1858,9 +1903,15 @@ describe("application session service", () => {
       signal(),
     );
     const privateAnswer = "PRIVATE ANSWER VALUE";
+    const privateFinalAnswer = "PROFESSIONAL PRIVATE ANSWER";
     const command: ApplicationSessionCommand = {
       type: "provide_additional_info",
-      answers: [{ id: "preferred_name", status: "answered", value: privateAnswer }],
+      answers: [{
+        id: "preferred_name",
+        status: "answered",
+        raw_value: privateAnswer,
+        value: privateFinalAnswer,
+      }],
     };
     await commandTarget.service.command(commandTarget.runId, command, signal());
     expect(commandHarness.commandCalls).toEqual([{
@@ -1870,6 +1921,9 @@ describe("application session service", () => {
     expect(JSON.stringify(
       commandTarget.repository.getLatestApplicationSession(commandTarget.runId)?.publicSnapshot,
     )).not.toContain(privateAnswer);
+    expect(JSON.stringify(
+      commandTarget.repository.getLatestApplicationSession(commandTarget.runId)?.publicSnapshot,
+    )).not.toContain(privateFinalAnswer);
 
     const getCallCountBeforeConflict = commandHarness.getCalls.length;
     commandHarness.commandError = new ApplicationHarnessError("command_conflict");
@@ -2170,5 +2224,201 @@ describe("application session service", () => {
     expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
     await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
       .rejects.toMatchObject({ code: "APPLICATION_SUBMISSION_FINAL", status: 409 });
+  });
+
+  test("brokers only strict suggestions for the current live text question", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessTextQuestionSnapshot();
+    harness.suggestionsResponse = {
+      suggestions: [{
+        question: "What name should applications use?",
+        answer: "Please use Alex Morgan.",
+      }],
+    };
+    const target = await createTarget({ harness });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+
+    await expect(target.service.suggestions(
+      target.runId,
+      "preferred_name",
+      signal(),
+    )).resolves.toEqual(harness.suggestionsResponse);
+    expect(harness.suggestionCalls).toEqual([{
+      sessionId: FIRST_SESSION_ID,
+      questionId: "preferred_name",
+    }]);
+    expect(JSON.stringify(await target.service.suggestions(
+      target.runId,
+      "preferred_name",
+      signal(),
+    ))).not.toContain("key");
+
+    harness.snapshots.set(FIRST_SESSION_ID, {
+      ...harnessSnapshot("awaiting_additional_info"),
+      pendingAction: {
+        type: "additional_info",
+        questions: [{
+          id: "preferred_name",
+          scope: "global",
+          question: "May we contact your manager?",
+          answerType: "boolean",
+        }],
+      },
+    });
+    await expect(target.service.suggestions(
+      target.runId,
+      "preferred_name",
+      signal(),
+    )).rejects.toMatchObject({
+      code: "APPLICATION_QUESTION_STALE",
+      status: 409,
+    });
+    expect(harness.suggestionCalls).toHaveLength(2);
+  });
+
+  test("does not return suggestions after the pending question changes during the broker call", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessTextQuestionSnapshot();
+    const pending = deferred<ApplicationAnswerSuggestionsResponse>();
+    harness.suggestionReplies.push(pending.promise);
+    const target = await createTarget({ harness });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+
+    const request = target.service.suggestions(
+      target.runId,
+      "preferred_name",
+      signal(),
+    );
+    await Promise.resolve();
+    harness.snapshots.set(
+      FIRST_SESSION_ID,
+      harnessTextQuestionSnapshot("What legal name should applications use?"),
+    );
+    pending.resolve({
+      suggestions: [{
+        question: "Private prior question",
+        answer: "Private prior answer",
+      }],
+    });
+
+    const error = await request.catch((reason: unknown) => reason);
+    expect(error).toMatchObject({
+      code: "APPLICATION_QUESTION_STALE",
+      message: "The application question changed; review the latest session state",
+      status: 409,
+    });
+    expect(JSON.stringify(error)).not.toContain("Private prior");
+  });
+
+  test("professionalizes the current text question and rejects a result when the gate changes", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessTextQuestionSnapshot();
+    const revisions = deferred<string>();
+    const professionalizeCalls: Array<{
+      question: string;
+      request: ApplicationProfessionalizeRequest;
+      signal: AbortSignal | undefined;
+    }> = [];
+    const target = await createTarget({
+      harness,
+      professionalizeAnswer: async (question, request, requestSignal) => {
+        professionalizeCalls.push({ question, request, signal: requestSignal });
+        return await revisions.promise;
+      },
+    });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const requestSignal = signal();
+    const request = target.service.professionalize(
+      target.runId,
+      "preferred_name",
+      {
+        promptId: "default",
+        draft: "call me alex",
+        instruction: "Use a complete sentence.",
+      },
+      requestSignal,
+    );
+    await Promise.resolve();
+    harness.snapshots.set(
+      FIRST_SESSION_ID,
+      harnessTextQuestionSnapshot("What legal name should applications use?"),
+    );
+    revisions.resolve("Please use Alex Morgan.");
+
+    await expect(request).rejects.toMatchObject({
+      code: "APPLICATION_QUESTION_STALE",
+      status: 409,
+    });
+    expect(professionalizeCalls).toEqual([{
+      question: "What name should applications use?",
+      request: {
+        promptId: "default",
+        draft: "call me alex",
+        instruction: "Use a complete sentence.",
+      },
+      signal: requestSignal,
+    }]);
+  });
+
+  test("returns one strict professional answer and maps model failures to bounded public errors", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessTextQuestionSnapshot();
+    const target = await createTarget({
+      harness,
+      professionalizeAnswer: async () => "Please use Alex Morgan.",
+    });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    await expect(target.service.professionalize(
+      target.runId,
+      "preferred_name",
+      { promptId: "default", draft: "call me alex" },
+      signal(),
+    )).resolves.toEqual({ answer: "Please use Alex Morgan." });
+
+    const failures = [
+      [new OAuthRequiredError("openai-codex"), "OAUTH_REQUIRED", 409],
+      [
+        new ApplicationAnswerProfessionalizationError(
+          "timeout",
+          "private timeout detail",
+        ),
+        "MODEL_TIMEOUT",
+        504,
+      ],
+      [
+        new ApplicationAnswerProfessionalizationError(
+          "invalid_output",
+          "private invalid answer",
+        ),
+        "INVALID_MODEL_OUTPUT",
+        502,
+      ],
+      [
+        new ApplicationAnswerProfessionalizationError(
+          "unavailable",
+          "Bearer private provider detail",
+        ),
+        "MODEL_PROVIDER_FAILED",
+        502,
+      ],
+    ] as const;
+    for (const [failure, code, status] of failures) {
+      const failedHarness = new FakeHarness();
+      failedHarness.snapshotAfterCreate = harnessTextQuestionSnapshot();
+      const failed = await createTarget({
+        harness: failedHarness,
+        professionalizeAnswer: async () => { throw failure; },
+      });
+      await failed.service.start(failed.runId, failed.pdf.sha256, signal());
+      const error = await failed.service.professionalize(
+        failed.runId,
+        "preferred_name",
+        { promptId: "default", draft: "draft" },
+        signal(),
+      ).catch((reason: unknown) => reason);
+      expect(error).toMatchObject({ code, status });
+      expect(String(error)).not.toContain("private");
+      expect(String(error)).not.toContain("Bearer");
+    }
   });
 });

@@ -400,7 +400,12 @@ describe("HttpApplicationHarnessClient", () => {
       {
         type: "provide_additional_info",
         answers: [
-          { id: "availability", status: "answered", value: "June 2027" },
+          {
+            id: "availability",
+            status: "answered",
+            raw_value: "June 2027",
+            value: "Available in June 2027.",
+          },
           { id: "sponsorship", status: "answered", value: false },
           { id: "referral", status: "answered", option_id: "company_site" },
           { id: "work_setting", status: "answered", option_ids: ["remote", "onsite"] },
@@ -434,6 +439,84 @@ describe("HttpApplicationHarnessClient", () => {
       "content-type": "application/json",
     });
     expect(calls.at(-1)!.init).toMatchObject({ method: "DELETE" });
+  });
+  test("fetches strict bounded prior-answer suggestions from the private bearer route", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const suggestions = {
+      suggestions: [
+        { question: "When can you start?", answer: "I can start in June 2027." },
+        { question: "What is your availability?", answer: "I am available after four weeks." },
+      ],
+    };
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async (input, init = {}) => {
+        calls.push({ url: String(input), init });
+        return Response.json(suggestions);
+      },
+    });
+    const signal = new AbortController().signal;
+
+    await expect(client.suggestions(SESSION_ID, "availability", signal))
+      .resolves.toEqual(suggestions);
+    expect(calls).toEqual([{
+      url: `${ORIGIN}/v1/sessions/${SESSION_ID}/additional-info/availability/suggestions`,
+      init: expect.objectContaining({
+        method: "GET",
+        redirect: "manual",
+        signal,
+        headers: expect.objectContaining({
+          accept: "application/json",
+          authorization: `Bearer ${TOKEN}`,
+        }),
+      }),
+    }]);
+
+    let invalidFetches = 0;
+    const invalidClient = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => {
+        invalidFetches += 1;
+        return Response.json({ suggestions: [] });
+      },
+    });
+    await expect(invalidClient.suggestions(SESSION_ID, "../private", signal))
+      .rejects.toEqual(new ApplicationHarnessError("invalid_request"));
+    expect(invalidFetches).toBe(0);
+
+    for (const response of [
+      Response.json({
+        suggestions: [{
+          question: "Question",
+          answer: "Answer",
+          key: "private.answer.key",
+          job_url: "https://jobs.private.example/role",
+          raw_value: "private raw answer",
+        }],
+      }),
+      Response.json({
+        suggestions: Array.from(
+          { length: 6 },
+          () => ({ question: "Question", answer: "Answer" }),
+        ),
+      }),
+      new Response("{}", {
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(64 * 1024 + 1),
+        },
+      }),
+    ]) {
+      const strictClient = new HttpApplicationHarnessClient({
+        origin: ORIGIN,
+        token: TOKEN,
+        fetchImpl: async () => response,
+      });
+      await expect(strictClient.suggestions(SESSION_ID, "availability", signal))
+        .rejects.toEqual(new ApplicationHarnessError("invalid_response"));
+    }
   });
   test("incrementally validates and reprojects every SSE event without private fields", async () => {
     const questions = [

@@ -3,15 +3,22 @@ import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+  ApplicationAnswerSuggestionsResponseSchema,
+  ApplicationProfessionalizeResponseSchema,
   ApplicationSessionEventDtoSchema,
   ApplicationSessionSnapshotDtoSchema,
   ApplicationSessionViewSchema,
+  type ApplicationAdditionalInfoQuestion,
+  type ApplicationAnswerSuggestionsResponse,
+  type ApplicationProfessionalizeRequest,
+  type ApplicationProfessionalizeResponse,
   type ApplicationSessionEventDto,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
   type ApplicationSessionView,
 } from "../contracts/index.ts";
 import { REPOSITORY_ROOT } from "../context/manifest.ts";
+import { OAuthRequiredError } from "../auth/oauth-only-resolver.ts";
 import {
   APPLICATION_SUBMISSION_UNCERTAIN_WARNING,
   ApplicationSubmissionFinalError,
@@ -29,6 +36,10 @@ import {
   type ApplicationHarnessEvent,
   type ApplicationHarnessSnapshot,
 } from "./application-harness-client.ts";
+import {
+  ApplicationAnswerProfessionalizationError,
+  type ProfessionalizeApplicationAnswer,
+} from "../models/application-answer-professionalizer.ts";
 import {
   MAX_COMPILED_PDF_BYTES,
   readVerifiedArtifactBytes,
@@ -71,10 +82,18 @@ export type ApplicationSessionServiceErrorCode =
   | "APPLICATION_SOURCE_UNAVAILABLE"
   | "APPLICATION_SESSION_BUSY"
   | "APPLICATION_COMMAND_CONFLICT"
-  | "APPLICATION_SUBMISSION_FINAL";
+  | "APPLICATION_SUBMISSION_FINAL"
+  | "APPLICATION_QUESTION_STALE"
+  | "OAUTH_REQUIRED"
+  | "MODEL_TIMEOUT"
+  | "INVALID_MODEL_OUTPUT"
+  | "MODEL_PROVIDER_FAILED";
 
 const SERVICE_ERRORS: Readonly<
-  Record<ApplicationSessionServiceErrorCode, { readonly message: string; readonly status: 409 | 503 }>
+  Record<
+    ApplicationSessionServiceErrorCode,
+    { readonly message: string; readonly status: 409 | 502 | 503 | 504 }
+  >
 > = Object.freeze({
   APPLICATION_HARNESS_UNAVAILABLE: {
     message: "The local application service is unavailable",
@@ -96,10 +115,30 @@ const SERVICE_ERRORS: Readonly<
     message: "The application submission cannot be retried",
     status: 409,
   },
+  APPLICATION_QUESTION_STALE: {
+    message: "The application question changed; review the latest session state",
+    status: 409,
+  },
+  OAUTH_REQUIRED: {
+    message: "Connect OpenAI Codex in Provider access",
+    status: 409,
+  },
+  MODEL_TIMEOUT: {
+    message: "The model request timed out",
+    status: 504,
+  },
+  INVALID_MODEL_OUTPUT: {
+    message: "The model returned invalid output",
+    status: 502,
+  },
+  MODEL_PROVIDER_FAILED: {
+    message: "The model request failed",
+    status: 502,
+  },
 });
 
 export class ApplicationSessionServiceError extends Error {
-  readonly status: 409 | 503;
+  readonly status: 409 | 502 | 503 | 504;
 
   constructor(readonly code: ApplicationSessionServiceErrorCode) {
     const definition = SERVICE_ERRORS[code];
@@ -119,6 +158,7 @@ export interface ApplicationSessionServiceDependencies {
   readonly now?: () => number;
   readonly profileReader?: ApplicantProfileReader;
   readonly onApplicationSessionReleased?: () => void;
+  readonly professionalizeAnswer?: ProfessionalizeApplicationAnswer;
 }
 
 export interface ApplicationSessionEventCursor {
@@ -302,6 +342,26 @@ interface PreparedStart {
   readonly pdf: PublicArtifact;
 }
 
+interface PendingTextQuestionIdentity {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly question: Extract<
+    ApplicationAdditionalInfoQuestion,
+    { readonly answerType: "text" }
+  >;
+}
+
+function samePendingTextQuestion(
+  left: PendingTextQuestionIdentity,
+  right: PendingTextQuestionIdentity,
+): boolean {
+  return left.sessionId === right.sessionId
+    && left.generation === right.generation
+    && left.question.id === right.question.id
+    && left.question.scope === right.question.scope
+    && left.question.question === right.question.question;
+}
+
 export class ApplicationSessionService {
   readonly #uuidFactory: () => string;
   readonly #now: () => number;
@@ -391,6 +451,81 @@ export class ApplicationSessionService {
       canStart: run.status === "approved",
       canStartAfterApproval: run.status === "review",
     });
+  }
+
+  async suggestions(
+    runId: string,
+    questionId: string,
+    signal: AbortSignal,
+  ): Promise<ApplicationAnswerSuggestionsResponse> {
+    const before = await this.#currentPendingTextQuestion(runId, questionId, signal);
+    const harness = this.dependencies.harness;
+    if (!harness) throw applicationHarnessUnavailable();
+    let suggestions: ApplicationAnswerSuggestionsResponse;
+    try {
+      suggestions = await harness.suggestions(before.sessionId, questionId, signal);
+    } catch (error) {
+      if (signal.aborted) signal.throwIfAborted();
+      if (
+        error instanceof ApplicationHarnessError
+        && (
+          error.code === "session_not_found"
+          || error.code === "session_terminal"
+          || error.code === "command_conflict"
+          || error.code === "invalid_request"
+        )
+      ) {
+        throw new ApplicationSessionServiceError("APPLICATION_QUESTION_STALE");
+      }
+      this.#throwHarnessError(error);
+    }
+    const after = await this.#currentPendingTextQuestion(runId, questionId, signal);
+    if (!samePendingTextQuestion(before, after)) {
+      throw new ApplicationSessionServiceError("APPLICATION_QUESTION_STALE");
+    }
+    const parsed = ApplicationAnswerSuggestionsResponseSchema.safeParse(suggestions);
+    if (!parsed.success) throw applicationHarnessUnavailable();
+    return parsed.data;
+  }
+
+  async professionalize(
+    runId: string,
+    questionId: string,
+    request: ApplicationProfessionalizeRequest,
+    signal: AbortSignal,
+  ): Promise<ApplicationProfessionalizeResponse> {
+    const before = await this.#currentPendingTextQuestion(runId, questionId, signal);
+    const professionalizeAnswer = this.dependencies.professionalizeAnswer;
+    if (!professionalizeAnswer) {
+      throw new ApplicationSessionServiceError("MODEL_PROVIDER_FAILED");
+    }
+    let answer: string;
+    try {
+      answer = await professionalizeAnswer(before.question.question, request, signal);
+    } catch (error) {
+      if (signal.aborted) signal.throwIfAborted();
+      if (error instanceof OAuthRequiredError) {
+        throw new ApplicationSessionServiceError("OAUTH_REQUIRED");
+      }
+      if (error instanceof ApplicationAnswerProfessionalizationError) {
+        if (error.kind === "timeout") {
+          throw new ApplicationSessionServiceError("MODEL_TIMEOUT");
+        }
+        if (error.kind === "invalid_output") {
+          throw new ApplicationSessionServiceError("INVALID_MODEL_OUTPUT");
+        }
+      }
+      throw new ApplicationSessionServiceError("MODEL_PROVIDER_FAILED");
+    }
+    const response = ApplicationProfessionalizeResponseSchema.safeParse({ answer });
+    if (!response.success) {
+      throw new ApplicationSessionServiceError("INVALID_MODEL_OUTPUT");
+    }
+    const after = await this.#currentPendingTextQuestion(runId, questionId, signal);
+    if (!samePendingTextQuestion(before, after)) {
+      throw new ApplicationSessionServiceError("APPLICATION_QUESTION_STALE");
+    }
+    return response.data;
   }
 
   async start(
@@ -1006,6 +1141,85 @@ export class ApplicationSessionService {
     } catch (error) {
       mapRepositoryError(error);
     }
+  }
+
+  async #currentPendingTextQuestion(
+    runId: string,
+    questionId: string,
+    signal: AbortSignal,
+  ): Promise<PendingTextQuestionIdentity> {
+    signal.throwIfAborted();
+    let session: PublicApplicationSession | null;
+    try {
+      session = this.dependencies.repository.getLatestApplicationSession(runId);
+    } catch (error) {
+      mapRepositoryError(error);
+    }
+    const run = this.dependencies.repository.getRun(runId);
+    if (
+      !session
+      || !run
+      || !isLive(session)
+      || session.bridgeState === "reserved"
+      || isSupersededApplicationSession(session, run.currentRevision)
+      || session.resumeRevision !== run.currentRevision
+      || session.slotReleased
+    ) {
+      throw new ApplicationSessionServiceError("APPLICATION_QUESTION_STALE");
+    }
+    const harness = this.dependencies.harness;
+    if (!harness) throw applicationHarnessUnavailable();
+
+    let snapshot: ApplicationHarnessSnapshot;
+    try {
+      snapshot = await harness.get(session.sessionId, signal);
+    } catch (error) {
+      if (signal.aborted) signal.throwIfAborted();
+      if (
+        error instanceof ApplicationHarnessError
+        && (
+          error.code === "session_not_found"
+          || error.code === "session_terminal"
+          || error.code === "command_conflict"
+          || error.code === "invalid_request"
+        )
+      ) {
+        throw new ApplicationSessionServiceError("APPLICATION_QUESTION_STALE");
+      }
+      this.#throwHarnessError(error);
+    }
+    let current: PublicApplicationSession | null;
+    try {
+      current = this.dependencies.repository.getLatestApplicationSession(runId);
+    } catch (error) {
+      mapRepositoryError(error);
+    }
+    const currentRun = this.dependencies.repository.getRun(runId);
+    if (
+      !current
+      || !currentRun
+      || isSupersededApplicationSession(current, currentRun.currentRevision)
+      || current.resumeRevision !== currentRun.currentRevision
+      || !isLive(current)
+      || current.slotReleased
+      || current.sessionId !== session.sessionId
+      || current.generation !== session.generation
+      || snapshot.state !== "awaiting_additional_info"
+      || snapshot.pendingAction?.type !== "additional_info"
+    ) {
+      throw new ApplicationSessionServiceError("APPLICATION_QUESTION_STALE");
+    }
+    const question = snapshot.pendingAction.questions.find(
+      (candidate) => candidate.id === questionId,
+    );
+    if (!question || question.answerType !== "text") {
+      throw new ApplicationSessionServiceError("APPLICATION_QUESTION_STALE");
+    }
+    return {
+      sessionId: session.sessionId,
+      generation: session.generation,
+      question,
+    };
   }
 
   async #prepareStart(
