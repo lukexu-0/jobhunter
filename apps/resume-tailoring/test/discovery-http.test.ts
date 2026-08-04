@@ -3,8 +3,8 @@ import { describe, expect, test } from "bun:test";
 import {
   DiscoveryHttpBudget,
   SafePublicHttpClient,
-  type ConnectorFetch,
 } from "../src/discovery/connectors/http";
+import type { ConnectorFetch } from "../src/discovery/connectors/http";
 
 const PUBLIC_ADDRESS = "93.184.216.34";
 
@@ -383,5 +383,30 @@ describe("SafePublicHttpClient", () => {
     controller.abort(reason);
 
     await expect(request).rejects.toBe(reason);
+  });
+  test("accepts only an explicitly allowed empty 202 without bypassing media validation", async () => {
+    let attempt = 0;
+    const client = new SafePublicHttpClient({
+      fetchImpl: async () => {
+        attempt += 1;
+        return attempt === 1
+          ? new Response(null, { status: 202 })
+          : new Response("unexpected body", {
+            status: 202,
+            headers: { "content-type": "text/plain" },
+          });
+      },
+      resolveHost: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+    });
+    const options = {
+      acceptedMediaTypes: ["application/json"],
+      acceptedEmptyStatuses: [202],
+    } as const;
+
+    const empty = await client.post("https://mcp.example/rpc", "{}", options);
+    expect(empty.status).toBe(202);
+    expect(empty.body.byteLength).toBe(0);
+    await expect(client.post("https://mcp.example/rpc", "{}", options))
+      .rejects.toMatchObject({ code: "UNSUPPORTED_MEDIA_TYPE" });
   });
 });

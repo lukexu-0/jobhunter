@@ -64,6 +64,16 @@ describe("discovery connector environment factory", () => {
         },
         detail: { descriptionSelector: ".description" },
       },
+      {
+        kind: "indeed",
+        id: "indeed-internships",
+        name: "Indeed internships",
+        searches: [
+          { query: "software intern", location: "Remote" },
+          { query: "machine learning intern" },
+        ],
+        maxJobs: 50,
+      },
     ] as const;
 
     const connectors = createDiscoveryConnectorsFromEnvironment({
@@ -72,6 +82,36 @@ describe("discovery connector environment factory", () => {
     });
 
     expect(connectors.slice(4).map(({ id, kind }) => ({ id, kind }))).toEqual(configured.map(({ id, kind }) => ({ id, kind })));
+  });
+
+  test("keeps four built-ins while accepting at most 96 configured sources", () => {
+    const configured = [
+      ...Array.from({ length: 95 }, (_, index) => ({
+        kind: "lever",
+        id: `bounded-${index}`,
+        site: `account-${index}`,
+        company: `Company ${index}`,
+      })),
+      {
+        kind: "indeed",
+        id: "indeed-bounded",
+        searches: [{ query: "intern" }],
+      },
+    ];
+
+    const connectors = createDiscoveryConnectorsFromEnvironment({
+      env: { JOBHUNTER_DISCOVERY_SOURCES: JSON.stringify(configured) },
+      httpClient: inertClient,
+    });
+
+    expect(connectors).toHaveLength(100);
+    expect(connectors.slice(0, 4).map(({ kind }) => kind)).toEqual([
+      "simplify",
+      "zapply",
+      "speedyapply",
+      "speedyapply",
+    ]);
+    expect(connectors.at(-1)).toMatchObject({ id: "indeed-bounded", kind: "indeed" });
   });
 
   test("rejects malformed, unknown, extra-key, duplicate, and unsafe configuration with redacted errors", () => {
@@ -109,6 +149,33 @@ describe("discovery connector environment factory", () => {
           applyUrl: { selector: "a", attribute: "href" },
         },
         detail: { descriptionSelector: ".description" },
+      }]),
+      JSON.stringify([{ kind: "indeed", id: "indeed-empty", searches: [] }]),
+      JSON.stringify([{
+        kind: "indeed",
+        id: "indeed-unknown",
+        searches: [{ query: "intern", radius: 25 }],
+      }]),
+      JSON.stringify([{
+        kind: "indeed",
+        id: "indeed-too-many",
+        searches: Array.from({ length: 11 }, (_, index) => ({ query: `intern ${index}` })),
+      }]),
+      JSON.stringify([{
+        kind: "indeed",
+        id: "indeed-too-large",
+        searches: [{ query: "intern" }],
+        maxJobs: 101,
+      }]),
+      JSON.stringify([{
+        kind: "indeed",
+        id: "indeed-blank-query",
+        searches: [{ query: "   " }],
+      }]),
+      JSON.stringify([{
+        kind: "indeed",
+        id: "indeed-long-location",
+        searches: [{ query: "intern", location: "x".repeat(201) }],
       }]),
     ];
 

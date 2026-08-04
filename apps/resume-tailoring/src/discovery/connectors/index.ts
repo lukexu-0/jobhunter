@@ -3,18 +3,19 @@ import { z } from "zod";
 import { canonicalizePublicHttpUrl } from "../../api/job-source";
 import type { DiscoveryConnector } from "../types";
 import { createAtsConnector } from "./ats";
-import { createGitHubTableConnector, type GitHubTableConnectorConfig } from "./github";
-import {
-  SafePublicHttpClient,
-  type ConnectorFetch,
-  type ResolveHost,
-} from "./http";
+import { createGitHubTableConnector } from "./github";
+import type { GitHubTableConnectorConfig } from "./github";
+import { createIndeedConnector } from "./indeed";
+import type { IndeedAccessTokenResolver } from "./indeed";
+import { SafePublicHttpClient } from "./http";
+import type { ConnectorFetch, ResolveHost } from "./http";
 import { createHtmlBoardConnector } from "./html-board";
 import { createLinkedInConnector } from "./linkedin";
 import { createWorkdayConnector } from "./workday";
 
 export * from "./ats";
 export * from "./github";
+export * from "./indeed";
 export * from "./html-board";
 export * from "./http";
 export * from "./linkedin";
@@ -26,6 +27,7 @@ export interface DiscoveryConnectorFactoryOptions {
   readonly httpClient?: SafePublicHttpClient;
   readonly fetchImpl?: ConnectorFetch;
   readonly resolveHost?: ResolveHost;
+  readonly indeedAccessTokenResolver?: IndeedAccessTokenResolver;
 }
 
 const SOURCE_ID = z.string().trim().min(1).max(100).regex(/^[a-z0-9][a-z0-9._-]*$/i);
@@ -93,6 +95,17 @@ const LINKEDIN_SCHEMA = z.object({
   maxPages: z.number().int().min(1).max(5).optional(),
   maxJobs: z.number().int().min(1).max(100).optional(),
 }).strict();
+const INDEED_SEARCH_SCHEMA = z.object({
+  query: z.string().trim().min(1).max(200),
+  location: z.string().trim().min(1).max(200).optional(),
+}).strict();
+const INDEED_SCHEMA = z.object({
+  kind: z.literal("indeed"),
+  id: SOURCE_ID,
+  name: DISPLAY_NAME.optional(),
+  searches: z.array(INDEED_SEARCH_SCHEMA).min(1).max(10),
+  maxJobs: z.number().int().min(1).max(100).optional(),
+}).strict();
 const SELECTOR_VALUE = z.object({
   selector: SELECTOR,
   attribute: ATTRIBUTE.optional(),
@@ -130,6 +143,7 @@ const CONFIGURED_SOURCE_SCHEMA = z.discriminatedUnion("kind", [
   ...ATS_SCHEMAS,
   WORKDAY_SCHEMA,
   LINKEDIN_SCHEMA,
+  INDEED_SCHEMA,
   HTML_BOARD_SCHEMA,
 ]);
 const CONFIGURED_SOURCES_SCHEMA = z.array(CONFIGURED_SOURCE_SCHEMA).max(96);
@@ -175,6 +189,14 @@ const BUILT_IN_GITHUB_SOURCES: readonly Omit<GitHubTableConnectorConfig, "github
 
 function invalidConfiguration(): Error {
   return new Error("Invalid JOBHUNTER_DISCOVERY_SOURCES configuration");
+}
+
+async function defaultIndeedAccessTokenResolver(signal: AbortSignal): Promise<string> {
+  const [{ getAuthStorage }, { resolveIndeedAccessToken }] = await Promise.all([
+    import("../../auth/storage"),
+    import("../../auth/indeed-oauth"),
+  ]);
+  return resolveIndeedAccessToken(await getAuthStorage(), signal);
 }
 
 export function createDiscoveryConnectorsFromEnvironment(
@@ -226,6 +248,15 @@ export function createDiscoveryConnectorsFromEnvironment(
           case "job_board": {
             const { kind: _kind, ...config } = source;
             connectors.push(createHtmlBoardConnector(config, client));
+            break;
+          }
+          case "indeed": {
+            const { kind: _kind, ...config } = source;
+            connectors.push(createIndeedConnector(
+              config,
+              options.indeedAccessTokenResolver ?? defaultIndeedAccessTokenResolver,
+              client,
+            ));
             break;
           }
         }

@@ -4,8 +4,10 @@ import {
   canonicalizePublicHttpUrl,
   fetchPinnedPublicHttp,
   readBoundedPublicHttpBody,
-  type JobSourceFetch,
-  type ResolveHost,
+} from "../../api/job-source";
+import type {
+  JobSourceFetch,
+  ResolveHost,
 } from "../../api/job-source";
 
 export type ConnectorFetch = JobSourceFetch;
@@ -114,6 +116,8 @@ export interface PublicHttpRequestOptions {
   readonly authorizationOrigin?: string;
   readonly allowedHosts?: readonly string[];
   readonly maxBodyBytes?: number;
+  readonly maxRedirects?: number;
+  readonly acceptedEmptyStatuses?: readonly number[];
 }
 
 export class PublicHttpResponse {
@@ -268,6 +272,17 @@ export class SafePublicHttpClient {
     const allowedHosts = options.allowedHosts?.map((host) => host.trim().toLowerCase());
     const authorizationOrigin = options.authorizationOrigin?.trim().toLowerCase();
     const acceptedMediaTypes = new Set((options.acceptedMediaTypes ?? DEFAULT_MEDIA_TYPES).map((value) => value.toLowerCase()));
+    const acceptedEmptyStatuses = new Set(options.acceptedEmptyStatuses ?? []);
+    for (const status of acceptedEmptyStatuses) {
+      if (!Number.isSafeInteger(status) || status < 100 || status > 599) {
+        throw new PublicHttpError("REQUEST_FAILED");
+      }
+    }
+    const requestedMaxRedirects = options.maxRedirects ?? this.#maxRedirects;
+    if (!Number.isSafeInteger(requestedMaxRedirects) || requestedMaxRedirects < 0) {
+      throw new PublicHttpError("REQUEST_FAILED");
+    }
+    const maxRedirects = Math.min(this.#maxRedirects, requestedMaxRedirects);
     const maxBodyBytes = Math.min(this.#maxBodyBytes, Math.max(1, options.maxBodyBytes ?? this.#maxBodyBytes));
     const budget = this.#budget;
     let method = options.method ?? "GET";
@@ -309,7 +324,7 @@ export class SafePublicHttpClient {
       if (REDIRECT_STATUSES[response.status]) {
         cancelPublicHttpBody(response);
         reservation?.settle(0);
-        if (hop >= this.#maxRedirects) throw new PublicHttpError("TOO_MANY_REDIRECTS");
+        if (hop >= maxRedirects) throw new PublicHttpError("TOO_MANY_REDIRECTS");
         const location = response.headers.get("location");
         if (!location) throw new PublicHttpError("REQUEST_FAILED");
         let next: URL;
@@ -340,7 +355,8 @@ export class SafePublicHttpClient {
         reservation?.settle(0);
         throw error;
       }
-      if (!acceptedMediaTypes.has(mediaType)) {
+      const mediaTypeAccepted = acceptedMediaTypes.has(mediaType);
+      if (!mediaTypeAccepted && !acceptedEmptyStatuses.has(response.status)) {
         cancelPublicHttpBody(response);
         reservation?.settle(0);
         throw new PublicHttpError("UNSUPPORTED_MEDIA_TYPE");
@@ -359,6 +375,10 @@ export class SafePublicHttpClient {
         reservation?.fail();
         throw mappedPublicHttpError(error);
       }
+      if (body.byteLength === 0 && acceptedEmptyStatuses.has(response.status)) {
+        return new PublicHttpResponse(logicalUrl, response.status, new Headers(response.headers), body);
+      }
+      if (!mediaTypeAccepted) throw new PublicHttpError("UNSUPPORTED_MEDIA_TYPE");
       return new PublicHttpResponse(logicalUrl, response.status, new Headers(response.headers), body);
     }
   }

@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 17;
+export const PIPELINE_SCHEMA_VERSION = 18;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -685,6 +685,48 @@ CREATE INDEX discovery_dedupe_keys_job
   ON discovery_dedupe_keys(job_id);
 `;
 
+const migration18 = `
+CREATE TABLE discovery_sources_v18 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),
+  kind TEXT NOT NULL CHECK (
+    kind IN (
+      'simplify',
+      'zapply',
+      'speedyapply',
+      'linkedin',
+      'indeed',
+      'greenhouse',
+      'lever',
+      'ashby',
+      'smartrecruiters',
+      'workable',
+      'recruitee',
+      'personio',
+      'workday',
+      'job_board'
+    )
+  ),
+  last_sync_at INTEGER,
+  last_success_at INTEGER,
+  last_sync_status TEXT CHECK (
+    last_sync_status IS NULL OR last_sync_status IN ('succeeded','failed')
+  ),
+  last_error TEXT,
+  provenance TEXT
+) STRICT;
+
+INSERT INTO discovery_sources_v18(
+  id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+)
+SELECT
+  id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+FROM discovery_sources;
+
+DROP TABLE discovery_sources;
+ALTER TABLE discovery_sources_v18 RENAME TO discovery_sources;
+`;
+
 
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
@@ -757,6 +799,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 17) {
         db.exec(migration17);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(17, now);
+      }
+      if (version < 18) {
+        db.exec(migration18);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(18, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

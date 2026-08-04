@@ -17,6 +17,7 @@ export const DISCOVERY_SOURCE_KINDS = [
   "zapply",
   "speedyapply",
   "linkedin",
+  "indeed",
   "greenhouse",
   "lever",
   "ashby",
