@@ -8,6 +8,12 @@ import {
   ArtifactDtoSchema,
   CreateRunRequestSchema,
   EditRunRequestSchema,
+  DiscoveryListRequestSchema,
+  DiscoveryListResponseSchema,
+  DiscoveryQueueRequestSchema,
+  DiscoveryQueueResponseSchema,
+  DiscoverySyncRequestSchema,
+  DiscoverySyncResponseSchema,
   RegenerateRunRequestSchema,
   ResumeIterationListResponseSchema,
   RunDtoSchema,
@@ -18,6 +24,10 @@ import {
   type ArtifactDto,
   type ApplicationStatus,
   type ResumeIterationListResponse,
+  type DiscoveryListRequest,
+  type DiscoveryListResponse,
+  type DiscoveryQueueResponse,
+  type DiscoverySyncResponse,
   type RunDto,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
@@ -149,7 +159,7 @@ function runPath(id: string): string {
 function applicationPath(id: string): string {
   return `${runPath(id)}/application`;
 }
-function ensureValidRequest(valid: boolean): void {
+function ensureValidRequest(valid: boolean): asserts valid {
   if (!valid) {
     throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
   }
@@ -202,6 +212,56 @@ export async function listRuns(): Promise<RunDto[]> {
   const parsed = RunListResponseSchema.safeParse(body);
   if (!parsed.success) throw invalidResponse();
   return parsed.data.runs;
+}
+
+function discoveryQuery(request: DiscoveryListRequest): string {
+  const query = new URLSearchParams();
+  if (request.role) query.set("role", request.role);
+  query.set("maxAgeDays", request.maxAgeDays === null ? "all" : String(request.maxAgeDays));
+  query.set("status", request.status);
+  query.set("search", request.search);
+  query.set("limit", String(request.limit));
+  query.set("offset", String(request.offset));
+  return query.toString();
+}
+
+export function listDiscoveryJobs(
+  request: z.input<typeof DiscoveryListRequestSchema> = {},
+): Promise<DiscoveryListResponse> {
+  const parsed = DiscoveryListRequestSchema.safeParse(request);
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    `/discovery?${discoveryQuery(parsed.data)}`,
+    { method: "GET" },
+    200,
+    DiscoveryListResponseSchema,
+  );
+}
+
+export function syncDiscoveryJobs(
+  request: z.input<typeof DiscoverySyncRequestSchema> = {},
+): Promise<DiscoverySyncResponse> {
+  const parsed = DiscoverySyncRequestSchema.safeParse(request);
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    "/discovery/sync",
+    jsonPost(parsed.data),
+    200,
+    DiscoverySyncResponseSchema,
+  );
+}
+
+export function queueDiscoveryJobs(
+  request: z.input<typeof DiscoveryQueueRequestSchema>,
+): Promise<DiscoveryQueueResponse> {
+  const parsed = DiscoveryQueueRequestSchema.safeParse(request);
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    "/discovery/queue",
+    jsonPost(parsed.data),
+    200,
+    DiscoveryQueueResponseSchema,
+  );
 }
 
 export function getRun(id: string): Promise<RunDto> {
