@@ -3,9 +3,13 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { KeyRound } from "lucide-react";
+import { CalendarDays, KeyRound } from "lucide-react";
 
-function NavIcon({ name }: { readonly name: "applications" | "providers" }): ReactNode {
+function NavIcon({ name }: { readonly name: "applications" | "events" | "providers" }): ReactNode {
+  if (name === "events") {
+    return <CalendarDays aria-hidden="true" strokeWidth={1.7} />;
+  }
+
   if (name === "providers") {
     return <KeyRound aria-hidden="true" strokeWidth={1.7} />;
   }
@@ -30,6 +34,7 @@ export function AppNavigation(): ReactNode {
   const pathname = usePathname();
   if (pathname.startsWith("/runs/")) return null;
   const applicationsCurrent = pathname === "/";
+  const eventsCurrent = pathname === "/events" || pathname.startsWith("/events/");
   const providersCurrent = pathname === "/providers" || pathname.startsWith("/providers/");
 
   return (
@@ -40,6 +45,12 @@ export function AppNavigation(): ReactNode {
             <Link href="/" aria-current={applicationsCurrent ? "page" : undefined}>
               <NavIcon name="applications" />
               <span>Applications</span>
+            </Link>
+          </li>
+          <li>
+            <Link href="/events" aria-current={eventsCurrent ? "page" : undefined}>
+              <NavIcon name="events" />
+              <span>Events</span>
             </Link>
           </li>
           <li>
