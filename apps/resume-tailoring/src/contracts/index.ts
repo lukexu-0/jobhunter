@@ -13,6 +13,61 @@ function hasCodePointLength(
   return length >= minimum;
 }
 
+function hasCredentialTextLength(
+  value: string,
+  minimum: number,
+  maximum: number,
+): boolean {
+  let length = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint === undefined
+      || codePoint === 0
+      || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+    ) {
+      return false;
+    }
+    length += 1;
+    if (length > maximum) return false;
+  }
+  return length >= minimum;
+}
+
+function isPythonWhitespaceCodeUnit(codeUnit: number): boolean {
+  return (
+    (codeUnit >= 0x0009 && codeUnit <= 0x000d)
+    || (codeUnit >= 0x001c && codeUnit <= 0x0020)
+    || codeUnit === 0x0085
+    || codeUnit === 0x00a0
+    || codeUnit === 0x1680
+    || (codeUnit >= 0x2000 && codeUnit <= 0x200a)
+    || codeUnit === 0x2028
+    || codeUnit === 0x2029
+    || codeUnit === 0x202f
+    || codeUnit === 0x205f
+    || codeUnit === 0x3000
+  );
+}
+
+function stripPythonWhitespace(value: string): string {
+  let start = 0;
+  while (
+    start < value.length
+    && isPythonWhitespaceCodeUnit(value.charCodeAt(start))
+  ) {
+    start += 1;
+  }
+  let end = value.length;
+  while (
+    end > start
+    && isPythonWhitespaceCodeUnit(value.charCodeAt(end - 1))
+  ) {
+    end -= 1;
+  }
+  return start === 0 && end === value.length ? value : value.slice(start, end);
+}
+
 function parsedHttpUrl(value: string): URL | undefined {
   try {
     const url = new URL(value);
@@ -504,6 +559,9 @@ export const ApplicationPendingActionSchema = z.discriminatedUnion("type", [
       .refine((value) => hasCodePointLength(value, 1, 2_000)),
   }).strict(),
   z.object({
+    type: z.literal("credentials"),
+  }).strict(),
+  z.object({
     type: z.literal("origin_approval"),
     origin: z.string().refine(isApplicationOrigin),
   }).strict(),
@@ -579,13 +637,18 @@ const TERMINAL_APPLICATION_BRIDGE_STATES = new Set<ApplicationSessionBridgeState
   "closed",
   "lost",
 ]);
-const PENDING_ACTION_BY_STATE: Readonly<
-  Partial<Record<ApplicationSessionBridgeState, ApplicationPendingAction["type"]>>
+const PENDING_ACTIONS_BY_STATE: Readonly<
+  Partial<
+    Record<
+      ApplicationSessionBridgeState,
+      Readonly<Partial<Record<ApplicationPendingAction["type"], true>>>
+    >
+  >
 > = {
-  awaiting_human_navigation: "human_navigation",
-  awaiting_origin_approval: "origin_approval",
-  awaiting_additional_info: "additional_info",
-  awaiting_human_review: "human_review",
+  awaiting_human_navigation: { human_navigation: true, credentials: true },
+  awaiting_origin_approval: { origin_approval: true },
+  awaiting_additional_info: { additional_info: true },
+  awaiting_human_review: { human_review: true },
 };
 export const ApplicationPlaywrightCliDiagnosticSchema = z.object({
   step: z.number().int().min(1).max(500),
@@ -744,12 +807,15 @@ export const ApplicationSessionSnapshotDtoSchema = z.object({
       message: "submission phase does not match bridge state",
     });
   }
-  const expectedPendingAction = PENDING_ACTION_BY_STATE[snapshot.bridgeState];
+  const allowedPendingActions = PENDING_ACTIONS_BY_STATE[snapshot.bridgeState];
   if (
-    (expectedPendingAction === undefined && snapshot.pendingAction !== null)
+    (allowedPendingActions === undefined && snapshot.pendingAction !== null)
     || (
-      expectedPendingAction !== undefined
-      && snapshot.pendingAction?.type !== expectedPendingAction
+      allowedPendingActions !== undefined
+      && (
+        snapshot.pendingAction === null
+        || allowedPendingActions[snapshot.pendingAction.type] !== true
+      )
     )
   ) {
     context.addIssue({
@@ -799,6 +865,11 @@ export const ApplicationSessionEventDtoSchema = z.discriminatedUnion("event", [
       instruction: z.string().trim()
         .refine((value) => hasCodePointLength(value, 1, 2_000)),
     }).strict(),
+  }).strict(),
+  z.object({
+    ...ApplicationEventBaseShape,
+    event: z.literal("credentials_required"),
+    detail: EmptyApplicationEventDetailSchema,
   }).strict(),
   z.object({
     ...ApplicationEventBaseShape,
@@ -900,9 +971,24 @@ const ApplicationSessionAnswerSchema = z.union([
       }),
   }).strict(),
 ]);
+const ApplicationCredentialUsernameSchema = z.string()
+  .transform(stripPythonWhitespace)
+  .refine((value) => hasCredentialTextLength(value, 1, 320));
+const ApplicationCredentialPasswordSchema = z.string()
+  .refine((value) => hasCredentialTextLength(value, 1, 4_096));
 
 export const ApplicationSessionCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("continue") }).strict(),
+  z.object({
+    type: z.literal("sign_in"),
+    username: ApplicationCredentialUsernameSchema,
+    password: ApplicationCredentialPasswordSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("save_credentials"),
+    username: ApplicationCredentialUsernameSchema,
+    password: ApplicationCredentialPasswordSchema,
+  }).strict(),
   z.object({
     type: z.literal("approve_origin"),
     origin: z.string().refine(isApplicationOrigin),

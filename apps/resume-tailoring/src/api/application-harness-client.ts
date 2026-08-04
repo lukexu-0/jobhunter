@@ -101,6 +101,9 @@ const RawPendingActionSchema = z.discriminatedUnion("type", [
     instruction: z.string().refine((value) => codePointLength(value, 1, 2_000)),
   }).strict(),
   z.object({
+    type: z.literal("credentials"),
+  }).strict(),
+  z.object({
     type: z.literal("origin_approval"),
     origin: z.string().refine(isCanonicalHttpOrigin),
   }).strict(),
@@ -114,13 +117,18 @@ const RawPendingActionSchema = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("human_review") }).strict(),
 ]);
-const PENDING_TYPE_BY_STATE: Partial<
-  Record<HarnessSessionState, ApplicationPendingAction["type"]>
+const PENDING_TYPES_BY_STATE: Readonly<
+  Partial<
+    Record<
+      HarnessSessionState,
+      Readonly<Partial<Record<ApplicationPendingAction["type"], true>>>
+    >
+  >
 > = {
-  awaiting_human_navigation: "human_navigation",
-  awaiting_origin_approval: "origin_approval",
-  awaiting_additional_info: "additional_info",
-  awaiting_human_review: "human_review",
+  awaiting_human_navigation: { human_navigation: true, credentials: true },
+  awaiting_origin_approval: { origin_approval: true },
+  awaiting_additional_info: { additional_info: true },
+  awaiting_human_review: { human_review: true },
 };
 const SLOT_RELEASED_STATES: Partial<Record<HarnessSessionState, true>> = {
   cancelled: true,
@@ -194,10 +202,16 @@ const RawSnapshotSchema = z.object({
   if ((snapshot.state === "failed") !== (snapshot.error !== null)) {
     context.addIssue({ code: "custom", path: ["error"], message: "error does not match state" });
   }
-  const expectedPending = PENDING_TYPE_BY_STATE[snapshot.state];
+  const allowedPendingTypes = PENDING_TYPES_BY_STATE[snapshot.state];
   if (
-    (expectedPending === undefined && snapshot.pending_action !== null)
-    || (expectedPending !== undefined && snapshot.pending_action?.type !== expectedPending)
+    (allowedPendingTypes === undefined && snapshot.pending_action !== null)
+    || (
+      allowedPendingTypes !== undefined
+      && (
+        snapshot.pending_action === null
+        || allowedPendingTypes[snapshot.pending_action.type] !== true
+      )
+    )
   ) {
     context.addIssue({
       code: "custom",
@@ -245,6 +259,11 @@ const RawEventSchema = z.discriminatedUnion("event", [
     detail: z.object({
       instruction: z.string().refine((value) => codePointLength(value, 1, 2_000)),
     }).strict(),
+  }).strict(),
+  z.object({
+    ...RawEventBaseShape,
+    event: z.literal("credentials_required"),
+    detail: EmptyEventDetailSchema,
   }).strict(),
   z.object({
     ...RawEventBaseShape,
@@ -312,6 +331,7 @@ export type ApplicationHarnessEvent =
     readonly event:
       | "session_started"
       | "snapshot"
+      | "credentials_required"
       | "review_required"
       | "submission_started"
       | "application_submitted"

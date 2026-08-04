@@ -1462,21 +1462,20 @@ describe("application session service", () => {
     await nextGeneration.return?.(undefined);
   });
 
-  test("replays the persisted projection when a connecting browser is behind the durable cursor", async () => {
+  test("replays the persisted credential marker when a connecting browser is behind", async () => {
     const target = await createTarget();
     await target.service.start(target.runId, target.pdf.sha256, signal());
     const gateEvent: ApplicationHarnessEvent = {
       id: 7,
-      event: "origin_approval_required",
+      event: "credentials_required",
       session: {
-        ...harnessSnapshot("awaiting_origin_approval"),
+        ...harnessSnapshot("awaiting_human_navigation"),
         updatedAt: 10_200,
         pendingAction: {
-          type: "origin_approval",
-          origin: "https://approval.example.test",
+          type: "credentials",
         },
       },
-      detail: { origin: "https://approval.example.test" },
+      detail: {},
     };
     target.harness!.events = [gateEvent];
     const persisting = (await target.service.events(
@@ -1503,10 +1502,9 @@ describe("application session service", () => {
         event: "snapshot",
         session: expect.objectContaining({
           generation: 1,
-          bridgeState: "awaiting_origin_approval",
+          bridgeState: "awaiting_human_navigation",
           pendingAction: {
-            type: "origin_approval",
-            origin: "https://approval.example.test",
+            type: "credentials",
           },
         }),
         detail: {},
@@ -1835,6 +1833,72 @@ describe("application session service", () => {
       bridgeState: "lost",
       pendingAction: null,
     });
+  });
+
+  test("forwards credentials only to the harness and retains only the durable gate marker", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = {
+      ...harnessSnapshot("awaiting_human_navigation"),
+      pendingAction: { type: "credentials" },
+    };
+    const target = await createTarget({ harness });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const commands = [
+      {
+        type: "sign_in",
+        username: "sign-in-private@example.test",
+        password: "PRIVATE SIGN IN PASSWORD",
+      },
+      {
+        type: "save_credentials",
+        username: "saved-private@example.test",
+        password: "PRIVATE SAVED PASSWORD",
+      },
+    ] satisfies ApplicationSessionCommand[];
+
+    for (const command of commands) {
+      await expect(target.service.command(target.runId, command, signal()))
+        .resolves.toBeUndefined();
+    }
+
+    expect(harness.commandCalls).toEqual(commands.map((command) => ({
+      sessionId: FIRST_SESSION_ID,
+      command,
+    })));
+    const publicData = JSON.stringify({
+      snapshot: await target.service.get(target.runId),
+      durableProjection: target.repository.getLatestApplicationSession(target.runId)
+        ?.publicSnapshot,
+    });
+    expect(JSON.parse(publicData)).toMatchObject({
+      snapshot: {
+        bridgeState: "awaiting_human_navigation",
+        pendingAction: { type: "credentials" },
+      },
+      durableProjection: {
+        bridgeState: "awaiting_human_navigation",
+        pendingAction: { type: "credentials" },
+      },
+    });
+    for (const command of commands) {
+      expect(publicData).not.toContain(command.username);
+      expect(publicData).not.toContain(command.password);
+    }
+
+    harness.commandError = new ApplicationHarnessError("command_conflict");
+    let conflict: unknown;
+    try {
+      await target.service.command(target.runId, commands[0]!, signal());
+    } catch (error) {
+      conflict = error;
+    }
+    expect(conflict).toMatchObject({
+      code: "APPLICATION_COMMAND_CONFLICT",
+      message: "The application state changed; review the latest session state",
+      status: 409,
+    });
+    expect(String(conflict)).not.toContain(commands[0]!.username);
+    expect(String(conflict)).not.toContain(commands[0]!.password);
   });
 
   test("forwards accepted live commands without persistence and closes active, reserved, and lost sessions", async () => {

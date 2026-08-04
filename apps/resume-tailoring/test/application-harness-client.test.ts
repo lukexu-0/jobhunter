@@ -163,6 +163,45 @@ describe("HttpApplicationHarnessClient", () => {
       slotReleased: true,
     });
   });
+  test("projects the credentials gate as a marker while preserving ordinary human navigation", async () => {
+    const privateUsername = "snapshot-private-user";
+    const privatePassword = "SNAPSHOT-PRIVATE-PASSWORD";
+    const responses = [
+      Response.json(rawSnapshot({
+        state: "awaiting_human_navigation",
+        job_url: `https://jobs.private.example/${privateUsername}/${privatePassword}`,
+        pending_action: { type: "credentials" },
+      })),
+      Response.json(rawSnapshot({
+        state: "awaiting_human_navigation",
+        pending_action: {
+          type: "human_navigation",
+          instruction: "Complete the CAPTCHA.",
+        },
+      })),
+    ];
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => responses.shift()!,
+    });
+
+    const credentialsGate = await client.get(SESSION_ID, new AbortController().signal);
+    expect(credentialsGate).toMatchObject({
+      state: "awaiting_human_navigation",
+      pendingAction: { type: "credentials" },
+    });
+    expect(JSON.stringify(credentialsGate)).not.toContain(privateUsername);
+    expect(JSON.stringify(credentialsGate)).not.toContain(privatePassword);
+    await expect(client.get(SESSION_ID, new AbortController().signal))
+      .resolves.toMatchObject({
+        state: "awaiting_human_navigation",
+        pendingAction: {
+          type: "human_navigation",
+          instruction: "Complete the CAPTCHA.",
+        },
+      });
+  });
   test("accepts only a bare loopback HTTP origin", () => {
     expect(() => new HttpApplicationHarnessClient({ token: TOKEN })).not.toThrow();
     expect(() => new HttpApplicationHarnessClient({
@@ -351,6 +390,14 @@ describe("HttpApplicationHarnessClient", () => {
       Response.json(rawSnapshot({ current_url: "https://private.example/current" })),
       Response.json(rawSnapshot({ slot_released: true })),
       Response.json(rawSnapshot({
+        state: "awaiting_human_navigation",
+        pending_action: {
+          type: "credentials",
+          username: "private@example.test",
+          password: "PRIVATE SNAPSHOT PASSWORD",
+        },
+      })),
+      Response.json(rawSnapshot({
         state: "awaiting_origin_approval",
         pending_action: {
           type: "origin_approval",
@@ -394,9 +441,21 @@ describe("HttpApplicationHarnessClient", () => {
         return new Response(null, { status: init.method === "DELETE" ? 204 : 202 });
       },
     });
+    const signInPassword = "PRIVATE SIGN IN PASSWORD";
+    const savedPassword = "PRIVATE SAVED PASSWORD";
     const commands: ApplicationSessionCommand[] = [
       { type: "continue" },
       { type: "approve_origin", origin: "https://ats.example.test" },
+      {
+        type: "sign_in",
+        username: "applicant@example.test",
+        password: signInPassword,
+      },
+      {
+        type: "save_credentials",
+        username: "saved@example.test",
+        password: savedPassword,
+      },
       {
         type: "provide_additional_info",
         answers: [
@@ -433,7 +492,43 @@ describe("HttpApplicationHarnessClient", () => {
       accept: "application/json",
       "content-type": "application/json",
     });
+    for (const secret of [signInPassword, savedPassword]) {
+      expect(
+        calls.slice(0, -1).filter(({ init }) => String(init.body).includes(secret)),
+      ).toHaveLength(1);
+      expect(calls.map(({ url }) => url).join("\n")).not.toContain(secret);
+      expect(JSON.stringify(calls.map(({ init }) => init.headers))).not.toContain(secret);
+    }
     expect(calls.at(-1)!.init).toMatchObject({ method: "DELETE" });
+  });
+  test("rejects argv-incompatible credentials before an authenticated request", async () => {
+    let requests = 0;
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => {
+        requests += 1;
+        return new Response(null, { status: 202 });
+      },
+    });
+    const invalidCommands: ApplicationSessionCommand[] = [
+      {
+        type: "sign_in",
+        username: "applicant\u0000@example.test",
+        password: "private",
+      },
+      {
+        type: "save_credentials",
+        username: "applicant@example.test",
+        password: "private\u0000password",
+      },
+    ];
+
+    for (const command of invalidCommands) {
+      await expect(client.command(SESSION_ID, command, new AbortController().signal))
+        .rejects.toEqual(new ApplicationHarnessError("invalid_request"));
+    }
+    expect(requests).toBe(0);
   });
   test("incrementally validates and reprojects every SSE event without private fields", async () => {
     const questions = [
@@ -469,6 +564,8 @@ describe("HttpApplicationHarnessClient", () => {
       },
     ];
     const baseSession = rawSnapshot({ state: "running", pending_action: null });
+    const privateEventUsername = "event-private-user";
+    const privateEventPassword = "EVENT-PRIVATE-PASSWORD";
     const eventInputs = [
       { event: "session_started", detail: {}, session: baseSession },
       {
@@ -483,6 +580,16 @@ describe("HttpApplicationHarnessClient", () => {
         session: rawSnapshot({
           state: "awaiting_human_navigation",
           pending_action: { type: "human_navigation", instruction: "Complete the CAPTCHA." },
+        }),
+      },
+      {
+        event: "credentials_required",
+        detail: {},
+        session: rawSnapshot({
+          state: "awaiting_human_navigation",
+          job_url:
+            `https://jobs.private.example/${privateEventUsername}/${privateEventPassword}`,
+          pending_action: { type: "credentials" },
         }),
       },
       {
@@ -595,6 +702,7 @@ describe("HttpApplicationHarnessClient", () => {
       { event: "agent_step", detail: { stepNumber: 2 } },
       { event: "snapshot", detail: {} },
       { event: "human_navigation_required", detail: { instruction: "Complete the CAPTCHA." } },
+      { event: "credentials_required", detail: {} },
       { event: "origin_approval_required", detail: { origin: "https://ats.example.test" } },
       {
         event: "additional_info_required",
@@ -651,6 +759,8 @@ describe("HttpApplicationHarnessClient", () => {
       "model_provider",
       "approved_origins",
       "availability.start",
+      privateEventUsername,
+      privateEventPassword,
     ]) expect(serialized).not.toContain(secret);
   });
   test("opens and validates the upstream SSE response before exposing its iterator", async () => {
@@ -698,6 +808,20 @@ describe("HttpApplicationHarnessClient", () => {
         0x0a,
         0x0a,
       ])),
+      () => streamResponse(`id: 1\nevent: credentials_required\ndata: ${
+        JSON.stringify({
+          id: 1,
+          event: "credentials_required",
+          session: rawSnapshot({
+            state: "awaiting_human_navigation",
+            pending_action: { type: "credentials" },
+          }),
+          detail: {
+            username: "private@example.test",
+            password: "PRIVATE EVENT PASSWORD",
+          },
+        })
+      }\n\n`),
       () => streamResponse(`id: 1\nevent: snapshot\ndata: ${
         "x".repeat(8 * 1024 * 1024)
       }\n\n`),

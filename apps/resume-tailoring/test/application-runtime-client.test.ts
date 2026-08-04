@@ -18,10 +18,12 @@ import {
   ApplicationRuntimeError,
   HttpApplicationRuntimeClient,
   RequestAdditionalInfoRuntimeActionSchema,
+  RequestSignInRuntimeActionSchema,
   PLAYWRIGHT_CLI_READ_ONLY_COMMANDS,
   PlaywrightCliToolParametersSchema,
   RuntimeActionRequestSchema,
   RuntimeActionResponseSchema,
+  SignInRuntimeActionResponseSchema,
   SubmitRuntimeActionResponseSchema,
   type RuntimeActionRequest,
   type RuntimeActionResponse,
@@ -357,6 +359,44 @@ test("mirrors strict additional-information question and request constraints", (
   expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
 });
 
+test("strictly validates credential-free sign-in runtime wire contracts", () => {
+  const request = {
+    type: "request_sign_in" as const,
+    username_ref: "e1",
+    password_ref: "e42",
+    submit_ref: "e999999999",
+  };
+  expect(RequestSignInRuntimeActionSchema.parse(request)).toEqual(request);
+  expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
+  for (const invalidRequest of [
+    { ...request, username_ref: "e0" },
+    { ...request, username_ref: "e01" },
+    { ...request, username_ref: "e1000000000" },
+    { ...request, password_ref: " e2" },
+    { ...request, submit_ref: "button" },
+    { type: "request_sign_in", username_ref: "e1", password_ref: "e2" },
+    { ...request, username: "candidate@example.test" },
+  ]) {
+    expect(RequestSignInRuntimeActionSchema.safeParse(invalidRequest).success).toBe(false);
+    expect(RuntimeActionRequestSchema.safeParse(invalidRequest).success).toBe(false);
+  }
+
+  for (const status of ["attempted", "saved"] as const) {
+    const response = { type: "sign_in" as const, status };
+    expect(SignInRuntimeActionResponseSchema.parse(response)).toEqual(response);
+    expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
+  }
+  for (const invalidResponse of [
+    { type: "sign_in" },
+    { type: "sign_in", status: "failed" },
+    { type: "sign_in", status: "attempted", origin: "https://apply.example.test" },
+    { type: "sign_in", status: "saved", username: "candidate@example.test" },
+  ]) {
+    expect(SignInRuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
+    expect(RuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
+  }
+});
+
 test("rejects the removed deterministic candidate-question response", () => {
   expect(RuntimeActionResponseSchema.safeParse({
     type: "candidate_questions_required",
@@ -609,6 +649,12 @@ describe("HttpApplicationRuntimeClient", () => {
     );
     const actions: RuntimeActionRequest[] = [
       { type: "playwright_cli", command: "eval", args: ["document.body.innerText"] },
+      {
+        type: "request_sign_in",
+        username_ref: "e1",
+        password_ref: "e2",
+        submit_ref: "e3",
+      },
       { type: "request_human_navigation", instruction: "Complete the CAPTCHA" },
       { type: "request_additional_info", questions: [...ADDITIONAL_INFO_QUESTIONS] },
       { type: "request_human_review", result: READY_RESULT },
@@ -653,6 +699,8 @@ describe("HttpApplicationRuntimeClient", () => {
           screenshot: { media_type: "image/png", data: "iVBORw0KGgo=" },
         },
       },
+      { type: "sign_in", status: "attempted" },
+      { type: "sign_in", status: "saved" },
       { type: "continue" },
       {
         type: "additional_info",
@@ -857,6 +905,12 @@ describe("HttpApplicationRuntimeClient", () => {
         type: "playwright_cli",
         command: "snapshot",
         args: Array.from({ length: 9 }, () => "x".repeat(8_192)),
+      },
+      {
+        type: "request_sign_in",
+        username_ref: "e0",
+        password_ref: "e2",
+        submit_ref: "e3",
       },
       { type: "request_human_navigation", instruction: "   " },
       {
