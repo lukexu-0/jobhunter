@@ -15,6 +15,11 @@ export type LoadedJobSource = Readonly<
   | { kind: "model-fallback"; lines: readonly string[] }
 >;
 export type LoadJobSource = (jobUrl: string, signal?: AbortSignal) => Promise<LoadedJobSource>;
+export interface LoadedPublicWebSource {
+  readonly url: string;
+  readonly mediaType: "html" | "plain";
+  readonly body: string;
+}
 
 export interface JobSourceLoadOptions {
   readonly fetchImpl?: JobSourceFetch;
@@ -693,13 +698,13 @@ function terminalMediaType(response: Response): "html" | "plain" {
   throw new JobSourceError("JOB_SOURCE_UNSUPPORTED");
 }
 
-async function loadWithSignal(
-  jobUrl: string,
+async function loadPublicWebSourceWithSignal(
+  sourceUrl: string,
   signal: AbortSignal,
   fetchImpl: JobSourceFetch,
   resolveHost: ResolveHost,
-): Promise<LoadedJobSource> {
-  let logicalUrl = canonicalizePublicHttpUrl(jobUrl);
+): Promise<LoadedPublicWebSource> {
+  let logicalUrl = canonicalizeLogicalUrl(sourceUrl);
   const visited = new Set([logicalUrl.href]);
   let redirectHops = 0;
 
@@ -757,22 +762,36 @@ async function loadWithSignal(
     } catch (error) {
       throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: error });
     }
-
-    if (mediaType === "plain") {
-      const jobDescription = normalizeText(body);
-      const parsed = JobDescriptionSchema.safeParse(jobDescription);
-      if (parsed.success) return { kind: "description", jobDescription: parsed.data };
-      throw new JobSourceError(
-        jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
-          ? "JOB_SOURCE_TOO_LARGE"
-          : "JOB_DESCRIPTION_UNAVAILABLE",
-      );
-    }
-
-    const deterministic = await deterministicHtmlDescription(body);
-    if (deterministic !== undefined) return { kind: "description", jobDescription: deterministic };
-    return htmlFallback(body);
+    return { url: logicalUrl.href, mediaType, body };
   }
+}
+
+async function loadJobSourceWithSignal(
+  jobUrl: string,
+  signal: AbortSignal,
+  fetchImpl: JobSourceFetch,
+  resolveHost: ResolveHost,
+): Promise<LoadedJobSource> {
+  const loaded = await loadPublicWebSourceWithSignal(
+    jobUrl,
+    signal,
+    fetchImpl,
+    resolveHost,
+  );
+  if (loaded.mediaType === "plain") {
+    const jobDescription = normalizeText(loaded.body);
+    const parsed = JobDescriptionSchema.safeParse(jobDescription);
+    if (parsed.success) return { kind: "description", jobDescription: parsed.data };
+    throw new JobSourceError(
+      jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
+        ? "JOB_SOURCE_TOO_LARGE"
+        : "JOB_DESCRIPTION_UNAVAILABLE",
+    );
+  }
+
+  const deterministic = await deterministicHtmlDescription(loaded.body);
+  if (deterministic !== undefined) return { kind: "description", jobDescription: deterministic };
+  return htmlFallback(loaded.body);
 }
 
 export async function loadJobSourceFromUrl(
@@ -789,8 +808,38 @@ export async function loadJobSourceFromUrl(
   signal?.addEventListener("abort", onCallerAbort, { once: true });
 
   try {
-    return await loadWithSignal(
+    return await loadJobSourceWithSignal(
       jobUrl,
+      controller.signal,
+      options.fetchImpl ?? fetch,
+      options.resolveHost ?? defaultResolveHost,
+    );
+  } catch (error) {
+    if (signal?.aborted) throw cancellationReason(signal);
+    if (error instanceof JobSourceError) throw error;
+    throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: error });
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onCallerAbort);
+  }
+}
+
+export async function loadPublicWebSourceFromUrl(
+  sourceUrl: string,
+  signal?: AbortSignal,
+  options: JobSourceLoadOptions = {},
+): Promise<LoadedPublicWebSource> {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const deadlineReason = new DeadlineExpired("Public source network deadline expired");
+  const deadlineMs = options.deadlineMs ?? NETWORK_DEADLINE_MS;
+  const timer = setTimeout(() => controller.abort(deadlineReason), Math.max(0, deadlineMs));
+  const onCallerAbort = () => controller.abort(cancellationReason(signal!));
+  signal?.addEventListener("abort", onCallerAbort, { once: true });
+
+  try {
+    return await loadPublicWebSourceWithSignal(
+      sourceUrl,
       controller.signal,
       options.fetchImpl ?? fetch,
       options.resolveHost ?? defaultResolveHost,

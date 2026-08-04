@@ -3,11 +3,15 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { Compass, KeyRound } from "lucide-react";
+import { CalendarDays, Compass, KeyRound } from "lucide-react";
 
-function NavIcon({ name }: { readonly name: "applications" | "discovery" | "providers" }): ReactNode {
+function NavIcon({ name }: { readonly name: "applications" | "discovery" | "events" | "providers" }): ReactNode {
   if (name === "discovery") {
     return <Compass aria-hidden="true" strokeWidth={1.7} />;
+  }
+
+  if (name === "events") {
+    return <CalendarDays aria-hidden="true" strokeWidth={1.7} />;
   }
 
   if (name === "providers") {
@@ -34,6 +38,7 @@ export function AppNavigationView({ pathname }: { readonly pathname: string }): 
   if (pathname.startsWith("/runs/")) return null;
   const applicationsCurrent = pathname === "/";
   const discoveryCurrent = pathname === "/discovery" || pathname.startsWith("/discovery/");
+  const eventsCurrent = pathname === "/events" || pathname.startsWith("/events/");
   const providersCurrent = pathname === "/providers" || pathname.startsWith("/providers/");
 
   return (
@@ -50,6 +55,12 @@ export function AppNavigationView({ pathname }: { readonly pathname: string }): 
             <Link href="/discovery" aria-current={discoveryCurrent ? "page" : undefined}>
               <NavIcon name="discovery" />
               <span>Discovery</span>
+            </Link>
+          </li>
+          <li>
+            <Link href="/events" aria-current={eventsCurrent ? "page" : undefined}>
+              <NavIcon name="events" />
+              <span>Events</span>
             </Link>
           </li>
           <li>

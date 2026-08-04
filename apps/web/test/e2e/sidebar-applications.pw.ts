@@ -326,7 +326,11 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
   expect(widths.bodyScroll).toBeLessThanOrEqual(widths.rootClient);
 }
 
-async function expectFolderNavigation(page: Page, width: number, currentLabel: "Applications" | "Discovery" | "Providers"): Promise<void> {
+async function expectFolderNavigation(
+  page: Page,
+  width: number,
+  currentLabel: "Applications" | "Discovery" | "Events" | "Providers",
+): Promise<void> {
   const strip = page.locator("header.app-navigation");
   const stripBox = await strip.boundingBox();
   if (!stripBox) throw new Error("Primary navigation geometry is unavailable");
@@ -348,18 +352,23 @@ async function expectFolderNavigation(page: Page, width: number, currentLabel: "
 
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
   const links = navigation.getByRole("link");
-  await expect(links).toHaveCount(3);
-  const firstBox = await links.nth(0).boundingBox();
-  const secondBox = await links.nth(1).boundingBox();
-  const thirdBox = await links.nth(2).boundingBox();
-  if (!firstBox || !secondBox || !thirdBox) throw new Error("Primary navigation links are unavailable");
-  expect(Math.abs(firstBox.width - secondBox.width)).toBeLessThanOrEqual(1);
-  expect(Math.abs(secondBox.width - thirdBox.width)).toBeLessThanOrEqual(1);
-  expect(firstBox.x).toBe(0);
-  expect(secondBox.x).toBe(firstBox.width);
-  expect(thirdBox.x).toBe(firstBox.width + secondBox.width);
-  expect(firstBox.width + secondBox.width + thirdBox.width).toBeCloseTo(width, 1);
-
+  await expect(links).toHaveCount(4);
+  const linkBoxes = await links.evaluateAll((elements) => elements.map((element) => {
+    const box = element.getBoundingClientRect();
+    return { x: box.x, width: box.width };
+  }));
+  expect(Math.max(...linkBoxes.map(({ width: linkWidth }) => linkWidth))
+    - Math.min(...linkBoxes.map(({ width: linkWidth }) => linkWidth))).toBeLessThanOrEqual(1);
+  expect(linkBoxes[0].x).toBe(0);
+  for (let index = 1; index < linkBoxes.length; index += 1) {
+    const priorWidth = linkBoxes
+      .slice(0, index)
+      .reduce((total, { width: linkWidth }) => total + linkWidth, 0);
+    expect(Math.abs(linkBoxes[index].x - priorWidth)).toBeLessThanOrEqual(1);
+  }
+  expect(Math.abs(
+    linkBoxes.reduce((total, { width: linkWidth }) => total + linkWidth, 0) - width,
+  )).toBeLessThanOrEqual(1);
   const linkStyles = await links.evaluateAll((elements) => elements.map((element) => {
     const style = getComputedStyle(element);
     return {
@@ -371,26 +380,27 @@ async function expectFolderNavigation(page: Page, width: number, currentLabel: "
   const expectedClipPath = width <= 560
     ? "polygon(8px 0px, calc(100% - 8px) 0px, 100% 100%, 0px 100%)"
     : "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)";
-  expect(linkStyles).toEqual(Array.from({ length: 3 }, () => ({
+  expect(linkStyles).toEqual(Array.from({ length: 4 }, () => ({
     clipPath: expectedClipPath,
     justifyContent: "center",
     whiteSpace: "nowrap",
   })));
 
-  const labels = ["Applications", "Discovery", "Providers"] as const;
   const current = navigation.getByRole("link", { name: currentLabel });
-  const inactiveLabels = labels.filter((label) => label !== currentLabel);
-  const inactive = navigation.getByRole("link", { name: inactiveLabels[0] });
-  for (const label of inactiveLabels) {
-    await expect(navigation.getByRole("link", { name: label })).not.toHaveAttribute("aria-current");
-  }
+  const inactive = navigation.locator("a:not([aria-current='page'])");
   await expect(current).toHaveAttribute("aria-current", "page");
+  await expect(inactive).toHaveCount(3);
   const currentBox = await current.boundingBox();
-  const inactiveBox = await inactive.boundingBox();
-  if (!currentBox || !inactiveBox) throw new Error("Primary navigation tab geometry is unavailable");
-  expect(inactiveBox.y - currentBox.y).toBe(8);
+  const inactiveBoxes = await inactive.evaluateAll((elements) => elements.map((element) => {
+    const box = element.getBoundingClientRect();
+    return { y: box.y, height: box.height };
+  }));
+  if (!currentBox) throw new Error("Current primary navigation tab geometry is unavailable");
+  for (const inactiveBox of inactiveBoxes) {
+    expect(inactiveBox.y - currentBox.y).toBe(8);
+    expect(inactiveBox.y + inactiveBox.height).toBe(stripBox.y + stripBox.height);
+  }
   expect(currentBox.y + currentBox.height).toBe(stripBox.y + stripBox.height);
-  expect(inactiveBox.y + inactiveBox.height).toBe(stripBox.y + stripBox.height);
 }
 
 async function expectFullViewportRunDetail(page: Page, width: number): Promise<void> {
@@ -1761,7 +1771,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
   const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
-  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Providers"]);
+  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Events", "Providers"]);
   await expect(applicationCount).toHaveText("7");
 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
@@ -1806,6 +1816,18 @@ test("uses full-width physical folder tabs at desktop and narrow widths", async 
     await expect(page.getByText("Resume tailoring", { exact: true })).toHaveCount(0);
     await expectNoDocumentOverflow(page);
   }
+
+  await page.goto("/events/upcoming");
+  await expect(
+    page.getByRole("navigation", { name: "Primary navigation" })
+      .getByRole("link", { name: "Events" }),
+  ).toHaveAttribute("aria-current", "page");
+
+  await page.goto("/providers/settings");
+  await expect(
+    page.getByRole("navigation", { name: "Primary navigation" })
+      .getByRole("link", { name: "Providers" }),
+  ).toHaveAttribute("aria-current", "page");
 });
 
 test("uses folder navigation and local scrollers on narrow displays", async ({ page }) => {

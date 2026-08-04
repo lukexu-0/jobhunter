@@ -18,12 +18,16 @@ import {
   DiscoverySyncRequestSchema,
   DiscoverySyncResponseSchema,
   RegenerateRunRequestSchema,
+  RecruitingEventDashboardResponseSchema,
+  RecruitingEventPreferencesSchema,
+  RecruitingEventScrapeResponseSchema,
   ResumeIterationListResponseSchema,
   RunDtoSchema,
   RunListResponseSchema,
   StartApplicationSessionRequestSchema,
   UpdateApplicationStatusRequestSchema,
   UpdateRunIdentityRequestSchema,
+  UpdateRecruitingEventPreferencesRequestSchema,
   type ArtifactDto,
   type ApplicationAnswerSuggestionsResponse,
   type ApplicationProfessionalizeRequest,
@@ -34,6 +38,9 @@ import {
   type DiscoveryListResponse,
   type DiscoveryQueueResponse,
   type DiscoverySyncResponse,
+  type RecruitingEventDashboardResponse,
+  type RecruitingEventPreferences,
+  type RecruitingEventScrapeResponse,
   type RunDto,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
@@ -287,6 +294,39 @@ export function listResumeIterations(id: string): Promise<ResumeIterationListRes
     { method: "GET" },
     200,
     ResumeIterationListResponseSchema,
+  );
+}
+
+export function getRecruitingEventDashboard(): Promise<RecruitingEventDashboardResponse> {
+  return requestApplicationResponse(
+    "/events",
+    { method: "GET" },
+    200,
+    RecruitingEventDashboardResponseSchema,
+  );
+}
+
+export function updateRecruitingEventPreferences(school: string): Promise<RecruitingEventPreferences> {
+  const parsed = UpdateRecruitingEventPreferencesRequestSchema.safeParse({ school });
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    "/events/preferences",
+    {
+      body: JSON.stringify(parsed.data),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    },
+    200,
+    RecruitingEventPreferencesSchema,
+  );
+}
+
+export function requestRecruitingEventScrape(): Promise<RecruitingEventScrapeResponse> {
+  return requestApplicationResponse(
+    "/events/scrape",
+    jsonPost({}),
+    202,
+    RecruitingEventScrapeResponseSchema,
   );
 }
 

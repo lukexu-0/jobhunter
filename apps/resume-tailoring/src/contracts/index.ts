@@ -68,6 +68,87 @@ export const ApiErrorSchema = z.object({
 });
 export type ApiError = z.infer<typeof ApiErrorSchema>;
 
+const RecruitingEventTimestampSchema = z.number().int().nonnegative();
+
+export const RecruitingEventPreferencesSchema = z.object({
+  school: z.string().trim().min(1).max(200).nullable(),
+}).strict();
+export type RecruitingEventPreferences = z.infer<
+  typeof RecruitingEventPreferencesSchema
+>;
+
+export const UpdateRecruitingEventPreferencesRequestSchema = z.object({
+  school: z.string().trim().min(1).max(200),
+}).strict();
+export type UpdateRecruitingEventPreferencesRequest = z.infer<
+  typeof UpdateRecruitingEventPreferencesRequestSchema
+>;
+
+export const RecruitingEventSchema = z.object({
+  id: z.string().uuid(),
+  title: z.string().trim().min(1).max(300),
+  organizer: z.string().trim().min(1).max(200),
+  startAt: RecruitingEventTimestampSchema,
+  endAt: RecruitingEventTimestampSchema.optional(),
+  timezone: z.string().trim().min(1).max(100).optional(),
+  location: z.string().trim().min(1).max(300).optional(),
+  attendance: z.enum(["virtual", "in_person", "hybrid", "unknown"]),
+  registrationUrl: z.string().url().max(2_048),
+  sourceUrls: z.array(z.string().url().max(2_048)).min(1).max(50),
+  description: z.string().trim().min(1).max(4_000).optional(),
+  eligibilitySummary: z.string().trim().min(1).max(1_000).optional(),
+  matchedForApplicant: z.boolean(),
+  firstSeenAt: RecruitingEventTimestampSchema,
+  lastSeenAt: RecruitingEventTimestampSchema,
+}).strict();
+export type RecruitingEvent = z.infer<typeof RecruitingEventSchema>;
+
+export const RecruitingEventScrapeRunSchema = z.object({
+  id: z.string().min(1).max(100),
+  trigger: z.enum(["startup", "scheduled", "manual"]),
+  state: z.enum(["running", "completed", "partial", "failed"]),
+  startedAt: RecruitingEventTimestampSchema,
+  completedAt: RecruitingEventTimestampSchema.optional(),
+  sourceCount: z.number().int().nonnegative(),
+  succeededSourceCount: z.number().int().nonnegative(),
+  failedSourceCount: z.number().int().nonnegative(),
+  eventCount: z.number().int().nonnegative(),
+}).strict();
+export type RecruitingEventScrapeRun = z.infer<typeof RecruitingEventScrapeRunSchema>;
+
+export const RecruitingEventIssueSchema = z.object({
+  sourceId: z.string().trim().min(1).max(100),
+  sourceName: z.string().trim().min(1).max(200),
+  sourceUrl: z.string().url().max(2_048),
+  code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/),
+  message: z.string().trim().min(1).max(240),
+  occurredAt: RecruitingEventTimestampSchema,
+}).strict();
+export type RecruitingEventIssue = z.infer<typeof RecruitingEventIssueSchema>;
+
+export const RecruitingEventDashboardResponseSchema = z.object({
+  preferences: RecruitingEventPreferencesSchema,
+  schedule: z.object({
+    cadenceHours: z.literal(24),
+    nextRunAt: RecruitingEventTimestampSchema.nullable(),
+    running: z.boolean(),
+    sourceCount: z.number().int().nonnegative(),
+  }).strict(),
+  latestRun: RecruitingEventScrapeRunSchema.nullable(),
+  events: z.array(RecruitingEventSchema).max(1_000),
+  issues: z.array(RecruitingEventIssueSchema).max(500),
+}).strict();
+export type RecruitingEventDashboardResponse = z.infer<
+  typeof RecruitingEventDashboardResponseSchema
+>;
+
+export const RecruitingEventScrapeResponseSchema = z.object({
+  run: RecruitingEventScrapeRunSchema,
+}).strict();
+export type RecruitingEventScrapeResponse = z.infer<
+  typeof RecruitingEventScrapeResponseSchema
+>;
+
 export const AuthProviderSchema = z.enum(["openai-codex", "indeed"]);
 export type AuthProvider = z.infer<typeof AuthProviderSchema>;
 

@@ -3,6 +3,7 @@ import {
   type ApplicationSessionSnapshotDto,
   type ApplicationSessionView,
   type ArtifactDto,
+  type RecruitingEventDashboardResponse,
   type RunDto,
   type ResumeIterationListResponse,
   type DiscoveryJob,
@@ -19,10 +20,12 @@ import {
   listDiscoveryJobs,
   editRun,
   getApplicationAnswerSuggestions,
+  getRecruitingEventDashboard,
   getApplicationSession,
   getRun,
   listRuns,
   listResumeIterations,
+  requestRecruitingEventScrape,
   readJsonArtifact,
   professionalizeApplicationAnswer,
   queueDiscoveryJobs,
@@ -34,6 +37,7 @@ import {
   syncDiscoveryJobs,
   updateApplicationStatus,
   updateRunIdentity,
+  updateRecruitingEventPreferences,
 } from "../app/lib/pipeline-client";
 
 const originalFetch = globalThis.fetch;
@@ -548,6 +552,115 @@ describe("pipeline run requests", () => {
     expect(cancelled).toBe(true);
   });
 
+});
+
+describe("pipeline recruiting event requests", () => {
+  const dashboard: RecruitingEventDashboardResponse = {
+    preferences: { school: "Example University" },
+    schedule: {
+      cadenceHours: 24,
+      nextRunAt: 1_900_000_000_000,
+      running: false,
+      sourceCount: 28,
+    },
+    latestRun: {
+      id: "events-run-1",
+      trigger: "scheduled",
+      state: "partial",
+      startedAt: 1_800_000_000_000,
+      completedAt: 1_800_000_001_000,
+      sourceCount: 28,
+      succeededSourceCount: 27,
+      failedSourceCount: 1,
+      eventCount: 1,
+    },
+    events: [{
+      id: "3f95527c-a45c-48e9-b36f-023c2b66f370",
+      title: "Technology recruiting forum",
+      organizer: "Example Organizer",
+      startAt: 1_900_000_000_000,
+      attendance: "hybrid",
+      registrationUrl: "https://events.example/register",
+      sourceUrls: ["https://events.example/source"],
+      matchedForApplicant: true,
+      firstSeenAt: 1_800_000_000_000,
+      lastSeenAt: 1_800_000_000_000,
+    }],
+    issues: [{
+      sourceId: "example-source",
+      sourceName: "Example Source",
+      sourceUrl: "https://events.example/source",
+      code: "SOURCE_UNAVAILABLE",
+      message: "The source did not respond.",
+      occurredAt: 1_800_000_001_000,
+    }],
+  };
+
+  test("uses exact same-origin methods and request bodies", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    setFetchMock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init });
+      if (String(input).endsWith("/preferences")) {
+        return json({ school: "Example University" });
+      }
+      if (String(input).endsWith("/scrape")) {
+        return json({ run: { ...dashboard.latestRun, trigger: "manual", state: "running", completedAt: undefined } }, { status: 202 });
+      }
+      return json(dashboard);
+    });
+
+    await expect(getRecruitingEventDashboard()).resolves.toEqual(dashboard);
+    await expect(updateRecruitingEventPreferences("  Example University  ")).resolves.toEqual({
+      school: "Example University",
+    });
+    await expect(requestRecruitingEventScrape()).resolves.toMatchObject({
+      run: { trigger: "manual", state: "running" },
+    });
+
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/events",
+        init: { cache: "no-store", method: "GET" },
+      },
+      {
+        input: "/api/pipeline/events/preferences",
+        init: {
+          body: JSON.stringify({ school: "Example University" }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        },
+      },
+      {
+        input: "/api/pipeline/events/scrape",
+        init: {
+          body: "{}",
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+    ]);
+  });
+
+  test("parses every response through the strict recruiting event contracts", async () => {
+    setFetchMock(async () => json({ ...dashboard, privateSourceConfiguration: true }));
+    await expect(getRecruitingEventDashboard()).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+
+    setFetchMock(async () => json({ school: "Example University", unexpected: true }));
+    await expect(updateRecruitingEventPreferences("Example University")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+
+    setFetchMock(async () => json({
+      run: { ...dashboard.latestRun, trigger: "manual", state: "queued" },
+    }, { status: 202 }));
+    await expect(requestRecruitingEventScrape()).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
 });
 
 describe("pipeline application session requests", () => {
