@@ -962,13 +962,10 @@ test("fresh databases default to pending while accepting lifecycle statuses", ()
     ) VALUES ('did-not-apply-run', 'did not apply job description', 'queued', 'did_not_apply', 3, 2000, 2000);
     INSERT INTO runs(
       id, job_description, status, application_status, queue_sequence, created_at, updated_at
-    ) VALUES ('waiting-for-review-run', 'waiting for review job description', 'queued', 'waiting_for_review', 4, 2000, 2000);
+    ) VALUES ('oa-received-run', 'OA received job description', 'queued', 'oa_received', 4, 2000, 2000);
     INSERT INTO runs(
       id, job_description, status, application_status, queue_sequence, created_at, updated_at
-    ) VALUES ('oa-received-run', 'OA received job description', 'queued', 'oa_received', 5, 2000, 2000);
-    INSERT INTO runs(
-      id, job_description, status, application_status, queue_sequence, created_at, updated_at
-    ) VALUES ('oa-completed-run', 'OA completed job description', 'queued', 'oa_completed', 6, 2000, 2000);
+    ) VALUES ('oa-completed-run', 'OA completed job description', 'queued', 'oa_completed', 5, 2000, 2000);
   `);
 
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
@@ -981,7 +978,6 @@ test("fresh databases default to pending while accepting lifecycle statuses", ()
     { application_status: "applied" },
     { application_status: "pending" },
     { application_status: "did_not_apply" },
-    { application_status: "waiting_for_review" },
     { application_status: "oa_received" },
     { application_status: "oa_completed" },
   ]);
@@ -1002,6 +998,9 @@ test("fresh databases default to pending while accepting lifecycle statuses", ()
   });
   expect(() => db.query(
     "UPDATE runs SET application_status = 'queued' WHERE id = 'default-run'",
+  ).run()).toThrow();
+  expect(() => db.query(
+    "UPDATE runs SET application_status = 'waiting_for_review' WHERE id = 'default-run'",
   ).run()).toThrow();
   expect(() => db.query(
     "UPDATE runs SET auto_submit = 2 WHERE id = 'default-run'",

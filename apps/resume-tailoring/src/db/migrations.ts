@@ -878,7 +878,7 @@ function migrateApplicationLifecycleStatuses(db: Database): void {
     .replace(runsTableDeclaration, "CREATE TABLE runs_pending_migration")
     .replace(
       previousLifecycleApplicationStatusCheck,
-      "CHECK (application_status IN ('pending','did_not_apply','applied','waiting_for_review','oa_received','oa_completed','rejected','interview','accepted','failed'))",
+      "CHECK (application_status IN ('pending','did_not_apply','applied','oa_received','oa_completed','rejected','interview','accepted','failed'))",
     );
   replaceRunsTable(db, upgradedRunsSql);
 }

@@ -191,7 +191,6 @@ describe("run HTTP routes", () => {
       "pending",
       "did_not_apply",
       "applied",
-      "waiting_for_review",
       "oa_received",
       "oa_completed",
       "rejected",
@@ -211,6 +210,7 @@ describe("run HTTP routes", () => {
 
     for (const body of [
       { applicationStatus: "queued" },
+      { applicationStatus: "waiting_for_review" },
       {},
       { applicationStatus: "applied", extra: true },
     ]) {

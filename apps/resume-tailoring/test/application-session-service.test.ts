@@ -2118,6 +2118,7 @@ describe("application session service", () => {
     target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
     const initial = await target.service.start(target.runId, target.pdf.sha256, signal());
     expect(initial.submissionPhase).toBe("not_attempted");
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
     target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
 
     expect(await target.service.get(target.runId)).toMatchObject({
@@ -2234,7 +2235,7 @@ describe("application session service", () => {
         "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
       ],
     });
-    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("waiting_for_review");
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
     await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
       .rejects.toMatchObject({
         code: "APPLICATION_SUBMISSION_FINAL",
@@ -2272,7 +2273,7 @@ describe("application session service", () => {
         }),
       }),
     })]);
-    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("waiting_for_review");
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
     await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
       .rejects.toMatchObject({ code: "APPLICATION_SUBMISSION_FINAL", status: 409 });
   });
@@ -2317,7 +2318,7 @@ describe("application session service", () => {
         "The application submission could not be verified. Check the headed browser if it is still available, then close this session.",
       ],
     });
-    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("waiting_for_review");
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
     await expect(target.service.retry(target.runId, target.pdf.sha256, signal()))
       .rejects.toMatchObject({ code: "APPLICATION_SUBMISSION_FINAL", status: 409 });
   });

@@ -287,7 +287,6 @@ export const APPLICATION_STATUSES = [
   "pending",
   "did_not_apply",
   "applied",
-  "waiting_for_review",
   "oa_received",
   "oa_completed",
   "rejected",

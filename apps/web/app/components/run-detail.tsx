@@ -668,13 +668,11 @@ export function RunDetail({ runId }: RunDetailProps) {
   const reportApplicationView = useCallback((next: ApplicationSessionView | null): void => {
     setApplicationView(next);
     if (next === null || "state" in next) return;
-    const refreshKey = next.bridgeState === "awaiting_human_review"
-      ? `${runId}:waiting_for_review`
-      : next.submissionPhase === "submitted"
-        ? `${runId}:submitted`
-        : next.submissionPhase === "uncertain"
-          ? `${runId}:uncertain`
-          : null;
+    const refreshKey = next.submissionPhase === "submitted"
+      ? `${runId}:submitted`
+      : next.submissionPhase === "uncertain"
+        ? `${runId}:uncertain`
+        : null;
     if (refreshKey === null || applicationStatusRefreshKeyRef.current === refreshKey) return;
     applicationStatusRefreshKeyRef.current = refreshKey;
     void refreshApplicationStatus();
@@ -1065,6 +1063,9 @@ export function RunDetail({ runId }: RunDetailProps) {
 
   const presentation = opportunityPresentation(run.opportunityKind);
   const title = run.titleOverride ?? identity?.title ?? presentation.titleFallback;
+  const awaitingHumanReview = applicationView !== null
+    && !("state" in applicationView)
+    && applicationView.bridgeState === "awaiting_human_review";
   return (
     <main
       className={styles.detailShell}
@@ -1081,6 +1082,9 @@ export function RunDetail({ runId }: RunDetailProps) {
         <WorkflowProgress applicationView={applicationView} run={run} />
       </header>
       <div className={styles.topAlerts}>
+        {awaitingHumanReview ? (
+          <p className={styles.reviewAlert} role="alert">Waiting for review!</p>
+        ) : null}
         {loadError ? <p className={styles.panelError} role="alert">{loadError}</p> : null}
         {applicationStatusRefreshError ? (
           <div className={`${styles.panelError} ${styles.statusRefreshError}`} role="alert">

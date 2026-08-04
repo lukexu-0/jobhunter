@@ -1914,8 +1914,9 @@ test("preserves a downstream lifecycle while an application remains parked for r
   });
   await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
   await expect(applicationSummary.getByText("OA received", { exact: true })).toBeVisible();
-  await expect(applicationSummary.getByText("Waiting for review!", { exact: true })).toHaveCount(0);
-  await expect.poll(() => mock.runGetCount).toBe(2);
+  await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ }))
+    .toHaveText("Waiting for review!");
+  await expect.poll(() => mock.runGetCount).toBe(1);
 });
 
 test("navigation, human review, submit approval, and close use exact public commands", async ({ page }) => {
@@ -2011,21 +2012,17 @@ test("navigation, human review, submit approval, and close use exact public comm
     window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
   }));
   await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
-  mock.run = {
-    ...mock.run,
-    applicationStatus: "waiting_for_review",
-    updatedAt: mock.run.updatedAt + 1,
-  };
   continueFrame.resolve();
 
 
   await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
-  await expect(
-    page
-      .getByRole("complementary", { name: "Application summary and keyword comparison" })
-      .getByText("Waiting for review!", { exact: true }),
-  ).toBeVisible();
-  await expect.poll(() => mock.runGetCount).toBe(2);
+  const applicationSummary = page.getByRole("complementary", {
+    name: "Application summary and keyword comparison",
+  });
+  await expect(applicationSummary.getByText("Pending", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ }))
+    .toHaveText("Waiting for review!");
+  await expect.poll(() => mock.runGetCount).toBe(1);
   await expect(applyingStage).toHaveAttribute("aria-current", "step");
   await expect(appliedStage.locator("svg")).toHaveCount(0);
   await expect(page.getByText("Email", { exact: true })).toBeVisible();
@@ -2068,7 +2065,7 @@ test("navigation, human review, submit approval, and close use exact public comm
 
   await expect(page.getByRole("status").filter({ hasText: "Application submitted" })).toBeVisible();
   await expect(page.getByText(/Headed Chrome stays open until .* so you can inspect the final application state/)).toBeVisible();
-  await expect.poll(() => mock.runGetCount).toBe(3);
+  await expect.poll(() => mock.runGetCount).toBe(2);
   await expect(applyingStage).not.toHaveAttribute("aria-current", "step");
   await expect(applyingStage.locator("svg")).toHaveCount(1);
   await expect(appliedStage.locator("svg")).toHaveCount(1);
@@ -2094,9 +2091,8 @@ test("navigation, human review, submit approval, and close use exact public comm
 
 test("submission uncertainty keeps Applying current and never offers Retry", async ({ page }) => {
   const initialRun = approvedRun();
-  const waitingRun: RunDto = {
+  const refreshedRun: RunDto = {
     ...initialRun,
-    applicationStatus: "waiting_for_review",
     updatedAt: initialRun.updatedAt + 1,
   };
   const uncertain = snapshotFixture({
@@ -2114,7 +2110,7 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
   });
   mock.runReplies.push(
     { status: 200, body: initialRun },
-    { status: 200, body: waitingRun },
+    { status: 200, body: refreshedRun },
   );
 
   await page.goto(`/runs/${runId}`);
@@ -2129,7 +2125,8 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
   await expect(page.getByText("The application submission could not be verified.", {
     exact: false,
   })).toBeVisible();
-  await expect(page.getByText("Waiting for review!", { exact: true })).toBeVisible();
+  await expect(page.getByText("Pending", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ })).toHaveCount(0);
   await expect.poll(() => mock.runGetCount).toBe(2);
 });
 
