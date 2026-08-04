@@ -181,6 +181,7 @@ export function RunIdentitySummary({
   >;
 }) {
   const presentation = opportunityPresentation(run.opportunityKind);
+  const KindIcon = presentation.icon;
   const title = run.titleOverride ?? identity?.title ?? presentation.titleFallback;
   const subtitle =
     run.organizationOverride ?? identity?.organization ?? presentation.organizationFallback;
@@ -189,6 +190,7 @@ export function RunIdentitySummary({
     <section className={styles.paneSection}>
       <div className={styles.identityStatusRow}>
         <p className={`${styles.eyebrow} ${styles.opportunityKind}`}>
+          <KindIcon className={styles.icon} aria-hidden="true" />
           {presentation.detailKindLabel}
         </p>
         <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>

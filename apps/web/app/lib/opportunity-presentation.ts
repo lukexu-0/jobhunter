@@ -1,6 +1,14 @@
 import type { OpportunityKind } from "@jobhunter/pipeline/contracts";
+import {
+  Briefcase,
+  CalendarDays,
+  Code2,
+  Trophy,
+  type LucideIcon,
+} from "lucide-react";
 
 export interface OpportunityPresentation {
+  readonly icon: LucideIcon;
   readonly visibleKindLabel: string | null;
   readonly detailKindLabel: string;
   readonly summaryLabel: string;
@@ -15,6 +23,7 @@ export interface OpportunityPresentation {
 
 export const OPPORTUNITY_PRESENTATION = {
   job: {
+    icon: Briefcase,
     detailKindLabel: "Job",
     visibleKindLabel: null,
     summaryLabel: "Application summary and keyword comparison",
@@ -27,6 +36,7 @@ export const OPPORTUNITY_PRESENTATION = {
     dashboardOrganizationFallback: null,
   },
   hackathon: {
+    icon: Code2,
     visibleKindLabel: "Hackathon",
     detailKindLabel: "Hackathon",
     summaryLabel: "Hackathon summary and keyword comparison",
@@ -39,6 +49,7 @@ export const OPPORTUNITY_PRESENTATION = {
     dashboardOrganizationFallback: "Organizer unavailable",
   },
   competition: {
+    icon: Trophy,
     visibleKindLabel: "Competition",
     detailKindLabel: "Competition",
     summaryLabel: "Competition summary and keyword comparison",
@@ -51,6 +62,7 @@ export const OPPORTUNITY_PRESENTATION = {
     dashboardOrganizationFallback: "Organizer unavailable",
   },
   event: {
+    icon: CalendarDays,
     visibleKindLabel: "Event",
     detailKindLabel: "Event",
     summaryLabel: "Event summary and keyword comparison",
