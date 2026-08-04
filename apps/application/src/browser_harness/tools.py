@@ -6,6 +6,8 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 
 from . import DEFAULT_SESSION_TIMEOUT_SECONDS
+from .playwright_cli import PlaywrightCliRuntimeError
+from .credentials import CredentialStore
 from .models import (
     AcceptedAdditionalInfoAnswer,
     AdditionalInfoBooleanCommandAnswer,
@@ -28,6 +30,7 @@ from .models import (
     SessionState,
     sanitize_public_url,
     validate_approved_origin,
+    session_error,
     validate_job_url,
 )
 from .user_info import UserInfoStore
@@ -40,9 +43,11 @@ GateEventPublisher = Callable[
     [SessionState, str | None, Mapping[str, object]], Awaitable[None]
 ]
 ReviewSnapshotSink = Callable[[ReviewApplicationResult], Awaitable[None]]
-GateKind = Literal["navigation", "origin", "additional_info", "review"]
+GateKind = Literal["navigation", "credentials", "origin", "additional_info", "review"]
 DecisionKind = Literal[
     "continue",
+    "sign_in",
+    "save_credentials",
     "approve",
     "additional_info",
     "revise",
@@ -58,6 +63,25 @@ class BrowserGateRuntime(Protocol):
     async def set_approved_origins(self, origins: Sequence[str]) -> None: ...
 
     async def suspend_navigation_guard(self) -> None: ...
+    async def suppress_private_capture(self) -> None: ...
+
+    async def activate_private_values(self, values: Iterable[str]) -> None: ...
+    async def verify_origin_and_activate_private_values(
+        self,
+        expected_origin: str,
+        values: Iterable[str],
+    ) -> str | None: ...
+
+    async def sign_in(
+        self,
+        *,
+        expected_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +101,11 @@ class _PendingGate:
     origin: str | None = None
     questions: tuple[AdditionalInfoQuestion, ...] = ()
     storage_questions: tuple[AdditionalInfoQuestion, ...] = ()
+    login_origin: str | None = None
+    username_ref: str | None = None
+    password_ref: str | None = None
+    submit_ref: str | None = None
+    credential_store: CredentialStore | None = None
 
 
 def _origin_from_url(value: str) -> str:
@@ -356,6 +385,9 @@ class HumanGate:
         self._cancelled = False
         self._revision_count = 0
         self._submission_approved = False
+        self._tried_credentials: set[tuple[str, str]] = set()
+        self._credential_values_activated = False
+        self._credential_command_task: asyncio.Task[None] | None = None
 
     @property
     def approved_origins(self) -> tuple[str, ...]:
@@ -372,6 +404,10 @@ class HumanGate:
     @property
     def submission_approved(self) -> bool:
         return self._submission_approved
+
+    @property
+    def screenshots_suppressed(self) -> bool:
+        return self._credential_values_activated
 
     @property
     def pending_kind(self) -> GateKind | None:
@@ -423,6 +459,88 @@ class HumanGate:
             )
         finally:
             await runtime.set_approved_origins(self._approved_origins)
+    async def request_sign_in(
+        self,
+        *,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        runtime: BrowserGateRuntime,
+        credential_store: CredentialStore,
+    ) -> GateResult:
+        try:
+            await runtime.suppress_private_capture()
+        except PlaywrightCliRuntimeError as error:
+            public = session_error(error.code)
+            raise HarnessServiceError(
+                504 if error.code == "session_timeout" else 502,
+                public.code,
+                public.message,
+            ) from None
+        except HarnessServiceError:
+            raise
+        except Exception:
+            raise HarnessServiceError(
+                502,
+                "browser_failed",
+                "Browser runtime failed.",
+            ) from None
+        try:
+            login_origin = _origin_from_url(await runtime.get_current_page_url())
+        except (RuntimeError, ValueError):
+            raise HarnessServiceError(
+                502,
+                "browser_failed",
+                "Browser runtime failed.",
+            ) from None
+        if login_origin not in self._approved_origins:
+            raise HarnessServiceError(
+                409,
+                "command_conflict",
+                "Sign-in requires an approved exact origin",
+            )
+
+        saved = credential_store.credentials_for_origin(login_origin)
+        credential = next(
+            (
+                candidate
+                for candidate in saved
+                if (candidate.origin, candidate.username)
+                not in self._tried_credentials
+            ),
+            None,
+        )
+        if credential is not None:
+            self._tried_credentials.add((credential.origin, credential.username))
+            await self._perform_sign_in(
+                runtime=runtime,
+                login_origin=login_origin,
+                username_ref=username_ref,
+                password_ref=password_ref,
+                submit_ref=submit_ref,
+                username=credential.username,
+                password=credential.password,
+            )
+            return GateResult(metadata={"sign_in_status": "attempted"})
+
+        decision, _ = await self._wait_for_gate(
+            kind="credentials",
+            runtime=runtime,
+            state="awaiting_human_navigation",
+            event="credentials_required",
+            detail={},
+            login_origin=login_origin,
+            username_ref=username_ref,
+            password_ref=password_ref,
+            submit_ref=submit_ref,
+            credential_store=credential_store,
+        )
+        if decision == "cancel":
+            return await self._cancelled_result(runtime)
+        status = "saved" if decision == "save_credentials" else "attempted"
+        await self._publish("running", None, {})
+        return GateResult(metadata={"sign_in_status": status})
+
 
     async def register_origin(
         self,
@@ -574,6 +692,108 @@ class HumanGate:
             await pending.runtime.set_approved_origins(approved_origins)
             self._approved_origins.append(canonical_origin)
             pending.future.set_result(("approve", None))
+    async def sign_in(self, username: str, password: str) -> None:
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("Credential command has no owning task")
+        async with self._lock:
+            pending = self._require_pending("credentials")
+            if (
+                pending.login_origin is None
+                or pending.username_ref is None
+                or pending.password_ref is None
+                or pending.submit_ref is None
+            ):
+                raise RuntimeError("Credential gate is incomplete")
+            if (
+                self._credential_command_task is not None
+                and not self._credential_command_task.done()
+            ):
+                raise self._conflict("A credential command is already pending")
+            self._credential_command_task = current_task
+            runtime = pending.runtime
+            login_origin = pending.login_origin
+            username_ref = pending.username_ref
+            password_ref = pending.password_ref
+            submit_ref = pending.submit_ref
+        try:
+            await self._perform_sign_in(
+                runtime=runtime,
+                login_origin=login_origin,
+                username_ref=username_ref,
+                password_ref=password_ref,
+                submit_ref=submit_ref,
+                username=username,
+                password=password,
+            )
+            async with self._lock:
+                if self._pending is not pending:
+                    raise self._conflict("The credential gate changed")
+                self._require_pending("credentials")
+                pending.future.set_result(("sign_in", None))
+        finally:
+            async with self._lock:
+                if self._credential_command_task is current_task:
+                    self._credential_command_task = None
+
+    async def save_credentials(self, username: str, password: str) -> None:
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("Credential command has no owning task")
+        async with self._lock:
+            pending = self._require_pending("credentials")
+            if pending.login_origin is None or pending.credential_store is None:
+                raise RuntimeError("Credential gate is incomplete")
+            if (
+                self._credential_command_task is not None
+                and not self._credential_command_task.done()
+            ):
+                raise self._conflict("A credential command is already pending")
+            self._credential_command_task = current_task
+            self._activate_credential_redaction(username, password)
+            runtime = pending.runtime
+            credential_store = pending.credential_store
+            login_origin = pending.login_origin
+        try:
+            try:
+                live_origin = (
+                    await runtime.verify_origin_and_activate_private_values(
+                        login_origin,
+                        (username, password),
+                    )
+                )
+                if live_origin is None:
+                    raise self._conflict("The credential page changed")
+                await credential_store.upsert(
+                    live_origin,
+                    username,
+                    password,
+                )
+            except PlaywrightCliRuntimeError as error:
+                public = session_error(error.code)
+                raise HarnessServiceError(
+                    504 if error.code == "session_timeout" else 502,
+                    public.code,
+                    public.message,
+                ) from None
+            except HarnessServiceError:
+                raise
+            except Exception:
+                raise HarnessServiceError(
+                    500,
+                    "internal_error",
+                    "Request failed",
+                ) from None
+            async with self._lock:
+                if self._pending is not pending:
+                    raise self._conflict("The credential gate changed")
+                self._require_pending("credentials")
+                pending.future.set_result(("save_credentials", None))
+        finally:
+            async with self._lock:
+                if self._credential_command_task is current_task:
+                    self._credential_command_task = None
+
 
     async def provide_additional_info(
         self,
@@ -621,11 +841,20 @@ class HumanGate:
             pending.future.set_result(("submit", None))
 
     async def cancel(self) -> None:
+        current_task = asyncio.current_task()
         async with self._lock:
             self._cancelled = True
             pending = self._pending
             if pending is not None and not pending.future.done():
                 pending.future.set_result(("cancel", None))
+            credential_task = self._credential_command_task
+        if (
+            credential_task is not None
+            and credential_task is not current_task
+            and not credential_task.done()
+        ):
+            credential_task.cancel()
+            await asyncio.gather(credential_task, return_exceptions=True)
 
     async def _wait_for_gate(
         self,
@@ -638,6 +867,11 @@ class HumanGate:
         origin: str | None = None,
         questions: tuple[AdditionalInfoQuestion, ...] = (),
         storage_questions: tuple[AdditionalInfoQuestion, ...] = (),
+        login_origin: str | None = None,
+        username_ref: str | None = None,
+        password_ref: str | None = None,
+        submit_ref: str | None = None,
+        credential_store: CredentialStore | None = None,
     ) -> GateDecision:
         async with self._lock:
             if self._submission_approved and kind not in {"navigation", "origin"}:
@@ -656,6 +890,11 @@ class HumanGate:
                 origin=origin,
                 questions=questions,
                 storage_questions=storage_questions,
+                login_origin=login_origin,
+                username_ref=username_ref,
+                password_ref=password_ref,
+                submit_ref=submit_ref,
+                credential_store=credential_store,
             )
             self._pending = pending
             await self._publish(state, event, detail)
@@ -675,6 +914,7 @@ class HumanGate:
                 if self._pending is pending:
                     self._pending = None
 
+
     def _require_pending(self, kind: GateKind) -> _PendingGate:
         pending = self._pending
         if pending is None or pending.kind != kind or pending.future.done():
@@ -683,6 +923,53 @@ class HumanGate:
 
     def _conflict(self, message: str) -> HarnessServiceError:
         return HarnessServiceError(409, "command_conflict", message)
+
+    async def _perform_sign_in(
+        self,
+        *,
+        runtime: BrowserGateRuntime,
+        login_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> None:
+        self._activate_credential_redaction(username, password)
+        try:
+            await runtime.sign_in(
+                expected_origin=login_origin,
+                username_ref=username_ref,
+                password_ref=password_ref,
+                submit_ref=submit_ref,
+                username=username,
+                password=password,
+            )
+        except PlaywrightCliRuntimeError as error:
+            public = session_error(error.code)
+            raise HarnessServiceError(
+                504 if error.code == "session_timeout" else 502,
+                public.code,
+                public.message,
+            ) from None
+        except HarnessServiceError:
+            raise
+        except Exception:
+            raise HarnessServiceError(
+                502,
+                "browser_failed",
+                "Browser runtime failed.",
+            ) from None
+
+    def _activate_credential_redaction(
+        self,
+        username: str,
+        password: str,
+    ) -> None:
+        self._redaction_values.update(
+            value for value in (username, password) if value
+        )
+        self._credential_values_activated = True
 
     async def _cancelled_result(
         self,

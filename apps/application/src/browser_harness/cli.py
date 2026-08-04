@@ -13,6 +13,7 @@ import uvicorn
 from pydantic import ValidationError
 from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 
+from .credentials import CredentialStore
 from .api import HarnessDependencies, create_app
 from .playwright_cli import (
     BrowserConfigurationError,
@@ -73,6 +74,15 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="durable scoped user-information JSON store",
     )
+    parser.add_argument(
+        "--credentials-json",
+        type=Path,
+        default=None,
+        help=(
+            "private application credential JSON store "
+            "(default: ~/.jobhunter/browser-harness/credentials.json)"
+        ),
+    )
     launch = parser.add_mutually_exclusive_group()
     launch.add_argument(
         "--chrome-executable",
@@ -110,7 +120,11 @@ def _resolve_regular_file(
     return resolved
 
 _DEFAULT_TOKEN_PATH = Path("~/.jobhunter/browser-harness/token")
+_DEFAULT_CREDENTIALS_PATH = Path("~/.jobhunter/browser-harness/credentials.json")
 _MAX_TOKEN_FILE_BYTES = 4096
+
+def _absolute_without_symlink_resolution(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
 def _read_default_token(path: Path) -> str:
@@ -259,6 +273,11 @@ def parse_config(
                 if args.user_info_json is None
                 else args.user_info_json.expanduser().resolve()
             ),
+            credentials_json=_absolute_without_symlink_resolution(
+                _DEFAULT_CREDENTIALS_PATH
+                if args.credentials_json is None
+                else args.credentials_json
+            ),
             browser=browser,
         )
         resolved = resolve_browser_launch(browser)
@@ -275,9 +294,11 @@ def _configure_logging() -> None:
 def main(argv: Sequence[str] | None = None) -> None:
     config, browser_launch = parse_config(argv)
     _configure_logging()
+    credential_store = CredentialStore(config.credentials_json)
     sessions = ApplicationSessionManager(
         config,
         browser_launch=browser_launch,
+        credential_store=credential_store,
     )
     app = create_app(config, HarnessDependencies(sessions=sessions))
     uvicorn.run(

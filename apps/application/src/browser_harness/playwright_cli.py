@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import base64
 import inspect
 import json
@@ -8,6 +9,7 @@ import math
 import os
 import platform
 import shutil
+import re
 import stat
 import sys
 import tempfile
@@ -16,7 +18,7 @@ from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID
 
 import psutil
@@ -37,12 +39,21 @@ _MAX_ARGUMENT_BYTES = 8_192
 _MAX_INVOCATION_BYTES = 65_536
 _MAX_CAPTURE_BYTES = 65_536
 _MAX_INTERNAL_CAPTURE_BYTES = 8 * 1024 * 1024
+_MAX_OBSERVATION_CAPTURE_BYTES = 16 * 1024 * 1024
 _MAX_OUTPUT_CHARS = 20_000
 _MAX_URL_CHARS = 4_096
 _MAX_TITLE_CHARS = 4_096
 _MAX_TAB_ID_CHARS = 512
 _MAX_TABS = 100
 _MAX_DOM_CHARS = 40_000
+_MAX_URL_CAPTURE_CHARS = _MAX_URL_CHARS * 12
+_MAX_TITLE_CAPTURE_CHARS = _MAX_TITLE_CHARS * 2
+_MAX_PRIVATE_REDACTION_FRAGMENT_CHARS = 4_096 * 16
+_MAX_DOM_CAPTURE_CHARS = (
+    _MAX_DOM_CHARS + _MAX_PRIVATE_REDACTION_FRAGMENT_CHARS
+)
+# 101 records * (49,152 URL bytes + 7 * 8,192 title scalars) stays below
+# 16 MiB with the result envelope and two JSON serialization layers.
 _MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
 _MAX_OUTPUT_DIRECTORY_BYTES = 128 * 1024 * 1024
 _MAX_TEMPORARY_DIRECTORY_BYTES = 128 * 1024 * 1024
@@ -57,10 +68,82 @@ _RECOVERY_TERMINATE_GRACE_SECONDS = 20.0
 _NATIVE_BROWSER_DISCOVERY_TIMEOUT_SECONDS = 5.0
 _PROCESS_TERMINATE_GRACE_SECONDS = 2.0
 _SAFE_INTERNAL_SCHEMES = frozenset({"about"})
+_ELEMENT_REF_PATTERN = re.compile(r"^e[1-9][0-9]{0,8}$")
 _CHROME_SINGLETON_SOCKET_LIMIT = 108
 _CHROME_SINGLETON_SOCKET_SUFFIX = Path(
     "com.google.Chrome.XXXXXX/SingletonSocket"
 )
+
+def _is_unicode_scalar_text(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _create_anonymous_memfd() -> int:
+    create_memfd = getattr(os, "memfd_create", None)
+    close_on_exec = getattr(os, "MFD_CLOEXEC", 0x0001)
+    if callable(create_memfd):
+        return create_memfd("jobhunter-sign-in", flags=close_on_exec)
+    libc = ctypes.CDLL(None, use_errno=True)
+    native_create = libc.memfd_create
+    native_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    native_create.restype = ctypes.c_int
+    descriptor = native_create(b"jobhunter-sign-in", close_on_exec)
+    if descriptor < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return descriptor
+
+
+def _yaml_value_fragment(value: str) -> str:
+    escaped: list[str] = []
+    named = {
+        "\\": "\\\\",
+        '"': '\\"',
+        "\b": "\\b",
+        "\f": "\\f",
+        "\n": "\\n",
+        "\r": "\\r",
+        "\t": "\\t",
+    }
+    for character in value:
+        replacement = named.get(character)
+        if replacement is not None:
+            escaped.append(replacement)
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0x1F or 0x7F <= codepoint <= 0x9F:
+            escaped.append(f"\\x{codepoint:02x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def _private_redaction_fragments(values: Iterable[str]) -> tuple[str, ...]:
+    fragments: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        fragments.add(value)
+        fragments.add(value.replace("'", "''"))
+        fragments.add(_yaml_value_fragment(value))
+        fragments.add(json.dumps(value, ensure_ascii=False)[1:-1])
+        fragments.add(json.dumps(value, ensure_ascii=True)[1:-1])
+    for fragment in tuple(fragments):
+        encoded = quote(fragment, safe="")
+        fragments.add(encoded)
+        fragments.add(
+            re.sub(
+                r"%([0-9A-F]{2})",
+                lambda match: f"%{match.group(1).lower()}",
+                encoded,
+            )
+        )
+    return tuple(sorted(fragments, key=len, reverse=True))
+
 
 _APPROVED_COMMANDS = frozenset(
     {
@@ -628,6 +711,39 @@ def _remove_owned_temporary_directory(path: Path, session_id: UUID) -> None:
     except OSError:
         raise BrowserConfigurationError(
             "The Playwright CLI temporary directory is unavailable"
+        ) from None
+
+
+def _remove_stale_private_sign_in_links(internal_directory: Path) -> None:
+    try:
+        details = internal_directory.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise BrowserConfigurationError(
+            "The Playwright CLI private payload directory is unavailable"
+        ) from None
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+    ):
+        raise BrowserConfigurationError(
+            "The Playwright CLI private payload directory is unavailable"
+        )
+    try:
+        for candidate in internal_directory.iterdir():
+            if (
+                re.fullmatch(
+                    r"\.(?:sign-in|restore)-[0-9a-f]{32}\.js",
+                    candidate.name,
+                )
+                and candidate.is_symlink()
+            ):
+                candidate.unlink()
+    except OSError:
+        raise BrowserConfigurationError(
+            "The Playwright CLI private payload directory is unavailable"
         ) from None
 async def _default_process_factory(*argv: str, **kwargs: object) -> _Process:
     process = await asyncio.create_subprocess_exec(*argv, **kwargs)
@@ -1356,6 +1472,7 @@ async def recover_stale_playwright_cli_sessions(
             raise BrowserConfigurationError(
                 "A stale Playwright CLI temporary directory could not be cleared"
             ) from None
+        _remove_stale_private_sign_in_links(scope_directory / "internal")
         try:
             ownership_path.unlink()
         except OSError:
@@ -1442,6 +1559,7 @@ class PlaywrightCliRuntime:
         self._current_metadata: _PageMetadata | None = None
         self._active_process: _Process | None = None
         self._observation_number = 0
+        self._screenshots_suppressed = False
         self._config_path = self._scope_directory / "cli.config.json"
         self._ownership_path = self._scope_directory / "ownership.json"
         self._video_path = self._video_directory / "session.webm"
@@ -1458,13 +1576,208 @@ class PlaywrightCliRuntime:
             raise
         self._environment = self._build_environment()
         self._private_values = self._build_private_values()
+        self._refresh_private_redaction_values()
+
+    async def activate_private_values(self, values: Iterable[str]) -> None:
+        async with self._operation_lock:
+            if not self._opened or self._closed:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            self._activate_private_values_unlocked(values)
+
+    async def verify_origin_and_activate_private_values(
+        self,
+        expected_origin: str,
+        values: Iterable[str],
+    ) -> str | None:
+        async with self._operation_lock:
+            if not self._started or self._closed:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            try:
+                canonical_origin = validate_approved_origin(expected_origin)
+            except (TypeError, ValueError):
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+            if canonical_origin != expected_origin:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            metadata = await self._metadata()
+            try:
+                live_origin = _origin_for_url(metadata.url)
+            except (TypeError, ValueError):
+                return None
+            if live_origin != canonical_origin:
+                return None
+            self._activate_private_values_unlocked(values)
+            refreshed_metadata = await self._metadata()
+            try:
+                refreshed_origin = _origin_for_url(refreshed_metadata.url)
+            except (TypeError, ValueError):
+                return None
+            if refreshed_origin != canonical_origin:
+                return None
+            self._current_metadata = refreshed_metadata
+            return refreshed_origin
+
+    async def suppress_private_capture(self) -> None:
+        async with self._operation_lock:
+            await self._suppress_private_capture_unlocked()
+
+    async def _suppress_private_capture_unlocked(self) -> None:
+        if not self._started or self._closed:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        self._screenshots_suppressed = True
+        if self._video_started:
+            try:
+                stopped = await self._invoke(
+                    "video-stop",
+                    timeout=_LIFECYCLE_TIMEOUT_SECONDS,
+                )
+                self._require_success(stopped)
+            except PlaywrightCliRuntimeError:
+                try:
+                    await self._emergency_budget_cleanup_unlocked()
+                except PlaywrightCliRuntimeError:
+                    self._started = False
+                    self._guard_armed = False
+                raise
+            self._video_started = False
+
+    async def sign_in(
+        self,
+        *,
+        expected_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> None:
+        async with self._operation_lock:
+            await self._suppress_private_capture_unlocked()
+            remaining = self._remaining()
+            aggregate_timeout = self._execution_timeout * 5
+            session_bound = remaining <= aggregate_timeout
+            try:
+                async with asyncio.timeout(min(remaining, aggregate_timeout)):
+                    await self._sign_in_unlocked(
+                        expected_origin=expected_origin,
+                        username_ref=username_ref,
+                        password_ref=password_ref,
+                        submit_ref=submit_ref,
+                        username=username,
+                        password=password,
+                    )
+            except TimeoutError:
+                code: Literal["browser_failed", "session_timeout"] = (
+                    "session_timeout" if session_bound else "browser_failed"
+                )
+                raise PlaywrightCliRuntimeError(code) from None
+
+    async def _sign_in_unlocked(
+        self,
+        *,
+        expected_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> None:
+        if not self._started or self._closed:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        try:
+            canonical_origin = validate_approved_origin(expected_origin)
+        except (TypeError, ValueError):
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+        if canonical_origin != expected_origin:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        refs = (username_ref, password_ref, submit_ref)
+        if any(
+            not isinstance(ref, str) or _ELEMENT_REF_PATTERN.fullmatch(ref) is None
+            for ref in refs
+        ):
+            raise PlaywrightCliRuntimeError("browser_failed")
+        if (
+            not isinstance(username, str)
+            or username != username.strip()
+            or not 1 <= len(username) <= 320
+            or not _is_unicode_scalar_text(username)
+            or "\x00" in username
+            or not isinstance(password, str)
+            or not 1 <= len(password) <= 4_096
+            or not _is_unicode_scalar_text(password)
+            or "\x00" in password
+        ):
+            raise PlaywrightCliRuntimeError("browser_failed")
+
+        pre_metadata = await self._metadata()
+        try:
+            current_origin = _origin_for_url(pre_metadata.url)
+        except (TypeError, ValueError):
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+        if current_origin != canonical_origin:
+            raise PlaywrightCliRuntimeError("browser_failed")
+
+        self._activate_private_values_unlocked((username, password))
+        script = self._private_sign_in_script(
+            expected_origin=canonical_origin,
+            username_ref=username_ref,
+            password_ref=password_ref,
+            submit_ref=submit_ref,
+            username=username,
+            password=password,
+        )
+        result = await self._invoke_private_script_unlocked(
+            script,
+            label="sign-in",
+            timeout=self._execution_timeout,
+        )
+        self._snapshot_from_execution(result, remove_file=True)
+        self._require_success(result)
+
+        post_metadata = await self._metadata()
+        if self._guard_armed and not self._url_is_allowed(
+            post_metadata.url,
+            self._approved_origins,
+        ):
+            await self._restore_allowed_page(pre_metadata, post_metadata)
+            raise PlaywrightCliRuntimeError("browser_failed")
+        self._current_metadata = post_metadata
+        if self._directory_size_exceeds(
+            self._output_directory,
+            _MAX_OUTPUT_DIRECTORY_BYTES,
+        ):
+            await self._emergency_budget_cleanup_unlocked()
+            raise PlaywrightCliRuntimeError("browser_failed")
+
+    def _activate_private_values_unlocked(self, values: Iterable[str]) -> None:
+        private_values = set(self._private_values)
+        original_count = len(private_values)
+        for value in values:
+            if isinstance(value, str) and value:
+                private_values.add(value)
+        if len(private_values) != original_count:
+            self._private_values = tuple(
+                sorted(private_values, key=len, reverse=True)
+            )
+            self._refresh_private_redaction_values()
+            self._current_metadata = None
+        self._screenshots_suppressed = True
+
+    def _refresh_private_redaction_values(self) -> None:
+        self._private_redaction_values = _private_redaction_fragments(
+            self._private_values
+        )
+        # Fragment strings are the only persistent redaction index.
+        # Boundary redaction below performs no per-character metadata caching.
 
     @property
     def session_name(self) -> str:
         return self._session_name
 
     def _write_config(self) -> None:
-        browser: dict[str, object] = {"browserName": "chromium"}
+        browser: dict[str, object] = {
+            "browserName": "chromium",
+            "contextOptions": {"acceptDownloads": False},
+        }
         if self._launch.cdp_url is not None:
             browser.update(
                 {
@@ -1498,6 +1811,8 @@ class PlaywrightCliRuntime:
             },
             "allowUnrestrictedFileAccess": False,
             "codegen": "none",
+            "snapshot": {"mode": "none"},
+            "console": {"level": "none"},
         }
         _atomic_write_private_json(self._config_path, config)
 
@@ -1636,7 +1951,6 @@ class PlaywrightCliRuntime:
         actual_timeout = min(timeout, remaining) if enforce_deadline else timeout
         session_bound = enforce_deadline and remaining < timeout
         process = await self._spawn(self._argv(command, args))
-        self._active_process = process
         stdout_capture = _BoundedCapture(capture_limit, bytearray())
         stderr_capture = _BoundedCapture(capture_limit, bytearray())
         stdout_task = asyncio.create_task(
@@ -1808,6 +2122,124 @@ class PlaywrightCliRuntime:
         self._native_browser_executable = executable
         self._write_ownership()
 
+    @staticmethod
+    def _private_sign_in_script(
+        *,
+        expected_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> str:
+        return (
+            "async (page) => {"
+            f"const expectedOrigin={json.dumps(expected_origin)};"
+            f"const username={json.dumps(username)};"
+            f"const password={json.dumps(password)};"
+            "if(await page.evaluate(()=>location.origin)!==expectedOrigin)"
+            "throw new Error('Unexpected sign-in origin');"
+            f"const usernameElement=await page.locator('aria-ref={username_ref}').elementHandle();"
+            f"const passwordElement=await page.locator('aria-ref={password_ref}').elementHandle();"
+            f"const submitElement=await page.locator('aria-ref={submit_ref}').elementHandle();"
+            "if(!usernameElement||!passwordElement||!submitElement)"
+            "throw new Error('Sign-in elements unavailable');"
+            "if(await page.evaluate(()=>location.origin)!==expectedOrigin)"
+            "throw new Error('Unexpected sign-in origin');"
+            "await usernameElement.fill(username);"
+            "await passwordElement.fill(password);"
+            "await submitElement.click();"
+            "}"
+        )
+
+    def _create_private_script_memfd(
+        self,
+        script: str,
+        *,
+        label: Literal["sign-in", "restore"],
+    ) -> tuple[int, Path]:
+        payload = script.encode("utf-8")
+        descriptor = -1
+        payload_path: Path | None = None
+        try:
+            descriptor = _create_anonymous_memfd()
+            os.fchmod(descriptor, 0o600)
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("private memfd write failed")
+                remaining = remaining[written:]
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            target = Path(f"/proc/{os.getpid()}/fd/{descriptor}")
+            for _ in range(10):
+                candidate = self._internal_directory / (
+                    f".{label}-{os.urandom(16).hex()}.js"
+                )
+                try:
+                    candidate.symlink_to(target)
+                except FileExistsError:
+                    continue
+                payload_path = candidate
+                break
+            if payload_path is None:
+                raise OSError("private memfd link collision")
+            return descriptor, payload_path
+        except (AttributeError, OSError, TypeError, ValueError):
+            if payload_path is not None:
+                try:
+                    payload_path.unlink()
+                except OSError:
+                    pass
+            if descriptor >= 0:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    os.ftruncate(descriptor, 0)
+                except OSError:
+                    pass
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+
+    async def _invoke_private_script_unlocked(
+        self,
+        script: str,
+        *,
+        label: Literal["sign-in", "restore"],
+        timeout: float,
+    ) -> _InvocationResult:
+        descriptor, payload_path = self._create_private_script_memfd(
+            script,
+            label=label,
+        )
+        try:
+            return await self._invoke(
+                "run-code",
+                [f"--filename={payload_path}"],
+                timeout=timeout,
+            )
+        finally:
+            cleanup_failed = False
+            try:
+                payload_path.unlink()
+            except OSError:
+                cleanup_failed = True
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.ftruncate(descriptor, 0)
+            except OSError:
+                cleanup_failed = True
+            try:
+                os.close(descriptor)
+            except OSError:
+                cleanup_failed = True
+            if cleanup_failed:
+                self._started = False
+                self._guard_armed = False
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+
     async def execute(
         self,
         command: str,
@@ -1834,21 +2266,35 @@ class PlaywrightCliRuntime:
         if not self._started or self._closed or not self._guard_armed:
             raise PlaywrightCliRuntimeError("browser_failed")
         normalized = self._validate_model_invocation(command, args)
+        if self._screenshots_suppressed and command in {
+            "eval",
+            "screenshot",
+            "pdf",
+        }:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        if self._screenshots_suppressed and command == "snapshot" and any(
+            value == "--filename" or value.startswith("--filename=")
+            for value in normalized
+        ):
+            raise PlaywrightCliRuntimeError("browser_failed")
         pre_metadata = self._current_metadata
         if pre_metadata is None:
             pre_metadata = await self._metadata()
         if not self._url_is_allowed(pre_metadata.url, self._approved_origins):
             raise PlaywrightCliRuntimeError("browser_failed")
         self._validate_tab_command(command, normalized, pre_metadata)
-
         execution = await self._invoke(
             command,
             normalized,
             timeout=self._execution_timeout,
         )
-        preserve_snapshot_file = command == "snapshot" and any(
-            value == "--filename" or value.startswith("--filename=")
-            for value in normalized
+        preserve_snapshot_file = (
+            not self._screenshots_suppressed
+            and command == "snapshot"
+            and any(
+                value == "--filename" or value.startswith("--filename=")
+                for value in normalized
+            )
         )
         post_metadata, observation = await self._collect_observation(
             execution,
@@ -1868,11 +2314,21 @@ class PlaywrightCliRuntime:
             ):
                 raise PlaywrightCliRuntimeError("browser_failed")
         self._current_metadata = post_metadata
-        stdout, stdout_text_truncated = self._public_output(execution.stdout)
-        stderr, stderr_text_truncated = self._public_output(execution.stderr)
-        if command == "tab-list":
+        if self._screenshots_suppressed:
             stdout = "[redacted]"
+            stderr = "[redacted]"
             stdout_text_truncated = False
+            stderr_text_truncated = False
+        else:
+            stdout, stdout_text_truncated = self._public_output(
+                execution.stdout
+            )
+            stderr, stderr_text_truncated = self._public_output(
+                execution.stderr
+            )
+            if command == "tab-list":
+                stdout = "[redacted]"
+                stdout_text_truncated = False
         exit_code = execution.exit_code
         if self._reported_cli_error(execution) and exit_code == 0:
             exit_code = 1
@@ -2093,7 +2549,7 @@ class PlaywrightCliRuntime:
     async def _monitor_artifact_budget(self) -> None:
         current = asyncio.current_task()
         try:
-            while self._video_started and not self._closed:
+            while self._open_attempted and not self._closed:
                 await asyncio.sleep(_ARTIFACT_BUDGET_POLL_SECONDS)
                 video_exceeded = self._directory_size_exceeds(
                     self._video_directory,
@@ -2190,6 +2646,7 @@ class PlaywrightCliRuntime:
                 self._temporary_directory,
                 self._session_id,
             )
+            _remove_stale_private_sign_in_links(self._internal_directory)
             self._ownership_path.unlink(missing_ok=True)
         except (BrowserConfigurationError, OSError):
             raise PlaywrightCliRuntimeError("browser_failed") from None
@@ -2214,7 +2671,6 @@ class PlaywrightCliRuntime:
             "const key=Symbol.for('jobhunter.playwrightCli.navigationGuard');"
             "const previous=context[key];"
             f"const allowed={encoded};"
-            "const internal=['about:','chrome:','devtools:','edge:'];"
             "const handler=async route=>{"
             "const request=route.request();"
             "if(!request.isNavigationRequest())return route.continue();"
@@ -2222,7 +2678,7 @@ class PlaywrightCliRuntime:
             "try{topLevel=request.frame().parentFrame()===null;}catch{}"
             "if(!topLevel)return route.continue();"
             "const url=request.url();"
-            "if(internal.some(prefix=>url.startsWith(prefix)))return route.continue();"
+            "if(url==='about:blank')return route.continue();"
             "if(allowed.some(origin=>url===origin||url.startsWith(origin+'/')))return route.continue();"
             "return route.abort('blockedbyclient');};"
             "await context.route('**/*',handler);"
@@ -2478,31 +2934,45 @@ class PlaywrightCliRuntime:
             timeout=_LIFECYCLE_TIMEOUT_SECONDS,
         )
         self._require_success(selected)
-        restored = await self._invoke(
-            "goto",
-            [previous.url],
-            timeout=_LIFECYCLE_TIMEOUT_SECONDS,
-        )
+        if self._screenshots_suppressed:
+            restore_script = (
+                "async (page) => {"
+                f"const target={json.dumps(previous.url)};"
+                "await page.goto(target);"
+                "}"
+            )
+            restored = await self._invoke_private_script_unlocked(
+                restore_script,
+                label="restore",
+                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
+            )
+        else:
+            restored = await self._invoke(
+                "goto",
+                [previous.url],
+                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
+            )
         self._require_success(restored)
 
     async def _metadata(self) -> _PageMetadata:
         script = (
             "async (page) => {"
+            "const clip=(value,limit)=>Array.from(value.slice(0,limit*2)).slice(0,limit).join('');"
             "const pages=page.context().pages();"
             "return {"
-            f"url:page.url().slice(0,{_MAX_URL_CHARS}),"
-            f"title:(await page.title().catch(()=>'' )).slice(0,{_MAX_TITLE_CHARS}),"
+            f"url:clip(page.url(),{_MAX_URL_CAPTURE_CHARS}),"
+            f"title:clip(await page.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS}),"
             "currentIndex:pages.indexOf(page),"
             f"tabs:await Promise.all(pages.slice(0,{_MAX_TABS}).map(async p=>({{"
-            f"url:p.url().slice(0,{_MAX_URL_CHARS}),"
-            f"title:(await p.title().catch(()=>'' )).slice(0,{_MAX_TITLE_CHARS})}})))"
+            f"url:clip(p.url(),{_MAX_URL_CAPTURE_CHARS}),"
+            f"title:clip(await p.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS})}})))"
             "};}"
         )
         result = await self._invoke(
             "run-code",
             [script],
             timeout=_LIFECYCLE_TIMEOUT_SECONDS,
-            capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+            capture_limit=_MAX_OBSERVATION_CAPTURE_BYTES,
         )
         self._require_success(result)
         return self._parse_metadata(self._decode_run_code_result(result))
@@ -2541,8 +3011,11 @@ class PlaywrightCliRuntime:
                     raise TypeError
                 tabs.append(
                     (
-                        tab_url[:_MAX_URL_CHARS],
-                        self._redact_text(tab_title)[:_MAX_TITLE_CHARS],
+                        tab_url[:_MAX_URL_CAPTURE_CHARS],
+                        self._redact_bounded_text(
+                            tab_title[:_MAX_TITLE_CAPTURE_CHARS],
+                            _MAX_TITLE_CHARS,
+                        ),
                     )
                 )
             url = raw_metadata["url"]
@@ -2560,29 +3033,42 @@ class PlaywrightCliRuntime:
         except (KeyError, TypeError, ValueError):
             raise PlaywrightCliRuntimeError("browser_failed") from None
         return _PageMetadata(
-            url=url[:_MAX_URL_CHARS],
-            title=self._redact_text(title)[:_MAX_TITLE_CHARS],
+            url=url[:_MAX_URL_CAPTURE_CHARS],
+            title=self._redact_bounded_text(
+                title[:_MAX_TITLE_CAPTURE_CHARS],
+                _MAX_TITLE_CHARS,
+            ),
             current_index=current_index,
             tabs=tuple(tabs),
         )
 
     @staticmethod
-    def _observation_script(screenshot_path: Path) -> str:
-        encoded_path = json.dumps(str(screenshot_path))
+    def _observation_script(screenshot_path: Path | None) -> str:
+        screenshot_setup = ""
+        screenshot_expression = "Promise.resolve(false)"
+        if screenshot_path is not None:
+            screenshot_setup = (
+                f"const screenshotPath={json.dumps(str(screenshot_path))};"
+            )
+            screenshot_expression = (
+                "page.screenshot({path:screenshotPath,type:'png'})"
+                ".then(()=>true,()=>false)"
+            )
         return (
             "async (page) => {"
-            f"const screenshotPath={encoded_path};"
+            f"{screenshot_setup}"
+            "const clip=(value,limit)=>Array.from(value.slice(0,limit*2)).slice(0,limit).join('');"
             "const allPages=page.context().pages();"
             f"const pages=allPages.slice(0,{_MAX_TABS});"
             "const [title,tabs,screenshot]=await Promise.all(["
-            f"page.title().then(value=>value.slice(0,{_MAX_TITLE_CHARS}),()=>''),"
+            f"page.title().then(value=>clip(value,{_MAX_TITLE_CAPTURE_CHARS}),()=>''),"
             "Promise.all(pages.map(async p=>({"
-            f"url:p.url().slice(0,{_MAX_URL_CHARS}),"
-            f"title:(await p.title().catch(()=>'' )).slice(0,{_MAX_TITLE_CHARS})"
+            f"url:clip(p.url(),{_MAX_URL_CAPTURE_CHARS}),"
+            f"title:clip(await p.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS})"
             "}))),"
-            "page.screenshot({path:screenshotPath,type:'png'}).then(()=>true,()=>false)"
+            f"{screenshot_expression}"
             "]);"
-            f"return {{url:page.url().slice(0,{_MAX_URL_CHARS}),title,"
+            f"return {{url:clip(page.url(),{_MAX_URL_CAPTURE_CHARS}),title,"
             "currentIndex:allPages.indexOf(page),tabs,screenshot};}"
         )
 
@@ -2597,9 +3083,13 @@ class PlaywrightCliRuntime:
         screenshot_path = self._internal_directory / f"{stem}.png"
         observation_result = await self._invoke(
             "run-code",
-            [self._observation_script(screenshot_path)],
+            [
+                self._observation_script(
+                    None if self._screenshots_suppressed else screenshot_path
+                )
+            ],
             timeout=_LIFECYCLE_TIMEOUT_SECONDS,
-            capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+            capture_limit=_MAX_OBSERVATION_CAPTURE_BYTES,
         )
         modal_state = self._blocked_by_modal_state(observation_result)
         if modal_state:
@@ -2620,7 +3110,10 @@ class PlaywrightCliRuntime:
             dom = await self._fallback_snapshot(stem)
 
         screenshot: BrowserScreenshot | None = None
-        if raw_observation.get("screenshot") is True:
+        if (
+            not self._screenshots_suppressed
+            and raw_observation.get("screenshot") is True
+        ):
             png = self._read_binary_artifact(screenshot_path, _MAX_SCREENSHOT_BYTES)
             if png is not None and png.startswith(b"\x89PNG\r\n\x1a\n"):
                 screenshot = BrowserScreenshot(
@@ -2636,14 +3129,14 @@ class PlaywrightCliRuntime:
             allowed = self._url_is_allowed(url, self._approved_origins)
             tabs.append(
                 BrowserTab(
-                    url=url if allowed else "[redacted]",
+                    url=self._public_redacted_url(url) if allowed else "[redacted]",
                     title=title if allowed else "[redacted]",
                     tab_id=str(index)[:_MAX_TAB_ID_CHARS],
                     parent_tab_id=None,
                 )
             )
         return metadata, BrowserObservation(
-            url=metadata.url,
+            url=self._public_redacted_url(metadata.url),
             title=metadata.title,
             tabs=tabs,
             dom=dom,
@@ -2666,7 +3159,10 @@ class PlaywrightCliRuntime:
                 return ""
             snapshot = payload.get("snapshot")
             if isinstance(snapshot, str):
-                return self._redact_text(snapshot)[:_MAX_DOM_CHARS]
+                return self._redact_bounded_text(
+                    snapshot[:_MAX_DOM_CAPTURE_CHARS],
+                    _MAX_DOM_CHARS,
+                )
             if not isinstance(snapshot, dict):
                 return ""
             filename = snapshot.get("file")
@@ -2675,6 +3171,8 @@ class PlaywrightCliRuntime:
             candidate = Path(filename)
             if not candidate.is_absolute():
                 candidate = self._session_directory / candidate
+            if self._screenshots_suppressed:
+                return ""
             resolved = candidate.resolve(strict=True)
             if not _is_within(resolved, self._output_directory):
                 return ""
@@ -2691,6 +3189,23 @@ class PlaywrightCliRuntime:
                     pass
 
     async def _fallback_snapshot(self, stem: str) -> str:
+        if self._screenshots_suppressed:
+            snapshot_result = await self._invoke(
+                "snapshot",
+                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
+                capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+            )
+            if (
+                snapshot_result.exit_code != 0
+                or snapshot_result.timed_out
+                or self._reported_cli_error(snapshot_result)
+                or snapshot_result.stdout_truncated
+            ):
+                return ""
+            return self._snapshot_from_execution(
+                snapshot_result,
+                remove_file=True,
+            )
         snapshot_path = self._internal_directory / f"{stem}.yml"
         snapshot_result = await self._invoke(
             "snapshot",
@@ -2717,12 +3232,18 @@ class PlaywrightCliRuntime:
                 return ""
             if not _is_within(path.resolve(strict=True), self._session_directory):
                 return ""
+            capture_chars = (
+                max(limit, _MAX_DOM_CAPTURE_CHARS)
+                if self._screenshots_suppressed
+                else limit
+            )
+            byte_limit = capture_chars * 4
             with path.open("rb") as artifact:
-                raw = artifact.read(limit * 4 + 1)
-            decoded = raw.decode("utf-8", errors="replace")
-        except OSError:
+                raw = artifact.read(byte_limit + 1)
+            decoded = raw.decode("utf-8")[:capture_chars]
+        except (OSError, UnicodeError):
             return ""
-        return self._redact_text(decoded)[:limit]
+        return self._redact_bounded_text(decoded, limit)
 
     def _read_binary_artifact(self, path: Path, limit: int) -> bytes | None:
         try:
@@ -2773,12 +3294,67 @@ class PlaywrightCliRuntime:
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _collapse_redaction_sentinels(value: str) -> str:
+        return re.sub("\ue000+", "[redacted]", value)
+
+    def _length_preserving_redaction(self, value: str) -> tuple[str, bool]:
+        redacted = value
+        changed = False
+        for private in self._private_redaction_values:
+            if private not in redacted:
+                continue
+            redacted = redacted.replace(private, "\ue000" * len(private))
+            changed = True
+        return redacted, changed
+
+    def _redact_bounded_text(self, value: str, limit: int) -> str:
+        redacted, _changed = self._length_preserving_redaction(value)
+        return self._collapse_redaction_sentinels(redacted[:limit])[:limit]
+
+
     def _redact_text(self, value: str) -> str:
         redacted = value
-        for private in self._private_values:
-            if private:
-                redacted = redacted.replace(private, "[redacted]")
+        for private in self._private_redaction_values:
+            redacted = redacted.replace(private, "[redacted]")
         return redacted
+
+    def _public_redacted_url(self, value: str) -> str:
+        captured = value[:_MAX_URL_CAPTURE_CHARS]
+        raw_redacted, raw_changed = self._length_preserving_redaction(captured)
+        if raw_changed:
+            return self._collapse_redaction_sentinels(
+                raw_redacted[:_MAX_URL_CHARS]
+            )[:_MAX_URL_CHARS]
+
+        if len(value) >= _MAX_URL_CAPTURE_CHARS:
+            try:
+                return f"{_origin_for_url(captured)}/[redacted]"
+            except (TypeError, ValueError):
+                return "[redacted]"
+
+        if re.search(r"%(?:[0-9A-Fa-f])?$", captured) is not None:
+            try:
+                return f"{_origin_for_url(captured)}/[redacted]"
+            except (TypeError, ValueError):
+                return "[redacted]"
+
+        decoded = captured
+        for _ in range(16):
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                decoded_redacted, decoded_changed = (
+                    self._length_preserving_redaction(decoded)
+                )
+                if decoded_changed:
+                    return self._collapse_redaction_sentinels(
+                        decoded_redacted[:_MAX_URL_CHARS]
+                    )[:_MAX_URL_CHARS]
+                return captured[:_MAX_URL_CHARS]
+            decoded = next_decoded
+        # Fail closed instead of exposing a deeply encoded value or decoding forever.
+        return "[redacted]"
+
 
     def _public_output(self, raw: bytes) -> tuple[str, bool]:
         decoded = raw.decode("utf-8", errors="replace")

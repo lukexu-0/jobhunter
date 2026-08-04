@@ -30,11 +30,14 @@ from jobhunter_browser_harness.models import (
     BrowserLaunchConfig,
     CancelCommand,
     ContinueCommand,
+    SaveCredentialsCommand,
+    SignInCommand,
     FieldResult,
     HarnessConfig,
     HarnessServiceError,
     RequestAdditionalInfoRuntimeAction,
     RequestHumanNavigationRuntimeAction,
+    RequestSignInRuntimeAction,
     RequestHumanReviewRuntimeAction,
     ReportApplicationMismatchRuntimeAction,
     PostSubmitConfirmation,
@@ -42,6 +45,7 @@ from jobhunter_browser_harness.models import (
     RuntimeActionRequest,
     RuntimeActionResponse,
     SubmitRuntimeActionResponse,
+    SignInRuntimeActionResponse,
     SubmitCommand,
     ReviseCommand,
     SessionCommand,
@@ -653,6 +657,7 @@ def test_session_errors_are_limited_to_the_fixed_catalog() -> None:
             },
         ),
         ("awaiting_human_review", {"type": "human_review"}),
+        ("awaiting_human_navigation", {"type": "credentials"}),
     ],
 )
 def test_pending_action_exactly_matches_awaiting_state(
@@ -722,6 +727,22 @@ def test_session_snapshot_releases_slot_only_after_terminal_cleanup() -> None:
         ({"type": "cancel"}, CancelCommand),
         (
             {
+                "type": "sign_in",
+                "username": "  ada@example.test  ",
+                "password": " password with spaces ",
+            },
+            SignInCommand,
+        ),
+        (
+            {
+                "type": "save_credentials",
+                "username": "ada@example.test",
+                "password": "new-account-password",
+            },
+            SaveCredentialsCommand,
+        ),
+        (
+            {
                 "type": "provide_additional_info",
                 "answers": [
                     {
@@ -748,7 +769,35 @@ def test_command_union_uses_strict_discriminators(
         assert command.origin == "https://ats.example"
     if isinstance(command, ReviseCommand):
         assert command.context == "Correct this field."
+    if isinstance(command, (SignInCommand, SaveCredentialsCommand)):
+        assert command.credentials()[0] == "ada@example.test"
+        if isinstance(command, SignInCommand):
+            assert command.credentials()[1] == " password with spaces "
+        projected = command.model_dump(mode="json")
+        assert projected["username"] == "**********"
+        assert projected["password"] == "**********"
+        assert "ada@example.test" not in repr(command)
 
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "sign_in",
+            "username": "ada\x00@example.test",
+            "password": "password",
+        },
+        {
+            "type": "save_credentials",
+            "username": "ada@example.test",
+            "password": "pass\x00word",
+        },
+    ],
+)
+def test_credential_commands_reject_nul(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        COMMAND_ADAPTER.validate_python(payload)
 
 def test_revision_command_accepts_twenty_thousand_trimmed_characters() -> None:
     context = "x" * 20_000
@@ -774,6 +823,18 @@ def test_revision_command_accepts_twenty_thousand_trimmed_characters() -> None:
         {"type": "revise", "context": ""},
         {"type": "revise", "context": "   "},
         {"type": "revise", "context": "x" * 20_001},
+        {"type": "sign_in", "username": "", "password": "password"},
+        {"type": "sign_in", "username": "\ud800", "password": "password"},
+        {"type": "sign_in", "username": "user@example.test", "password": "\ud800"},
+        {"type": "sign_in", "username": "user@example.test", "password": ""},
+        {"type": "sign_in", "username": "x" * 321, "password": "password"},
+        {"type": "sign_in", "username": "user@example.test", "password": "x" * 4_097},
+        {
+            "type": "save_credentials",
+            "username": "user@example.test",
+            "password": "password",
+            "extra": True,
+        },
     ],
 )
 def test_command_union_rejects_unknown_empty_oversize_and_extra_values(
@@ -1086,6 +1147,22 @@ async def test_sse_rejects_invalid_or_negative_last_event_id(
         ({"type": "revise", "context": "  use corrected fact  "}, ReviseCommand),
         ({"type": "submit"}, SubmitCommand),
         ({"type": "cancel"}, CancelCommand),
+        (
+            {
+                "type": "sign_in",
+                "username": "  ada@example.test  ",
+                "password": " transient password ",
+            },
+            SignInCommand,
+        ),
+        (
+            {
+                "type": "save_credentials",
+                "username": "ada@example.test",
+                "password": "saved password",
+            },
+            SaveCredentialsCommand,
+        ),
     ],
 )
 async def test_command_endpoint_dispatches_typed_commands_and_returns_202(
@@ -1107,6 +1184,8 @@ async def test_command_endpoint_dispatches_typed_commands_and_returns_202(
     dispatched_id, dispatched = service.command_calls[0]
     assert dispatched_id == SESSION_ID
     assert isinstance(dispatched, command_type)
+    if isinstance(dispatched, (SignInCommand, SaveCredentialsCommand)):
+        assert dispatched.credentials()[0] == "ada@example.test"
     if isinstance(dispatched, ReviseCommand):
         assert dispatched.context == "use corrected fact"
 
@@ -1129,6 +1208,33 @@ async def test_command_endpoint_rejects_bad_discriminator_without_dispatch(
     assert "secret" not in response.text
     assert service.command_calls == []
 
+
+async def test_invalid_credential_command_returns_fixed_error_without_values(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    username = "private-user@example.test"
+    password = "private-password"
+
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/commands",
+        headers=AUTHORIZATION,
+        json={
+            "type": "sign_in",
+            "username": username,
+            "password": password,
+            "extra": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert username not in response.text
+    assert password not in response.text
+    assert service.command_calls == []
 
 def _application_result_payload(
     status: str = "ready_for_submission",
@@ -1328,6 +1434,15 @@ def test_playwright_cli_runtime_action_rejects_prohibited_commands(
         ),
         (
             {
+                "type": "request_sign_in",
+                "username_ref": "e1",
+                "password_ref": "e22",
+                "submit_ref": "e333",
+            },
+            RequestSignInRuntimeAction,
+        ),
+        (
+            {
                 "type": "request_human_review",
                 "result": _application_result_payload(),
             },
@@ -1386,6 +1501,33 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
     assert dispatched_id == SESSION_ID
     assert isinstance(dispatched, action_type)
 
+async def test_request_sign_in_endpoint_returns_only_attempt_status(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    service.runtime_action_response = SignInRuntimeActionResponse(
+        type="sign_in",
+        status="attempted",
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/runtime/actions",
+        headers=AUTHORIZATION,
+        json={
+            "type": "request_sign_in",
+            "username_ref": "e1",
+            "password_ref": "e2",
+            "submit_ref": "e3",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "type": "sign_in",
+        "status": "attempted",
+    }
+    assert set(response.json()) == {"type", "status"}
+
 
 @pytest.mark.parametrize(
     "payload",
@@ -1398,6 +1540,37 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
             "token": "secret",
         },
         {"type": "request_human_navigation", "instruction": " "},
+        {
+            "type": "request_sign_in",
+            "username_ref": "e0",
+            "password_ref": "e2",
+            "submit_ref": "e3",
+        },
+        {
+            "type": "request_sign_in",
+            "username_ref": "e1\n",
+            "password_ref": "e2",
+            "submit_ref": "e3",
+        },
+        {
+            "type": "request_sign_in",
+            "username_ref": "e1",
+            "password_ref": "e0002",
+            "submit_ref": "e3",
+        },
+        {
+            "type": "request_sign_in",
+            "username_ref": "e1",
+            "password_ref": "e2",
+            "submit_ref": "e1234567890",
+        },
+        {
+            "type": "request_sign_in",
+            "username_ref": "e1",
+            "password_ref": "e2",
+            "submit_ref": "e3",
+            "username": "must not be accepted",
+        },
         {"type": "request_origin_approval", "origin": "https://ats.example"},
         {"type": "request_human_review", "result": {"status": "cancelled"}},
         {
@@ -1439,6 +1612,25 @@ async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
         "message": "Request is invalid",
     }
     assert service.runtime_action_calls == []
+
+def test_sign_in_runtime_response_projects_only_status() -> None:
+    response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {"type": "sign_in", "status": "attempted"}
+    )
+
+    assert isinstance(response, SignInRuntimeActionResponse)
+    assert response.model_dump(mode="json") == {
+        "type": "sign_in",
+        "status": "attempted",
+    }
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {
+                "type": "sign_in",
+                "status": "saved",
+                "username": "ada@example.test",
+            }
+        )
 
 
 @pytest.mark.parametrize(

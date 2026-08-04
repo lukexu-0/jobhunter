@@ -85,6 +85,7 @@ def test_help_succeeds_without_configured_token(
     assert "--node-executable" in captured.out
     assert "--playwright-cli-script" in captured.out
     assert "--user-info-json" in captured.out
+    assert "--credentials-json" in captured.out
     assert "--chrome-executable" in captured.out
     assert "--chrome-user-data-dir" in captured.out
     assert "--cdp-url" in captured.out
@@ -412,6 +413,9 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
         session_timeout=123,
         node_executable=fake_playwright_cli[0].resolve(),
         playwright_cli_script=fake_playwright_cli[1].resolve(),
+        credentials_json=Path(
+            "~/.jobhunter/browser-harness/credentials.json"
+        ).expanduser().absolute(),
         browser=BrowserLaunchConfig(
             chrome_executable=executable,
             chrome_user_data_dir=profile,
@@ -478,6 +482,7 @@ def test_runtime_paths_are_explicit_resolved_configuration(
 ) -> None:
     node, script = fake_playwright_cli
     user_info_json = tmp_path / "private" / "user-info.json"
+    credentials_json = tmp_path / "private-credentials" / "credentials.json"
 
     config, _ = cli_module.parse_config(
         [
@@ -489,13 +494,49 @@ def test_runtime_paths_are_explicit_resolved_configuration(
             str(script),
             "--user-info-json",
             str(user_info_json),
+            "--credentials-json",
+            str(credentials_json),
+        ],
+        environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
+    )
+    assert config.node_executable == node.resolve()
+    assert config.playwright_cli_script == script.resolve()
+    assert config.user_info_json == user_info_json.resolve()
+    assert config.credentials_json == credentials_json.absolute()
+
+
+
+def test_credentials_override_preserves_symlink_for_store_rejection(
+    tmp_path: Path,
+    fake_playwright_cli: tuple[Path, Path],
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    private.chmod(0o700)
+    target = private / "target.json"
+    target.write_text('{"version":1,"credentials":[]}', encoding="utf-8")
+    target.chmod(0o600)
+    linked = private / "linked.json"
+    linked.symlink_to(target)
+
+    config, _ = cli_module.parse_config(
+        [
+            *_runtime_args(fake_playwright_cli),
+            "--cdp-url",
+            LOOPBACK_CDP_URL,
+            "--credentials-json",
+            str(linked),
         ],
         environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
     )
 
-    assert config.node_executable == node.resolve()
-    assert config.playwright_cli_script == script.resolve()
-    assert config.user_info_json == user_info_json.resolve()
+    assert config.credentials_json == linked.absolute()
+    with pytest.raises(
+        cli_module.BrowserConfigurationError,
+        match="credential store is invalid or unavailable",
+    ):
+        cli_module.CredentialStore(config.credentials_json)
+
 
 
 def test_runtime_paths_default_to_detected_node_and_repository_cli_script(
@@ -533,6 +574,9 @@ def test_runtime_paths_default_to_detected_node_and_repository_cli_script(
 
     assert config.node_executable == node.resolve()
     assert config.playwright_cli_script == default_script.resolve()
+    assert config.credentials_json == Path(
+        "~/.jobhunter/browser-harness/credentials.json"
+    ).expanduser().absolute()
     assert resolutions == [
         (node, "Node.js executable", True),
         (default_script, "Playwright CLI script", False),
@@ -708,7 +752,11 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     manager = object()
     app = object()
     resolve_calls: list[BrowserLaunchConfig] = []
-    manager_calls: list[tuple[HarnessConfig, ResolvedBrowserLaunch]] = []
+    credential_store = object()
+    credential_store_calls: list[Path] = []
+    manager_calls: list[
+        tuple[HarnessConfig, ResolvedBrowserLaunch, object]
+    ] = []
     create_app_calls: list[tuple[HarnessConfig, HarnessDependencies]] = []
     uvicorn_calls: list[tuple[object, dict[str, Any]]] = []
 
@@ -716,12 +764,17 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         resolve_calls.append(browser)
         return resolved_launch
 
+    def fake_credential_store(path: Path) -> object:
+        credential_store_calls.append(path)
+        return credential_store
+
     def fake_manager(
         config: HarnessConfig,
         *,
         browser_launch: ResolvedBrowserLaunch,
+        credential_store: object,
     ) -> object:
-        manager_calls.append((config, browser_launch))
+        manager_calls.append((config, browser_launch, credential_store))
         return manager
 
     def fake_create_app(
@@ -736,6 +789,7 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
 
     monkeypatch.setenv("JOBHUNTER_HARNESS_TOKEN", TOKEN)
     monkeypatch.setattr(cli_module, "resolve_browser_launch", fake_resolve)
+    monkeypatch.setattr(cli_module, "CredentialStore", fake_credential_store)
     monkeypatch.setattr(cli_module, "ApplicationSessionManager", fake_manager)
     monkeypatch.setattr(cli_module, "create_app", fake_create_app)
     monkeypatch.setattr(cli_module.uvicorn, "run", fake_uvicorn_run)
@@ -769,10 +823,16 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         session_timeout=1800,
         node_executable=fake_playwright_cli[0].resolve(),
         playwright_cli_script=fake_playwright_cli[1].resolve(),
+        credentials_json=Path(
+            "~/.jobhunter/browser-harness/credentials.json"
+        ).expanduser().absolute(),
         browser=expected_browser,
     )
     assert resolve_calls == [expected_browser]
-    assert manager_calls == [(expected_config, resolved_launch)]
+    assert credential_store_calls == [expected_config.credentials_json]
+    assert manager_calls == [
+        (expected_config, resolved_launch, credential_store)
+    ]
     assert len(create_app_calls) == 1
     created_config, dependencies = create_app_calls[0]
     assert created_config == expected_config
