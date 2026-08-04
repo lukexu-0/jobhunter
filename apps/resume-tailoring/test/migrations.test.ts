@@ -191,7 +191,8 @@ function versionNineDatabase(): Database {
       queue_sequence INTEGER NOT NULL UNIQUE,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      application_status TEXT NOT NULL DEFAULT 'pending',
+      application_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed')),
       generate_keyword_map INTEGER NOT NULL DEFAULT 0,
       title_override TEXT,
       organization_override TEXT,
@@ -228,6 +229,8 @@ function versionFourteenDatabase(): Database {
     ) STRICT;
     CREATE TABLE runs (
       id TEXT PRIMARY KEY,
+      application_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed')),
       auto_apply INTEGER NOT NULL DEFAULT 0 CHECK (auto_apply IN (0,1))
     ) STRICT;
     CREATE TABLE run_application_sessions (
@@ -249,7 +252,9 @@ function versionFifteenApplicationDatabase(): Database {
       applied_at INTEGER NOT NULL
     ) STRICT;
     CREATE TABLE runs (
-      id TEXT PRIMARY KEY
+      id TEXT PRIMARY KEY,
+      application_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed'))
     ) STRICT;
     CREATE TABLE run_application_sessions (
       run_id TEXT NOT NULL,
@@ -290,7 +295,9 @@ function versionSixteenDatabase(): Database {
       applied_at INTEGER NOT NULL
     ) STRICT;
     CREATE TABLE runs (
-      id TEXT PRIMARY KEY
+      id TEXT PRIMARY KEY,
+      application_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed'))
     ) STRICT;
     INSERT INTO runs(id) VALUES ('legacy-job');
     INSERT INTO schema_migrations(version, applied_at) VALUES (16, 1600);
@@ -309,7 +316,9 @@ function versionSeventeenDiscoveryDatabase(): Database {
       applied_at INTEGER NOT NULL
     ) STRICT;
     CREATE TABLE runs (
-      id TEXT PRIMARY KEY
+      id TEXT PRIMARY KEY,
+      application_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (application_status IN ('pending','applied','rejected','interview','accepted','failed'))
     ) STRICT;
     INSERT INTO runs(id) VALUES ('legacy-job');
     CREATE TABLE discovery_jobs (
@@ -608,7 +617,7 @@ test("migration twelve preserves the live claim and adds four unique empty claim
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
   expect(db.query<{
     id: number;
     run_id: string | null;
@@ -936,7 +945,7 @@ test("migration ten preserves version nine runs and creates the durable applicat
   expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
 });
 
-test("fresh databases default to pending while accepting applied", () => {
+test("fresh databases default to pending while accepting lifecycle statuses", () => {
   const db = new Database(":memory:");
   databases.push(db);
 
@@ -948,6 +957,15 @@ test("fresh databases default to pending while accepting applied", () => {
     INSERT INTO runs(
       id, job_description, status, queue_sequence, created_at, updated_at
     ) VALUES ('default-run', 'default job description', 'queued', 2, 2000, 2000);
+    INSERT INTO runs(
+      id, job_description, status, application_status, queue_sequence, created_at, updated_at
+    ) VALUES ('did-not-apply-run', 'did not apply job description', 'queued', 'did_not_apply', 3, 2000, 2000);
+    INSERT INTO runs(
+      id, job_description, status, application_status, queue_sequence, created_at, updated_at
+    ) VALUES ('oa-received-run', 'OA received job description', 'queued', 'oa_received', 4, 2000, 2000);
+    INSERT INTO runs(
+      id, job_description, status, application_status, queue_sequence, created_at, updated_at
+    ) VALUES ('oa-completed-run', 'OA completed job description', 'queued', 'oa_completed', 5, 2000, 2000);
   `);
 
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
@@ -959,6 +977,9 @@ test("fresh databases default to pending while accepting applied", () => {
   ).all()).toEqual([
     { application_status: "applied" },
     { application_status: "pending" },
+    { application_status: "did_not_apply" },
+    { application_status: "oa_received" },
+    { application_status: "oa_completed" },
   ]);
   expect(db.query<{
     title_override: string | null;
@@ -977,6 +998,9 @@ test("fresh databases default to pending while accepting applied", () => {
   });
   expect(() => db.query(
     "UPDATE runs SET application_status = 'queued' WHERE id = 'default-run'",
+  ).run()).toThrow();
+  expect(() => db.query(
+    "UPDATE runs SET application_status = 'waiting_for_review' WHERE id = 'default-run'",
   ).run()).toThrow();
   expect(() => db.query(
     "UPDATE runs SET auto_submit = 2 WHERE id = 'default-run'",
@@ -1076,6 +1100,7 @@ test("migration eighteen adds Indeed while preserving version seventeen sources 
     { version: 18, applied_at: 2_000 },
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
+    { version: 21, applied_at: 2_000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1130,6 +1155,7 @@ test("combined migrations preserve a populated recruiting-event version seventee
     { version: 18, applied_at: 2_000 },
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
+    { version: 21, applied_at: 2_000 },
   ]);
   expect(db.query<{ id: number; school: string; updated_at: number }, []>(
     "SELECT id, school, updated_at FROM recruiting_event_preferences",
@@ -1315,6 +1341,7 @@ test("combined migrations preserve a populated Indeed discovery version eighteen
     { version: 18, applied_at: 1_800 },
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
+    { version: 21, applied_at: 2_000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1464,6 +1491,7 @@ test("combined migrations preserve a version seventeen opportunity database", ()
     { version: 18, applied_at: 2_000 },
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
+    { version: 21, applied_at: 2_000 },
   ]);
 });
 
@@ -1476,7 +1504,7 @@ test("migrates version seven defaults without changing existing statuses", () =>
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -1512,6 +1540,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 18, applied_at: 2000 },
     { version: 19, applied_at: 2000 },
     { version: 20, applied_at: 2000 },
+    { version: 21, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1553,7 +1582,7 @@ test("migrates existing runs to application status applied atomically", () => {
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
   expect(migrated.query<{
     application_status: string;
     generate_keyword_map: number;
@@ -1587,7 +1616,7 @@ test("migrates version two retention state atomically without changing history",
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

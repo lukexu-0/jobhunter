@@ -187,7 +187,17 @@ describe("run HTTP routes", () => {
   });
 
   test("accepts only application statuses without waking the scheduler", async () => {
-    const applicationStatuses = ["pending", "applied", "rejected", "interview", "accepted", "failed"] as const;
+    const applicationStatuses = [
+      "pending",
+      "did_not_apply",
+      "applied",
+      "oa_received",
+      "oa_completed",
+      "rejected",
+      "interview",
+      "accepted",
+      "failed",
+    ] as const;
     const received: string[] = [];
     let updateCalls = 0;
     const target = service({
@@ -200,6 +210,7 @@ describe("run HTTP routes", () => {
 
     for (const body of [
       { applicationStatus: "queued" },
+      { applicationStatus: "waiting_for_review" },
       {},
       { applicationStatus: "applied", extra: true },
     ]) {

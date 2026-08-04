@@ -5,7 +5,17 @@ import { OpportunityKindSchema, type OpportunityKind } from "../contracts/index.
 
 export const RUN_STATUSES = ["queued", "analyzing", "tailoring", "editing", "compiling", "repairing", "deterministic_qa", "visual_qa", "review", "approved", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
-export const APPLICATION_STATUSES = ["pending", "applied", "rejected", "interview", "accepted", "failed"] as const;
+export const APPLICATION_STATUSES = [
+  "pending",
+  "did_not_apply",
+  "applied",
+  "oa_received",
+  "oa_completed",
+  "rejected",
+  "interview",
+  "accepted",
+  "failed",
+] as const;
 export type ApplicationStatus = (typeof APPLICATION_STATUSES)[number];
 export type ActiveStage = Exclude<RunStatus, "queued" | "review" | "approved" | "failed">;
 export type RevisionOrigin = "initial" | "retry" | "machine_regenerate" | "human_edit";
@@ -906,7 +916,9 @@ export class PipelineRepository {
                 ELSE ?
               END
           WHERE id = ?
-            AND application_status IN ('pending','failed','applied')
+            AND application_status IN (
+              'pending','did_not_apply','failed','applied'
+            )
         `).run(finalizedAt, current.run_id);
       }
     });

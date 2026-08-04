@@ -381,7 +381,16 @@ test("uses the shared lifecycle order and exposes a square accessible row action
   });
   await page.goto("/");
 
-  const statusLabels = ["Pending", "Applied", "Rejected", "Interview", "Accepted"];
+  const statusLabels = [
+    "Pending",
+    "Did not apply",
+    "Applied",
+    "OA received",
+    "OA completed",
+    "Rejected",
+    "Interview",
+    "Accepted",
+  ];
   const filter = page.getByRole("combobox", { name: "Filter applications by state" });
   const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
@@ -486,7 +495,16 @@ test("keeps an existing Failed status visible but not selectable", async ({ page
   await expect(filter.locator('option[value="failed"]')).toHaveCount(0);
   await expect(rowStatus).toHaveValue("failed");
   await expect(failedOption).toBeDisabled();
-  await expect(rowStatus.locator("option:not([disabled])")).toHaveText(["Pending", "Applied", "Rejected", "Interview", "Accepted"]);
+  await expect(rowStatus.locator("option:not([disabled])")).toHaveText([
+    "Pending",
+    "Did not apply",
+    "Applied",
+    "OA received",
+    "OA completed",
+    "Rejected",
+    "Interview",
+    "Accepted",
+  ]);
 });
 
 test("renders application status text with stronger contrast", async ({ page }) => {

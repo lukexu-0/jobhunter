@@ -2118,6 +2118,7 @@ describe("application session service", () => {
     target.harness!.snapshotAfterCreate = harnessReviewSnapshot();
     const initial = await target.service.start(target.runId, target.pdf.sha256, signal());
     expect(initial.submissionPhase).toBe("not_attempted");
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
     target.repository.claimApplicationSubmission(FIRST_SESSION_ID);
 
     expect(await target.service.get(target.runId)).toMatchObject({
