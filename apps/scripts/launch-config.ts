@@ -5,6 +5,7 @@ export interface LaunchConfiguration {
   readonly webPort: number;
   readonly pipelineOrigin: string;
   readonly webOrigin: string;
+  readonly harnessOrigin: string;
   readonly pipelineDatabase: string;
   readonly contextDatabase: string;
   readonly authDatabase: string;
@@ -23,6 +24,7 @@ export function resolveLaunchConfiguration(
     webPort,
     pipelineOrigin: `http://127.0.0.1:${pipelinePort}`,
     webOrigin: `http://127.0.0.1:${webPort}`,
+    harnessOrigin: `http://127.0.0.1:${development ? 8865 : 8765}`,
     pipelineDatabase: resolve(
       appsRoot,
       `resume-tailoring/data/state/pipeline${development ? ".dev" : ""}.sqlite`,

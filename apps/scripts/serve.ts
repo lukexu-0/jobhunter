@@ -14,6 +14,7 @@ const childEnvironment = {
   JOBHUNTER_PIPELINE_PORT: String(configuration.pipelinePort),
   JOBHUNTER_PIPELINE_ORIGIN: configuration.pipelineOrigin,
   JOBHUNTER_WEB_ORIGIN: configuration.webOrigin,
+  JOBHUNTER_HARNESS_URL: configuration.harnessOrigin,
   JOBHUNTER_PIPELINE_DATABASE: configuration.pipelineDatabase,
   JOBHUNTER_CONTEXT_DATABASE: configuration.contextDatabase,
   JOBHUNTER_AUTH_DATABASE: configuration.authDatabase,
