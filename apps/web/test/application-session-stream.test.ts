@@ -37,6 +37,7 @@ describe("application session SSE projection", () => {
   test("accepts only strict generation-qualified projected frames", () => {
     expect(APPLICATION_SESSION_EVENT_NAMES).toContain("snapshot");
     expect(APPLICATION_SESSION_EVENT_NAMES).toContain("additional_info_required");
+    expect(APPLICATION_SESSION_EVENT_NAMES).toContain("credentials_required");
     expect(APPLICATION_SESSION_EVENT_NAMES).toContain("submission_started");
     expect(APPLICATION_SESSION_EVENT_NAMES).toContain("application_submitted");
     expect(APPLICATION_SESSION_EVENT_NAMES).toContain("submission_uncertain");

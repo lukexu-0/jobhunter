@@ -129,12 +129,20 @@ function commandProjectionMatcher(
         );
     }
     if (next.generation !== baseline.generation) {
-      return next.generation > baseline.generation;
+      const credentialCommand = command.type === "sign_in"
+        || command.type === "save_credentials";
+      return next.generation > baseline.generation
+        && (!credentialCommand || baseline.pendingAction?.type === "credentials");
     }
     switch (command.type) {
       case "continue":
         return next.pendingAction?.type !== "human_navigation"
           || next.pendingAction.instruction !== navigationInstruction;
+      case "sign_in":
+      case "save_credentials":
+        return baseline.pendingAction?.type === "credentials"
+          && next.updatedAt > baseline.updatedAt
+          && next.pendingAction?.type !== "credentials";
       case "approve_origin":
         return next.pendingAction?.type !== "origin_approval"
           || next.pendingAction.origin !== command.origin;
@@ -778,7 +786,7 @@ export function RunReviewWorkspace({
           actionBusy={
             isStartingApplication
               ? "resume"
-              : applicationCommandAction ?? applicationLifecycleAction
+              : applicationLifecycleAction ?? applicationCommandAction
           }
           onCancel={cancelApplication}
           onClose={closeApplication}

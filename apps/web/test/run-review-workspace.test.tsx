@@ -222,4 +222,70 @@ describe("RunReviewWorkspace", () => {
     }))).toBeTrue();
     expect(isApplicationActionLatchBusy(latch)).toBeFalse();
   });
+
+  test("keeps credential commands busy until a newer projection changes or leaves the gate", () => {
+    const credentials = reviewSnapshot({
+      bridgeState: "awaiting_human_navigation",
+      harnessState: "awaiting_human_navigation",
+      pendingAction: { type: "credentials" },
+    });
+    const signInLatch = createApplicationCommandLatch({
+      type: "sign_in",
+      username: "applicant@example.test",
+      password: "private password",
+    }, credentials);
+
+    expect(settleApplicationActionRequest(signInLatch)).toBeFalse();
+    expect(acceptApplicationActionProjection(signInLatch, credentials)).toBeFalse();
+    expect(acceptApplicationActionProjection(signInLatch, reviewSnapshot({
+      bridgeState: "awaiting_human_navigation",
+      harnessState: "awaiting_human_navigation",
+      pendingAction: { type: "credentials" },
+      updatedAt: credentials.updatedAt + 1,
+    }))).toBeFalse();
+    expect(isApplicationActionLatchBusy(signInLatch)).toBeTrue();
+    expect(acceptApplicationActionProjection(signInLatch, reviewSnapshot({
+      bridgeState: "awaiting_human_navigation",
+      generation: credentials.generation + 1,
+      harnessState: "awaiting_human_navigation",
+      pendingAction: { type: "credentials" },
+      updatedAt: credentials.updatedAt + 2,
+    }))).toBeTrue();
+    expect(isApplicationActionLatchBusy(signInLatch)).toBeFalse();
+
+    const saveLatch = createApplicationCommandLatch({
+      type: "save_credentials",
+      username: "applicant@example.test",
+      password: "private password",
+    }, credentials);
+    const progressed = reviewSnapshot({
+      bridgeState: "running",
+      harnessState: "running",
+      pendingAction: null,
+      updatedAt: credentials.updatedAt + 1,
+    });
+    expect(acceptApplicationActionProjection(saveLatch, progressed)).toBeFalse();
+    expect(isApplicationActionLatchBusy(saveLatch)).toBeTrue();
+    expect(settleApplicationActionRequest(saveLatch)).toBeTrue();
+    expect(isApplicationActionLatchBusy(saveLatch)).toBeFalse();
+
+    const cancelledSignInLatch = createApplicationCommandLatch({
+      type: "sign_in",
+      username: "applicant@example.test",
+      password: "private password",
+    }, credentials);
+    expect(settleApplicationActionRequest(cancelledSignInLatch)).toBeFalse();
+    expect(isApplicationActionLatchBusy(cancelledSignInLatch)).toBeTrue();
+    expect(acceptApplicationActionProjection(
+      cancelledSignInLatch,
+      reviewSnapshot({
+        bridgeState: "cancelled",
+        harnessState: "cancelled",
+        pendingAction: null,
+        terminalAt: credentials.updatedAt + 2,
+        updatedAt: credentials.updatedAt + 2,
+      }),
+    )).toBeTrue();
+    expect(isApplicationActionLatchBusy(cancelledSignInLatch)).toBeFalse();
+  });
 });

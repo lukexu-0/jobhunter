@@ -545,6 +545,16 @@ describe("pipeline application session requests", () => {
       type: "approve_origin",
       origin: "https://apply.example.test",
     })).resolves.toBeUndefined();
+    await expect(sendApplicationCommand(id, {
+      type: "sign_in",
+      username: "\u001c\u001dapplicant@example.test\u001e\u001f",
+      password: "  exact password  ",
+    })).resolves.toBeUndefined();
+    await expect(sendApplicationCommand(id, {
+      type: "save_credentials",
+      username: "account-name",
+      password: "saved password",
+    })).resolves.toBeUndefined();
     await expect(sendApplicationCommand(id, { type: "submit" })).resolves.toBeUndefined();
     await expect(closeApplicationSession(id)).resolves.toBeUndefined();
     expect(applicationEventsHref(id)).toBe(
@@ -589,6 +599,32 @@ describe("pipeline application session requests", () => {
       {
         input: "/api/pipeline/runs/run%20%2F1%3F/application/commands",
         init: {
+          body: JSON.stringify({
+            type: "sign_in",
+            username: "applicant@example.test",
+            password: "  exact password  ",
+          }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/commands",
+        init: {
+          body: JSON.stringify({
+            type: "save_credentials",
+            username: "account-name",
+            password: "saved password",
+          }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/commands",
+        init: {
           body: JSON.stringify({ type: "submit" }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -621,6 +657,36 @@ describe("pipeline application session requests", () => {
       "run-1",
       { type: "continue", answer: "private" } as never,
     )).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "sign_in",
+      username: "\u{1f642}".repeat(321),
+      password: "password",
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "sign_in",
+      username: "\u001c",
+      password: "password",
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "sign_in",
+      username: "account\u0000name",
+      password: "password",
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "sign_in",
+      username: "account-name",
+      password: "\ud800",
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "save_credentials",
+      username: "account-name",
+      password: "pass\u0000word",
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "save_credentials",
+      username: "account-name",
+      password: "",
+    })).toThrow(PipelineClientError);
     expect(fetchCalls).toBe(0);
 
     setFetchMock(async () => json({

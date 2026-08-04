@@ -10,6 +10,7 @@ export const APPLICATION_SESSION_EVENT_NAMES = [
   "agent_step",
   "snapshot",
   "human_navigation_required",
+  "credentials_required",
   "origin_approval_required",
   "additional_info_required",
   "additional_info_saved",
