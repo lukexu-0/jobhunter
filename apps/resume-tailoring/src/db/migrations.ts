@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 22;
+export const PIPELINE_SCHEMA_VERSION = 23;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -762,7 +762,7 @@ DROP TABLE IF EXISTS recruiting_event_scrape_runs;
 DROP TABLE IF EXISTS recruiting_event_preferences;
 `;
 
-const migration22 = `
+const migration23 = `
 DELETE FROM discovery_dedupe_keys
 WHERE source_id IN (
   SELECT id
@@ -828,7 +828,7 @@ WHERE NOT EXISTS (
   WHERE discovery_observations.job_id = discovery_jobs.id
 );
 
-CREATE TABLE discovery_sources_v22 (
+CREATE TABLE discovery_sources_v23 (
   id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),
   kind TEXT NOT NULL CHECK (kind IN ('simplify','zapply','speedyapply')),
@@ -841,7 +841,7 @@ CREATE TABLE discovery_sources_v22 (
   provenance TEXT
 ) STRICT;
 
-INSERT INTO discovery_sources_v22(
+INSERT INTO discovery_sources_v23(
   id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
 )
 SELECT
@@ -850,7 +850,7 @@ FROM discovery_sources
 WHERE kind IN ('simplify','zapply','speedyapply');
 
 DROP TABLE discovery_sources;
-ALTER TABLE discovery_sources_v22 RENAME TO discovery_sources;
+ALTER TABLE discovery_sources_v23 RENAME TO discovery_sources;
 `;
 
 function hasOpportunityKindColumn(db: Database): boolean {
@@ -974,6 +974,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 22) {
         db.exec(migration22);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(22, now);
+      }
+      if (version < 23) {
+        db.exec(migration23);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(23, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");
