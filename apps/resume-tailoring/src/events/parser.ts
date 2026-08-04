@@ -1,6 +1,9 @@
 import { z } from "zod";
 import type { RecruitingEventPreferences } from "../contracts";
-import type { RecruitingEventCandidate } from "./repository.ts";
+import {
+  canonicalizeRecruitingEventUrl,
+  type RecruitingEventCandidate,
+} from "./repository.ts";
 
 export interface LoadedRecruitingEventSource {
   readonly url: string;
@@ -35,7 +38,7 @@ const CandidateSchema = z.object({
   timezone: z.string().trim().min(1).max(100).optional(),
   location: z.string().trim().min(1).max(300).optional(),
   attendance: z.enum(["virtual", "in_person", "hybrid", "unknown"]),
-  registrationUrl: z.string().url().max(2_048),
+  registrationUrl: z.string().trim().min(1).max(2_048),
   description: z.string().trim().min(1).max(4_000).optional(),
   eligibilitySummary: z.string().trim().min(1).max(1_000).optional(),
   matchedForApplicant: z.boolean(),
@@ -48,6 +51,12 @@ function parsedCandidate(value: unknown): RecruitingEventCandidate | undefined {
   const parsed = CandidateSchema.safeParse(value);
   if (!parsed.success) return undefined;
   const candidate = parsed.data;
+  let registrationUrl: string;
+  try {
+    registrationUrl = canonicalizeRecruitingEventUrl(candidate.registrationUrl);
+  } catch {
+    return undefined;
+  }
   return {
     title: candidate.title,
     organizer: candidate.organizer,
@@ -56,7 +65,7 @@ function parsedCandidate(value: unknown): RecruitingEventCandidate | undefined {
     ...(candidate.timezone === undefined ? {} : { timezone: candidate.timezone }),
     ...(candidate.location === undefined ? {} : { location: candidate.location }),
     attendance: candidate.attendance,
-    registrationUrl: candidate.registrationUrl,
+    registrationUrl,
     ...(candidate.description === undefined ? {} : { description: candidate.description }),
     ...(candidate.eligibilitySummary === undefined
       ? {}
@@ -137,21 +146,20 @@ function attendanceValue(value: unknown): RecruitingEventCandidate["attendance"]
 function resolvedUrl(value: unknown, base: string): string | undefined {
   if (typeof value !== "string") return undefined;
   try {
-    const url = new URL(value, base);
-    return url.protocol === "http:" || url.protocol === "https:" ? url.href : undefined;
+    return canonicalizeRecruitingEventUrl(value, base);
   } catch {
     return undefined;
   }
 }
 
-function registrationUrl(event: Record<string, unknown>, base: string): string {
+function registrationUrl(event: Record<string, unknown>, base: string): string | undefined {
   const offers = Array.isArray(event.offers) ? event.offers : [event.offers];
   for (const offerValue of offers) {
     const offer = objectValue(offerValue);
     const url = resolvedUrl(offer?.url, base);
     if (url) return url;
   }
-  return resolvedUrl(event.url, base) ?? base;
+  return resolvedUrl(event.url, base) ?? resolvedUrl(base, base);
 }
 
 function schoolTerms(school: string | null): readonly string[] {
@@ -186,7 +194,8 @@ function structuredCandidate(
   const title = namedValue(event.name);
   const organizer = namedValue(event.organizer ?? event.performer);
   const startAt = parseDate(event.startDate);
-  if (!title || !organizer || startAt === undefined) return undefined;
+  const canonicalRegistrationUrl = registrationUrl(event, sourceUrl);
+  if (!title || !organizer || startAt === undefined || !canonicalRegistrationUrl) return undefined;
   const endAt = parseDate(event.endDate);
   const description = typeof event.description === "string"
     ? compact(event.description, 4_000) || undefined
@@ -199,7 +208,7 @@ function structuredCandidate(
     ...(endAt === undefined ? {} : { endAt }),
     ...(locationValue(event.location) ? { location: locationValue(event.location) } : {}),
     attendance: attendanceValue(event.eventAttendanceMode),
-    registrationUrl: registrationUrl(event, sourceUrl),
+    registrationUrl: canonicalRegistrationUrl,
     ...(description ? { description } : {}),
     ...(eligibilitySummary ? { eligibilitySummary } : {}),
     matchedForApplicant: matchesSchool(eligibilitySummary, school),
@@ -226,11 +235,12 @@ export async function parseRecruitingEventSource(
   options: RecruitingEventParseOptions,
 ): Promise<RecruitingEventParseResult> {
   options.signal?.throwIfAborted();
+  const sourceUrl = canonicalizeRecruitingEventUrl(source.url);
   const eventObjects: Record<string, unknown>[] = [];
   for (const value of source.jsonLd) collectEventObjects(value, eventObjects);
   if (eventObjects.length > 0) {
     const candidates = eventObjects
-      .map((event) => structuredCandidate(event, source.url, options.preferences.school))
+      .map((event) => structuredCandidate(event, sourceUrl, options.preferences.school))
       .filter((candidate): candidate is RecruitingEventCandidate => candidate !== undefined);
     if (candidates.length > 0) {
       return { parser: "deterministic", candidates: upcoming(candidates, options.now) };
@@ -239,7 +249,7 @@ export async function parseRecruitingEventSource(
 
   const modelCandidates = await options.extractWithModel(
     source.lines,
-    { school: options.preferences.school, sourceUrl: source.url, now: options.now },
+    { school: options.preferences.school, sourceUrl, now: options.now },
     options.signal,
   );
   return { parser: "llm", candidates: upcoming(modelCandidates, options.now) };

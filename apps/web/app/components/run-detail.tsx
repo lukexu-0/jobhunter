@@ -27,6 +27,7 @@ import {
   retryRun,
 } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
+import { opportunityPresentation } from "../lib/opportunity-presentation";
 import {
   reconcileResumeIterationSelection,
   selectResolvedArtifact,
@@ -160,6 +161,55 @@ function formatDate(timestamp: number): string {
 }
 
 
+
+export function RunIdentitySummary({
+  identity,
+  run,
+}: {
+  readonly identity: JobIdentity | null;
+  readonly run: Pick<
+    RunDto,
+    | "applicationStatus"
+    | "createdAt"
+    | "jobUrl"
+    | "opportunityKind"
+    | "organizationOverride"
+    | "titleOverride"
+    | "updatedAt"
+  >;
+}) {
+  const presentation = opportunityPresentation(run.opportunityKind);
+  const title = run.titleOverride ?? identity?.title ?? presentation.titleFallback;
+  const subtitle =
+    run.organizationOverride ?? identity?.organization ?? presentation.organizationFallback;
+
+  return (
+    <section className={styles.paneSection}>
+      {presentation.visibleKindLabel ? (
+        <p className={styles.eyebrow}>{presentation.visibleKindLabel}</p>
+      ) : null}
+      <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>
+        {APPLICATION_STATUS_LABELS[run.applicationStatus]}
+      </p>
+      <h1 className={styles.runTitle}>{title}</h1>
+      <p className={styles.runSubtitle}>{subtitle}</p>
+      {run.jobUrl ? (
+        <a
+          className={styles.jobPostingLink}
+          href={run.jobUrl}
+          rel="noreferrer"
+          target="_blank"
+        >
+          {presentation.linkLabel} <span aria-hidden="true">↗</span>
+        </a>
+      ) : null}
+      <dl className={styles.metadataGrid}>
+        <div><dt>Created</dt><dd>{formatDate(run.createdAt)}</dd></div>
+        <div><dt>Last updated</dt><dd>{formatDate(run.updatedAt)}</dd></div>
+      </dl>
+    </section>
+  );
+}
 
 function publicMessage(error: unknown, fallback: string): string {
   if (!(error instanceof PipelineClientError)) return fallback;
@@ -995,8 +1045,8 @@ export function RunDetail({ runId }: RunDetailProps) {
   if (isLoading && !run) {
     return (
       <main className={styles.detailShell}>
-        <header className={styles.topBar}><Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to applications</Link></header>
-        <section className={styles.fullState} aria-live="polite"><p className={styles.eyebrow}>Opened run</p><h1>Loading application</h1><p>Fetching the current pipeline state and public review artifacts…</p></section>
+        <header className={styles.topBar}><Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to opportunities</Link></header>
+        <section className={styles.fullState} aria-live="polite"><p className={styles.eyebrow}>Opened run</p><h1>Loading opportunity</h1><p>Fetching the current pipeline state and public review artifacts…</p></section>
       </main>
     );
   }
@@ -1004,15 +1054,14 @@ export function RunDetail({ runId }: RunDetailProps) {
   if (!run) {
     return (
       <main className={styles.detailShell}>
-        <header className={styles.topBar}><Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to applications</Link></header>
-        <section className={styles.fullState} role="alert"><p className={styles.eyebrow}>Run unavailable</p><h1>This application could not be opened</h1><p>{loadError ?? "The current run state is unavailable."}</p><button className={styles.primaryButton} type="button" disabled={isRefreshing} onClick={() => void loadRun(true)}><Icon name="refresh" />{isRefreshing ? "Reloading…" : "Reload run"}</button></section>
+        <header className={styles.topBar}><Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to opportunities</Link></header>
+        <section className={styles.fullState} role="alert"><p className={styles.eyebrow}>Run unavailable</p><h1>This opportunity could not be opened</h1><p>{loadError ?? "The current run state is unavailable."}</p><button className={styles.primaryButton} type="button" disabled={isRefreshing} onClick={() => void loadRun(true)}><Icon name="refresh" />{isRefreshing ? "Reloading…" : "Reload run"}</button></section>
       </main>
     );
   }
 
-  const title = run.titleOverride ?? identity?.title ?? "Application";
-  const subtitle = run.organizationOverride ?? identity?.organization ?? "Organization unavailable";
-
+  const presentation = opportunityPresentation(run.opportunityKind);
+  const title = run.titleOverride ?? identity?.title ?? presentation.titleFallback;
   return (
     <main
       className={styles.detailShell}
@@ -1025,7 +1074,7 @@ export function RunDetail({ runId }: RunDetailProps) {
       }
     >
       <header className={styles.topBar}>
-        <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to applications</Link>
+        <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to opportunities</Link>
         <WorkflowProgress applicationView={applicationView} run={run} />
       </header>
       <div className={styles.topAlerts}>
@@ -1047,28 +1096,8 @@ export function RunDetail({ runId }: RunDetailProps) {
       </div>
 
       <div className={styles.paneGrid}>
-        <aside className={`${styles.pane} ${styles.leftPane}`} aria-label="Application summary and keyword comparison">
-          <section className={styles.paneSection}>
-            <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>
-              {APPLICATION_STATUS_LABELS[run.applicationStatus]}
-            </p>
-            <h1 className={styles.runTitle}>{title}</h1>
-            <p className={styles.runSubtitle}>{subtitle}</p>
-            {run.jobUrl ? (
-              <a
-                className={styles.jobPostingLink}
-                href={run.jobUrl}
-                rel="noreferrer"
-                target="_blank"
-              >
-                View job posting <span aria-hidden="true">↗</span>
-              </a>
-            ) : null}
-            <dl className={styles.metadataGrid}>
-              <div><dt>Created</dt><dd>{formatDate(run.createdAt)}</dd></div>
-              <div><dt>Last updated</dt><dd>{formatDate(run.updatedAt)}</dd></div>
-            </dl>
-          </section>
+        <aside className={`${styles.pane} ${styles.leftPane}`} aria-label={presentation.summaryLabel}>
+          <RunIdentitySummary identity={identity} run={run} />
           <section className={styles.paneSection} aria-label="Keyword comparison">
             <ArtifactState artifact={analysisArtifact} error={errorFor("job-analysis")} loading={isLoadingArtifacts} label="job analysis">
               <AnalysisContent
@@ -1294,7 +1323,7 @@ export function RunDetail({ runId }: RunDetailProps) {
 
         <aside
           className={`${styles.pane} ${styles.rightPane}`}
-          aria-label="Review and application workspace"
+          aria-label="Review and opportunity workspace"
         >
           <RunReviewWorkspace
             artifactState={iterationList?.artifactState ?? "retained"}

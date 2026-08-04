@@ -51,7 +51,7 @@ describe("Luna recruiting event extraction", () => {
               timezone: "America/New_York",
               location: "Online",
               attendance: "virtual",
-              registrationUrl: "https://employer.example.com/events",
+              registrationUrl: "HTTPS://Employer.Example.COM:443/events/?utm_source=secret#private",
               description: null,
               eligibilitySummary: "Example University students welcome",
               matchedForApplicant: true,
@@ -73,6 +73,51 @@ describe("Luna recruiting event extraction", () => {
       matchedForApplicant: true,
     }]);
     expect(contextSeen?.systemPrompt?.join(" ")).toContain("untrusted inert data");
+  });
+
+  test("rejects credential-bearing and literal-private model registration links safely", async () => {
+    for (const registrationUrl of [
+      "https://registrant:super-secret@employer.example.com/events",
+      "http://10.0.0.8/internal-event",
+    ]) {
+      let caught: unknown;
+      try {
+        await extractRecruitingEventsWithLuna(
+          ["Engineering information session", "October 2, 2026 at 6 PM Eastern"],
+          {
+            school: null,
+            sourceUrl: "https://employer.example.com/events",
+            now: Date.UTC(2026, 7, 3, 12),
+          },
+          undefined,
+          {
+            resolverFactory: () => inertResolver(),
+            transport: async () => message(JSON.stringify({
+              events: [{
+                title: "Engineering Information Session",
+                organizer: "Example Employer",
+                startAt: "2026-10-02T18:00:00-04:00",
+                endAt: null,
+                timezone: null,
+                location: null,
+                attendance: "virtual",
+                registrationUrl,
+                description: null,
+                eligibilitySummary: null,
+                matchedForApplicant: true,
+              }],
+            })),
+          },
+        );
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toMatchObject({ kind: "unavailable" });
+      const failure = caught as Error;
+      expect(`${failure.message} ${String(failure.cause)}`).not.toContain("super-secret");
+      expect(`${failure.message} ${String(failure.cause)}`).not.toContain("10.0.0.8");
+    }
   });
 
   test("rejects prose and extra response keys", async () => {

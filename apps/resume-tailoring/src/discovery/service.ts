@@ -102,13 +102,30 @@ function validatedConnectorResult(value: unknown): ConnectorResult {
 }
 
 
-async function abortable<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
+const ABORTED = Symbol("discovery operation aborted");
+
+async function abortable<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal,
+  activeOperations: Set<Promise<unknown>>,
+): Promise<T> {
   signal.throwIfAborted();
-  const { promise: aborted, reject } = Promise.withResolvers<never>();
-  const onAbort = (): void => reject(signal.reason);
+  const operationPromise = Promise.resolve().then(() => {
+    signal.throwIfAborted();
+    return operation();
+  });
+  activeOperations.add(operationPromise);
+  void operationPromise.then(
+    () => activeOperations.delete(operationPromise),
+    () => activeOperations.delete(operationPromise),
+  );
+  const { promise: aborted, resolve } = Promise.withResolvers<typeof ABORTED>();
+  const onAbort = (): void => resolve(ABORTED);
   signal.addEventListener("abort", onAbort, { once: true });
   try {
-    return await Promise.race([Promise.resolve().then(operation), aborted]);
+    const outcome = await Promise.race([operationPromise, aborted]);
+    if (outcome === ABORTED) throw signal.reason;
+    return outcome as T;
   } finally {
     signal.removeEventListener("abort", onAbort);
   }
@@ -118,10 +135,11 @@ async function synchronizeConnector(
   connector: DiscoveryConnector,
   signal: AbortSignal,
   budget: DiscoveryHttpBudget,
+  activeOperations: Set<Promise<unknown>>,
 ): Promise<ConnectorSyncOutcome> {
   try {
     const result = validatedConnectorResult(
-      await abortable(() => connector.sync(signal, budget), signal),
+      await abortable(() => connector.sync(signal, budget), signal, activeOperations),
     );
     return { connector, result };
   } catch (error) {
@@ -176,8 +194,12 @@ function publicSourceError(error: unknown): string {
 
 export class DiscoveryService {
   readonly #now: () => number;
+  readonly #shutdown = new AbortController();
+  readonly #activeConnectorOperations = new Set<Promise<unknown>>();
   #syncing = false;
-
+  #closed = false;
+  #activeSync: Promise<DiscoverySyncResponse> | undefined;
+  #closePromise: Promise<void> | undefined;
   constructor(private readonly dependencies: DiscoveryServiceDependencies) {
     this.#now = dependencies.now ?? Date.now;
     if (dependencies.connectors.length > 100) {
@@ -193,19 +215,53 @@ export class DiscoveryService {
     return DiscoveryListResponseSchema.parse(this.dependencies.repository.list(options));
   }
 
-  async sync(signal: AbortSignal): Promise<DiscoverySyncResponse> {
+  sync(signal: AbortSignal): Promise<DiscoverySyncResponse> {
+    if (this.#closed) {
+      return Promise.reject(this.#shutdown.signal.reason);
+    }
     if (this.#syncing) {
-      throw new DiscoveryServiceError(
+      return Promise.reject(new DiscoveryServiceError(
         "DISCOVERY_SYNC_IN_PROGRESS",
         "A discovery synchronization is already running",
         409,
-      );
+      ));
+    }
+    if (signal.aborted) {
+      return Promise.reject(signal.reason);
     }
     this.#syncing = true;
+    const sync = this.#synchronize(signal);
+    this.#activeSync = sync;
+    return sync;
+  }
+
+  close(): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    this.#closed = true;
+    this.#shutdown.abort(new DiscoveryServiceError(
+      "DISCOVERY_SERVICE_CLOSED",
+      "The discovery service is closed",
+      409,
+    ));
+    this.#closePromise = this.#settleForClose(this.#activeSync);
+    return this.#closePromise;
+  }
+
+  async #settleForClose(activeSync: Promise<DiscoverySyncResponse> | undefined): Promise<void> {
+    await activeSync?.then(
+      () => undefined,
+      () => undefined,
+    );
+    await Promise.allSettled([...this.#activeConnectorOperations]);
+  }
+
+  async #synchronize(signal: AbortSignal): Promise<DiscoverySyncResponse> {
     try {
       signal.throwIfAborted();
+      const cancellationSignal = AbortSignal.any([signal, this.#shutdown.signal]);
       const connectorSignal = AbortSignal.any([
         signal,
+        this.#shutdown.signal,
         AbortSignal.timeout(MAX_SYNC_DURATION_MS),
       ]);
       const budget = new DiscoveryHttpBudget({
@@ -223,6 +279,7 @@ export class DiscoveryService {
             this.dependencies.connectors[index]!,
             connectorSignal,
             budget,
+            this.#activeConnectorOperations,
           );
         }
       };
@@ -232,7 +289,7 @@ export class DiscoveryService {
         },
         worker,
       ));
-      signal.throwIfAborted();
+      cancellationSignal.throwIfAborted();
       const outcomes = pending.map((outcome) => {
         if (outcome === undefined) throw new Error("discovery connector outcome is missing");
         return outcome;
@@ -309,6 +366,7 @@ export class DiscoveryService {
       return DiscoverySyncResponseSchema.parse(response);
     } finally {
       this.#syncing = false;
+      this.#activeSync = undefined;
     }
   }
 

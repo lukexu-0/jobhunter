@@ -7,6 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
 import { PipelineClientError, createRun, deleteRun, listRuns, readJsonArtifact, updateApplicationStatus, updateRunIdentity } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
+import { opportunityPresentation } from "../lib/opportunity-presentation";
 import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
 
 const PAGE_SIZE = 8;
@@ -190,6 +191,35 @@ function effectiveRunIdentity(run: RunDto, artifactIdentity: JobIdentity | undef
     organization: run.organizationOverride ?? artifactIdentity?.organization,
   };
 }
+export function RunIdentityLink({
+  identity,
+  run,
+}: {
+  readonly identity: EffectiveIdentity;
+  readonly run: Pick<RunDto, "id" | "opportunityKind">;
+}) {
+  const presentation = opportunityPresentation(run.opportunityKind);
+  const title = identity.title ?? presentation.dashboardTitleFallback;
+  const accessibleName = title
+    ? `${presentation.openNamedPrefix} ${title} ${shortRunId(run.id)}`
+    : `${presentation.openFallbackLabel} ${shortRunId(run.id)}`;
+
+  return (
+    <Link className="application-link" href={`/runs/${encodeURIComponent(run.id)}`} aria-label={accessibleName}>
+      {title ? (
+        <span>
+          {presentation.visibleKindLabel ? (
+            <span className="table-muted">{presentation.visibleKindLabel} · </span>
+          ) : null}
+          {title}
+        </span>
+      ) : (
+        <span className="table-placeholder-line" aria-hidden="true" />
+      )}
+    </Link>
+  );
+}
+
 
 function shortRunId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
@@ -893,7 +923,10 @@ export function RunDashboard() {
                   ) : null}
                   {!isLoading ? visibleRuns.map((run) => {
                     const identity = effectiveRunIdentity(run, jobIdentities[run.id]);
+                    const presentation = opportunityPresentation(run.opportunityKind);
                     const href = `/runs/${encodeURIComponent(run.id)}`;
+                    const organization =
+                      identity.organization ?? presentation.dashboardOrganizationFallback;
                     return (
                       <tr
                         key={run.id}
@@ -904,11 +937,13 @@ export function RunDashboard() {
                         }}
                       >
                         <td>
-                          <Link className="application-link" href={href} aria-label={identity.title ? `Open ${identity.title} ${shortRunId(run.id)}` : `Open application ${shortRunId(run.id)}`}>
-                            {identity.title ? <span>{identity.title}</span> : <span className="table-placeholder-line" aria-hidden="true" />}
-                          </Link>
+                          <RunIdentityLink identity={identity} run={run} />
                         </td>
-                        <td>{identity.organization ? <span className="application-organization-name">{identity.organization}</span> : <span className="table-placeholder-line table-placeholder-line--organization" role="img" aria-label="Unknown organization" />}</td>
+                        <td>{
+                          organization
+                            ? <span className="application-organization-name">{organization}</span>
+                            : <span className="table-placeholder-line table-placeholder-line--organization" role="img" aria-label="Unknown organization" />
+                        }</td>
                         <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
                         <td>
                           <select
@@ -934,7 +969,7 @@ export function RunDashboard() {
                             }}
                             className="run-action-trigger"
                             type="button"
-                            aria-label={`Actions for ${identity.title ?? shortRunId(run.id)}`}
+                            aria-label={`Actions for ${identity.title ?? presentation.dashboardTitleFallback ?? shortRunId(run.id)}`}
                             aria-haspopup="menu"
                             aria-expanded={actionMenu?.runId === run.id}
                             aria-controls={`run-actions-${encodeURIComponent(run.id)}`}

@@ -128,7 +128,7 @@ test("EVENTS-UI-001 saves school, starts a scrape, and retains the loaded snapsh
   await page.goto("/events");
 
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
-  await expect(navigation.getByRole("link")).toHaveText(["Applications", "Events", "Providers"]);
+  await expect(navigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Events", "Providers"]);
   await expect(navigation.getByRole("link", { name: "Events" })).toHaveAttribute("aria-current", "page");
 
   const school = page.getByRole("textbox", { name: "School" });

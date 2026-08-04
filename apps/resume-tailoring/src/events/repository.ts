@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
+import { canonicalizePublicHttpUrl } from "../api/job-source";
 import {
   RecruitingEventPreferencesSchema,
   UpdateRecruitingEventPreferencesRequestSchema,
@@ -82,6 +83,13 @@ export class RecruitingEventRunConflictError extends Error {
   }
 }
 
+export class RecruitingEventUrlError extends Error {
+  constructor() {
+    super("Recruiting event URL must be a public HTTP(S) URL");
+    this.name = "RecruitingEventUrlError";
+  }
+}
+
 function compact(value: string, maximum: number): string {
   return value.replace(/\s+/g, " ").trim().slice(0, maximum);
 }
@@ -103,15 +111,31 @@ function identityText(value: string, organizer = false): string {
   return normalized;
 }
 
-function canonicalUrl(value: string): string {
-  const url = new URL(value);
-  url.hash = "";
-  for (const key of [...url.searchParams.keys()]) {
-    if (/^(?:utm_.+|fbclid|gclid)$/i.test(key)) url.searchParams.delete(key);
+export function canonicalizeRecruitingEventUrl(
+  value: string | URL,
+  base?: string | URL,
+): string {
+  try {
+    const resolved = base === undefined ? value : new URL(value, base);
+    const url = canonicalizePublicHttpUrl(resolved);
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(?:utm_.+|fbclid|gclid)$/i.test(key)) url.searchParams.delete(key);
+    }
+    url.searchParams.sort();
+    if (url.pathname !== "/") url.pathname = url.pathname.replace(/\/+$/, "");
+    if (url.href.length > 2_048) throw new Error();
+    return url.href;
+  } catch {
+    throw new RecruitingEventUrlError();
   }
-  url.searchParams.sort();
-  if (url.pathname !== "/") url.pathname = url.pathname.replace(/\/+$/, "");
-  return url.href;
+}
+
+function safeCanonicalRecruitingEventUrl(value: string): string | undefined {
+  try {
+    return canonicalizeRecruitingEventUrl(value);
+  } catch {
+    return undefined;
+  }
 }
 
 function fingerprint(candidate: RecruitingEventCandidate): string {
@@ -221,11 +245,13 @@ export class RecruitingEventRepository {
     candidates: readonly RecruitingEventCandidate[],
     completedAt: number,
   ): void {
+    const sourceUrl = canonicalizeRecruitingEventUrl(source.url);
     this.#immediate(() => {
       const run = this.#run(runId);
       if (run.state !== "running") throw new Error("Recruiting event scrape is not running");
       const uniqueEventIds = new Set<string>();
       for (const candidate of candidates) {
+        const registrationUrl = canonicalizeRecruitingEventUrl(candidate.registrationUrl);
         const eventFingerprint = fingerprint(candidate);
         const existing = this.#db.query<{ id: string }, [string]>(
           "SELECT id FROM recruiting_events WHERE fingerprint = ?",
@@ -248,7 +274,7 @@ export class RecruitingEventRepository {
             candidate.timezone ? compact(candidate.timezone, 100) : null,
             candidate.location ? compact(candidate.location, 300) : null,
             candidate.attendance,
-            canonicalUrl(candidate.registrationUrl),
+            registrationUrl,
             candidate.description ? compact(candidate.description, 4_000) : null,
             candidate.eligibilitySummary ? compact(candidate.eligibilitySummary, 1_000) : null,
             candidate.matchedForApplicant ? 1 : 0,
@@ -276,7 +302,7 @@ export class RecruitingEventRepository {
             candidate.location ? compact(candidate.location, 300) : null,
             candidate.attendance,
             candidate.attendance,
-            canonicalUrl(candidate.registrationUrl),
+            registrationUrl,
             candidate.description ? compact(candidate.description, 4_000) : null,
             candidate.eligibilitySummary ? compact(candidate.eligibilitySummary, 1_000) : null,
             candidate.matchedForApplicant ? 1 : 0,
@@ -292,7 +318,7 @@ export class RecruitingEventRepository {
           ON CONFLICT(event_id, source_id) DO UPDATE SET
             source_url = excluded.source_url,
             last_seen_at = excluded.last_seen_at
-        `).run(eventId, source.id, canonicalUrl(source.url), completedAt, completedAt);
+        `).run(eventId, source.id, sourceUrl, completedAt, completedAt);
         uniqueEventIds.add(eventId);
       }
       this.#db.query(`
@@ -304,7 +330,7 @@ export class RecruitingEventRepository {
         runId,
         compact(source.id, 100),
         compact(source.name, 200),
-        canonicalUrl(source.url),
+        sourceUrl,
         parser,
         uniqueEventIds.size,
         completedAt,
@@ -319,6 +345,7 @@ export class RecruitingEventRepository {
     message: string,
     completedAt: number,
   ): void {
+    const sourceUrl = canonicalizeRecruitingEventUrl(source.url);
     this.#immediate(() => {
       const run = this.#run(runId);
       if (run.state !== "running") throw new Error("Recruiting event scrape is not running");
@@ -331,7 +358,7 @@ export class RecruitingEventRepository {
         runId,
         compact(source.id, 100),
         compact(source.name, 200),
-        canonicalUrl(source.url),
+        sourceUrl,
         compact(code, 64),
         compact(message, 240),
         completedAt,
@@ -426,13 +453,15 @@ export class RecruitingEventRepository {
       ORDER BY start_at ASC, title COLLATE NOCASE ASC
       LIMIT 1000
     `).all(input.now);
-    const events = eventRows.map((row) => {
+    const events = eventRows.flatMap((row) => {
+      const registrationUrl = safeCanonicalRecruitingEventUrl(row.registration_url);
+      if (!registrationUrl) return [];
       const sources = this.#db.query<{ source_url: string }, [string]>(`
         SELECT source_url FROM recruiting_event_sources
         WHERE event_id = ?
         ORDER BY first_seen_at ASC, source_id ASC
       `).all(row.id);
-      return {
+      return [{
         id: row.id,
         title: row.title,
         organizer: row.organizer,
@@ -441,8 +470,11 @@ export class RecruitingEventRepository {
         ...(row.timezone === null ? {} : { timezone: row.timezone }),
         ...(row.location === null ? {} : { location: row.location }),
         attendance: row.attendance,
-        registrationUrl: row.registration_url,
-        sourceUrls: sources.map((source) => source.source_url),
+        registrationUrl,
+        sourceUrls: sources.flatMap((source) => {
+          const sourceUrl = safeCanonicalRecruitingEventUrl(source.source_url);
+          return sourceUrl ? [sourceUrl] : [];
+        }),
         ...(row.description === null ? {} : { description: row.description }),
         ...(row.eligibility_summary === null
           ? {}
@@ -450,7 +482,7 @@ export class RecruitingEventRepository {
         matchedForApplicant: row.matched_for_applicant === 1,
         firstSeenAt: row.first_seen_at,
         lastSeenAt: row.last_seen_at,
-      };
+      }];
     });
     const issues = latestRow
       ? this.#db.query<IssueRow, [string]>(`
@@ -459,14 +491,19 @@ export class RecruitingEventRepository {
           WHERE run_id = ? AND state = 'failed'
           ORDER BY completed_at ASC, source_id ASC
           LIMIT 500
-        `).all(latestRow.id).map((row) => ({
-          sourceId: row.source_id,
-          sourceName: row.source_name,
-          sourceUrl: row.source_url,
-          code: row.issue_code,
-          message: row.issue_message,
-          occurredAt: row.completed_at,
-        }))
+        `).all(latestRow.id).flatMap((row) => {
+          const sourceUrl = safeCanonicalRecruitingEventUrl(row.source_url);
+          return sourceUrl
+            ? [{
+                sourceId: row.source_id,
+                sourceName: row.source_name,
+                sourceUrl,
+                code: row.issue_code,
+                message: row.issue_message,
+                occurredAt: row.completed_at,
+              }]
+            : [];
+        })
       : [];
 
     return {

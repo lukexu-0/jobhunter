@@ -481,3 +481,150 @@ test("WEB-AUTH-003 offers a manual Indeed sign-in link when the browser blocks t
   await indeed.getByRole("button", { name: "Cancel Indeed Jobs authorization" }).click();
   await expect(indeed.getByText("Authorization was cancelled.", { exact: true })).toHaveCount(1);
 });
+
+test("WEB-AUTH-004 settles simultaneous provider sessions independently at the polling cadence", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.open = () => null;
+  });
+
+  await page.route("**/api/pipeline/auth", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        providers: [
+          { provider: "openai-codex", state: "disconnected" },
+          { provider: "indeed", state: "disconnected" },
+        ],
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [] }),
+    });
+  });
+  await page.route("**/api/pipeline/auth/openai-codex/sessions", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "simultaneous-codex-session",
+        provider: "openai-codex",
+        state: "pending",
+        instructions: "Complete Codex authorization.",
+        progress: ["Waiting for Codex authorization."],
+        expiresAt: 1_900_000_000_000,
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/auth/indeed/sessions", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "simultaneous-indeed-session",
+        provider: "indeed",
+        state: "pending",
+        instructions: "Complete Indeed authorization.",
+        progress: ["Waiting for Indeed authorization."],
+        expiresAt: 1_900_000_000_000,
+      }),
+    });
+  });
+
+  let markCodexPollStarted = () => {};
+  const codexPollStarted = new Promise<void>((resolve) => {
+    markCodexPollStarted = resolve;
+  });
+  let releaseCodexPoll = () => {};
+  const codexPollResponse = new Promise<void>((resolve) => {
+    releaseCodexPoll = resolve;
+  });
+  await page.route("**/api/pipeline/auth/sessions/simultaneous-codex-session", async (route) => {
+    markCodexPollStarted();
+    await codexPollResponse;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "simultaneous-codex-session",
+        provider: "openai-codex",
+        state: "succeeded",
+        progress: ["Codex authorization completed."],
+        expiresAt: 1_900_000_000_000,
+      }),
+    });
+  });
+
+  let indeedPollCount = 0;
+  let markIndeedPollStarted = () => {};
+  const indeedPollStarted = new Promise<void>((resolve) => {
+    markIndeedPollStarted = resolve;
+  });
+  let releaseIndeedPendingPoll = () => {};
+  const indeedPendingPollResponse = new Promise<void>((resolve) => {
+    releaseIndeedPendingPoll = resolve;
+  });
+  await page.route("**/api/pipeline/auth/sessions/simultaneous-indeed-session", async (route) => {
+    indeedPollCount += 1;
+    markIndeedPollStarted();
+
+    if (indeedPollCount === 1) {
+      await indeedPendingPollResponse;
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: "simultaneous-indeed-session",
+          provider: "indeed",
+          state: "pending",
+          instructions: "Complete Indeed authorization.",
+          progress: ["Indeed authorization is still pending."],
+          expiresAt: 1_900_000_000_000,
+        }),
+      });
+      return;
+    }
+
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "simultaneous-indeed-session",
+        provider: "indeed",
+        state: "succeeded",
+        progress: ["Indeed authorization completed."],
+        expiresAt: 1_900_000_000_000,
+      }),
+    });
+  });
+
+  await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
+  await page.goto("/providers");
+  await page.clock.pauseAt(new Date("2026-01-01T00:00:01Z"));
+  const providers = page.getByRole("list", { name: "OAuth providers" });
+  const providerRows = providers.getByRole("listitem");
+  const codex = providerRows.filter({ hasText: "OpenAI Codex" });
+  const indeed = providerRows.filter({ hasText: "Indeed Jobs" });
+  await expect(providerRows.nth(0)).toContainText("OpenAI Codex");
+  await expect(providerRows.nth(1)).toContainText("Indeed Jobs");
+
+  await codex.getByRole("button", { name: "Connect OpenAI Codex" }).click();
+  await indeed.getByRole("button", { name: "Connect Indeed Jobs" }).click();
+  await Promise.all([codexPollStarted, indeedPollStarted]);
+
+  releaseCodexPoll();
+  await expect(codex.getByText("Authorization completed. The provider connection was refreshed.", { exact: true }))
+    .toBeVisible();
+  expect(indeedPollCount).toBe(1);
+
+  releaseIndeedPendingPoll();
+  await expect(indeed.getByText("Indeed authorization is still pending.", { exact: true })).toBeVisible();
+  expect(indeedPollCount).toBe(1);
+
+  await page.clock.runFor(2_499);
+  expect(indeedPollCount).toBe(1);
+  await page.clock.runFor(1);
+
+  await expect(indeed.getByText("Authorization completed. The provider connection was refreshed.", { exact: true }))
+    .toBeVisible();
+  expect(indeedPollCount).toBe(2);
+});

@@ -232,6 +232,7 @@ function revisionArtifacts(revision: number, pdfSha256: string): ArtifactDto[] {
     artifact(revision, "ats-keyword-extraction", `extraction-r${revision}`, "b".repeat(64), "application/json; charset=utf-8"),
     artifact(revision, "compiled-pdf", `resume-r${revision}`, pdfSha256, "application/pdf"),
     artifact(revision, "keyword-map-pdf", `keyword-map-r${revision}`, "c".repeat(64), "application/pdf"),
+    artifact(revision, "keyword-map", `keyword-coverage-r${revision}`, "e".repeat(64), "application/json"),
     artifact(revision, "resume-diff", `diff-r${revision}`, "d".repeat(64), "application/json"),
   ];
 }
@@ -487,6 +488,25 @@ function extractionPayload(revision: number): unknown {
   };
 }
 
+function keywordCoveragePayload(revision: number, pdfSha256: string): unknown {
+  return {
+    schemaVersion: 1,
+    pdfSha256,
+    keywords: [
+      {
+        id: `included-r${revision}`,
+        phrase: `Revision ${revision} orchestration`,
+        found: true,
+      },
+      {
+        id: `missing-r${revision}`,
+        phrase: `Revision ${revision} missing phrase`,
+        found: false,
+      },
+    ],
+  };
+}
+
 function diffPayload(revision: number): unknown {
   return {
     schemaVersion: 1,
@@ -616,6 +636,10 @@ async function installPipeline(
       }
       if (selectedArtifact?.kind === "ats-keyword-extraction") {
         await fulfillJson(route, mock, extractionPayload(revision));
+        return;
+      }
+      if (selectedArtifact?.kind === "keyword-map") {
+        await fulfillJson(route, mock, keywordCoveragePayload(revision, selectedIteration!.pdfSha256));
         return;
       }
       if (selectedArtifact?.kind === "resume-diff") {
@@ -2634,7 +2658,7 @@ test("390px workspace has no overflow, exposes keyboard review controls, and ann
   const mock = await installPipeline(page);
   await page.goto(`/runs/${runId}`);
 
-  await expect(page.getByRole("complementary", { name: "Review and application workspace" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Review and opportunity workspace" })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   const editInstructions = page.getByLabel("Edit instructions");
   const requestEdits = page.getByRole("button", { name: "Request edits" });

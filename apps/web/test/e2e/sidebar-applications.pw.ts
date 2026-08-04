@@ -1172,7 +1172,7 @@ test("shows the visible review and application workspace", async ({ page }) => {
   await page.goto("/runs/visible-review-workspace");
 
   const reviewPane = page.getByRole("complementary", {
-    name: "Review and application workspace",
+    name: "Review and opportunity workspace",
   });
   await expect(reviewPane).toBeVisible();
   await expect(reviewPane.getByRole("heading")).toHaveText(["Displayed resume"]);
@@ -1644,7 +1644,7 @@ test("uses the simplified opened-run header workflow layout", async ({ page }) =
   await page.goto("/runs/workflow-visual");
 
   const pageHeader = page.getByRole("main").locator(":scope > header");
-  await expect(pageHeader.getByRole("link", { name: "Back to applications" })).toBeVisible();
+  await expect(pageHeader.getByRole("link", { name: "Back to opportunities" })).toBeVisible();
 
   const workflow = pageHeader.getByRole("list");
   const stages = workflow.getByRole("listitem");

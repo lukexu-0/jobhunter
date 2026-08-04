@@ -85,14 +85,26 @@ function boundary(stdout: string, code = 0, stderr = ""): ProcessBoundary {
 
 describe("keyword map renderer", () => {
   test("parses Poppler bbox entities and rejects malformed or out-of-bounds XML", () => {
-    expect(parsePdftotextBbox(`<!DOCTYPE html><doc><page width="612" height="792"><word xMin="1" yMin="2" xMax="40" yMax="12">R&amp;D &#x2B; APIs</word></page></doc>`)).toEqual({
+    expect(parsePdftotextBbox([
+      '<!DOCTYPE html><doc><page width="612" height="792"><flow><block><line>',
+      '<word xMin="1" yMin="2" xMax="40" yMax="12">R&amp;D &#x2B; APIs</word>',
+      "</line></block></flow></page></doc>",
+    ].join(""))).toEqual({
       width: 612,
       height: 792,
-      words: [{ text: "R&D + APIs", xMin: 1, yMin: 2, xMax: 40, yMax: 12 }],
+      words: [{
+        text: "R&D + APIs",
+        xMin: 1,
+        yMin: 2,
+        xMax: 40,
+        yMax: 12,
+        blockIndex: 0,
+        lineIndex: 0,
+      }],
     });
-    expect(() => parsePdftotextBbox("<doc><page width=\"612\" height=\"792\"><word>bad</page></doc>"))
+    expect(() => parsePdftotextBbox("<doc><page width=\"612\" height=\"792\"><block><line><word>bad</line></block></page></doc>"))
       .toThrow(/malformed word/i);
-    expect(() => parsePdftotextBbox("<doc><page width=\"10\" height=\"10\"><word xMin=\"1\" yMin=\"1\" xMax=\"20\" yMax=\"2\">bad</word></page></doc>"))
+    expect(() => parsePdftotextBbox("<doc><page width=\"10\" height=\"10\"><block><line><word xMin=\"1\" yMin=\"1\" xMax=\"20\" yMax=\"2\">bad</word></line></block></page></doc>"))
       .toThrow(/out-of-bounds/i);
   });
 
@@ -219,7 +231,7 @@ describe("keyword map renderer", () => {
     expect(rendered.pdf.sha256).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  testWithPdftotext("counts an extracted phrase that wraps across rendered resume lines", async () => {
+  test("counts an extracted phrase that wraps across lines in one Poppler text block", async () => {
     const jobDescription = "TypeScript role requires Distributed tracing.";
     const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
     const atsKeywordExtraction = {
@@ -236,12 +248,21 @@ describe("keyword map renderer", () => {
     });
     const analysis = { ...baseAnalysis, jdKeywords: [], exactEdits: [] };
     const resume = await compiledResume("Built production Distributed\ntracing systems.");
+    const bboxXml = [
+      '<doc><page width="612" height="792"><flow><block>',
+      '<line><word xMin="54" yMin="100" xMax="76" yMax="111">Built</word>',
+      '<word xMin="80" yMin="100" xMax="140" yMax="111">Distributed</word></line>',
+      '<line><word xMin="54" yMin="113" xMax="91" yMax="124">tracing</word>',
+      '<word xMin="95" yMin="113" xMax="137" yMax="124">systems</word></line>',
+      "</block></flow></page></doc>",
+    ].join("");
 
     const rendered = await renderKeywordMapArtifacts({
       ...resume,
       jobDescription,
       atsKeywordExtraction,
       analysis,
+      processBoundary: boundary(bboxXml),
     });
     const coverage = ResumeKeywordCoverageSchema.parse(JSON.parse(
       await Bun.file(rendered.coverage.path).text(),
@@ -382,6 +403,61 @@ describe("keyword map renderer", () => {
     expect(operators.match(/0\.85 0\.05 0\.05 RG/g)).toHaveLength(3);
   });
 
+  test("keeps a phrase split across adjacent independent Poppler blocks unmatched", async () => {
+    const jobDescription = "TypeScript services experience required.";
+    const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const atsKeywordExtraction = {
+      ...baseExtraction,
+      keywords: [{
+        id: "keyword-typescript-services",
+        phrase: "TypeScript services",
+        jdQuote: jobDescription,
+      }],
+    };
+    const analysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
+    const resume = await compiledResume("TypeScript\nservices");
+    const bboxXml = [
+      '<doc><page width="612" height="792"><flow>',
+      '<block><line><word xMin="54" yMin="100" xMax="110" yMax="111">TypeScript</word></line></block>',
+      '<block><line><word xMin="54" yMin="113" xMax="96" yMax="124">services</word></line></block>',
+      "</flow></page></doc>",
+    ].join("");
+
+    const rendered = await renderKeywordMapArtifacts({
+      ...resume,
+      jobDescription,
+      atsKeywordExtraction,
+      analysis,
+      processBoundary: boundary(bboxXml),
+    });
+    const document = await PDFDocument.load(
+      await resume.artifacts.read(rendered.pdf.path, ARTIFACT_LIMITS.pdf),
+    );
+    let operators = "";
+    for (const [, object] of document.context.enumerateIndirectObjects()) {
+      if (!(object instanceof PDFRawStream)) continue;
+      try {
+        operators += Buffer.from(decodePDFRawStream(object).decode()).toString("latin1");
+      } catch {
+        // Font and image streams are not content streams and need not be text-decodable.
+      }
+    }
+
+    expect(operators.match(/1 0\.85 0 rg/g)).toHaveLength(1);
+    expect(operators).not.toContain("0.85 0.05 0.05 RG");
+    const coverage = ResumeKeywordCoverageSchema.parse(
+      await Bun.file(rendered.coverage.path).json(),
+    );
+    expect(coverage.keywords).toEqual([{
+      id: "keyword-typescript-services",
+      phrase: "TypeScript services",
+      found: false,
+    }]);
+  });
+
   test("KEYWORD-LINE-001 keeps a phrase split across separate resume bullets unmatched", async () => {
     const jobDescription = "TypeScript services experience required.";
     const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
@@ -399,12 +475,12 @@ describe("keyword map renderer", () => {
     });
     const resume = await compiledResume("- TypeScript\n\n\n\n\n\n\n\n- services");
     const bboxXml = [
-      '<doc><page width="612" height="792">',
-      '<word xMin="54" yMin="91" xMax="58" yMax="102">-</word>',
-      '<word xMin="62" yMin="91" xMax="118" yMax="102">TypeScript</word>',
-      '<word xMin="54" yMin="211" xMax="58" yMax="222">-</word>',
-      '<word xMin="62" yMin="211" xMax="104" yMax="222">services</word>',
-      "</page></doc>",
+      '<doc><page width="612" height="792"><flow>',
+      '<block><line><word xMin="54" yMin="91" xMax="58" yMax="102">-</word>',
+      '<word xMin="62" yMin="91" xMax="118" yMax="102">TypeScript</word></line></block>',
+      '<block><line><word xMin="54" yMin="104" xMax="58" yMax="115">-</word>',
+      '<word xMin="62" yMin="104" xMax="104" yMax="115">services</word></line></block>',
+      "</flow></page></doc>",
     ].join("");
 
     const rendered = await renderKeywordMapArtifacts({

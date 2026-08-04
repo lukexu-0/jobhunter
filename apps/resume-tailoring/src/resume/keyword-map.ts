@@ -69,6 +69,8 @@ export interface BboxWord {
   readonly yMin: number;
   readonly xMax: number;
   readonly yMax: number;
+  readonly blockIndex: number;
+  readonly lineIndex: number;
 }
 
 export interface ParsedBboxPage {
@@ -84,6 +86,8 @@ interface WordBox {
   readonly y: number;
   readonly width: number;
   readonly height: number;
+  readonly blockIndex?: number;
+  readonly lineIndex?: number;
 }
 
 interface BoxRange {
@@ -159,32 +163,81 @@ export function parsePdftotextBbox(xml: string): ParsedBboxPage {
   }
   const pageOpenings = [...xml.matchAll(/<page\b([^>]*)>/gi)];
   const pageClosings = [...xml.matchAll(/<\/page\s*>/gi)];
-  if (pageOpenings.length !== 1 || pageClosings.length !== 1) {
+  const pageMatches = [...xml.matchAll(/<page\b([^>]*)>([\s\S]*?)<\/page\s*>/gi)];
+  if (pageOpenings.length !== 1 || pageClosings.length !== 1 || pageMatches.length !== 1) {
     throw new Error("compiled resume bbox must contain exactly one page");
   }
-  const pageAttributes = attributes(pageOpenings[0]![1] ?? "");
+  const pageAttributes = attributes(pageMatches[0]![1] ?? "");
   const width = coordinate(pageAttributes.width, "page width");
   const height = coordinate(pageAttributes.height, "page height");
   if (width <= 0 || height <= 0) throw new Error("pdftotext bbox page dimensions must be positive");
 
+  const pageBody = pageMatches[0]![2] ?? "";
+  const blockOpenings = [...pageBody.matchAll(/<block\b/gi)].length;
+  const blockClosings = [...pageBody.matchAll(/<\/block\s*>/gi)].length;
+  const blockMatches = [...pageBody.matchAll(/<block\b[^>]*>([\s\S]*?)<\/block\s*>/gi)];
+  const lineOpenings = [...pageBody.matchAll(/<line\b/gi)].length;
+  const lineClosings = [...pageBody.matchAll(/<\/line\s*>/gi)].length;
   const wordOpenings = [...xml.matchAll(/<word\b/gi)].length;
   const wordClosings = [...xml.matchAll(/<\/word\s*>/gi)].length;
-  const words: BboxWord[] = [];
-  const wordPattern = /<word\b([^>]*)>([\s\S]*?)<\/word\s*>/gi;
-  for (const match of xml.matchAll(wordPattern)) {
-    const wordAttributes = attributes(match[1] ?? "");
-    const xMin = coordinate(wordAttributes.xMin, "word xMin");
-    const yMin = coordinate(wordAttributes.yMin, "word yMin");
-    const xMax = coordinate(wordAttributes.xMax, "word xMax");
-    const yMax = coordinate(wordAttributes.yMax, "word yMax");
-    if (xMin < 0 || yMin < 0 || xMax <= xMin || yMax <= yMin || xMax > width + 1 || yMax > height + 1) {
-      throw new Error("pdftotext bbox contains an out-of-bounds word box");
-    }
-    const text = decodeXml(match[2] ?? "").trim();
-    if (!text || /<[^>]+>/.test(text)) throw new Error("pdftotext bbox contains malformed word text");
-    words.push({ text, xMin, yMin, xMax, yMax });
+  if (
+    blockOpenings === 0
+    || blockClosings !== blockOpenings
+    || blockMatches.length !== blockOpenings
+    || lineOpenings === 0
+    || lineClosings !== lineOpenings
+  ) {
+    throw new Error("pdftotext bbox contains malformed block or line structure");
   }
-  if (wordOpenings === 0 || words.length !== wordOpenings || wordClosings !== wordOpenings) {
+
+  const words: BboxWord[] = [];
+  let parsedLineCount = 0;
+  for (const [blockIndex, blockMatch] of blockMatches.entries()) {
+    const blockBody = blockMatch[1] ?? "";
+    const blockLineOpenings = [...blockBody.matchAll(/<line\b/gi)].length;
+    const blockLineClosings = [...blockBody.matchAll(/<\/line\s*>/gi)].length;
+    const lineMatches = [...blockBody.matchAll(/<line\b[^>]*>([\s\S]*?)<\/line\s*>/gi)];
+    if (
+      blockLineOpenings === 0
+      || blockLineClosings !== blockLineOpenings
+      || lineMatches.length !== blockLineOpenings
+    ) {
+      throw new Error("pdftotext bbox contains malformed block or line structure");
+    }
+    parsedLineCount += lineMatches.length;
+    for (const [lineIndex, lineMatch] of lineMatches.entries()) {
+      const lineBody = lineMatch[1] ?? "";
+      const lineWordOpenings = [...lineBody.matchAll(/<word\b/gi)].length;
+      const lineWordClosings = [...lineBody.matchAll(/<\/word\s*>/gi)].length;
+      const wordMatches = [...lineBody.matchAll(/<word\b([^>]*)>([\s\S]*?)<\/word\s*>/gi)];
+      if (
+        lineWordOpenings === 0
+        || lineWordClosings !== lineWordOpenings
+        || wordMatches.length !== lineWordOpenings
+      ) {
+        throw new Error("pdftotext bbox contains malformed word elements");
+      }
+      for (const match of wordMatches) {
+        const wordAttributes = attributes(match[1] ?? "");
+        const xMin = coordinate(wordAttributes.xMin, "word xMin");
+        const yMin = coordinate(wordAttributes.yMin, "word yMin");
+        const xMax = coordinate(wordAttributes.xMax, "word xMax");
+        const yMax = coordinate(wordAttributes.yMax, "word yMax");
+        if (xMin < 0 || yMin < 0 || xMax <= xMin || yMax <= yMin || xMax > width + 1 || yMax > height + 1) {
+          throw new Error("pdftotext bbox contains an out-of-bounds word box");
+        }
+        const text = decodeXml(match[2] ?? "").trim();
+        if (!text || /<[^>]+>/.test(text)) throw new Error("pdftotext bbox contains malformed word text");
+        words.push({ text, xMin, yMin, xMax, yMax, blockIndex, lineIndex });
+      }
+    }
+  }
+  if (
+    parsedLineCount !== lineOpenings
+    || wordOpenings === 0
+    || words.length !== wordOpenings
+    || wordClosings !== wordOpenings
+  ) {
     throw new Error("pdftotext bbox contains malformed word elements");
   }
   return { width, height, words };
@@ -331,6 +384,15 @@ function range(boxes: readonly WordBox[]): BoxRange {
 }
 
 function sameVisualTextLine(left: WordBox, right: WordBox): boolean {
+  if (left.page !== right.page) return false;
+  if (left.blockIndex !== undefined || right.blockIndex !== undefined) {
+    return left.blockIndex !== undefined
+      && right.blockIndex !== undefined
+      && left.lineIndex !== undefined
+      && right.lineIndex !== undefined
+      && left.blockIndex === right.blockIndex
+      && left.lineIndex === right.lineIndex;
+  }
   const verticalOverlap = Math.min(left.y + left.height, right.y + right.height)
     - Math.max(left.y, right.y);
   const baselineDistance = Math.abs(left.y - right.y);
@@ -372,7 +434,12 @@ function findPhrase(boxes: readonly WordBox[], phrase: string): BoxRange | undef
 function boxesAreContinuous(left: WordBox, right: WordBox): boolean {
   if (left.page !== right.page) return false;
   if (sameVisualTextLine(left, right)) return true;
-  return Math.abs(left.y - right.y) <= Math.max(left.height, right.height) * 3;
+  return left.blockIndex !== undefined
+    && right.blockIndex !== undefined
+    && left.lineIndex !== undefined
+    && right.lineIndex !== undefined
+    && left.blockIndex === right.blockIndex
+    && right.lineIndex === left.lineIndex + 1;
 }
 
 function hasPhrase(boxes: readonly WordBox[], phrase: string): boolean {
@@ -505,6 +572,8 @@ function createResumeLayout(source: ParsedBboxPage): ResumeLayout {
       y: y + (source.height - word.yMax) * scale,
       width: (word.xMax - word.xMin) * scale,
       height: (word.yMax - word.yMin) * scale,
+      blockIndex: word.blockIndex,
+      lineIndex: word.lineIndex,
     })),
   };
 }

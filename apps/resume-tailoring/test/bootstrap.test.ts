@@ -48,12 +48,15 @@ interface IngestionOverrides {
   readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
   readonly webOrigin?: string;
   readonly recruitingEvents?: PipelineRecruitingEventService;
+  readonly injectPipelineDatabase?: boolean;
   readonly beforeApplication?: (
     repository: PipelineRepository,
     database: Database,
   ) => void;
   readonly useDefaultWorker?: boolean;
   readonly workerOptions?: PipelineApplicationOptions["workerOptions"];
+  readonly discoveryConnectors?: PipelineApplicationOptions["discoveryConnectors"];
+  readonly discovery?: PipelineApplicationOptions["discovery"];
 }
 
 function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {}) {
@@ -131,7 +134,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     : undefined;
   const app = createPipelineApplication({
     webOrigin: ingestion.webOrigin ?? WEB_ORIGIN,
-    pipelineDatabase,
+    ...(ingestion.injectPipelineDatabase === false ? {} : { pipelineDatabase }),
     contextDatabase,
     repository,
     artifacts,
@@ -141,6 +144,10 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
       : { worker }),
     auth,
     ...(runs ? { runs } : {}),
+    ...(ingestion.discoveryConnectors
+      ? { discoveryConnectors: ingestion.discoveryConnectors }
+      : {}),
+    ...(ingestion.discovery ? { discovery: ingestion.discovery } : {}),
     ...(ingestion.browserHarnessToken
       ? { browserHarnessToken: ingestion.browserHarnessToken }
       : {}),
@@ -191,6 +198,24 @@ describe("pipeline application bootstrap", () => {
     expect(await response.json()).toEqual({ status: "ok" });
     expect(fixture.calls.kick).toBe(0);
     await fixture.app.close();
+  });
+
+  test("keeps repository-injected composition usable without a recruiting event service", async () => {
+    const fixture = createFixture(false, { injectPipelineDatabase: false });
+    try {
+      expect(fixture.app.services.pipelineDatabase).toBeUndefined();
+      expect(fixture.app.services.recruitingEvents).toBeUndefined();
+
+      const response = await fixture.app.fetch(
+        new Request("http://127.0.0.1:3457/v1/events"),
+      );
+      expect(response.status).toBe(404);
+
+      await fixture.app.close();
+      expect(fixture.pipelineDatabase.query("SELECT 1").get()).toBeDefined();
+    } finally {
+      fixture.pipelineDatabase.close();
+    }
   });
 
   test("composes recruiting event routes and owns the event service lifecycle", async () => {
@@ -765,6 +790,45 @@ describe("pipeline application bootstrap", () => {
 
     expect(reported).toEqual([reportedError]);
     await fixture.app.close();
+  });
+
+  test("awaits an injected discovery boundary before closing its repository database", async () => {
+    let releaseDiscovery!: () => void;
+    const discoveryRelease = new Promise<void>((resolve) => { releaseDiscovery = resolve; });
+    let closeOrder: string[] | undefined;
+    let discoveryCloseCalls = 0;
+    const discovery = {
+      close: () => {
+        discoveryCloseCalls += 1;
+        closeOrder?.push("discovery");
+        return discoveryRelease;
+      },
+    } as unknown as NonNullable<PipelineApplicationOptions["discovery"]>;
+    const fixture = createFixture(false, { discovery });
+    closeOrder = fixture.calls.close;
+    let closeSettled = false;
+
+    const firstClose = fixture.app.close();
+    const secondClose = fixture.app.close();
+    void firstClose.then(() => { closeSettled = true; });
+
+    expect(secondClose).toBe(firstClose);
+    expect(discoveryCloseCalls).toBe(1);
+    expect(fixture.calls.close).toEqual(["discovery"]);
+    expect(fixture.pipelineDatabase.query("SELECT 1").get()).toBeDefined();
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+
+    releaseDiscovery();
+    await Promise.all([firstClose, secondClose]);
+
+    expect(fixture.calls.close.indexOf("discovery")).toBeLessThan(
+      fixture.calls.close.indexOf("pipeline-database"),
+    );
+    expect(fixture.calls.close.filter((entry) => entry === "pipeline-database")).toHaveLength(1);
+    expect(() => fixture.pipelineDatabase.query("SELECT 1").get()).toThrow();
+    expect(fixture.app.close()).toBe(firstClose);
+    expect(discoveryCloseCalls).toBe(1);
   });
 
   test("closes worker, auth, context, and owned databases in order exactly once", async () => {

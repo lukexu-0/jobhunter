@@ -153,6 +153,65 @@ function terminalMessage(state: AuthSession["state"]): string | null {
   }
 }
 
+function usePendingSessionPolling(
+  session: BrowserAuthSession | undefined,
+  updateSession: (session: BrowserAuthSession) => void,
+  refreshAuthStatus: () => Promise<void>,
+  setNotice: (provider: AuthProvider, notice: Notice) => void,
+): void {
+  const sessionId = session?.state === "pending" ? session.id : undefined;
+  const provider = session?.state === "pending" ? session.provider : undefined;
+  const currentSession = useRef(session);
+  currentSession.current = session;
+
+  useEffect(() => {
+    if (!sessionId || !provider) return;
+
+    const controller = new AbortController();
+    let current = true;
+
+    const poll = async () => {
+      const requestedSession = currentSession.current;
+      if (
+        requestedSession?.state !== "pending"
+        || requestedSession.id !== sessionId
+        || requestedSession.provider !== provider
+      ) return;
+
+      try {
+        const response = await fetch(`${AUTH_ROOT}/sessions/${encodeURIComponent(sessionId)}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        const value = await readResponseJson(response);
+        const nextSession = parseAuthSession(value);
+        if (!nextSession) throw new Error("The service returned an invalid authorization session.");
+        if (!current || currentSession.current !== requestedSession) return;
+
+        updateSession(nextSession);
+        if (nextSession.state === "succeeded") {
+          await refreshAuthStatus();
+        }
+      } catch (error) {
+        if (!current || controller.signal.aborted) return;
+        setNotice(provider, {
+          tone: "error",
+          text: error instanceof Error ? redactPublicText(error.message) : "Authorization status is unavailable.",
+        });
+      }
+    };
+
+    void poll();
+    const interval = window.setInterval(() => void poll(), POLL_INTERVAL_MS);
+
+    return () => {
+      current = false;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [provider, refreshAuthStatus, sessionId, setNotice, updateSession]);
+}
+
 export function OAuthDashboard() {
   const { authStatus, setAuthStatus } = useDashboardData();
   const showInitialLoading = useRef(authStatus === undefined);
@@ -212,52 +271,18 @@ export function OAuthDashboard() {
     });
   }, []);
 
-  useEffect(() => {
-    const pendingSessions = Object.values(sessions).filter(
-      (session): session is BrowserAuthSession => session?.state === "pending",
-    );
-    if (pendingSessions.length === 0) return;
-
-    const controller = new AbortController();
-    let current = true;
-
-    const poll = async () => {
-      await Promise.all(
-        pendingSessions.map(async (session) => {
-          try {
-            const response = await fetch(`${AUTH_ROOT}/sessions/${encodeURIComponent(session.id)}`, {
-              cache: "no-store",
-              signal: controller.signal,
-            });
-            const value = await readResponseJson(response);
-            const nextSession = parseAuthSession(value);
-            if (!nextSession) throw new Error("The service returned an invalid authorization session.");
-            if (!current) return;
-
-            updateSession(nextSession);
-            if (nextSession.state === "succeeded") {
-              await refreshAuthStatus();
-            }
-          } catch (error) {
-            if (!current || controller.signal.aborted) return;
-            setNotice(session.provider, {
-              tone: "error",
-              text: error instanceof Error ? redactPublicText(error.message) : "Authorization status is unavailable.",
-            });
-          }
-        }),
-      );
-    };
-
-    void poll();
-    const interval = window.setInterval(() => void poll(), POLL_INTERVAL_MS);
-
-    return () => {
-      current = false;
-      controller.abort();
-      window.clearInterval(interval);
-    };
-  }, [refreshAuthStatus, sessions, setNotice, updateSession]);
+  usePendingSessionPolling(
+    sessions["openai-codex"],
+    updateSession,
+    refreshAuthStatus,
+    setNotice,
+  );
+  usePendingSessionPolling(
+    sessions.indeed,
+    updateSession,
+    refreshAuthStatus,
+    setNotice,
+  );
 
   const startSession = useCallback(
     async (provider: AuthProvider) => {

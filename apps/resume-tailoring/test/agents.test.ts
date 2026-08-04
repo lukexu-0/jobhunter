@@ -53,6 +53,8 @@ import {
 } from "../src/agents/ats-keyword-extraction-agent.ts";
 import {
   buildMechanicalTailoringPlan,
+  MAX_TAILORING_TOOL_BYTES,
+  MAX_TAILORING_TOOL_CALLS,
   type OnePageCorrection,
   TAILORING_INSTRUCTIONS,
   TAILORING_TASK,
@@ -933,7 +935,7 @@ describe("guarded agents", () => {
     const sequence: string[] = [];
     let renderCalls = 0;
     const runtime = runtimeWith(async (agent, input, options) => {
-      runOptionsAreFresh(options, 5);
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
       expect(agent.modelSettings).toMatchObject({
         reasoning: { effort: "high" }, parallelToolCalls: false, store: false,
         retry: { maxRetries: 0 },
@@ -1008,7 +1010,7 @@ describe("guarded agents", () => {
   test("allows up to 100 aggregate tailoring tool calls without per-tool caps", async () => {
     const tailoredTex = `${BASELINE}\n% repeatedly inspected tailored copy`;
     const runtime = runtimeWith(async (agent, _input, options) => {
-      runOptionsAreFresh(options, 5);
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
       for (let call = 0; call < 50; call++) {
         expect(await invoke(agent, "read_working_tex", {})).toBe(BASELINE);
       }
@@ -1034,7 +1036,7 @@ describe("guarded agents", () => {
 
   test("rejects the 101st aggregate tailoring tool call", async () => {
     const runtime = runtimeWith(async (agent, _input, options) => {
-      runOptionsAreFresh(options, 5);
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
       for (let call = 0; call < 100; call++) {
         await invoke(agent, "read_working_tex", {});
       }
@@ -1052,6 +1054,91 @@ describe("guarded agents", () => {
       signal: new AbortController().signal,
       runtime,
     })).rejects.toThrow("tailoring tool call budget of 100 exhausted");
+  });
+
+  test("an over-budget working-copy read cannot satisfy the submission inspection latch", async () => {
+    const oversizedOutput = "x".repeat(258_000);
+    const runtime = runtimeWith(async (agent, _input, options) => {
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
+      await invoke(agent, "read_working_tex", {});
+      await invoke(agent, "apply_analysis_edits", {});
+      for (let call = 0; call < 12; call++) {
+        expect(await invoke(agent, "read_working_tex", {})).toBe(oversizedOutput);
+      }
+      await invoke(agent, "apply_analysis_edits", {});
+      await expect(invoke(agent, "read_working_tex", {}))
+        .rejects.toThrow(`tailoring tool byte budget of ${MAX_TAILORING_TOOL_BYTES} exhausted`);
+      await expect(invoke(agent, "submit_tailoring_result", {}))
+        .rejects.toThrow("requires reading the applied working copy");
+      return {};
+    });
+
+    await expect(runTailoringAgent({
+      attemptSessionId: "tailor-over-budget-read",
+      input: {
+        analysis: ANALYSIS,
+        baseline: BASELINE,
+        operations: { renderPlan: () => oversizedOutput },
+      },
+      signal: new AbortController().signal,
+      runtime,
+    })).rejects.toThrow("requires exactly one validated terminal call");
+  });
+
+  test("an over-budget apply leaves the inspected working copy unchanged", async () => {
+    const inputBytes = Buffer.byteLength(JSON.stringify({}));
+    const smallOutput = "a";
+    const applyOutputBytes = (preview: string): number => Buffer.byteLength(JSON.stringify({
+      ok: true,
+      bytes: Buffer.byteLength(preview),
+      sha256: createHash("sha256").update(preview).digest("hex"),
+    }));
+    const largeReadCount = 12;
+    const sampleLargeOutput = "x".repeat(250_000);
+    const fixedBytes = inputBytes + Buffer.byteLength(JSON.stringify(BASELINE))
+      + inputBytes + applyOutputBytes(sampleLargeOutput)
+      + inputBytes + applyOutputBytes(smallOutput)
+      + inputBytes + Buffer.byteLength(JSON.stringify(smallOutput))
+      + inputBytes;
+    const targetSerializedBytes = Math.floor(
+      (MAX_TAILORING_TOOL_BYTES - fixedBytes - 32) / largeReadCount,
+    ) - inputBytes;
+    const largeOutput = "x".repeat(targetSerializedBytes - Buffer.byteLength(JSON.stringify("")));
+    expect(Buffer.byteLength(largeOutput)).toBeLessThanOrEqual(256 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(largeOutput))).toBe(targetSerializedBytes);
+
+    let renderCall = 0;
+    const runtime = runtimeWith(async (agent, _input, options) => {
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
+      await invoke(agent, "read_working_tex", {});
+      await invoke(agent, "apply_analysis_edits", {});
+      for (let call = 0; call < largeReadCount; call++) {
+        expect(await invoke(agent, "read_working_tex", {})).toBe(largeOutput);
+      }
+      await invoke(agent, "apply_analysis_edits", {});
+      expect(await invoke(agent, "read_working_tex", {})).toBe(smallOutput);
+      expect(await invoke(agent, "apply_analysis_edits", {}))
+        .toContain(`tailoring tool byte budget of ${MAX_TAILORING_TOOL_BYTES} exhausted`);
+      expect(await invoke(agent, "read_working_tex", {})).toBe(smallOutput);
+      await invoke(agent, "submit_tailoring_result", {});
+      return {};
+    });
+
+    await expect(runTailoringAgent({
+      attemptSessionId: "tailor-over-budget-apply",
+      input: {
+        analysis: ANALYSIS,
+        baseline: BASELINE,
+        operations: {
+          renderPlan: () => {
+            renderCall++;
+            return renderCall === 2 ? smallOutput : largeOutput;
+          },
+        },
+      },
+      signal: new AbortController().signal,
+      runtime,
+    })).resolves.toEqual({ plan: PLAN, toolCount: 19 });
   });
 
   test("propagates the bounded one-page correction note into model input and applies its cut", async () => {
@@ -1072,7 +1159,7 @@ describe("guarded agents", () => {
     const correctedPlan = buildMechanicalTailoringPlan(ANALYSIS, BASELINE, onePageCorrection);
     const correctedTex = `${BASELINE}\n% one-page corrected copy`;
     const runtime = runtimeWith(async (agent, input, options) => {
-      runOptionsAreFresh(options, 5);
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
       const parsedInput = JSON.parse(input);
       expect(parsedInput.onePageCorrection).toEqual(onePageCorrection);
       expect(input).toContain("1 visible line over one page.");
@@ -1114,7 +1201,7 @@ describe("guarded agents", () => {
     let guardResult: unknown;
     let renderCalls = 0;
     const runtime = runtimeWith(async (agent, _input, options) => {
-      runOptionsAreFresh(options, 5);
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
       guardResult = await invoke(agent, "apply_analysis_edits", {});
       return {};
     });
@@ -1139,7 +1226,7 @@ describe("guarded agents", () => {
 
   test("rejects submission before inspecting the applied working copy", async () => {
     const runtime = runtimeWith(async (agent, _input, options) => {
-      runOptionsAreFresh(options, 5);
+      runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
       await invoke(agent, "read_working_tex", {});
       await invoke(agent, "apply_analysis_edits", {});
       await expect(invoke(agent, "submit_tailoring_result", {}))

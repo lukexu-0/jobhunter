@@ -43,7 +43,7 @@ describe("recruiting event persistence", () => {
     });
     const startedAt = Date.UTC(2026, 7, 3, 12);
 
-    expect(PIPELINE_SCHEMA_VERSION).toBe(17);
+    expect(PIPELINE_SCHEMA_VERSION).toBe(20);
     expect(repository.getPreferences()).toEqual({ school: null });
     expect(repository.setPreferences(
       { school: "Example University" },
@@ -109,6 +109,88 @@ describe("recruiting event persistence", () => {
       running: false,
       sourceCount: 3,
     });
+
+    db.close();
+  });
+
+  test("rejects unsafe links before persistence and projects only canonical public URLs", () => {
+    const db = openPipelineDatabase(":memory:");
+    const repository = new RecruitingEventRepository(db);
+    const startedAt = Date.UTC(2026, 7, 3, 12);
+    const run = repository.startRun({
+      trigger: "manual",
+      sourceCount: 1,
+      startedAt,
+    });
+    const sourceWithNoncanonicalUrl: RecruitingEventSource = {
+      ...ieee,
+      url: "HTTPS://Careers.IEEE.ORG:443/career-fair/?utm_campaign=calendar#schedule",
+    };
+
+    for (const registrationUrl of [
+      "https://registrant:super-secret@careers.ieee.org/register/global-fair",
+      "http://172.16.4.2/register/global-fair",
+    ]) {
+      let caught: unknown;
+      try {
+        repository.completeSource(
+          run.id,
+          sourceWithNoncanonicalUrl,
+          "deterministic",
+          [{ ...event, registrationUrl }],
+          startedAt + 10,
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(String(caught)).toBe(
+        "RecruitingEventUrlError: Recruiting event URL must be a public HTTP(S) URL",
+      );
+      expect(String(caught)).not.toContain("super-secret");
+      expect(String(caught)).not.toContain("172.16.4.2");
+    }
+
+    repository.completeSource(
+      run.id,
+      sourceWithNoncanonicalUrl,
+      "deterministic",
+      [{
+        ...event,
+        registrationUrl:
+          "HTTPS://Careers.IEEE.ORG:443/register/global-fair/?session=student&gclid=secret#private",
+      }],
+      startedAt + 20,
+    );
+    repository.finishRun(run.id, startedAt + 30);
+
+    expect(repository.getDashboard({ sourceCount: 1, now: startedAt }).events).toEqual([
+      expect.objectContaining({
+        registrationUrl: "https://careers.ieee.org/register/global-fair?session=student",
+        sourceUrls: ["https://careers.ieee.org/career-fair"],
+      }),
+    ]);
+
+    for (const legacyRegistrationUrl of [
+      "https://registrant:legacy-secret@careers.ieee.org/register/global-fair",
+      "http://127.0.0.1/register/global-fair",
+    ]) {
+      db.query("UPDATE recruiting_events SET registration_url = ?").run(legacyRegistrationUrl);
+      const projected = repository.getDashboard({ sourceCount: 1, now: startedAt });
+      expect(projected.events).toEqual([]);
+      expect(JSON.stringify(projected)).not.toContain("legacy-secret");
+      expect(JSON.stringify(projected)).not.toContain("127.0.0.1");
+    }
+
+    db.query("UPDATE recruiting_events SET registration_url = ?").run(
+      "https://careers.ieee.org/register/global-fair",
+    );
+    db.query("UPDATE recruiting_event_sources SET source_url = ?").run(
+      "http://[::1]/private-source",
+    );
+    expect(repository.getDashboard({ sourceCount: 1, now: startedAt }).events).toEqual([
+      expect.objectContaining({ sourceUrls: [] }),
+    ]);
 
     db.close();
   });

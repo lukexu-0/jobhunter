@@ -307,10 +307,11 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
     execute: (): string => {
       budget.begin("read_working_tex", {});
       assertActive(attempt.signal);
+      const output = workingTex;
+      budget.finish(output);
       if (applied) appliedRead = true;
       else baselineRead = true;
-      budget.finish(workingTex);
-      return workingTex;
+      return output;
     },
   });
 
@@ -339,15 +340,15 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
       const preview = await attempt.input.operations.renderPlan(plan, toolSignal);
       assertActive(toolSignal);
       if (Buffer.byteLength(preview) > 256 * 1024) throw new Error("tailored TeX exceeds 256 KiB");
-      workingTex = preview;
-      applied = { plan, preview };
-      appliedRead = false;
       const result = {
         ok: true as const,
         bytes: Buffer.byteLength(preview),
         sha256: createHash("sha256").update(preview).digest("hex"),
       };
       budget.finish(result);
+      workingTex = preview;
+      applied = { plan, preview };
+      appliedRead = false;
       return result;
     },
   });
@@ -382,7 +383,14 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
     resetToolChoice: false,
   });
   const runner = createAttemptRunner(attempt.attemptSessionId, attempt.runtime);
-  await runWithDeadline(runner, agent, input, 5, attempt.signal, TAILORING_DEADLINE_MS);
+  await runWithDeadline(
+    runner,
+    agent,
+    input,
+    MAX_TAILORING_TOOL_CALLS + 1,
+    attempt.signal,
+    TAILORING_DEADLINE_MS,
+  );
   submission.requireExactlyOne();
   if (!applied) throw new Error("tailoring agent completed without applied analysis edits");
   return TailoringResultSchema.parse({

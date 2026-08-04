@@ -114,7 +114,7 @@ export interface PipelineApplicationServices {
   readonly discovery?: DiscoveryService;
   readonly auth: ClosableAuthRouteService;
   readonly applicationSessions: PipelineApplicationSessionService;
-  readonly recruitingEvents: PipelineRecruitingEventService;
+  readonly recruitingEvents?: PipelineRecruitingEventService;
 }
 
 export interface PipelineApplication {
@@ -122,6 +122,12 @@ export interface PipelineApplication {
   kick(): void;
   close(): Promise<void>;
   readonly services: Readonly<PipelineApplicationServices>;
+}
+
+export interface PipelineApplicationWithRecruitingEvents extends PipelineApplication {
+  readonly services: Readonly<PipelineApplicationServices & {
+    readonly recruitingEvents: PipelineRecruitingEventService;
+  }>;
 }
 
 async function closeAll(operations: readonly (() => void | Promise<void>)[]): Promise<void> {
@@ -137,6 +143,16 @@ async function closeAll(operations: readonly (() => void | Promise<void>)[]): Pr
   if (errors.length > 1) throw new AggregateError(errors, "Pipeline application close failed");
 }
 
+export function createPipelineApplication(
+  options: PipelineApplicationOptions & (
+    | { readonly pipelineDatabase: Database }
+    | { readonly recruitingEvents: PipelineRecruitingEventService }
+  ),
+): PipelineApplicationWithRecruitingEvents;
+export function createPipelineApplication(
+  options?: PipelineApplicationOptions & { readonly repository?: never },
+): PipelineApplicationWithRecruitingEvents;
+export function createPipelineApplication(options: PipelineApplicationOptions): PipelineApplication;
 export function createPipelineApplication(options: PipelineApplicationOptions = {}): PipelineApplication {
   const webOrigin = options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN;
   createIndeedCallbackUri(webOrigin);
@@ -213,12 +229,14 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     );
   const auth = options.auth ?? defaultAuthService;
   auth.configureAuthCallbackOrigin?.(webOrigin);
-  if (!pipelineDatabase && !options.recruitingEvents) {
-    throw new Error("A pipeline database or recruiting event service is required");
-  }
-  const recruitingEvents = options.recruitingEvents ?? new RecruitingEventService({
-    repository: new RecruitingEventRepository(pipelineDatabase!),
-  });
+  const recruitingEvents = options.recruitingEvents
+    ?? (
+      pipelineDatabase === undefined
+        ? undefined
+        : new RecruitingEventService({
+            repository: new RecruitingEventRepository(pipelineDatabase),
+          })
+    );
   const applicationAgent = options.applicationAgent
     ?? (browserHarnessToken === undefined
       ? undefined
@@ -243,7 +261,9 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeContext = createContextRoutes(context);
   const routeRuns = createRunRoutes(runs);
   const routeDiscovery = discovery === undefined ? undefined : createDiscoveryRoutes(discovery);
-  const routeRecruitingEvents = createRecruitingEventRoutes(recruitingEvents);
+  const routeRecruitingEvents = recruitingEvents === undefined
+    ? undefined
+    : createRecruitingEventRoutes(recruitingEvents);
   const routeApplicationSessions = createApplicationSessionRoutes(applicationSessions);
   const fetch = createApiHandler({
     internalRoute: routeApplicationAgent,
@@ -251,7 +271,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     route: async (request, url) =>
       (await routeAuth(request, url))
       ?? (await routeContext(request, url))
-      ?? (await routeRecruitingEvents(request, url))
+      ?? (await routeRecruitingEvents?.(request, url))
       ?? (await routeApplicationSessions(request, url))
       ?? (await routeDiscovery?.(request, url))
       ?? (await routeRuns(request, url)),
@@ -268,7 +288,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     ...(discovery === undefined ? {} : { discovery }),
     auth,
     applicationSessions,
-    recruitingEvents,
+    ...(recruitingEvents === undefined ? {} : { recruitingEvents }),
   });
   let closePromise: Promise<void> | undefined;
 
@@ -277,9 +297,10 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     kick: () => worker.kick(),
     close: () => {
       closePromise ??= closeAll([
+        ...(discovery ? [() => discovery.close()] : []),
         () => worker.close(),
         () => applicationSessions.dispose?.(),
-        () => recruitingEvents.close(),
+        ...(recruitingEvents ? [() => recruitingEvents.close()] : []),
         () => closeAuth(),
         () => context.close?.(),
         ...(pipelineDatabase ? [() => pipelineDatabase.close()] : []),

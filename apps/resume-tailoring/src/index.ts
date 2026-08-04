@@ -59,21 +59,30 @@ export async function main(): Promise<void> {
     browserHarnessToken === undefined ? {} : { browserHarnessToken },
   );
   const server = startPipelineHttpServer(app, { port });
-  app.services.recruitingEvents.start();
-  app.kick();
-  console.log(`Resume pipeline listening on http://${hostname}:${port}`);
-
-  let stopPromise: Promise<void> | undefined;
-  const stop = (signal: NodeJS.Signals): Promise<void> => {
-    stopPromise ??= (async () => {
-      console.log(`Stopping resume pipeline after ${signal}`);
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    closePromise ??= (async () => {
       try {
         await server.stop();
       } finally {
         await app.close();
       }
     })();
-    return stopPromise;
+    return closePromise;
+  };
+
+  try {
+    app.services.recruitingEvents.start();
+    app.kick();
+  } catch (startupError) {
+    await close().catch(() => undefined);
+    throw startupError;
+  }
+  console.log(`Resume pipeline listening on http://${hostname}:${port}`);
+
+  const stop = (signal: NodeJS.Signals): Promise<void> => {
+    console.log(`Stopping resume pipeline after ${signal}`);
+    return close();
   };
 
   process.once("SIGINT", () => void stop("SIGINT"));

@@ -311,6 +311,7 @@ function versionSeventeenDiscoveryDatabase(): Database {
     CREATE TABLE runs (
       id TEXT PRIMARY KEY
     ) STRICT;
+    INSERT INTO runs(id) VALUES ('legacy-job');
     CREATE TABLE discovery_jobs (
       id TEXT PRIMARY KEY
     ) STRICT;
@@ -362,6 +363,161 @@ function versionSeventeenDiscoveryDatabase(): Database {
     VALUES ('existing-source', 'existing-item', 'existing-job');
     INSERT INTO schema_migrations(version, applied_at) VALUES (17, 1700);
     PRAGMA user_version = 17;
+  `);
+  return db;
+}
+
+function versionEighteenDiscoveryDatabase(): Database {
+  const db = versionSeventeenDiscoveryDatabase();
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec(`
+    CREATE TABLE discovery_sources_v18 (
+      id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
+      name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),
+      kind TEXT NOT NULL CHECK (
+        kind IN (
+          'simplify','zapply','speedyapply','linkedin','indeed','greenhouse','lever','ashby',
+          'smartrecruiters','workable','recruitee','personio','workday','job_board'
+        )
+      ),
+      last_sync_at INTEGER,
+      last_success_at INTEGER,
+      last_sync_status TEXT CHECK (
+        last_sync_status IS NULL OR last_sync_status IN ('succeeded','failed')
+      ),
+      last_error TEXT,
+      provenance TEXT
+    ) STRICT;
+    INSERT INTO discovery_sources_v18(
+      id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+    )
+    SELECT id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+    FROM discovery_sources;
+    DROP TABLE discovery_sources;
+    ALTER TABLE discovery_sources_v18 RENAME TO discovery_sources;
+    INSERT INTO discovery_sources(
+      id, name, kind, last_sync_at, last_success_at, last_sync_status, provenance
+    ) VALUES (
+      'indeed-existing', 'Indeed existing', 'indeed', 1800, 1750, 'succeeded',
+      'indeed oauth fixture'
+    );
+    INSERT INTO discovery_observations(source_id, source_item_id, job_id)
+    VALUES ('indeed-existing', 'indeed-item', 'existing-job');
+    INSERT INTO schema_migrations(version, applied_at) VALUES (18, 1800);
+    PRAGMA user_version = 18;
+  `);
+  db.exec("PRAGMA foreign_keys = ON");
+  return db;
+}
+
+function versionSeventeenRecruitingEventDatabase(): Database {
+  const db = versionSixteenDatabase();
+  db.exec(`
+    CREATE TABLE recruiting_event_preferences (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      school TEXT,
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE recruiting_event_scrape_runs (
+      id TEXT PRIMARY KEY,
+      trigger TEXT NOT NULL CHECK (trigger IN ('startup','scheduled','manual')),
+      state TEXT NOT NULL CHECK (state IN ('running','completed','partial','failed')),
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      preferences_json TEXT NOT NULL CHECK (json_valid(preferences_json)),
+      source_count INTEGER NOT NULL CHECK (source_count >= 0),
+      succeeded_source_count INTEGER NOT NULL DEFAULT 0 CHECK (succeeded_source_count >= 0),
+      failed_source_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_source_count >= 0),
+      event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+      CHECK (
+        (state = 'running' AND completed_at IS NULL)
+        OR (state <> 'running' AND completed_at IS NOT NULL)
+      )
+    ) STRICT;
+    CREATE UNIQUE INDEX recruiting_event_one_running_scrape
+      ON recruiting_event_scrape_runs(state)
+      WHERE state = 'running';
+    CREATE INDEX recruiting_event_scrape_runs_started
+      ON recruiting_event_scrape_runs(started_at DESC);
+    CREATE TABLE recruiting_event_source_attempts (
+      run_id TEXT NOT NULL REFERENCES recruiting_event_scrape_runs(id) ON DELETE CASCADE,
+      source_id TEXT NOT NULL,
+      source_name TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('succeeded','failed')),
+      parser TEXT NOT NULL CHECK (parser IN ('deterministic','llm','none')),
+      event_count INTEGER NOT NULL CHECK (event_count >= 0),
+      issue_code TEXT,
+      issue_message TEXT,
+      completed_at INTEGER NOT NULL,
+      PRIMARY KEY (run_id, source_id),
+      CHECK (
+        (state = 'succeeded' AND issue_code IS NULL AND issue_message IS NULL)
+        OR (state = 'failed' AND parser = 'none' AND issue_code IS NOT NULL AND issue_message IS NOT NULL)
+      )
+    ) STRICT;
+    CREATE TABLE recruiting_events (
+      id TEXT PRIMARY KEY,
+      fingerprint TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL,
+      organizer TEXT NOT NULL,
+      start_at INTEGER NOT NULL,
+      end_at INTEGER,
+      timezone TEXT,
+      location TEXT,
+      attendance TEXT NOT NULL CHECK (attendance IN ('virtual','in_person','hybrid','unknown')),
+      registration_url TEXT NOT NULL,
+      description TEXT,
+      eligibility_summary TEXT,
+      matched_for_applicant INTEGER NOT NULL CHECK (matched_for_applicant IN (0,1)),
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      last_scrape_run_id TEXT NOT NULL REFERENCES recruiting_event_scrape_runs(id) ON DELETE RESTRICT
+    ) STRICT;
+    CREATE INDEX recruiting_events_upcoming
+      ON recruiting_events(start_at, title);
+    CREATE TABLE recruiting_event_sources (
+      event_id TEXT NOT NULL REFERENCES recruiting_events(id) ON DELETE CASCADE,
+      source_id TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      PRIMARY KEY (event_id, source_id)
+    ) STRICT;
+    INSERT INTO recruiting_event_preferences(id, school, updated_at)
+    VALUES (1, 'State University', 1100);
+    INSERT INTO recruiting_event_scrape_runs(
+      id, trigger, state, started_at, completed_at, preferences_json, source_count,
+      succeeded_source_count, failed_source_count, event_count
+    ) VALUES (
+      'scrape-17', 'manual', 'completed', 1200, 1300, '{"school":"State University"}',
+      1, 1, 0, 1
+    );
+    INSERT INTO recruiting_event_source_attempts(
+      run_id, source_id, source_name, source_url, state, parser, event_count,
+      issue_code, issue_message, completed_at
+    ) VALUES (
+      'scrape-17', 'source-17', 'Career fair source', 'https://events.example/source',
+      'succeeded', 'deterministic', 1, NULL, NULL, 1280
+    );
+    INSERT INTO recruiting_events(
+      id, fingerprint, title, organizer, start_at, end_at, timezone, location,
+      attendance, registration_url, description, eligibility_summary,
+      matched_for_applicant, first_seen_at, last_seen_at, last_scrape_run_id
+    ) VALUES (
+      'event-17', 'fingerprint-17', 'Engineering Career Fair', 'State University',
+      3000, 3600, 'America/New_York', 'Student Center', 'hybrid',
+      'https://events.example/register', 'Meet engineering employers.',
+      'Open to enrolled students', 1, 1250, 1280, 'scrape-17'
+    );
+    INSERT INTO recruiting_event_sources(
+      event_id, source_id, source_url, first_seen_at, last_seen_at
+    ) VALUES (
+      'event-17', 'source-17', 'https://events.example/source', 1250, 1280
+    );
+    INSERT INTO schema_migrations(version, applied_at) VALUES (17, 1700);
+    PRAGMA user_version = 17;
+    PRAGMA foreign_keys = ON;
   `);
   return db;
 }
@@ -956,6 +1112,309 @@ test("migration eighteen adds Indeed while preserving version seventeen sources 
   ).get("indeed-internships")).toEqual({ kind: "indeed" });
   expect(() => db.query(
     "INSERT INTO discovery_sources(id, name, kind) VALUES ('unknown', 'Unknown', 'unknown')",
+  ).run()).toThrow();
+});
+
+test("combined migrations preserve a populated recruiting-event version seventeen database", () => {
+  const db = versionSeventeenRecruitingEventDatabase();
+
+  migratePipelineDatabase(db, 2_000);
+
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version)
+    .toBe(PIPELINE_SCHEMA_VERSION);
+  expect(db.query<{ version: number; applied_at: number }, []>(
+    "SELECT version, applied_at FROM schema_migrations ORDER BY version",
+  ).all()).toEqual([
+    { version: 16, applied_at: 1_600 },
+    { version: 17, applied_at: 1_700 },
+    { version: 18, applied_at: 2_000 },
+    { version: 19, applied_at: 2_000 },
+    { version: 20, applied_at: 2_000 },
+  ]);
+  expect(db.query<{ id: number; school: string; updated_at: number }, []>(
+    "SELECT id, school, updated_at FROM recruiting_event_preferences",
+  ).all()).toEqual([{ id: 1, school: "State University", updated_at: 1_100 }]);
+  expect(db.query<{
+    id: string;
+    trigger: string;
+    state: string;
+    started_at: number;
+    completed_at: number;
+    preferences_json: string;
+    source_count: number;
+    succeeded_source_count: number;
+    failed_source_count: number;
+    event_count: number;
+  }, []>("SELECT * FROM recruiting_event_scrape_runs").all()).toEqual([{
+    id: "scrape-17",
+    trigger: "manual",
+    state: "completed",
+    started_at: 1_200,
+    completed_at: 1_300,
+    preferences_json: '{"school":"State University"}',
+    source_count: 1,
+    succeeded_source_count: 1,
+    failed_source_count: 0,
+    event_count: 1,
+  }]);
+  expect(db.query<{
+    run_id: string;
+    source_id: string;
+    source_name: string;
+    source_url: string;
+    state: string;
+    parser: string;
+    event_count: number;
+    issue_code: null;
+    issue_message: null;
+    completed_at: number;
+  }, []>("SELECT * FROM recruiting_event_source_attempts").all()).toEqual([{
+    run_id: "scrape-17",
+    source_id: "source-17",
+    source_name: "Career fair source",
+    source_url: "https://events.example/source",
+    state: "succeeded",
+    parser: "deterministic",
+    event_count: 1,
+    issue_code: null,
+    issue_message: null,
+    completed_at: 1_280,
+  }]);
+  expect(db.query<{
+    id: string;
+    fingerprint: string;
+    title: string;
+    organizer: string;
+    start_at: number;
+    end_at: number;
+    timezone: string;
+    location: string;
+    attendance: string;
+    registration_url: string;
+    description: string;
+    eligibility_summary: string;
+    matched_for_applicant: number;
+    first_seen_at: number;
+    last_seen_at: number;
+    last_scrape_run_id: string;
+  }, []>("SELECT * FROM recruiting_events").all()).toEqual([{
+    id: "event-17",
+    fingerprint: "fingerprint-17",
+    title: "Engineering Career Fair",
+    organizer: "State University",
+    start_at: 3_000,
+    end_at: 3_600,
+    timezone: "America/New_York",
+    location: "Student Center",
+    attendance: "hybrid",
+    registration_url: "https://events.example/register",
+    description: "Meet engineering employers.",
+    eligibility_summary: "Open to enrolled students",
+    matched_for_applicant: 1,
+    first_seen_at: 1_250,
+    last_seen_at: 1_280,
+    last_scrape_run_id: "scrape-17",
+  }]);
+  expect(db.query<{
+    event_id: string;
+    source_id: string;
+    source_url: string;
+    first_seen_at: number;
+    last_seen_at: number;
+  }, []>("SELECT * FROM recruiting_event_sources").all()).toEqual([{
+    event_id: "event-17",
+    source_id: "source-17",
+    source_url: "https://events.example/source",
+    first_seen_at: 1_250,
+    last_seen_at: 1_280,
+  }]);
+  expect(db.query<{ name: string }, []>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'index'
+      AND name IN (
+        'recruiting_event_one_running_scrape',
+        'recruiting_event_scrape_runs_started',
+        'recruiting_events_upcoming'
+      )
+    ORDER BY name
+  `).all().map(({ name }) => name)).toEqual([
+    "recruiting_event_one_running_scrape",
+    "recruiting_event_scrape_runs_started",
+    "recruiting_events_upcoming",
+  ]);
+  expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(() => db.query(
+    "DELETE FROM recruiting_event_scrape_runs WHERE id = 'scrape-17'",
+  ).run()).toThrow();
+
+  expect(db.query<{ name: string }, []>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'table'
+      AND name IN (
+        'discovery_jobs',
+        'discovery_sources',
+        'discovery_observations',
+        'discovery_dedupe_keys',
+        'discovery_run_links'
+      )
+    ORDER BY name
+  `).all().map(({ name }) => name)).toEqual([
+    "discovery_dedupe_keys",
+    "discovery_jobs",
+    "discovery_observations",
+    "discovery_run_links",
+    "discovery_sources",
+  ]);
+  expect(db.query<{ name: string }, []>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'index'
+      AND name IN (
+        'discovery_jobs_recency',
+        'discovery_jobs_role_recency',
+        'discovery_observations_job',
+        'discovery_dedupe_keys_key',
+        'discovery_dedupe_keys_job'
+      )
+    ORDER BY name
+  `).all().map(({ name }) => name)).toEqual([
+    "discovery_dedupe_keys_job",
+    "discovery_dedupe_keys_key",
+    "discovery_jobs_recency",
+    "discovery_jobs_role_recency",
+    "discovery_observations_job",
+  ]);
+  db.query("INSERT INTO discovery_sources(id, name, kind) VALUES (?, ?, ?)")
+    .run("indeed-after-events", "Indeed after events", "indeed");
+  expect(() => db.query(
+    "INSERT INTO discovery_sources(id, name, kind) VALUES ('unknown', 'Unknown', 'unknown')",
+  ).run()).toThrow();
+
+  expect(db.query<{ opportunity_kind: string }, []>(
+    "SELECT opportunity_kind FROM runs WHERE id = 'legacy-job'",
+  ).get()).toEqual({ opportunity_kind: "job" });
+  db.exec("INSERT INTO runs(id, opportunity_kind) VALUES ('event-run', 'event')");
+  expect(() => db.query(
+    "UPDATE runs SET opportunity_kind = 'grant' WHERE id = 'event-run'",
+  ).run()).toThrow();
+});
+
+test("combined migrations preserve a populated Indeed discovery version eighteen database", () => {
+  const db = versionEighteenDiscoveryDatabase();
+
+  migratePipelineDatabase(db, 2_000);
+
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version)
+    .toBe(PIPELINE_SCHEMA_VERSION);
+  expect(db.query<{ version: number; applied_at: number }, []>(
+    "SELECT version, applied_at FROM schema_migrations ORDER BY version",
+  ).all()).toEqual([
+    { version: 17, applied_at: 1_700 },
+    { version: 18, applied_at: 1_800 },
+    { version: 19, applied_at: 2_000 },
+    { version: 20, applied_at: 2_000 },
+  ]);
+  expect(db.query<{
+    id: string;
+    name: string;
+    kind: string;
+    last_sync_at: number;
+    last_success_at: number;
+    last_sync_status: string;
+    last_error: string | null;
+    provenance: string;
+  }, []>("SELECT * FROM discovery_sources ORDER BY id").all()).toEqual([
+    {
+      id: "existing-source",
+      name: "Existing source",
+      kind: "greenhouse",
+      last_sync_at: 1_000,
+      last_success_at: 900,
+      last_sync_status: "failed",
+      last_error: "bounded failure",
+      provenance: "existing provenance",
+    },
+    {
+      id: "indeed-existing",
+      name: "Indeed existing",
+      kind: "indeed",
+      last_sync_at: 1_800,
+      last_success_at: 1_750,
+      last_sync_status: "succeeded",
+      last_error: null,
+      provenance: "indeed oauth fixture",
+    },
+  ]);
+  expect(db.query<{ source_id: string; source_item_id: string; job_id: string }, []>(
+    "SELECT source_id, source_item_id, job_id FROM discovery_observations ORDER BY source_id",
+  ).all()).toEqual([
+    {
+      source_id: "existing-source",
+      source_item_id: "existing-item",
+      job_id: "existing-job",
+    },
+    {
+      source_id: "indeed-existing",
+      source_item_id: "indeed-item",
+      job_id: "existing-job",
+    },
+  ]);
+  expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(() => db.query(
+    "DELETE FROM discovery_sources WHERE id = 'indeed-existing'",
+  ).run()).toThrow();
+  db.query("INSERT INTO discovery_sources(id, name, kind) VALUES (?, ?, ?)")
+    .run("indeed-after-v18", "Indeed after v18", "indeed");
+  expect(() => db.query(
+    "INSERT INTO discovery_sources(id, name, kind) VALUES ('unknown', 'Unknown', 'unknown')",
+  ).run()).toThrow();
+
+  expect(db.query<{ name: string }, []>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'table'
+      AND name IN (
+        'recruiting_event_preferences',
+        'recruiting_event_scrape_runs',
+        'recruiting_event_source_attempts',
+        'recruiting_events',
+        'recruiting_event_sources'
+      )
+    ORDER BY name
+  `).all().map(({ name }) => name)).toEqual([
+    "recruiting_event_preferences",
+    "recruiting_event_scrape_runs",
+    "recruiting_event_source_attempts",
+    "recruiting_event_sources",
+    "recruiting_events",
+  ]);
+  expect(db.query<{ id: number; school: null; updated_at: number }, []>(
+    "SELECT id, school, updated_at FROM recruiting_event_preferences",
+  ).all()).toEqual([{ id: 1, school: null, updated_at: 0 }]);
+  expect(db.query<{ name: string }, []>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'index'
+      AND name IN (
+        'recruiting_event_one_running_scrape',
+        'recruiting_event_scrape_runs_started',
+        'recruiting_events_upcoming'
+      )
+    ORDER BY name
+  `).all().map(({ name }) => name)).toEqual([
+    "recruiting_event_one_running_scrape",
+    "recruiting_event_scrape_runs_started",
+    "recruiting_events_upcoming",
+  ]);
+
+  expect(db.query<{ opportunity_kind: string }, []>(
+    "SELECT opportunity_kind FROM runs WHERE id = 'legacy-job'",
+  ).get()).toEqual({ opportunity_kind: "job" });
+  db.exec("INSERT INTO runs(id, opportunity_kind) VALUES ('competition-run', 'competition')");
+  expect(() => db.query(
+    "UPDATE runs SET opportunity_kind = 'grant' WHERE id = 'competition-run'",
   ).run()).toThrow();
 });
 

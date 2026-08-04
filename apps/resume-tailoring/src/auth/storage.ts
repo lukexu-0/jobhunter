@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
-import { access, chmod, mkdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
   AuthStorage,
@@ -51,7 +52,7 @@ export interface AuthStorageLike {
   logout(provider: string): Promise<void>;
 }
 
-type StorageFactory = (dbPath: string) => Promise<AuthStorageLike>;
+type StorageFactory = (dbPath: string, needsInitialization?: boolean) => Promise<AuthStorageLike>;
 
 const AUTH_TABLE = "auth_credentials";
 const CHILD_AUTH_TABLES = [
@@ -59,15 +60,225 @@ const CHILD_AUTH_TABLES = [
   "auth_credential_refresh_leases",
 ] as const;
 
-export async function purgeUnsupportedCredentials(dbPath: string): Promise<void> {
+const STORAGE_DIRECTORY_ERROR = "OAuth storage directory must be a private regular directory";
+const STORAGE_DATABASE_ERROR = "OAuth storage database must be a regular file";
+const SQLITE_COMPANION_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
+
+function directoryComponents(directory: string): string[] {
+  const components: string[] = [];
+  for (let current = directory; dirname(current) !== current; current = dirname(current)) {
+    components.push(current);
+  }
+  return components.reverse();
+}
+
+async function validateDirectoryTree(directory: string, create: boolean): Promise<boolean> {
+  if (dirname(directory) === directory) {
+    throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+  }
+  for (const component of directoryComponents(directory)) {
+    let stats;
+    try {
+      stats = await lstat(component);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+      }
+      if (!create) return false;
+      try {
+        await mkdir(component, { mode: 0o700 });
+      } catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+        }
+      }
+      try {
+        stats = await lstat(component);
+      } catch {
+        throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+      }
+    }
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+    }
+  }
+  return true;
+}
+
+async function securePrivateDirectory(directory: string): Promise<void> {
+  let stats;
   try {
-    await access(dbPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
+    stats = await lstat(directory);
+  } catch {
+    throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+  }
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
   }
 
-  const db = new Database(dbPath, { create: false, readwrite: true });
+  let handle;
+  try {
+    handle = await open(
+      directory,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+  }
+  try {
+    const openedStats = await handle.stat();
+    if (!openedStats.isDirectory()) {
+      throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+    }
+    await handle.chmod(0o700);
+  } catch (error) {
+    if (error instanceof AuthConfigurationError) throw error;
+    throw new AuthConfigurationError(STORAGE_DIRECTORY_ERROR);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function validateDatabaseEntry(databasePath: string): Promise<boolean> {
+  let stats;
+  try {
+    stats = await lstat(databasePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+  }
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+  }
+
+  let handle;
+  try {
+    handle = await open(
+      databasePath,
+      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+  }
+  try {
+    if (!(await handle.stat()).isFile()) {
+      throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+    }
+  } finally {
+    await handle.close();
+  }
+  return true;
+}
+
+async function validateSqliteCompanionEntries(databasePath: string): Promise<void> {
+  for (const suffix of SQLITE_COMPANION_SUFFIXES) {
+    await validateDatabaseEntry(`${databasePath}${suffix}`);
+  }
+}
+
+async function secureExistingDatabaseEntry(databasePath: string): Promise<void> {
+  if (!await validateDatabaseEntry(databasePath)) return;
+  let handle;
+  try {
+    handle = await open(
+      databasePath,
+      constants.O_RDWR | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+  }
+  try {
+    if (!(await handle.stat()).isFile()) {
+      throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+    }
+    await handle.chmod(0o600);
+  } catch (error) {
+    if (error instanceof AuthConfigurationError) throw error;
+    throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+  } finally {
+    await handle.close();
+  }
+  await validateDatabaseEntry(databasePath);
+}
+
+async function secureSqliteCompanionEntries(databasePath: string): Promise<void> {
+  for (const suffix of SQLITE_COMPANION_SUFFIXES) {
+    await secureExistingDatabaseEntry(`${databasePath}${suffix}`);
+  }
+}
+
+async function secureDatabaseEntry(databasePath: string): Promise<boolean> {
+  const existed = await validateDatabaseEntry(databasePath);
+  let handle;
+  try {
+    handle = await open(
+      databasePath,
+      constants.O_RDWR
+        | constants.O_NONBLOCK
+        | constants.O_NOFOLLOW
+        | (existed ? 0 : constants.O_CREAT | constants.O_EXCL),
+      0o600,
+    );
+  } catch {
+    throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+  }
+  let needsInitialization = !existed;
+  try {
+    const openedStats = await handle.stat();
+    if (!openedStats.isFile()) {
+      throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+    }
+    needsInitialization ||= openedStats.size === 0;
+    await handle.chmod(0o600);
+  } catch (error) {
+    if (error instanceof AuthConfigurationError) throw error;
+    throw new AuthConfigurationError(STORAGE_DATABASE_ERROR);
+  } finally {
+    await handle.close();
+  }
+  await validateDatabaseEntry(databasePath);
+  return needsInitialization;
+}
+
+async function prepareAuthDatabasePath(dbPath: string): Promise<{
+  databasePath: string;
+  needsInitialization: boolean;
+}> {
+  const databasePath = resolve(dbPath);
+  const oauthDirectory = dirname(databasePath);
+  await validateDirectoryTree(oauthDirectory, true);
+  await validateDatabaseEntry(databasePath);
+  await validateSqliteCompanionEntries(databasePath);
+  await securePrivateDirectory(oauthDirectory);
+  await validateDirectoryTree(oauthDirectory, false);
+  const needsInitialization = await secureDatabaseEntry(databasePath);
+  await secureSqliteCompanionEntries(databasePath);
+  await validateDirectoryTree(oauthDirectory, false);
+  await validateDatabaseEntry(databasePath);
+  await validateSqliteCompanionEntries(databasePath);
+  return { databasePath, needsInitialization };
+}
+
+async function existingAuthDatabasePath(dbPath: string): Promise<string | undefined> {
+  const databasePath = resolve(dbPath);
+  const oauthDirectory = dirname(databasePath);
+  if (!await validateDirectoryTree(oauthDirectory, false)) return undefined;
+  if (!await validateDatabaseEntry(databasePath)) return undefined;
+  await validateSqliteCompanionEntries(databasePath);
+  await securePrivateDirectory(oauthDirectory);
+  await secureExistingDatabaseEntry(databasePath);
+  await secureSqliteCompanionEntries(databasePath);
+  await validateDirectoryTree(oauthDirectory, false);
+  await validateDatabaseEntry(databasePath);
+  await validateSqliteCompanionEntries(databasePath);
+  return databasePath;
+}
+
+export async function purgeUnsupportedCredentials(dbPath: string): Promise<void> {
+  const databasePath = await existingAuthDatabasePath(dbPath);
+  if (!databasePath) return;
+
+  const db = new Database(databasePath, { create: false, readwrite: true });
   try {
     db.exec("PRAGMA busy_timeout = 5000; PRAGMA secure_delete = ON;");
     const tableRows = db.query<{ name: string }, []>(
@@ -139,8 +350,8 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
   }
 }
 
-const defaultStorageFactory: StorageFactory = async (path) => {
-  await purgeUnsupportedCredentials(path);
+const defaultStorageFactory: StorageFactory = async (path, needsInitialization = false) => {
+  if (!needsInitialization) await purgeUnsupportedCredentials(path);
   return AuthStorage.create(path);
 };
 
@@ -205,17 +416,12 @@ export function assertProviderOAuthConnected(storage: AuthStorageLike, provider:
 }
 
 async function createStorage(): Promise<AuthStorageLike> {
-  const databasePath = process.env.JOBHUNTER_AUTH_DATABASE ?? authDatabasePath;
-  const oauthDirectory = dirname(databasePath);
-  await mkdir(oauthDirectory, { recursive: true, mode: 0o700 });
-  await chmod(oauthDirectory, 0o700);
-  const storage = await factory(databasePath);
+  const configuredPath = process.env.JOBHUNTER_AUTH_DATABASE ?? authDatabasePath;
+  const { databasePath, needsInitialization } = await prepareAuthDatabasePath(configuredPath);
+  const storage = await factory(databasePath, needsInitialization);
   try {
     await storage.reload();
     assertOAuthOnlyStorage(storage);
-    await chmod(databasePath, 0o600).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
     return storage;
   } catch (error) {
     storage.close();

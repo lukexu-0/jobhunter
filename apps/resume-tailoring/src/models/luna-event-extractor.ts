@@ -11,7 +11,10 @@ import { getBundledModel, resolveWireModelId, type Effort } from "@oh-my-pi/pi-c
 import { z } from "zod";
 import { OAuthRequiredError, createOAuthOnlyApiKeyResolver } from "../auth/oauth-only-resolver";
 import type { RecruitingEventExtractionContext } from "../events/parser.ts";
-import type { RecruitingEventCandidate } from "../events/repository.ts";
+import {
+  canonicalizeRecruitingEventUrl,
+  type RecruitingEventCandidate,
+} from "../events/repository.ts";
 import {
   LUNA_EXTRACTION_DEADLINE_MS,
   LUNA_MAX_RESPONSE_BYTES,
@@ -29,7 +32,7 @@ const LunaEventSchema = z.object({
   timezone: NullableText(100),
   location: NullableText(300),
   attendance: z.enum(["virtual", "in_person", "hybrid", "unknown"]),
-  registrationUrl: z.string().url().max(2_048),
+  registrationUrl: z.string().trim().min(1).max(2_048),
   description: NullableText(4_000),
   eligibilitySummary: NullableText(1_000),
   matchedForApplicant: z.boolean(),
@@ -141,7 +144,7 @@ function parseResponse(message: AssistantMessage): RecruitingEventCandidate[] {
     ...(event.timezone === null ? {} : { timezone: event.timezone }),
     ...(event.location === null ? {} : { location: event.location }),
     attendance: event.attendance,
-    registrationUrl: event.registrationUrl,
+    registrationUrl: canonicalizeRecruitingEventUrl(event.registrationUrl),
     ...(event.description === null ? {} : { description: event.description }),
     ...(event.eligibilitySummary === null
       ? {}
@@ -158,6 +161,7 @@ export async function extractRecruitingEventsWithLuna(
 ): Promise<readonly RecruitingEventCandidate[]> {
   assertBoundedSource(lines);
   signal?.throwIfAborted();
+  const sourceUrl = canonicalizeRecruitingEventUrl(extractionContext.sourceUrl);
 
   const combinedController = new AbortController();
   let timedOut = false;
@@ -197,7 +201,7 @@ export async function extractRecruitingEventsWithLuna(
         role: "user",
         content: JSON.stringify({
           preferences: { school: extractionContext.school },
-          sourceUrl: extractionContext.sourceUrl,
+          sourceUrl,
           currentTime: new Date(extractionContext.now).toISOString(),
           sourceLines: lines.map((text, index) => [index + 1, text]),
         }),

@@ -37,6 +37,48 @@ describe("SafePublicHttpClient", () => {
     })).not.toThrow();
   });
 
+  test("rejects invalid per-request body limits without consuming the shared budget", async () => {
+    let resolutions = 0;
+    let requests = 0;
+    const client = new SafePublicHttpClient({
+      budget: new DiscoveryHttpBudget({ maxRequests: 1, maxBytes: 4 }),
+      maxBodyBytes: 4,
+      fetchImpl: async () => {
+        requests += 1;
+        return new Response("1234", { headers: { "content-type": "text/plain" } });
+      },
+      resolveHost: async () => {
+        resolutions += 1;
+        return [{ address: PUBLIC_ADDRESS, family: 4 }];
+      },
+    });
+    const invalidOverrides = [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      1.5,
+      0,
+      -1,
+      Number.MAX_SAFE_INTEGER + 1,
+      Number.MIN_SAFE_INTEGER - 1,
+    ];
+
+    for (const maxBodyBytes of invalidOverrides) {
+      await expect(client.get("https://board.example/invalid", { maxBodyBytes })).rejects.toMatchObject({
+        code: "REQUEST_FAILED",
+        message: "Discovery source could not be loaded",
+      });
+    }
+    expect(resolutions).toBe(0);
+    expect(requests).toBe(0);
+
+    await expect(client.get("https://board.example/valid", { maxBodyBytes: 8 })).resolves.toMatchObject({
+      status: 200,
+    });
+    expect(resolutions).toBe(1);
+    expect(requests).toBe(1);
+  });
+
   test("pins each redirect hop to a freshly validated public address", async () => {
     const resolved: string[] = [];
     const requests: Array<{ url: string; host: string | null }> = [];

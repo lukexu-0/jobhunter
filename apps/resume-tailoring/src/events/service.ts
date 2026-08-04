@@ -102,6 +102,13 @@ export class RecruitingEventService implements RecruitingEventRouteService {
   constructor(options: RecruitingEventServiceOptions) {
     this.#repository = options.repository;
     this.#sources = options.sources ?? RECRUITING_EVENT_SOURCES;
+    const sourceIds = new Set<string>();
+    for (const source of this.#sources) {
+      if (sourceIds.has(source.id)) {
+        throw new Error(`Recruiting event source ID is duplicated: ${source.id}`);
+      }
+      sourceIds.add(source.id);
+    }
     this.#loadSource = options.loadSource ?? loadRecruitingEventSourceFromUrl;
     this.#parseSource = options.parseSource ?? parseRecruitingEventSource;
     this.#extractWithModel = options.extractWithModel ?? extractRecruitingEventsWithLuna;
@@ -122,9 +129,13 @@ export class RecruitingEventService implements RecruitingEventRouteService {
     return this.#repository.setPreferences(preferences, this.#now());
   }
 
-  #startRun(trigger: RecruitingEventScrapeTrigger): RecruitingEventScrapeRun {
+  #startRun(
+    trigger: RecruitingEventScrapeTrigger,
+    recoverInterrupted = true,
+  ): RecruitingEventScrapeRun {
     if (this.#closed) throw new Error("Recruiting event service is closed");
     if (this.#active) throw new RecruitingEventScrapeConflictError();
+    if (recoverInterrupted) this.#repository.recoverInterruptedRun(this.#now());
     let run: RecruitingEventScrapeRun;
     try {
       run = this.#repository.startRun({
@@ -158,19 +169,21 @@ export class RecruitingEventService implements RecruitingEventRouteService {
 
   runIfDue(trigger: "startup" | "scheduled"): RecruitingEventScrapeRun | null {
     if (this.#closed || this.#active) return null;
+    const now = this.#now();
+    this.#repository.recoverInterruptedRun(now);
     const latest = this.#repository.latestRun();
     if (latest?.state === "running") return null;
-    if (latest && this.#now() < latest.startedAt + RECRUITING_EVENT_CADENCE_MS) return null;
-    return this.#startRun(trigger);
+    if (latest && now < latest.startedAt + RECRUITING_EVENT_CADENCE_MS) return null;
+    return this.#startRun(trigger, false);
   }
 
   recoverInterruptedRun(): RecruitingEventScrapeRun | null {
+    if (this.#active) return null;
     return this.#repository.recoverInterruptedRun(this.#now());
   }
 
   start(): void {
     if (this.#closed || this.#timer) return;
-    this.recoverInterruptedRun();
     this.runIfDue("startup");
     this.#timer = setInterval(() => {
       try {
@@ -191,21 +204,15 @@ export class RecruitingEventService implements RecruitingEventRouteService {
     const processNext = async (): Promise<void> => {
       while (nextSource < this.#sources.length) {
         const source = this.#sources[nextSource++]!;
+        let parsed: RecruitingEventParseResult;
         try {
           const loaded = await this.#loadSource(source.url, signal);
-          const parsed = await this.#parseSource(loaded, {
+          parsed = await this.#parseSource(loaded, {
             preferences,
             now: this.#now(),
             extractWithModel: this.#extractWithModel,
             signal,
           });
-          this.#repository.completeSource(
-            runId,
-            source,
-            parsed.parser,
-            parsed.candidates,
-            this.#now(),
-          );
         } catch (error) {
           const issue = publicIssue(error);
           this.#repository.failSource(
@@ -215,14 +222,25 @@ export class RecruitingEventService implements RecruitingEventRouteService {
             issue.message,
             this.#now(),
           );
+          continue;
         }
+        this.#repository.completeSource(
+          runId,
+          source,
+          parsed.parser,
+          parsed.candidates,
+          this.#now(),
+        );
       }
     };
     const workers = Array.from(
       { length: Math.min(SOURCE_CONCURRENCY, this.#sources.length) },
       () => processNext(),
     );
-    await Promise.all(workers);
+    const results = await Promise.allSettled(workers);
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
     this.#repository.finishRun(runId, this.#now());
   }
 

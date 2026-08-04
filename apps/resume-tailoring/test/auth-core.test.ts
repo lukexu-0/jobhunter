@@ -1,5 +1,14 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -17,6 +26,8 @@ import { AuthService, scrubProviderEnvironment } from "../src/auth/service";
 import {
   assertOAuthOnlyStorage,
   AuthConfigurationError,
+  closeAuthStorage,
+  getAuthStorage,
   purgeUnsupportedCredentials,
   type AuthStorageLike,
 } from "../src/auth/storage";
@@ -122,6 +133,18 @@ const ids = {
   first: "AAAAAAAAAAAAAAAAAAAAAA",
   second: "BBBBBBBBBBBBBBBBBBBBBB",
 };
+
+function createPurgeableTarget(databasePath: string, provider: string): Buffer {
+  const db = new Database(databasePath);
+  try {
+    db.exec("CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL)");
+    db.query("INSERT INTO auth_credentials(id, provider) VALUES (1, ?)").run(provider);
+  } finally {
+    db.close();
+  }
+  chmodSync(databasePath, 0o640);
+  return readFileSync(databasePath);
+}
 
 describe("app-owned OAuth storage and sessions", () => {
   test("rejects static, unsupported, and duplicate stored credentials", () => {
@@ -396,6 +419,148 @@ describe("OAuth-only resolver", () => {
     expect(await resolver({ error: new Error("401"), lastChance: true })).toBeUndefined();
     expect(storage.accessOptions.map((options) => options.forceRefresh)).toEqual([false, true]);
   });
+});
+
+test("rejects a final auth database symlink without mutating its target", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "jobhunter-auth-final-link-"));
+  const oauthDirectory = join(directory, "oauth");
+  const targetPath = join(directory, "target.sqlite");
+  const databasePath = join(oauthDirectory, "auth.sqlite");
+  const priorDatabasePath = process.env.JOBHUNTER_AUTH_DATABASE;
+  mkdirSync(oauthDirectory, { mode: 0o750 });
+  chmodSync(oauthDirectory, 0o750);
+  const targetBytes = createPurgeableTarget(targetPath, "unsupported-final-link-target");
+  symlinkSync(targetPath, databasePath);
+  const oauthDirectoryMode = statSync(oauthDirectory).mode & 0o777;
+  const targetMode = statSync(targetPath).mode & 0o777;
+
+  try {
+    await expect(purgeUnsupportedCredentials(databasePath)).rejects.toThrow(
+      "OAuth storage database must be a regular file",
+    );
+    expect(Buffer.compare(readFileSync(targetPath), targetBytes)).toBe(0);
+    expect(statSync(targetPath).mode & 0o777).toBe(targetMode);
+    expect(statSync(oauthDirectory).mode & 0o777).toBe(oauthDirectoryMode);
+
+    process.env.JOBHUNTER_AUTH_DATABASE = databasePath;
+    await expect(getAuthStorage()).rejects.toThrow(
+      "OAuth storage database must be a regular file",
+    );
+    expect(Buffer.compare(readFileSync(targetPath), targetBytes)).toBe(0);
+    expect(statSync(targetPath).mode & 0o777).toBe(targetMode);
+    expect(statSync(oauthDirectory).mode & 0o777).toBe(oauthDirectoryMode);
+  } finally {
+    await closeAuthStorage();
+    if (priorDatabasePath === undefined) delete process.env.JOBHUNTER_AUTH_DATABASE;
+    else process.env.JOBHUNTER_AUTH_DATABASE = priorDatabasePath;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects a parent auth directory symlink without mutating its target", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "jobhunter-auth-parent-link-"));
+  const targetDirectory = join(directory, "target");
+  const linkedDirectory = join(directory, "oauth");
+  const targetPath = join(targetDirectory, "auth.sqlite");
+  const databasePath = join(linkedDirectory, "auth.sqlite");
+  const priorDatabasePath = process.env.JOBHUNTER_AUTH_DATABASE;
+  mkdirSync(targetDirectory, { mode: 0o750 });
+  chmodSync(targetDirectory, 0o750);
+  const targetBytes = createPurgeableTarget(targetPath, "unsupported-parent-link-target");
+  symlinkSync(targetDirectory, linkedDirectory);
+  const targetDirectoryMode = statSync(targetDirectory).mode & 0o777;
+  const targetMode = statSync(targetPath).mode & 0o777;
+
+  try {
+    await expect(purgeUnsupportedCredentials(databasePath)).rejects.toThrow(
+      "OAuth storage directory must be a private regular directory",
+    );
+    expect(Buffer.compare(readFileSync(targetPath), targetBytes)).toBe(0);
+    expect(statSync(targetDirectory).mode & 0o777).toBe(targetDirectoryMode);
+    expect(statSync(targetPath).mode & 0o777).toBe(targetMode);
+
+    process.env.JOBHUNTER_AUTH_DATABASE = databasePath;
+    await expect(getAuthStorage()).rejects.toThrow(
+      "OAuth storage directory must be a private regular directory",
+    );
+    expect(Buffer.compare(readFileSync(targetPath), targetBytes)).toBe(0);
+    expect(statSync(targetDirectory).mode & 0o777).toBe(targetDirectoryMode);
+    expect(statSync(targetPath).mode & 0o777).toBe(targetMode);
+  } finally {
+    await closeAuthStorage();
+    if (priorDatabasePath === undefined) delete process.env.JOBHUNTER_AUTH_DATABASE;
+    else process.env.JOBHUNTER_AUTH_DATABASE = priorDatabasePath;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects a symbolic-link SQLite companion without mutating either target", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "jobhunter-auth-companion-link-"));
+  const oauthDirectory = join(directory, "oauth");
+  const databasePath = join(oauthDirectory, "auth.sqlite");
+  const companionTarget = join(directory, "target.wal");
+  const priorDatabasePath = process.env.JOBHUNTER_AUTH_DATABASE;
+  mkdirSync(oauthDirectory, { mode: 0o750 });
+  chmodSync(oauthDirectory, 0o750);
+  const databaseBytes = createPurgeableTarget(databasePath, "unsupported-companion-link-target");
+  const companionBytes = createPurgeableTarget(companionTarget, "unsupported-wal-link-target");
+  symlinkSync(companionTarget, `${databasePath}-wal`);
+  const directoryMode = statSync(oauthDirectory).mode & 0o777;
+  const databaseMode = statSync(databasePath).mode & 0o777;
+  const companionMode = statSync(companionTarget).mode & 0o777;
+
+  try {
+    await expect(purgeUnsupportedCredentials(databasePath)).rejects.toThrow(
+      "OAuth storage database must be a regular file",
+    );
+    expect(Buffer.compare(readFileSync(databasePath), databaseBytes)).toBe(0);
+    expect(Buffer.compare(readFileSync(companionTarget), companionBytes)).toBe(0);
+    expect(statSync(oauthDirectory).mode & 0o777).toBe(directoryMode);
+    expect(statSync(databasePath).mode & 0o777).toBe(databaseMode);
+    expect(statSync(companionTarget).mode & 0o777).toBe(companionMode);
+
+    process.env.JOBHUNTER_AUTH_DATABASE = databasePath;
+    await expect(getAuthStorage()).rejects.toThrow(
+      "OAuth storage database must be a regular file",
+    );
+    expect(Buffer.compare(readFileSync(databasePath), databaseBytes)).toBe(0);
+    expect(Buffer.compare(readFileSync(companionTarget), companionBytes)).toBe(0);
+    expect(statSync(oauthDirectory).mode & 0o777).toBe(directoryMode);
+    expect(statSync(databasePath).mode & 0o777).toBe(databaseMode);
+    expect(statSync(companionTarget).mode & 0o777).toBe(companionMode);
+  } finally {
+    await closeAuthStorage();
+    if (priorDatabasePath === undefined) delete process.env.JOBHUNTER_AUTH_DATABASE;
+    else process.env.JOBHUNTER_AUTH_DATABASE = priorDatabasePath;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("creates private auth storage and safely reopens the regular database", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "jobhunter-auth-private-"));
+  const oauthDirectory = join(directory, "nested", "oauth");
+  const databasePath = join(oauthDirectory, "auth.sqlite");
+  const priorDatabasePath = process.env.JOBHUNTER_AUTH_DATABASE;
+  process.env.JOBHUNTER_AUTH_DATABASE = databasePath;
+
+  try {
+    const created = await getAuthStorage();
+    expect(created.listStoredCredentials()).toEqual([]);
+    await closeAuthStorage();
+    expect(statSync(oauthDirectory).mode & 0o777).toBe(0o700);
+    expect(statSync(databasePath).mode & 0o777).toBe(0o600);
+
+    const reopened = await getAuthStorage();
+    expect(reopened.listStoredCredentials()).toEqual([]);
+    await closeAuthStorage();
+    expect(statSync(oauthDirectory).mode & 0o777).toBe(0o700);
+    expect(statSync(databasePath).mode & 0o777).toBe(0o600);
+  } finally {
+    await closeAuthStorage();
+    if (priorDatabasePath === undefined) delete process.env.JOBHUNTER_AUTH_DATABASE;
+    else process.env.JOBHUNTER_AUTH_DATABASE = priorDatabasePath;
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("hard-purges unsupported credentials, children, and token bytes without touching Codex or Indeed", async () => {

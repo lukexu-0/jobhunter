@@ -31,6 +31,7 @@ function run(id: string): RunDto {
     id,
     jobUrl: `https://jobs.example.test/${id}`,
     status: "queued",
+    opportunityKind: "job",
     applicationStatus: "pending",
     generateKeywordMap: true,
     skipReview: false,
@@ -156,6 +157,111 @@ describe("discovery synchronization", () => {
     expect(calls).toBe(1);
     release();
     await first;
+  });
+
+  test("aborts active connector work and drains it before service close settles", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database);
+    const connectorStarted = Promise.withResolvers<void>();
+    const connectorAborted = Promise.withResolvers<void>();
+    const connectorRelease = Promise.withResolvers<void>();
+    let connectorSignal: AbortSignal | undefined;
+    const service = new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [connector("waiting", async (signal) => {
+        connectorSignal = signal;
+        signal.addEventListener("abort", () => connectorAborted.resolve(), { once: true });
+        connectorStarted.resolve();
+        await connectorRelease.promise;
+        return { items: [input("late-item")], completeSnapshot: true };
+      })],
+    });
+    const caller = new AbortController();
+    const syncing = service.sync(caller.signal);
+    await connectorStarted.promise;
+
+    const firstClose = service.close();
+    const secondClose = service.close();
+    let closeSettled = false;
+    void firstClose.then(() => { closeSettled = true; });
+
+    expect(secondClose).toBe(firstClose);
+    await connectorAborted.promise;
+    expect(connectorSignal?.aborted).toBe(true);
+    expect(caller.signal.aborted).toBe(false);
+    await expect(syncing).rejects.toMatchObject({
+      code: "DISCOVERY_SERVICE_CLOSED",
+      status: 409,
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(0);
+    await expect(service.sync(caller.signal)).rejects.toMatchObject({
+      code: "DISCOVERY_SERVICE_CLOSED",
+      status: 409,
+    });
+
+    connectorRelease.resolve();
+    await firstClose;
+    expect(closeSettled).toBe(true);
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(0);
+    expect(service.close()).toBe(firstClose);
+  });
+
+  test("preserves caller cancellation and drains late connector work on close", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database);
+    let connectorCalls = 0;
+    let releaseConnector!: () => void;
+    let reportStarted!: () => void;
+    const connectorStarted = new Promise<void>((resolve) => { reportStarted = resolve; });
+    const connectorRelease = new Promise<void>((resolve) => { releaseConnector = resolve; });
+    const lateConnectorError = new Error("connector rejected after cancellation");
+    const service = new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [connector("waiting", async () => {
+        connectorCalls += 1;
+        reportStarted();
+        await connectorRelease;
+        throw lateConnectorError;
+      })],
+    });
+    const controller = new AbortController();
+    const callerReason = new Error("caller stopped discovery");
+    const syncing = service.sync(controller.signal);
+    await connectorStarted;
+
+    controller.abort(callerReason);
+    await expect(syncing).rejects.toBe(callerReason);
+    const firstClose = service.close();
+    const secondClose = service.close();
+    let closeSettled = false;
+    void firstClose.then(() => { closeSettled = true; });
+
+    expect(secondClose).toBe(firstClose);
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    await expect(service.sync(new AbortController().signal)).rejects.toMatchObject({
+      code: "DISCOVERY_SERVICE_CLOSED",
+      status: 409,
+    });
+    expect(connectorCalls).toBe(1);
+
+    releaseConnector();
+    await firstClose;
+    expect(closeSettled).toBe(true);
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(0);
+    expect(service.close()).toBe(firstClose);
   });
 
   test("limits connector synchronization concurrency to four sources", async () => {

@@ -296,6 +296,23 @@ function assignHostname(url: URL, hostname: string, family?: 4 | 6): void {
   url.hostname = family === 6 || hostname.includes(":") ? `[${hostname}]` : hostname;
 }
 
+function canonicalizeLogicalUrl(value: string | URL): URL {
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new JobSourceError("JOB_URL_BLOCKED");
+  if (url.username || url.password) throw new JobSourceError("JOB_URL_BLOCKED");
+  url.hash = "";
+
+  let hostname = rawHostname(url).toLowerCase();
+  hostname = hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+  if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost")) {
+    throw new JobSourceError("JOB_URL_BLOCKED");
+  }
+  const ip = parseAddress(hostname, false);
+  if (isIP(hostname) !== 0 && !ip) throw new JobSourceError("JOB_URL_BLOCKED");
+  assignHostname(url, ip?.address ?? hostname, ip?.family);
+  return url;
+}
+
 export function canonicalizePublicHttpUrl(value: string | URL): URL {
   const url = new URL(value);
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new JobSourceError("JOB_URL_BLOCKED");

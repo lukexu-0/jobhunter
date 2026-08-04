@@ -262,6 +262,8 @@ export class SafePublicHttpClient {
     options: PublicHttpRequestOptions,
     signal: AbortSignal,
   ): Promise<PublicHttpResponse> {
+    const requestedMaxBodyBytes = validatedLimit(options.maxBodyBytes, this.#maxBodyBytes, 1);
+    const maxBodyBytes = Math.min(this.#maxBodyBytes, requestedMaxBodyBytes);
     let logicalUrl: URL;
     try {
       logicalUrl = canonicalizePublicHttpUrl(input);
@@ -283,7 +285,6 @@ export class SafePublicHttpClient {
       throw new PublicHttpError("REQUEST_FAILED");
     }
     const maxRedirects = Math.min(this.#maxRedirects, requestedMaxRedirects);
-    const maxBodyBytes = Math.min(this.#maxBodyBytes, Math.max(1, options.maxBodyBytes ?? this.#maxBodyBytes));
     const budget = this.#budget;
     let method = options.method ?? "GET";
     let requestBody = options.body;

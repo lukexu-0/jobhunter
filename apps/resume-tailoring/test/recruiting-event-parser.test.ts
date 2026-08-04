@@ -55,6 +55,50 @@ describe("recruiting event parsing", () => {
     }]);
   });
 
+  test("keeps JSON-LD registration links within the canonical public URL boundary", async () => {
+    const result = await parseRecruitingEventSource({
+      ...source,
+      jsonLd: [
+        {
+          "@type": "Event",
+          name: "Credential Link Event",
+          organizer: "Example Careers",
+          startDate: "2026-09-20T10:00:00-04:00",
+          url: "https://registrant:super-secret@events.example.edu/register/credential",
+        },
+        {
+          "@type": "Event",
+          name: "Private Link Event",
+          organizer: "Example Careers",
+          startDate: "2026-09-21T10:00:00-04:00",
+          url: "http://192.168.1.9/register/private",
+        },
+        {
+          "@type": "Event",
+          name: "Canonical Link Event",
+          organizer: "Example Careers",
+          startDate: "2026-09-22T10:00:00-04:00",
+          url: "HTTPS://Events.Example.EDU:443/register/valid/?b=2&utm_source=secret&a=1#private",
+        },
+      ],
+    }, {
+      preferences: { school: null },
+      now,
+      extractWithModel: async () => {
+        throw new Error("model fallback must not run");
+      },
+    });
+
+    expect(result.parser).toBe("deterministic");
+    expect(result.candidates.map((candidate) => candidate.registrationUrl)).toEqual([
+      source.url,
+      source.url,
+      "https://events.example.edu/register/valid?a=1&b=2",
+    ]);
+    expect(JSON.stringify(result)).not.toContain("super-secret");
+    expect(JSON.stringify(result)).not.toContain("192.168.1.9");
+  });
+
   test("falls back to the model for unstructured pages and filters past events", async () => {
     const unstructured: LoadedRecruitingEventSource = {
       url: "https://employer.example.com/events",
@@ -84,6 +128,23 @@ describe("recruiting event parsing", () => {
             registrationUrl: "https://employer.example.com/events",
             matchedForApplicant: true,
           },
+          {
+            title: "Credential Link Session",
+            organizer: "Example Employer",
+            startAt: Date.UTC(2026, 9, 3, 22),
+            attendance: "virtual",
+            registrationUrl:
+              "https://registrant:model-secret@employer.example.com/internal-event",
+            matchedForApplicant: true,
+          },
+          {
+            title: "Private Link Session",
+            organizer: "Example Employer",
+            startAt: Date.UTC(2026, 9, 4, 22),
+            attendance: "virtual",
+            registrationUrl: "http://169.254.1.2/internal-event",
+            matchedForApplicant: true,
+          },
         ];
       },
     });
@@ -92,6 +153,8 @@ describe("recruiting event parsing", () => {
     expect(result.candidates.map((candidate) => candidate.title)).toEqual([
       "Engineering Information Session",
     ]);
+    expect(JSON.stringify(result)).not.toContain("model-secret");
+    expect(JSON.stringify(result)).not.toContain("169.254.1.2");
     expect(calls).toEqual([{
       lines: unstructured.lines,
       context: {
