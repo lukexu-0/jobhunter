@@ -20,7 +20,7 @@ import { ResumeDiffSchema } from "../contracts/index.ts";
 import { ClaimRejectedError, type PublicArtifact, type PublicAttempt, type PublicRun } from "../db/repository.ts";
 import { inspectResumePng, type VisualInspectorOptions } from "../models/visual-inspector.ts";
 import { compileResume, type CompileResult } from "../resume/compiler.ts";
-import { renderKeywordMapPdf } from "../resume/keyword-map.ts";
+import { renderKeywordMapArtifacts } from "../resume/keyword-map.ts";
 import {
   AtsKeywordExtractionSchema,
   assertResumeDiffMatchesTailoredSource,
@@ -127,7 +127,7 @@ export interface PipelineStageDependencies {
   readonly editAgent?: typeof runEditAgent;
   readonly repairAgent?: typeof runRepairAgent;
   readonly compiler?: typeof compileResume;
-  readonly keywordMapRenderer?: typeof renderKeywordMapPdf;
+  readonly keywordMapRenderer?: typeof renderKeywordMapArtifacts;
   readonly deterministicQa?: typeof runDeterministicPdfQa;
   readonly rasterizer?: typeof rasterizePdfPage;
   readonly visualInspector?: typeof inspectResumePng;
@@ -175,7 +175,7 @@ export class PipelineStageProcessor {
   readonly #editAgent: typeof runEditAgent;
   readonly #repairAgent: typeof runRepairAgent;
   readonly #compiler: typeof compileResume;
-  readonly #keywordMapRenderer: typeof renderKeywordMapPdf;
+  readonly #keywordMapRenderer: typeof renderKeywordMapArtifacts;
   readonly #deterministicQa: typeof runDeterministicPdfQa;
   readonly #rasterizer: typeof rasterizePdfPage;
   readonly #visualInspector: typeof inspectResumePng;
@@ -194,7 +194,7 @@ export class PipelineStageProcessor {
     this.#editAgent = dependencies.editAgent ?? runEditAgent;
     this.#repairAgent = dependencies.repairAgent ?? runRepairAgent;
     this.#compiler = dependencies.compiler ?? compileResume;
-    this.#keywordMapRenderer = dependencies.keywordMapRenderer ?? renderKeywordMapPdf;
+    this.#keywordMapRenderer = dependencies.keywordMapRenderer ?? renderKeywordMapArtifacts;
     this.#deterministicQa = dependencies.deterministicQa ?? runDeterministicPdfQa;
     this.#rasterizer = dependencies.rasterizer ?? rasterizePdfPage;
     this.#visualInspector = dependencies.visualInspector ?? inspectResumePng;
@@ -659,7 +659,8 @@ export class PipelineStageProcessor {
       });
       signal.throwIfAborted();
       await this.#verifyAgain(run.id, signal);
-      this.#finalize(claim, attempt, "keyword-map-pdf", keywordMap, pdf.id);
+      this.#finalize(claim, attempt, "keyword-map-pdf", keywordMap.pdf, pdf.id);
+      this.#finalize(claim, attempt, "keyword-map", keywordMap.coverage, pdf.id);
     }
     this.#repository.finishAttempt(claim, attempt.id, "succeeded", audit);
     this.#repository.transition(claim, "visual_qa");

@@ -80,6 +80,17 @@ const extraction = {
   ],
 };
 
+const keywordCoverage = {
+  schemaVersion: 1,
+  pdfSha256: "f".repeat(64),
+  keywords: [
+    { id: "keyword-distributed-tracing", phrase: "Distributed tracing", found: true },
+    { id: "keyword-typescript", phrase: "Production TypeScript", found: true },
+    { id: "keyword-zero-downtime", phrase: "Zero-downtime delivery", found: false },
+    { id: "keyword-observability", phrase: "Operational observability", found: false },
+  ],
+};
+
 const oldReportHeadings = [
   "Role summary",
   "Requirement evidence",
@@ -96,9 +107,15 @@ const unsupportedLegacyMessage =
   "Unsupported legacy job-analysis artifact. This view requires schemaVersion 2.";
 
 describe("job analysis artifact rendering", () => {
-  test("renders phrase-only included and not-included keyword lists in source order", () => {
+  test("classifies every extracted phrase by presence in the rendered resume", () => {
     const markup = renderToStaticMarkup(
-      <AnalysisContent value={analysis} extraction={extraction} extractionAvailable />,
+      <AnalysisContent
+        value={analysis}
+        extraction={extraction}
+        extractionAvailable
+        keywordCoverage={keywordCoverage}
+        keywordCoverageAvailable
+      />,
     );
 
     for (const heading of ["Keywords included", "Keywords not included"]) {
@@ -107,15 +124,15 @@ describe("job analysis artifact rendering", () => {
     expect(markup.match(/aria-labelledby="keywords-(?:included|not-included)-heading"/g)).toHaveLength(2);
     expect(markup.match(/<ul/g)).toHaveLength(2);
     for (const phrase of [
-      "Operational observability",
-      "Production TypeScript",
       "Distributed tracing",
+      "Production TypeScript",
       "Zero-downtime delivery",
+      "Operational observability",
     ]) {
       expect(markup).toContain(phrase);
     }
-    expect(markup.indexOf("Operational observability")).toBeLessThan(markup.indexOf("Production TypeScript"));
-    expect(markup.indexOf("Distributed tracing")).toBeLessThan(markup.indexOf("Zero-downtime delivery"));
+    expect(markup.indexOf("Distributed tracing")).toBeLessThan(markup.indexOf("Production TypeScript"));
+    expect(markup.indexOf("Zero-downtime delivery")).toBeLessThan(markup.indexOf("Operational observability"));
     for (const privateDetail of [
       "analysis-1",
       "Staff AI Engineer",
@@ -153,17 +170,19 @@ describe("job analysis artifact rendering", () => {
     expect(markup).not.toContain(unsupportedLegacyMessage);
   });
 
-  test("keeps included phrases visible when extraction is unavailable", () => {
-    const markup = renderToStaticMarkup(<AnalysisContent value={analysis} />);
+  test("does not infer resume presence when rendered coverage is unavailable", () => {
+    const markup = renderToStaticMarkup(
+      <AnalysisContent value={analysis} extraction={extraction} extractionAvailable />,
+    );
 
-    expect(markup).toContain("Keywords included");
-    expect(markup).toContain("Operational observability");
-    expect(markup).toContain("Production TypeScript");
-    expect(markup).toContain("Keywords not included");
-    expect(markup).toContain("Keyword extraction is unavailable.");
-    expect(markup.split("Keyword extraction is unavailable.")).toHaveLength(2);
-    expect(markup.indexOf("Keyword extraction is unavailable."))
-      .toBeGreaterThan(markup.indexOf("Keywords not included"));
+    for (const heading of ["Keywords included", "Keywords not included"]) {
+      expect(markup).toContain(heading);
+    }
+    expect(markup).not.toContain("Operational observability");
+    expect(markup).not.toContain("Production TypeScript");
+    expect(markup).not.toContain("Distributed tracing");
+    expect(markup).not.toContain("Zero-downtime delivery");
+    expect(markup.split("Rendered-resume keyword coverage is unavailable.")).toHaveLength(3);
   });
 
   test("shows concise states for empty keyword lists", () => {
@@ -175,6 +194,12 @@ describe("job analysis artifact rendering", () => {
           keywords: [{ id: "keyword-accessibility", phrase: "Accessible interfaces" }],
         }}
         extractionAvailable
+        keywordCoverage={{
+          schemaVersion: 1,
+          pdfSha256: "f".repeat(64),
+          keywords: [{ id: "keyword-accessibility", phrase: "Accessible interfaces", found: false }],
+        }}
+        keywordCoverageAvailable
       />,
     );
     expect(noIncludedMarkup).toContain("No keywords are included.");
@@ -191,6 +216,12 @@ describe("job analysis artifact rendering", () => {
           keywords: [{ id: "keyword-accessibility", phrase: "Accessible interfaces" }],
         }}
         extractionAvailable
+        keywordCoverage={{
+          schemaVersion: 1,
+          pdfSha256: "f".repeat(64),
+          keywords: [{ id: "keyword-accessibility", phrase: "Accessible interfaces", found: true }],
+        }}
+        keywordCoverageAvailable
       />,
     );
     expect(noAbsentMarkup).toContain("Accessible interfaces");

@@ -5,6 +5,7 @@ import { Fragment, useCallback, useEffect, useRef, useState, type KeyboardEvent,
 import type { PDFDocumentLoadingTask, RenderTask } from "pdfjs-dist";
 import {
   ResumeDiffSchema,
+  ResumeKeywordCoverageSchema,
   type ArtifactDto,
   type ApplicationSessionView,
   type ArtifactKind,
@@ -196,6 +197,7 @@ function isDisplayedJsonArtifact(artifact: ArtifactDto): boolean {
     && (
       artifact.kind === "job-analysis"
       || artifact.kind === "ats-keyword-extraction"
+      || artifact.kind === "keyword-map"
       || artifact.kind === "resume-diff"
       || artifact.kind === "visual-qa"
     );
@@ -275,6 +277,8 @@ interface AnalysisContentProps {
   readonly value: unknown;
   readonly extraction?: unknown;
   readonly extractionAvailable?: boolean;
+  readonly keywordCoverage?: unknown;
+  readonly keywordCoverageAvailable?: boolean;
 }
 
 interface KeywordPhrase {
@@ -298,6 +302,8 @@ export function AnalysisContent({
   value,
   extraction,
   extractionAvailable = false,
+  keywordCoverage,
+  keywordCoverageAvailable = false,
 }: AnalysisContentProps) {
   const analysis = asRecord(value);
   if (analysis?.schemaVersion !== 2) {
@@ -308,15 +314,22 @@ export function AnalysisContent({
     );
   }
 
-  const included = keywordPhrases(analysis.jdKeywords);
-  const includedIds = new Set(included.map((keyword) => keyword.id));
   const extractionRecord = asRecord(extraction);
+  const extracted = keywordPhrases(extractionRecord?.keywords);
   const hasExtraction = extractionAvailable
     && extractionRecord?.schemaVersion === 1
     && Array.isArray(extractionRecord.keywords);
-  const notIncluded = hasExtraction
-    ? keywordPhrases(extractionRecord.keywords).filter((keyword) => !includedIds.has(keyword.id))
-    : [];
+  const coverageResult = ResumeKeywordCoverageSchema.safeParse(keywordCoverage);
+  const covered = coverageResult.success ? coverageResult.data.keywords : [];
+  const completeCoverage = keywordCoverageAvailable
+    && coverageResult.success
+    && covered.length === extracted.length
+    && extracted.every((keyword, index) => {
+      const candidate = covered[index];
+      return candidate?.id === keyword.id && candidate.phrase === keyword.phrase;
+    });
+  const included = completeCoverage ? covered.filter((keyword) => keyword.found) : [];
+  const notIncluded = completeCoverage ? covered.filter((keyword) => !keyword.found) : [];
 
   return (
     <div className={styles.keywordComparison}>
@@ -325,7 +338,11 @@ export function AnalysisContent({
         className={styles.keywordBox}
       >
         <h2 id="keywords-included-heading">Keywords included</h2>
-        {included.length > 0 ? (
+        {!hasExtraction ? (
+          <p className={styles.keywordEmpty}>Keyword extraction is unavailable.</p>
+        ) : !completeCoverage ? (
+          <p className={styles.keywordEmpty}>Rendered-resume keyword coverage is unavailable.</p>
+        ) : included.length > 0 ? (
           <ul className={styles.keywordPhraseList}>
             {included.map((keyword) => <li key={keyword.id}>{keyword.phrase}</li>)}
           </ul>
@@ -341,6 +358,8 @@ export function AnalysisContent({
         <h2 id="keywords-not-included-heading">Keywords not included</h2>
         {!hasExtraction ? (
           <p className={styles.keywordEmpty}>Keyword extraction is unavailable.</p>
+        ) : !completeCoverage ? (
+          <p className={styles.keywordEmpty}>Rendered-resume keyword coverage is unavailable.</p>
         ) : notIncluded.length > 0 ? (
           <ul className={styles.keywordPhraseList}>
             {notIncluded.map((keyword) => <li key={keyword.id}>{keyword.phrase}</li>)}
@@ -742,6 +761,19 @@ export function RunDetail({ runId }: RunDetailProps) {
     : undefined;
   const extraction = extractionArtifact ? artifactData[extractionArtifact.id] : undefined;
   const extractionError = extractionArtifact ? artifactErrors[extractionArtifact.id] : undefined;
+  const keywordCoverageArtifact = analysisArtifact
+    ? artifactFor("keyword-map")
+    : undefined;
+  const keywordCoverageError = keywordCoverageArtifact
+    ? artifactErrors[keywordCoverageArtifact.id]
+    : undefined;
+  const parsedKeywordCoverage = ResumeKeywordCoverageSchema.safeParse(
+    keywordCoverageArtifact ? artifactData[keywordCoverageArtifact.id] : undefined,
+  );
+  const keywordCoverage = parsedKeywordCoverage.success
+    && parsedKeywordCoverage.data.pdfSha256 === selectedIteration?.pdfSha256
+    ? parsedKeywordCoverage.data
+    : undefined;
   const pdfArtifact = selectedPdfArtifact(selectedIteration);
   const pageImageArtifact = selectedPageImage(selectedIteration);
   const pdfHref = safeArtifactHref(pdfArtifact);
@@ -1043,6 +1075,12 @@ export function RunDetail({ runId }: RunDetailProps) {
                 value={analysis}
                 extraction={extraction}
                 extractionAvailable={Boolean(extractionArtifact && !extractionError)}
+                keywordCoverage={keywordCoverage}
+                keywordCoverageAvailable={Boolean(
+                  keywordCoverageArtifact
+                  && !keywordCoverageError
+                  && keywordCoverage,
+                )}
               />
             </ArtifactState>
           </section>

@@ -55,6 +55,7 @@ const PUBLIC_ARTIFACT_KINDS: Readonly<Record<string, ArtifactKind>> = Object.fre
   "tailored-tex": "tailored-tex",
   "compiled-pdf": "compiled-pdf",
   "keyword-map-pdf": "keyword-map-pdf",
+  "keyword-map": "keyword-map",
   "page-image": "page-image",
   "deterministic-qa": "deterministic-qa",
   "visual-qa": "visual-qa",

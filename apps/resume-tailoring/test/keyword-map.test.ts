@@ -9,9 +9,11 @@ import {
   decodePDFRawStream,
   rgb,
 } from "pdf-lib";
+import { ResumeKeywordCoverageSchema } from "../src/contracts/index.ts";
 import {
   normalizeJobDescription,
   parsePdftotextBbox,
+  renderKeywordMapArtifacts,
   renderKeywordMapPdf,
   type KeywordMapRequest,
 } from "../src/resume/keyword-map.ts";
@@ -187,6 +189,115 @@ describe("keyword map renderer", () => {
     expect(operators.match(/1 0\.85 0 rg/g)).toHaveLength(1);
   });
 
+  testWithPdftotext("writes complete rendered-resume coverage for every extracted keyword", async () => {
+    const resume = await compiledResume();
+    const atsKeywordExtraction = atsKeywordExtractionFixture();
+    const analysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: KEYWORD_MAP_JOB_DESCRIPTION,
+    });
+
+    const rendered = await renderKeywordMapArtifacts({
+      ...resume,
+      jobDescription: KEYWORD_MAP_JOB_DESCRIPTION,
+      atsKeywordExtraction,
+      analysis,
+    });
+    const coverage = ResumeKeywordCoverageSchema.parse(JSON.parse(
+      await Bun.file(rendered.coverage.path).text(),
+    ));
+
+    expect(coverage).toEqual({
+      schemaVersion: 1,
+      pdfSha256: resume.compiledPdf.sha256,
+      keywords: [
+        { id: "keyword-typescript", phrase: "TypeScript", found: true },
+        { id: "keyword-nextjs", phrase: "Next.js", found: true },
+        { id: "keyword-kubernetes", phrase: "Kubernetes", found: false },
+      ],
+    });
+    expect(rendered.pdf.sha256).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  testWithPdftotext("counts an extracted phrase that wraps across rendered resume lines", async () => {
+    const jobDescription = "TypeScript role requires Distributed tracing.";
+    const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const atsKeywordExtraction = {
+      ...baseExtraction,
+      keywords: [{
+        id: "keyword-distributed-tracing",
+        phrase: "Distributed tracing",
+        jdQuote: jobDescription,
+      }],
+    };
+    const baseAnalysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
+    const analysis = { ...baseAnalysis, jdKeywords: [], exactEdits: [] };
+    const resume = await compiledResume("Built production Distributed\ntracing systems.");
+
+    const rendered = await renderKeywordMapArtifacts({
+      ...resume,
+      jobDescription,
+      atsKeywordExtraction,
+      analysis,
+    });
+    const coverage = ResumeKeywordCoverageSchema.parse(JSON.parse(
+      await Bun.file(rendered.coverage.path).text(),
+    ));
+
+    expect(coverage.keywords).toEqual([{
+      id: "keyword-distributed-tracing",
+      phrase: "Distributed tracing",
+      found: true,
+    }]);
+  });
+
+  testWithPdftotext("does not count a keyword found only as a substring of linked edit text", async () => {
+    const jobDescription = "TypeScript role requires Java.";
+    const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const keyword = {
+      id: "keyword-java",
+      phrase: "Java",
+      jdQuote: jobDescription,
+    };
+    const atsKeywordExtraction = { ...baseExtraction, keywords: [keyword] };
+    const baseAnalysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
+    const analysis = {
+      ...baseAnalysis,
+      jdKeywords: [{
+        ...keyword,
+        evidenceIds: baseAnalysis.jdKeywords[0]!.evidenceIds,
+      }],
+      exactEdits: [{
+        ...baseAnalysis.exactEdits[0]!,
+        after: "JavaScript services",
+        keywordIds: [keyword.id],
+      }],
+    };
+    const resume = await compiledResume("Built JavaScript services.");
+
+    const rendered = await renderKeywordMapArtifacts({
+      ...resume,
+      jobDescription,
+      atsKeywordExtraction,
+      analysis,
+    });
+    const coverage = ResumeKeywordCoverageSchema.parse(JSON.parse(
+      await Bun.file(rendered.coverage.path).text(),
+    ));
+
+    expect(coverage.keywords).toEqual([{
+      id: "keyword-java",
+      phrase: "Java",
+      found: false,
+    }]);
+  });
+
   testWithPdftotext("highlights complete keywords within punctuation-delimited PDF word boxes", async () => {
     const jobDescription = "TypeScript role requiring Node, Next.js, C++, and C#";
     const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
@@ -296,7 +407,7 @@ describe("keyword map renderer", () => {
       "</page></doc>",
     ].join("");
 
-    const rendered = await renderKeywordMapPdf({
+    const rendered = await renderKeywordMapArtifacts({
       ...resume,
       jobDescription,
       atsKeywordExtraction,
@@ -304,7 +415,7 @@ describe("keyword map renderer", () => {
       processBoundary: boundary(bboxXml),
     });
     const document = await PDFDocument.load(
-      await resume.artifacts.read(rendered.path, ARTIFACT_LIMITS.pdf),
+      await resume.artifacts.read(rendered.pdf.path, ARTIFACT_LIMITS.pdf),
     );
     let operators = "";
     for (const [, object] of document.context.enumerateIndirectObjects()) {
@@ -318,6 +429,14 @@ describe("keyword map renderer", () => {
 
     expect(operators.match(/1 0\.85 0 rg/g)).toHaveLength(1);
     expect(operators).not.toContain("0.85 0.05 0.05 RG");
+    const coverage = ResumeKeywordCoverageSchema.parse(
+      await Bun.file(rendered.coverage.path).json(),
+    );
+    expect(coverage.keywords).toEqual([{
+      id: "keyword-typescript-services",
+      phrase: "TypeScript services",
+      found: false,
+    }]);
   });
 
   test("honors cancellation and surfaces pdftotext failures and malformed bbox output", async () => {
