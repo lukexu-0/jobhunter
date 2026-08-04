@@ -569,6 +569,23 @@ describe("job source loading", () => {
     ]);
   });
 
+  test("does not start DNS resolution for an already aborted pinned request", async () => {
+    const controller = new AbortController();
+    const reason = new Error("cancelled before Oracle fallback");
+    controller.abort(reason);
+    let resolverCalled = false;
+
+    await expect(fetchPinnedPublicHttp("https://jobs.example.test/role", {
+      signal: controller.signal,
+      resolveHost: async () => {
+        resolverCalled = true;
+        return [{ address: PUBLIC_V4, family: 4 }];
+      },
+      fetchImpl: async () => response(VALID_TEXT),
+    })).rejects.toBe(reason);
+    expect(resolverCalled).toBe(false);
+  });
+
   test("omits DNS SNI for an IP-literal logical host while keeping verification enabled", async () => {
     let init: BunFetchRequestInit | undefined;
     await loadJobSourceFromUrl("https://93.184.216.34:8443/role", undefined, {

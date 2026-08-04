@@ -823,6 +823,7 @@ export async function fetchPinnedPublicHttp(
   input: string | URL,
   request: PinnedPublicHttpRequest,
 ): Promise<{ readonly logicalUrl: URL; readonly response: Response }> {
+  request.signal.throwIfAborted();
   const logicalUrl = canonicalizePublicHttpUrl(input);
   const addresses = await resolveValidatedAddresses(
     logicalUrl,
