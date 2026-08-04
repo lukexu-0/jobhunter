@@ -252,8 +252,19 @@ export class RunApplicationService {
 
   constructor(private readonly dependencies: RunApplicationDependencies) {
     this.#idFactory = dependencies.idFactory ?? randomUUID;
-    this.#loadJobSource = dependencies.loadJobSource ?? loadJobSourceFromUrl;
-    this.#extractJobDescription = dependencies.extractJobDescription ?? extractJobDescriptionWithLuna;
+    this.#loadJobSource = dependencies.loadJobSource
+      ?? ((jobUrl, signal, opportunityKindHint) => loadJobSourceFromUrl(
+        jobUrl,
+        signal,
+        {},
+        opportunityKindHint,
+      ));
+    this.#extractJobDescription = dependencies.extractJobDescription
+      ?? ((lines, signal, opportunityKindHint) => extractJobDescriptionWithLuna(
+        lines,
+        signal,
+        opportunityKindHint === undefined ? {} : { opportunityKindHint },
+      ));
     this.#validatePublicJobUrl = dependencies.validatePublicJobUrl
       ?? (async (jobUrl, signal) => {
         await validatePublicHttpDestination(jobUrl, signal);
@@ -280,12 +291,13 @@ export class RunApplicationService {
     skipReview = false,
     autoSubmit = false,
     requestSignal?: AbortSignal,
+    opportunityKind?: OpportunityKind,
   ): Promise<RunDto> {
     const signal = requestSignal;
     signal?.throwIfAborted();
     let source: LoadedJobSource;
     try {
-      source = await this.#loadJobSource(jobUrl, signal);
+      source = await this.#loadJobSource(jobUrl, signal, opportunityKind);
     } catch (error) {
       if (signal?.aborted) signal.throwIfAborted();
       throw error;
@@ -297,13 +309,13 @@ export class RunApplicationService {
       extracted = source;
     } else {
       try {
-        extracted = await this.#extractJobDescription(source.lines, signal);
+        extracted = await this.#extractJobDescription(source.lines, signal, opportunityKind);
       } catch (error) {
         if (signal?.aborted) signal.throwIfAborted();
         if (error instanceof OAuthRequiredError) {
           throw new RunServiceError(
             "JOB_EXTRACTION_AUTH_REQUIRED",
-            "Connect OpenAI Codex OAuth before importing this job page",
+            "Connect OpenAI Codex OAuth before importing this opportunity page",
             409,
           );
         }
@@ -311,13 +323,13 @@ export class RunApplicationService {
           if (error.kind === "timeout") {
             throw new RunServiceError(
               "JOB_EXTRACTION_TIMEOUT",
-              "Job description extraction timed out",
+              "Opportunity description extraction timed out",
               504,
             );
           }
           throw new RunServiceError(
             "JOB_EXTRACTION_UNAVAILABLE",
-            "Job description extraction failed",
+            "Opportunity description extraction failed",
             502,
           );
         }
@@ -331,7 +343,7 @@ export class RunApplicationService {
     return await this.#persistRun(
       jobUrl,
       validated,
-      extracted.opportunityKind,
+      opportunityKind ?? extracted.opportunityKind,
       generateKeywordMap,
       skipReview,
       autoSubmit,

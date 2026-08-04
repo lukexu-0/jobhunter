@@ -304,6 +304,26 @@ describe("RunApplicationService", () => {
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
     expect(target.repository.acquire()?.runId).toBe(run.id);
   });
+  test("treats an explicit hackathon kind as authoritative over deterministic source inference", async () => {
+    const projectSubmission = [
+      "Climate resilience project submission",
+      "This prototype uses open data to help communities prepare for extreme weather events.",
+    ].join("\n");
+    const target = fixture({
+      loadJobSource: async () => ({
+        kind: "description",
+        opportunityKind: "job",
+        jobDescription: projectSubmission,
+      }),
+    });
+
+    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "hackathon");
+
+    expect(run.opportunityKind).toBe("hackathon");
+    expect(target.repository.getRun(run.id)?.opportunityKind).toBe("hackathon");
+    expect(target.repository.getArtifact(run.id, "job-description")).not.toBeNull();
+  });
+
 
   test("synchronizes stale context once and creates the run from the refreshed snapshot", async () => {
     let snapshotCalls = 0;
@@ -433,7 +453,7 @@ describe("RunApplicationService", () => {
     expect(legacy).not.toHaveProperty("jobUrl");
     expect(await target.service.getRun(legacy.id)).not.toHaveProperty("jobUrl");
   });
-  test("uses sanitized fallback lines and persists only the exact reconstructed description", async () => {
+  test("omits the hint so fallback extraction keeps its inferred opportunity kind", async () => {
     const controller = new AbortController();
     const lines = [
       "Senior Platform Engineer",
@@ -442,16 +462,24 @@ describe("RunApplicationService", () => {
     ] as const;
     const selected = `${lines[0]}\n\n${lines[2]}`;
     const observed: {
-      loader?: { jobUrl: string; signal: AbortSignal | undefined };
-      extractor?: { lines: readonly string[]; signal: AbortSignal | undefined };
+      loader?: {
+        jobUrl: string;
+        signal: AbortSignal | undefined;
+        opportunityKindHint: "job" | "hackathon" | "competition" | "event" | undefined;
+      };
+      extractor?: {
+        lines: readonly string[];
+        signal: AbortSignal | undefined;
+        opportunityKindHint: "job" | "hackathon" | "competition" | "event" | undefined;
+      };
     } = {};
     const target = fixture({
-      loadJobSource: async (jobUrl, signal) => {
-        observed.loader = { jobUrl, signal };
+      loadJobSource: async (jobUrl, signal, opportunityKindHint) => {
+        observed.loader = { jobUrl, signal, opportunityKindHint };
         return { kind: "model-fallback", lines };
       },
-      extractJobDescription: async (sourceLines, signal) => {
-        observed.extractor = { lines: sourceLines, signal };
+      extractJobDescription: async (sourceLines, signal, opportunityKindHint) => {
+        observed.extractor = { lines: sourceLines, signal, opportunityKindHint };
         return { opportunityKind: "competition", jobDescription: selected };
       },
     });
@@ -459,8 +487,12 @@ describe("RunApplicationService", () => {
     const run = await target.service.createRun(JOB_URL, true, false, false, controller.signal);
 
     expect(observed).toEqual({
-      loader: { jobUrl: JOB_URL, signal: controller.signal },
-      extractor: { lines, signal: controller.signal },
+      loader: {
+        jobUrl: JOB_URL,
+        signal: controller.signal,
+        opportunityKindHint: undefined,
+      },
+      extractor: { lines, signal: controller.signal, opportunityKindHint: undefined },
     });
     const input = target.repository.getArtifact(run.id, "job-description")!;
     expect(Buffer.from(await target.artifacts.read(input.path, input.byteSize)).toString("utf8")).toBe(selected);
@@ -469,6 +501,38 @@ describe("RunApplicationService", () => {
     ).get(run.id)?.job_description).toBe(selected);
     expect(run.jobUrl).toBe(JOB_URL);
     expect(run.opportunityKind).toBe("competition");
+  });
+
+  test("keeps an explicit hackathon kind authoritative through model-fallback extraction", async () => {
+    const lines = [
+      "Senior Platform Engineer",
+      "Example Systems",
+      "Own reliable TypeScript services and production delivery.",
+    ] as const;
+    const selected = `${lines[0]}\n\n${lines[2]}`;
+    const observed: {
+      loaderHint: "job" | "hackathon" | "competition" | "event" | undefined;
+      extractorHint: "job" | "hackathon" | "competition" | "event" | undefined;
+    } = { loaderHint: undefined, extractorHint: undefined };
+    const target = fixture({
+      loadJobSource: async (_jobUrl, _signal, opportunityKindHint) => {
+        observed.loaderHint = opportunityKindHint;
+        return { kind: "model-fallback", lines };
+      },
+      extractJobDescription: async (_sourceLines, _signal, opportunityKindHint) => {
+        observed.extractorHint = opportunityKindHint;
+        return { opportunityKind: "competition", jobDescription: selected };
+      },
+    });
+
+    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "hackathon");
+
+    expect(observed).toEqual({
+      loaderHint: "hackathon",
+      extractorHint: "hackathon",
+    });
+    expect(run.opportunityKind).toBe("hackathon");
+    expect(target.repository.getRun(run.id)?.opportunityKind).toBe("hackathon");
   });
 
   test("bubbles loader failures and maps only fixed fallback failures before persistence", async () => {
@@ -493,7 +557,7 @@ describe("RunApplicationService", () => {
     await expect(nullTarget.service.createRun(JOB_URL)).rejects.toMatchObject({
       code: "JOB_DESCRIPTION_UNAVAILABLE",
       status: 422,
-      message: "The page does not contain a usable job description",
+      message: "The page does not contain a usable opportunity description",
     });
     expectNoPersistence(nullTarget);
 
@@ -503,7 +567,7 @@ describe("RunApplicationService", () => {
         expected: {
           code: "JOB_EXTRACTION_AUTH_REQUIRED",
           status: 409,
-          message: "Connect OpenAI Codex OAuth before importing this job page",
+          message: "Connect OpenAI Codex OAuth before importing this opportunity page",
         },
       },
       {
@@ -511,7 +575,7 @@ describe("RunApplicationService", () => {
         expected: {
           code: "JOB_EXTRACTION_TIMEOUT",
           status: 504,
-          message: "Job description extraction timed out",
+          message: "Opportunity description extraction timed out",
         },
       },
       {
@@ -519,7 +583,7 @@ describe("RunApplicationService", () => {
         expected: {
           code: "JOB_EXTRACTION_UNAVAILABLE",
           status: 502,
-          message: "Job description extraction failed",
+          message: "Opportunity description extraction failed",
         },
       },
     ]) {

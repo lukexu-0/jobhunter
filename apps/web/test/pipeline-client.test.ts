@@ -394,6 +394,27 @@ describe("pipeline run requests", () => {
     ]);
   });
 
+  test("forwards an explicit opportunity type", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(json(run()), requests);
+
+    await createRun(
+      "https://events.example.test/hackathons/ship-it",
+      true,
+      false,
+      false,
+      "hackathon",
+    );
+
+    expect(requests.map(({ init }) => JSON.parse(String(init?.body)))).toEqual([{
+      jobUrl: "https://events.example.test/hackathons/ship-it",
+      opportunityKind: "hackathon",
+      generateKeywordMap: true,
+      skipReview: false,
+      autoSubmit: false,
+    }]);
+  });
+
   test("rejects invalid job URLs locally without fetching", () => {
     let fetchCalls = 0;
     setFetchMock(async () => {
@@ -494,8 +515,8 @@ describe("pipeline run requests", () => {
 
   test("exposes only fixed actionable extraction 5xx messages", async () => {
     for (const [code, status, message] of [
-      ["JOB_EXTRACTION_UNAVAILABLE", 502, "Job description extraction failed"],
-      ["JOB_EXTRACTION_TIMEOUT", 504, "Job description extraction timed out"],
+      ["JOB_EXTRACTION_UNAVAILABLE", 502, "Opportunity description extraction failed"],
+      ["JOB_EXTRACTION_TIMEOUT", 504, "Opportunity description extraction timed out"],
     ] as const) {
       setFetchMock(async () => json({
         error: {

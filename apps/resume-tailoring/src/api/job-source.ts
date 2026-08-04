@@ -15,7 +15,11 @@ export type LoadedJobSource = Readonly<
   | { kind: "description"; opportunityKind: OpportunityKind; jobDescription: string }
   | { kind: "model-fallback"; lines: readonly string[] }
 >;
-export type LoadJobSource = (jobUrl: string, signal?: AbortSignal) => Promise<LoadedJobSource>;
+export type LoadJobSource = (
+  jobUrl: string,
+  signal?: AbortSignal,
+  opportunityKindHint?: OpportunityKind,
+) => Promise<LoadedJobSource>;
 export interface LoadedPublicWebSource {
   readonly url: string;
   readonly mediaType: "html" | "plain";
@@ -46,11 +50,11 @@ export type JobSourceErrorCode =
   | "JOB_DESCRIPTION_UNAVAILABLE";
 
 const ERROR_DETAILS = {
-  JOB_URL_BLOCKED: [400, "Job URL must resolve to a public HTTP(S) address"],
-  JOB_SOURCE_UNAVAILABLE: [422, "The job posting could not be loaded"],
-  JOB_SOURCE_UNSUPPORTED: [422, "The job posting response is not HTML or plain text"],
-  JOB_SOURCE_TOO_LARGE: [413, "The job posting is too large to import"],
-  JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable job description"],
+  JOB_URL_BLOCKED: [400, "Opportunity URL must resolve to a public HTTP(S) address"],
+  JOB_SOURCE_UNAVAILABLE: [422, "The opportunity page could not be loaded"],
+  JOB_SOURCE_UNSUPPORTED: [422, "The opportunity page response is not HTML or plain text"],
+  JOB_SOURCE_TOO_LARGE: [413, "The opportunity page is too large to import"],
+  JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable opportunity description"],
 } as const satisfies Record<JobSourceErrorCode, readonly [400 | 413 | 422, string]>;
 
 export class JobSourceError extends Error {
@@ -555,6 +559,7 @@ async function collectJsonLdScripts(html: string): Promise<string[]> {
 
 async function deterministicHtmlDescription(
   html: string,
+  opportunityKindHint?: OpportunityKind,
 ): Promise<Extract<LoadedJobSource, { kind: "description" }> | undefined> {
   const opportunities: JsonLdOpportunity[] = [];
   for (const script of await collectJsonLdScripts(html)) {
@@ -585,8 +590,13 @@ async function deterministicHtmlDescription(
     }
     const candidate = JobDescriptionSchema.safeParse(normalized.join("\n\n"));
     if (candidate.success) {
-      const loaded = { kind: "description", opportunityKind, jobDescription: candidate.data } as const;
-      candidates.set(`${opportunityKind}\0${candidate.data}`, loaded);
+      const selectedOpportunityKind = opportunityKindHint ?? opportunityKind;
+      const loaded = {
+        kind: "description",
+        opportunityKind: selectedOpportunityKind,
+        jobDescription: candidate.data,
+      } as const;
+      candidates.set(`${selectedOpportunityKind}\0${candidate.data}`, loaded);
     }
   }
   return candidates.size === 1 ? candidates.values().next().value : undefined;
@@ -821,6 +831,7 @@ async function loadJobSourceWithSignal(
   signal: AbortSignal,
   fetchImpl: JobSourceFetch,
   resolveHost: ResolveHost,
+  opportunityKindHint?: OpportunityKind,
 ): Promise<LoadedJobSource> {
   const loaded = await loadPublicWebSourceWithSignal(
     jobUrl,
@@ -832,7 +843,11 @@ async function loadJobSourceWithSignal(
     const jobDescription = normalizeText(loaded.body);
     const parsed = JobDescriptionSchema.safeParse(jobDescription);
     if (parsed.success) {
-      return { kind: "description", opportunityKind: "job", jobDescription: parsed.data };
+      return {
+        kind: "description",
+        opportunityKind: opportunityKindHint ?? "job",
+        jobDescription: parsed.data,
+      };
     }
     throw new JobSourceError(
       jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
@@ -841,7 +856,7 @@ async function loadJobSourceWithSignal(
     );
   }
 
-  const deterministic = await deterministicHtmlDescription(loaded.body);
+  const deterministic = await deterministicHtmlDescription(loaded.body, opportunityKindHint);
   if (deterministic !== undefined) return deterministic;
   return htmlFallback(loaded.body);
 }
@@ -850,6 +865,7 @@ export async function loadJobSourceFromUrl(
   jobUrl: string,
   signal?: AbortSignal,
   options: JobSourceLoadOptions = {},
+  opportunityKindHint?: OpportunityKind,
 ): Promise<LoadedJobSource> {
   signal?.throwIfAborted();
   const controller = new AbortController();
@@ -865,6 +881,7 @@ export async function loadJobSourceFromUrl(
       controller.signal,
       options.fetchImpl ?? fetch,
       options.resolveHost ?? defaultResolveHost,
+      opportunityKindHint,
     );
   } catch (error) {
     if (signal?.aborted) throw cancellationReason(signal);

@@ -71,6 +71,25 @@ describe("job source loading", () => {
       resolveHost: resolvePublic,
     })).resolves.toEqual({ kind: "description", opportunityKind: "job", jobDescription: "Senior Engineer\n\nBuild secure systems and collaborate across the whole team." });
   });
+  test("uses an explicit hackathon kind for a deterministic project submission page", async () => {
+    const projectSubmission =
+      "Climate resilience project submission\n\nThis prototype uses open data to help communities prepare for extreme weather events.";
+
+    await expect(loadJobSourceFromUrl(
+      "https://hackathons.example.test/projects/climate-resilience/submissions/1",
+      undefined,
+      {
+        fetchImpl: async () => response(projectSubmission),
+        resolveHost: resolvePublic,
+      },
+      "hackathon",
+    )).resolves.toEqual({
+      kind: "description",
+      opportunityKind: "hackathon",
+      jobDescription: projectSubmission,
+    });
+  });
+
 
   test("enforces plain-text character bounds without falling back to a model", async () => {
     for (const [body, code] of [
@@ -296,11 +315,11 @@ describe("job source loading", () => {
 
   test("exposes only fixed public error metadata", () => {
     const expected = {
-      JOB_URL_BLOCKED: [400, "Job URL must resolve to a public HTTP(S) address"],
-      JOB_SOURCE_UNAVAILABLE: [422, "The job posting could not be loaded"],
-      JOB_SOURCE_UNSUPPORTED: [422, "The job posting response is not HTML or plain text"],
-      JOB_SOURCE_TOO_LARGE: [413, "The job posting is too large to import"],
-      JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable job description"],
+      JOB_URL_BLOCKED: [400, "Opportunity URL must resolve to a public HTTP(S) address"],
+      JOB_SOURCE_UNAVAILABLE: [422, "The opportunity page could not be loaded"],
+      JOB_SOURCE_UNSUPPORTED: [422, "The opportunity page response is not HTML or plain text"],
+      JOB_SOURCE_TOO_LARGE: [413, "The opportunity page is too large to import"],
+      JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable opportunity description"],
     } as const;
     for (const [code, [status, message]] of Object.entries(expected)) {
       const typedCode = code as keyof typeof expected;

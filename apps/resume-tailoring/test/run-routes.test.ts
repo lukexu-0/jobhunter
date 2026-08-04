@@ -92,17 +92,38 @@ function patch(body: unknown): RequestInit {
 }
 
 describe("run HTTP routes", () => {
+  test("accepts and forwards an explicit hackathon opportunity kind", async () => {
+    let receivedOpportunityKind: RunDto["opportunityKind"] | undefined;
+    const target = service({
+      createRun: async (_jobUrl, _generateKeywordMap, _skipReview, _autoSubmit, _signal, opportunityKind) => {
+        receivedOpportunityKind = opportunityKind;
+        return { ...run, opportunityKind: "hackathon" };
+      },
+    });
+
+    const response = await request(target, "/v1/runs", post({
+      jobUrl: "https://hackathons.example.test/projects/climate-resilience/submissions/1",
+      opportunityKind: "hackathon",
+    }));
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ opportunityKind: "hackathon" });
+    expect(receivedOpportunityKind).toBe("hackathon");
+    expect(target.kickCount()).toBe(1);
+  });
+
   test("canonicalizes the job URL, forwards independent run modes and request signal, and kicks only after persistence succeeds", async () => {
     let received: {
       jobUrl: string;
       generateKeywordMap: boolean;
       skipReview: boolean;
       autoSubmit: boolean;
+      opportunityKind: "job" | "hackathon" | "competition" | "event" | undefined;
       signal: AbortSignal | undefined;
     } | undefined;
     const target = service({
-      createRun: async (jobUrl, generateKeywordMap, skipReview, autoSubmit, signal) => {
-        received = { jobUrl, generateKeywordMap, skipReview, autoSubmit, signal };
+      createRun: async (jobUrl, generateKeywordMap, skipReview, autoSubmit, signal, opportunityKind) => {
+        received = { jobUrl, generateKeywordMap, skipReview, autoSubmit, opportunityKind, signal };
         return { ...run, jobUrl, skipReview, autoSubmit };
       },
     });
@@ -125,13 +146,14 @@ describe("run HTTP routes", () => {
       generateKeywordMap: true,
       skipReview: true,
       autoSubmit: true,
+      opportunityKind: undefined,
       signal: incoming.signal,
     });
     expect(target.kickCount()).toBe(1);
 
     const failedTarget = service({
       createRun: async () => {
-        throw Object.assign(new Error("The page does not contain a usable job description"), {
+        throw Object.assign(new Error("The page does not contain a usable opportunity description"), {
           code: "JOB_DESCRIPTION_UNAVAILABLE",
           status: 422,
         });
@@ -142,7 +164,7 @@ describe("run HTTP routes", () => {
     expect(await failed.json()).toEqual({
       error: {
         code: "JOB_DESCRIPTION_UNAVAILABLE",
-        message: "The page does not contain a usable job description",
+        message: "The page does not contain a usable opportunity description",
       },
     });
     expect(failedTarget.kickCount()).toBe(0);
@@ -331,6 +353,7 @@ describe("run HTTP routes", () => {
       { jobUrl: "https://user:secret@example.test/job" },
       { jobUrl: "https://example.test/job", generateKeywordMap: "true" },
       { jobUrl: "https://example.test/job", skipReview: "true" },
+      { jobUrl: "https://example.test/job", opportunityKind: "conference" },
       { jobUrl: "https://example.test/job", autoSubmit: "true" },
       { jobUrl: "https://example.test/job", autoApply: true },
       { jobUrl: "https://example.test/job", extra: true },
@@ -373,12 +396,12 @@ describe("run HTTP routes", () => {
       {
         code: "JOB_EXTRACTION_UNAVAILABLE",
         status: 502,
-        message: "Job description extraction failed",
+        message: "Opportunity description extraction failed",
       },
       {
         code: "JOB_EXTRACTION_TIMEOUT",
         status: 504,
-        message: "Job description extraction timed out",
+        message: "Opportunity description extraction timed out",
       },
     ]) {
       const response = await request(service({
@@ -397,7 +420,7 @@ describe("run HTTP routes", () => {
 
     const authRequired = await request(service({
       createRun: async () => {
-        throw Object.assign(new Error("Connect OpenAI Codex OAuth before importing this job page"), {
+        throw Object.assign(new Error("Connect OpenAI Codex OAuth before importing this opportunity page"), {
           code: "JOB_EXTRACTION_AUTH_REQUIRED",
           status: 409,
         });
@@ -407,7 +430,7 @@ describe("run HTTP routes", () => {
     expect(await authRequired.json()).toEqual({
       error: {
         code: "JOB_EXTRACTION_AUTH_REQUIRED",
-        message: "Connect OpenAI Codex OAuth before importing this job page",
+        message: "Connect OpenAI Codex OAuth before importing this opportunity page",
       },
     });
 
