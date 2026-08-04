@@ -159,7 +159,7 @@ function transition(repository: PipelineRepository, claim: { runId: string; toke
   for (const stage of stages) repository.transition(claim, stage);
 }
 
-async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1.7\nreview", visualAcknowledgementRequired = false, keywordMapBytes?: string, tailoredTexBytes?: string): Promise<{ id: string; sha256: string; keywordMapId?: string; tailoredTexId?: string }> {
+async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1.7\nreview", visualAcknowledgementRequired = false, keywordMapBytes?: string, tailoredTexBytes?: string): Promise<{ id: string; sha256: string; keywordMapId?: string; keywordCoverageId?: string; tailoredTexId?: string }> {
   const claim = target.repository.acquire();
   if (!claim || claim.runId !== runId) throw new Error("claim missing");
   const run = target.repository.getRun(runId);
@@ -191,6 +191,7 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
       byteSize: tex.bytes,
     }).id;
   }
+  let keywordCoverageId: string | undefined;
   let keywordMapId: string | undefined;
   if (keywordMapBytes !== undefined) {
     const map = await target.artifacts.write(join(root, "keyword-map.pdf"), keywordMapBytes, 10 * 1024 * 1024);
@@ -203,6 +204,24 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
       byteSize: map.bytes,
       sourceArtifactId: artifact.id,
     }).id;
+    const coverage = await target.artifacts.write(
+      join(root, "keyword-map.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        pdfSha256: artifact.sha256,
+        keywords: [{ id: "keyword-platform", phrase: "Platform", found: true }],
+      }),
+      1024 * 1024,
+    );
+    keywordCoverageId = target.repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "keyword-map",
+      sha256: coverage.sha256,
+      path: coverage.path,
+      byteSize: coverage.bytes,
+      sourceArtifactId: artifact.id,
+    }).id;
   }
   target.repository.finishAttempt(claim, attempt.id, "succeeded");
   target.repository.transition(claim, "review", { visualAcknowledgementRequired });
@@ -211,6 +230,7 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
     id: artifact.id,
     sha256: artifact.sha256,
     ...(keywordMapId ? { keywordMapId } : {}),
+    ...(keywordCoverageId ? { keywordCoverageId } : {}),
     ...(tailoredTexId ? { tailoredTexId } : {}),
   };
 }
@@ -1163,10 +1183,25 @@ describe("RunApplicationService", () => {
     expect(map?.headers.get("content-disposition")).toBe('inline; filename="keyword-map-pdf.pdf"');
     expect(await map?.text()).toBe("%PDF-1.7\nkeyword-map");
 
+    const coverage = await target.service.getArtifact(run.id, pdf.keywordCoverageId!);
+    expect(coverage?.status).toBe(200);
+    expect(coverage?.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(coverage?.headers.get("content-disposition")).toBe('attachment; filename="keyword-map.json"');
+    expect(await coverage?.json()).toMatchObject({
+      schemaVersion: 1,
+      pdfSha256: pdf.sha256,
+      keywords: [{ id: "keyword-platform", phrase: "Platform", found: true }],
+    });
+
     const dto = RunDtoSchema.parse(await target.service.getRun(run.id));
     expect(dto?.artifacts.find((artifact) => artifact.id === pdf.keywordMapId)).toMatchObject({
       kind: "keyword-map-pdf",
       mediaType: "application/pdf",
+      public: true,
+    });
+    expect(dto?.artifacts.find((artifact) => artifact.id === pdf.keywordCoverageId)).toMatchObject({
+      kind: "keyword-map",
+      mediaType: "application/json; charset=utf-8",
       public: true,
     });
     expect(dto.artifacts.find((artifact) => artifact.id === latestExtraction.id)).toMatchObject({

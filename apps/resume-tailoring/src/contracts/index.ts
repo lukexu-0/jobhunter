@@ -315,6 +315,32 @@ export const ResumeDiffSchema = z.object({
 });
 export type ResumeDiff = z.infer<typeof ResumeDiffSchema>;
 
+const ResumeKeywordCoverageEntrySchema = z.object({
+  id: z.string().trim().min(1).max(200),
+  phrase: z.string().trim().min(1).max(2_000),
+  found: z.boolean(),
+}).strict();
+
+export const ResumeKeywordCoverageSchema = z.object({
+  schemaVersion: z.literal(1),
+  pdfSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  keywords: z.array(ResumeKeywordCoverageEntrySchema).min(1).max(100).readonly(),
+}).strict().superRefine((coverage, ctx) => {
+  const keywordIds = coverage.keywords.map((keyword) => keyword.id);
+  if (new Set(keywordIds).size !== keywordIds.length) {
+    ctx.addIssue({ code: "custom", path: ["keywords"], message: "keyword IDs must be unique" });
+  }
+  const normalizedPhrases = coverage.keywords.map((keyword) => keyword.phrase.toLocaleLowerCase());
+  if (new Set(normalizedPhrases).size !== normalizedPhrases.length) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["keywords"],
+      message: "keyword phrases must be unique case-insensitively",
+    });
+  }
+});
+export type ResumeKeywordCoverage = z.infer<typeof ResumeKeywordCoverageSchema>;
+
 export const ArtifactKindSchema = z.enum([
   "job-analysis",
   "ats-keyword-extraction",
@@ -326,6 +352,7 @@ export const ArtifactKindSchema = z.enum([
   "latex-log",
   "compiled-pdf",
   "keyword-map-pdf",
+  "keyword-map",
   "page-image",
   "deterministic-qa",
   "visual-qa",

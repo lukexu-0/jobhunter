@@ -7,6 +7,10 @@ import {
   type PDFFont,
   type PDFPage,
 } from "pdf-lib";
+import {
+  ResumeKeywordCoverageSchema,
+  type ResumeKeywordCoverage,
+} from "../contracts/index.ts";
 import { ARTIFACT_LIMITS, type ArtifactMetadata, type ArtifactStore } from "../system/artifacts.ts";
 import { runTrustedProcess, type ProcessBoundary } from "../system/process.ts";
 import type { AtsKeywordExtraction, JobAnalysis } from "./types.ts";
@@ -21,6 +25,7 @@ const TEXT_TOP = PAGE_HEIGHT - 24;
 const TEXT_BOTTOM = 24;
 const BBOX_OUTPUT_LIMIT = 4 * 1024 * 1024;
 const BBOX_TIMEOUT_MS = 30_000;
+const KEYWORD_COVERAGE_OUTPUT_LIMIT = 1024 * 1024;
 const RED = rgb(0.85, 0.05, 0.05);
 const YELLOW = rgb(1, 0.85, 0);
 const LIGHT_GRAY = rgb(0.82, 0.82, 0.82);
@@ -51,6 +56,11 @@ export interface KeywordMapRequest {
   readonly atsKeywordExtraction: AtsKeywordExtraction;
   readonly signal?: AbortSignal;
   readonly processBoundary?: ProcessBoundary;
+}
+
+export interface RenderedKeywordMapArtifacts {
+  readonly pdf: ArtifactMetadata;
+  readonly coverage: ArtifactMetadata;
 }
 
 export interface BboxWord {
@@ -92,6 +102,7 @@ interface KeywordMatch {
 interface KeywordHighlights {
   readonly matches: readonly KeywordMatch[];
   readonly unmatchedJobBoxes: readonly BoxRange[];
+  readonly coverage: ResumeKeywordCoverage["keywords"];
 }
 
 interface ResumeLayout {
@@ -358,6 +369,47 @@ function findPhrase(boxes: readonly WordBox[], phrase: string): BoxRange | undef
   return undefined;
 }
 
+function boxesAreContinuous(left: WordBox, right: WordBox): boolean {
+  if (left.page !== right.page) return false;
+  if (sameVisualTextLine(left, right)) return true;
+  return Math.abs(left.y - right.y) <= Math.max(left.height, right.height) * 3;
+}
+
+function hasPhrase(boxes: readonly WordBox[], phrase: string): boolean {
+  const tokens = canonicalTokens(phrase);
+  if (tokens.length === 0) return false;
+  const indexedTokens: Array<{ token: string | null; boxIndex: number }> = [];
+  for (const [boxIndex, box] of boxes.entries()) {
+    const boxTokens = canonicalTokens(box.text);
+    if (boxTokens.length === 0) {
+      indexedTokens.push({ token: null, boxIndex });
+      continue;
+    }
+    for (const token of boxTokens) indexedTokens.push({ token, boxIndex });
+  }
+  for (let start = 0; start + tokens.length <= indexedTokens.length; start++) {
+    let matches = true;
+    for (let offset = 0; offset < tokens.length; offset++) {
+      const indexedToken = indexedTokens[start + offset]!;
+      const previousToken = offset > 0 ? indexedTokens[start + offset - 1]! : undefined;
+      if (
+        indexedToken.token !== tokens[offset]
+        || (previousToken
+          && previousToken.boxIndex !== indexedToken.boxIndex
+          && !boxesAreContinuous(
+            boxes[previousToken.boxIndex]!,
+            boxes[indexedToken.boxIndex]!,
+          ))
+      ) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return true;
+  }
+  return false;
+}
+
 
 function keywordMatches(
   atsKeywordExtraction: AtsKeywordExtraction,
@@ -367,6 +419,7 @@ function keywordMatches(
 ): KeywordHighlights {
   const matches: KeywordMatch[] = [];
   const unmatchedJobBoxes: BoxRange[] = [];
+  const coverage: Array<ResumeKeywordCoverage["keywords"][number]> = [];
   for (const keyword of atsKeywordExtraction.keywords) {
     const evidenceBackedKeyword = analysis.jdKeywords.find((candidate) =>
       candidate.id === keyword.id
@@ -380,15 +433,16 @@ function keywordMatches(
           .map((edit) => edit.after)
         : []),
     ];
-    const job = findPhrase(jobBoxes, keyword.phrase);
-    if (!job) continue;
     const resume = resumeCandidates
       .map((candidate) => findPhrase(resumeBoxes, candidate))
       .find(Boolean);
+    coverage.push({ id: keyword.id, phrase: keyword.phrase, found: hasPhrase(resumeBoxes, keyword.phrase) });
+    const job = findPhrase(jobBoxes, keyword.phrase);
+    if (!job) continue;
     if (resume) matches.push({ resume, job });
     else unmatchedJobBoxes.push(job);
   }
-  return { matches, unmatchedJobBoxes };
+  return { matches, unmatchedJobBoxes, coverage };
 }
 
 function drawBox(page: PDFPage, box: BoxRange): void {
@@ -509,7 +563,10 @@ async function extractBbox(request: KeywordMapRequest): Promise<ParsedBboxPage> 
   return parsePdftotextBbox(xml);
 }
 
-export async function renderKeywordMapPdf(request: KeywordMapRequest): Promise<ArtifactMetadata> {
+async function buildKeywordMap(request: KeywordMapRequest): Promise<{
+  readonly bytes: Uint8Array;
+  readonly coverage: ResumeKeywordCoverage;
+}> {
   request.signal?.throwIfAborted();
   const compiledBytes = await request.artifacts.read(request.compiledPdf.path, ARTIFACT_LIMITS.pdf);
   const [source, bbox] = await Promise.all([
@@ -567,10 +624,37 @@ export async function renderKeywordMapPdf(request: KeywordMapRequest): Promise<A
   for (const [pageIndex, page] of pages.entries()) drawPageMatches(page, highlights, pageIndex);
   request.signal?.throwIfAborted();
   const bytes = await output.save({ useObjectStreams: false, addDefaultPage: false });
+  const coverage = ResumeKeywordCoverageSchema.parse({
+    schemaVersion: 1,
+    pdfSha256: request.compiledPdf.sha256,
+    keywords: highlights.coverage,
+  });
+  request.signal?.throwIfAborted();
+  return { bytes, coverage };
+}
+
+export async function renderKeywordMapPdf(request: KeywordMapRequest): Promise<ArtifactMetadata> {
+  const rendered = await buildKeywordMap(request);
   request.signal?.throwIfAborted();
   return await request.artifacts.write(
     join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
-    bytes,
+    rendered.bytes,
     ARTIFACT_LIMITS.pdf,
   );
+}
+
+export async function renderKeywordMapArtifacts(request: KeywordMapRequest): Promise<RenderedKeywordMapArtifacts> {
+  const rendered = await buildKeywordMap(request);
+  request.signal?.throwIfAborted();
+  const pdf = await request.artifacts.write(
+    join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
+    rendered.bytes,
+    ARTIFACT_LIMITS.pdf,
+  );
+  const coverage = await request.artifacts.write(
+    join(dirname(request.compiledPdf.path), "keyword-map.json"),
+    `${JSON.stringify(rendered.coverage, null, 2)}\n`,
+    KEYWORD_COVERAGE_OUTPUT_LIMIT,
+  );
+  return { pdf, coverage };
 }

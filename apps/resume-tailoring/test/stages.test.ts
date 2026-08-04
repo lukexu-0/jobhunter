@@ -431,11 +431,25 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     keywordMapRenderer: options.keywordMapRenderer ?? (async (request) => {
       keywordMapCalls.count += 1;
       keywordMapCalls.requests.push(request);
-      return await request.artifacts.write(
+      const pdf = await request.artifacts.write(
         join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
         "%PDF-1.7\nkeyword-map",
         ARTIFACT_LIMITS.pdf,
       );
+      const coverage = await request.artifacts.write(
+        join(dirname(request.compiledPdf.path), "keyword-map.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          pdfSha256: request.compiledPdf.sha256,
+          keywords: request.atsKeywordExtraction.keywords.map((keyword) => ({
+            id: keyword.id,
+            phrase: keyword.phrase,
+            found: false,
+          })),
+        }),
+        1024 * 1024,
+      );
+      return { pdf, coverage };
     }),
     deterministicQa: options.deterministicQa ?? (async () => deterministicReports.shift()
       ?? (options.deterministicPass === false
@@ -817,6 +831,8 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       expect(harness.keywordMapCalls.count).toBe(generateKeywordMap ? 1 : 0);
       expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf") !== null)
         .toBe(generateKeywordMap);
+      expect(harness.repository.getArtifact(harness.runId, "keyword-map") !== null)
+        .toBe(generateKeywordMap);
     }
   });
 
@@ -956,6 +972,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       .toBe(compilingAttempts[2]?.id);
     expect(harness.keywordMapCalls.count).toBe(1);
     expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).not.toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map")).not.toBeNull();
   });
 
   test("allows exactly five automatic one-page correction cycles after the initial attempt", async () => {
@@ -1006,6 +1023,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "deterministic_qa" });
     expect(harness.repository.getArtifact(harness.runId, "compiled-pdf")).not.toBeNull();
     expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map")).toBeNull();
     expect(harness.repository.timeline(harness.runId).attempts.find((attempt) => attempt.stage === "deterministic_qa")).toMatchObject({
       status: "failed",
     });
@@ -1036,6 +1054,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     });
     expect(harness.keywordMapCalls.count).toBe(0);
     expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map")).toBeNull();
   });
 
   test("finalizes neither analyzing product when ATS extraction fails", async () => {
