@@ -13,6 +13,7 @@ import { RunServiceError } from "../src/api/run-service";
 import type {
   ApplicationSessionEventDto,
   ApplicationSessionSnapshotDto,
+  ApplicationSessionCommand,
   ApplicationSessionView,
   ResumeIterationListResponse,
   RunDto,
@@ -822,6 +823,46 @@ describe("application session HTTP routes", () => {
   });
 
 
+  test("allows only navigation or credential markers while awaiting human navigation", async () => {
+    const pendingActions = [
+      { type: "credentials" as const },
+      {
+        type: "human_navigation" as const,
+        instruction: "Complete the CAPTCHA.",
+      },
+    ];
+    for (const pendingAction of pendingActions) {
+      const snapshot: ApplicationSessionSnapshotDto = {
+        ...applicationSnapshot,
+        bridgeState: "awaiting_human_navigation",
+        harnessState: "awaiting_human_navigation",
+        pendingAction,
+      };
+      const response = await applicationRequest(
+        applicationService({ get: async () => snapshot }),
+        "/v1/runs/run-1/application",
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        bridgeState: "awaiting_human_navigation",
+        pendingAction,
+      });
+    }
+
+    const invalid = await applicationRequest(
+      applicationService({
+        get: async () => ({
+          ...applicationSnapshot,
+          pendingAction: { type: "credentials" },
+        }),
+      }),
+      "/v1/runs/run-1/application",
+    );
+    expect(invalid.status).toBe(500);
+    expect(await invalid.json()).toEqual({
+      error: { code: "INTERNAL_ERROR", message: "Request failed" },
+    });
+  });
   test("retries, sends a validated command, and closes with empty no-store responses", async () => {
     const calls: string[] = [];
     const target = applicationService({
@@ -870,6 +911,56 @@ describe("application session HTTP routes", () => {
       "command:run%20one:{\"type\":\"revise\",\"context\":\"Emphasize the platform work.\"}",
       "close:run%20one",
     ]);
+  });
+
+  test("forwards credentials with Python username stripping and exact passwords", async () => {
+    const received: ApplicationSessionCommand[] = [];
+    const target = applicationService({
+      command: async (_runId, command) => {
+        received.push(command);
+      },
+    });
+    const signInPassword = "  exact sign-in password  ";
+    const savedPassword = " exact saved password ";
+    const inputs = [
+      {
+        type: "sign_in",
+        username: "\u001c\u0085applicant@example.test\u001f",
+        password: signInPassword,
+      },
+      {
+        type: "save_credentials",
+        username: "\ufeffsaved@example.test\ufeff",
+        password: savedPassword,
+      },
+    ] as const;
+
+    const responses: Response[] = [];
+    for (const command of inputs) {
+      responses.push(await applicationRequest(
+        target,
+        "/v1/runs/run-1/application/commands",
+        post(command),
+      ));
+    }
+
+    expect(received).toEqual([
+      {
+        type: "sign_in",
+        username: "applicant@example.test",
+        password: signInPassword,
+      },
+      {
+        type: "save_credentials",
+        username: "\ufeffsaved@example.test\ufeff",
+        password: savedPassword,
+      },
+    ]);
+    for (const response of responses) {
+      expect(response.status).toBe(202);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.text()).toBe("");
+    }
   });
 
   test("rejects malformed requests through the public Origin and JSON boundary", async () => {
@@ -972,6 +1063,29 @@ describe("application session HTTP routes", () => {
       { type: "approve_origin", origin: "https://example.test/path" },
       { type: "provide_additional_info", answers: [] },
       { type: "ready" },
+      { type: "sign_in", username: " ", password: "private" },
+      { type: "sign_in", username: "😀".repeat(321), password: "private" },
+      { type: "sign_in", username: "applicant@example.test", password: "" },
+      { type: "sign_in", username: "\ud800", password: "private" },
+      { type: "sign_in", username: "applicant@example.test", password: "\udfff" },
+      { type: "sign_in", username: "applicant\u0000@example.test", password: "private" },
+      {
+        type: "save_credentials",
+        username: "applicant@example.test",
+        password: "private\u0000password",
+      },
+      {
+        type: "sign_in",
+        username: "applicant@example.test",
+        password: "😀".repeat(4_097),
+      },
+      {
+        type: "sign_in",
+        username: "applicant@example.test",
+        password: "private",
+        extra: true,
+      },
+      { type: "save_credentials", username: "applicant@example.test" },
     ]) {
       const response = await applicationRequest(
         target,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path, PurePath
@@ -13,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     StringConstraints,
     field_validator,
     model_serializer,
@@ -117,6 +119,20 @@ WarningText = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=1_000),
 ]
+_ELEMENT_REF_PATTERN = re.compile(r"^e[1-9][0-9]{0,8}$")
+ElementRef = Annotated[
+    str,
+    StringConstraints(strict=True, pattern=r"^e[1-9][0-9]{0,8}$"),
+]
+def _is_unicode_scalar_text(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+
 
 AdditionalInfoQuestionId = Annotated[
     str,
@@ -521,6 +537,7 @@ class HarnessConfig(FrozenPrivateModel):
     user_info_json: Path = Path(
         "apps/user-info/current-context/personal/user-info.json"
     )
+    credentials_json: Path = Path("~/.jobhunter/browser-harness/credentials.json")
     browser: BrowserLaunchConfig = Field(default_factory=BrowserLaunchConfig)
 
     @field_validator("pipeline_url")
@@ -664,6 +681,10 @@ class HumanNavigationPendingAction(PublicModel):
         StringConstraints(strict=True, min_length=1, max_length=2_000),
     ]
 
+class CredentialsPendingAction(PublicModel):
+    type: Literal["credentials"]
+
+
 
 class OriginApprovalPendingAction(PublicModel):
     type: Literal["origin_approval"]
@@ -686,6 +707,7 @@ class HumanReviewPendingAction(PublicModel):
 
 PendingAction: TypeAlias = Annotated[
     HumanNavigationPendingAction
+    | CredentialsPendingAction
     | OriginApprovalPendingAction
     | AdditionalInfoPendingAction
     | HumanReviewPendingAction,
@@ -749,8 +771,14 @@ class SessionSnapshot(PublicModel):
             raise ValueError("failed sessions require an error")
         if self.state != "failed" and self.error is not None:
             raise ValueError("only failed sessions may contain an error")
-        pending_types: dict[str, type[PublicModel]] = {
-            "awaiting_human_navigation": HumanNavigationPendingAction,
+        pending_types: dict[
+            str,
+            type[PublicModel] | tuple[type[PublicModel], ...],
+        ] = {
+            "awaiting_human_navigation": (
+                HumanNavigationPendingAction,
+                CredentialsPendingAction,
+            ),
             "awaiting_origin_approval": OriginApprovalPendingAction,
             "awaiting_additional_info": AdditionalInfoPendingAction,
             "awaiting_human_review": HumanReviewPendingAction,
@@ -831,6 +859,7 @@ HarnessEventType: TypeAlias = Literal[
     "cancelled",
     "failed",
     "closed",
+    "credentials_required",
 ]
 
 
@@ -860,6 +889,51 @@ class HarnessEvent(PublicModel):
         if not isinstance(self.detail, expected):
             raise ValueError(f"detail does not match {self.event}")
         return self
+
+class _CredentialCommandBase(PublicModel):
+    username: SecretStr = Field(repr=False)
+    password: SecretStr = Field(repr=False)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def _validate_username(cls, value: object) -> SecretStr:
+        if not isinstance(value, str):
+            raise ValueError("username is invalid")
+        trimmed = value.strip()
+        if (
+            not 1 <= len(trimmed) <= 320
+            or "\x00" in trimmed
+            or not _is_unicode_scalar_text(trimmed)
+        ):
+            raise ValueError("username is invalid")
+        return SecretStr(trimmed)
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def _validate_password(cls, value: object) -> SecretStr:
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= 4_096
+            or not _is_unicode_scalar_text(value)
+            or "\x00" in value
+        ):
+            raise ValueError("password is invalid")
+        return SecretStr(value)
+
+    def credentials(self) -> tuple[str, str]:
+        return (
+            self.username.get_secret_value(),
+            self.password.get_secret_value(),
+        )
+
+
+class SignInCommand(_CredentialCommandBase):
+    type: Literal["sign_in"]
+
+
+class SaveCredentialsCommand(_CredentialCommandBase):
+    type: Literal["save_credentials"]
+
 
 
 class ContinueCommand(PublicModel):
@@ -917,7 +991,9 @@ SessionCommand: TypeAlias = Annotated[
     | ReviseCommand
     | SubmitCommand
     | CancelCommand
-    | ProvideAdditionalInfoCommand,
+    | ProvideAdditionalInfoCommand
+    | SignInCommand
+    | SaveCredentialsCommand,
     Field(discriminator="type"),
 ]
 
@@ -1137,6 +1213,20 @@ class RequestHumanNavigationRuntimeAction(PublicModel):
             max_length=2_000,
         ),
     ]
+class RequestSignInRuntimeAction(PublicModel):
+    type: Literal["request_sign_in"]
+    username_ref: ElementRef
+    password_ref: ElementRef
+    submit_ref: ElementRef
+
+    @field_validator("username_ref", "password_ref", "submit_ref")
+    @classmethod
+    def _validate_ref(cls, value: str) -> str:
+        if _ELEMENT_REF_PATTERN.fullmatch(value) is None:
+            raise ValueError("element ref is invalid")
+        return value
+
+
 
 
 class RequestAdditionalInfoRuntimeAction(PublicModel):
@@ -1163,6 +1253,7 @@ class ReportApplicationMismatchRuntimeAction(PublicModel):
 RuntimeActionRequest: TypeAlias = Annotated[
     PlaywrightCliRuntimeAction
     | RequestHumanNavigationRuntimeAction
+    | RequestSignInRuntimeAction
     | RequestAdditionalInfoRuntimeAction
     | RequestHumanReviewRuntimeAction
     | ReportApplicationMismatchRuntimeAction,
@@ -1172,6 +1263,11 @@ RuntimeActionRequest: TypeAlias = Annotated[
 
 class PlaywrightCliResultRuntimeActionResponse(PlaywrightCliExecutionResult):
     type: Literal["playwright_cli_result"]
+
+class SignInRuntimeActionResponse(PublicModel):
+    type: Literal["sign_in"]
+    status: Literal["attempted", "saved"]
+
 
 
 class ContinueRuntimeActionResponse(PublicModel):
@@ -1214,6 +1310,7 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 
 RuntimeActionResponse: TypeAlias = Annotated[
     PlaywrightCliResultRuntimeActionResponse
+    | SignInRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | ReviseRuntimeActionResponse
     | SubmitRuntimeActionResponse

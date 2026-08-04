@@ -11,6 +11,7 @@ import type {
   ApplicationSessionSnapshotDto,
 } from "@jobhunter/pipeline/contracts";
 import { ApplicationAdditionalInfoForm } from "./application-additional-info-form";
+import { ApplicationCredentialsForm } from "./application-credentials-form";
 import { ApplicationReviewGate } from "./application-review-gate";
 import styles from "../run-detail.module.css";
 
@@ -66,6 +67,8 @@ const ACTION_STATUS_LABELS: Readonly<Record<ApplicationPanelAction, string>> = {
   cancel: "Cancelling application",
   close: "Closing browser",
   continue: "Continuing application",
+  sign_in: "Signing in with credentials",
+  save_credentials: "Saving credentials",
   approve_origin: "Approving origin",
   provide_additional_info: "Answering questions",
   revise: "Requesting application revision",
@@ -131,14 +134,20 @@ export function ApplicationSessionPanel({
   const submitting = snapshot.bridgeState === "submitting";
   const retryableTerminal = terminal && !finalSubmission;
   const busy = actionBusy !== null;
+  const cancelDisabled = busy
+    && actionBusy !== "sign_in"
+    && actionBusy !== "save_credentials";
   const pendingAction = snapshot.pendingAction;
   const commandBusy =
     actionBusy === "close" || actionBusy === "resume" || actionBusy === "retry"
       ? null
       : actionBusy;
-  const stateLabel = actionBusy
-    ? `${STATE_LABELS[snapshot.bridgeState]} — ${ACTION_STATUS_LABELS[actionBusy]}`
+  const baseStateLabel = pendingAction?.type === "credentials"
+    ? "Waiting for credentials"
     : STATE_LABELS[snapshot.bridgeState];
+  const stateLabel = actionBusy
+    ? `${baseStateLabel} — ${ACTION_STATUS_LABELS[actionBusy]}`
+    : baseStateLabel;
 
   return (
     <section className={styles.workspaceSection} aria-label="Application">
@@ -200,7 +209,14 @@ export function ApplicationSessionPanel({
         </div>
       </div>
 
-      {pendingAction?.type === "human_navigation" ? (
+      {pendingAction?.type === "credentials" ? (
+        <ApplicationCredentialsForm
+          key={`${snapshot.generation}:credentials`}
+          busy={busy}
+          busyAction={commandBusy}
+          onSubmit={onCommand}
+        />
+      ) : pendingAction?.type === "human_navigation" ? (
         <div className={styles.applicationGate}>
           <h3>Navigation needed</h3>
           <p>{pendingAction.instruction}</p>
@@ -286,7 +302,7 @@ export function ApplicationSessionPanel({
             ) : null}
             <button
               className={styles.secondaryButton}
-              disabled={busy}
+              disabled={cancelDisabled}
               onClick={() => void onCancel()}
               type="button"
             >

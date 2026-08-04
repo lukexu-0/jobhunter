@@ -5,6 +5,7 @@ import {
   ApplicationSessionPanel,
   simpleApplicationGateCommand,
 } from "../app/components/application-session-panel";
+import { buildApplicationCredentialCommand } from "../app/components/application-credentials-form";
 
 function snapshot(
   overrides: Partial<ApplicationSessionSnapshotDto> = {},
@@ -192,6 +193,177 @@ describe("ApplicationSessionPanel", () => {
     expect(originMarkup).toContain("https://apply.example.com");
     expect(originMarkup).toContain("Restart required");
     expect(originMarkup).not.toContain("Approve origin");
+  });
+
+  test("builds strict credential commands with trimmed usernames and exact passwords", () => {
+    expect(buildApplicationCredentialCommand(
+      "sign_in",
+      "  applicant@example.test  ",
+      "  exact password  ",
+    )).toEqual({
+      success: true,
+      command: {
+        type: "sign_in",
+        username: "applicant@example.test",
+        password: "  exact password  ",
+      },
+    });
+    expect(buildApplicationCredentialCommand(
+      "sign_in",
+      "\u001c\u001dapplicant@example.test\u001e\u001f",
+      "password",
+    )).toEqual({
+      success: true,
+      command: {
+        type: "sign_in",
+        username: "applicant@example.test",
+        password: "password",
+      },
+    });
+    expect(buildApplicationCredentialCommand(
+      "save_credentials",
+      "\ufeffaccount-name\ufeff",
+      "password",
+    )).toEqual({
+      success: true,
+      command: {
+        type: "save_credentials",
+        username: "\ufeffaccount-name\ufeff",
+        password: "password",
+      },
+    });
+    expect(buildApplicationCredentialCommand(
+      "save_credentials",
+      "account-name",
+      "password",
+    )).toEqual({
+      success: true,
+      command: {
+        type: "save_credentials",
+        username: "account-name",
+        password: "password",
+      },
+    });
+    expect(buildApplicationCredentialCommand(
+      "sign_in",
+      "\u{1f642}".repeat(320),
+      "\u{1f642}".repeat(4_096),
+    ).success).toBeTrue();
+    expect(buildApplicationCredentialCommand(
+      "sign_in",
+      "\u{1f642}".repeat(321),
+      "password",
+    )).toEqual({
+      success: false,
+      field: "username",
+      message: "Enter a username or email between 1 and 320 characters.",
+    });
+    expect(buildApplicationCredentialCommand(
+      "sign_in",
+      "\u001c",
+      "password",
+    )).toEqual({
+      success: false,
+      field: "username",
+      message: "Enter a username or email between 1 and 320 characters.",
+    });
+    expect(buildApplicationCredentialCommand(
+      "sign_in",
+      "\ud800",
+      "password",
+    )).toEqual({
+      success: false,
+      field: "username",
+      message: "Enter a username or email between 1 and 320 characters.",
+    });
+    expect(buildApplicationCredentialCommand(
+      "sign_in",
+      "account\u0000name",
+      "password",
+    )).toEqual({
+      success: false,
+      field: "username",
+      message: "Enter a username or email between 1 and 320 characters.",
+    });
+    expect(buildApplicationCredentialCommand(
+      "save_credentials",
+      "account-name",
+      "\udfff",
+    )).toEqual({
+      success: false,
+      field: "password",
+      message: "Enter a password between 1 and 4,096 characters.",
+    });
+    expect(buildApplicationCredentialCommand(
+      "save_credentials",
+      "account-name",
+      "pass\u0000word",
+    )).toEqual({
+      success: false,
+      field: "password",
+      message: "Enter a password between 1 and 4,096 characters.",
+    });
+    expect(buildApplicationCredentialCommand(
+      "save_credentials",
+      "account-name",
+      "\u{1f642}".repeat(4_097),
+    )).toEqual({
+      success: false,
+      field: "password",
+      message: "Enter a password between 1 and 4,096 characters.",
+    });
+  });
+
+  test("renders one accessible masked credential form with exactly two actions", () => {
+    const markup = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "awaiting_human_navigation",
+          harnessState: "awaiting_human_navigation",
+          pendingAction: { type: "credentials" },
+        })}
+      />,
+    );
+    const formStart = markup.indexOf("<form");
+    const formEnd = markup.indexOf("</form>", formStart);
+    const formMarkup = markup.slice(formStart, formEnd);
+    const normalizedMarkup = markup.toLowerCase();
+
+    expect(markup).toContain("Credentials needed");
+    expect(markup).toContain("Username or email");
+    expect(markup).toContain("Password");
+    expect(normalizedMarkup.match(/autocomplete="off"/g)).toHaveLength(2);
+    expect(normalizedMarkup).toContain('autocomplete="new-password"');
+    expect(normalizedMarkup).not.toContain('autocomplete="current-password"');
+    expect(normalizedMarkup).not.toContain('autocomplete="username"');
+    expect(normalizedMarkup).toContain('type="password"');
+    expect(markup).toContain("Sign in with credentials");
+    expect(markup).toContain("Save credentials");
+    expect(markup).toContain("private local credential file");
+    expect(markup).toContain("after creating an account in headed Chrome");
+    expect(formMarkup.match(/<button/g)).toHaveLength(2);
+    expect(formMarkup).not.toContain("Continue application");
+
+    const busyMarkup = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        actionBusy="sign_in"
+        snapshot={snapshot({
+          bridgeState: "awaiting_human_navigation",
+          harnessState: "awaiting_human_navigation",
+          pendingAction: { type: "credentials" },
+        })}
+      />,
+    );
+    const cancelLabel = busyMarkup.indexOf("Cancel application");
+    const cancelMarkup = busyMarkup.slice(
+      busyMarkup.lastIndexOf("<button", cancelLabel),
+      cancelLabel,
+    );
+    expect(busyMarkup).toContain("Signing in\u2026");
+    expect(busyMarkup).toContain("disabled");
+    expect(cancelMarkup).not.toContain("disabled");
   });
 
   test("renders every additional-information question as an accessible choice group", () => {

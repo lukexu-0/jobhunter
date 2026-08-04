@@ -249,6 +249,18 @@ export const PlaywrightCliRuntimeActionSchema = z.object({
 }).strict().superRefine(validatePlaywrightCliInvocation);
 export type PlaywrightCliRuntimeAction = z.infer<typeof PlaywrightCliRuntimeActionSchema>;
 
+export const PlaywrightSnapshotElementRefSchema = z.string().regex(/^e[1-9][0-9]{0,8}$/);
+
+export const RequestSignInRuntimeActionSchema = z.object({
+  type: z.literal("request_sign_in"),
+  username_ref: PlaywrightSnapshotElementRefSchema,
+  password_ref: PlaywrightSnapshotElementRefSchema,
+  submit_ref: PlaywrightSnapshotElementRefSchema,
+}).strict();
+export type RequestSignInRuntimeAction = z.infer<
+  typeof RequestSignInRuntimeActionSchema
+>;
+
 export const RequestHumanNavigationRuntimeActionSchema = z.object({
   type: z.literal("request_human_navigation"),
   instruction: z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
@@ -297,6 +309,7 @@ export type ReportApplicationMismatchRuntimeAction = z.infer<
 
 export const RuntimeActionRequestSchema = z.discriminatedUnion("type", [
   PlaywrightCliRuntimeActionSchema,
+  RequestSignInRuntimeActionSchema,
   RequestHumanNavigationRuntimeActionSchema,
   RequestAdditionalInfoRuntimeActionSchema,
   RequestHumanReviewRuntimeActionSchema,
@@ -346,6 +359,14 @@ export const PlaywrightCliResultRuntimeActionResponseSchema = PlaywrightCliExecu
 }).strict();
 export type PlaywrightCliResultRuntimeActionResponse = z.infer<
   typeof PlaywrightCliResultRuntimeActionResponseSchema
+>;
+
+export const SignInRuntimeActionResponseSchema = z.object({
+  type: z.literal("sign_in"),
+  status: z.enum(["attempted", "saved"]),
+}).strict();
+export type SignInRuntimeActionResponse = z.infer<
+  typeof SignInRuntimeActionResponseSchema
 >;
 
 export const ContinueRuntimeActionResponseSchema = z.object({
@@ -446,6 +467,7 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   PlaywrightCliResultRuntimeActionResponseSchema,
+  SignInRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   ReviseRuntimeActionResponseSchema,
   SubmitRuntimeActionResponseSchema,

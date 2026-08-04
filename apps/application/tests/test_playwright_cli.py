@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
+from urllib.parse import quote
 
 import pytest
 
@@ -95,6 +96,227 @@ def session_dir(tmp_path: Path) -> Path:
     d = tmp_path / "session"
     d.mkdir(mode=0o700)
     return d
+
+
+
+
+def test_private_redaction_fragments_match_pinned_yaml_and_json_escaping() -> None:
+    secret = "\\\"\b\f\n\r\t" + chr(1) + chr(0x1F) + chr(0x7F) + chr(0x9F)
+    yaml_fragment = (
+        "\\\\"
+        '\\"'
+        "\\b"
+        "\\f"
+        "\\n"
+        "\\r"
+        "\\t"
+        "\\x01"
+        "\\x1f"
+        "\\x7f"
+        "\\x9f"
+    )
+    assert playwright_cli._yaml_value_fragment(secret) == yaml_fragment
+    fragments = playwright_cli._private_redaction_fragments(
+        (secret, "O'Brien{", "雪")
+    )
+    assert secret in fragments
+    assert yaml_fragment in fragments
+    assert "O''Brien{" in fragments
+    assert "\\u96ea" in fragments
+    assert quote("雪", safe="") in fragments
+
+@pytest.mark.asyncio
+async def test_private_observation_redacts_before_public_field_limits(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    password = "😀" * 4_096
+    username = "U" * 320
+    mixed_secret = "mixed😀"
+    literal_percent_secret = "secret%aFword"
+    encoded_password = quote(password, safe="")
+    double_encoded_secret = quote(quote("private%value", safe=""), safe="")
+    full_url = f"https://example.com/?secret=x{encoded_password}"
+    raw_url = full_url[: playwright_cli._MAX_URL_CAPTURE_CHARS]
+    raw_title = f"x{password}"
+    raw_metadata = {
+        "url": raw_url,
+        "title": raw_title,
+        "currentIndex": 0,
+        "tabs": [
+            {"url": raw_url, "title": raw_title}
+            for _ in range(playwright_cli._MAX_TABS)
+        ],
+    }
+    invocation_payload = json.dumps(
+        {"result": json.dumps(raw_metadata)}
+    ).encode("utf-8")
+    capture_limits: list[int] = []
+    scripts: list[str] = []
+
+    async def invoke(
+        _command: str,
+        args: Sequence[str] = (),
+        *,
+        capture_limit: int = playwright_cli._MAX_CAPTURE_BYTES,
+        **_kwargs: Any,
+    ) -> playwright_cli._InvocationResult:
+        capture_limits.append(capture_limit)
+        scripts.extend(args)
+        return playwright_cli._InvocationResult(
+            exit_code=0,
+            timed_out=False,
+            stdout=invocation_payload,
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000099"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        cli_script=cli_script,
+    )
+    runtime._activate_private_values_unlocked(
+        (
+            username,
+            password,
+            "private%value",
+            mixed_secret,
+            literal_percent_secret,
+        )
+    )
+    monkeypatch.setattr(runtime, "_invoke", invoke)
+
+    metadata = await runtime._metadata()
+
+    assert capture_limits == [playwright_cli._MAX_OBSERVATION_CAPTURE_BYTES]
+    assert capture_limits[0] == 16 * 1024 * 1024
+    assert len(invocation_payload) < capture_limits[0]
+    assert len(metadata.tabs) == playwright_cli._MAX_TABS
+    assert "Array.from(value.slice(0,limit*2))" in scripts[0]
+    assert str(playwright_cli._MAX_URL_CAPTURE_CHARS) in scripts[0]
+    assert str(playwright_cli._MAX_TITLE_CAPTURE_CHARS) in scripts[0]
+    assert playwright_cli._MAX_TITLE_CAPTURE_CHARS == 8_192
+    assert metadata.url == raw_url
+    assert metadata.tabs[0][0] == raw_url
+    assert encoded_password not in metadata.url
+    assert metadata.title == "x[redacted]"
+    assert metadata.tabs[0][1] == "x[redacted]"
+
+    public_url = runtime._public_redacted_url(metadata.url)
+    assert len(public_url) <= playwright_cli._MAX_URL_CHARS
+    assert password not in public_url
+    assert encoded_password not in public_url
+    assert public_url == "https://example.com/[redacted]"
+    double_encoded_url = (
+        f"https://example.com/?secret={double_encoded_secret}"
+    )
+    assert runtime._public_redacted_url(double_encoded_url).endswith(
+        "secret=[redacted]"
+    )
+
+    double_encoded_with_incomplete_suffix = f"{double_encoded_url}%F"
+    assert runtime._public_redacted_url(
+        double_encoded_with_incomplete_suffix
+    ) == "https://example.com/[redacted]"
+
+    for encoded_prefix in ("%", "%F"):
+        prefix_url = f"https://example.com/?secret={encoded_prefix}"
+        assert runtime._public_redacted_url(prefix_url) == (
+            "https://example.com/[redacted]"
+        )
+
+    mixed_encoded_secret = quote(mixed_secret, safe="").replace("%F0", "%f0")
+    mixed_url = f"https://example.com/?secret={mixed_encoded_secret}"
+    assert runtime._public_redacted_url(mixed_url).endswith(
+        "secret=[redacted]"
+    )
+    literal_url = f"https://example.com/?secret={literal_percent_secret}"
+    assert runtime._public_redacted_url(literal_url).endswith(
+        "secret=[redacted]"
+    )
+
+    repeated_title = (
+        f"x{password}{password}"
+    )[: playwright_cli._MAX_TITLE_CAPTURE_CHARS]
+    redacted_repeated_title = runtime._redact_bounded_text(
+        repeated_title,
+        playwright_cli._MAX_TITLE_CHARS,
+    )
+    assert password not in redacted_repeated_title
+    assert len(redacted_repeated_title) <= playwright_cli._MAX_TITLE_CHARS
+
+    combined_title = (
+        f"{'x' * 3_900}{username}{password}"
+    )[: playwright_cli._MAX_TITLE_CAPTURE_CHARS]
+    redacted_combined_title = runtime._redact_bounded_text(
+        combined_title,
+        playwright_cli._MAX_TITLE_CHARS,
+    )
+    assert username not in redacted_combined_title
+    assert password not in redacted_combined_title
+    assert len(redacted_combined_title) <= playwright_cli._MAX_TITLE_CHARS
+
+    serialized_password = json.dumps(password)[1:-1]
+    serialized_dom = (
+        f"x{serialized_password}{serialized_password}"
+    )[: playwright_cli._MAX_DOM_CAPTURE_CHARS]
+    inline = playwright_cli._InvocationResult(
+        exit_code=0,
+        timed_out=False,
+        stdout=json.dumps({"snapshot": serialized_dom}).encode("utf-8"),
+        stderr=b"",
+        stdout_truncated=False,
+        stderr_truncated=False,
+    )
+    inline_dom = runtime._snapshot_from_execution(inline, remove_file=True)
+    assert serialized_password not in inline_dom
+    assert "[redacted]" in inline_dom
+    assert len(inline_dom) <= playwright_cli._MAX_DOM_CHARS
+
+    artifact_path = runtime._internal_directory / "boundary.yml"
+    artifact_path.write_text(serialized_dom, encoding="utf-8")
+    file_dom = runtime._read_text_artifact(
+        artifact_path,
+        playwright_cli._MAX_DOM_CHARS,
+    )
+    assert serialized_password not in file_dom
+    assert "[redacted]" in file_dom
+    assert len(file_dom) <= playwright_cli._MAX_DOM_CHARS
+
+    invalid_utf8_path = runtime._internal_directory / "invalid-utf8.yml"
+    invalid_utf8_path.write_bytes(
+        b"x" * (playwright_cli._MAX_DOM_CAPTURE_CHARS * 4) + b"\xf0\x9f"
+    )
+    assert (
+        runtime._read_text_artifact(
+            invalid_utf8_path,
+            playwright_cli._MAX_DOM_CHARS,
+        )
+        == ""
+    )
+
+    many_private_values = tuple(
+        f"{index:03d}{'x' * 4_093}" for index in range(64)
+    )
+    started = time.monotonic()
+    runtime._activate_private_values_unlocked(many_private_values)
+    for _ in range(100):
+        assert runtime._redact_bounded_text("public", 4_096) == "public"
+    assert time.monotonic() - started < 2
+    assert not hasattr(runtime, "_private_redaction_prefixes")
+
+    await runtime.close()
+
+
 def test_resolve_browser_launch_cdp() -> None:
     config = BrowserLaunchConfig(cdp_url="http://127.0.0.1:9222")
     launch = resolve_browser_launch(config)
@@ -678,6 +900,165 @@ async def test_runtime_execute_exact_origin_direct_navigation(session_dir: Path,
 
 
 @pytest.mark.asyncio
+async def test_private_restore_keeps_secret_url_out_of_argv_and_memfd_on_disk(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    password = "private-restore-password"
+    previous_url = f"https://example.com/account?token={password}"
+    invocations: list[list[str]] = []
+    restore_scripts: list[str] = []
+    restore_paths: list[Path] = []
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        invocations.append(list(argv))
+        if argv[3] == "run-code":
+            filename = next(
+                value.split("=", 1)[1]
+                for value in argv[4:]
+                if value.startswith("--filename=")
+            )
+            restore_path = Path(filename)
+            restore_paths.append(restore_path)
+            restore_scripts.append(restore_path.read_text(encoding="utf-8"))
+        return DummyProcess(argv, stdout=b"{}")
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000098"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=factory,
+        cli_script=cli_script,
+    )
+    runtime._approved_origins = ("https://example.com",)
+    runtime._activate_private_values_unlocked((password,))
+    previous = playwright_cli._PageMetadata(
+        url=previous_url,
+        title="Account",
+        current_index=0,
+        tabs=((previous_url, "Account"),),
+    )
+    current = playwright_cli._PageMetadata(
+        url="chrome-error://chromewebdata/",
+        title="Blocked",
+        current_index=0,
+        tabs=(("chrome-error://chromewebdata/", "Blocked"),),
+    )
+
+    await runtime._restore_allowed_page(previous, current)
+
+    assert [invocation[3] for invocation in invocations] == [
+        "tab-select",
+        "run-code",
+    ]
+    assert all(
+        password not in argument
+        for invocation in invocations
+        for argument in invocation
+    )
+    assert len(restore_scripts) == 1
+    assert json.dumps(previous_url) in restore_scripts[0]
+    assert len(restore_paths) == 1
+    assert not restore_paths[0].exists()
+    assert not list(runtime._internal_directory.glob(".restore-*.js"))
+    guard_script = runtime._guard_script(("https://example.com",))
+    assert "url==='about:blank'" in guard_script
+    assert "url.startsWith('about:')" not in guard_script
+    assert "chrome:" not in guard_script
+
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_save_origin_verification_redacts_cached_modal_fallback_metadata(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    username = "modal-user@example.test"
+    password = "modal-private-password"
+    metadata_title = "Login"
+    modal_observation = False
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        stdout = b""
+        if command == "run-code":
+            script = argv[4]
+            if modal_observation and "const allPages=" in script:
+                stdout = json.dumps(
+                    {
+                        "isError": True,
+                        "error": (
+                            "Synthetic command does not handle the modal state."
+                        ),
+                    }
+                ).encode()
+            elif "const pages=" in script:
+                stdout = json.dumps(
+                    {
+                        "result": json.dumps(
+                            {
+                                "url": "https://example.com/login",
+                                "title": metadata_title,
+                                "currentIndex": 0,
+                                "tabs": [
+                                    {
+                                        "url": "https://example.com/login",
+                                        "title": metadata_title,
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                ).encode()
+            else:
+                stdout = b"{}"
+        elif command == "snapshot":
+            stdout = json.dumps({"snapshot": "modal login"}).encode()
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000097"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/login")
+    await runtime.suppress_private_capture()
+    metadata_title = f"{'x' * 4_080}{username}{password}"
+
+    verified = await runtime.verify_origin_and_activate_private_values(
+        "https://example.com",
+        (username, password),
+    )
+    modal_observation = True
+    result = await runtime.execute("click", ["e1"])
+
+    assert verified == "https://example.com"
+    dumped = result.model_dump_json()
+    assert username not in dumped
+    assert password not in dumped
+    assert len(result.observation.title) <= 4_096
+    assert result.observation.title == f"{'x' * 4_080}[redacted]"
+    assert result.observation.tabs[0].title == (
+        f"{'x' * 4_080}[redacted]"
+    )
+
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_rejects_tab_creation_at_observation_limit(
     session_dir: Path,
     cli_script: Path,
@@ -780,7 +1161,10 @@ async def test_runtime_metadata_transport_covers_declared_tab_bounds(
 
     assert runtime._current_metadata is not None
     assert len(runtime._current_metadata.tabs) == 100
-    assert len(runtime._current_metadata.tabs[-1][0]) == 4_096
+    internal_url = runtime._current_metadata.tabs[-1][0]
+    assert internal_url == tabs[-1]["url"]
+    assert len(internal_url) <= playwright_cli._MAX_URL_CAPTURE_CHARS
+    assert len(runtime._public_redacted_url(internal_url)) == 4_096
     assert len(runtime._current_metadata.tabs[-1][1]) == 4_096
 
     await runtime.close()
@@ -1905,6 +2289,9 @@ async def test_model_outputs_do_not_share_harness_artifact_namespace(
     assert model_output.read_bytes() == b"model-output"
     config = json.loads(runtime._config_path.read_text(encoding="utf-8"))
     assert "outputMaxSize" not in config
+    assert config["snapshot"] == {"mode": "none"}
+    assert config["console"] == {"level": "none"}
+    assert config["browser"]["contextOptions"] == {"acceptDownloads": False}
     assert runtime._video_path.parent != model_output.parent
     await runtime.close()
 
@@ -2097,6 +2484,11 @@ async def test_live_artifact_budget_closes_the_owned_cli_session(
     )
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
+    if artifact_kind in {"output", "temporary"}:
+        await runtime.suppress_private_capture()
+        assert runtime._video_started is False
+        assert runtime._artifact_monitor_task is not None
+        assert not runtime._artifact_monitor_task.done()
 
     if artifact_kind == "video":
         artifact = runtime._video_directory / "session-1.webm"
@@ -2309,6 +2701,12 @@ async def test_stale_cli_ownership_is_closed_before_reuse(
     session_directory = artifacts_root / str(session_id)
     home_directory = session_directory / "playwright-cli" / "home"
     home_directory.mkdir(parents=True)
+    internal_directory = session_directory / "playwright-cli" / "internal"
+    internal_directory.mkdir(mode=0o700)
+    stale_payload = internal_directory / (
+        ".sign-in-00000000000000000000000000000000.js"
+    )
+    stale_payload.symlink_to("/proc/999999/fd/99")
     ownership_path = session_directory / "playwright-cli" / "ownership.json"
     ownership_path.write_text(
         json.dumps(
@@ -2353,6 +2751,8 @@ async def test_stale_cli_ownership_is_closed_before_reuse(
     assert kwargs["cwd"] == str(session_directory.resolve())
     assert kwargs["env"]["HOME"] == str(home_directory.resolve())
     assert not ownership_path.exists()
+    assert not stale_payload.exists()
+    assert not stale_payload.is_symlink()
 
 
 @pytest.mark.asyncio
@@ -2636,3 +3036,365 @@ async def test_not_open_close_retains_ownership_when_daemon_survives(
 
     assert runtime._open_attempted
     assert runtime._ownership_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshots(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    username = "-u'O'Brien{\\ser"
+    password = '--submit\n\t"secret\\tail'
+    yaml_key_fragment = "-u''O''Brien{\\ser"
+    yaml_value_fragment = '--submit\\n\\t\\"secret\\\\tail'
+    invocations: list[list[str]] = []
+    payload_scripts: list[str] = []
+    payload_paths: list[Path] = []
+    payload_modes: list[int] = []
+    payload_is_symlink: list[bool] = []
+    payload_targets: list[str] = []
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        invocations.append(list(argv))
+        command = argv[3]
+        stdout = b""
+        stderr = b""
+        exit_code = 0
+        if command == "run-code":
+            filename_argument = next(
+                (
+                    value
+                    for value in argv[4:]
+                    if value.startswith("--filename=")
+                ),
+                None,
+            )
+            if filename_argument is not None:
+                payload_path = Path(filename_argument.split("=", 1)[1])
+                payload_is_symlink.append(payload_path.is_symlink())
+                payload_targets.append(os.readlink(payload_path))
+                payload_paths.append(payload_path)
+                payload_modes.append(stat.S_IMODE(payload_path.stat().st_mode))
+                payload_scripts.append(
+                    payload_path.read_text(encoding="utf-8")
+                )
+                stdout = f'reflected "{username}"\\{password}\x01'.encode()
+                stderr = f"private diagnostic\r{password}".encode()
+            else:
+                metadata = {
+                    "url": "https://example.com/login",
+                    "title": f"Welcome {username}",
+                    "currentIndex": 0,
+                    "tabs": [
+                        {
+                            "url": "https://example.com/login",
+                            "title": f"Account {password}",
+                        }
+                    ],
+                    "screenshot": False,
+                }
+                stdout = json.dumps(
+                    {"result": json.dumps(metadata)}
+                ).encode("utf-8")
+        elif command == "snapshot":
+            filename_argument = next(
+                (
+                    value
+                    for value in argv[4:]
+                    if value.startswith("--filename=")
+                ),
+                None,
+            )
+            if filename_argument is not None:
+                Path(filename_argument.split("=", 1)[1]).write_text(
+                    "login form",
+                    encoding="utf-8",
+                )
+            else:
+                inline_dom = (
+                    f"'{yaml_key_fragment}': textbox\n"
+                    f'value: "{yaml_value_fragment}"'
+                )
+                stdout = json.dumps({"snapshot": inline_dom}).encode()
+                stderr = f"reflected\n{password}".encode()
+                exit_code = 7
+        return DummyProcess(
+            argv=argv,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000016"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/login")
+    invocations.clear()
+
+    await runtime.sign_in(
+        expected_origin="https://example.com",
+        username_ref="e1",
+        password_ref="e2",
+        submit_ref="e3",
+        username=username,
+        password=password,
+    )
+
+    assert [invocation[3] for invocation in invocations] == [
+        "video-stop",
+        "run-code",
+        "run-code",
+        "run-code",
+    ]
+    assert all(
+        username not in argument and password not in argument
+        for invocation in invocations
+        for argument in invocation
+    )
+    assert payload_modes == [0o600]
+    assert len(payload_paths) == 1
+    assert not payload_paths[0].exists()
+    assert payload_is_symlink == [True]
+    assert len(payload_targets) == 1
+    assert payload_targets[0].startswith(f"/proc/{os.getpid()}/fd/")
+    assert len(payload_scripts) == 1
+    assert "aria-ref=e1" in payload_scripts[0]
+    assert "aria-ref=e2" in payload_scripts[0]
+    assert "aria-ref=e3" in payload_scripts[0]
+    assert json.dumps(username) in payload_scripts[0]
+    assert json.dumps(password) in payload_scripts[0]
+    assert "const expectedOrigin=\"https://example.com\"" in payload_scripts[0]
+    origin_check = (
+        "await page.evaluate(()=>location.origin)!==expectedOrigin"
+    )
+    assert payload_scripts[0].count(origin_check) == 2
+    assert payload_scripts[0].count(".elementHandle()") == 3
+    assert payload_scripts[0].index(
+        "const submitElement="
+    ) < payload_scripts[0].rindex(origin_check)
+    assert payload_scripts[0].rindex(origin_check) < payload_scripts[0].index(
+        "await usernameElement.fill(username)"
+    )
+    assert runtime._video_started is False
+    assert runtime._artifact_monitor_task is not None
+    assert not runtime._artifact_monitor_task.done()
+
+    invocations.clear()
+    result = await runtime.execute("snapshot", [])
+    assert result.stdout == "[redacted]"
+    assert result.stderr == "[redacted]"
+    assert result.stdout_truncated is False
+    assert result.stderr_truncated is False
+    assert result.exit_code == 7
+    dumped = result.model_dump_json()
+    assert username not in dumped
+    assert password not in dumped
+    assert yaml_key_fragment not in dumped
+    assert yaml_value_fragment not in dumped
+    assert "[redacted]" in result.observation.title
+    assert "[redacted]" in result.observation.dom
+    assert result.observation.screenshot is None
+    observation_scripts = [
+        invocation[4]
+        for invocation in invocations
+        if invocation[3] == "run-code"
+    ]
+    assert all("const screenshotPath=" not in script for script in observation_scripts)
+    assert runtime._video_started is False
+    assert all(invocation[3] != "video-start" for invocation in invocations)
+    assert all(
+        not any(
+            argument == "--filename" or argument.startswith("--filename=")
+            for argument in invocation[4:]
+        )
+        for invocation in invocations
+        if invocation[3] == "snapshot"
+    )
+    assert list(runtime._internal_directory.glob("*.yml")) == []
+
+    for blocked_command, blocked_args in (
+        (
+            "eval",
+            ["() => btoa(document.querySelector('input').value)"],
+        ),
+        ("screenshot", ["--filename=after-sign-in.png"]),
+        ("pdf", ["--filename=after-sign-in.pdf"]),
+        ("snapshot", ["--filename=after-sign-in.yml"]),
+    ):
+        spawn_count = len(invocations)
+        with pytest.raises(PlaywrightCliRuntimeError) as blocked_error:
+            await runtime.execute(blocked_command, blocked_args)
+        assert blocked_error.value.code == "browser_failed"
+        assert len(invocations) == spawn_count
+        assert username not in str(blocked_error.value)
+        assert password not in str(blocked_error.value)
+
+    for invalid_username, invalid_password in (
+        ("ada\x00@example.test", password),
+        (username, "private\x00password"),
+    ):
+        spawn_count = len(invocations)
+        with pytest.raises(PlaywrightCliRuntimeError) as invalid_error:
+            await runtime.sign_in(
+                expected_origin="https://example.com",
+                username_ref="e1",
+                password_ref="e2",
+                submit_ref="e3",
+                username=invalid_username,
+                password=invalid_password,
+            )
+        assert invalid_error.value.code == "browser_failed"
+        assert len(invocations) == spawn_count
+
+    spawn_count = len(invocations)
+
+    await runtime.close()
+    assert all(
+        invocation[3] != "video-stop"
+        for invocation in invocations[spawn_count:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_capture_suppression_blocks_private_extraction_commands(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    invocations: list[list[str]] = []
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        invocations.append(list(argv))
+        stdout = b""
+        if argv[3] == "run-code":
+            stdout = json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "url": "https://example.com/login",
+                            "title": "Login",
+                            "currentIndex": 0,
+                            "tabs": [
+                                {
+                                    "url": "https://example.com/login",
+                                    "title": "Login",
+                                }
+                            ],
+                        }
+                    )
+                }
+            ).encode()
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000017"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/login")
+    invocations.clear()
+
+    await runtime.suppress_private_capture()
+    assert [invocation[3] for invocation in invocations] == ["video-stop"]
+    for blocked_command, blocked_args in (
+        (
+            "eval",
+            ["() => btoa(document.querySelector('input').value)"],
+        ),
+        ("screenshot", ["--filename=private.png"]),
+        ("pdf", ["--filename=private.pdf"]),
+    ):
+        spawn_count = len(invocations)
+        with pytest.raises(PlaywrightCliRuntimeError):
+            await runtime.execute(blocked_command, blocked_args)
+        assert len(invocations) == spawn_count
+
+    snapshot = await runtime.execute("snapshot", [])
+    assert snapshot.exit_code == 0
+    assert snapshot.stdout == "[redacted]"
+    assert snapshot.stderr == "[redacted]"
+    assert snapshot.observation.screenshot is None
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_video_stop_closes_runtime_before_private_fill(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    commands: list[str] = []
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        commands.append(command)
+        stdout = b""
+        if command == "run-code":
+            stdout = json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "url": "https://example.com/login",
+                            "title": "Login",
+                            "currentIndex": 0,
+                            "tabs": [
+                                {
+                                    "url": "https://example.com/login",
+                                    "title": "Login",
+                                }
+                            ],
+                        }
+                    )
+                }
+            ).encode()
+        return DummyProcess(
+            argv,
+            exit_code=1 if command == "video-stop" else 0,
+            stdout=stdout,
+        )
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000018"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/login")
+    commands.clear()
+
+    with pytest.raises(PlaywrightCliRuntimeError) as caught:
+        await runtime.sign_in(
+            expected_origin="https://example.com",
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            username="-user",
+            password="--submit",
+        )
+
+    assert caught.value.code == "browser_failed"
+    assert commands == ["video-stop", "video-stop", "close"]
+    assert "fill" not in commands
+    assert "click" not in commands
+    assert runtime._closed is True
+    assert runtime._started is False

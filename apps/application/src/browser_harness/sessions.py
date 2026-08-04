@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from fastapi import UploadFile
 from pydantic import ValidationError
 
+from .credentials import CredentialStore
 from .agent import ApplicationRunRequest, build_application_task
 from .artifacts import (
     StoredCandidateArtifacts,
@@ -47,6 +48,8 @@ from .models import (
     ApplicationMismatchRuntimeActionResponse,
     ApproveOriginCommand,
     CancelCommand,
+    SaveCredentialsCommand,
+    SignInCommand,
     PlaywrightCliResultRuntimeActionResponse,
     PlaywrightCliRuntimeAction,
     CancelRuntimeActionResponse,
@@ -65,9 +68,11 @@ from .models import (
     SubmitRuntimeActionResponse,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
+    RequestSignInRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
     ReviseRuntimeActionResponse,
+    SignInRuntimeActionResponse,
     RuntimeActionRequest,
     RuntimeActionResponse,
     RevisionAppliedDetail,
@@ -89,6 +94,7 @@ from .pipeline_agent import (
 )
 from .tools import (
     HumanGate,
+    redact_public_text,
     redact_public_url,
 )
 from .user_info import UserInfoSnapshot, UserInfoStore
@@ -175,6 +181,8 @@ class _ApplicationSession:
     runtime_action_pending: bool = False
     runtime_action_task: asyncio.Task[Any] | None = None
     playwright_cli_action_count: int = 0
+    last_successful_inspection_step: int = 0
+    sign_in_inspection_step: int = 0
     additional_info_question_count: int = 0
     submission_action_started: bool = False
     setup_task: asyncio.Task[Any] | None = None
@@ -234,9 +242,13 @@ def _sse_frame(event: HarnessEvent) -> str:
 
 def _pending_action_for_state(
     state: SessionState,
+    event: str | None,
     detail: dict[str, object] | Any,
 ) -> dict[str, object] | None:
     if state == "awaiting_human_navigation":
+        if event == "credentials_required":
+            EmptyEventDetail.model_validate(detail)
+            return {"type": "credentials"}
         public_detail = HumanNavigationDetail.model_validate(detail)
         return {
             "type": "human_navigation",
@@ -287,6 +299,7 @@ class ApplicationSessionManager:
         application_runner: ApplicationRunner | None = None,
         runtime_factory: RuntimeFactory = PlaywrightCliRuntime,
         user_info_store: UserInfoStore | None = None,
+        credential_store: CredentialStore | None = None,
     ) -> None:
         self._config = config
         self._artifacts_root = (
@@ -298,6 +311,7 @@ class ApplicationSessionManager:
         self._application_runner = application_runner
         self._runtime_factory = runtime_factory
         self._user_info_store = user_info_store or UserInfoStore(config.user_info_json)
+        self._credential_store = credential_store
         self._lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
         self._startup_complete = False
@@ -733,6 +747,8 @@ class ApplicationSessionManager:
             raise self._not_found()
 
         expired = False
+        credential_gate: HumanGate | None = None
+        credential_command: SignInCommand | SaveCredentialsCommand | None = None
         async with record.request_lock:
             if record.finalized or record.final_request is not None:
                 if (
@@ -770,6 +786,8 @@ class ApplicationSessionManager:
                 if record.submission_action_started:
                     await self._park_submission_uncertain(record)
                 else:
+                    if record.human_gate is not None:
+                        await record.human_gate.cancel()
                     await self._begin_finalization_locked(
                         record,
                         _TerminalRequest("cancelled", "cancelled"),
@@ -792,6 +810,9 @@ class ApplicationSessionManager:
                     await gate.submit()
                 elif isinstance(command, ProvideAdditionalInfoCommand):
                     await gate.provide_additional_info(command.answers)
+                elif isinstance(command, (SignInCommand, SaveCredentialsCommand)):
+                    credential_gate = gate
+                    credential_command = command
                 else:
                     raise HarnessServiceError(
                         422, "invalid_request", "Command is invalid"
@@ -803,6 +824,13 @@ class ApplicationSessionManager:
                 "session_terminal",
                 "The application session has already ended",
             )
+
+        if credential_gate is not None and credential_command is not None:
+            username, password = credential_command.credentials()
+            if isinstance(credential_command, SignInCommand):
+                await credential_gate.sign_in(username, password)
+            else:
+                await credential_gate.save_credentials(username, password)
     async def runtime_action(
         self,
         session_id: UUID,
@@ -994,13 +1022,20 @@ class ApplicationSessionManager:
                             "submitting" if gate.submission_approved else "running"
                         ),
                     )
+                if result.exit_code == 0 and not result.timed_out:
+                    record.last_successful_inspection_step = step
+                private_values = gate.redaction_values
                 public_tabs = [
                     tab.model_copy(
                         update={
                             "url": _redact_playwright_cli_url(
                                 tab.url,
-                                gate.redaction_values,
-                            )
+                                private_values,
+                            ),
+                            "title": (
+                                redact_public_text(tab.title, private_values)
+                                or ""
+                            ),
                         }
                     )
                     for tab in result.observation.tabs
@@ -1009,16 +1044,45 @@ class ApplicationSessionManager:
                     public_tabs = []
                 public_result = result.model_copy(
                     update={
+                        "stdout": redact_public_text(
+                            result.stdout,
+                            private_values,
+                        )
+                        or "",
+                        "stderr": redact_public_text(
+                            result.stderr,
+                            private_values,
+                        )
+                        or "",
                         "observation": result.observation.model_copy(
                             update={
                                 "url": _redact_playwright_cli_url(
                                     result.observation.url,
-                                    gate.redaction_values,
+                                    private_values,
+                                ),
+                                "title": (
+                                    redact_public_text(
+                                        result.observation.title,
+                                        private_values,
+                                    )
+                                    or ""
                                 ),
                                 "tabs": public_tabs,
+                                "dom": (
+                                    redact_public_text(
+                                        result.observation.dom,
+                                        private_values,
+                                    )
+                                    or ""
+                                ),
                                 "page_info": None,
+                                "screenshot": (
+                                    None
+                                    if gate.screenshots_suppressed
+                                    else result.observation.screenshot
+                                ),
                             }
-                        )
+                        ),
                     }
                 )
                 return PlaywrightCliResultRuntimeActionResponse(
@@ -1035,6 +1099,55 @@ class ApplicationSessionManager:
             if terminal is not None:
                 return terminal
             return ContinueRuntimeActionResponse(type="continue")
+
+        if isinstance(action, RequestSignInRuntimeAction):
+            async with record.request_lock:
+                if record.playwright_cli_action_count >= request.max_steps:
+                    error = session_error("step_limit")
+                    raise HarnessServiceError(
+                        409,
+                        error.code,
+                        error.message,
+                    )
+                record.playwright_cli_action_count += 1
+                if (
+                    record.last_successful_inspection_step
+                    <= record.sign_in_inspection_step
+                ):
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "Inspect the application before requesting sign-in",
+                    )
+                record.sign_in_inspection_step = (
+                    record.last_successful_inspection_step
+                )
+            gate_result = await gate.request_sign_in(
+                username_ref=action.username_ref,
+                password_ref=action.password_ref,
+                submit_ref=action.submit_ref,
+                runtime=runtime,
+                credential_store=self._credential_store_for_use(),
+            )
+            terminal = self._runtime_gate_terminal_response(gate_result)
+            if terminal is not None:
+                return terminal
+            status = (
+                gate_result.metadata.get("sign_in_status")
+                if gate_result.metadata is not None
+                else None
+            )
+            if status not in {"attempted", "saved"}:
+                public = session_error("browser_failed")
+                raise HarnessServiceError(
+                    502,
+                    public.code,
+                    public.message,
+                )
+            return SignInRuntimeActionResponse(
+                type="sign_in",
+                status=status,
+            )
 
         if isinstance(action, RequestAdditionalInfoRuntimeAction):
             if record.playwright_cli_action_count < 1:
@@ -1112,6 +1225,13 @@ class ApplicationSessionManager:
             )
 
         raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+
+    def _credential_store_for_use(self) -> CredentialStore:
+        credential_store = self._credential_store
+        if credential_store is None:
+            credential_store = CredentialStore(self._config.credentials_json)
+            self._credential_store = credential_store
+        return credential_store
 
     @staticmethod
     def _runtime_gate_terminal_response(
@@ -1719,7 +1839,7 @@ class ApplicationSessionManager:
             if record.human_gate is not None
             else record.snapshot.revision_count
         )
-        pending_action = _pending_action_for_state(state, detail)
+        pending_action = _pending_action_for_state(state, event, detail)
         snapshot_changed = (
             record.snapshot.state != state
             or record.snapshot.pending_action != pending_action

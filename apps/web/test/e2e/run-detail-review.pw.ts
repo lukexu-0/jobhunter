@@ -43,6 +43,8 @@ const privateHarnessValues = [
   "/home/private/applicant-profile.md",
   "private-returned-answer",
 ] as const;
+const privateCredentialUsername = "credential-user@example.test";
+const privateCredentialPassword = "credential password must stay private";
 
 interface Deferred {
   readonly promise: Promise<void>;
@@ -731,6 +733,10 @@ async function installPipeline(
       const reply = mock.commandReplies.shift() ?? { status: 202 };
       await reply.waitFor;
       reply.before?.();
+      if (reply.status === 0) {
+        await route.abort("connectionfailed");
+        return;
+      }
       if (reply.status === 202) {
         await route.fulfill({ status: 202 });
       } else {
@@ -1462,6 +1468,309 @@ test("a professionalize response from an old question gate cannot replace the ne
   modelFrame.resolve();
   await expect(newGroup.getByRole("textbox", { name: "Answer", exact: true })).toHaveValue("");
   await expect(page.getByText("An obsolete professional answer.", { exact: true })).toHaveCount(0);
+});
+
+test("credential gate sends exact actions, retains failures, clears on progress, and fits mobile", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const initialCredentials = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    pendingAction: { type: "credentials" },
+    updatedAt: createdAt + 100,
+  });
+  const authoritativeCredentials = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    pendingAction: { type: "credentials" },
+    updatedAt: createdAt + 150,
+  });
+  const changedCredentials = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 2,
+    pendingAction: { type: "credentials" },
+    updatedAt: createdAt + 200,
+  });
+  const progressed = snapshotFixture({
+    bridgeState: "running",
+    generation: 2,
+    updatedAt: createdAt + 300,
+  });
+  const returnedCredentials = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 2,
+    pendingAction: { type: "credentials" },
+    updatedAt: createdAt + 400,
+  });
+  const changedFrame = deferred();
+  const progressFrame = deferred();
+  const returnFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: initialCredentials,
+  });
+  mock.commandReplies.push({
+    status: 409,
+    body: apiError(
+      "APPLICATION_COMMAND_CONFLICT",
+      "The application state changed; review the latest session state",
+    ),
+    before: () => {
+      mock.application = authoritativeCredentials;
+    },
+  });
+  mock.commandReplies.push({ status: 202 });
+  queueSse(
+    mock,
+    eventFixture("credentials_required", changedCredentials, {}),
+    2,
+    changedFrame.promise,
+    () => {
+      mock.application = changedCredentials;
+    },
+  );
+  queueSse(
+    mock,
+    eventFixture("snapshot", progressed, {}),
+    3,
+    progressFrame.promise,
+    () => {
+      mock.application = progressed;
+    },
+  );
+  queueSse(
+    mock,
+    eventFixture("credentials_required", returnedCredentials, {}),
+    4,
+    returnFrame.promise,
+    () => {
+      mock.application = returnedCredentials;
+    },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  const credentialsForm = page.getByRole("form", { name: "Credentials needed" });
+  const username = page.getByLabel("Username or email");
+  const password = page.getByLabel("Password");
+  const signIn = credentialsForm.getByRole("button", { name: "Sign in with credentials" });
+  const save = credentialsForm.getByRole("button", { name: "Save credentials" });
+  await expect(credentialsForm).toBeVisible();
+  await expect(credentialsForm.getByRole("button")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Cancel application" })).toBeVisible();
+  await expect(credentialsForm).toHaveAttribute("autocomplete", "off");
+  await expect(username).toHaveAttribute("autocomplete", "off");
+  await expect(password).toHaveAttribute("autocomplete", "new-password");
+  await expect(password).toHaveAttribute("type", "password");
+  await expect(username).toHaveAttribute("required", "");
+  await expect(password).toHaveAttribute("required", "");
+  await expect(credentialsForm).toContainText("private local credential file");
+  await expect(credentialsForm).toContainText("after creating an account in headed Chrome");
+  await username.focus();
+  await username.press("Tab");
+  await expect(password).toBeFocused();
+  await password.press("Tab");
+  await expect(signIn).toBeFocused();
+  await signIn.press("Tab");
+  await expect(save).toBeFocused();
+  expect(await page.evaluate(() =>
+    document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  )).toBe(true);
+  const formBox = await credentialsForm.boundingBox();
+  if (!formBox) throw new Error("Credential form has no layout box");
+  for (const control of [username, password, signIn, save]) {
+    const controlBox = await control.boundingBox();
+    if (!controlBox) throw new Error("Credential control has no layout box");
+    expect(Math.floor(controlBox.x)).toBeGreaterThanOrEqual(Math.floor(formBox.x));
+    expect(Math.ceil(controlBox.x + controlBox.width))
+      .toBeLessThanOrEqual(Math.ceil(formBox.x + formBox.width));
+  }
+
+  await password.fill(privateCredentialPassword);
+  await signIn.press("Enter");
+  await expect(page.getByRole("alert").filter({
+    hasText: "Enter a username or email between 1 and 320 characters.",
+  })).toBeVisible();
+  await expect(username).toBeFocused();
+  await expect(password).toHaveValue(privateCredentialPassword);
+  expect(mock.commands).toHaveLength(0);
+  await username.fill("\u001c");
+  await signIn.press("Enter");
+  await expect(page.getByRole("alert").filter({
+    hasText: "Enter a username or email between 1 and 320 characters.",
+  })).toBeVisible();
+  await expect(username).toBeFocused();
+  await expect(username).toHaveValue("\u001c");
+  await expect(password).toHaveValue(privateCredentialPassword);
+  expect(mock.commands).toHaveLength(0);
+  await username.fill("account\u0000name");
+  await signIn.press("Enter");
+  await expect(page.getByRole("alert").filter({
+    hasText: "Enter a username or email between 1 and 320 characters.",
+  })).toBeVisible();
+  await expect(username).toBeFocused();
+  await expect(username).toHaveValue("account\u0000name");
+  await expect(password).toHaveValue(privateCredentialPassword);
+  expect(mock.commands).toHaveLength(0);
+
+  await username.fill(privateCredentialUsername);
+  await password.fill("pass\u0000word");
+  await signIn.press("Enter");
+  await expect(page.getByRole("alert").filter({
+    hasText: "Enter a password between 1 and 4,096 characters.",
+  })).toBeVisible();
+  await expect(password).toBeFocused();
+  await expect(username).toHaveValue(privateCredentialUsername);
+  await expect(password).toHaveValue("pass\u0000word");
+  expect(mock.commands).toHaveLength(0);
+
+  await password.fill(privateCredentialPassword);
+
+  await username.fill(`  ${privateCredentialUsername}  `);
+  await signIn.click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({
+    type: "sign_in",
+    username: privateCredentialUsername,
+    password: privateCredentialPassword,
+  });
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application state changed; review the latest session state",
+  })).toBeVisible();
+  await expect(username).toHaveValue(`  ${privateCredentialUsername}  `);
+  await expect(password).toHaveValue(privateCredentialPassword);
+  await expect(signIn).toBeEnabled();
+  const statusText = (await page.getByRole("status").allInnerTexts()).join(" ");
+  expect(statusText).not.toContain(privateCredentialUsername);
+  expect(statusText).not.toContain(privateCredentialPassword);
+  const renderedText = await page.locator("body").innerText();
+  expect(renderedText).not.toContain(privateCredentialUsername);
+  expect(renderedText).not.toContain(privateCredentialPassword);
+
+  changedFrame.resolve();
+  await expect(username).toHaveValue("");
+  await expect(password).toHaveValue("");
+
+  const savedUsername = "new-account@example.test";
+  const savedPassword = "new account private password";
+  await username.fill(savedUsername);
+  await password.fill(savedPassword);
+  await save.evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands[1]).toEqual({
+    type: "save_credentials",
+    username: savedUsername,
+    password: savedPassword,
+  });
+  await expect(credentialsForm.getByRole("button", { name: "Saving credentials…" }))
+    .toBeDisabled();
+  await expect(username).toBeDisabled();
+  await expect(password).toBeDisabled();
+  await expect(username).toHaveValue(savedUsername);
+  await expect(password).toHaveValue(savedPassword);
+
+  progressFrame.resolve();
+  await expect(credentialsForm).toHaveCount(0);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  returnFrame.resolve();
+  await expect(page.getByRole("form", { name: "Credentials needed" })).toBeVisible();
+  await expect(page.getByLabel("Username or email")).toHaveValue("");
+  await expect(page.getByLabel("Password")).toHaveValue("");
+  const finalRenderedText = await page.locator("body").innerText();
+  expect(finalRenderedText).not.toContain(privateCredentialUsername);
+  expect(finalRenderedText).not.toContain(privateCredentialPassword);
+  expect(finalRenderedText).not.toContain(savedUsername);
+  expect(finalRenderedText).not.toContain(savedPassword);
+  const publicResponses = mock.publicResponseBodies.join(" ");
+  expect(publicResponses).not.toContain(privateCredentialUsername);
+  expect(publicResponses).not.toContain(privateCredentialPassword);
+  expect(publicResponses).not.toContain(savedUsername);
+  expect(publicResponses).not.toContain(savedPassword);
+});
+
+test("credential values survive a network failure while both actions stay latched", async ({ page }) => {
+  const credentials = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    pendingAction: { type: "credentials" },
+    updatedAt: createdAt + 100,
+  });
+  const cancelled = snapshotFixture({
+    bridgeState: "cancelled",
+    updatedAt: createdAt + 200,
+  });
+  const cancelFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: credentials,
+  });
+  mock.commandReplies.push({ status: 0 }, { status: 202 });
+  queueSse(
+    mock,
+    eventFixture("cancelled", cancelled, {}),
+    2,
+    cancelFrame.promise,
+    () => {
+      mock.application = cancelled;
+    },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  const credentialsForm = page.getByRole("form", { name: "Credentials needed" });
+  const username = page.getByLabel("Username or email");
+  const password = page.getByLabel("Password");
+  await username.fill(privateCredentialUsername);
+  await password.fill(privateCredentialPassword);
+  await credentialsForm.getByRole("button", { name: "Sign in with credentials" }).click();
+
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({
+    type: "sign_in",
+    username: privateCredentialUsername,
+    password: privateCredentialPassword,
+  });
+  await expect(page.getByRole("alert").filter({
+    hasText: "The pipeline service could not be reached.",
+  })).toBeVisible();
+  await expect(credentialsForm.getByRole("button", { name: "Signing in…" })).toBeDisabled();
+  await expect(credentialsForm.getByRole("button", { name: "Save credentials" })).toBeDisabled();
+  await expect(username).toBeDisabled();
+  await expect(password).toBeDisabled();
+  await expect(username).toHaveValue(privateCredentialUsername);
+  await expect(password).toHaveValue(privateCredentialPassword);
+  const statusText = (await page.getByRole("status").allInnerTexts()).join(" ");
+  expect(statusText).not.toContain(privateCredentialUsername);
+  expect(statusText).not.toContain(privateCredentialPassword);
+  const renderedText = await page.locator("body").innerText();
+  expect(renderedText).not.toContain(privateCredentialUsername);
+  expect(renderedText).not.toContain(privateCredentialPassword);
+  const cancel = page.getByRole("button", { name: "Cancel application" });
+  await expect(cancel).toBeEnabled();
+  await cancel.evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands[1]).toEqual({ type: "cancel" });
+  await expect(page.getByRole("button", { name: "Cancelling…" })).toBeDisabled();
+  await expect(page.getByRole("status").filter({
+    hasText: "Waiting for credentials — Cancelling application",
+  })).toBeVisible();
+  await expect(username).toHaveValue(privateCredentialUsername);
+  await expect(password).toHaveValue(privateCredentialPassword);
+
+  cancelFrame.resolve();
+  await expect(page.getByRole("status").filter({ hasText: "Cancelled" })).toBeVisible();
+  await expect(credentialsForm).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Cancel application" })).toHaveCount(0);
+  expect(mock.commands).toEqual([
+    {
+      type: "sign_in",
+      username: privateCredentialUsername,
+      password: privateCredentialPassword,
+    },
+    { type: "cancel" },
+  ]);
 });
 
 test("an uncertain revision response keeps the command latch engaged", async ({ page }) => {

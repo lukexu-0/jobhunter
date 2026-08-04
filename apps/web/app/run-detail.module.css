@@ -403,6 +403,51 @@
   width: 100%;
 }
 
+.applicationCredentialsForm {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-4);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-4);
+  background: var(--color-surface-raised);
+}
+
+.applicationCredentialsIntro,
+.applicationCredentialFields,
+.applicationCredentialActions {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+}
+
+.applicationCredentialsIntro p,
+.applicationCredentialSaveDescription {
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-base);
+}
+
+.applicationCredentialSaveDescription {
+  border-left: var(--border-width) solid var(--color-accent);
+  padding-left: var(--space-3);
+}
+
+.applicationCredentialActions {
+  gap: var(--space-2);
+}
+
+.applicationCredentialActions button {
+  width: 100%;
+}
+
+.applicationCredentialFields input:disabled {
+  border-color: var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-faint);
+  cursor: not-allowed;
+}
+
 .applicationAdditionalInfoForm {
   display: grid;
   gap: var(--space-4);

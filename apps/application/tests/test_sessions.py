@@ -19,6 +19,7 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 import jobhunter_browser_harness.sessions as sessions_module
+from jobhunter_browser_harness.credentials import CredentialStore
 from jobhunter_browser_harness.artifacts import cleanup_session_artifacts, store_uploads
 from jobhunter_browser_harness.agent import ApplicationRunRequest
 from jobhunter_browser_harness.api import HarnessDependencies, create_app
@@ -58,6 +59,9 @@ from jobhunter_browser_harness.models import (
     PlaywrightCliRuntimeAction,
     ContinueRuntimeActionResponse,
     CancelCommand,
+    SaveCredentialsCommand,
+    SignInCommand,
+    SignInRuntimeActionResponse,
     ContinueCommand,
     OpportunityKind,
     HarnessConfig,
@@ -67,6 +71,7 @@ from jobhunter_browser_harness.models import (
     SubmitRuntimeActionResponse,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
+    RequestSignInRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
     ReviseCommand,
@@ -267,7 +272,12 @@ class FakePlaywrightRuntime:
     blocker: asyncio.Event | None = None
     error: PlaywrightCliRuntimeError | None = None
     start_error: PlaywrightCliRuntimeError | None = None
+    private_sign_in_error: PlaywrightCliRuntimeError | None = None
+    activate_private_values_error: PlaywrightCliRuntimeError | None = None
+    capture_suppression_error: PlaywrightCliRuntimeError | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
+    private_sign_in_blocker: asyncio.Event | None = None
+    private_sign_in_started: asyncio.Event = field(default_factory=asyncio.Event)
     commands: list[tuple[str, list[str]]] = field(default_factory=list)
     close_failures: int = 0
     close_cancels_active: bool = True
@@ -280,12 +290,17 @@ class FakePlaywrightRuntime:
     current_url: str = JOB_URL
     approved_origins: tuple[str, ...] = ()
     navigation_guard_suspended: bool = False
+    activated_private_values: list[tuple[str, ...]] = field(default_factory=list)
+    sign_in_calls: list[dict[str, str]] = field(default_factory=list)
+    capture_suppression_calls: int = 0
+    video_recording: bool = False
 
     async def start(self, job_url: str) -> None:
         self.order.append("runtime.start")
         self.job_url = job_url
         self.current_url = job_url
         self.runtime_started = True
+        self.video_recording = True
         if self.start_error is not None:
             raise self.start_error
 
@@ -317,6 +332,59 @@ class FakePlaywrightRuntime:
 
     async def suspend_navigation_guard(self) -> None:
         self.navigation_guard_suspended = True
+
+    async def suppress_private_capture(self) -> None:
+        self.order.append("runtime.suppress_private_capture")
+        self.capture_suppression_calls += 1
+        if self.capture_suppression_error is not None:
+            raise self.capture_suppression_error
+        self.video_recording = False
+
+    async def activate_private_values(self, values: Sequence[str]) -> None:
+        self.activated_private_values.append(tuple(values))
+        if self.activate_private_values_error is not None:
+            raise self.activate_private_values_error
+
+    async def verify_origin_and_activate_private_values(
+        self,
+        expected_origin: str,
+        values: Sequence[str],
+    ) -> str | None:
+        if self.current_url != expected_origin and not self.current_url.startswith(
+            f"{expected_origin}/"
+        ):
+            return None
+        await self.activate_private_values(values)
+        return expected_origin
+
+    async def sign_in(
+        self,
+        *,
+        expected_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> None:
+        self.order.append("runtime.private_sign_in_started")
+        self.private_sign_in_started.set()
+        if self.private_sign_in_blocker is not None:
+            await self.private_sign_in_blocker.wait()
+        self.order.append("runtime.private_sign_in")
+        if self.private_sign_in_error is not None:
+            raise self.private_sign_in_error
+        self.activated_private_values.append((username, password))
+        self.sign_in_calls.append(
+            {
+                "expected_origin": expected_origin,
+                "username_ref": username_ref,
+                "password_ref": password_ref,
+                "submit_ref": submit_ref,
+                "username": username,
+                "password": password,
+            }
+        )
 
     async def close(self) -> None:
         self.order.append("runtime.close")
@@ -446,6 +514,7 @@ def make_manager(
     fakes: Fakes | None = None,
     timeout: int = 14_400,
     context_process_factory: Callable[[Any], Any] = ImmediateContextProcess,
+    credential_store: CredentialStore | None = None,
 ) -> tuple[ApplicationSessionManager, Fakes, Path]:
     doubles = fakes or Fakes()
     root = tmp_path / "sessions"
@@ -456,6 +525,7 @@ def make_manager(
             node_executable=tmp_path / "node",
             playwright_cli_script=tmp_path / "playwright-cli.js",
             user_info_json=tmp_path / "user-info.json",
+            credentials_json=tmp_path / "credentials.json",
         ),
         artifacts_root=root,
         browser_launch=ResolvedBrowserLaunch(
@@ -467,6 +537,7 @@ def make_manager(
         context_process_factory=context_process_factory,
         application_runner=runner,
         runtime_factory=doubles.runtime_factory,
+        credential_store=credential_store,
     )
     return manager, doubles, root
 
@@ -558,13 +629,14 @@ async def create_valid(
     session_id: UUID | None = None,
     auto_submit: bool = False,
     opportunity_kind: OpportunityKind = "job",
+    allow_domains: Sequence[str] = (),
 ):
     personal, resume = valid_uploads()
     return await manager.create_session(
         session_id=session_id,
         job_url=JOB_URL,
         opportunity_kind=opportunity_kind,
-        allow_domains=[],
+        allow_domains=list(allow_domains),
         auto_submit=auto_submit,
         max_steps=100,
         personal_information=personal,
@@ -4551,3 +4623,674 @@ async def test_subsecond_remaining_deadline_waits_for_ttl_without_posting(
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.error is not None
     assert snapshot.error.code == "session_timeout"
+
+
+@pytest.mark.asyncio
+async def test_saved_credentials_try_newest_once_per_successful_inspection_then_gate(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    moments = iter(
+        [
+            datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
+            datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
+        ]
+    )
+    credential_store = CredentialStore(
+        tmp_path / "credentials.json",
+        clock=lambda: next(moments),
+    )
+    await credential_store.upsert(
+        "https://jobs.example",
+        "old@example.test",
+        "old-password",
+    )
+    await credential_store.upsert(
+        "https://jobs.example",
+        "new@example.test",
+        "new-password",
+    )
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=credential_store,
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    request = RequestSignInRuntimeAction(
+        type="request_sign_in",
+        username_ref="e1",
+        password_ref="e2",
+        submit_ref="e3",
+    )
+
+    with pytest.raises(HarnessServiceError) as before_inspection:
+        await manager.runtime_action(created.session_id, request)
+    assert_service_error(
+        before_inspection.value,
+        409,
+        "command_conflict",
+        "Inspect the application before requesting sign-in",
+    )
+
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    first = await manager.runtime_action(created.session_id, request)
+    assert first == SignInRuntimeActionResponse(
+        type="sign_in",
+        status="attempted",
+    )
+    assert fakes.runtimes[0].sign_in_calls[-1]["username"] == "new@example.test"
+
+    with pytest.raises(HarnessServiceError) as stale_inspection:
+        await manager.runtime_action(created.session_id, request)
+    assert_service_error(
+        stale_inspection.value,
+        409,
+        "command_conflict",
+        "Inspect the application before requesting sign-in",
+    )
+
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    second = await manager.runtime_action(created.session_id, request)
+    assert second == SignInRuntimeActionResponse(
+        type="sign_in",
+        status="attempted",
+    )
+    assert [
+        call["username"] for call in fakes.runtimes[0].sign_in_calls
+    ] == ["new@example.test", "old@example.test"]
+
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    gated = asyncio.create_task(
+        manager.runtime_action(created.session_id, request)
+    )
+    await wait_state(
+        manager,
+        created.session_id,
+        "awaiting_human_navigation",
+    )
+    runtime = fakes.runtimes[0]
+    assert runtime.capture_suppression_calls == 3
+    assert runtime.video_recording is False
+    assert runtime.navigation_guard_suspended is False
+    assert runtime.order.index(
+        "runtime.suppress_private_capture"
+    ) < runtime.order.index("runtime.private_sign_in")
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.pending_action is not None
+    assert snapshot.pending_action.model_dump(mode="json") == {
+        "type": "credentials"
+    }
+    record = manager._active
+    assert record is not None
+    assert record.playwright_cli_action_count == 8
+    credentials_event = next(
+        event for event in record.events if event.event == "credentials_required"
+    )
+    assert credentials_event.detail.model_dump(mode="json") == {}
+    assert credentials_event.session.pending_action is not None
+    assert credentials_event.session.pending_action.model_dump(mode="json") == {
+        "type": "credentials"
+    }
+
+    with pytest.raises(HarnessServiceError) as wrong_command:
+        await manager.command(
+            created.session_id,
+            ContinueCommand(type="continue"),
+        )
+    assert wrong_command.value.code == "command_conflict"
+
+    await manager.command(created.session_id, CancelCommand(type="cancel"))
+    outcome = (await asyncio.gather(gated, return_exceptions=True))[0]
+    assert isinstance(outcome, asyncio.CancelledError) or getattr(
+        outcome,
+        "type",
+        None,
+    ) == "cancel"
+    await wait_state(manager, created.session_id, "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screenshots(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=credential_store,
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    pending = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestSignInRuntimeAction(
+                type="request_sign_in",
+                username_ref="e10",
+                password_ref="e20",
+                submit_ref="e30",
+            ),
+        )
+    )
+    await wait_state(
+        manager,
+        created.session_id,
+        "awaiting_human_navigation",
+    )
+    runtime = fakes.runtimes[0]
+    assert runtime.capture_suppression_calls == 1
+    assert runtime.video_recording is False
+    assert runtime.navigation_guard_suspended is False
+
+    username = "transient@example.test"
+    password = " transient-password "
+    await manager.command(
+        created.session_id,
+        SignInCommand(
+            type="sign_in",
+            username=username,
+            password=password,
+        ),
+    )
+    response = await pending
+
+    assert response.model_dump(mode="json") == {
+        "type": "sign_in",
+        "status": "attempted",
+    }
+    assert username not in response.model_dump_json()
+    assert password not in response.model_dump_json()
+    assert credential_store.credentials_for_origin("https://jobs.example") == ()
+    assert runtime.video_recording is False
+    assert runtime.sign_in_calls == [
+        {
+            "expected_origin": "https://jobs.example",
+            "username_ref": "e10",
+            "password_ref": "e20",
+            "submit_ref": "e30",
+            "username": username,
+            "password": password,
+        }
+    ]
+
+    runtime.result = PlaywrightCliExecutionResult(
+        exit_code=0,
+        timed_out=False,
+        stdout=f"result for {username} using {password}",
+        stderr=f"stderr {password}",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        observation=BrowserObservation(
+            url=f"https://jobs.example/account/{username}",
+            title=f"Welcome {username}",
+            tabs=[
+                BrowserTab(
+                    url=f"https://jobs.example/account/{username}",
+                    title=f"Account {password}",
+                    tab_id="0",
+                )
+            ],
+            dom=f"Signed in as {username} with {password}",
+            page_info={"username": username},
+            screenshot={"data": "c2VjcmV0LXNjcmVlbnNob3Q="},
+        ),
+    )
+    later = await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    dumped = later.model_dump_json()
+    assert username not in dumped
+    assert password not in dumped
+    assert "[redacted]" in dumped
+    assert later.observation.screenshot is None
+    assert later.observation.page_info is None
+    snapshot_dump = manager.get_snapshot(created.session_id).model_dump_json()
+    assert username not in snapshot_dump
+    assert password not in snapshot_dump
+    record = manager._active
+    assert record is not None
+    event_dump = "".join(event.model_dump_json() for event in record.events)
+    assert username not in event_dump
+    assert password not in event_dump
+
+    await manager.delete(created.session_id)
+
+
+@pytest.mark.asyncio
+async def test_save_credentials_verifies_same_origin_path_without_browser_submission(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=credential_store,
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    pending = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestSignInRuntimeAction(
+                type="request_sign_in",
+                username_ref="e1",
+                password_ref="e2",
+                submit_ref="e3",
+            ),
+        )
+    )
+    await wait_state(
+        manager,
+        created.session_id,
+        "awaiting_human_navigation",
+    )
+    runtime = fakes.runtimes[0]
+    assert runtime.capture_suppression_calls == 1
+    assert runtime.video_recording is False
+    assert runtime.navigation_guard_suspended is False
+    runtime.current_url = "https://jobs.example/account/welcome"
+    username = "created@example.test"
+    password = "created-account-password"
+
+    await manager.command(
+        created.session_id,
+        SaveCredentialsCommand(
+            type="save_credentials",
+            username=username,
+            password=password,
+        ),
+    )
+    response = await pending
+
+    assert response.model_dump(mode="json") == {
+        "type": "sign_in",
+        "status": "saved",
+    }
+    assert runtime.sign_in_calls == []
+    assert runtime.activated_private_values == [(username, password)]
+    assert credential_store.credentials_for_origin(
+        "https://account.example.test"
+    ) == ()
+    saved = credential_store.credentials_for_origin("https://jobs.example")
+    assert [(item.username, item.password) for item in saved] == [
+        (username, password)
+    ]
+    assert manager.get_snapshot(created.session_id).approved_origins == [
+        "https://jobs.example",
+    ]
+    assert runtime.approved_origins == ("https://jobs.example",)
+    assert username not in manager.get_snapshot(created.session_id).model_dump_json()
+    assert password not in manager.get_snapshot(created.session_id).model_dump_json()
+
+    await manager.delete(created.session_id)
+
+
+@pytest.mark.asyncio
+async def test_save_credentials_conflicts_after_navigation_to_other_approved_origin(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=credential_store,
+    )
+    created = await create_valid(
+        manager,
+        allow_domains=("https://account.example.test",),
+    )
+    await wait_state(manager, created.session_id, "running")
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    pending = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestSignInRuntimeAction(
+                type="request_sign_in",
+                username_ref="e1",
+                password_ref="e2",
+                submit_ref="e3",
+            ),
+        )
+    )
+    await wait_state(
+        manager,
+        created.session_id,
+        "awaiting_human_navigation",
+    )
+    runtime = fakes.runtimes[0]
+    runtime.current_url = "https://account.example.test/welcome"
+    username = "created@example.test"
+    password = "created-account-password"
+
+    with pytest.raises(HarnessServiceError) as caught:
+        await manager.command(
+            created.session_id,
+            SaveCredentialsCommand(
+                type="save_credentials",
+                username=username,
+                password=password,
+            ),
+        )
+
+    assert_service_error(
+        caught.value,
+        409,
+        "command_conflict",
+        "The credential page changed",
+    )
+    assert credential_store.credentials_for_origin("https://jobs.example") == ()
+    assert credential_store.credentials_for_origin(
+        "https://account.example.test"
+    ) == ()
+    assert runtime.activated_private_values == []
+    assert not pending.done()
+
+    await manager.command(created.session_id, CancelCommand(type="cancel"))
+    await asyncio.gather(pending, return_exceptions=True)
+    await wait_state(manager, created.session_id, "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_saved_sign_in_preserves_private_runtime_session_timeout(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    await credential_store.upsert(
+        "https://jobs.example",
+        "timeout@example.test",
+        "timeout-password",
+    )
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=credential_store,
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    runtime = fakes.runtimes[0]
+    runtime.private_sign_in_error = PlaywrightCliRuntimeError(
+        "session_timeout"
+    )
+
+    with pytest.raises(HarnessServiceError) as caught:
+        await manager.runtime_action(
+            created.session_id,
+            RequestSignInRuntimeAction(
+                type="request_sign_in",
+                username_ref="e1",
+                password_ref="e2",
+                submit_ref="e3",
+            ),
+        )
+
+    assert_service_error(
+        caught.value,
+        504,
+        "session_timeout",
+        SESSION_ERROR_MESSAGES["session_timeout"],
+    )
+    assert runtime.capture_suppression_calls == 1
+    assert runtime.video_recording is False
+    record = manager._active
+    assert record is not None
+    assert record.human_gate is not None
+    assert record.human_gate.screenshots_suppressed is True
+
+    await manager.delete(created.session_id)
+
+
+@pytest.mark.asyncio
+async def test_cancel_preempts_blocked_private_sign_in_before_submission(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=credential_store,
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    gated = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestSignInRuntimeAction(
+                type="request_sign_in",
+                username_ref="e1",
+                password_ref="e2",
+                submit_ref="e3",
+            ),
+        )
+    )
+    await wait_state(
+        manager,
+        created.session_id,
+        "awaiting_human_navigation",
+    )
+    runtime = fakes.runtimes[0]
+    runtime.private_sign_in_blocker = asyncio.Event()
+    command = SignInCommand(
+        type="sign_in",
+        username="blocked@example.test",
+        password="blocked-password",
+    )
+    signing_in = asyncio.create_task(
+        manager.command(created.session_id, command)
+    )
+    await asyncio.wait_for(runtime.private_sign_in_started.wait(), timeout=1)
+
+    with pytest.raises(HarnessServiceError) as duplicate:
+        await manager.command(created.session_id, command)
+    assert duplicate.value.status_code == 409
+    assert duplicate.value.code == "command_conflict"
+
+    await asyncio.wait_for(
+        manager.command(created.session_id, CancelCommand(type="cancel")),
+        timeout=1,
+    )
+    sign_outcome = (
+        await asyncio.gather(signing_in, return_exceptions=True)
+    )[0]
+    assert isinstance(sign_outcome, asyncio.CancelledError)
+    gate_outcome = (await asyncio.gather(gated, return_exceptions=True))[0]
+    assert isinstance(gate_outcome, asyncio.CancelledError) or getattr(
+        gate_outcome,
+        "type",
+        None,
+    ) == "cancel"
+    await wait_state(manager, created.session_id, "cancelled")
+    assert runtime.sign_in_calls == []
+    assert "runtime.private_sign_in" not in runtime.order
+    assert runtime.private_sign_in_blocker is not None
+    assert not runtime.private_sign_in_blocker.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runtime_code", "status_code"),
+    [("browser_failed", 502), ("session_timeout", 504)],
+)
+async def test_save_credentials_preserves_private_runtime_errors(
+    tmp_path: Path,
+    runtime_code: Literal["browser_failed", "session_timeout"],
+    status_code: int,
+) -> None:
+    tmp_path.chmod(0o700)
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=credential_store,
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    gated = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestSignInRuntimeAction(
+                type="request_sign_in",
+                username_ref="e1",
+                password_ref="e2",
+                submit_ref="e3",
+            ),
+        )
+    )
+    await wait_state(
+        manager,
+        created.session_id,
+        "awaiting_human_navigation",
+    )
+    runtime = fakes.runtimes[0]
+    runtime.activate_private_values_error = PlaywrightCliRuntimeError(
+        runtime_code
+    )
+
+    with pytest.raises(HarnessServiceError) as caught:
+        await manager.command(
+            created.session_id,
+            SaveCredentialsCommand(
+                type="save_credentials",
+                username="created@example.test",
+                password="created-password",
+            ),
+        )
+
+    assert_service_error(
+        caught.value,
+        status_code,
+        runtime_code,
+        SESSION_ERROR_MESSAGES[runtime_code],
+    )
+    assert credential_store.credentials_for_origin("https://jobs.example") == ()
+    await manager.command(created.session_id, CancelCommand(type="cancel"))
+    await asyncio.gather(gated, return_exceptions=True)
+    await wait_state(manager, created.session_id, "cancelled")
+
+@pytest.mark.asyncio
+async def test_capture_failure_never_opens_or_executes_the_credentials_gate(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        credential_store=CredentialStore(tmp_path / "credentials.json"),
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    runtime = fakes.runtimes[0]
+    runtime.capture_suppression_error = PlaywrightCliRuntimeError(
+        "browser_failed"
+    )
+
+    with pytest.raises(HarnessServiceError) as caught:
+        await manager.runtime_action(
+            created.session_id,
+            RequestSignInRuntimeAction(
+                type="request_sign_in",
+                username_ref="e1",
+                password_ref="e2",
+                submit_ref="e3",
+            ),
+        )
+
+    assert_service_error(
+        caught.value,
+        502,
+        "browser_failed",
+        SESSION_ERROR_MESSAGES["browser_failed"],
+    )
+    assert manager.get_snapshot(created.session_id).state == "running"
+    record = manager._active
+    assert record is not None
+    assert all(event.event != "credentials_required" for event in record.events)
+    assert runtime.sign_in_calls == []
+    assert runtime.capture_suppression_calls == 1
+    await manager.delete(created.session_id)
