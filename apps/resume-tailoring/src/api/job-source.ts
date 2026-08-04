@@ -81,6 +81,11 @@ const ACCEPTED_HTML_TYPES: Readonly<Record<string, true>> = {
   "text/html": true,
   "application/xhtml+xml": true,
 };
+const ACCEPTED_ORACLE_JSON_TYPES: Readonly<Record<string, true>> = {
+  "application/json": true,
+  "application/vnd.oracle.adf.resourcecollection+json": true,
+};
+const ORACLE_CANDIDATE_PATH = /^\/hcmUI\/CandidateExperience\/[A-Za-z0-9_-]{1,32}\/sites\/([A-Za-z0-9_-]{1,64})\/job\/([0-9]{1,32})\/?$/;
 const JSON_LD_OPPORTUNITY_TYPES: Readonly<Record<string, OpportunityKind>> = {
   JobPosting: "job",
   "http://schema.org/JobPosting": "job",
@@ -620,6 +625,104 @@ async function htmlFallback(html: string): Promise<LoadedJobSource> {
   throw new JobSourceError(sawOversized ? "JOB_SOURCE_TOO_LARGE" : "JOB_DESCRIPTION_UNAVAILABLE");
 }
 
+interface OracleCandidateSource {
+  readonly sourceUrl: URL;
+  readonly siteNumber: string;
+  readonly requisitionId: string;
+}
+
+function oracleCandidateSource(sourceUrl: string): OracleCandidateSource | undefined {
+  const url = new URL(sourceUrl);
+  const hostname = url.hostname.toLowerCase();
+  if (
+    url.protocol !== "https:"
+    || url.port !== ""
+    || (hostname !== "fa.oraclecloud.com" && !hostname.endsWith(".fa.oraclecloud.com"))
+  ) {
+    return undefined;
+  }
+  const match = ORACLE_CANDIDATE_PATH.exec(url.pathname);
+  if (!match) return undefined;
+  return { sourceUrl: url, siteNumber: match[1]!, requisitionId: match[2]! };
+}
+
+async function loadOracleCandidateExperienceFallback(
+  sourceUrl: string,
+  signal: AbortSignal,
+  fetchImpl: JobSourceFetch,
+  resolveHost: ResolveHost,
+): Promise<LoadedJobSource | undefined> {
+  const source = oracleCandidateSource(sourceUrl);
+  if (!source) return undefined;
+
+  const apiUrl = new URL("/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails", source.sourceUrl);
+  apiUrl.search = `?expand=all&onlyData=true&finder=ById;Id=%22${source.requisitionId}%22,siteNumber=${source.siteNumber}`;
+  const { response } = await fetchPinnedPublicHttp(apiUrl, {
+    signal,
+    fetchImpl,
+    resolveHost,
+    headers: { accept: "application/json" },
+  });
+  if (response.status < 200 || response.status > 299) {
+    cancelPublicHttpBody(response);
+    throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+  }
+
+  try {
+    const contentEncoding = response.headers.get("content-encoding");
+    if (contentEncoding && contentEncoding.trim().toLowerCase() !== "identity") {
+      throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+    }
+    const rawType = response.headers.get("content-type");
+    const type = rawType?.split(";", 1)[0]!.trim().toLowerCase();
+    if (!type || !Object.hasOwn(ACCEPTED_ORACLE_JSON_TYPES, type)) {
+      throw new JobSourceError("JOB_SOURCE_UNSUPPORTED");
+    }
+    const declaredLength = response.headers.get("content-length");
+    if (declaredLength && /^\d+$/.test(declaredLength.trim()) && Number(declaredLength) > MAX_BODY_BYTES) {
+      throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+    }
+  } catch (error) {
+    cancelPublicHttpBody(response);
+    throw error;
+  }
+
+  const bytes = await readBoundedPublicHttpBody(response, signal);
+  let document: unknown;
+  try {
+    document = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch (error) {
+    throw new JobSourceError("JOB_SOURCE_UNAVAILABLE", { cause: error });
+  }
+  if (!document || typeof document !== "object") {
+    throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+  }
+  const items = (document as Record<string, unknown>).items;
+  if (!Array.isArray(items) || items.length !== 1) {
+    throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+  }
+  const item = items[0];
+  if (!item || typeof item !== "object") {
+    throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+  }
+  const record = item as Record<string, unknown>;
+  const id = record.Id;
+  if (
+    (typeof id !== "string" && (typeof id !== "number" || !Number.isSafeInteger(id)))
+    || String(id) !== source.requisitionId
+    || typeof record.Title !== "string"
+    || typeof record.ExternalDescriptionStr !== "string"
+  ) {
+    throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+  }
+  const title = await normalizeHtmlFragment(record.Title);
+  const description = await normalizeHtmlFragment(record.ExternalDescriptionStr);
+  const candidate = buildFallbackCandidate(`${title}\n${description}`);
+  if (candidate === "too-large") throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+  if (!candidate) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+  return candidate;
+}
+
 function normalizedResolvedAddresses(answers: readonly ResolvedAddress[]): ParsedAddress[] {
   const output: ParsedAddress[] = [];
   const seen = new Set<string>();
@@ -720,6 +823,7 @@ export async function fetchPinnedPublicHttp(
   input: string | URL,
   request: PinnedPublicHttpRequest,
 ): Promise<{ readonly logicalUrl: URL; readonly response: Response }> {
+  request.signal.throwIfAborted();
   const logicalUrl = canonicalizePublicHttpUrl(input);
   const addresses = await resolveValidatedAddresses(
     logicalUrl,
@@ -744,7 +848,7 @@ function terminalMediaType(response: Response): "html" | "plain" {
   const rawType = response.headers.get("content-type");
   const type = rawType?.split(";", 1)[0]!.trim().toLowerCase();
   if (type === "text/plain") return "plain";
-  if (type && ACCEPTED_HTML_TYPES[type]) return "html";
+  if (type && Object.hasOwn(ACCEPTED_HTML_TYPES, type)) return "html";
   throw new JobSourceError("JOB_SOURCE_UNSUPPORTED");
 }
 
@@ -843,6 +947,13 @@ async function loadJobSourceWithSignal(
 
   const deterministic = await deterministicHtmlDescription(loaded.body);
   if (deterministic !== undefined) return deterministic;
+  const oracleCandidate = await loadOracleCandidateExperienceFallback(
+    loaded.url,
+    signal,
+    fetchImpl,
+    resolveHost,
+  );
+  if (oracleCandidate !== undefined) return oracleCandidate;
   return htmlFallback(loaded.body);
 }
 
