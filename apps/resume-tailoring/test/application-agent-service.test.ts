@@ -10,6 +10,7 @@ import {
   APPLICATION_AGENT_REASONING,
   ApplicationAgentService,
 } from "../src/agents/application-agent-service";
+import type { AuthStatusResponse } from "../src/contracts";
 
 const TOKEN = "test-token-0123456789abcdef-0123456789";
 const SESSION_ID = "123e4567-e89b-42d3-a456-426614174000";
@@ -54,9 +55,12 @@ const SUBMISSION_GUARD_FACTORY = () => ({
   finalize: async (_outcome: "submitted" | "uncertain") => undefined,
 });
 
-function connectedStatus() {
+function connectedStatus(): AuthStatusResponse {
   return {
-    providers: [{ provider: "openai-codex" as const, state: "connected" as const }],
+    providers: [
+      { provider: "openai-codex" as const, state: "connected" as const },
+      { provider: "indeed" as const, state: "disconnected" as const },
+    ],
   };
 }
 
@@ -84,7 +88,10 @@ describe("ApplicationAgentService", () => {
     const service = new ApplicationAgentService(TOKEN, {
       submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => ({
-        providers: [{ provider: "openai-codex", state: "disconnected" }],
+        providers: [
+          { provider: "openai-codex", state: "disconnected" },
+          { provider: "indeed", state: "disconnected" },
+        ],
       }),
       runtimeClientFactory: () => {
         runtimeConstructions += 1;
@@ -290,7 +297,10 @@ describe("ApplicationAgentService", () => {
         return authReads === 1
           ? connectedStatus()
           : {
-              providers: [{ provider: "openai-codex", state: "disconnected" }],
+              providers: [
+                { provider: "openai-codex", state: "disconnected" },
+                { provider: "indeed", state: "disconnected" },
+              ],
             };
       },
       runtimeClientFactory: () => ({

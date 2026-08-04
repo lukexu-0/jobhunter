@@ -68,8 +68,11 @@ export const ApiErrorSchema = z.object({
 });
 export type ApiError = z.infer<typeof ApiErrorSchema>;
 
-export const OAuthProviderSchema = z.literal("openai-codex");
-export type OAuthProvider = z.infer<typeof OAuthProviderSchema>;
+export const AuthProviderSchema = z.enum(["openai-codex", "indeed"]);
+export type AuthProvider = z.infer<typeof AuthProviderSchema>;
+
+export const ModelAuthProviderSchema = z.literal("openai-codex");
+export type ModelAuthProvider = z.infer<typeof ModelAuthProviderSchema>;
 
 export const AuthIdentitySchema = z
   .object({
@@ -81,7 +84,7 @@ export type AuthIdentity = z.infer<typeof AuthIdentitySchema>;
 
 export const AuthProviderStatusSchema = z
   .object({
-    provider: OAuthProviderSchema,
+    provider: AuthProviderSchema,
     state: z.enum(["connected", "disconnected"]),
     identity: AuthIdentitySchema.optional(),
   })
@@ -90,7 +93,10 @@ export type AuthProviderStatus = z.infer<typeof AuthProviderStatusSchema>;
 
 export const AuthStatusResponseSchema = z
   .object({
-    providers: z.array(AuthProviderStatusSchema).length(1),
+    providers: z.tuple([
+      AuthProviderStatusSchema.extend({ provider: z.literal("openai-codex") }),
+      AuthProviderStatusSchema.extend({ provider: z.literal("indeed") }),
+    ]),
   })
   .strict();
 export type AuthStatusResponse = z.infer<typeof AuthStatusResponseSchema>;
@@ -107,7 +113,7 @@ export type AuthPrompt = z.infer<typeof AuthPromptSchema>;
 export const AuthSessionSchema = z
   .object({
     id: z.string().min(1),
-    provider: OAuthProviderSchema,
+    provider: AuthProviderSchema,
     state: z.enum(["pending", "succeeded", "failed", "cancelled", "expired"]),
     launchUrl: z.string().url().optional(),
     url: z.string().url().optional(),

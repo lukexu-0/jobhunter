@@ -3,14 +3,21 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import type { OAuthAccess, StoredAuthCredential } from "@oh-my-pi/pi-ai";
+import type {
+  AuthCredentialEntry,
+  OAuthAccess,
+  OAuthCredential,
+  StoredAuthCredential,
+  StoredOAuthRefreshOptions,
+  StoredOAuthRefreshResult,
+} from "@oh-my-pi/pi-ai";
+import type { AuthProvider } from "../src/contracts";
 import { createOAuthOnlyApiKeyResolver, OAuthRequiredError, resolveOAuthOnlyWithStorage } from "../src/auth/oauth-only-resolver";
 import { AuthService, scrubProviderEnvironment } from "../src/auth/service";
 import {
   assertOAuthOnlyStorage,
   AuthConfigurationError,
   purgeUnsupportedCredentials,
-  type AuthProvider,
   type AuthStorageLike,
 } from "../src/auth/storage";
 
@@ -48,9 +55,23 @@ class FakeStorage implements AuthStorageLike {
   loginReleased = false;
   readonly accessOptions: Array<{ modelId?: string; signal?: AbortSignal; forceRefresh?: boolean }> = [];
   closed = false;
+  writesAfterClose = 0;
 
   async reload(): Promise<void> {}
   close(): void { this.closed = true; }
+  async set(provider: string, credential: AuthCredentialEntry): Promise<void> {
+    if (this.closed) this.writesAfterClose += 1;
+    const selected = Array.isArray(credential) ? credential[0] : credential;
+    this.rows = this.rows.filter((row) => row.provider !== provider);
+    if (selected) {
+      this.rows.push({
+        id: 1,
+        provider,
+        credential: selected,
+        disabledCause: null,
+      });
+    }
+  }
   listStoredCredentials(provider?: string): StoredAuthCredential[] {
     if (this.loginReleased) this.loginValidated.resolve();
     return provider ? this.rows.filter((row) => row.provider === provider) : [...this.rows];
@@ -62,6 +83,16 @@ class FakeStorage implements AuthStorageLike {
       ...(row.credential.accountId ? { accountId: row.credential.accountId } : {}),
       ...(row.credential.email ? { email: row.credential.email } : {}),
     };
+  }
+  getOAuthCredential(provider: string): OAuthCredential | undefined {
+    const row = this.rows.find((candidate) => candidate.provider === provider);
+    return row?.credential.type === "oauth" ? row.credential : undefined;
+  }
+  async refreshStoredOAuthCredential<T extends OAuthCredential = OAuthCredential>(
+    _provider: string,
+    _options: StoredOAuthRefreshOptions<T>,
+  ): Promise<StoredOAuthRefreshResult<T>> {
+    throw new Error("unexpected durable refresh");
   }
   async getOAuthAccess(
     _provider: string,
@@ -121,6 +152,17 @@ describe("app-owned OAuth storage and sessions", () => {
     const duplicateStorage = new FakeStorage();
     duplicateStorage.rows = [oauthRow("openai-codex"), { ...oauthRow("openai-codex"), id: 2 }];
     expect(() => assertOAuthOnlyStorage(duplicateStorage)).toThrow("Multiple active OAuth credentials");
+    const indeedStorage = new FakeStorage();
+    indeedStorage.rows = [oauthRow("indeed", { accountId: undefined, clientId: "indeed-client" })];
+    expect(() => assertOAuthOnlyStorage(indeedStorage)).not.toThrow();
+    indeedStorage.rows = [oauthRow("indeed", { accountId: undefined })];
+    expect(() => assertOAuthOnlyStorage(indeedStorage)).toThrow("Indeed OAuth credential has no registered client identity");
+    for (const clientId of [" indeed-client", "indeed-client ", "indeed\u0000client", "indeed\nclient"]) {
+      indeedStorage.rows = [oauthRow("indeed", { accountId: undefined, clientId })];
+      expect(() => assertOAuthOnlyStorage(indeedStorage)).toThrow(
+        "Indeed OAuth credential has no registered client identity",
+      );
+    }
   });
 
   test("rejects connect when connected and rejects a concurrent provider session", async () => {
@@ -141,6 +183,88 @@ describe("app-owned OAuth storage and sessions", () => {
       status: 409,
     });
     pendingService.cancelSession(ids.first);
+  });
+
+  test("logout waits for a late provider callback and retires its credential before releasing the lock", async () => {
+    const storage = new FakeStorage();
+    const releaseCallback = Promise.withResolvers<void>();
+    const credentialPersisted = Promise.withResolvers<void>();
+    const service = new AuthService(storage, {
+      randomId: () => ids.first,
+      schedule: () => undefined,
+      providerLogin: async (provider, controller) => {
+        controller.onAuth({ url: "https://provider.example/authorize?state=opaque" });
+        await releaseCallback.promise;
+        await storage.set(provider, {
+          type: "oauth",
+          access: "late-access",
+          refresh: "late-refresh",
+          expires: 2_000_000_000_000,
+          clientId: "late-indeed-client",
+        } as OAuthCredential);
+        credentialPersisted.resolve();
+      },
+    });
+    const started = await service.startSession("indeed");
+
+    let logoutSettled = false;
+    const logout = service.logout("indeed").then(() => { logoutSettled = true; });
+    await Promise.resolve();
+    expect(logoutSettled).toBe(false);
+    await expect(service.startSession("indeed")).rejects.toMatchObject({
+      code: "AUTH_CONFLICT",
+      status: 409,
+    });
+
+    releaseCallback.resolve();
+    await credentialPersisted.promise;
+    await logout;
+    expect(logoutSettled).toBe(true);
+    expect(service.getSession(started.id)?.state).toBe("cancelled");
+    expect(service.getAuthStatus().providers[1]).toEqual({
+      provider: "indeed",
+      state: "disconnected",
+    });
+    expect(storage.rows).toEqual([]);
+  });
+
+  test("close waits for pending provider settlement and cleanup before storage closes", async () => {
+    const storage = new FakeStorage();
+    const releaseCallback = Promise.withResolvers<void>();
+    const credentialPersisted = Promise.withResolvers<void>();
+    const service = new AuthService(storage, {
+      randomId: () => ids.first,
+      schedule: () => undefined,
+      providerLogin: async (provider, controller) => {
+        controller.onAuth({ url: "https://provider.example/authorize?state=opaque" });
+        await releaseCallback.promise;
+        await storage.set(provider, {
+          type: "oauth",
+          access: "late-access",
+          refresh: "late-refresh",
+          expires: 2_000_000_000_000,
+          clientId: "late-indeed-client",
+        } as OAuthCredential);
+        credentialPersisted.resolve();
+      },
+    });
+    await service.startSession("indeed");
+
+    let closeSettled = false;
+    const close = service.close().then(() => {
+      storage.close();
+      closeSettled = true;
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    expect(storage.closed).toBe(false);
+
+    releaseCallback.resolve();
+    await credentialPersisted.promise;
+    await close;
+    expect(storage.closed).toBe(true);
+    expect(storage.writesAfterClose).toBe(0);
+    expect(storage.rows).toEqual([]);
   });
 
   test("exposes one prompt, accepts its answer, and never exposes provider secrets", async () => {
@@ -183,6 +307,9 @@ describe("app-owned OAuth storage and sessions", () => {
     now += 10 * 60_000;
     expect(expiring.getSession(ids.second)?.state).toBe("expired");
     expect(expiringStorage.callbacks!.signal?.aborted).toBe(true);
+    expiringStorage.loginGate.resolve();
+    await expiringStorage.loginValidated.promise;
+    await expiring.close();
     now += 60_000;
     expect(expiring.getSession(ids.second)).toBeUndefined();
   });
@@ -202,10 +329,13 @@ describe("app-owned OAuth storage and sessions", () => {
     await storage.loginValidated.promise;
 
     expect(service.getSession(ids.first)?.state).toBe("succeeded");
-    expect(service.getAuthStatus().providers).toEqual([expect.objectContaining({
-      provider: "openai-codex",
-      state: "connected",
-    })]);
+    expect(service.getAuthStatus().providers).toEqual([
+      expect.objectContaining({
+        provider: "openai-codex",
+        state: "connected",
+      }),
+      { provider: "indeed", state: "disconnected" },
+    ]);
   });
 
   test("returns only redacted account identity and explicitly logs out", async () => {
@@ -217,14 +347,17 @@ describe("app-owned OAuth storage and sessions", () => {
       state: "connected",
       identity: { email: "p***@example.com", accountId: "***1234" },
     });
-    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex"]);
+    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex", "indeed"]);
     expect(encoded).not.toContain("stored-access-secret");
     expect(encoded).not.toContain("stored-refresh-secret");
     expect(encoded).not.toContain("person@example.com");
     expect(encoded).not.toContain("acct-secret");
     const service = new AuthService(storage);
     await service.logout("openai-codex");
-    expect(service.getAuthStatus().providers[0]).toEqual({ provider: "openai-codex", state: "disconnected" });
+    expect(service.getAuthStatus().providers).toEqual([
+      { provider: "openai-codex", state: "disconnected" },
+      { provider: "indeed", state: "disconnected" },
+    ]);
   });
 });
 
@@ -265,7 +398,7 @@ describe("OAuth-only resolver", () => {
   });
 });
 
-test("hard-purges active and disabled unsupported credentials, children, and token bytes without touching Codex", async () => {
+test("hard-purges unsupported credentials, children, and token bytes without touching Codex or Indeed", async () => {
   const directory = mkdtempSync(join(tmpdir(), "jobhunter-auth-purge-"));
   const dbPath = join(directory, "auth.sqlite");
   const missingPath = join(directory, "missing.sqlite");
@@ -275,11 +408,18 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
   const disabledRefresh = "disabled-unsupported-refresh-sentinel-f5a3d87d";
   const googleStickySentinel = "google-sticky-sentinel-d12c4e81";
   const codexStickyValue = '{"type":"oauth","index":0,"credentialId":3}';
+  const indeedStickyValue = '{"type":"oauth","index":0,"credentialId":4}';
   const codexData = JSON.stringify({
     access: "allowed-codex-access",
     refresh: "allowed-codex-refresh",
     expires: 2_000_000_000_000,
     accountId: "acct-allowed",
+  });
+  const indeedData = JSON.stringify({
+    access: "allowed-indeed-access",
+    refresh: "allowed-indeed-refresh",
+    expires: 2_000_000_000_000,
+    clientId: "indeed-client",
   });
 
   try {
@@ -335,22 +475,26 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
       projectId: "legacy-disabled-project",
     }), "retired");
     insertCredential.run(3, "openai-codex", codexData, null);
+    insertCredential.run(4, "indeed", indeedData, null);
     const insertBlock = db.query(
       "INSERT INTO auth_credential_blocks(credential_id, provider_key, block_scope, blocked_until_ms, updated_at) VALUES (?, ?, '', 999999, 1)",
     );
     insertBlock.run(1, "google-antigravity:oauth");
     insertBlock.run(2, "google-antigravity:oauth");
     insertBlock.run(3, "openai-codex:oauth");
+    insertBlock.run(4, "indeed:oauth");
     const insertLease = db.query(
       "INSERT INTO auth_credential_refresh_leases(credential_id, owner, expires_at_ms, updated_at) VALUES (?, ?, 999999, 1)",
     );
     insertLease.run(1, "unsupported-active");
     insertLease.run(2, "unsupported-disabled");
     insertLease.run(3, "codex");
+    insertLease.run(4, "indeed");
     const insertCache = db.query("INSERT INTO cache(key, value, expires_at) VALUES (?, ?, 9999999999)");
     insertCache.run("session:sticky:google-antigravity:active", googleStickySentinel);
     insertCache.run("session:sticky:google-antigravity:disabled", '{"type":"oauth","index":1,"credentialId":2}');
     insertCache.run("session:sticky:openai-codex:active", codexStickyValue);
+    insertCache.run("session:sticky:indeed:active", indeedStickyValue);
     insertCache.run("usage_cache:google-antigravity:legacy", "unrelated-cache-row");
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     db.close();
@@ -370,14 +514,29 @@ test("hard-purges active and disabled unsupported credentials, children, and tok
         data: codexData,
         disabled_cause: null,
       });
+      expect(verified.query("SELECT id, provider, data, disabled_cause FROM auth_credentials WHERE id = 4").get()).toEqual({
+        id: 4,
+        provider: "indeed",
+        data: indeedData,
+        disabled_cause: null,
+      });
       expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id = 3").get()).toEqual({
         credential_id: 3,
+      });
+      expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id = 4").get()).toEqual({
+        credential_id: 4,
       });
       expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id = 3").get()).toEqual({
         credential_id: 3,
       });
+      expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id = 4").get()).toEqual({
+        credential_id: 4,
+      });
       expect(verified.query("SELECT value FROM cache WHERE key = 'session:sticky:openai-codex:active'").get()).toEqual({
         value: codexStickyValue,
+      });
+      expect(verified.query("SELECT value FROM cache WHERE key = 'session:sticky:indeed:active'").get()).toEqual({
+        value: indeedStickyValue,
       });
       expect(verified.query("SELECT value FROM cache WHERE key = 'usage_cache:google-antigravity:legacy'").get()).toEqual({
         value: "unrelated-cache-row",

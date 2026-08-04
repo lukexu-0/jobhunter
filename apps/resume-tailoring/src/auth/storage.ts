@@ -3,12 +3,16 @@ import { access, chmod, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   AuthStorage,
+  type AuthCredentialEntry,
   type OAuthAccess,
+  type OAuthCredential,
   type StoredAuthCredential,
+  type StoredOAuthRefreshOptions,
+  type StoredOAuthRefreshResult,
 } from "@oh-my-pi/pi-ai";
+import type { AuthProvider } from "../contracts";
 
-export const AUTH_PROVIDERS = ["openai-codex"] as const;
-export type AuthProvider = (typeof AUTH_PROVIDERS)[number];
+export const AUTH_PROVIDERS = ["openai-codex", "indeed"] as const satisfies readonly AuthProvider[];
 
 export class AuthConfigurationError extends Error {
   readonly code = "INVALID_AUTH_STORAGE";
@@ -22,10 +26,16 @@ export class AuthConfigurationError extends Error {
 export interface AuthStorageLike {
   reload(): Promise<void>;
   close(): void;
+  set(provider: string, credential: AuthCredentialEntry): Promise<void>;
   listStoredCredentials(provider?: string): StoredAuthCredential[];
   getOAuthAccountIdentity(provider: string, sessionId?: string):
     | { accountId?: string; email?: string }
     | undefined;
+  getOAuthCredential(provider: string): OAuthCredential | undefined;
+  refreshStoredOAuthCredential<T extends OAuthCredential = OAuthCredential>(
+    provider: string,
+    options: StoredOAuthRefreshOptions<T>,
+  ): Promise<StoredOAuthRefreshResult<T>>;
   getOAuthAccess(
     provider: string,
     sessionId?: string,
@@ -80,7 +90,7 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
         if (!tables.has(table)) continue;
         const statement = db.query(
           `DELETE FROM ${table} WHERE credential_id IN (
-            SELECT id FROM auth_credentials WHERE provider <> ?
+            SELECT id FROM auth_credentials WHERE provider NOT IN (?, ?)
           )`,
         );
         try {
@@ -89,18 +99,18 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
           statement.finalize();
         }
       }
-      const deleteCredentials = db.query("DELETE FROM auth_credentials WHERE provider <> ?");
+      const deleteCredentials = db.query("DELETE FROM auth_credentials WHERE provider NOT IN (?, ?)");
       try {
-        deleteCredentials.run(AUTH_PROVIDERS[0]);
+        deleteCredentials.run(...AUTH_PROVIDERS);
       } finally {
         deleteCredentials.finalize();
       }
       if (tables.has("cache")) {
         const deleteStickyCache = db.query(
-          "DELETE FROM cache WHERE key LIKE 'session:sticky:%' AND key NOT LIKE ?",
+          "DELETE FROM cache WHERE key LIKE 'session:sticky:%' AND key NOT LIKE ? AND key NOT LIKE ?",
         );
         try {
-          deleteStickyCache.run(`session:sticky:${AUTH_PROVIDERS[0]}:%`);
+          deleteStickyCache.run(...AUTH_PROVIDERS.map((provider) => `session:sticky:${provider}:%`));
         } finally {
           deleteStickyCache.finalize();
         }
@@ -143,6 +153,14 @@ function isProvider(value: string): value is AuthProvider {
   return (AUTH_PROVIDERS as readonly string[]).includes(value);
 }
 
+function isSafeIndeedClientId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 2_048
+    && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 function validateOAuthRow(row: StoredAuthCredential): void {
   if (!isProvider(row.provider)) {
     throw new AuthConfigurationError(`Unsupported credential provider: ${row.provider}`);
@@ -160,6 +178,10 @@ function validateOAuthRow(row: StoredAuthCredential): void {
   }
   if (row.provider === "openai-codex" && !credential.accountId) {
     throw new AuthConfigurationError("OpenAI Codex OAuth credential has no account identity");
+  }
+  const indeedClientId = (credential as OAuthCredential & { clientId?: unknown }).clientId;
+  if (row.provider === "indeed" && !isSafeIndeedClientId(indeedClientId)) {
+    throw new AuthConfigurationError("Indeed OAuth credential has no registered client identity");
   }
 }
 

@@ -1,10 +1,11 @@
 import type { ApiKeyResolver } from "@oh-my-pi/pi-ai";
-import { assertOAuthOnlyStorage, getAuthStorage, type AuthProvider, type AuthStorageLike } from "./storage";
+import type { ModelAuthProvider } from "../contracts";
+import { assertOAuthOnlyStorage, getAuthStorage, type AuthStorageLike } from "./storage";
 
 export class OAuthRequiredError extends Error {
   readonly code = "OAUTH_REQUIRED";
 
-  constructor(provider: AuthProvider, cause?: unknown) {
+  constructor(provider: ModelAuthProvider, cause?: unknown) {
     super(`OAuth sign-in required for ${provider}`, cause === undefined ? undefined : { cause });
     this.name = "OAuthRequiredError";
   }
@@ -13,7 +14,7 @@ export class OAuthRequiredError extends Error {
 
 const OAUTH_MODELS = ["gpt-5.6-sol", "gpt-5.6-luna"] as const;
 
-function assertModel(provider: AuthProvider, modelId: string): void {
+function assertModel(provider: ModelAuthProvider, modelId: string): void {
   if (!(OAUTH_MODELS as readonly string[]).includes(modelId)) {
     throw new Error(`Unsupported OAuth model ${provider}/${modelId}`);
   }
@@ -21,7 +22,7 @@ function assertModel(provider: AuthProvider, modelId: string): void {
 
 export async function resolveOAuthOnlyWithStorage(
   storage: AuthStorageLike,
-  provider: AuthProvider,
+  provider: ModelAuthProvider,
   sessionId: string,
   modelId: string,
   signal?: AbortSignal,
@@ -45,7 +46,7 @@ export async function resolveOAuthOnlyWithStorage(
 }
 
 export async function oauthOnlyResolver(
-  provider: AuthProvider,
+  provider: ModelAuthProvider,
   sessionId: string,
   modelId: string,
   signal?: AbortSignal,
@@ -55,7 +56,7 @@ export async function oauthOnlyResolver(
 }
 
 export function createOAuthOnlyApiKeyResolver(
-  provider: AuthProvider,
+  provider: ModelAuthProvider,
   sessionId: string,
   modelId: string,
   signal?: AbortSignal,

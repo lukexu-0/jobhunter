@@ -1,5 +1,6 @@
 import { getBundledModel, resolveWireModelId, type Effort } from "@oh-my-pi/pi-catalog";
 import { getAuthStatus } from "../auth/service.ts";
+import type { AuthProvider } from "../contracts/index.ts";
 import { openContextDatabase } from "../context/database.ts";
 import { loadContextManifest } from "../context/manifest.ts";
 import { checkContextFreshness } from "../context/service.ts";
@@ -29,7 +30,7 @@ export type DoctorModelDescriptors = Readonly<Record<DoctorModelId, unknown>>;
 export type DoctorAuthState = "connected" | "disconnected" | "expired";
 
 export interface DoctorAuthStatus {
-  readonly providers: readonly { readonly provider: DoctorProvider; readonly state: DoctorAuthState }[];
+  readonly providers: readonly { readonly provider: AuthProvider; readonly state: DoctorAuthState }[];
 }
 
 export type ContextDoctorStatus =
@@ -257,9 +258,9 @@ export async function runDoctor(dependencies: DoctorDependencies, options: Docto
     authStatus = { providers: [] };
     authConfigurationInvalid = true;
   }
-  const authByProvider: Partial<Record<DoctorProvider, DoctorAuthState>> = {};
-  for (const provider of authStatus.providers) authByProvider[provider.provider] = provider.state;
-  const openaiAuth = authByProvider["openai-codex"] ?? "disconnected";
+  const openaiAuth = authStatus.providers.find(
+    ({ provider }) => provider === "openai-codex",
+  )?.state ?? "disconnected";
 
   let descriptors: DoctorModelDescriptors;
   try {

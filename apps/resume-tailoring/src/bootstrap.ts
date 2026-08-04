@@ -19,6 +19,7 @@ import { RunApplicationService } from "./api/run-service.ts";
 import type { LoadJobSource } from "./api/job-source.ts";
 import type { ExtractJobDescription } from "./models/luna-job-extractor.ts";
 import * as defaultAuthService from "./auth/service.ts";
+import { createIndeedCallbackUri } from "./auth/indeed-oauth.ts";
 import { createContextApplicationService, type ContextApplicationService } from "./context/application-service.ts";
 import { openContextDatabase } from "./context/database.ts";
 import { openPipelineDatabase } from "./db/database.ts";
@@ -119,6 +120,8 @@ async function closeAll(operations: readonly (() => void | Promise<void>)[]): Pr
 }
 
 export function createPipelineApplication(options: PipelineApplicationOptions = {}): PipelineApplication {
+  const webOrigin = options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN;
+  createIndeedCallbackUri(webOrigin);
   const browserHarnessToken = options.browserHarnessToken ?? process.env.JOBHUNTER_HARNESS_TOKEN;
   if (browserHarnessToken !== undefined && browserHarnessToken.length < 32) {
     throw new Error("JOBHUNTER_HARNESS_TOKEN must contain at least 32 characters");
@@ -189,6 +192,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
           })
     );
   const auth = options.auth ?? defaultAuthService;
+  auth.configureAuthCallbackOrigin?.(webOrigin);
   const applicationAgent = options.applicationAgent
     ?? (browserHarnessToken === undefined
       ? undefined
@@ -216,7 +220,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeApplicationSessions = createApplicationSessionRoutes(applicationSessions);
   const fetch = createApiHandler({
     internalRoute: routeApplicationAgent,
-    webOrigin: options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
+    webOrigin,
     route: async (request, url) =>
       (await routeAuth(request, url))
       ?? (await routeContext(request, url))
