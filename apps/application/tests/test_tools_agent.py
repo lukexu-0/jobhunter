@@ -24,6 +24,7 @@ from jobhunter_browser_harness.models import (
     CancelledApplicationResult,
     ReviewApplicationResult,
     HarnessServiceError,
+    OpportunityKind,
     SessionCreateRequest,
     UploadedArtifacts,
 )
@@ -251,7 +252,12 @@ def make_result(
     )
 
 
-def make_request(tmp_path: Path, *, max_steps: int = 3) -> ApplicationRunRequest:
+def make_request(
+    tmp_path: Path,
+    *,
+    max_steps: int = 3,
+    opportunity_kind: OpportunityKind = "job",
+) -> ApplicationRunRequest:
     session_directory = tmp_path / "session"
     session_directory.mkdir()
     resume = session_directory / "resume.pdf"
@@ -264,6 +270,7 @@ def make_request(tmp_path: Path, *, max_steps: int = 3) -> ApplicationRunRequest
     session = SessionCreateRequest(
         session_id=SESSION_ID,
         job_url=JOB_URL,
+        opportunity_kind=opportunity_kind,
         approved_origins=(JOB_ORIGIN,),
         auto_submit=False,
         max_steps=max_steps,
@@ -942,6 +949,7 @@ def test_task_is_exact_compact_data_envelope_for_current_application(
         {
             "job": {
                 "url": JOB_URL,
+                "opportunity_kind": "job",
                 "approved_origins": [JOB_ORIGIN, ATS_ORIGIN],
                 "resume": {
                     "display_name": "resume.pdf",
@@ -1003,3 +1011,18 @@ def test_task_is_exact_compact_data_envelope_for_current_application(
     assert "updated_at" not in task
     assert '"question"' not in task
     assert "workflow" not in task.lower()
+
+
+@pytest.mark.parametrize(
+    "opportunity_kind",
+    ["job", "hackathon", "competition", "event"],
+)
+def test_task_carries_every_opportunity_kind_inside_private_job_envelope(
+    tmp_path: Path,
+    opportunity_kind: OpportunityKind,
+) -> None:
+    request = make_request(tmp_path, opportunity_kind=opportunity_kind)
+
+    task = json.loads(build_application_task(request))
+
+    assert task["job"]["opportunity_kind"] == opportunity_kind

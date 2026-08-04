@@ -16,9 +16,10 @@ import {
 import { parseBaselineResume } from "../resume/parser.ts";
 import { MODEL_NAME } from "../models/oauth-codex-model.ts";
 import type { ContextSnapshot } from "../context/types.ts";
+import type { OpportunityKind } from "../contracts/index.ts";
 import { isMustIncludeEvidenceBlock } from "../context/directives.ts";
 import {
-  ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256,
+  ATS_KEYWORD_EXTRACTION_PROFILES,
   validateAtsKeywordExtractionAgainstJobDescription,
 } from "./ats-keyword-extraction-agent.ts";
 import {
@@ -108,6 +109,7 @@ function validateAnalysisKeywordLineage(
   analysis: JobAnalysis,
   extraction: AtsKeywordExtraction,
   requireCurrentExtractionWorkflow: boolean,
+  opportunityKind: OpportunityKind,
 ): JobAnalysis {
   const parsedAnalysis = JobAnalysisSchema.parse(analysis);
   const parsedExtraction = AtsKeywordExtractionSchema.parse(extraction);
@@ -117,7 +119,7 @@ function validateAnalysisKeywordLineage(
   if (
     requireCurrentExtractionWorkflow
     && parsedExtraction.keywordExtractionWorkflowSha256
-      !== ATS_KEYWORD_EXTRACTION_WORKFLOW_SHA256
+      !== ATS_KEYWORD_EXTRACTION_PROFILES[opportunityKind].workflowSha256
   ) {
     throw new Error("ATS keyword extraction does not match the configured workflow");
   }
@@ -129,15 +131,16 @@ function validateAnalysisKeywordLineage(
 export function validateAnalysisAgainstAtsKeywordExtraction(
   analysis: JobAnalysis,
   extraction: AtsKeywordExtraction,
+  opportunityKind: OpportunityKind,
 ): JobAnalysis {
-  return validateAnalysisKeywordLineage(analysis, extraction, true);
+  return validateAnalysisKeywordLineage(analysis, extraction, true, opportunityKind);
 }
 
 export function validatePersistedAnalysisAgainstAtsKeywordExtraction(
   analysis: JobAnalysis,
   extraction: AtsKeywordExtraction,
 ): JobAnalysis {
-  return validateAnalysisKeywordLineage(analysis, extraction, false);
+  return validateAnalysisKeywordLineage(analysis, extraction, false, "job");
 }
 
 function nestedError(
@@ -308,6 +311,7 @@ function formatAnalysisValidationError(error: unknown): string {
 }
 
 export interface AnalysisAgentInput {
+  readonly opportunityKind: OpportunityKind;
   readonly rawJobDescription: string;
   readonly atsKeywordExtraction: AtsKeywordExtraction;
   readonly canonicalCv: string;
@@ -326,6 +330,7 @@ export async function runAnalysisAgent(attempt: AnalysisAgentAttempt): Promise<J
   validateAtsKeywordExtractionAgainstJobDescription(
     attempt.input.atsKeywordExtraction,
     attempt.input.rawJobDescription,
+    attempt.input.opportunityKind,
   );
   const baselineInventory = parseBaselineResume(attempt.input.canonicalCv);
   const sourceById = new Map(attempt.input.context.sources.map((source) => [source.id, source]));
@@ -430,6 +435,7 @@ export async function runAnalysisAgent(attempt: AnalysisAgentAttempt): Promise<J
   const extractionValidated = validateAnalysisAgainstAtsKeywordExtraction(
     result,
     attempt.input.atsKeywordExtraction,
+    attempt.input.opportunityKind,
   );
   return validateAnalysisAgainstBaseline(
     extractionValidated,

@@ -52,11 +52,20 @@ async function persistedReviewWindow(ids: readonly string[]) {
     const queueSequence = repository.nextQueueSequence();
     const inputRoot = await artifacts.createRunInput({ run: queueSequence });
     const input = await artifacts.write(join(inputRoot, "job-description.txt"), `job:${id}`, 1024);
-    const run = repository.createQueuedRun(`job:${id}`, `https://jobs.example.test/${id}`, SOURCE_SNAPSHOT, {
-      sha256: input.sha256,
-      path: input.path,
-      byteSize: input.bytes,
-    }, id, true, queueSequence);
+    const run = repository.createQueuedRun(
+      `job:${id}`,
+      `https://jobs.example.test/${id}`,
+      "job",
+      SOURCE_SNAPSHOT,
+      {
+        sha256: input.sha256,
+        path: input.path,
+        byteSize: input.bytes,
+      },
+      id,
+      true,
+      queueSequence,
+    );
     const claim = repository.acquire();
     if (!claim || claim.runId !== id) throw new Error(`claim missing for ${id}`);
     for (const stage of REVIEW_STAGES) repository.transition(claim, stage);

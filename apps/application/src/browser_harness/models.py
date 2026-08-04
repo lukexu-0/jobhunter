@@ -24,6 +24,14 @@ MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
 MODEL_REASONING = "high"
 
+OpportunityKind: TypeAlias = Literal[
+    "job",
+    "hackathon",
+    "competition",
+    "event",
+]
+
+
 SessionState: TypeAlias = Literal[
     "starting",
     "running",
@@ -532,6 +540,7 @@ class UploadedArtifacts(FrozenPrivateModel):
 class SessionCreateRequest(FrozenPrivateModel):
     session_id: UUID
     job_url: StrictText
+    opportunity_kind: OpportunityKind
     approved_origins: tuple[StrictText, ...] = Field(min_length=1, max_length=20)
     auto_submit: bool
     max_steps: int = Field(default=100, ge=1, le=500)

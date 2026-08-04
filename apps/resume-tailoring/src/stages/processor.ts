@@ -283,7 +283,10 @@ export class PipelineStageProcessor {
     await this.#verifyAgain(run.id, signal);
     const atsKeywordExtraction = await this.#atsKeywordExtractionAgent({
       attemptSessionId: attempt.attemptSessionId,
-      input: { rawJobDescription },
+      input: {
+        opportunityKind: run.opportunityKind,
+        rawJobDescription,
+      },
       signal,
       ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
     });
@@ -291,10 +294,12 @@ export class PipelineStageProcessor {
     validateAtsKeywordExtractionAgainstJobDescription(
       atsKeywordExtraction,
       rawJobDescription,
+      run.opportunityKind,
     );
     const analysis = await this.#analysisAgent({
       attemptSessionId: attempt.attemptSessionId,
       input: {
+        opportunityKind: run.opportunityKind,
         rawJobDescription,
         atsKeywordExtraction,
         canonicalCv: sources.baseline,
@@ -307,7 +312,7 @@ export class PipelineStageProcessor {
     if (analysis.analysisWorkflowSha256 !== ANALYSIS_WORKFLOW_SHA256) {
       throw new Error("job analysis does not match the configured analysis workflow");
     }
-    validateAnalysisAgainstAtsKeywordExtraction(analysis, atsKeywordExtraction);
+    validateAnalysisAgainstAtsKeywordExtraction(analysis, atsKeywordExtraction, run.opportunityKind);
     validateAnalysisAgainstBaseline(analysis, rawJobDescription, sources.baseline, sources.snapshot);
     signal.throwIfAborted();
     const root = await this.#artifacts.createAttempt(this.#address(run, attempt));

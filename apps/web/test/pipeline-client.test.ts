@@ -51,6 +51,7 @@ const statuses: RunStatus[] = [
 function run(status: RunStatus = "queued"): RunDto {
   return {
     id: `run ${status}`,
+    opportunityKind: "job",
     status,
     applicationStatus: "applied",
     queueSequence: 1,

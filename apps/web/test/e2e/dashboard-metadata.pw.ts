@@ -3,6 +3,7 @@ import { type RunDto } from "@jobhunter/pipeline/contracts";
 
 const reviewRun: RunDto = {
   id: "metadata-review-run",
+  opportunityKind: "job",
   status: "review",
   applicationStatus: "applied",
   queueSequence: 1,

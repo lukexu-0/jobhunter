@@ -3,6 +3,7 @@ import {
   ApplicationHarnessError,
   HttpApplicationHarnessClient,
   type ApplicationHarnessFetch,
+  type ApplicationHarnessCreateInput,
 } from "../src/api/application-harness-client";
 import type { ApplicationSessionCommand } from "../src/contracts";
 
@@ -212,6 +213,7 @@ describe("HttpApplicationHarnessClient", () => {
     await expect(client.create({
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123?source=local",
+      opportunityKind: "hackathon",
       personalInformationMarkdown: "# Applicant\n\nPrivate profile",
       autoSubmit: true,
       resumePdf,
@@ -233,6 +235,7 @@ describe("HttpApplicationHarnessClient", () => {
     expect([...form.keys()]).toEqual([
       "session_id",
       "job_url",
+      "opportunity_kind",
       "auto_submit",
       "personal_information",
       "resume",
@@ -240,6 +243,7 @@ describe("HttpApplicationHarnessClient", () => {
     ]);
     expect(form.get("session_id")).toBe(SESSION_ID);
     expect(form.get("job_url")).toBe("https://jobs.private.example/roles/123?source=local");
+    expect(form.get("opportunity_kind")).toBe("hackathon");
     expect(form.get("auto_submit")).toBe("true");
     expect(form.get("max_steps")).toBe("100");
     const profile = form.get("personal_information");
@@ -283,6 +287,7 @@ describe("HttpApplicationHarnessClient", () => {
     await client.create({
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
+      opportunityKind: "job",
       autoSubmit: false,
       personalInformationMarkdown: "# Applicant",
       resumePdf: new TextEncoder().encode("%PDF-private"),
@@ -305,6 +310,7 @@ describe("HttpApplicationHarnessClient", () => {
     await expect(client.create({
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
+      opportunityKind: "job",
       personalInformationMarkdown: "# Applicant",
       autoSubmit: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
@@ -312,9 +318,10 @@ describe("HttpApplicationHarnessClient", () => {
   });
   test("rejects mismatched caller IDs and non-strict create responses", async () => {
     const otherSessionId = "223e4567-e89b-42d3-a456-426614174000";
-    const input = {
+    const input: ApplicationHarnessCreateInput = {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
+      opportunityKind: "job",
       personalInformationMarkdown: "# Applicant",
       autoSubmit: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
@@ -809,9 +816,10 @@ describe("HttpApplicationHarnessClient", () => {
     }
   });
   test("maps only bounded stable harness and network failures", async () => {
-    const createInput = {
+    const createInput: ApplicationHarnessCreateInput = {
       sessionId: SESSION_ID,
       jobUrl: "https://jobs.private.example/roles/123",
+      opportunityKind: "job",
       autoSubmit: false,
       personalInformationMarkdown: "# Applicant",
       resumePdf: new TextEncoder().encode("%PDF-private"),

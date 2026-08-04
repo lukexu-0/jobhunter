@@ -32,6 +32,7 @@ function iteration(
 
 const run: RunDto = {
   id: "run-1",
+  opportunityKind: "job",
   status: "review",
   applicationStatus: "pending",
   generateKeywordMap: false,

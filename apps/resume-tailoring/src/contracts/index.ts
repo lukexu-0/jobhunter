@@ -137,6 +137,9 @@ export const RunStatusSchema = z.enum([
   "failed",
 ]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
+export const OpportunityKindSchema = z.enum(["job", "hackathon", "competition", "event"]);
+export type OpportunityKind = z.infer<typeof OpportunityKindSchema>;
+
 
 export const APPLICATION_STATUSES = ["pending", "applied", "rejected", "interview", "accepted", "failed"] as const;
 export const ApplicationStatusSchema = z.enum(APPLICATION_STATUSES);
@@ -435,6 +438,7 @@ export const RunDtoSchema = z
   .object({
     id: z.string(),
     jobUrl: JobUrlSchema.optional(),
+    opportunityKind: OpportunityKindSchema,
     status: RunStatusSchema,
     applicationStatus: ApplicationStatusSchema,
     titleOverride: RunIdentityTextSchema.optional(),
@@ -1012,6 +1016,7 @@ export const StartApplicationSessionRequestSchema = z.object({
 export type StartApplicationSessionRequest = z.infer<
   typeof StartApplicationSessionRequestSchema
 >;
+
 
 export const JOB_DESCRIPTION_MIN_CHARS = 40;
 export const JOB_DESCRIPTION_MAX_CHARS = 50_000;

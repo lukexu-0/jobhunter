@@ -17,6 +17,7 @@ const RUNTIME_URL = "http://127.0.0.1:8765";
 const DIRECT_VALUE = "private-candidate-value";
 
 const INPUT: ApplicationAgentRunInput = {
+  opportunityKind: "job",
   sessionId: SESSION_ID,
   runtimeUrl: RUNTIME_URL,
   task: `Apply using ${DIRECT_VALUE}`,
@@ -189,6 +190,35 @@ describe("ApplicationAgentService", () => {
     expect(serializedSuccess).not.toContain(RUNTIME_URL);
     expect(serializedSuccess).not.toContain(DIRECT_VALUE);
     expect(JSON.stringify(runCalls[0]?.[2])).not.toContain(TOKEN);
+  });
+
+  test("routes jobs and non-job opportunities to separate application-agent runners", async () => {
+    const jobKinds: string[] = [];
+    const nonJobKinds: string[] = [];
+    const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
+      authStatusReader: connectedStatus,
+      runtimeClientFactory: () => ({
+        action: async () => { throw new Error("unused"); },
+      }),
+      runApplicationAgent: async (input) => {
+        jobKinds.push(input.opportunityKind);
+        return RESULT;
+      },
+      runNonJobApplicationAgent: async (input) => {
+        nonJobKinds.push(input.opportunityKind);
+        return RESULT;
+      },
+    });
+    const signal = new AbortController().signal;
+
+    await service.invoke(INPUT, signal);
+    for (const opportunityKind of ["hackathon", "competition", "event"] as const) {
+      await service.invoke({ ...INPUT, opportunityKind }, signal);
+    }
+
+    expect(jobKinds).toEqual(["job"]);
+    expect(nonJobKinds).toEqual(["hackathon", "competition", "event"]);
   });
 
   test("strictly revalidates invoke input before OAuth or runtime construction", async () => {

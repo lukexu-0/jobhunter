@@ -8,6 +8,7 @@ import {
   type AttemptDto,
   type AttemptStage,
   type RevisionOrigin as PublicRevisionOrigin,
+  type OpportunityKind,
   type ResumeIterationListResponse,
   type RunDto,
   type RunStatus,
@@ -281,12 +282,12 @@ export class RunApplicationService {
     }
     signal?.throwIfAborted();
 
-    let jobDescription: string | null;
+    let extracted: { readonly opportunityKind: OpportunityKind; readonly jobDescription: string } | null;
     if (source.kind === "description") {
-      jobDescription = source.jobDescription;
+      extracted = source;
     } else {
       try {
-        jobDescription = await this.#extractJobDescription(source.lines, signal);
+        extracted = await this.#extractJobDescription(source.lines, signal);
       } catch (error) {
         if (signal?.aborted) signal.throwIfAborted();
         if (error instanceof OAuthRequiredError) {
@@ -314,8 +315,8 @@ export class RunApplicationService {
       }
       signal?.throwIfAborted();
     }
-    if (jobDescription === null) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
-    const validated = JobDescriptionSchema.parse(jobDescription);
+    if (extracted === null) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+    const validated = JobDescriptionSchema.parse(extracted.jobDescription);
 
     signal?.throwIfAborted();
     let freshSnapshot: ContextSnapshot;
@@ -339,11 +340,22 @@ export class RunApplicationService {
         validated,
         MAX_JOB_DESCRIPTION_BYTES,
       );
-      run = this.dependencies.repository.createQueuedRun(validated, jobUrl, snapshot, {
-        sha256: input.sha256,
-        path: input.path,
-        byteSize: input.bytes,
-      }, runId, generateKeywordMap, reservation.run, skipReview, autoSubmit);
+      run = this.dependencies.repository.createQueuedRun(
+        validated,
+        jobUrl,
+        extracted.opportunityKind,
+        snapshot,
+        {
+          sha256: input.sha256,
+          path: input.path,
+          byteSize: input.bytes,
+        },
+        runId,
+        generateKeywordMap,
+        reservation.run,
+        skipReview,
+        autoSubmit,
+      );
     } catch (error) {
       try {
         await this.dependencies.artifacts.removeRun(reservation.run);
@@ -615,6 +627,7 @@ export class RunApplicationService {
     return {
       id: run.id,
       ...(run.jobUrl !== undefined ? { jobUrl: run.jobUrl } : {}),
+      opportunityKind: run.opportunityKind,
       status: run.status,
       applicationStatus: run.applicationStatus,
       ...(run.titleOverride !== undefined ? { titleOverride: run.titleOverride } : {}),

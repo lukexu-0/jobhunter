@@ -11,6 +11,7 @@ import {
   ApplicationSessionErrorSchema,
   FieldResultSchema,
   HarnessSessionStateSchema,
+  OpportunityKindSchema,
   type ApplicationAdditionalInfoQuestion,
   type ApplicationAnswerSuggestionsResponse,
   type ApplicationPlaywrightCliDiagnostic,
@@ -18,6 +19,7 @@ import {
   type ApplicationPendingAction,
   type ApplicationSessionCommand,
   type ApplicationSessionError,
+  type OpportunityKind,
   type HarnessSessionState,
 } from "../contracts";
 
@@ -75,6 +77,7 @@ export interface ApplicationHarnessClientOptions {
 export interface ApplicationHarnessCreateInput {
   readonly sessionId: string;
   readonly jobUrl: string;
+  readonly opportunityKind: OpportunityKind;
   readonly autoSubmit: boolean;
   readonly personalInformationMarkdown: string;
   readonly resumePdf: Uint8Array;
@@ -876,11 +879,13 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
 
   async create(input: ApplicationHarnessCreateInput, signal: AbortSignal): Promise<void> {
     const sessionId = UUIDSchema.safeParse(input.sessionId);
+    const opportunityKind = OpportunityKindSchema.safeParse(input.opportunityKind);
     const profileBytes = typeof input.personalInformationMarkdown === "string"
       ? Buffer.byteLength(input.personalInformationMarkdown)
       : Number.POSITIVE_INFINITY;
     if (
       !sessionId.success
+      || !opportunityKind.success
       || !isHarnessJobUrl(input.jobUrl)
       || typeof input.autoSubmit !== "boolean"
       || profileBytes < 1
@@ -895,6 +900,7 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     const form = new FormData();
     form.set("session_id", sessionId.data);
     form.set("job_url", input.jobUrl);
+    form.set("opportunity_kind", opportunityKind.data);
     form.set("auto_submit", input.autoSubmit ? "true" : "false");
     form.set(
       "personal_information",

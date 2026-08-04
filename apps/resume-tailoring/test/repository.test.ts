@@ -225,13 +225,14 @@ describe("persisted workflow commands", () => {
     expect(() => repo.setIdentity(created.id, { title: " padded " })).toThrow(/trimmed/);
   });
 
-  test("projects canonical job URLs and omits legacy null values", () => {
+  test("persists classified opportunity kinds with canonical URLs", () => {
     const { repo } = fixture();
     const legacy = repo.createRun("Legacy JD", "legacy-job-url");
     const jobUrl = "https://jobs.example.test/role?gh_jid=123&source=repository";
     const canonical = repo.createQueuedRun(
       "Canonical JD",
       jobUrl,
+      "event",
       {
         manifestSha256: "1".repeat(64),
         baselineSha256: "2".repeat(64),
@@ -250,9 +251,11 @@ describe("persisted workflow commands", () => {
       "canonical-job-url",
     );
 
-    expect(canonical.jobUrl).toBe(jobUrl);
-    expect(repo.getRun(canonical.id)?.jobUrl).toBe(jobUrl);
+    expect(canonical).toMatchObject({ jobUrl, opportunityKind: "event" });
+    expect(repo.getRun(canonical.id)).toMatchObject({ jobUrl, opportunityKind: "event" });
+    expect(legacy).toMatchObject({ opportunityKind: "job" });
     expect(legacy).not.toHaveProperty("jobUrl");
+    expect(repo.getRun(legacy.id)).toMatchObject({ opportunityKind: "job" });
     expect(repo.getRun(legacy.id)).not.toHaveProperty("jobUrl");
   });
 

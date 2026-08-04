@@ -17,6 +17,7 @@ from .models import (
     AdditionalInfoQuestionId,
     ApplicationAnswerSuggestionsResponse,
     HarnessConfig,
+    OpportunityKind,
     HarnessServiceError,
     SessionCommand,
     RuntimeActionRequest,
@@ -34,6 +35,7 @@ class HarnessSessionService(Protocol):
         *,
         session_id: UUID | None,
         job_url: str,
+        opportunity_kind: OpportunityKind,
         allow_domains: Sequence[str],
         auto_submit: bool,
         max_steps: int,
@@ -139,6 +141,7 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
     @app.post("/v1/sessions", status_code=202, response_model=SessionCreateResponse)
     async def create_session(
         job_url: Annotated[str, Form()],
+        opportunity_kind: Annotated[OpportunityKind, Form()],
         personal_information: Annotated[UploadFile, File()],
         resume: Annotated[UploadFile, File()],
         session_id: Annotated[UUID | None, Form()] = None,
@@ -156,6 +159,7 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         return await dependencies.sessions.create_session(
             session_id=session_id,
             job_url=job_url,
+            opportunity_kind=opportunity_kind,
             allow_domains=allow_domains,
             auto_submit=auto_submit == "true",
             max_steps=max_steps,

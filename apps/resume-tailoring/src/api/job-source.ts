@@ -4,6 +4,7 @@ import {
   JOB_DESCRIPTION_MAX_CHARS,
   JOB_DESCRIPTION_MIN_CHARS,
   JobDescriptionSchema,
+  type OpportunityKind,
 } from "../contracts";
 import { LUNA_MAX_SOURCE_BYTES, LUNA_MAX_SOURCE_LINES } from "../models/luna-job-extractor";
 
@@ -11,7 +12,7 @@ export type ResolvedAddress = { readonly address: string; readonly family: 4 | 6
 export type ResolveHost = (hostname: string) => Promise<readonly ResolvedAddress[]>;
 export type JobSourceFetch = (input: string | URL, init: BunFetchRequestInit) => Promise<Response>;
 export type LoadedJobSource = Readonly<
-  | { kind: "description"; jobDescription: string }
+  | { kind: "description"; opportunityKind: OpportunityKind; jobDescription: string }
   | { kind: "model-fallback"; lines: readonly string[] }
 >;
 export type LoadJobSource = (jobUrl: string, signal?: AbortSignal) => Promise<LoadedJobSource>;
@@ -64,10 +65,19 @@ const ACCEPTED_HTML_TYPES: Readonly<Record<string, true>> = {
   "text/html": true,
   "application/xhtml+xml": true,
 };
-const JSON_LD_JOB_POSTING_TYPES: Readonly<Record<string, true>> = {
-  JobPosting: true,
-  "http://schema.org/JobPosting": true,
-  "https://schema.org/JobPosting": true,
+const JSON_LD_OPPORTUNITY_TYPES: Readonly<Record<string, OpportunityKind>> = {
+  JobPosting: "job",
+  "http://schema.org/JobPosting": "job",
+  "https://schema.org/JobPosting": "job",
+  Hackathon: "hackathon",
+  "http://schema.org/Hackathon": "hackathon",
+  "https://schema.org/Hackathon": "hackathon",
+  Competition: "competition",
+  "http://schema.org/Competition": "competition",
+  "https://schema.org/Competition": "competition",
+  Event: "event",
+  "http://schema.org/Event": "event",
+  "https://schema.org/Event": "event",
 };
 const BOUNDARY_ELEMENTS = [
   "br", "p", "li", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -457,22 +467,33 @@ async function normalizeHtmlFragment(fragment: string): Promise<string> {
   return captureDocument(sanitized);
 }
 
-function jsonLdTypeIsJobPosting(value: unknown): boolean {
-  return typeof value === "string"
-    ? JSON_LD_JOB_POSTING_TYPES[value] === true
+function jsonLdOpportunityKind(value: unknown): OpportunityKind | undefined {
+  const values = typeof value === "string"
+    ? [value]
     : Array.isArray(value)
-      && value.some((item) => typeof item === "string" && JSON_LD_JOB_POSTING_TYPES[item] === true);
+      ? value.filter((item): item is string => typeof item === "string")
+      : [];
+  const kinds = new Set(values.map((item) => JSON_LD_OPPORTUNITY_TYPES[item]).filter(
+    (item): item is OpportunityKind => item !== undefined,
+  ));
+  return kinds.size === 1 ? kinds.values().next().value : undefined;
 }
 
-function visitJson(value: unknown, postings: Record<string, unknown>[]): void {
+interface JsonLdOpportunity {
+  readonly opportunityKind: OpportunityKind;
+  readonly value: Record<string, unknown>;
+}
+
+function visitJson(value: unknown, opportunities: JsonLdOpportunity[]): void {
   if (Array.isArray(value)) {
-    for (const item of value) visitJson(item, postings);
+    for (const item of value) visitJson(item, opportunities);
     return;
   }
   if (!value || typeof value !== "object") return;
   const object = value as Record<string, unknown>;
-  if (jsonLdTypeIsJobPosting(object["@type"])) postings.push(object);
-  for (const child of Object.values(object)) visitJson(child, postings);
+  const opportunityKind = jsonLdOpportunityKind(object["@type"]);
+  if (opportunityKind) opportunities.push({ opportunityKind, value: object });
+  for (const child of Object.values(object)) visitJson(child, opportunities);
 }
 
 async function collectJsonLdScripts(html: string): Promise<string[]> {
@@ -494,29 +515,41 @@ async function collectJsonLdScripts(html: string): Promise<string[]> {
   return scripts;
 }
 
-async function deterministicHtmlDescription(html: string): Promise<string | undefined> {
-  const postings: Record<string, unknown>[] = [];
+async function deterministicHtmlDescription(
+  html: string,
+): Promise<Extract<LoadedJobSource, { kind: "description" }> | undefined> {
+  const opportunities: JsonLdOpportunity[] = [];
   for (const script of await collectJsonLdScripts(html)) {
-    try { visitJson(JSON.parse(script), postings); } catch { /* Ignore each malformed block independently. */ }
+    try { visitJson(JSON.parse(script), opportunities); } catch { /* Ignore each malformed block independently. */ }
   }
-  const candidates = new Set<string>();
-  for (const posting of postings) {
-    const organization = posting.hiringOrganization;
+  const candidates = new Map<string, Extract<LoadedJobSource, { kind: "description" }>>();
+  for (const { opportunityKind, value } of opportunities) {
+    const organization = value.hiringOrganization ?? value.organizer ?? value.sponsor;
     const values = [
-      typeof posting.title === "string" ? posting.title : undefined,
-      organization && typeof organization === "object" && typeof (organization as Record<string, unknown>).name === "string"
-        ? (organization as Record<string, unknown>).name as string
-        : undefined,
-      typeof posting.description === "string" ? posting.description : undefined,
+      typeof value.title === "string"
+        ? value.title
+        : typeof value.name === "string"
+          ? value.name
+          : undefined,
+      typeof organization === "string"
+        ? organization
+        : organization && typeof organization === "object"
+          && typeof (organization as Record<string, unknown>).name === "string"
+          ? (organization as Record<string, unknown>).name as string
+          : undefined,
+      typeof value.description === "string" ? value.description : undefined,
     ];
     const normalized: string[] = [];
-    for (const value of values) {
-      if (value === undefined) continue;
-      const text = await normalizeHtmlFragment(value);
+    for (const source of values) {
+      if (source === undefined) continue;
+      const text = await normalizeHtmlFragment(source);
       if (text) normalized.push(text);
     }
     const candidate = JobDescriptionSchema.safeParse(normalized.join("\n\n"));
-    if (candidate.success) candidates.add(candidate.data);
+    if (candidate.success) {
+      const loaded = { kind: "description", opportunityKind, jobDescription: candidate.data } as const;
+      candidates.set(`${opportunityKind}\0${candidate.data}`, loaded);
+    }
   }
   return candidates.size === 1 ? candidates.values().next().value : undefined;
 }
@@ -706,7 +739,9 @@ async function loadWithSignal(
     if (mediaType === "plain") {
       const jobDescription = normalizeText(body);
       const parsed = JobDescriptionSchema.safeParse(jobDescription);
-      if (parsed.success) return { kind: "description", jobDescription: parsed.data };
+      if (parsed.success) {
+        return { kind: "description", opportunityKind: "job", jobDescription: parsed.data };
+      }
       throw new JobSourceError(
         jobDescription.length > JOB_DESCRIPTION_MAX_CHARS
           ? "JOB_SOURCE_TOO_LARGE"
@@ -715,7 +750,7 @@ async function loadWithSignal(
     }
 
     const deterministic = await deterministicHtmlDescription(body);
-    if (deterministic !== undefined) return { kind: "description", jobDescription: deterministic };
+    if (deterministic !== undefined) return deterministic;
     return htmlFallback(body);
   }
 }

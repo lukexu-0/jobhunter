@@ -15,6 +15,8 @@ import {
   ApplicationAgentRunInputSchema,
   ApplicationRunResultSchema,
   runApplicationAgent,
+  runNonJobApplicationAgent,
+  type ApplicationAgentRunInput,
   type ApplicationAgentDependencies,
   type BrowserApplicationContext,
 } from "../src/agents/application-agent.ts";
@@ -194,7 +196,8 @@ const EXPECTED_PLAYWRIGHT_CLI_RESTRICTION_SUFFIX = `Application-harness restrict
 const EXPECTED_PLAYWRIGHT_CLI_DESCRIPTION =
   `${EXPECTED_PLAYWRIGHT_CLI_MAPPING_PRELUDE}\n\n${PLAYWRIGHT_CLI_AGENT_REFERENCE}\n\n${EXPECTED_PLAYWRIGHT_CLI_RESTRICTION_SUFFIX}`;
 
-const RUN_INPUT = {
+const RUN_INPUT: ApplicationAgentRunInput = {
+  opportunityKind: "job",
   sessionId: "123e4567-e89b-42d3-a456-426614174000",
   runtimeUrl: "http://127.0.0.1:8765",
   task: "Fill the supplied application with direct candidate data.",
@@ -273,7 +276,8 @@ function dependenciesWith(
 
 describe("application agent", () => {
   test("accepts only the strict bounded run and result contracts", () => {
-    const input = {
+    const input: ApplicationAgentRunInput = {
+      opportunityKind: "job",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
       runtimeUrl: "http://127.0.0.1:8765",
       task: "Fill the supplied application.",
@@ -298,6 +302,26 @@ describe("application agent", () => {
       submit_attempted: false,
     })).toThrow();
     expect(() => ApplicationRunResultSchema.parse({ ...VALID_SUBMITTED_RESULT, extra: true })).toThrow();
+  });
+
+  test("uses a distinct non-job agent with organizer and opportunity mismatch checks", async () => {
+    const dependencies = dependenciesWith(
+      async () => {
+        throw new Error("runtime actions must not run");
+      },
+      async (agent) => {
+        expect(agent.name).toBe("non-job-application");
+        expect(agent.instructions).toContain("matches organizer and opportunity");
+        expect(agent.instructions).not.toContain("matches company and role");
+        return { history: [null] };
+      },
+    );
+
+    await expect(runNonJobApplicationAgent(
+      { ...RUN_INPUT, opportunityKind: "hackathon" },
+      new AbortController().signal,
+      dependencies,
+    )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
   });
 
   test("AGENT-TRANSCRIPT-001 rejects an oversized non-history transcript field", async () => {

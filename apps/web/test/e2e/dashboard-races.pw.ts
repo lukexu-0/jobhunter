@@ -3,6 +3,7 @@ import { type RunDto } from "@jobhunter/pipeline/contracts";
 
 const newerRun: RunDto = {
   id: "newer-run",
+  opportunityKind: "job",
   status: "approved",
   applicationStatus: "applied",
   revision: 2,

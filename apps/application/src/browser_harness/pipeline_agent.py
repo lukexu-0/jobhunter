@@ -8,7 +8,7 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .models import ApplicationRunResult
+from .models import ApplicationRunResult, OpportunityKind
 
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
@@ -135,6 +135,7 @@ class PipelineApplicationAgentClient:
         self,
         *,
         runtime_url: str,
+        opportunity_kind: OpportunityKind,
         auto_submit: bool,
         task: str,
         max_turns: int,
@@ -143,6 +144,13 @@ class PipelineApplicationAgentClient:
         runtime_origin = _normalize_loopback_origin(
             runtime_url, name="runtime_url"
         )
+        if opportunity_kind not in (
+            "job",
+            "hackathon",
+            "competition",
+            "event",
+        ):
+            raise ValueError("opportunity_kind is invalid")
         if type(auto_submit) is not bool:
             raise ValueError("auto_submit is invalid")
         _validate_utf8_text(task, name="task", max_bytes=1_048_576)
@@ -158,6 +166,7 @@ class PipelineApplicationAgentClient:
             json={
                 "sessionId": str(self._session_id),
                 "runtimeUrl": runtime_origin,
+                "opportunityKind": opportunity_kind,
                 "task": task,
                 "autoSubmit": auto_submit,
                 "maxTurns": max_turns,

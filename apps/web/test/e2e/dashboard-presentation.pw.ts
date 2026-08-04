@@ -14,6 +14,7 @@ async function interceptEmptyRuns(page: Page): Promise<void> {
 function runFixture(): RunDto {
   return {
     id: "presentation-run",
+    opportunityKind: "job",
     status: "approved",
     applicationStatus: "applied",
     queueSequence: 1,
