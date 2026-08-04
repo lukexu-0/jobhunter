@@ -97,6 +97,175 @@ describe("job source loading", () => {
     })).rejects.toMatchObject({ code: "JOB_DESCRIPTION_UNAVAILABLE" });
   });
 
+  test("loads a JPMC Oracle Candidate Experience shell through its same-origin public requisition API", async () => {
+    const attempts: Array<{ url: URL; init: BunFetchRequestInit }> = [];
+    const shell = `<!doctype html>
+      <html lang="en">
+        <head>
+          <meta property="og:title" content="2026 Software Engineer Program">
+          <meta property="og:description" content="Build your career at JPMorganChase.">
+        </head>
+        <body><div id="app"></div><script src="/hcmUI/CandidateExperience/cx.js"></script></body>
+      </html>`;
+    const fetchImpl: JobSourceFetch = async (input, init) => {
+      const attempt = { url: new URL(input), init };
+      attempts.push(attempt);
+      if (attempts.length === 1) return htmlResponse(shell);
+      return new Response(JSON.stringify({
+        items: [{
+          Id: 210775223,
+          Title: "2026 Software Engineer Program – Summer Internship",
+          ExternalDescriptionStr: [
+            "<p>Design, develop, and deliver technology products that improve experiences for our clients and colleagues.</p>",
+            "<p>Work with engineers and business partners to build secure, scalable solutions across the full software development lifecycle.</p>",
+          ].join(""),
+        }],
+        count: 1,
+        hasMore: false,
+        limit: 25,
+        offset: 0,
+      }), { headers: { "content-type": "application/vnd.oracle.adf.resourcecollection+json; charset=utf-8" } });
+    };
+
+    const result = await loadJobSourceFromUrl(
+      "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
+      undefined,
+      { fetchImpl, resolveHost: resolvePublic },
+    );
+
+    expect(result).toEqual({
+      kind: "model-fallback",
+      lines: [
+        "2026 Software Engineer Program – Summer Internship",
+        "Design, develop, and deliver technology products that improve experiences for our clients and colleagues.",
+        "Work with engineers and business partners to build secure, scalable solutions across the full software development lifecycle.",
+      ],
+    });
+    expect(result).not.toEqual({
+      kind: "model-fallback",
+      lines: ["Build your career at JPMorganChase."],
+    });
+    expect(attempts).toHaveLength(2);
+    const apiAttempt = attempts[1]!;
+    expect(apiAttempt.url.hostname).toBe(PUBLIC_V4);
+    expect(apiAttempt.url.pathname).toBe("/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails");
+    expect(apiAttempt.url.search).toBe("?expand=all&onlyData=true&finder=ById;Id=%22210775223%22,siteNumber=CX_1001");
+    const apiHeaders = new Headers(apiAttempt.init.headers);
+    expect(apiHeaders.get("host")).toBe("jpmc.fa.oraclecloud.com");
+    expect(apiHeaders.get("accept")).toBe("application/json");
+    expect(apiHeaders.get("accept-encoding")).toBe("identity");
+    expect(apiAttempt.init.redirect).toBe("manual");
+    expect(apiAttempt.init.decompress).toBe(false);
+    expect(apiAttempt.init.tls).toEqual({ rejectUnauthorized: true, serverName: "jpmc.fa.oraclecloud.com" });
+  });
+
+  test("uses the Oracle adapter only for its exact HTTPS host and Candidate Experience path", async () => {
+    for (const sourceUrl of [
+      "https://jobs.example.test/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
+      "https://fa.oraclecloud.com.evil.test/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
+      "http://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
+      "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223/details",
+    ]) {
+      let fetches = 0;
+      await expect(loadJobSourceFromUrl(sourceUrl, undefined, {
+        resolveHost: resolvePublic,
+        fetchImpl: async () => {
+          fetches += 1;
+          return htmlResponse("<html><body><div id=\"app\"></div></body></html>");
+        },
+      })).rejects.toMatchObject({ code: "JOB_DESCRIPTION_UNAVAILABLE" });
+      expect(fetches).toBe(1);
+    }
+  });
+
+  test("keeps deterministic JSON-LD ahead of the Oracle adapter", async () => {
+    let fetches = 0;
+    await expect(loadJobSourceFromUrl(
+      "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
+      undefined,
+      {
+        resolveHost: resolvePublic,
+        fetchImpl: async () => {
+          fetches += 1;
+          return htmlResponse(`<script type="application/ld+json">${JSON.stringify({
+            "@type": "Hackathon",
+            name: "Data for Good Hackathon",
+            organizer: { name: "JPMorganChase" },
+            description: "Build data and AI solutions for nonprofit organizations with an engineering team.",
+          })}</script>`);
+        },
+      },
+    )).resolves.toEqual({
+      kind: "description",
+      opportunityKind: "hackathon",
+      jobDescription: "Data for Good Hackathon\n\nJPMorganChase\n\nBuild data and AI solutions for nonprofit organizations with an engineering team.",
+    });
+    expect(fetches).toBe(1);
+  });
+
+  test("rejects unusable Oracle requisition API responses", async () => {
+    const validItem = {
+      Id: "210775223",
+      Title: "Software Engineer Internship",
+      ExternalDescriptionStr: "<p>Build secure systems and collaborate across the full product lifecycle.</p>",
+    };
+    const cases = [
+      {
+        response: new Response("{", { headers: { "content-type": "application/json" } }),
+        code: "JOB_SOURCE_UNAVAILABLE",
+      },
+      {
+        response: new Response(JSON.stringify({ items: [{ ...validItem, Id: "999" }] }), {
+          headers: { "content-type": "application/json" },
+        }),
+        code: "JOB_DESCRIPTION_UNAVAILABLE",
+      },
+      {
+        response: new Response(JSON.stringify({ items: [{ ...validItem, Id: ["210775223"] }] }), {
+          headers: { "content-type": "application/json" },
+        }),
+        code: "JOB_DESCRIPTION_UNAVAILABLE",
+      },
+      {
+        response: new Response(JSON.stringify({ items: [validItem] }), {
+          headers: { "content-type": "text/html" },
+        }),
+        code: "JOB_SOURCE_UNSUPPORTED",
+      },
+      {
+        response: new Response(JSON.stringify({ items: [validItem] }), {
+          headers: { "content-type": "constructor" },
+        }),
+        code: "JOB_SOURCE_UNSUPPORTED",
+      },
+      {
+        response: new Response("unavailable", {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+        code: "JOB_SOURCE_UNAVAILABLE",
+      },
+    ] as const;
+
+    for (const item of cases) {
+      let fetches = 0;
+      await expect(loadJobSourceFromUrl(
+        "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
+        undefined,
+        {
+          resolveHost: resolvePublic,
+          fetchImpl: async () => {
+            fetches += 1;
+            return fetches === 1
+              ? htmlResponse("<html><body><div id=\"app\"></div></body></html>")
+              : item.response;
+          },
+        },
+      )).rejects.toMatchObject({ code: item.code });
+      expect(fetches).toBe(2);
+    }
+  });
+
   test("extracts one exact valid JSON-LD JobPosting candidate", async () => {
     const body = `
       <html><body>
@@ -500,6 +669,7 @@ describe("job source loading", () => {
     for (const [headers, code] of [
       [{}, "JOB_SOURCE_UNSUPPORTED"],
       [{ "content-type": "application/json" }, "JOB_SOURCE_UNSUPPORTED"],
+      [{ "content-type": "constructor" }, "JOB_SOURCE_UNSUPPORTED"],
       [{ "content-type": "text/plain", "content-encoding": "gzip" }, "JOB_SOURCE_UNAVAILABLE"],
       [{ "content-type": "text/plain", "content-encoding": "br" }, "JOB_SOURCE_UNAVAILABLE"],
       [{ "content-type": "text/plain", "content-encoding": "deflate" }, "JOB_SOURCE_UNAVAILABLE"],
