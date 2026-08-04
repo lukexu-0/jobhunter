@@ -109,7 +109,7 @@ export function createSequentialToolBudget(options: {
   sharedSubmitted: { value: boolean };
   maxCalls: number;
   maxBytes: number;
-  perToolCalls: Readonly<Record<string, number>>;
+  perToolCalls?: Readonly<Record<string, number>>;
   label?: string;
 }): SequentialToolBudget {
   const counts = new Map<string, number>();
@@ -122,9 +122,10 @@ export function createSequentialToolBudget(options: {
       if (options.sharedSubmitted.value) throw new Error(`${toolName} cannot be called after terminal submission`);
       if (calls >= options.maxCalls) throw new Error(`${label} tool call budget of ${options.maxCalls} exhausted`);
       const nextForTool = (counts.get(toolName) ?? 0) + 1;
-      const limit = options.perToolCalls[toolName];
-      if (limit === undefined) throw new Error(`unknown ${label} tool ${toolName}`);
-      if (nextForTool > limit) throw new Error(`${toolName} call budget of ${limit} exhausted`);
+      const limit = options.perToolCalls?.[toolName];
+      if (limit !== undefined && nextForTool > limit) {
+        throw new Error(`${toolName} call budget of ${limit} exhausted`);
+      }
       const nextBytes = bytes + Buffer.byteLength(JSON.stringify(input));
       if (nextBytes > options.maxBytes) throw new Error(`${label} tool byte budget of ${options.maxBytes} exhausted`);
       calls++;
