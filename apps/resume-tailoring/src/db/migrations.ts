@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 16;
+export const PIPELINE_SCHEMA_VERSION = 17;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -583,6 +583,89 @@ CREATE INDEX run_application_sessions_unreleased_slot
   WHERE slot_released = 0;
 `;
 
+const migration17 = `
+CREATE TABLE recruiting_event_preferences (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  school TEXT,
+  updated_at INTEGER NOT NULL
+) STRICT;
+
+INSERT INTO recruiting_event_preferences(id, school, updated_at)
+VALUES (1, NULL, 0);
+
+CREATE TABLE recruiting_event_scrape_runs (
+  id TEXT PRIMARY KEY,
+  trigger TEXT NOT NULL CHECK (trigger IN ('startup','scheduled','manual')),
+  state TEXT NOT NULL CHECK (state IN ('running','completed','partial','failed')),
+  started_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  preferences_json TEXT NOT NULL CHECK (json_valid(preferences_json)),
+  source_count INTEGER NOT NULL CHECK (source_count >= 0),
+  succeeded_source_count INTEGER NOT NULL DEFAULT 0 CHECK (succeeded_source_count >= 0),
+  failed_source_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_source_count >= 0),
+  event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+  CHECK (
+    (state = 'running' AND completed_at IS NULL)
+    OR (state <> 'running' AND completed_at IS NOT NULL)
+  )
+) STRICT;
+
+CREATE UNIQUE INDEX recruiting_event_one_running_scrape
+  ON recruiting_event_scrape_runs(state)
+  WHERE state = 'running';
+CREATE INDEX recruiting_event_scrape_runs_started
+  ON recruiting_event_scrape_runs(started_at DESC);
+
+CREATE TABLE recruiting_event_source_attempts (
+  run_id TEXT NOT NULL REFERENCES recruiting_event_scrape_runs(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL,
+  source_name TEXT NOT NULL,
+  source_url TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('succeeded','failed')),
+  parser TEXT NOT NULL CHECK (parser IN ('deterministic','llm','none')),
+  event_count INTEGER NOT NULL CHECK (event_count >= 0),
+  issue_code TEXT,
+  issue_message TEXT,
+  completed_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, source_id),
+  CHECK (
+    (state = 'succeeded' AND issue_code IS NULL AND issue_message IS NULL)
+    OR (state = 'failed' AND parser = 'none' AND issue_code IS NOT NULL AND issue_message IS NOT NULL)
+  )
+) STRICT;
+
+CREATE TABLE recruiting_events (
+  id TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  organizer TEXT NOT NULL,
+  start_at INTEGER NOT NULL,
+  end_at INTEGER,
+  timezone TEXT,
+  location TEXT,
+  attendance TEXT NOT NULL CHECK (attendance IN ('virtual','in_person','hybrid','unknown')),
+  registration_url TEXT NOT NULL,
+  description TEXT,
+  eligibility_summary TEXT,
+  matched_for_applicant INTEGER NOT NULL CHECK (matched_for_applicant IN (0,1)),
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  last_scrape_run_id TEXT NOT NULL REFERENCES recruiting_event_scrape_runs(id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX recruiting_events_upcoming
+  ON recruiting_events(start_at, title);
+
+CREATE TABLE recruiting_event_sources (
+  event_id TEXT NOT NULL REFERENCES recruiting_events(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL,
+  source_url TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  PRIMARY KEY (event_id, source_id)
+) STRICT;
+`;
+
 
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
@@ -651,6 +734,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 16) {
         db.exec(migration16);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(16, now);
+      }
+      if (version < 17) {
+        db.exec(migration17);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(17, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");
