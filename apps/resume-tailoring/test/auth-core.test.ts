@@ -20,7 +20,6 @@ import type {
   StoredOAuthRefreshOptions,
   StoredOAuthRefreshResult,
 } from "@oh-my-pi/pi-ai";
-import type { AuthProvider } from "../src/contracts";
 import { createOAuthOnlyApiKeyResolver, OAuthRequiredError, resolveOAuthOnlyWithStorage } from "../src/auth/oauth-only-resolver";
 import { AuthService, scrubProviderEnvironment } from "../src/auth/service";
 import {
@@ -40,7 +39,7 @@ interface LoginCallbacks {
   signal?: AbortSignal;
 }
 
-function oauthRow(provider: AuthProvider, overrides: Record<string, unknown> = {}): StoredAuthCredential {
+function oauthRow(provider: string, overrides: Record<string, unknown> = {}): StoredAuthCredential {
   return {
     id: 1,
     provider,
@@ -175,17 +174,13 @@ describe("app-owned OAuth storage and sessions", () => {
     const duplicateStorage = new FakeStorage();
     duplicateStorage.rows = [oauthRow("openai-codex"), { ...oauthRow("openai-codex"), id: 2 }];
     expect(() => assertOAuthOnlyStorage(duplicateStorage)).toThrow("Multiple active OAuth credentials");
-    const indeedStorage = new FakeStorage();
-    indeedStorage.rows = [oauthRow("indeed", { accountId: undefined, clientId: "indeed-client" })];
-    expect(() => assertOAuthOnlyStorage(indeedStorage)).not.toThrow();
-    indeedStorage.rows = [oauthRow("indeed", { accountId: undefined })];
-    expect(() => assertOAuthOnlyStorage(indeedStorage)).toThrow("Indeed OAuth credential has no registered client identity");
-    for (const clientId of [" indeed-client", "indeed-client ", "indeed\u0000client", "indeed\nclient"]) {
-      indeedStorage.rows = [oauthRow("indeed", { accountId: undefined, clientId })];
-      expect(() => assertOAuthOnlyStorage(indeedStorage)).toThrow(
-        "Indeed OAuth credential has no registered client identity",
-      );
-    }
+    const retiredIndeed = new FakeStorage();
+    retiredIndeed.rows = [oauthRow("indeed", {
+      accountId: undefined,
+      clientId: "retired-indeed-client",
+    })];
+    expect(() => assertOAuthOnlyStorage(retiredIndeed))
+      .toThrow("Unsupported credential provider: indeed");
   });
 
   test("rejects connect when connected and rejects a concurrent provider session", async () => {
@@ -223,18 +218,18 @@ describe("app-owned OAuth storage and sessions", () => {
           access: "late-access",
           refresh: "late-refresh",
           expires: 2_000_000_000_000,
-          clientId: "late-indeed-client",
+          accountId: "late-codex-account",
         } as OAuthCredential);
         credentialPersisted.resolve();
       },
     });
-    const started = await service.startSession("indeed");
+    const started = await service.startSession("openai-codex");
 
     let logoutSettled = false;
-    const logout = service.logout("indeed").then(() => { logoutSettled = true; });
+    const logout = service.logout("openai-codex").then(() => { logoutSettled = true; });
     await Promise.resolve();
     expect(logoutSettled).toBe(false);
-    await expect(service.startSession("indeed")).rejects.toMatchObject({
+    await expect(service.startSession("openai-codex")).rejects.toMatchObject({
       code: "AUTH_CONFLICT",
       status: 409,
     });
@@ -244,8 +239,8 @@ describe("app-owned OAuth storage and sessions", () => {
     await logout;
     expect(logoutSettled).toBe(true);
     expect(service.getSession(started.id)?.state).toBe("cancelled");
-    expect(service.getAuthStatus().providers[1]).toEqual({
-      provider: "indeed",
+    expect(service.getAuthStatus().providers[0]).toEqual({
+      provider: "openai-codex",
       state: "disconnected",
     });
     expect(storage.rows).toEqual([]);
@@ -266,12 +261,12 @@ describe("app-owned OAuth storage and sessions", () => {
           access: "late-access",
           refresh: "late-refresh",
           expires: 2_000_000_000_000,
-          clientId: "late-indeed-client",
+          accountId: "late-codex-account",
         } as OAuthCredential);
         credentialPersisted.resolve();
       },
     });
-    await service.startSession("indeed");
+    await service.startSession("openai-codex");
 
     let closeSettled = false;
     const close = service.close().then(() => {
@@ -357,7 +352,6 @@ describe("app-owned OAuth storage and sessions", () => {
         provider: "openai-codex",
         state: "connected",
       }),
-      { provider: "indeed", state: "disconnected" },
     ]);
   });
 
@@ -370,7 +364,7 @@ describe("app-owned OAuth storage and sessions", () => {
       state: "connected",
       identity: { email: "p***@example.com", accountId: "***1234" },
     });
-    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex", "indeed"]);
+    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex"]);
     expect(encoded).not.toContain("stored-access-secret");
     expect(encoded).not.toContain("stored-refresh-secret");
     expect(encoded).not.toContain("person@example.com");
@@ -379,7 +373,6 @@ describe("app-owned OAuth storage and sessions", () => {
     await service.logout("openai-codex");
     expect(service.getAuthStatus().providers).toEqual([
       { provider: "openai-codex", state: "disconnected" },
-      { provider: "indeed", state: "disconnected" },
     ]);
   });
 });
@@ -563,7 +556,7 @@ test("creates private auth storage and safely reopens the regular database", asy
   }
 });
 
-test("hard-purges unsupported credentials, children, and token bytes without touching Codex or Indeed", async () => {
+test("hard-purges unsupported credentials, children, and token bytes without touching Codex", async () => {
   const directory = mkdtempSync(join(tmpdir(), "jobhunter-auth-purge-"));
   const dbPath = join(directory, "auth.sqlite");
   const missingPath = join(directory, "missing.sqlite");
@@ -679,30 +672,22 @@ test("hard-purges unsupported credentials, children, and token bytes without tou
         data: codexData,
         disabled_cause: null,
       });
-      expect(verified.query("SELECT id, provider, data, disabled_cause FROM auth_credentials WHERE id = 4").get()).toEqual({
-        id: 4,
-        provider: "indeed",
-        data: indeedData,
-        disabled_cause: null,
-      });
+      expect(verified.query("SELECT id FROM auth_credentials WHERE id = 4").all()).toEqual([]);
       expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id = 3").get()).toEqual({
         credential_id: 3,
       });
-      expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id = 4").get()).toEqual({
-        credential_id: 4,
-      });
+      expect(verified.query("SELECT credential_id FROM auth_credential_blocks WHERE credential_id = 4").all())
+        .toEqual([]);
       expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id = 3").get()).toEqual({
         credential_id: 3,
       });
-      expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id = 4").get()).toEqual({
-        credential_id: 4,
-      });
+      expect(verified.query("SELECT credential_id FROM auth_credential_refresh_leases WHERE credential_id = 4").all())
+        .toEqual([]);
       expect(verified.query("SELECT value FROM cache WHERE key = 'session:sticky:openai-codex:active'").get()).toEqual({
         value: codexStickyValue,
       });
-      expect(verified.query("SELECT value FROM cache WHERE key = 'session:sticky:indeed:active'").get()).toEqual({
-        value: indeedStickyValue,
-      });
+      expect(verified.query("SELECT value FROM cache WHERE key = 'session:sticky:indeed:active'").all())
+        .toEqual([]);
       expect(verified.query("SELECT value FROM cache WHERE key = 'usage_cache:google-antigravity:legacy'").get()).toEqual({
         value: "unrelated-cache-row",
       });
@@ -713,7 +698,16 @@ test("hard-purges unsupported credentials, children, and token bytes without tou
     for (const path of [dbPath, `${dbPath}-wal`]) {
       if (!existsSync(path)) continue;
       const bytes = readFileSync(path);
-      for (const sentinel of [unsupportedAccess, unsupportedRefresh, disabledAccess, disabledRefresh, googleStickySentinel]) {
+      for (const sentinel of [
+        unsupportedAccess,
+        unsupportedRefresh,
+        disabledAccess,
+        disabledRefresh,
+        googleStickySentinel,
+        "allowed-indeed-access",
+        "allowed-indeed-refresh",
+        indeedStickyValue,
+      ]) {
         expect(bytes.includes(Buffer.from(sentinel))).toBe(false);
       }
     }

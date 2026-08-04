@@ -16,17 +16,6 @@ export const DISCOVERY_SOURCE_KINDS = [
   "simplify",
   "zapply",
   "speedyapply",
-  "linkedin",
-  "indeed",
-  "greenhouse",
-  "lever",
-  "ashby",
-  "smartrecruiters",
-  "workable",
-  "recruitee",
-  "personio",
-  "workday",
-  "job_board",
 ] as const;
 
 export type DiscoverySourceKind = (typeof DISCOVERY_SOURCE_KINDS)[number];

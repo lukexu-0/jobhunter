@@ -60,7 +60,6 @@ function connectedStatus(): AuthStatusResponse {
   return {
     providers: [
       { provider: "openai-codex" as const, state: "connected" as const },
-      { provider: "indeed" as const, state: "disconnected" as const },
     ],
   };
 }
@@ -91,7 +90,6 @@ describe("ApplicationAgentService", () => {
       authStatusReader: () => ({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
-          { provider: "indeed", state: "disconnected" },
         ],
       }),
       runtimeClientFactory: () => {
@@ -329,7 +327,6 @@ describe("ApplicationAgentService", () => {
           : {
               providers: [
                 { provider: "openai-codex", state: "disconnected" },
-                { provider: "indeed", state: "disconnected" },
               ],
             };
       },

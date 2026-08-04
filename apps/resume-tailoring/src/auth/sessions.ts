@@ -277,10 +277,6 @@ export class AuthSessionManager {
     session.terminalAt = this.#now();
     if (error) session.error = boundedPublicText(error, MAX_PROGRESS_LENGTH);
     else delete session.error;
-    if (session.provider === "indeed") {
-      delete session.url;
-      delete session.launchUrl;
-    }
     delete session.pendingPrompt;
     session.controller.abort(terminalError(state));
     session.promptDeferred?.reject(terminalError(state));

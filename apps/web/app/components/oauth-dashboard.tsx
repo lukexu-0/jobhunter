@@ -20,10 +20,6 @@ const PROVIDERS = [
     provider: "openai-codex",
     name: "OpenAI Codex",
   },
-  {
-    provider: "indeed",
-    name: "Indeed Jobs",
-  },
 ] as const satisfies ReadonlyArray<{
   provider: AuthProvider;
   name: string;
@@ -273,12 +269,6 @@ export function OAuthDashboard() {
 
   usePendingSessionPolling(
     sessions["openai-codex"],
-    updateSession,
-    refreshAuthStatus,
-    setNotice,
-  );
-  usePendingSessionPolling(
-    sessions.indeed,
     updateSession,
     refreshAuthStatus,
     setNotice,

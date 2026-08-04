@@ -762,6 +762,97 @@ DROP TABLE IF EXISTS recruiting_event_scrape_runs;
 DROP TABLE IF EXISTS recruiting_event_preferences;
 `;
 
+const migration22 = `
+DELETE FROM discovery_dedupe_keys
+WHERE source_id IN (
+  SELECT id
+  FROM discovery_sources
+  WHERE kind NOT IN ('simplify','zapply','speedyapply')
+);
+
+DELETE FROM discovery_observations
+WHERE source_id IN (
+  SELECT id
+  FROM discovery_sources
+  WHERE kind NOT IN ('simplify','zapply','speedyapply')
+);
+UPDATE discovery_jobs AS jobs
+SET
+  catalog_source_id = (
+    SELECT observations.source_id
+    FROM discovery_observations AS observations
+    JOIN discovery_sources AS sources ON sources.id = observations.source_id
+    WHERE observations.job_id = jobs.id
+      AND sources.kind IN ('simplify','zapply','speedyapply')
+    ORDER BY observations.active DESC, observations.source_id, observations.source_item_id
+    LIMIT 1
+  ),
+  catalog_source_item_id = (
+    SELECT observations.source_item_id
+    FROM discovery_observations AS observations
+    JOIN discovery_sources AS sources ON sources.id = observations.source_id
+    WHERE observations.job_id = jobs.id
+      AND sources.kind IN ('simplify','zapply','speedyapply')
+    ORDER BY observations.active DESC, observations.source_id, observations.source_item_id
+    LIMIT 1
+  )
+WHERE EXISTS (
+  SELECT 1
+  FROM discovery_observations AS observations
+  JOIN discovery_sources AS sources ON sources.id = observations.source_id
+  WHERE observations.job_id = jobs.id
+    AND sources.kind IN ('simplify','zapply','speedyapply')
+)
+AND NOT EXISTS (
+  SELECT 1
+  FROM discovery_observations AS observations
+  JOIN discovery_sources AS sources ON sources.id = observations.source_id
+  WHERE observations.job_id = jobs.id
+    AND observations.source_id = jobs.catalog_source_id
+    AND observations.source_item_id = jobs.catalog_source_item_id
+    AND sources.kind IN ('simplify','zapply','speedyapply')
+);
+
+
+DELETE FROM discovery_run_links
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM discovery_observations
+  WHERE discovery_observations.job_id = discovery_run_links.job_id
+);
+
+DELETE FROM discovery_jobs
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM discovery_observations
+  WHERE discovery_observations.job_id = discovery_jobs.id
+);
+
+CREATE TABLE discovery_sources_v22 (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),
+  kind TEXT NOT NULL CHECK (kind IN ('simplify','zapply','speedyapply')),
+  last_sync_at INTEGER,
+  last_success_at INTEGER,
+  last_sync_status TEXT CHECK (
+    last_sync_status IS NULL OR last_sync_status IN ('succeeded','failed')
+  ),
+  last_error TEXT,
+  provenance TEXT
+) STRICT;
+
+INSERT INTO discovery_sources_v22(
+  id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+)
+SELECT
+  id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
+FROM discovery_sources
+WHERE kind IN ('simplify','zapply','speedyapply');
+
+DROP TABLE discovery_sources;
+ALTER TABLE discovery_sources_v22 RENAME TO discovery_sources;
+`;
+
 function hasOpportunityKindColumn(db: Database): boolean {
   return db.query<{ name: string }, []>("PRAGMA table_info(runs)")
     .all()

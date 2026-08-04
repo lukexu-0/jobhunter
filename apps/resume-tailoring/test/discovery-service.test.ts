@@ -52,7 +52,7 @@ function connector(
   id: string,
   sync: DiscoveryConnector["sync"],
 ): DiscoveryConnector {
-  return { id, name: `Source ${id}`, kind: "job_board", sync };
+  return { id, name: `Source ${id}`, kind: "simplify", sync };
 }
 
 afterEach(() => {
@@ -60,6 +60,27 @@ afterEach(() => {
 });
 
 describe("discovery synchronization", () => {
+  test("rejects connector families outside the approved catalog", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database);
+    const unsupported = {
+      id: "linkedin",
+      name: "LinkedIn",
+      kind: "linkedin",
+      sync: async () => ({ items: [], completeSnapshot: true }),
+    } as unknown as DiscoveryConnector;
+
+    expect(() => new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [unsupported],
+    })).toThrow("unsupported discovery connector kind");
+  });
+
   test("keeps successful source data when another source fails and redacts upstream URLs", async () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);
@@ -357,21 +378,21 @@ describe("discovery queueing", () => {
     repository.reconcileSource({
       id: "open-source",
       name: "Open source",
-      kind: "job_board",
+      kind: "simplify",
       items: [input("open"), input("race")],
       completeSnapshot: true,
     });
     repository.reconcileSource({
       id: "closed-source",
       name: "Closed source",
-      kind: "job_board",
+      kind: "simplify",
       items: [input("closed", "Data Science Intern")],
       completeSnapshot: true,
     });
     repository.reconcileSource({
       id: "closed-source",
       name: "Closed source",
-      kind: "job_board",
+      kind: "simplify",
       items: [],
       completeSnapshot: true,
     });
@@ -424,7 +445,7 @@ describe("discovery queueing", () => {
     repository.reconcileSource({
       id: "mixed-source",
       name: "Mixed source",
-      kind: "job_board",
+      kind: "simplify",
       items: [
         input("first", "First internship"),
         input("failing", "Failing internship"),
@@ -479,7 +500,7 @@ describe("discovery queueing", () => {
     repository.reconcileSource({
       id: "abort-source",
       name: "Abort source",
-      kind: "job_board",
+      kind: "simplify",
       items: [input("first", "First internship"), input("abort", "Abort internship")],
       completeSnapshot: true,
     });

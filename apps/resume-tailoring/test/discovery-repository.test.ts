@@ -26,7 +26,7 @@ function item(overrides: Partial<DiscoveredJobInput> = {}): DiscoveredJobInput {
 }
 
 function source(id: string, name: string, items: readonly DiscoveredJobInput[], completeSnapshot = true) {
-  return { id, name, kind: "job_board" as const, items, completeSnapshot };
+  return { id, name, kind: "simplify" as const, items, completeSnapshot };
 }
 
 afterEach(() => {
@@ -416,7 +416,7 @@ describe("discovery source reconciliation", () => {
 
     now = 3_000;
     repository.recordSourceFailure(
-      { id: "source-a", name: "Alpha", kind: "job_board" },
+      { id: "source-a", name: "Alpha", kind: "simplify" },
       new Error("upstream unavailable"),
     );
     expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0]?.status)

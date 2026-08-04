@@ -124,7 +124,7 @@ export const ApiErrorSchema = z.object({
 export type ApiError = z.infer<typeof ApiErrorSchema>;
 
 
-export const AuthProviderSchema = z.enum(["openai-codex", "indeed"]);
+export const AuthProviderSchema = z.literal("openai-codex");
 export type AuthProvider = z.infer<typeof AuthProviderSchema>;
 
 export const ModelAuthProviderSchema = z.literal("openai-codex");
@@ -151,7 +151,6 @@ export const AuthStatusResponseSchema = z
   .object({
     providers: z.tuple([
       AuthProviderStatusSchema.extend({ provider: z.literal("openai-codex") }),
-      AuthProviderStatusSchema.extend({ provider: z.literal("indeed") }),
     ]),
   })
   .strict();

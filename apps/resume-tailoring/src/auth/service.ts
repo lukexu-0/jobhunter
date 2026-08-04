@@ -1,10 +1,4 @@
-import type { OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth";
 import type { AuthIdentity, AuthProvider, AuthSession, AuthStatusResponse } from "../contracts";
-import {
-  createIndeedCallbackUri,
-  IndeedOAuthFlow,
-  type IndeedCallbackInput,
-} from "./indeed-oauth.ts";
 import {
   AuthSessionError,
   AuthSessionManager,
@@ -90,31 +84,19 @@ function contractSession(session: PublicAuthSession): AuthSession {
   };
 }
 
-export interface IndeedOAuthLike {
-  login(callbacks: OAuthLoginCallbacks): Promise<void>;
-  completeCallback(input: IndeedCallbackInput): Promise<void>;
-}
 
 export interface AuthServiceDependencies extends Omit<AuthSessionDependencies, "providerLogin"> {
-  readonly callbackOrigin?: string;
-  readonly indeedOAuth?: IndeedOAuthLike;
   readonly providerLogin?: AuthProviderLogin;
 }
 
 export class AuthService {
   readonly #sessions: AuthSessionManager;
-  readonly #indeedOAuth: IndeedOAuthLike;
 
   constructor(private readonly storage: AuthStorageLike, dependencies: AuthServiceDependencies = {}) {
     scrubProviderEnvironment();
     assertOAuthOnlyStorage(storage);
-    this.#indeedOAuth = dependencies.indeedOAuth ?? new IndeedOAuthFlow(storage, {
-      redirectUri: createIndeedCallbackUri(dependencies.callbackOrigin ?? DEFAULT_AUTH_WEB_ORIGIN),
-    });
     const providerLogin: AuthProviderLogin = dependencies.providerLogin
-      ?? ((provider, controller) => provider === "indeed"
-        ? this.#indeedOAuth.login(controller)
-        : storage.login(provider, controller));
+      ?? ((provider, controller) => storage.login(provider, controller));
     this.#sessions = new AuthSessionManager(storage, {
       ...(dependencies.now ? { now: dependencies.now } : {}),
       ...(dependencies.randomId ? { randomId: dependencies.randomId } : {}),
@@ -169,9 +151,6 @@ export class AuthService {
     }
   }
 
-  async completeIndeedCallback(input: IndeedCallbackInput): Promise<void> {
-    await this.#indeedOAuth.completeCallback(input);
-  }
 
   async logout(provider: AuthProvider): Promise<void> {
     await this.#sessions.cancelProvider(provider);
@@ -184,26 +163,11 @@ export class AuthService {
   }
 }
 
-const DEFAULT_AUTH_WEB_ORIGIN = "http://127.0.0.1:3456";
-let configuredAuthWebOrigin: string | undefined;
-
 let servicePromise: Promise<AuthService> | undefined;
 
-export function configureAuthCallbackOrigin(webOrigin: string): void {
-  createIndeedCallbackUri(webOrigin);
-  const lockedOrigin = servicePromise
-    ? configuredAuthWebOrigin ?? DEFAULT_AUTH_WEB_ORIGIN
-    : configuredAuthWebOrigin;
-  if (lockedOrigin !== undefined && lockedOrigin !== webOrigin) {
-    throw new Error("Authentication callback origin cannot change after authentication initialization");
-  }
-  configuredAuthWebOrigin = webOrigin;
-}
 
 async function defaultService(): Promise<AuthService> {
-  servicePromise ??= getAuthStorage().then((storage) => new AuthService(storage, {
-    callbackOrigin: configuredAuthWebOrigin ?? DEFAULT_AUTH_WEB_ORIGIN,
-  }));
+  servicePromise ??= getAuthStorage().then((storage) => new AuthService(storage));
   return servicePromise;
 }
 
@@ -227,9 +191,6 @@ export async function cancelSession(id: string): Promise<AuthSession | undefined
   return (await defaultService()).cancelSession(id);
 }
 
-export async function completeIndeedCallback(input: IndeedCallbackInput): Promise<void> {
-  await (await defaultService()).completeIndeedCallback(input);
-}
 
 export async function logout(provider: AuthProvider): Promise<void> {
   await (await defaultService()).logout(provider);
@@ -238,7 +199,6 @@ export async function logout(provider: AuthProvider): Promise<void> {
 export async function closeAuth(): Promise<void> {
   const current = servicePromise;
   servicePromise = undefined;
-  configuredAuthWebOrigin = undefined;
   try {
     const service = current ? await current : undefined;
     await service?.close();

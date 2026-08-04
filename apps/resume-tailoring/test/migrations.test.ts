@@ -322,7 +322,9 @@ function versionSeventeenDiscoveryDatabase(): Database {
     ) STRICT;
     INSERT INTO runs(id) VALUES ('legacy-job');
     CREATE TABLE discovery_jobs (
-      id TEXT PRIMARY KEY
+      id TEXT PRIMARY KEY,
+      catalog_source_id TEXT NOT NULL,
+      catalog_source_item_id TEXT NOT NULL
     ) STRICT;
     CREATE TABLE discovery_sources (
       id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
@@ -344,6 +346,7 @@ function versionSeventeenDiscoveryDatabase(): Database {
     CREATE TABLE discovery_observations (
       source_id TEXT NOT NULL REFERENCES discovery_sources(id) ON DELETE RESTRICT,
       source_item_id TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       job_id TEXT NOT NULL REFERENCES discovery_jobs(id) ON DELETE RESTRICT,
       PRIMARY KEY (source_id, source_item_id)
     ) STRICT;
@@ -361,7 +364,8 @@ function versionSeventeenDiscoveryDatabase(): Database {
       run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
       created_at INTEGER NOT NULL
     ) STRICT;
-    INSERT INTO discovery_jobs(id) VALUES ('existing-job');
+    INSERT INTO discovery_jobs(id, catalog_source_id, catalog_source_item_id)
+    VALUES ('existing-job', 'existing-source', 'existing-item');
     INSERT INTO discovery_sources(
       id, name, kind, last_sync_at, last_success_at, last_sync_status, last_error, provenance
     ) VALUES (
@@ -412,6 +416,32 @@ function versionEighteenDiscoveryDatabase(): Database {
     );
     INSERT INTO discovery_observations(source_id, source_item_id, job_id)
     VALUES ('indeed-existing', 'indeed-item', 'existing-job');
+    INSERT INTO discovery_jobs(id, catalog_source_id, catalog_source_item_id)
+    VALUES ('approved-job', 'simplify-summer-2027', 'approved-item');
+    INSERT INTO discovery_sources(
+      id, name, kind, last_sync_at, last_success_at, last_sync_status, provenance
+    ) VALUES (
+      'simplify-summer-2027', 'Simplify Summer 2027 Internships', 'simplify',
+      1800, 1750, 'succeeded', 'approved fixture'
+    );
+    INSERT INTO discovery_observations(source_id, source_item_id, job_id)
+    VALUES ('simplify-summer-2027', 'approved-item', 'approved-job');
+    INSERT INTO discovery_dedupe_keys(source_id, source_item_id, dedupe_key, job_id)
+    VALUES ('simplify-summer-2027', 'approved-item', 'url:https://jobs.example/approved', 'approved-job');
+    INSERT INTO discovery_jobs(id, catalog_source_id, catalog_source_item_id)
+    VALUES ('shared-job', 'indeed-existing', 'indeed-shared-item');
+    INSERT INTO discovery_observations(source_id, source_item_id, job_id) VALUES
+      ('indeed-existing', 'indeed-shared-item', 'shared-job'),
+      ('simplify-summer-2027', 'approved-shared-item', 'shared-job');
+    INSERT INTO discovery_observations(source_id, source_item_id, job_id, active)
+    VALUES ('simplify-summer-2027', 'a-approved-inactive-item', 'shared-job', 0);
+    INSERT INTO discovery_dedupe_keys(source_id, source_item_id, dedupe_key, job_id)
+    VALUES (
+      'simplify-summer-2027',
+      'approved-shared-item',
+      'url:https://jobs.example/shared',
+      'shared-job'
+    );
     INSERT INTO schema_migrations(version, applied_at) VALUES (18, 1800);
     PRAGMA user_version = 18;
   `);
@@ -1097,7 +1127,7 @@ test("migration seventeen adds the normalized discovery catalog to version sixte
   ).run()).toThrow();
 });
 
-test("migration eighteen adds Indeed while preserving version seventeen sources and foreign keys", () => {
+test("migration twenty-two removes retired version seventeen discovery sources", () => {
   const db = versionSeventeenDiscoveryDatabase();
 
   migratePipelineDatabase(db, 2_000);
@@ -1114,42 +1144,19 @@ test("migration eighteen adds Indeed while preserving version seventeen sources 
     { version: 21, applied_at: 2_000 },
     { version: 22, applied_at: 2_000 },
   ]);
-  expect(db.query<{
-    id: string;
-    name: string;
-    kind: string;
-    last_sync_at: number;
-    last_success_at: number;
-    last_sync_status: string;
-    last_error: string;
-    provenance: string;
-  }, []>("SELECT * FROM discovery_sources WHERE id = 'existing-source'").get()).toEqual({
-    id: "existing-source",
-    name: "Existing source",
-    kind: "greenhouse",
-    last_sync_at: 1_000,
-    last_success_at: 900,
-    last_sync_status: "failed",
-    last_error: "bounded failure",
-    provenance: "existing provenance",
-  });
-  expect(db.query<{ source_id: string; source_item_id: string; job_id: string }, []>(
-    "SELECT * FROM discovery_observations",
-  ).all()).toEqual([{
-    source_id: "existing-source",
-    source_item_id: "existing-item",
-    job_id: "existing-job",
-  }]);
+  expect(db.query<{ id: string }, []>("SELECT id FROM discovery_sources").all()).toEqual([]);
+  expect(db.query<{ job_id: string }, []>("SELECT job_id FROM discovery_observations").all())
+    .toEqual([]);
+  expect(db.query<{ id: string }, []>("SELECT id FROM discovery_jobs").all()).toEqual([]);
   expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
-  expect(() => db.query("DELETE FROM discovery_sources WHERE id = 'existing-source'").run()).toThrow();
-  db.query("INSERT INTO discovery_sources(id, name, kind) VALUES (?, ?, ?)")
-    .run("indeed-internships", "Indeed internships", "indeed");
-  expect(db.query<{ kind: string }, [string]>(
-    "SELECT kind FROM discovery_sources WHERE id = ?",
-  ).get("indeed-internships")).toEqual({ kind: "indeed" });
   expect(() => db.query(
-    "INSERT INTO discovery_sources(id, name, kind) VALUES ('unknown', 'Unknown', 'unknown')",
+    "INSERT INTO discovery_sources(id, name, kind) VALUES ('indeed', 'Indeed', 'indeed')",
   ).run()).toThrow();
+  expect(() => db.query(
+    "INSERT INTO discovery_sources(id, name, kind) VALUES ('greenhouse', 'Greenhouse', 'greenhouse')",
+  ).run()).toThrow();
+  db.query("INSERT INTO discovery_sources(id, name, kind) VALUES (?, ?, ?)")
+    .run("speedyapply-2027-swe", "speedyapply 2027 SWE College Jobs", "speedyapply");
 });
 
 test("migration twenty-two deletes recruiting-event storage from a populated version seventeen database", () => {
@@ -1217,7 +1224,7 @@ test("migration twenty-two deletes recruiting-event storage from a populated ver
     "discovery_observations_job",
   ]);
   db.query("INSERT INTO discovery_sources(id, name, kind) VALUES (?, ?, ?)")
-    .run("indeed-after-events", "Indeed after events", "indeed");
+    .run("speedyapply-2027-ai", "speedyapply 2027 AI College Jobs", "speedyapply");
   expect(() => db.query(
     "INSERT INTO discovery_sources(id, name, kind) VALUES ('unknown', 'Unknown', 'unknown')",
   ).run()).toThrow();
@@ -1231,7 +1238,7 @@ test("migration twenty-two deletes recruiting-event storage from a populated ver
   ).run()).toThrow();
 });
 
-test("combined migrations preserve a populated Indeed discovery version eighteen database", () => {
+test("migration twenty-two keeps only approved discovery source families", () => {
   const db = versionEighteenDiscoveryDatabase();
 
   migratePipelineDatabase(db, 2_000);
@@ -1257,51 +1264,79 @@ test("combined migrations preserve a populated Indeed discovery version eighteen
     last_sync_status: string;
     last_error: string | null;
     provenance: string;
-  }, []>("SELECT * FROM discovery_sources ORDER BY id").all()).toEqual([
+  }, []>("SELECT * FROM discovery_sources ORDER BY id").all()).toEqual([{
+    id: "simplify-summer-2027",
+    name: "Simplify Summer 2027 Internships",
+    kind: "simplify",
+    last_sync_at: 1_800,
+    last_success_at: 1_750,
+    last_sync_status: "succeeded",
+    last_error: null,
+    provenance: "approved fixture",
+  }]);
+  expect(db.query<{ source_id: string; source_item_id: string; job_id: string }, []>(`
+    SELECT source_id, source_item_id, job_id
+    FROM discovery_observations
+    ORDER BY source_item_id
+  `).all()).toEqual([
     {
-      id: "existing-source",
-      name: "Existing source",
-      kind: "greenhouse",
-      last_sync_at: 1_000,
-      last_success_at: 900,
-      last_sync_status: "failed",
-      last_error: "bounded failure",
-      provenance: "existing provenance",
+      source_id: "simplify-summer-2027",
+      source_item_id: "a-approved-inactive-item",
+      job_id: "shared-job",
     },
     {
-      id: "indeed-existing",
-      name: "Indeed existing",
-      kind: "indeed",
-      last_sync_at: 1_800,
-      last_success_at: 1_750,
-      last_sync_status: "succeeded",
-      last_error: null,
-      provenance: "indeed oauth fixture",
+      source_id: "simplify-summer-2027",
+      source_item_id: "approved-item",
+      job_id: "approved-job",
+    },
+    {
+      source_id: "simplify-summer-2027",
+      source_item_id: "approved-shared-item",
+      job_id: "shared-job",
     },
   ]);
-  expect(db.query<{ source_id: string; source_item_id: string; job_id: string }, []>(
-    "SELECT source_id, source_item_id, job_id FROM discovery_observations ORDER BY source_id",
-  ).all()).toEqual([
+  expect(db.query<{
+    id: string;
+    catalog_source_id: string;
+    catalog_source_item_id: string;
+  }, []>(`
+    SELECT id, catalog_source_id, catalog_source_item_id
+    FROM discovery_jobs
+    ORDER BY id
+  `).all()).toEqual([
     {
-      source_id: "existing-source",
-      source_item_id: "existing-item",
-      job_id: "existing-job",
+      id: "approved-job",
+      catalog_source_id: "simplify-summer-2027",
+      catalog_source_item_id: "approved-item",
     },
     {
-      source_id: "indeed-existing",
-      source_item_id: "indeed-item",
-      job_id: "existing-job",
+      id: "shared-job",
+      catalog_source_id: "simplify-summer-2027",
+      catalog_source_item_id: "approved-shared-item",
+    },
+  ]);
+  expect(db.query<{ source_id: string; source_item_id: string; job_id: string }, []>(`
+    SELECT source_id, source_item_id, job_id
+    FROM discovery_dedupe_keys
+    ORDER BY source_item_id
+  `).all()).toEqual([
+    {
+      source_id: "simplify-summer-2027",
+      source_item_id: "approved-item",
+      job_id: "approved-job",
+    },
+    {
+      source_id: "simplify-summer-2027",
+      source_item_id: "approved-shared-item",
+      job_id: "shared-job",
     },
   ]);
   expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
   expect(() => db.query(
-    "DELETE FROM discovery_sources WHERE id = 'indeed-existing'",
+    "INSERT INTO discovery_sources(id, name, kind) VALUES ('indeed', 'Indeed', 'indeed')",
   ).run()).toThrow();
   db.query("INSERT INTO discovery_sources(id, name, kind) VALUES (?, ?, ?)")
-    .run("indeed-after-v18", "Indeed after v18", "indeed");
-  expect(() => db.query(
-    "INSERT INTO discovery_sources(id, name, kind) VALUES ('unknown', 'Unknown', 'unknown')",
-  ).run()).toThrow();
+    .run("zapply-underclassmen", "zapply Underclassmen Internships", "zapply");
 
   expect(db.query<{ count: number }, []>(`
     SELECT count(*) AS count

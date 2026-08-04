@@ -13,7 +13,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import type { AuthProvider } from "../contracts";
 
-export const AUTH_PROVIDERS = ["openai-codex", "indeed"] as const satisfies readonly AuthProvider[];
+export const AUTH_PROVIDERS = ["openai-codex"] as const satisfies readonly AuthProvider[];
 
 export class AuthConfigurationError extends Error {
   readonly code = "INVALID_AUTH_STORAGE";
@@ -59,6 +59,8 @@ const CHILD_AUTH_TABLES = [
   "auth_credential_blocks",
   "auth_credential_refresh_leases",
 ] as const;
+const AUTH_PROVIDER_PLACEHOLDERS = AUTH_PROVIDERS.map(() => "?").join(", ");
+const AUTH_PROVIDER_CACHE_PREDICATE = AUTH_PROVIDERS.map(() => "key NOT LIKE ?").join(" AND ");
 
 const STORAGE_DIRECTORY_ERROR = "OAuth storage directory must be a private regular directory";
 const STORAGE_DATABASE_ERROR = "OAuth storage database must be a regular file";
@@ -301,7 +303,7 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
         if (!tables.has(table)) continue;
         const statement = db.query(
           `DELETE FROM ${table} WHERE credential_id IN (
-            SELECT id FROM auth_credentials WHERE provider NOT IN (?, ?)
+            SELECT id FROM auth_credentials WHERE provider NOT IN (${AUTH_PROVIDER_PLACEHOLDERS})
           )`,
         );
         try {
@@ -310,7 +312,9 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
           statement.finalize();
         }
       }
-      const deleteCredentials = db.query("DELETE FROM auth_credentials WHERE provider NOT IN (?, ?)");
+      const deleteCredentials = db.query(
+        `DELETE FROM auth_credentials WHERE provider NOT IN (${AUTH_PROVIDER_PLACEHOLDERS})`,
+      );
       try {
         deleteCredentials.run(...AUTH_PROVIDERS);
       } finally {
@@ -318,7 +322,7 @@ export async function purgeUnsupportedCredentials(dbPath: string): Promise<void>
       }
       if (tables.has("cache")) {
         const deleteStickyCache = db.query(
-          "DELETE FROM cache WHERE key LIKE 'session:sticky:%' AND key NOT LIKE ? AND key NOT LIKE ?",
+          `DELETE FROM cache WHERE key LIKE 'session:sticky:%' AND ${AUTH_PROVIDER_CACHE_PREDICATE}`,
         );
         try {
           deleteStickyCache.run(...AUTH_PROVIDERS.map((provider) => `session:sticky:${provider}:%`));
@@ -363,13 +367,6 @@ function isProvider(value: string): value is AuthProvider {
   return (AUTH_PROVIDERS as readonly string[]).includes(value);
 }
 
-function isSafeIndeedClientId(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 2_048
-    && value === value.trim()
-    && !/[\u0000-\u001f\u007f]/.test(value);
-}
 
 function validateOAuthRow(row: StoredAuthCredential): void {
   if (!isProvider(row.provider)) {
@@ -388,10 +385,6 @@ function validateOAuthRow(row: StoredAuthCredential): void {
   }
   if (row.provider === "openai-codex" && !credential.accountId) {
     throw new AuthConfigurationError("OpenAI Codex OAuth credential has no account identity");
-  }
-  const indeedClientId = (credential as OAuthCredential & { clientId?: unknown }).clientId;
-  if (row.provider === "indeed" && !isSafeIndeedClientId(indeedClientId)) {
-    throw new AuthConfigurationError("Indeed OAuth credential has no registered client identity");
   }
 }
 

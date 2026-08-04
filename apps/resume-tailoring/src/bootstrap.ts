@@ -23,15 +23,13 @@ import {
   type ProfessionalizeApplicationAnswer,
 } from "./models/application-answer-professionalizer.ts";
 import * as defaultAuthService from "./auth/service.ts";
-import { createIndeedCallbackUri } from "./auth/indeed-oauth.ts";
 import { createContextApplicationService, type ContextApplicationService } from "./context/application-service.ts";
 import { openContextDatabase } from "./context/database.ts";
 import { openPipelineDatabase } from "./db/database.ts";
 import { PipelineRepository } from "./db/repository.ts";
-import { createDiscoveryConnectorsFromEnvironment } from "./discovery/connectors/index.ts";
+import { createDiscoveryConnectors } from "./discovery/connectors/index.ts";
 import { DiscoveryRepository } from "./discovery/repository.ts";
 import { DiscoveryService } from "./discovery/service.ts";
-import type { DiscoveryConnector } from "./discovery/types.ts";
 import { ArtifactStore, DEFAULT_ARTIFACT_ROOT } from "./system/artifacts.ts";
 import { migrateRunOutputLayout } from "./system/run-output-migration.ts";
 import { enforceRunArtifactRetention } from "./system/run-retention.ts";
@@ -78,8 +76,6 @@ export interface PipelineApplicationOptions {
   readonly extractJobDescription?: ExtractJobDescription;
   readonly discoveryRepository?: DiscoveryRepository;
   readonly discovery?: DiscoveryService;
-  readonly discoveryConnectors?: readonly DiscoveryConnector[];
-  readonly createDiscoveryConnectors?: () => readonly DiscoveryConnector[];
   readonly auth?: ClosableAuthRouteService;
   readonly closeAuth?: () => void | Promise<void>;
   readonly browserHarnessToken?: string;
@@ -112,6 +108,29 @@ export interface PipelineApplication {
   readonly services: Readonly<PipelineApplicationServices>;
 }
 
+function validateWebOrigin(origin: string): string {
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new Error("JOBHUNTER_WEB_ORIGIN must be an exact HTTPS or loopback HTTP origin");
+  }
+  const loopbackHttp = url.protocol === "http:"
+    && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+  if (
+    (url.protocol !== "https:" && !loopbackHttp)
+    || url.origin !== origin
+    || url.username !== ""
+    || url.password !== ""
+    || url.pathname !== "/"
+    || url.search !== ""
+    || url.hash !== ""
+  ) {
+    throw new Error("JOBHUNTER_WEB_ORIGIN must be an exact HTTPS or loopback HTTP origin");
+  }
+  return origin;
+}
+
 
 async function closeAll(operations: readonly (() => void | Promise<void>)[]): Promise<void> {
   const errors: unknown[] = [];
@@ -127,8 +146,9 @@ async function closeAll(operations: readonly (() => void | Promise<void>)[]): Pr
 }
 
 export function createPipelineApplication(options: PipelineApplicationOptions = {}): PipelineApplication {
-  const webOrigin = options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN;
-  createIndeedCallbackUri(webOrigin);
+  const webOrigin = validateWebOrigin(
+    options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
+  );
   const browserHarnessToken = options.browserHarnessToken ?? process.env.JOBHUNTER_HARNESS_TOKEN;
   if (browserHarnessToken !== undefined && browserHarnessToken.length < 32) {
     throw new Error("JOBHUNTER_HARNESS_TOKEN must contain at least 32 characters");
@@ -195,13 +215,10 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
         : new DiscoveryService({
             repository: discoveryRepository,
             runs,
-            connectors: options.discoveryConnectors
-              ?? options.createDiscoveryConnectors?.()
-              ?? createDiscoveryConnectorsFromEnvironment(),
+            connectors: createDiscoveryConnectors(),
           })
     );
   const auth = options.auth ?? defaultAuthService;
-  auth.configureAuthCallbackOrigin?.(webOrigin);
   const applicationAgent = options.applicationAgent
     ?? (browserHarnessToken === undefined
       ? undefined

@@ -20,7 +20,10 @@ import {
   type DiscoverySourceDescriptor,
 } from "./repository.ts";
 import { DiscoveryHttpBudget } from "./connectors/http.ts";
-import type { DiscoveryConnector } from "./types.ts";
+import type {
+  DiscoveryConnector,
+  DiscoverySourceKind,
+} from "./types.ts";
 
 const PublicDiscoveryUrlSchema = z.string().url().max(2_048).refine((value) => {
   try {
@@ -67,6 +70,11 @@ const MAX_SYNC_DURATION_MS = 120_000;
 const MAX_SYNC_REQUESTS = 2_500;
 const MAX_SYNC_BYTES = 256 * 1024 * 1024;
 type ConnectorResult = z.infer<typeof ConnectorResultSchema>;
+const APPROVED_DISCOVERY_SOURCE_KINDS = {
+  simplify: true,
+  speedyapply: true,
+  zapply: true,
+} as const satisfies Readonly<Record<DiscoverySourceKind, true>>;
 type ConnectorSyncOutcome =
   | { readonly connector: DiscoveryConnector; readonly result: ConnectorResult }
   | { readonly connector: DiscoveryConnector; readonly error: unknown };
@@ -204,6 +212,11 @@ export class DiscoveryService {
     this.#now = dependencies.now ?? Date.now;
     if (dependencies.connectors.length > 100) {
       throw new Error("at most 100 discovery connectors may be configured");
+    }
+    for (const connector of dependencies.connectors) {
+      if (!Object.hasOwn(APPROVED_DISCOVERY_SOURCE_KINDS, connector.kind)) {
+        throw new Error(`unsupported discovery connector kind: ${connector.kind}`);
+      }
     }
     const ids = dependencies.connectors.map((connector) => connector.id);
     if (new Set(ids).size !== ids.length) {
