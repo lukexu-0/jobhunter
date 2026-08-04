@@ -165,6 +165,8 @@ Verify the active posting matches company and role; otherwise call report_applic
 
 Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
 
+The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.
+
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
 Fill all visible fields supported by facts and upload the resume before requesting missing information. Batch all remaining visible unknowns in request_additional_info. After human navigation, inspect, fill, and ask about new unknowns before review. Scope availability globally and job-source or referral per application. Apply answers and finish fields. Declines are unavailable; ask about saved facts only on conflict.
@@ -176,6 +178,8 @@ const AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare and submit an appl
 Verify the active posting matches company and role; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. Use human navigation for login, 2FA, inaccessible controls, or a required transition to a new origin. Try CAPTCHAs in this test environment; if blocked, pause for human navigation.
 
 Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+
+The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 

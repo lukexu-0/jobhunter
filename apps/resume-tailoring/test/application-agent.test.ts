@@ -113,6 +113,8 @@ Verify the active posting matches company and role; otherwise call report_applic
 
 Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
 
+The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.
+
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
 Fill all visible fields supported by facts and upload the resume before requesting missing information. Batch all remaining visible unknowns in request_additional_info. After human navigation, inspect, fill, and ask about new unknowns before review. Scope availability globally and job-source or referral per application. Apply answers and finish fields. Declines are unavailable; ask about saved facts only on conflict.
@@ -124,6 +126,8 @@ const EXPECTED_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare and submi
 Verify the active posting matches company and role; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. Use human navigation for login, 2FA, inaccessible controls, or a required transition to a new origin. Try CAPTCHAs in this test environment; if blocked, pause for human navigation.
 
 Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+
+The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
@@ -799,7 +803,8 @@ describe("application agent", () => {
           throw new Error("application agent instructions must be static");
         }
         expect(agent.instructions).toBe(EXPECTED_HUMAN_REVIEW_AGENT_INSTRUCTIONS);
-        expect(agent.instructions.trim().split(/\s+/).length).toBeLessThanOrEqual(250);
+        expect(agent.instructions).toContain("The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.");
+        expect(agent.instructions.trim().split(/\s+/).length).toBeLessThanOrEqual(300);
         expect(agent.instructions).not.toContain(RUN_INPUT.task);
         expect(agent.instructions).not.toContain("HARD WORKFLOW CONTRACT");
         await functionTool(agent, "request_human_review").invoke(
@@ -909,8 +914,13 @@ describe("application agent", () => {
         throw new Error(`unexpected runtime action ${request.type}`);
       },
       async (agent, _input, options) => {
+        if (typeof agent.instructions !== "string") {
+          throw new Error("application agent instructions must be static");
+        }
         expect(agent.instructions).toBe(EXPECTED_AUTO_SUBMIT_AGENT_INSTRUCTIONS);
         expect(agent.instructions).toContain("You're good to submit.");
+        expect(agent.instructions).toContain("The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.");
+        expect(agent.instructions.trim().split(/\s+/).length).toBeLessThanOrEqual(300);
         expect(functionTool(agent, "request_human_review").description).toBe(
           "Record the final application summary and authorize automatic submission after every application field and warning has been handled and no required fact remains unresolved. Include candidate-data and application fields, including completed nonstandard widgets. Omit navigation, human-only, and checkpoint controls; every fields_filled item has value_present true, and fields_needing_human must be empty.",
         );
