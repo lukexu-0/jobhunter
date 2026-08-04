@@ -1,6 +1,9 @@
 "use client";
 
 import type {
+  ApplicationAnswerSuggestionsResponse,
+  ApplicationProfessionalizeRequest,
+  ApplicationProfessionalizeResponse,
   ApplicationFieldResult,
   ApplicationPendingAction,
   ApplicationSessionBridgeState,
@@ -27,6 +30,15 @@ export interface ApplicationSessionPanelProps {
   readonly onCancel: () => Promise<void>;
   readonly onClose: () => Promise<void>;
   readonly onRetry: () => Promise<void>;
+  readonly onLoadSuggestions: (
+    questionId: string,
+    signal: AbortSignal,
+  ) => Promise<ApplicationAnswerSuggestionsResponse>;
+  readonly onProfessionalize: (
+    questionId: string,
+    request: ApplicationProfessionalizeRequest,
+    signal: AbortSignal,
+  ) => Promise<ApplicationProfessionalizeResponse>;
   readonly onResume: () => Promise<void>;
   readonly onCommand: (command: ApplicationSessionCommand) => Promise<void>;
 }
@@ -106,6 +118,8 @@ export function ApplicationSessionPanel({
   onCancel,
   onClose,
   onRetry,
+  onLoadSuggestions,
+  onProfessionalize,
   onResume,
   onCommand,
 }: ApplicationSessionPanelProps) {
@@ -212,6 +226,8 @@ export function ApplicationSessionPanel({
         <ApplicationAdditionalInfoForm
           key={`${snapshot.generation}:${JSON.stringify(pendingAction.questions)}`}
           busy={busy}
+          onLoadSuggestions={onLoadSuggestions}
+          onProfessionalize={onProfessionalize}
           onSubmit={onCommand}
           questions={pendingAction.questions}
           submitting={actionBusy === "provide_additional_info"}

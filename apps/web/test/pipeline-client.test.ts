@@ -16,11 +16,13 @@ import {
   createRun,
   deleteRun,
   editRun,
+  getApplicationAnswerSuggestions,
   getApplicationSession,
   getRun,
   listRuns,
   listResumeIterations,
   readJsonArtifact,
+  professionalizeApplicationAnswer,
   regenerateRun,
   retryApplicationSession,
   retryRun,
@@ -605,6 +607,98 @@ describe("pipeline application session requests", () => {
     expect(JSON.stringify(requests)).not.toContain("JOBHUNTER_HARNESS_TOKEN");
   });
 
+  test("loads suggestions and professionalizes through exact same-origin question paths", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const controller = new AbortController();
+    setFetchMock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init });
+      return String(input).endsWith("/suggestions")
+        ? json({
+          suggestions: [{
+            question: "Why are you interested in this role?",
+            answer: "I am drawn to the team’s reliability work.",
+          }],
+        })
+        : json({ answer: "I build reliable systems for regulated teams." });
+    });
+
+    const id = "run /1?";
+    const questionId = "motivation /?";
+    await expect(getApplicationAnswerSuggestions(id, questionId, controller.signal)).resolves.toEqual({
+      suggestions: [{
+        question: "Why are you interested in this role?",
+        answer: "I am drawn to the team’s reliability work.",
+      }],
+    });
+    await expect(professionalizeApplicationAnswer(
+      id,
+      questionId,
+      {
+        promptId: "default",
+        draft: "  build reliable systems for regulated teams  ",
+        instruction: "  Make this more direct.  ",
+      },
+      controller.signal,
+    )).resolves.toEqual({
+      answer: "I build reliable systems for regulated teams.",
+    });
+
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/additional-info/motivation%20%2F%3F/suggestions",
+        init: {
+          body: JSON.stringify({}),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+          signal: controller.signal,
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/additional-info/motivation%20%2F%3F/professionalize",
+        init: {
+          body: JSON.stringify({
+            promptId: "default",
+            draft: "build reliable systems for regulated teams",
+            instruction: "Make this more direct.",
+          }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+          signal: controller.signal,
+        },
+      },
+    ]);
+    expect(JSON.stringify(requests)).not.toContain("authorization");
+    expect(JSON.stringify(requests)).not.toContain("JOBHUNTER_HARNESS_TOKEN");
+    expect(JSON.stringify(requests)).not.toContain("127.0.0.1:8765");
+  });
+
+  test("rejects private or malformed answer-tool responses instead of leaking them", async () => {
+    setFetchMock(async () => json({
+      suggestions: [{
+        question: "Why this role?",
+        answer: "A safe previous answer.",
+        raw_value: "private-returned-answer",
+      }],
+    }));
+    await expect(getApplicationAnswerSuggestions("run-1", "motivation")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+
+    setFetchMock(async () => json({
+      answer: "A safe answer.",
+      sessionId: "private-session-id",
+    }));
+    await expect(professionalizeApplicationAnswer(
+      "run-1",
+      "motivation",
+      { promptId: "default", draft: "facts" },
+    )).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
   test("rejects malformed application requests locally and strict private responses", async () => {
     let fetchCalls = 0;
     setFetchMock(async () => {
@@ -620,6 +714,11 @@ describe("pipeline application session requests", () => {
     expect(() => sendApplicationCommand(
       "run-1",
       { type: "continue", answer: "private" } as never,
+    )).toThrow(PipelineClientError);
+    expect(() => professionalizeApplicationAnswer(
+      "run-1",
+      "motivation",
+      { promptId: "default", draft: "   " },
     )).toThrow(PipelineClientError);
     expect(fetchCalls).toBe(0);
 

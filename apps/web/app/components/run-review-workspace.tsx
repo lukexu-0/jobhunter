@@ -8,6 +8,7 @@ import {
   type FormEvent,
 } from "react";
 import type {
+  ApplicationProfessionalizeRequest,
   ApplicationSessionView,
   ApplicationSessionCommand,
   ApplicationSessionSnapshotDto,
@@ -28,8 +29,10 @@ import {
   PipelineClientError,
   applicationEventsHref,
   closeApplicationSession,
+  getApplicationAnswerSuggestions,
   getApplicationSession,
   retryApplicationSession,
+  professionalizeApplicationAnswer,
   sendApplicationCommand,
   startApplicationSession,
 } from "../lib/pipeline-client";
@@ -281,6 +284,20 @@ export function RunReviewWorkspace({
     }
     if (activeRunIdRef.current === requestRunId) setApplicationError(message);
   }, [refreshApplicationView, run.id]);
+  const loadApplicationAnswerSuggestions = useCallback((
+    questionId: string,
+    signal: AbortSignal,
+  ) => getApplicationAnswerSuggestions(run.id, questionId, signal), [run.id]);
+  const professionalizeApplicationAnswerForQuestion = useCallback((
+    questionId: string,
+    request: ApplicationProfessionalizeRequest,
+    signal: AbortSignal,
+  ) => professionalizeApplicationAnswer(
+    run.id,
+    questionId,
+    request,
+    signal,
+  ), [run.id]);
 
   const snapshot = applicationSnapshot(applicationView);
   const selectionReady = selectedIteration?.revision === run.revision
@@ -782,6 +799,8 @@ export function RunReviewWorkspace({
           }
           onCancel={cancelApplication}
           onClose={closeApplication}
+          onLoadSuggestions={loadApplicationAnswerSuggestions}
+          onProfessionalize={professionalizeApplicationAnswerForQuestion}
           onCommand={submitApplicationCommand}
           onResume={resumeReservedApplication}
           onRetry={retryApplication}

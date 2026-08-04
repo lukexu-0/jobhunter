@@ -43,7 +43,11 @@ const questions: readonly ApplicationAdditionalInfoQuestion[] = [
 function validDrafts(): AdditionalInfoDrafts {
   return {
     work_authorization: { status: "answered", value: true },
-    portfolio_note: { status: "answered", value: "  Please review my systems work.  " },
+    portfolio_note: {
+      status: "answered",
+      rawValue: "  built systems for regulated teams  ",
+      value: "  Please review my systems work.  ",
+    },
     preferred_location: { status: "answered", value: "remote" },
     available_days: { status: "answered", value: ["friday", "monday"] },
   };
@@ -60,6 +64,7 @@ describe("buildAdditionalInfoCommand", () => {
           {
             id: "portfolio_note",
             status: "answered",
+            raw_value: "built systems for regulated teams",
             value: "Please review my systems work.",
           },
           { id: "preferred_location", status: "answered", option_id: "remote" },
@@ -101,10 +106,63 @@ describe("buildAdditionalInfoCommand", () => {
     });
   });
 
-  test("rejects empty text and option ids outside the projected choices", () => {
+  test("uses the final text as raw when no assistance froze an earlier draft", () => {
+    const drafts = validDrafts();
+    drafts.portfolio_note = { status: "answered", value: "  Wrote reliable services.  " };
+    const result = buildAdditionalInfoCommand(questions, drafts);
+    expect(result).toMatchObject({
+      success: true,
+      command: {
+        answers: expect.arrayContaining([{
+          id: "portfolio_note",
+          status: "answered",
+          raw_value: "Wrote reliable services.",
+          value: "Wrote reliable services.",
+        }]),
+      },
+    });
+  });
+
+  test("rejects empty raw or final text and option ids outside the projected choices", () => {
     const emptyText = validDrafts();
-    emptyText.portfolio_note = { status: "answered", value: "   " };
+    emptyText.portfolio_note = {
+      status: "answered",
+      rawValue: "Raw facts",
+      value: "   ",
+    };
     expect(buildAdditionalInfoCommand(questions, emptyText)).toMatchObject({
+      success: false,
+      questionId: "portfolio_note",
+    });
+    const emptyRawText = validDrafts();
+    emptyRawText.portfolio_note = {
+      status: "answered",
+      rawValue: "   ",
+      value: "Professional facts",
+    };
+    expect(buildAdditionalInfoCommand(questions, emptyRawText)).toMatchObject({
+      success: false,
+      questionId: "portfolio_note",
+    });
+
+    const longRawText = validDrafts();
+    longRawText.portfolio_note = {
+      status: "answered",
+      rawValue: "🙂".repeat(2_001),
+      value: "Professional facts",
+    };
+    expect(buildAdditionalInfoCommand(questions, longRawText)).toMatchObject({
+      success: false,
+      questionId: "portfolio_note",
+    });
+
+    const longFinalText = validDrafts();
+    longFinalText.portfolio_note = {
+      status: "answered",
+      rawValue: "Raw facts",
+      value: "🙂".repeat(2_001),
+    };
+    expect(buildAdditionalInfoCommand(questions, longFinalText)).toMatchObject({
       success: false,
       questionId: "portfolio_note",
     });

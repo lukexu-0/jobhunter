@@ -43,6 +43,8 @@ const callbacks = {
   onRetry: async () => {},
   onResume: async () => {},
   onCommand: async () => {},
+  onLoadSuggestions: async () => ({ suggestions: [] }),
+  onProfessionalize: async () => ({ answer: "Professional answer" }),
 };
 
 describe("ApplicationSessionPanel", () => {
@@ -250,6 +252,10 @@ describe("ApplicationSessionPanel", () => {
     expect(markup).toContain("Monday");
     expect(markup.match(/Decline to answer/g)).toHaveLength(4);
     expect(markup).toContain('disabled="" type="submit">Answer questions');
+    expect(markup).toContain("Professionalize");
+    expect(markup).toContain('aria-label="Professionalize settings"');
+    expect(markup).toContain('aria-expanded="false"');
+    expect(markup).toContain("Previous answers");
   });
 
   test("renders transient revision guidance and the submission confirmation", () => {

@@ -1,6 +1,9 @@
 import { z } from "zod";
 import {
   ApiErrorSchema,
+  ApplicationAnswerSuggestionsResponseSchema,
+  ApplicationProfessionalizeRequestSchema,
+  ApplicationProfessionalizeResponseSchema,
   ApplicationSessionCommandSchema,
   ApplicationSessionSnapshotDtoSchema,
   ApplicationSessionViewSchema,
@@ -16,6 +19,9 @@ import {
   UpdateApplicationStatusRequestSchema,
   UpdateRunIdentityRequestSchema,
   type ArtifactDto,
+  type ApplicationAnswerSuggestionsResponse,
+  type ApplicationProfessionalizeRequest,
+  type ApplicationProfessionalizeResponse,
   type ApplicationStatus,
   type ResumeIterationListResponse,
   type RunDto,
@@ -28,10 +34,14 @@ const PIPELINE_ROOT = "/api/pipeline";
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 const MAX_JSON_ARTIFACT_BYTES = 1024 * 1024;
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
+const MAX_APPLICATION_ANSWER_BODY_BYTES = 64 * 1024;
 const ARTIFACT_PATH = /^\/v1\/runs\/[^/?#]+\/(?:artifacts\/[^/?#]+|iterations\/[1-9]\d*\/artifacts\/[^/?#]+)$/;
 const PUBLIC_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   APPLICATION_HARNESS_UNAVAILABLE: "The local application service is unavailable",
+  INVALID_MODEL_OUTPUT: "The model returned invalid output",
+  MODEL_PROVIDER_FAILED: "The model request failed",
+  MODEL_TIMEOUT: "The model request timed out",
   JOB_EXTRACTION_UNAVAILABLE: "Job description extraction failed",
   JOB_EXTRACTION_TIMEOUT: "Job description extraction timed out",
 });
@@ -160,12 +170,15 @@ async function requestApplicationResponse<T>(
   init: RequestInit,
   expectedStatus: number,
   schema: z.ZodType<T>,
+  maxBytes?: number,
 ): Promise<T> {
   const response = await fetchPipeline(path, init);
   if (response.status !== expectedStatus) throw invalidResponse();
   let body: unknown;
   try {
-    body = await response.json();
+    body = maxBytes === undefined
+      ? await response.json()
+      : JSON.parse(await readBoundedText(response, maxBytes));
   } catch {
     throw invalidResponse();
   }
@@ -349,6 +362,41 @@ export function sendApplicationCommand(
     `${applicationPath(id)}/commands`,
     jsonPost(parsed.data),
     202,
+  );
+}
+
+export function getApplicationAnswerSuggestions(
+  id: string,
+  questionId: string,
+  signal?: AbortSignal,
+): Promise<ApplicationAnswerSuggestionsResponse> {
+  const init = jsonPost({});
+  if (signal) init.signal = signal;
+  return requestApplicationResponse(
+    `${applicationPath(id)}/additional-info/${encodeURIComponent(questionId)}/suggestions`,
+    init,
+    200,
+    ApplicationAnswerSuggestionsResponseSchema,
+    MAX_APPLICATION_ANSWER_BODY_BYTES,
+  );
+}
+
+export function professionalizeApplicationAnswer(
+  id: string,
+  questionId: string,
+  request: ApplicationProfessionalizeRequest,
+  signal?: AbortSignal,
+): Promise<ApplicationProfessionalizeResponse> {
+  const parsed = ApplicationProfessionalizeRequestSchema.safeParse(request);
+  ensureValidRequest(parsed.success);
+  const init = jsonPost(parsed.data);
+  if (signal) init.signal = signal;
+  return requestApplicationResponse(
+    `${applicationPath(id)}/additional-info/${encodeURIComponent(questionId)}/professionalize`,
+    init,
+    200,
+    ApplicationProfessionalizeResponseSchema,
+    MAX_APPLICATION_ANSWER_BODY_BYTES,
   );
 }
 

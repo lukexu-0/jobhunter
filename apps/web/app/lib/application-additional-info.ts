@@ -9,6 +9,7 @@ export type AdditionalInfoDraft =
   | { readonly status: "declined" }
   | {
     readonly status: "answered";
+    readonly rawValue?: string;
     readonly value: string | boolean | readonly string[];
   };
 
@@ -56,11 +57,20 @@ export function buildAdditionalInfoCommand(
         if (typeof draft.value !== "string") {
           return failure(question.id, "Enter an answer between 1 and 2,000 characters.");
         }
+        const rawValue = (draft.rawValue ?? draft.value).trim();
         const value = draft.value.trim();
-        if (!hasCodePointLength(value, 1, 2_000)) {
+        if (
+          !hasCodePointLength(rawValue, 1, 2_000)
+          || !hasCodePointLength(value, 1, 2_000)
+        ) {
           return failure(question.id, "Enter an answer between 1 and 2,000 characters.");
         }
-        answers.push({ id: question.id, status: "answered", value });
+        answers.push({
+          id: question.id,
+          status: "answered",
+          raw_value: rawValue,
+          value,
+        });
         break;
       }
       case "boolean":

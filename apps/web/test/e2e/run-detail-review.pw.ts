@@ -81,6 +81,8 @@ interface MockPipeline {
   readonly startReplies: QueuedReply[];
   readonly retryReplies: QueuedReply[];
   readonly commandReplies: QueuedReply[];
+  readonly suggestionReplies: QueuedReply[];
+  readonly professionalizeReplies: QueuedReply[];
   readonly sseReplies: SseReply[];
   readonly useNativeSse: boolean;
   onDelete: (() => void) | null;
@@ -547,6 +549,8 @@ async function installPipeline(
     startReplies: [],
     retryReplies: [],
     commandReplies: [],
+    suggestionReplies: [],
+    professionalizeReplies: [],
     sseReplies: [],
     useNativeSse: options.useNativeSse ?? false,
     onDelete: null,
@@ -654,6 +658,33 @@ async function installPipeline(
       if (!mock.approveReply) throw new Error("Unexpected approval request without a queued run reply");
       mock.run = RunDtoSchema.parse(mock.approveReply);
       await fulfillJson(route, mock, mock.run);
+      return;
+    }
+
+    const additionalInfoPrefix = `${pipelineRunPath}/application/additional-info/`;
+    if (
+      path.startsWith(additionalInfoPrefix)
+      && path.endsWith("/suggestions")
+      && method === "POST"
+    ) {
+      expect(requestBody).toEqual({});
+      const reply = mock.suggestionReplies.shift();
+      if (!reply) throw new Error("Unexpected previous-answer request without a queued reply");
+      await reply.waitFor;
+      reply.before?.();
+      await fulfillJson(route, mock, reply.body, reply.status);
+      return;
+    }
+    if (
+      path.startsWith(additionalInfoPrefix)
+      && path.endsWith("/professionalize")
+      && method === "POST"
+    ) {
+      const reply = mock.professionalizeReplies.shift();
+      if (!reply) throw new Error("Unexpected professionalize request without a queued reply");
+      await reply.waitFor;
+      reply.before?.();
+      await fulfillJson(route, mock, reply.body, reply.status);
       return;
     }
 
@@ -1076,7 +1107,12 @@ test("additional-information answers survive conflict reconciliation and clear o
   const expectedCommand: ApplicationSessionCommand = {
     type: "provide_additional_info",
     answers: [
-      { id: "legal_name", status: "answered", value: "Ada Public" },
+      {
+        id: "legal_name",
+        status: "answered",
+        raw_value: "Ada Public",
+        value: "Ada Public",
+      },
       { id: "work_authorized", status: "answered", value: false },
       { id: "preferred_office", status: "answered", option_id: "hybrid" },
       { id: "available_shifts", status: "answered", option_ids: ["day", "weekend"] },
@@ -1118,6 +1154,313 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
   mock.application = progressed;
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
+});
+
+test("professional answers support keyboard revisions, retain the raw draft, and survive conflicts", async ({ page }) => {
+  const question: ApplicationAdditionalInfoQuestion = {
+    id: "motivation",
+    scope: "application",
+    question: "Why are you interested in this role?",
+    answerType: "text",
+  };
+  const application = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [question] },
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application,
+  });
+  mock.professionalizeReplies.push(
+    {
+      status: 200,
+      body: { answer: "I build reliable systems for regulated teams." },
+    },
+    {
+      status: 200,
+      body: { answer: "I build reliable systems for regulated organizations." },
+    },
+  );
+  mock.commandReplies.push({
+    status: 409,
+    body: apiError(
+      "APPLICATION_COMMAND_CONFLICT",
+      "The application state changed; review the latest session state",
+    ),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const group = page.getByRole("group", { name: question.question });
+  const answer = group.getByRole("textbox", { name: "Answer", exact: true });
+  await answer.fill("  built reliable systems for regulated teams  ");
+
+  const settings = group.getByRole("button", { name: "Professionalize settings" });
+  await settings.focus();
+  await page.keyboard.press("Enter");
+  await expect(settings).toHaveAttribute("aria-expanded", "true");
+  await expect(group.getByRole("radio", { name: "Default" })).toBeChecked();
+  await expect(group.getByText(
+    "Default Sol turns loose thoughts into a concise professional answer without adding facts.",
+    { exact: true },
+  )).toBeVisible();
+
+  await group.getByRole("button", { name: "Professionalize", exact: true }).click();
+  await expect(group.getByRole("status")).toContainText("Professional answer ready");
+  await expect(answer).toHaveValue("I build reliable systems for regulated teams.");
+
+  const editSpecification = group.getByRole("textbox", { name: "Edit specification" });
+  await editSpecification.press("Enter");
+  expect(mock.commands).toEqual([]);
+  expect(mock.requests.filter(({ path }) => path.endsWith("/professionalize"))).toHaveLength(1);
+
+  await answer.fill("I build reliable systems for regulated banks and teams.");
+  await editSpecification.fill("Make it concise.");
+  await editSpecification.press("Enter");
+  await expect(answer).toHaveValue("I build reliable systems for regulated organizations.");
+  expect(mock.commands).toEqual([]);
+  const modelRequests = mock.requests.filter(({ path }) => path.endsWith("/professionalize"));
+  expect(modelRequests.map(({ body }) => body)).toEqual([
+    {
+      promptId: "default",
+      draft: "built reliable systems for regulated teams",
+    },
+    {
+      promptId: "default",
+      draft: "I build reliable systems for regulated banks and teams.",
+      instruction: "Make it concise.",
+    },
+  ]);
+
+  await page.getByRole("button", { name: "Answer questions" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({
+    type: "provide_additional_info",
+    answers: [{
+      id: "motivation",
+      status: "answered",
+      raw_value: "built reliable systems for regulated teams",
+      value: "I build reliable systems for regulated organizations.",
+    }],
+  });
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application state changed; review the latest session state",
+  })).toBeVisible();
+  await expect(answer).toHaveValue("I build reliable systems for regulated organizations.");
+  await expect(group.getByRole("textbox", { name: "Edit specification" })).toBeVisible();
+});
+
+test("a previous answer can seed the raw draft without leaking storage metadata", async ({ page }) => {
+  const question: ApplicationAdditionalInfoQuestion = {
+    id: "motivation",
+    scope: "application",
+    question: "Why this role?",
+    answerType: "text",
+  };
+  const application = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [question] },
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application,
+  });
+  mock.suggestionReplies.push({
+    status: 200,
+    body: {
+      suggestions: [{
+        question: "What interests you about reliability work?",
+        answer: "I value careful engineering for systems people depend on.",
+      }],
+    },
+  });
+  mock.commandReplies.push({ status: 202 });
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  await page.goto(`/runs/${runId}`);
+  const group = page.getByRole("group", { name: question.question });
+  await group.getByRole("button", { name: "Previous answers" }).click();
+  await expect(group.getByText(
+    "What interests you about reliability work?",
+    { exact: true },
+  )).toBeVisible();
+  expect(await page.evaluate(() =>
+    document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  )).toBe(true);
+  await group.getByRole("button", {
+    name: "Use answer: I value careful engineering for systems people depend on.",
+  }).click();
+  const answer = group.getByRole("textbox", { name: "Answer", exact: true });
+  await expect(answer).toHaveValue(
+    "I value careful engineering for systems people depend on.",
+  );
+  await answer.fill("I value careful engineering for dependable systems.");
+  await page.getByRole("button", { name: "Answer questions" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({
+    type: "provide_additional_info",
+    answers: [{
+      id: "motivation",
+      status: "answered",
+      raw_value: "I value careful engineering for systems people depend on.",
+      value: "I value careful engineering for dependable systems.",
+    }],
+  });
+  const sourceResponse = mock.publicResponseBodies.find((body) =>
+    body.includes("I value careful engineering for systems people depend on.")
+  );
+  expect(sourceResponse).toBeDefined();
+  expect(sourceResponse).not.toContain("raw_value");
+  expect(sourceResponse).not.toContain("jobUrl");
+  expect(sourceResponse).not.toContain("storage");
+});
+
+test("previous-answer sources cannot replace the dispatched answer while its command is pending", async ({ page }) => {
+  const question: ApplicationAdditionalInfoQuestion = {
+    id: "motivation",
+    scope: "application",
+    question: "Why this role?",
+    answerType: "text",
+  };
+  const application = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [question] },
+  });
+  const commandReply = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application,
+  });
+  mock.suggestionReplies.push({
+    status: 200,
+    body: {
+      suggestions: [{
+        question: "What interests you about reliability work?",
+        answer: "A different saved answer.",
+      }],
+    },
+  });
+  mock.commandReplies.push({ status: 202, waitFor: commandReply.promise });
+
+  await page.goto(`/runs/${runId}`);
+  const group = page.getByRole("group", { name: question.question });
+  const answer = group.getByRole("textbox", { name: "Answer", exact: true });
+  await answer.fill("The final answer dispatched to the browser.");
+  await group.getByRole("button", { name: "Previous answers" }).click();
+  const useAnswer = group.getByRole("button", {
+    name: "Use answer: A different saved answer.",
+  });
+  await expect(useAnswer).toBeEnabled();
+
+  await page.getByRole("button", { name: "Answer questions" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({
+    type: "provide_additional_info",
+    answers: [{
+      id: "motivation",
+      status: "answered",
+      raw_value: "The final answer dispatched to the browser.",
+      value: "The final answer dispatched to the browser.",
+    }],
+  });
+  await expect(useAnswer).toBeDisabled();
+  await useAnswer.evaluate((button) => (button as HTMLButtonElement).click());
+  await expect(answer).toHaveValue("The final answer dispatched to the browser.");
+
+  commandReply.resolve();
+});
+
+test("professionalize failures stay local to their question and keep the draft editable", async ({ page }) => {
+  const question: ApplicationAdditionalInfoQuestion = {
+    id: "motivation",
+    scope: "application",
+    question: "Why this role?",
+    answerType: "text",
+  };
+  const application = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [question] },
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application,
+  });
+  mock.professionalizeReplies.push({
+    status: 504,
+    body: apiError("MODEL_TIMEOUT", "upstream private timeout details"),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const group = page.getByRole("group", { name: question.question });
+  const answer = group.getByRole("textbox", { name: "Answer", exact: true });
+  await answer.fill("facts that should remain");
+  await group.getByRole("button", { name: "Professionalize", exact: true }).click();
+  await expect(group.getByRole("alert")).toHaveText("The model request timed out");
+  await expect(answer).toHaveValue("facts that should remain");
+  await expect(answer).toBeEditable();
+  await expect(page.getByText("upstream private timeout details", { exact: true })).toHaveCount(0);
+});
+
+test("a professionalize response from an old question gate cannot replace the new gate", async ({ page }) => {
+  const oldQuestion: ApplicationAdditionalInfoQuestion = {
+    id: "motivation",
+    scope: "application",
+    question: "Why this role?",
+    answerType: "text",
+  };
+  const newQuestion: ApplicationAdditionalInfoQuestion = {
+    id: "role_fit",
+    scope: "application",
+    question: "What makes you a strong fit?",
+    answerType: "text",
+  };
+  const initial = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [oldQuestion] },
+    updatedAt: createdAt + 100,
+  });
+  const changed = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [newQuestion] },
+    updatedAt: createdAt + 200,
+  });
+  const modelFrame = deferred();
+  const gateFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: initial,
+  });
+  mock.professionalizeReplies.push({
+    status: 200,
+    body: { answer: "An obsolete professional answer." },
+    waitFor: modelFrame.promise,
+  });
+  queueSse(
+    mock,
+    eventFixture("snapshot", changed, {}),
+    2,
+    gateFrame.promise,
+    () => {
+      mock.application = changed;
+    },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  const oldGroup = page.getByRole("group", { name: oldQuestion.question });
+  await oldGroup.getByRole("textbox", { name: "Answer", exact: true }).fill("old loose facts");
+  await oldGroup.getByRole("button", { name: "Professionalize", exact: true }).click();
+  await expect(oldGroup.getByRole("button", { name: "Professionalizing…" })).toBeDisabled();
+
+  gateFrame.resolve();
+  const newGroup = page.getByRole("group", { name: newQuestion.question });
+  await expect(newGroup).toBeVisible();
+  modelFrame.resolve();
+  await expect(newGroup.getByRole("textbox", { name: "Answer", exact: true })).toHaveValue("");
+  await expect(page.getByText("An obsolete professional answer.", { exact: true })).toHaveCount(0);
 });
 
 test("an uncertain revision response keeps the command latch engaged", async ({ page }) => {
