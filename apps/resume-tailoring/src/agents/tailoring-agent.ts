@@ -27,7 +27,7 @@ import {
   DEFAULT_TOOL_TIMEOUT_MS,
 } from "./tools.ts";
 
-export const MAX_TAILORING_TOOL_CALLS = 3;
+export const MAX_TAILORING_TOOL_CALLS = 100;
 export const MAX_TAILORING_TOOL_BYTES = 3 * 1024 * 1024;
 
 export const TAILORING_TASK =
@@ -289,7 +289,6 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
     sharedSubmitted,
     maxCalls: MAX_TAILORING_TOOL_CALLS,
     maxBytes: MAX_TAILORING_TOOL_BYTES,
-    perToolCalls: { read_working_tex: 2, apply_analysis_edits: 1 },
     label: "tailoring",
   });
   let workingTex = attempt.input.baseline;

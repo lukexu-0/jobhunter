@@ -214,7 +214,7 @@ export type TailoringPlan = z.infer<typeof TailoringPlanSchema>;
 
 export const TailoringResultSchema = z.object({
   plan: TailoringPlanSchema,
-  toolCount: z.literal(4),
+  toolCount: z.number().int().min(4).max(101),
 }).strict();
 export type TailoringResult = z.infer<typeof TailoringResultSchema>;
 

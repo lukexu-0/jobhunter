@@ -1005,6 +1005,55 @@ describe("guarded agents", () => {
     expect(result).toEqual({ plan: PLAN, toolCount: 4 });
   });
 
+  test("allows up to 100 aggregate tailoring tool calls without per-tool caps", async () => {
+    const tailoredTex = `${BASELINE}\n% repeatedly inspected tailored copy`;
+    const runtime = runtimeWith(async (agent, _input, options) => {
+      runOptionsAreFresh(options, 5);
+      for (let call = 0; call < 50; call++) {
+        expect(await invoke(agent, "read_working_tex", {})).toBe(BASELINE);
+      }
+      await invoke(agent, "apply_analysis_edits", {});
+      for (let call = 0; call < 49; call++) {
+        expect(await invoke(agent, "read_working_tex", {})).toBe(tailoredTex);
+      }
+      await invoke(agent, "submit_tailoring_result", {});
+      return {};
+    });
+
+    await expect(runTailoringAgent({
+      attemptSessionId: "tailor-aggregate-budget",
+      input: {
+        analysis: ANALYSIS,
+        baseline: BASELINE,
+        operations: { renderPlan: () => tailoredTex },
+      },
+      signal: new AbortController().signal,
+      runtime,
+    })).resolves.toEqual({ plan: PLAN, toolCount: 101 });
+  });
+
+  test("rejects the 101st aggregate tailoring tool call", async () => {
+    const runtime = runtimeWith(async (agent, _input, options) => {
+      runOptionsAreFresh(options, 5);
+      for (let call = 0; call < 100; call++) {
+        await invoke(agent, "read_working_tex", {});
+      }
+      await invoke(agent, "read_working_tex", {});
+      return {};
+    });
+
+    await expect(runTailoringAgent({
+      attemptSessionId: "tailor-aggregate-budget-exhausted",
+      input: {
+        analysis: ANALYSIS,
+        baseline: BASELINE,
+        operations: { renderPlan: () => BASELINE },
+      },
+      signal: new AbortController().signal,
+      runtime,
+    })).rejects.toThrow("tailoring tool call budget of 100 exhausted");
+  });
+
   test("propagates the bounded one-page correction note into model input and applies its cut", async () => {
     const bullet = BASELINE_INVENTORY.bullets.at(-1);
     expect(bullet).toBeDefined();
