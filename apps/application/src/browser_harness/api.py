@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
 from .models import (
+    AdditionalInfoQuestionId,
+    ApplicationAnswerSuggestionsResponse,
     HarnessConfig,
     HarnessServiceError,
     SessionCommand,
@@ -42,6 +44,12 @@ class HarnessSessionService(Protocol):
     ) -> SessionCreateResponse: ...
 
     def get_snapshot(self, session_id: UUID) -> SessionSnapshot: ...
+
+    async def get_additional_info_suggestions(
+        self,
+        session_id: UUID,
+        question_id: str,
+    ) -> ApplicationAnswerSuggestionsResponse: ...
 
     def stream_events(self, session_id: UUID, last_event_id: int | None) -> AsyncIterator[str]: ...
 
@@ -160,6 +168,26 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
     @app.get("/v1/sessions/{session_id}", response_model=SessionSnapshot)
     async def get_session(session_id: UUID) -> SessionSnapshot:
         return dependencies.sessions.get_snapshot(session_id)
+
+    @app.get(
+        "/v1/sessions/{session_id}/additional-info/{question_id}/suggestions",
+        response_model=ApplicationAnswerSuggestionsResponse,
+    )
+    async def get_additional_info_suggestions(
+        session_id: UUID,
+        question_id: AdditionalInfoQuestionId,
+        request: Request,
+    ) -> ApplicationAnswerSuggestionsResponse:
+        if request.query_params or await request.body():
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            )
+        return await dependencies.sessions.get_additional_info_suggestions(
+            session_id,
+            question_id,
+        )
 
     @app.get("/v1/sessions/{session_id}/events")
     async def get_events(

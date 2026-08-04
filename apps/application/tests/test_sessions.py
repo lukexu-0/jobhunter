@@ -693,6 +693,7 @@ async def test_preflight_completes_before_playwright_runtime_and_create_contract
             AdditionalInfoTextCommandAnswer(
                 id="saved_path",
                 status="answered",
+                raw_value="openings",
                 value="openings",
             ),
         ),
@@ -1225,6 +1226,96 @@ async def test_terminal_event_is_published_before_tombstone_exposure(
 
     tombstone = manager._tombstones[created.session_id]
     assert tombstone.events[-1].event == "closed"
+
+
+
+async def test_suggestions_cannot_read_saved_answers_after_finalization_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    assert record.human_gate is not None
+    question = AdditionalInfoTextQuestion(
+        id="availability",
+        key="availability.summer_2027",
+        scope="global",
+        question="What dates are available?",
+        answer_type="text",
+    )
+
+    def pending_question(
+        _gate: HumanGate,
+        _question_id: str,
+    ) -> AdditionalInfoTextQuestion:
+        return question
+
+    monkeypatch.setattr(
+        HumanGate,
+        "get_pending_text_question",
+        pending_question,
+    )
+
+    saved_answers_read = False
+
+    def tracked_suggestions(*_args: object, **_kwargs: object) -> object:
+        nonlocal saved_answers_read
+        saved_answers_read = True
+        return ()
+
+    monkeypatch.setattr(
+        type(manager._user_info_store),
+        "suggestions",
+        tracked_suggestions,
+    )
+    original_publish = manager._publish_event
+    terminal_publish_started = asyncio.Event()
+    allow_terminal_publish = asyncio.Event()
+
+    async def blocked_publish(
+        current_record: Any, event: str, detail: dict[str, object]
+    ) -> None:
+        if event == "closed":
+            terminal_publish_started.set()
+            await allow_terminal_publish.wait()
+        await original_publish(current_record, event, detail)
+
+    manager._publish_event = blocked_publish  # type: ignore[method-assign]
+    deletion = asyncio.create_task(manager.delete(created.session_id))
+    suggestions: asyncio.Task[Any] | None = None
+    try:
+        await asyncio.wait_for(terminal_publish_started.wait(), timeout=1)
+        suggestions = asyncio.create_task(
+            manager.get_additional_info_suggestions(
+                created.session_id,
+                "availability",
+            )
+        )
+        await asyncio.sleep(0)
+        assert suggestions.done() is False
+        assert saved_answers_read is False
+
+        allow_terminal_publish.set()
+        await asyncio.wait_for(deletion, timeout=1)
+        with pytest.raises(HarnessServiceError) as raised:
+            await suggestions
+        assert_service_error(
+            raised.value,
+            409,
+            "command_conflict",
+            "A terminal command is already pending",
+        )
+        assert saved_answers_read is False
+    finally:
+        allow_terminal_publish.set()
+        if not deletion.done():
+            await asyncio.wait_for(deletion, timeout=1)
+        if suggestions is not None and not suggestions.done():
+            suggestions.cancel()
+            await asyncio.gather(suggestions, return_exceptions=True)
 
 
 @pytest.mark.parametrize(
@@ -3225,6 +3316,24 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     )[0].session
     assert additional_info_replay.pending_action == snapshot.pending_action
     assert additional_info_replay.expires_at == snapshot.expires_at
+    assert (
+        await manager.get_additional_info_suggestions(
+            created.session_id,
+            "availability",
+        )
+    ).model_dump() == {"suggestions": []}
+    for invalid_question_id in ("referral", "stale_question"):
+        with pytest.raises(HarnessServiceError) as invalid_suggestions:
+            await manager.get_additional_info_suggestions(
+                created.session_id,
+                invalid_question_id,
+            )
+        assert_service_error(
+            invalid_suggestions.value,
+            409,
+            "command_conflict",
+            "No matching text question is pending",
+        )
     previous_store = (tmp_path / "user-info.json").read_bytes()
     with pytest.raises(HarnessServiceError) as partial:
         await manager.command(
@@ -3235,6 +3344,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
                     AdditionalInfoTextCommandAnswer(
                         id="availability",
                         status="answered",
+                        raw_value="partial raw value",
                         value="partial value",
                     )
                 ],
@@ -3250,7 +3360,8 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     assert record.human_gate.pending_kind == "additional_info"
 
     events_before_answers = len(record.events)
-    answer_value = "June through August 2027"
+    raw_answer_value = "free june through august"
+    answer_value = "I am available from June through August 2027."
     await manager.command(
         created.session_id,
         ProvideAdditionalInfoCommand(
@@ -3259,6 +3370,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
                 AdditionalInfoTextCommandAnswer(
                     id="availability",
                     status="answered",
+                    raw_value=raw_answer_value,
                     value=answer_value,
                 ),
                 AdditionalInfoSingleSelectCommandAnswer(
@@ -3296,6 +3408,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         ["Remote", "Hybrid"],
         None,
     ]
+    assert raw_answer_value not in response.model_dump_json()
     assert manager.get_snapshot(created.session_id).state == "running"
     assert manager.get_snapshot(created.session_id).pending_action is None
     saved = record.events[-1]
@@ -3308,6 +3421,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         }
     )
     assert answer_value not in public_data
+    assert raw_answer_value not in public_data
     assert '"status": "answered"' not in public_data
     post_answer_public_data = json.dumps(
         {
@@ -3319,6 +3433,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         }
     )
     for accepted_private_value in (
+        raw_answer_value,
         answer_value,
         "A friend",
         "Remote",
@@ -3330,7 +3445,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         assert accepted_private_value not in post_answer_public_data
     disk = json.loads((tmp_path / "user-info.json").read_text(encoding="utf-8"))
     assert set(disk) == {"version", "global", "applications"}
-    assert disk["version"] == 1
+    assert disk["version"] == 2
     assert set(disk["global"]) == {
         "availability.summer_2027",
         "authorization.sponsorship_required",
@@ -3341,7 +3456,15 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         "preferences.work_modes",
         "compensation.minimum",
     }
-    assert disk["global"]["availability.summer_2027"]["value"] == answer_value
+    assert (
+        disk["global"]["availability.summer_2027"]["raw_value"]
+        == raw_answer_value
+    )
+    assert (
+        disk["global"]["availability.summer_2027"]["sanitized_value"]
+        == answer_value
+    )
+    assert "value" not in disk["global"]["availability.summer_2027"]
     assert disk["applications"][JOB_URL]["referral.source"]["value"] == "A friend"
     assert disk["global"]["authorization.sponsorship_required"]["value"] is False
     assert disk["applications"][JOB_URL]["preferences.work_modes"]["value"] == [
@@ -3361,7 +3484,8 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
                     AdditionalInfoTextCommandAnswer(
                         id="availability",
                         status="answered",
-                        value=answer_value,
+                        raw_value="stale raw private value",
+                        value="stale final private value",
                     ),
                     AdditionalInfoSingleSelectCommandAnswer(
                         id="referral",
@@ -3371,7 +3495,22 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
                 ],
             ),
         )
+    assert {
+        "stale raw private value",
+        "stale final private value",
+    } <= record.human_gate.redaction_values
     assert stale.value.code == "command_conflict"
+    with pytest.raises(HarnessServiceError) as stale_suggestions:
+        await manager.get_additional_info_suggestions(
+            created.session_id,
+            "availability",
+        )
+    assert_service_error(
+        stale_suggestions.value,
+        409,
+        "command_conflict",
+        "No matching text question is pending",
+    )
 
     record.additional_info_question_count = 99
     with pytest.raises(HarnessServiceError) as over_limit:
@@ -4184,6 +4323,7 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
             AdditionalInfoTextCommandAnswer(
                 id="saved_global",
                 status="answered",
+                raw_value="free june aug",
                 value="June through August 2027",
             ),
             AdditionalInfoDeclinedCommandAnswer(
@@ -4194,6 +4334,9 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     )
 
     created = await create_valid(manager)
+    record = manager._active
+    assert record is not None
+    assert record.human_gate is not None
     await wait_state(manager, created.session_id, "cancelled")
 
     assert len(fakes.models[0].run_calls) == 1
@@ -4223,6 +4366,9 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
             "status": "declined",
         }
     }
+    assert "free june aug" in record.human_gate.redaction_values
+    assert "June through August 2027" in record.human_gate.redaction_values
+    assert "free june aug" not in call["task"]
     assert "question" not in call["task"]
     assert "auto_submit" not in call["task"]
     assert "autoSubmit" not in call["task"]

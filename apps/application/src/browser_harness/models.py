@@ -329,6 +329,15 @@ AdditionalInfoQuestion: TypeAlias = Annotated[
 ]
 
 
+class ApplicationAnswerSuggestion(PublicModel):
+    question: AdditionalInfoQuestionText
+    answer: AdditionalInfoTextValue
+
+
+class ApplicationAnswerSuggestionsResponse(PublicModel):
+    suggestions: list[ApplicationAnswerSuggestion] = Field(max_length=5)
+
+
 def _validate_unique_additional_info_questions(
     values: list[AdditionalInfoQuestion],
 ) -> list[AdditionalInfoQuestion]:
@@ -348,6 +357,7 @@ class AdditionalInfoDeclinedCommandAnswer(FrozenPrivateModel):
 class AdditionalInfoTextCommandAnswer(FrozenPrivateModel):
     id: AdditionalInfoQuestionId
     status: Literal["answered"]
+    raw_value: AdditionalInfoTextValue
     value: AdditionalInfoTextValue
 
 

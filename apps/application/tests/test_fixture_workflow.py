@@ -649,6 +649,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
                         AdditionalInfoTextCommandAnswer(
                             id="summer_availability",
                             status="answered",
+                            raw_value=_SUMMER_AVAILABILITY,
                             value=_SUMMER_AVAILABILITY,
                         ),
                         AdditionalInfoSingleSelectCommandAnswer(
@@ -686,7 +687,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             stored_user_info = json.loads(
                 (tmp_path / "user-info.json").read_text(encoding="utf-8")
             )
-            assert stored_user_info["version"] == 1
+            assert stored_user_info["version"] == 2
             assert set(stored_user_info["global"]) == {
                 "availability.summer_2027",
                 "relocation.willing",
@@ -703,7 +704,10 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
                 "compensation.expectation",
             }
             assert stored_user_info["global"]["availability.summer_2027"][
-                "value"
+                "raw_value"
+            ] == _SUMMER_AVAILABILITY
+            assert stored_user_info["global"]["availability.summer_2027"][
+                "sanitized_value"
             ] == _SUMMER_AVAILABILITY
             assert stored_user_info["global"]["relocation.willing"]["value"] is False
             assert application_facts["referral.source"]["value"] == _REFERRAL_SOURCE
@@ -823,6 +827,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
                         AdditionalInfoTextCommandAnswer(
                             id=question.id,
                             status="answered",
+                            raw_value=_INITIAL_REVIEW_REPLY,
                             value=_INITIAL_REVIEW_REPLY,
                         )
                     ],

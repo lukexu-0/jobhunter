@@ -33,6 +33,7 @@ from .playwright_cli import (
 from .context import CandidateContext, CandidateContextProcess
 from .models import (
     AdditionalInfoRequiredDetail,
+    ApplicationAnswerSuggestionsResponse,
     AdditionalInfoRuntimeActionResponse,
     AdditionalInfoSavedDetail,
     AgentStepDetail,
@@ -259,7 +260,7 @@ def _pending_action_for_state(
 
 
 def _saved_private_values(snapshot: UserInfoSnapshot) -> frozenset[str]:
-    values: set[str] = set()
+    values: set[str] = set(snapshot.raw_text_values)
     for facts in (snapshot.saved_global, snapshot.saved_application):
         for fact in facts.values():
             if fact.status != "answered" or fact.answer_type == "boolean":
@@ -645,6 +646,54 @@ class ApplicationSessionManager:
         if tombstone is not None:
             return SessionSnapshot.model_validate(tombstone.snapshot.model_dump())
         raise self._not_found()
+
+    async def get_additional_info_suggestions(
+        self,
+        session_id: UUID,
+        question_id: str,
+    ) -> ApplicationAnswerSuggestionsResponse:
+        record = self._active
+        if record is None or record.session_id != session_id:
+            if session_id in self._tombstones:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "The session is terminal",
+                )
+            raise self._not_found()
+        async with record.request_lock:
+            if record.finalized or record.final_request is not None:
+                if (
+                    record.final_request is not None
+                    and record.final_request.error_code == "session_timeout"
+                ):
+                    raise HarnessServiceError(
+                        409,
+                        "session_terminal",
+                        "The application session has already ended",
+                    )
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "A terminal command is already pending",
+                )
+            gate = record.human_gate
+            request = record.request
+            if gate is None or request is None:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "No matching text question is pending",
+                )
+            question = gate.get_pending_text_question(question_id)
+            return ApplicationAnswerSuggestionsResponse(
+                suggestions=list(
+                    self._user_info_store.suggestions(
+                        request.job_url,
+                        question,
+                    )
+                )
+            )
 
     async def stream_events(
         self, session_id: UUID, last_event_id: int | None

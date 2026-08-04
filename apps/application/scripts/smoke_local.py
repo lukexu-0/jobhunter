@@ -469,7 +469,7 @@ def read_user_info(path: Path) -> dict[str, Any]:
 
 def assert_empty_user_info(path: Path) -> None:
     require(
-        read_user_info(path) == {"version": 1, "global": {}, "applications": {}},
+        read_user_info(path) == {"version": 2, "global": {}, "applications": {}},
         "Smoke requires a fresh empty user-info store",
     )
 
@@ -483,7 +483,7 @@ def assert_saved_user_info(
 ) -> None:
     document = read_user_info(path)
     require(set(document) == {"version", "global", "applications"}, "User-info document shape changed")
-    require(document.get("version") == 1, "User-info document version changed")
+    require(document.get("version") == 2, "User-info document version changed")
     global_facts = document.get("global")
     applications = document.get("applications")
     require(
@@ -513,13 +513,20 @@ def assert_saved_user_info(
         )
     for record, answer_type, expected_value in expected_records:
         require(isinstance(record, dict), "User-info fact was not an object")
-        require(
-            set(record) == {"answer_type", "status", "value", "question", "updated_at"},
-            "User-info fact shape changed",
+        common_fields = {"answer_type", "status", "question", "updated_at"}
+        expected_fields = (
+            common_fields | {"raw_value", "sanitized_value"}
+            if answer_type == "text"
+            else common_fields | {"value"}
         )
+        require(set(record) == expected_fields, "User-info fact shape changed")
         require(record.get("answer_type") == answer_type, "User-info fact answer type changed")
         require(record.get("status") == "answered", "User-info fact was not answered")
-        require(record.get("value") == expected_value, "User-info fact persisted the wrong value")
+        if answer_type == "text":
+            require(record.get("raw_value") == expected_value, "User-info fact persisted the wrong raw value")
+            require(record.get("sanitized_value") == expected_value, "User-info fact persisted the wrong final value")
+        else:
+            require(record.get("value") == expected_value, "User-info fact persisted the wrong value")
         require(
             isinstance(record.get("question"), str) and bool(record["question"].strip()),
             "User-info fact omitted its source question",
@@ -640,6 +647,7 @@ def additional_info_command(
             {
                 "id": global_id,
                 "status": "answered",
+                "raw_value": SUMMER_AVAILABILITY,
                 "value": SUMMER_AVAILABILITY,
             },
             {
@@ -687,6 +695,7 @@ def review_emphasis_command(event: dict[str, Any]) -> tuple[dict[str, Any], str]
                 {
                     "id": question_id,
                     "status": "answered",
+                    "raw_value": REVIEW_EMPHASIS_REPLY,
                     "value": REVIEW_EMPHASIS_REPLY,
                 }
             ],

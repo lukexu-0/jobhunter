@@ -23,7 +23,7 @@ from jobhunter_browser_harness.user_info import UserInfoStore
 
 
 JOB_URL = "https://jobs.example.test/roles/42"
-EMPTY_DOCUMENT = {"version": 1, "global": {}, "applications": {}}
+EMPTY_DOCUMENT = {"version": 2, "global": {}, "applications": {}}
 
 
 def test_missing_store_is_created_private_and_snapshots_are_empty(tmp_path: Path) -> None:
@@ -97,6 +97,81 @@ def test_snapshot_loads_only_task_projection_for_exact_job(tmp_path: Path) -> No
     }
 
 
+
+async def test_v1_text_fact_is_read_and_next_write_migrates_every_fact_to_v2(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "user-info.json"
+    _write_document(
+        path,
+        {
+            "version": 1,
+            "global": {
+                "legacy.answer": {
+                    "answer_type": "text",
+                    "status": "answered",
+                    "question": "Legacy question?",
+                    "value": "Legacy answer",
+                    "updated_at": "2026-07-19T12:34:56.000Z",
+                }
+            },
+            "applications": {},
+        },
+    )
+    store = UserInfoStore(path)
+
+    await store.merge(
+        JOB_URL,
+        (
+            AdditionalInfoTextQuestion(
+                id="current_answer",
+                key="current.answer",
+                scope="application",
+                question="Current question?",
+                answer_type="text",
+            ),
+        ),
+        (
+            AdditionalInfoTextCommandAnswer(
+                id="current_answer",
+                status="answered",
+                raw_value="Loose current thoughts",
+                value="Professional current answer.",
+            ),
+        ),
+    )
+
+    disk = json.loads(path.read_text(encoding="utf-8"))
+    assert disk["version"] == 2
+    assert disk["global"]["legacy.answer"] == {
+        "answer_type": "text",
+        "status": "answered",
+        "question": "Legacy question?",
+        "raw_value": "Legacy answer",
+        "sanitized_value": "Legacy answer",
+        "updated_at": "2026-07-19T12:34:56.000Z",
+    }
+    assert disk["applications"][JOB_URL]["current.answer"] == {
+        "answer_type": "text",
+        "status": "answered",
+        "question": "Current question?",
+        "raw_value": "Loose current thoughts",
+        "sanitized_value": "Professional current answer.",
+        "updated_at": disk["applications"][JOB_URL]["current.answer"]["updated_at"],
+    }
+    snapshot = store.snapshot(JOB_URL)
+    assert snapshot.raw_text_values == frozenset(
+        {"Legacy answer", "Loose current thoughts"}
+    )
+    assert snapshot.as_task_payload()["saved_application"] == {
+        "current.answer": {
+            "answer_type": "text",
+            "status": "answered",
+            "value": "Professional current answer.",
+        }
+    }
+
+
 async def test_merge_persists_global_and_exact_application_facts(
     tmp_path: Path,
 ) -> None:
@@ -126,6 +201,7 @@ async def test_merge_persists_global_and_exact_application_facts(
         AdditionalInfoTextCommandAnswer(
             id="summer_availability",
             status="answered",
+            raw_value="free june aug",
             value="June through August 2027",
         ),
         AdditionalInfoSingleSelectCommandAnswer(
@@ -175,9 +251,142 @@ async def test_merge_persists_global_and_exact_application_facts(
         },
     }
     disk = json.loads(path.read_text(encoding="utf-8"))
-    assert disk["global"]["availability.summer_2027"]["question"] == questions[0].question
+    assert disk["version"] == 2
+    stored_text = disk["global"]["availability.summer_2027"]
+    assert stored_text["question"] == questions[0].question
+    assert stored_text["raw_value"] == "free june aug"
+    assert stored_text["sanitized_value"] == "June through August 2027"
+    assert "value" not in stored_text
     assert disk["applications"][JOB_URL]["referral.source"]["value"] == "A friend"
     assert "options" not in json.dumps(disk)
+
+
+def test_suggestions_rank_exact_key_then_recency_deduplicate_and_exclude_other_jobs(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "user-info.json"
+
+    def text_fact(
+        question: str,
+        raw_value: str,
+        sanitized_value: str,
+        updated_at: str,
+    ) -> dict[str, object]:
+        return {
+            "answer_type": "text",
+            "status": "answered",
+            "question": question,
+            "raw_value": raw_value,
+            "sanitized_value": sanitized_value,
+            "updated_at": updated_at,
+        }
+
+    _write_document(
+        path,
+        {
+            "version": 2,
+            "global": {
+                "target.answer": text_fact(
+                    "Global exact question?",
+                    "global exact raw secret",
+                    "Repeated answer",
+                    "2026-07-19T09:00:00Z",
+                ),
+                "unrelated.newest": text_fact(
+                    "Newest source?",
+                    "newest raw secret",
+                    "Newest unrelated",
+                    "2026-07-19T15:00:00Z",
+                ),
+                "unrelated.duplicate": text_fact(
+                    "Duplicate source?",
+                    "duplicate raw secret",
+                    "Repeated answer",
+                    "2026-07-19T16:00:00Z",
+                ),
+                "unrelated.third": text_fact(
+                    "Third source?",
+                    "third raw secret",
+                    "Third",
+                    "2026-07-19T14:00:00Z",
+                ),
+                "unrelated.fourth": text_fact(
+                    "Fourth source?",
+                    "fourth raw secret",
+                    "Fourth",
+                    "2026-07-19T13:00:00Z",
+                ),
+                "unrelated.boolean": {
+                    "answer_type": "boolean",
+                    "status": "answered",
+                    "question": "Boolean source?",
+                    "value": True,
+                    "updated_at": "2026-07-19T18:00:00Z",
+                },
+                "unrelated.declined": {
+                    "answer_type": "text",
+                    "status": "declined",
+                    "question": "Declined source?",
+                    "updated_at": "2026-07-19T19:00:00Z",
+                },
+            },
+            "applications": {
+                JOB_URL: {
+                    "target.answer": text_fact(
+                        "Application exact question?",
+                        "application exact raw secret",
+                        "Application exact",
+                        "2026-07-19T10:00:00Z",
+                    ),
+                    "unrelated.older": text_fact(
+                        "Older source?",
+                        "older raw secret",
+                        "Older",
+                        "2026-07-19T12:00:00Z",
+                    ),
+                },
+                "https://jobs.example.test/roles/99": {
+                    "target.answer": text_fact(
+                        "Other job question?",
+                        "other job raw secret",
+                        "Other job answer",
+                        "2026-07-19T17:00:00Z",
+                    )
+                },
+            },
+        },
+    )
+    question = AdditionalInfoTextQuestion(
+        id="pending_answer",
+        key="target.answer",
+        scope="application",
+        question="Pending question?",
+        answer_type="text",
+    )
+
+    suggestions = UserInfoStore(path).suggestions(JOB_URL, question)
+
+    assert [suggestion.model_dump() for suggestion in suggestions] == [
+        {
+            "question": "Application exact question?",
+            "answer": "Application exact",
+        },
+        {"question": "Global exact question?", "answer": "Repeated answer"},
+        {"question": "Newest source?", "answer": "Newest unrelated"},
+        {"question": "Third source?", "answer": "Third"},
+        {"question": "Fourth source?", "answer": "Fourth"},
+    ]
+    serialized = json.dumps(
+        [suggestion.model_dump() for suggestion in suggestions]
+    )
+    for private_value in (
+        "raw secret",
+        "target.answer",
+        JOB_URL,
+        "Other job answer",
+        "Duplicate source?",
+    ):
+        assert private_value not in serialized
 
 
 def _stored_fact(
@@ -220,8 +429,13 @@ def _write_document(path: Path, document: object) -> None:
     "document",
     [
         {},
-        {"version": 2, "global": {}, "applications": {}},
+        {"version": 3, "global": {}, "applications": {}},
         {"version": 1, "global": {}, "applications": {}, "extra": True},
+        {
+            "version": 2,
+            "global": {"valid": _stored_fact(value="legacy-only-value")},
+            "applications": {},
+        },
         _document(global_facts={"Bad.Key": _stored_fact()}),
         _document(global_facts={"bad..key": _stored_fact()}),
         _document(global_facts={"a" * 101: _stored_fact()}),
@@ -263,6 +477,7 @@ def _write_document(path: Path, document: object) -> None:
         "missing-root-fields",
         "unknown-version",
         "extra-root-field",
+        "v2-text-with-v1-value",
         "uppercase-key",
         "empty-key-segment",
         "oversized-key",
@@ -493,10 +708,13 @@ def test_complete_saved_snapshot_wrapper_bound(
             UserInfoStore(path)
 
 
-def test_document_byte_bound_accepts_limit_and_rejects_next_byte(
+def test_v1_document_byte_bound_accepts_limit_and_rejects_next_byte(
     tmp_path: Path,
 ) -> None:
-    raw = json.dumps(EMPTY_DOCUMENT, separators=(",", ":")).encode("utf-8")
+    raw = json.dumps(
+        {"version": 1, "global": {}, "applications": {}},
+        separators=(",", ":"),
+    ).encode("utf-8")
     for extra in (0, 1):
         path = tmp_path / f"document-{extra}.json"
         padding = b" " * (8 * 1024 * 1024 - len(raw) + extra)
@@ -507,6 +725,82 @@ def test_document_byte_bound_accepts_limit_and_rejects_next_byte(
         else:
             with pytest.raises(BrowserConfigurationError):
                 UserInfoStore(path)
+
+
+async def test_maximum_size_text_heavy_v1_document_migrates_on_next_write(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "user-info.json"
+    legacy_fact = _stored_fact(value="😀" * 2_000)
+    document = _document(
+        applications={
+            f"https://jobs.example.test/roles/{index}": {
+                "legacy.answer": legacy_fact
+            }
+            for index in range(1_000)
+        }
+    )
+    encoded = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(encoded) < 8 * 1024 * 1024
+    path.write_bytes(encoded + b" " * (8 * 1024 * 1024 - len(encoded)))
+
+    store = UserInfoStore(path)
+    await store.merge(
+        JOB_URL,
+        (
+            AdditionalInfoTextQuestion(
+                id="current",
+                key="current.answer",
+                scope="global",
+                question="Current answer?",
+                answer_type="text",
+            ),
+        ),
+        (
+            AdditionalInfoTextCommandAnswer(
+                id="current",
+                status="answered",
+                raw_value="current raw answer",
+                value="Current final answer.",
+            ),
+        ),
+    )
+
+    assert path.stat().st_size > 8 * 1024 * 1024
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+    assert migrated["version"] == 2
+    first_legacy = migrated["applications"][
+        "https://jobs.example.test/roles/0"
+    ]["legacy.answer"]
+    assert first_legacy["raw_value"] == "😀" * 2_000
+    assert first_legacy["sanitized_value"] == "😀" * 2_000
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["at-limit", "beyond-limit"])
+def test_v2_document_byte_bound_is_hard(
+    tmp_path: Path,
+    extra: int,
+) -> None:
+    old_document_limit = 8 * 1024 * 1024
+    maximum_fact_count = 200 + 1_000 * 100
+    added_text_key_overhead = 23
+    v2_document_limit = (
+        2 * old_document_limit
+        + maximum_fact_count * added_text_key_overhead
+    )
+    raw = json.dumps(EMPTY_DOCUMENT, separators=(",", ":")).encode("utf-8")
+    path = tmp_path / f"v2-document-{extra}.json"
+    path.write_bytes(raw + b" " * (v2_document_limit - len(raw) + extra))
+
+    if extra == 0:
+        UserInfoStore(path)
+    else:
+        with pytest.raises(BrowserConfigurationError):
+            UserInfoStore(path)
 
 
 @pytest.mark.parametrize(
@@ -574,18 +868,18 @@ async def test_merge_rereads_and_preserves_external_valid_changes(
             AdditionalInfoTextCommandAnswer(
                 id="answer",
                 status="answered",
+                raw_value="accepted",
                 value="accepted",
             ),
         ),
     )
 
     disk = json.loads(path.read_text(encoding="utf-8"))
-    assert (
-        disk["applications"]["https://jobs.example.test/roles/external"][
-            "external.fact"
-        ]["value"]
-        == "preserved"
-    )
+    external = disk["applications"]["https://jobs.example.test/roles/external"][
+        "external.fact"
+    ]
+    assert external["raw_value"] == "preserved"
+    assert external["sanitized_value"] == "preserved"
 
 
 async def test_merge_overwrites_only_the_exact_scoped_key_and_persists_decline(
@@ -626,7 +920,8 @@ async def test_merge_overwrites_only_the_exact_scoped_key_and_persists_decline(
         "status": "declined",
     }
     disk = json.loads(path.read_text(encoding="utf-8"))
-    assert disk["global"]["same.key"]["value"] == "global"
+    assert disk["global"]["same.key"]["raw_value"] == "global"
+    assert disk["global"]["same.key"]["sanitized_value"] == "global"
     assert "value" not in disk["applications"][JOB_URL]["same.key"]
 
 
@@ -655,6 +950,7 @@ async def test_temp_file_is_private_and_replace_failure_preserves_bytes(
     answer = AdditionalInfoTextCommandAnswer(
         id="answer",
         status="answered",
+        raw_value="private",
         value="private",
     )
 
@@ -696,6 +992,7 @@ async def test_parent_fsync_failure_exposes_commit_and_identical_retry_succeeds(
     answer = AdditionalInfoTextCommandAnswer(
         id="answer",
         status="answered",
+        raw_value="committed",
         value="committed",
     )
 
@@ -744,6 +1041,7 @@ async def test_merge_projection_conflict_preserves_previous_bytes(
                 AdditionalInfoTextCommandAnswer(
                     id="new_answer",
                     status="answered",
+                    raw_value="x",
                     value="x",
                 ),
             ),
@@ -791,6 +1089,7 @@ async def test_temp_mode_failure_closes_descriptor_and_preserves_bytes(
                 AdditionalInfoTextCommandAnswer(
                     id="answer",
                     status="answered",
+                    raw_value="private",
                     value="private",
                 ),
             ),
@@ -840,6 +1139,7 @@ async def test_precommit_io_failures_preserve_previous_bytes(
                 AdditionalInfoTextCommandAnswer(
                     id="answer",
                     status="answered",
+                    raw_value="private",
                     value="private",
                 ),
             ),

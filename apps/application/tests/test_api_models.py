@@ -16,6 +16,8 @@ from jobhunter_browser_harness.api import HarnessDependencies, create_app
 from jobhunter_browser_harness.models import (
     SESSION_ERROR_MESSAGES,
     AdditionalInfoRuntimeActionResponse,
+    ApplicationAnswerSuggestion,
+    ApplicationAnswerSuggestionsResponse,
     ApplicationRunResult,
     ReviewApplicationResult,
     PlaywrightCliDiagnostic,
@@ -112,15 +114,27 @@ class FakeSessionService:
     snapshot: SessionSnapshot = field(default_factory=make_snapshot)
     create_error: HarnessServiceError | None = None
     snapshot_error: Exception | None = None
+    suggestions_error: HarnessServiceError | None = None
     create_calls: list[dict[str, Any]] = field(default_factory=list)
     snapshot_calls: list[UUID] = field(default_factory=list)
     event_calls: list[tuple[UUID, int | None]] = field(default_factory=list)
+    suggestion_calls: list[tuple[UUID, str]] = field(default_factory=list)
     command_calls: list[tuple[UUID, SessionCommand]] = field(default_factory=list)
     runtime_action_calls: list[tuple[UUID, RuntimeActionRequest]] = field(
         default_factory=list
     )
     runtime_action_response: RuntimeActionResponse = field(
         default_factory=lambda: ContinueRuntimeActionResponse(type="continue")
+    )
+    suggestions_response: ApplicationAnswerSuggestionsResponse = field(
+        default_factory=lambda: ApplicationAnswerSuggestionsResponse(
+            suggestions=[
+                ApplicationAnswerSuggestion(
+                    question="What did a previous application ask?",
+                    answer="A safe previous answer.",
+                )
+            ]
+        )
     )
     delete_calls: list[UUID] = field(default_factory=list)
     startup_calls: int = 0
@@ -177,6 +191,16 @@ class FakeSessionService:
         if session_id != SESSION_ID:
             raise HarnessServiceError(404, "session_not_found", "Session not found")
         return self.snapshot
+
+    async def get_additional_info_suggestions(
+        self,
+        session_id: UUID,
+        question_id: str,
+    ) -> ApplicationAnswerSuggestionsResponse:
+        self.suggestion_calls.append((session_id, question_id))
+        if self.suggestions_error is not None:
+            raise self.suggestions_error
+        return self.suggestions_response
 
     async def stream_events(
         self, session_id: UUID, last_event_id: int | None
@@ -727,6 +751,7 @@ def test_session_snapshot_releases_slot_only_after_terminal_cleanup() -> None:
                     {
                         "id": "summer_availability",
                         "status": "answered",
+                        "raw_value": "Available for the summer",
                         "value": "June through August 2027",
                     },
                     {
@@ -748,6 +773,70 @@ def test_command_union_uses_strict_discriminators(
         assert command.origin == "https://ats.example"
     if isinstance(command, ReviseCommand):
         assert command.context == "Correct this field."
+
+
+def test_text_additional_info_command_requires_distinct_trimmed_raw_and_final_values() -> None:
+    command = COMMAND_ADAPTER.validate_python(
+        {
+            "type": "provide_additional_info",
+            "answers": [
+                {
+                    "id": "summer_availability",
+                    "status": "answered",
+                    "raw_value": "  loose thoughts  ",
+                    "value": "  A concise professional answer.  ",
+                }
+            ],
+        }
+    )
+
+    assert isinstance(command, ProvideAdditionalInfoCommand)
+    answer = command.answers[0]
+    assert answer.model_dump() == {
+        "id": "summer_availability",
+        "status": "answered",
+        "raw_value": "loose thoughts",
+        "value": "A concise professional answer.",
+    }
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"id": "answer", "status": "answered", "value": "final only"},
+        {
+            "id": "answer",
+            "status": "answered",
+            "raw_value": "raw only",
+        },
+        {
+            "id": "answer",
+            "status": "answered",
+            "raw_value": "raw",
+            "value": "final",
+            "extra": True,
+        },
+        {
+            "id": "answer",
+            "status": "answered",
+            "raw_value": "x" * 2_001,
+            "value": "final",
+        },
+        {
+            "id": "answer",
+            "status": "answered",
+            "raw_value": "raw",
+            "value": "x" * 2_001,
+        },
+    ],
+)
+def test_text_additional_info_command_rejects_missing_extra_and_oversize_values(
+    answer: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        COMMAND_ADAPTER.validate_python(
+            {"type": "provide_additional_info", "answers": [answer]}
+        )
 
 
 def test_revision_command_accepts_twenty_thousand_trimmed_characters() -> None:
@@ -1032,6 +1121,70 @@ async def test_snapshot_get_returns_sanitized_public_model(
         PlaywrightCliDiagnostic,
     )
     assert service.snapshot_calls == [SESSION_ID]
+
+
+async def test_private_suggestions_get_is_authenticated_strict_and_public_safe(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    path = f"/v1/sessions/{SESSION_ID}/additional-info/pending_answer/suggestions"
+
+    unauthorized = await client.get(path)
+    invalid = await client.get(
+        f"/v1/sessions/{SESSION_ID}/additional-info/Not-Valid/suggestions",
+        headers=AUTHORIZATION,
+    )
+    extra_query = await client.get(
+        f"{path}?storage_key=private.key",
+        headers=AUTHORIZATION,
+    )
+    response = await client.get(path, headers=AUTHORIZATION)
+
+    assert unauthorized.status_code == 401
+    assert invalid.status_code == 422
+    assert extra_query.status_code == 422
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "suggestions": [
+            {
+                "question": "What did a previous application ask?",
+                "answer": "A safe previous answer.",
+            }
+        ]
+    }
+    serialized = response.text
+    for private_value in (
+        "storage_key",
+        "private.key",
+        "raw_value",
+        "sanitized_value",
+        "job_url",
+    ):
+        assert private_value not in serialized
+    assert service.suggestion_calls == [(SESSION_ID, "pending_answer")]
+
+
+async def test_private_suggestions_get_maps_stale_question_to_bounded_error(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    service.suggestions_error = HarnessServiceError(
+        409,
+        "command_conflict",
+        "No matching text question is pending",
+    )
+
+    response = await client.get(
+        f"/v1/sessions/{SESSION_ID}/additional-info/stale_answer/suggestions",
+        headers=AUTHORIZATION,
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": "command_conflict",
+        "message": "No matching text question is pending",
+    }
 
 
 @pytest.mark.parametrize("last_event_id", [0, 2])

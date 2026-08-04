@@ -701,6 +701,7 @@ async def test_additional_info_gate_redacts_public_questions_and_persists_origin
             AdditionalInfoTextCommandAnswer(
                 id="availability",
                 status="answered",
+                raw_value="free june through august",
                 value="June through August 2027",
             ),
             AdditionalInfoSingleSelectCommandAnswer(
@@ -738,6 +739,7 @@ async def test_additional_info_gate_redacts_public_questions_and_persists_origin
         "additional_info_saved",
         {"count": 2},
     )
+    assert "free june through august" in gate.redaction_values
     assert "June through August 2027" in gate.redaction_values
     assert "private-person@example.test choice" in gate.redaction_values
     disk = json.loads((tmp_path / "user-info.json").read_text(encoding="utf-8"))
@@ -745,6 +747,13 @@ async def test_additional_info_gate_redacts_public_questions_and_persists_origin
         disk["applications"][JOB_URL]["referral.source"]["value"]
         == "private-person@example.test choice"
     )
+    assert disk["global"]["availability.summer_2027"]["raw_value"] == (
+        "free june through august"
+    )
+    assert disk["global"]["availability.summer_2027"]["sanitized_value"] == (
+        "June through August 2027"
+    )
+    assert "free june through august" not in result.extracted_content
     assert (
         disk["applications"][JOB_URL]["referral.source"]["question"]
         == "Who referred [redacted]?"
@@ -791,23 +800,29 @@ async def test_additional_info_invalid_and_failed_commands_leave_gate_pending(
                 AdditionalInfoTextCommandAnswer(
                     id="first",
                     status="answered",
+                    raw_value="first raw private value",
                     value="first private value",
                 ),
             )
         )
     assert_conflict(partial.value)
     assert gate.pending_kind == "additional_info"
-    assert "first private value" not in gate.redaction_values
+    assert {
+        "first raw private value",
+        "first private value",
+    } <= gate.redaction_values
 
     answers = (
         AdditionalInfoTextCommandAnswer(
             id="first",
             status="answered",
+            raw_value="first raw private value",
             value="first private value",
         ),
         AdditionalInfoTextCommandAnswer(
             id="second",
             status="answered",
+            raw_value="second raw private value",
             value="second private value",
         ),
     )
@@ -815,7 +830,12 @@ async def test_additional_info_invalid_and_failed_commands_leave_gate_pending(
         await gate.provide_additional_info(answers)
     assert failed.value.code == "internal_error"
     assert gate.pending_kind == "additional_info"
-    assert {"first private value", "second private value"} <= gate.redaction_values
+    assert {
+        "first raw private value",
+        "first private value",
+        "second raw private value",
+        "second private value",
+    } <= gate.redaction_values
 
     await gate.cancel()
     cancelled = await pending

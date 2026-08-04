@@ -16,6 +16,7 @@ from typing import Any, Final
 from .playwright_cli import BrowserConfigurationError
 from .models import (
     AcceptedAdditionalInfoAnswer,
+    ApplicationAnswerSuggestion,
     AdditionalInfoBooleanCommandAnswer,
     AdditionalInfoBooleanQuestion,
     AdditionalInfoCommandAnswer,
@@ -31,10 +32,24 @@ from .models import (
     validate_job_url,
 )
 
-_MAX_DOCUMENT_BYTES: Final = 8 * 1024 * 1024
+_MAX_V1_DOCUMENT_BYTES: Final = 8 * 1024 * 1024
 _MAX_GLOBAL_FACTS: Final = 200
 _MAX_APPLICATIONS: Final = 1_000
 _MAX_APPLICATION_FACTS: Final = 100
+_MAX_STORED_FACTS: Final = (
+    _MAX_GLOBAL_FACTS + _MAX_APPLICATIONS * _MAX_APPLICATION_FACTS
+)
+_V2_TEXT_FIELD_KEY_OVERHEAD_BYTES: Final = (
+    len(b'"raw_value":')
+    + len(b',"sanitized_value":')
+    - len(b'"value":')
+)
+# Migration duplicates at most one v1 document's encoded text values and adds
+# the two v2 text-field keys once for each possible stored fact.
+_MAX_V2_DOCUMENT_BYTES: Final = (
+    2 * _MAX_V1_DOCUMENT_BYTES
+    + _MAX_STORED_FACTS * _V2_TEXT_FIELD_KEY_OVERHEAD_BYTES
+)
 _MAX_PROJECTION_BYTES: Final = 64 * 1024
 _MAX_SNAPSHOT_BYTES: Final = 128 * 1024
 _KEY_PATTERN: Final = re.compile(
@@ -43,7 +58,7 @@ _KEY_PATTERN: Final = re.compile(
 _TIMESTAMP_PATTERN: Final = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
-_EMPTY_DOCUMENT_BYTES: Final = b'{"version":1,"global":{},"applications":{}}'
+_EMPTY_DOCUMENT_BYTES: Final = b'{"version":2,"global":{},"applications":{}}'
 _ANSWER_TYPES: Final = frozenset(
     {"text", "boolean", "single_select", "multi_select"}
 )
@@ -70,6 +85,7 @@ class SavedUserInfoFact:
 class UserInfoSnapshot:
     saved_global: Mapping[str, SavedUserInfoFact]
     saved_application: Mapping[str, SavedUserInfoFact]
+    raw_text_values: frozenset[str]
 
     def as_task_payload(self) -> dict[str, dict[str, dict[str, object]]]:
         return {
@@ -88,9 +104,16 @@ class _StoredFact:
     saved: SavedUserInfoFact
     question: str
     updated_at: str
+    raw_value: str | None = None
 
     def as_disk_value(self) -> dict[str, object]:
         value = self.saved.as_task_value()
+        if self.saved.status == "answered" and self.saved.answer_type == "text":
+            sanitized_value = value.pop("value")
+            assert isinstance(self.raw_value, str)
+            assert isinstance(sanitized_value, str)
+            value["raw_value"] = self.raw_value
+            value["sanitized_value"] = sanitized_value
         value["question"] = self.question
         value["updated_at"] = self.updated_at
         return value
@@ -103,7 +126,7 @@ class _Document:
 
     def as_disk_value(self) -> dict[str, object]:
         return {
-            "version": 1,
+            "version": 2,
             "global": {
                 key: fact.as_disk_value() for key, fact in self.global_facts.items()
             },
@@ -135,7 +158,55 @@ class UserInfoStore:
             saved_application=_freeze_projection(
                 document.applications.get(validated_job_url, {})
             ),
+            raw_text_values=_raw_text_values(
+                document.global_facts,
+                document.applications.get(validated_job_url, {}),
+            ),
         )
+
+    def suggestions(
+        self,
+        job_url: str,
+        question: AdditionalInfoTextQuestion,
+    ) -> tuple[ApplicationAnswerSuggestion, ...]:
+        validated_job_url = validate_job_url(job_url)
+        try:
+            document = self._read_document()
+        except Exception as error:
+            if isinstance(error, HarnessServiceError):
+                raise
+            raise _internal_error() from None
+        candidates = [
+            *document.applications.get(validated_job_url, {}).items(),
+            *document.global_facts.items(),
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                candidate[0] == question.key,
+                _timestamp_sort_key(candidate[1].updated_at),
+            ),
+            reverse=True,
+        )
+        suggestions: list[ApplicationAnswerSuggestion] = []
+        seen_answers: set[str] = set()
+        for _key, fact in candidates:
+            if (
+                fact.saved.answer_type != "text"
+                or fact.saved.status != "answered"
+                or not isinstance(fact.saved.value, str)
+                or fact.saved.value in seen_answers
+            ):
+                continue
+            seen_answers.add(fact.saved.value)
+            suggestions.append(
+                ApplicationAnswerSuggestion(
+                    question=fact.question,
+                    answer=fact.saved.value,
+                )
+            )
+            if len(suggestions) == 5:
+                break
+        return tuple(suggestions)
 
     async def merge(
         self,
@@ -216,8 +287,8 @@ class UserInfoStore:
             raise ValueError("symbolic link")
         _require_regular_file(self._path)
         with self._path.open("rb") as source:
-            encoded = source.read(_MAX_DOCUMENT_BYTES + 1)
-        if len(encoded) > _MAX_DOCUMENT_BYTES:
+            encoded = source.read(_MAX_V2_DOCUMENT_BYTES + 1)
+        if len(encoded) > _MAX_V2_DOCUMENT_BYTES:
             raise ValueError("document is too large")
         try:
             raw = json.loads(
@@ -227,8 +298,18 @@ class UserInfoStore:
             )
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise ValueError("document is not valid JSON") from None
+        version = raw.get("version") if isinstance(raw, dict) else None
+        maximum_document_bytes = (
+            _MAX_V1_DOCUMENT_BYTES
+            if type(version) is int and version == 1
+            else _MAX_V2_DOCUMENT_BYTES
+        )
         document = _parse_document(raw)
-        _validate_document_bounds(document, encoded_size=len(encoded))
+        _validate_document_bounds(
+            document,
+            encoded_size=len(encoded),
+            maximum_document_bytes=maximum_document_bytes,
+        )
         return document
 
     def _replace(self, encoded: bytes) -> None:
@@ -336,6 +417,12 @@ def _accept_answers(
                     ),
                     question=question.question,
                     updated_at=timestamp,
+                    raw_value=(
+                        answer.raw_value
+                        if isinstance(question, AdditionalInfoTextQuestion)
+                        and isinstance(answer, AdditionalInfoTextCommandAnswer)
+                        else None
+                    ),
                 ),
             )
         )
@@ -376,9 +463,14 @@ def _semantic_value(
 def _parse_document(raw: object) -> _Document:
     if not isinstance(raw, dict) or set(raw) != {"version", "global", "applications"}:
         raise ValueError("invalid root")
-    if type(raw["version"]) is not int or raw["version"] != 1:
+    version = raw["version"]
+    if type(version) is not int or version not in {1, 2}:
         raise ValueError("unsupported version")
-    global_facts = _parse_fact_map(raw["global"], maximum=_MAX_GLOBAL_FACTS)
+    global_facts = _parse_fact_map(
+        raw["global"],
+        maximum=_MAX_GLOBAL_FACTS,
+        version=version,
+    )
     applications_raw = raw["applications"]
     if not isinstance(applications_raw, dict) or len(applications_raw) > _MAX_APPLICATIONS:
         raise ValueError("invalid applications")
@@ -389,11 +481,17 @@ def _parse_document(raw: object) -> _Document:
         applications[job_url] = _parse_fact_map(
             facts,
             maximum=_MAX_APPLICATION_FACTS,
+            version=version,
         )
     return _Document(global_facts=global_facts, applications=applications)
 
 
-def _parse_fact_map(raw: object, *, maximum: int) -> dict[str, _StoredFact]:
+def _parse_fact_map(
+    raw: object,
+    *,
+    maximum: int,
+    version: int,
+) -> dict[str, _StoredFact]:
     if not isinstance(raw, dict) or len(raw) > maximum:
         raise ValueError("invalid fact map")
     facts: dict[str, _StoredFact] = {}
@@ -404,11 +502,11 @@ def _parse_fact_map(raw: object, *, maximum: int) -> dict[str, _StoredFact]:
             or _KEY_PATTERN.fullmatch(key) is None
         ):
             raise ValueError("invalid fact key")
-        facts[key] = _parse_fact(value)
+        facts[key] = _parse_fact(value, version=version)
     return facts
 
 
-def _parse_fact(raw: object) -> _StoredFact:
+def _parse_fact(raw: object, *, version: int) -> _StoredFact:
     if not isinstance(raw, dict):
         raise ValueError("invalid fact")
     answer_type = raw.get("answer_type")
@@ -417,7 +515,12 @@ def _parse_fact(raw: object) -> _StoredFact:
         raise ValueError("invalid fact type or status")
     status = str(status_value)
     expected = {"answer_type", "status", "question", "updated_at"}
-    if status == "answered":
+    v2_answered_text = (
+        version == 2 and answer_type == "text" and status == "answered"
+    )
+    if v2_answered_text:
+        expected.update({"raw_value", "sanitized_value"})
+    elif status == "answered":
         expected.add("value")
     if set(raw) != expected:
         raise ValueError("invalid fact fields")
@@ -432,9 +535,23 @@ def _parse_fact(raw: object) -> _StoredFact:
     updated_at = raw["updated_at"]
     if not isinstance(updated_at, str) or not _valid_utc_timestamp(updated_at):
         raise ValueError("invalid fact timestamp")
-    semantic_value = None
-    if status == "answered":
+    semantic_value: str | bool | tuple[str, ...] | None = None
+    raw_value: str | None = None
+    if v2_answered_text:
+        validated_raw = _validate_saved_value("text", raw["raw_value"])
+        validated_sanitized = _validate_saved_value(
+            "text",
+            raw["sanitized_value"],
+        )
+        assert isinstance(validated_raw, str)
+        assert isinstance(validated_sanitized, str)
+        raw_value = validated_raw
+        semantic_value = validated_sanitized
+    elif status == "answered":
         semantic_value = _validate_saved_value(str(answer_type), raw["value"])
+        if answer_type == "text":
+            assert isinstance(semantic_value, str)
+            raw_value = semantic_value
     return _StoredFact(
         saved=SavedUserInfoFact(
             answer_type=str(answer_type),
@@ -443,6 +560,7 @@ def _parse_fact(raw: object) -> _StoredFact:
         ),
         question=question,
         updated_at=updated_at,
+        raw_value=raw_value,
     )
 
 
@@ -484,8 +602,13 @@ def _validate_saved_value(
     return tuple(value)
 
 
-def _validate_document_bounds(document: _Document, *, encoded_size: int) -> None:
-    if encoded_size > _MAX_DOCUMENT_BYTES:
+def _validate_document_bounds(
+    document: _Document,
+    *,
+    encoded_size: int,
+    maximum_document_bytes: int,
+) -> None:
+    if encoded_size > maximum_document_bytes:
         raise ValueError("document is too large")
     _validate_projection(document.global_facts, {})
     for application in document.applications.values():
@@ -518,7 +641,11 @@ def _encode_and_validate_document(document: _Document) -> bytes:
     if any(len(facts) > _MAX_APPLICATION_FACTS for facts in document.applications.values()):
         raise ValueError("too many application facts")
     encoded = _compact_json(document.as_disk_value())
-    _validate_document_bounds(document, encoded_size=len(encoded))
+    _validate_document_bounds(
+        document,
+        encoded_size=len(encoded),
+        maximum_document_bytes=_MAX_V2_DOCUMENT_BYTES,
+    )
     return encoded
 
 
@@ -530,6 +657,21 @@ def _freeze_projection(
     facts: Mapping[str, _StoredFact],
 ) -> Mapping[str, SavedUserInfoFact]:
     return MappingProxyType({key: fact.saved for key, fact in facts.items()})
+
+
+def _raw_text_values(
+    *fact_maps: Mapping[str, _StoredFact],
+) -> frozenset[str]:
+    values = {
+        fact.raw_value
+        for facts in fact_maps
+        for fact in facts.values()
+        if fact.saved.answer_type == "text"
+        and fact.saved.status == "answered"
+        and isinstance(fact.raw_value, str)
+        and fact.raw_value
+    }
+    return frozenset(values)
 
 
 def _copy_document(document: _Document) -> _Document:
@@ -569,6 +711,10 @@ def _utc_timestamp() -> str:
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
     )
+
+
+def _timestamp_sort_key(value: str) -> datetime:
+    return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
 
 
 def _valid_utc_timestamp(value: str) -> bool:

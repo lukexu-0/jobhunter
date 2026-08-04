@@ -244,6 +244,18 @@ def _prepare_additional_info_questions(
     return tuple(public), tuple(storage)
 
 
+def _private_text_values_from_answers(
+    answers: Sequence[AdditionalInfoCommandAnswer],
+) -> frozenset[str]:
+    return frozenset(
+        value
+        for answer in answers
+        if isinstance(answer, AdditionalInfoTextCommandAnswer)
+        for value in (answer.raw_value, answer.value)
+        if value
+    )
+
+
 def _private_values_from_answers(
     questions: Sequence[AdditionalInfoQuestion],
     answers: Sequence[AdditionalInfoCommandAnswer],
@@ -377,6 +389,24 @@ class HumanGate:
     def pending_kind(self) -> GateKind | None:
         pending = self._pending
         return pending.kind if pending is not None and not pending.future.done() else None
+
+    def get_pending_text_question(
+        self,
+        question_id: str,
+    ) -> AdditionalInfoTextQuestion:
+        pending = self._pending
+        if (
+            pending is not None
+            and pending.kind == "additional_info"
+            and not pending.future.done()
+        ):
+            for question in pending.questions:
+                if (
+                    question.id == question_id
+                    and isinstance(question, AdditionalInfoTextQuestion)
+                ):
+                    return question
+        raise self._conflict("No matching text question is pending")
 
     async def request_human_navigation(
         self,
@@ -580,6 +610,9 @@ class HumanGate:
         answers: Sequence[AdditionalInfoCommandAnswer],
     ) -> None:
         async with self._lock:
+            self._redaction_values.update(
+                _private_text_values_from_answers(answers)
+            )
             pending = self._require_pending("additional_info")
             private_values = _private_values_from_answers(
                 pending.questions,
