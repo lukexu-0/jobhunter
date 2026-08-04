@@ -72,6 +72,8 @@ const WORKFLOW_STAGES = [
 
 const VERIFIED_APPLICATION_STATUSES: Partial<Record<RunDto["applicationStatus"], true>> = {
   applied: true,
+  oa_received: true,
+  oa_completed: true,
   rejected: true,
   interview: true,
   accepted: true,
@@ -612,7 +614,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   const requestVersion = useRef(0);
   const iterationRequestVersion = useRef(0);
   const applicationStatusRefreshVersion = useRef(0);
-  const submittedRefreshRunRef = useRef<string | null>(null);
+  const applicationStatusRefreshKeyRef = useRef<string | null>(null);
   const resumeTabRef = useRef<HTMLButtonElement>(null);
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
@@ -641,7 +643,7 @@ export function RunDetail({ runId }: RunDetailProps) {
     }
   }, [runId]);
 
-  const refreshSubmittedRun = useCallback(async (): Promise<void> => {
+  const refreshApplicationStatus = useCallback(async (): Promise<void> => {
     const request = ++applicationStatusRefreshVersion.current;
     setIsRefreshingApplicationStatus(true);
     try {
@@ -654,7 +656,7 @@ export function RunDetail({ runId }: RunDetailProps) {
       if (request !== applicationStatusRefreshVersion.current) return;
       setApplicationStatusRefreshError(publicMessage(
         error,
-        "The submitted application status could not be refreshed. Try again.",
+        "The application status could not be refreshed. Try again.",
       ));
     } finally {
       if (request === applicationStatusRefreshVersion.current) {
@@ -665,17 +667,18 @@ export function RunDetail({ runId }: RunDetailProps) {
 
   const reportApplicationView = useCallback((next: ApplicationSessionView | null): void => {
     setApplicationView(next);
-    if (
-      next === null
-      || "state" in next
-      || next.submissionPhase !== "submitted"
-      || submittedRefreshRunRef.current === runId
-    ) {
-      return;
-    }
-    submittedRefreshRunRef.current = runId;
-    void refreshSubmittedRun();
-  }, [refreshSubmittedRun, runId]);
+    if (next === null || "state" in next) return;
+    const refreshKey = next.bridgeState === "awaiting_human_review"
+      ? `${runId}:waiting_for_review`
+      : next.submissionPhase === "submitted"
+        ? `${runId}:submitted`
+        : next.submissionPhase === "uncertain"
+          ? `${runId}:uncertain`
+          : null;
+    if (refreshKey === null || applicationStatusRefreshKeyRef.current === refreshKey) return;
+    applicationStatusRefreshKeyRef.current = refreshKey;
+    void refreshApplicationStatus();
+  }, [refreshApplicationStatus, runId]);
 
   useEffect(() => {
     setRun(null);
@@ -691,7 +694,7 @@ export function RunDetail({ runId }: RunDetailProps) {
     setApplicationView(null);
     setApplicationStatusRefreshError(null);
     setIsRefreshingApplicationStatus(false);
-    submittedRefreshRunRef.current = null;
+    applicationStatusRefreshKeyRef.current = null;
     applicationStatusRefreshVersion.current += 1;
     void loadRun(true);
     return () => {
@@ -1085,7 +1088,7 @@ export function RunDetail({ runId }: RunDetailProps) {
             <button
               className={styles.secondaryButton}
               disabled={isRefreshingApplicationStatus}
-              onClick={() => void refreshSubmittedRun()}
+              onClick={() => void refreshApplicationStatus()}
               type="button"
             >
               <Icon name="refresh" />

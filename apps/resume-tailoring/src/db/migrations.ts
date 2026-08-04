@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 20;
+export const PIPELINE_SCHEMA_VERSION = 21;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -859,6 +859,30 @@ function hasOpportunityKindColumn(db: Database): boolean {
     .some(({ name }) => name === "opportunity_kind");
 }
 
+const previousLifecycleApplicationStatusCheck =
+  /CHECK\s*\(\s*application_status\s+IN\s*\(\s*'pending'\s*,\s*'applied'\s*,\s*'rejected'\s*,\s*'interview'\s*,\s*'accepted'\s*,\s*'failed'\s*\)\s*\)/i;
+
+function migrateApplicationLifecycleStatuses(db: Database): void {
+  const runsSql = db.query<{ sql: string | null }, []>(
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+  ).get()?.sql;
+  if (
+    !runsSql
+    || !previousLifecycleApplicationStatusCheck.test(runsSql)
+    || !runsTableDeclaration.test(runsSql)
+  ) {
+    throw new Error("runs application_status constraint does not match schema version 20");
+  }
+
+  const upgradedRunsSql = runsSql
+    .replace(runsTableDeclaration, "CREATE TABLE runs_pending_migration")
+    .replace(
+      previousLifecycleApplicationStatusCheck,
+      "CHECK (application_status IN ('pending','did_not_apply','applied','waiting_for_review','oa_received','oa_completed','rejected','interview','accepted','failed'))",
+    );
+  replaceRunsTable(db, upgradedRunsSql);
+}
+
 
 export function migratePipelineDatabase(db: Database, now = Date.now()): void {
   const version = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
@@ -943,6 +967,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 20) {
         if (!hasOpportunityKindColumn(db)) db.exec(migration20);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(20, now);
+      }
+      if (version < 21) {
+        migrateApplicationLifecycleStatuses(db);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(21, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

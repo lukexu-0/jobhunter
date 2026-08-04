@@ -1895,6 +1895,29 @@ test("a definite submit conflict releases the approval latch", async ({ page }) 
   await expect(submitButton).toBeEnabled();
 });
 
+test("preserves a downstream lifecycle while an application remains parked for review", async ({ page }) => {
+  const review = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    pendingAction: { type: "human_review" },
+    updatedAt: createdAt + 300,
+  });
+  const mock = await installPipeline(page, {
+    run: { ...approvedRun(), applicationStatus: "oa_received" },
+    iterations: approvedIterations(),
+    application: review,
+  });
+
+  await page.goto(`/runs/${runId}`);
+
+  const applicationSummary = page.getByRole("complementary", {
+    name: "Application summary and keyword comparison",
+  });
+  await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
+  await expect(applicationSummary.getByText("OA received", { exact: true })).toBeVisible();
+  await expect(applicationSummary.getByText("Waiting for review!", { exact: true })).toHaveCount(0);
+  await expect.poll(() => mock.runGetCount).toBe(2);
+});
+
 test("navigation, human review, submit approval, and close use exact public commands", async ({ page }) => {
   const navigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
@@ -1988,10 +2011,21 @@ test("navigation, human review, submit approval, and close use exact public comm
     window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
   }));
   await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
+  mock.run = {
+    ...mock.run,
+    applicationStatus: "waiting_for_review",
+    updatedAt: mock.run.updatedAt + 1,
+  };
   continueFrame.resolve();
 
 
   await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
+  await expect(
+    page
+      .getByRole("complementary", { name: "Application summary and keyword comparison" })
+      .getByText("Waiting for review!", { exact: true }),
+  ).toBeVisible();
+  await expect.poll(() => mock.runGetCount).toBe(2);
   await expect(applyingStage).toHaveAttribute("aria-current", "step");
   await expect(appliedStage.locator("svg")).toHaveCount(0);
   await expect(page.getByText("Email", { exact: true })).toBeVisible();
@@ -2034,7 +2068,7 @@ test("navigation, human review, submit approval, and close use exact public comm
 
   await expect(page.getByRole("status").filter({ hasText: "Application submitted" })).toBeVisible();
   await expect(page.getByText(/Headed Chrome stays open until .* so you can inspect the final application state/)).toBeVisible();
-  await expect.poll(() => mock.runGetCount).toBe(2);
+  await expect.poll(() => mock.runGetCount).toBe(3);
   await expect(applyingStage).not.toHaveAttribute("aria-current", "step");
   await expect(applyingStage.locator("svg")).toHaveCount(1);
   await expect(appliedStage.locator("svg")).toHaveCount(1);
@@ -2059,6 +2093,12 @@ test("navigation, human review, submit approval, and close use exact public comm
 });
 
 test("submission uncertainty keeps Applying current and never offers Retry", async ({ page }) => {
+  const initialRun = approvedRun();
+  const waitingRun: RunDto = {
+    ...initialRun,
+    applicationStatus: "waiting_for_review",
+    updatedAt: initialRun.updatedAt + 1,
+  };
   const uncertain = snapshotFixture({
     bridgeState: "submission_uncertain",
     submissionPhase: "uncertain",
@@ -2068,10 +2108,14 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
     ],
   });
   const mock = await installPipeline(page, {
-    run: approvedRun(),
+    run: initialRun,
     iterations: approvedIterations(),
     application: uncertain,
   });
+  mock.runReplies.push(
+    { status: 200, body: initialRun },
+    { status: 200, body: waitingRun },
+  );
 
   await page.goto(`/runs/${runId}`);
   const workflow = page.getByRole("list", { name: "Workflow progress" });
@@ -2085,7 +2129,8 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
   await expect(page.getByText("The application submission could not be verified.", {
     exact: false,
   })).toBeVisible();
-  expect(mock.runGetCount).toBe(1);
+  await expect(page.getByText("Waiting for review!", { exact: true })).toBeVisible();
+  await expect.poll(() => mock.runGetCount).toBe(2);
 });
 
 test("a closed submitted session refreshes the authoritative run status", async ({ page }) => {

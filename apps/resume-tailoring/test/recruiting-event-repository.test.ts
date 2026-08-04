@@ -43,7 +43,7 @@ describe("recruiting event persistence", () => {
     });
     const startedAt = Date.UTC(2026, 7, 3, 12);
 
-    expect(PIPELINE_SCHEMA_VERSION).toBe(20);
+    expect(PIPELINE_SCHEMA_VERSION).toBe(21);
     expect(repository.getPreferences()).toEqual({ school: null });
     expect(repository.setPreferences(
       { school: "Example University" },

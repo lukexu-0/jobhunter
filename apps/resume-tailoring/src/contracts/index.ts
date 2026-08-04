@@ -283,7 +283,18 @@ export const OpportunityKindSchema = z.enum(["job", "hackathon", "competition", 
 export type OpportunityKind = z.infer<typeof OpportunityKindSchema>;
 
 
-export const APPLICATION_STATUSES = ["pending", "applied", "rejected", "interview", "accepted", "failed"] as const;
+export const APPLICATION_STATUSES = [
+  "pending",
+  "did_not_apply",
+  "applied",
+  "waiting_for_review",
+  "oa_received",
+  "oa_completed",
+  "rejected",
+  "interview",
+  "accepted",
+  "failed",
+] as const;
 export const ApplicationStatusSchema = z.enum(APPLICATION_STATUSES);
 export type ApplicationStatus = z.infer<typeof ApplicationStatusSchema>;
 export const UpdateApplicationStatusRequestSchema =

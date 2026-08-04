@@ -291,6 +291,10 @@ async function interceptDocumentRun(
 
 const lifecycleRuns: readonly RunDto[] = [
   runFixture("lifecycle-applied", "applied", "failed"),
+  runFixture("lifecycle-waiting-for-review", "waiting_for_review", "approved"),
+  runFixture("lifecycle-did-not-apply", "did_not_apply", "approved"),
+  runFixture("lifecycle-oa-received", "oa_received", "approved"),
+  runFixture("lifecycle-oa-completed", "oa_completed", "approved"),
   runFixture("lifecycle-rejected", "rejected", "approved"),
   runFixture("lifecycle-interview", "interview", "queued"),
   runFixture("lifecycle-accepted", "accepted", "failed"),
@@ -1457,18 +1461,34 @@ test("filters by selectable application state and keeps stored Failed display-on
   await expect(state.locator("option")).toHaveText([
     "All states",
     "Pending",
+    "Did not apply",
     "Applied",
+    "Waiting for review!",
+    "OA received",
+    "OA completed",
     "Rejected",
     "Interview",
     "Accepted",
   ]);
   await expect(state.locator('option[value="failed"]')).toHaveCount(0);
 
+  for (const [status, runId] of [
+    ["did_not_apply", "lifecycle-did-not-apply"],
+    ["waiting_for_review", "lifecycle-waiting-for-review"],
+    ["oa_received", "lifecycle-oa-received"],
+    ["oa_completed", "lifecycle-oa-completed"],
+  ] as const) {
+    await state.selectOption(status);
+    await expect(page.locator("tbody tr")).toHaveCount(1);
+    await expect(page.locator(`tbody a.application-link[href="/runs/${runId}"]`)).toBeVisible();
+  }
+
   await state.selectOption("interview");
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await expect(page.locator('tbody a.application-link[href="/runs/lifecycle-interview"]')).toBeVisible();
 
   await state.selectOption("all");
+  await page.getByRole("button", { name: "Page 2" }).click();
   const failedState = page.getByRole("combobox", { name: "Application state for lifecycl…iled" });
   await expect(failedState).toHaveValue("failed");
   await expect(failedState.locator('option[value="failed"]')).toBeDisabled();
@@ -1541,6 +1561,44 @@ test("shows application lifecycle and pipeline progress separately without legac
   await expect(workflow.getByRole("listitem").filter({ hasText: "Review" })).toHaveAttribute("aria-current", "step");
   await expect(page.getByRole("complementary", { name: "Run metadata and history" })).toHaveCount(0);
   await expect(page.getByText("Pipeline status", { exact: true })).toHaveCount(0);
+});
+
+test("shows completed online assessments as applied in workflow progress", async ({ page }) => {
+  const detailRun = runFixture("oa-completed-detail", "oa_completed", "approved");
+  await interceptDocumentRun(page, detailRun);
+  await page.goto("/runs/oa-completed-detail");
+
+  const applicationSummary = page.getByRole("complementary", {
+    name: "Application summary and keyword comparison",
+  });
+  const workflow = page.getByRole("list", { name: "Workflow progress" });
+  const applyingStage = workflow.getByRole("listitem").filter({ hasText: "Applying" });
+  const appliedStage = workflow.getByRole("listitem").filter({ hasText: "Applied" });
+
+  await expect(applicationSummary.getByText("OA completed", { exact: true })).toBeVisible();
+  await expect(applyingStage.locator("svg")).toHaveCount(1);
+  await expect(appliedStage.locator("svg")).toHaveCount(1);
+});
+
+test("calls out an agent awaiting review without marking the application complete", async ({ page }) => {
+  const detailRun = runFixture("waiting-review-detail", "waiting_for_review", "approved");
+  await interceptDocumentRun(page, detailRun);
+  await page.goto("/runs/waiting-review-detail");
+
+  const applicationSummary = page.getByRole("complementary", {
+    name: "Application summary and keyword comparison",
+  });
+  const reviewStatus = applicationSummary.getByText("Waiting for review!", { exact: true });
+  const workflow = page.getByRole("list", { name: "Workflow progress" });
+  const applyingStage = workflow.getByRole("listitem").filter({ hasText: "Applying" });
+  const appliedStage = workflow.getByRole("listitem").filter({ hasText: "Applied" });
+
+  await expect(reviewStatus).toBeVisible();
+  expect(await reviewStatus.evaluate((badge) =>
+    getComputedStyle(badge).getPropertyValue("--application-badge-color").trim()
+  )).toBe("#f1b86a");
+  await expect(applyingStage).toHaveAttribute("aria-current", "step");
+  await expect(appliedStage.locator("svg")).toHaveCount(0);
 });
 
 test("removes primary navigation and gives run details the full viewport", async ({ page }) => {
@@ -1909,7 +1967,11 @@ test("uses the original dark palette across surfaces and states", async ({ page 
     "--color-warning": "#ebca73",
     "--color-danger": "#ef8a82",
     "--color-focus": "#d2f34c",
+    "--color-application-did_not_apply": "#aeb4bf",
     "--color-application-applied": "#c2a7ef",
+    "--color-application-waiting_for_review": "#f1b86a",
+    "--color-application-oa_received": "#e3c66f",
+    "--color-application-oa_completed": "#8fd4c0",
     "--color-application-rejected": "#e8ad73",
     "--color-application-interview": "#79cae8",
     "--color-application-accepted": "#79cf92",
@@ -1919,7 +1981,7 @@ test("uses the original dark palette across surfaces and states", async ({ page 
   await page.setViewportSize({ width: 1_672, height: 941 });
   await interceptRuns(page);
   await page.goto("/");
-  await expect(page.locator(".application-status-control")).toHaveCount(5);
+  await expect(page.locator(".application-status-control")).toHaveCount(8);
 
   const rootStyle = await page.evaluate((tokens) => {
     const style = getComputedStyle(document.documentElement);
@@ -1940,7 +2002,20 @@ test("uses the original dark palette across surfaces and states", async ({ page 
   await applicationsLink.focus();
   expect(await applicationsLink.evaluate((element) => getComputedStyle(element).outlineColor)).toBe(cssRgb(expectedColors["--color-focus"]));
 
-  for (const status of ["applied", "rejected", "interview", "accepted", "failed"] as const) {
+  for (const status of [
+    "did_not_apply",
+    "applied",
+    "waiting_for_review",
+    "oa_received",
+    "oa_completed",
+    "rejected",
+    "interview",
+    "accepted",
+    "failed",
+  ] as const) {
+    if (status === "failed") {
+      await page.getByRole("button", { name: "Page 2" }).click();
+    }
     const token = `--color-application-${status}` as keyof typeof expectedColors;
     const control = page.locator(`.application-status-control--${status}`);
     const style = await control.evaluate((element) => {
@@ -1971,7 +2046,11 @@ test("uses the original dark palette across surfaces and states", async ({ page 
     "--color-warning",
     "--color-danger",
     "--color-focus",
+    "--color-application-did_not_apply",
     "--color-application-applied",
+    "--color-application-waiting_for_review",
+    "--color-application-oa_received",
+    "--color-application-oa_completed",
     "--color-application-rejected",
     "--color-application-interview",
     "--color-application-accepted",

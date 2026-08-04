@@ -649,8 +649,24 @@
   --application-badge-color: var(--color-application-pending);
 }
 
+.applicationBadge--did_not_apply {
+  --application-badge-color: var(--color-application-did_not_apply);
+}
+
 .applicationBadge--applied {
   --application-badge-color: var(--color-application-applied);
+}
+
+.applicationBadge--waiting_for_review {
+  --application-badge-color: var(--color-application-waiting_for_review);
+}
+
+.applicationBadge--oa_received {
+  --application-badge-color: var(--color-application-oa_received);
+}
+
+.applicationBadge--oa_completed {
+  --application-badge-color: var(--color-application-oa_completed);
 }
 
 .applicationBadge--rejected {

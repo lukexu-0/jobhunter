@@ -17,7 +17,11 @@
   --color-danger: #ef8a82;
   --color-focus: #d2f34c;
   --color-application-pending: var(--color-warning);
+  --color-application-did_not_apply: #aeb4bf;
   --color-application-applied: #c2a7ef;
+  --color-application-waiting_for_review: #f1b86a;
+  --color-application-oa_received: #e3c66f;
+  --color-application-oa_completed: #8fd4c0;
   --color-application-rejected: #e8ad73;
   --color-application-interview: #79cae8;
   --color-application-accepted: #79cf92;
@@ -725,8 +729,24 @@ a {
   --application-status-color: var(--color-application-pending);
 }
 
+.application-status-control--did_not_apply {
+  --application-status-color: var(--color-application-did_not_apply);
+}
+
 .application-status-control--applied {
   --application-status-color: var(--color-application-applied);
+}
+
+.application-status-control--waiting_for_review {
+  --application-status-color: var(--color-application-waiting_for_review);
+}
+
+.application-status-control--oa_received {
+  --application-status-color: var(--color-application-oa_received);
+}
+
+.application-status-control--oa_completed {
+  --application-status-color: var(--color-application-oa_completed);
 }
 
 .application-status-control--rejected {

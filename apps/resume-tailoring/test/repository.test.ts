@@ -1002,6 +1002,7 @@ describe("application session ledger", () => {
       bridgeState: "awaiting_human_review",
       publicSnapshot: { state: "awaiting_human_review" },
     });
+    expect(repo.getRun(runId)?.applicationStatus).toBe("waiting_for_review");
 
     repo.claimApplicationSubmission(sessionId);
 
@@ -1142,15 +1143,19 @@ describe("application session ledger", () => {
     });
   });
 
-  test("submitted finalization preserves downstream lifecycles while uncertainty never applies", () => {
+  test("submitted finalization preserves downstream lifecycles while uncertainty keeps review state", () => {
     const { repo } = fixture();
     const hash = "c".repeat(64);
     const cases = [
       ["failed", "submitted", "applied"],
+      ["did_not_apply", "submitted", "applied"],
+      ["waiting_for_review", "submitted", "applied"],
+      ["oa_received", "submitted", "oa_received"],
+      ["oa_completed", "submitted", "oa_completed"],
       ["rejected", "submitted", "rejected"],
       ["interview", "submitted", "interview"],
       ["accepted", "submitted", "accepted"],
-      ["pending", "uncertain", "pending"],
+      ["pending", "uncertain", "waiting_for_review"],
     ] as const;
     for (const [index, [before, outcome, expected]] of cases.entries()) {
       const runId = createReview(repo, hash, false, `final-status-${index}`);
