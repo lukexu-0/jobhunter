@@ -354,6 +354,34 @@ export class RecruitingEventRepository {
     });
   }
 
+  recoverInterruptedRun(completedAt: number): RecruitingEventScrapeRun | null {
+    return this.#immediate(() => {
+      const row = this.#db.query<ScrapeRunRow, []>(
+        "SELECT * FROM recruiting_event_scrape_runs WHERE state = 'running' LIMIT 1",
+      ).get();
+      if (!row) return null;
+      const succeeded = Number(this.#db.query<{ count: number }, [string]>(`
+        SELECT count(*) AS count
+        FROM recruiting_event_source_attempts
+        WHERE run_id = ? AND state = 'succeeded'
+      `).get(row.id)?.count ?? 0);
+      const failed = Math.max(0, row.source_count - succeeded);
+      const eventCount = Number(this.#db.query<{ count: number }, [string]>(`
+        SELECT count(DISTINCT event_id) AS count
+        FROM recruiting_event_sources
+        JOIN recruiting_events ON recruiting_events.id = recruiting_event_sources.event_id
+        WHERE recruiting_events.last_scrape_run_id = ?
+      `).get(row.id)?.count ?? 0);
+      this.#db.query(`
+        UPDATE recruiting_event_scrape_runs
+        SET state = 'failed', completed_at = ?, succeeded_source_count = ?,
+            failed_source_count = ?, event_count = ?
+        WHERE id = ? AND state = 'running'
+      `).run(completedAt, succeeded, failed, eventCount, row.id);
+      return publicRun(this.#run(row.id));
+    });
+  }
+
   latestRun(): RecruitingEventScrapeRun | null {
     const row = this.#db.query<ScrapeRunRow, []>(`
       SELECT * FROM recruiting_event_scrape_runs

@@ -46,6 +46,7 @@ export async function main(): Promise<void> {
     browserHarnessToken === undefined ? {} : { browserHarnessToken },
   );
   const server = startPipelineHttpServer(app);
+  app.services.recruitingEvents.start();
   app.kick();
   console.log(`Resume pipeline listening on http://${hostname}:${port}`);
 

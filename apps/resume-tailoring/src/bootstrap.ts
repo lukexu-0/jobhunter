@@ -13,6 +13,10 @@ import { ApplicationSessionService } from "./api/application-session-service.ts"
 import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
 import { createApiHandler } from "./api/handler.ts";
+import {
+  createRecruitingEventRoutes,
+  type RecruitingEventRouteService,
+} from "./api/recruiting-event-routes.ts";
 import { createRunRoutes } from "./api/run-routes.ts";
 import { RunApplicationService } from "./api/run-service.ts";
 import type { LoadJobSource } from "./api/job-source.ts";
@@ -22,6 +26,8 @@ import { createContextApplicationService, type ContextApplicationService } from 
 import { openContextDatabase } from "./context/database.ts";
 import { openPipelineDatabase } from "./db/database.ts";
 import { PipelineRepository } from "./db/repository.ts";
+import { RecruitingEventRepository } from "./events/repository.ts";
+import { RecruitingEventService } from "./events/service.ts";
 import { ArtifactStore, DEFAULT_ARTIFACT_ROOT } from "./system/artifacts.ts";
 import { migrateRunOutputLayout } from "./system/run-output-migration.ts";
 import { enforceRunArtifactRetention } from "./system/run-retention.ts";
@@ -53,6 +59,11 @@ export interface PipelineApplicationSessionService extends ApplicationSessionRou
   dispose?(): void | Promise<void>;
 }
 
+export interface PipelineRecruitingEventService extends RecruitingEventRouteService {
+  start(): void;
+  close(): void | Promise<void>;
+}
+
 export interface PipelineApplicationOptions {
   readonly webOrigin?: string;
   readonly pipelineDatabase?: Database;
@@ -72,6 +83,7 @@ export interface PipelineApplicationOptions {
   readonly applicationHarnessOrigin?: string;
   readonly applicationHarness?: ApplicationHarnessClient;
   readonly applicationSessions?: PipelineApplicationSessionService;
+  readonly recruitingEvents?: PipelineRecruitingEventService;
 }
 
 /** Internal handles are exposed for typed integration tests, not serialized by any route. */
@@ -85,6 +97,7 @@ export interface PipelineApplicationServices {
   readonly runs: RunApplicationService;
   readonly auth: ClosableAuthRouteService;
   readonly applicationSessions: PipelineApplicationSessionService;
+  readonly recruitingEvents: PipelineRecruitingEventService;
 }
 
 export interface PipelineApplication {
@@ -164,6 +177,12 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
   });
   const auth = options.auth ?? defaultAuthService;
+  if (!pipelineDatabase && !options.recruitingEvents) {
+    throw new Error("A pipeline database or recruiting event service is required");
+  }
+  const recruitingEvents = options.recruitingEvents ?? new RecruitingEventService({
+    repository: new RecruitingEventRepository(pipelineDatabase!),
+  });
   const applicationAgent = options.applicationAgent
     ?? (browserHarnessToken === undefined
       ? undefined
@@ -187,6 +206,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeAuth = createAuthRoutes(auth);
   const routeContext = createContextRoutes(context);
   const routeRuns = createRunRoutes(runs);
+  const routeRecruitingEvents = createRecruitingEventRoutes(recruitingEvents);
   const routeApplicationSessions = createApplicationSessionRoutes(applicationSessions);
   const fetch = createApiHandler({
     internalRoute: routeApplicationAgent,
@@ -194,6 +214,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     route: async (request, url) =>
       (await routeAuth(request, url))
       ?? (await routeContext(request, url))
+      ?? (await routeRecruitingEvents(request, url))
       ?? (await routeApplicationSessions(request, url))
       ?? (await routeRuns(request, url)),
   });
@@ -207,6 +228,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     runs,
     auth,
     applicationSessions,
+    recruitingEvents,
   });
   let closePromise: Promise<void> | undefined;
 
@@ -217,6 +239,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       closePromise ??= closeAll([
         () => worker.close(),
         () => applicationSessions.dispose?.(),
+        () => recruitingEvents.close(),
         () => closeAuth(),
         () => context.close?.(),
         ...(pipelineDatabase ? [() => pipelineDatabase.close()] : []),
