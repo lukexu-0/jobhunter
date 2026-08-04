@@ -1905,7 +1905,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   holdAuthRefresh = true;
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await authRefreshStarted;
-  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
+  await expect(providerBadges).toHaveText(["connected"]);
   await expect(providerBadges.filter({ hasText: "Checking" })).toHaveCount(0);
   releaseAuthRefresh();
   await authRefreshCompleted;
