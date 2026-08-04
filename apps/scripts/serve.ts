@@ -1,7 +1,12 @@
 import { resolve } from "node:path";
 
+const mode = process.argv[2];
+if (mode !== "dev" && mode !== "start") {
+  throw new Error("Expected launch mode: dev or start");
+}
+
 const appsRoot = resolve(import.meta.dir, "..");
-const pipeline = Bun.spawn(["bun", "run", "--cwd", "resume-tailoring", "dev"], {
+const pipeline = Bun.spawn(["bun", "run", "--cwd", "resume-tailoring", mode], {
   cwd: appsRoot,
   stdin: "inherit",
   stdout: "inherit",
@@ -44,7 +49,7 @@ while (true) {
   await Bun.sleep(200);
 }
 
-web = Bun.spawn(["bun", "run", "--cwd", "web", "dev"], {
+web = Bun.spawn(["bun", "run", "--cwd", "web", mode], {
   cwd: appsRoot,
   stdin: "inherit",
   stdout: "inherit",

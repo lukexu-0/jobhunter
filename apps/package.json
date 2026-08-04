@@ -8,7 +8,8 @@
     "playwright": "1.62.0-alpha-1783623505000"
   },
   "scripts": {
-    "dev": "bun scripts/dev.ts",
+    "dev": "bun scripts/serve.ts dev",
+    "start": "bun scripts/serve.ts start",
     "typecheck": "bun run --cwd resume-tailoring typecheck && bun run --cwd web typecheck",
     "build": "bun run --cwd resume-tailoring build && bun run --cwd web build",
     "test": "bun test --cwd resume-tailoring && bun test --cwd web"
