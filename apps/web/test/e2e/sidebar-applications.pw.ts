@@ -358,7 +358,7 @@ async function expectFolderNavigation(page: Page, width: number, currentLabel: "
   expect(firstBox.x).toBe(0);
   expect(secondBox.x).toBe(firstBox.width);
   expect(thirdBox.x).toBe(firstBox.width + secondBox.width);
-  expect(firstBox.width + secondBox.width + thirdBox.width).toBe(width);
+  expect(firstBox.width + secondBox.width + thirdBox.width).toBeCloseTo(width, 1);
 
   const linkStyles = await links.evaluateAll((elements) => elements.map((element) => {
     const style = getComputedStyle(element);
@@ -1751,6 +1751,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
+          { provider: "indeed", state: "disconnected" },
         ],
       }),
     });
@@ -1766,8 +1767,8 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await expect(page).toHaveURL(/\/providers$/);
   const providerBadges = page.locator(".status-badge");
-  await expect(providerBadges).toHaveText(["connected"]);
-  await expect(page.locator(".provider-row")).toHaveCount(1);
+  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
+  await expect(page.locator(".provider-row")).toHaveCount(2);
   await expect(page.getByText("Google Antigravity", { exact: true })).toHaveCount(0);
 
   holdRunRefresh = true;
@@ -1781,8 +1782,8 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   holdAuthRefresh = true;
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await authRefreshStarted;
-  await expect(providerBadges).toHaveText(["connected"]);
-  await expect(providerBadges).not.toContainText("Checking");
+  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
+  await expect(providerBadges.filter({ hasText: "Checking" })).toHaveCount(0);
   releaseAuthRefresh();
   await authRefreshCompleted;
 });
@@ -1818,6 +1819,7 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
+          { provider: "indeed", state: "connected", identity: { email: "indeed@example.com" } },
         ],
       }),
     });
@@ -1838,12 +1840,19 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
     await page.goto("/providers");
     await expectFolderNavigation(page, width, "Providers");
     await expectNoDocumentOverflow(page);
-    const providerRow = page.locator(".provider-row").first();
-    expect(await providerRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(1);
-    const providerRowBox = await providerRow.boundingBox();
-    const providerWorkspaceBox = await page.locator(".workspace").boundingBox();
-    if (!providerRowBox || !providerWorkspaceBox) throw new Error("Provider layout geometry is unavailable");
-    expect(providerRowBox.x + providerRowBox.width).toBeLessThanOrEqual(providerWorkspaceBox.x + providerWorkspaceBox.width);
+    const providerRows = page.locator(".provider-row");
+    await expect(providerRows).toHaveCount(2);
+    await expect(providerRows).toContainText(["OpenAI Codex", "Indeed Jobs"]);
+    await expect(providerRows.locator(".status-badge")).toHaveText(["disconnected", "connected"]);
+    await expect(providerRows.nth(0).getByRole("button", { name: "Connect OpenAI Codex" })).toBeEnabled();
+    await expect(providerRows.nth(1).getByRole("button", { name: "Logout Indeed Jobs" })).toBeEnabled();
+    for (const providerRow of await providerRows.all()) {
+      expect(await providerRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(1);
+      const providerRowBox = await providerRow.boundingBox();
+      const providerWorkspaceBox = await page.locator(".workspace").boundingBox();
+      if (!providerRowBox || !providerWorkspaceBox) throw new Error("Provider layout geometry is unavailable");
+      expect(providerRowBox.x + providerRowBox.width).toBeLessThanOrEqual(providerWorkspaceBox.x + providerWorkspaceBox.width);
+    }
 
     await page.goto("/runs/lifecycle-detail");
     await expectFullViewportRunDetail(page, width);

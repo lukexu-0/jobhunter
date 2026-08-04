@@ -1201,6 +1201,7 @@ a {
 
 .provider-identity__id {
   margin-top: var(--space-2);
+  color: var(--color-muted);
 }
 
 
@@ -1246,7 +1247,7 @@ a {
 
 .status-badge--disconnected,
 .status-badge--unavailable {
-  --status-color: var(--color-faint);
+  --status-color: var(--color-muted);
 }
 
 .provider-account {
