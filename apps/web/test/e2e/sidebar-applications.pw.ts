@@ -334,7 +334,7 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
 async function expectFolderNavigation(
   page: Page,
   width: number,
-  currentLabel: "Applications" | "Discovery" | "Events" | "Providers",
+  currentLabel: "Applications" | "Discovery" | "Providers",
 ): Promise<void> {
   const strip = page.locator("header.app-navigation");
   const stripBox = await strip.boundingBox();
@@ -1885,7 +1885,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
   const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
-  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Events", "Providers"]);
+  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Providers"]);
   await expect(applicationCount).toHaveText("7");
 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
@@ -1931,11 +1931,6 @@ test("uses full-width physical folder tabs at desktop and narrow widths", async 
     await expectNoDocumentOverflow(page);
   }
 
-  await page.goto("/events/upcoming");
-  await expect(
-    page.getByRole("navigation", { name: "Primary navigation" })
-      .getByRole("link", { name: "Events" }),
-  ).toHaveAttribute("aria-current", "page");
 
   await page.goto("/providers/settings");
   await expect(

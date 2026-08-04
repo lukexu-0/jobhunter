@@ -72,7 +72,6 @@ export async function main(): Promise<void> {
   };
 
   try {
-    app.services.recruitingEvents.start();
     app.kick();
   } catch (startupError) {
     await close().catch(() => undefined);

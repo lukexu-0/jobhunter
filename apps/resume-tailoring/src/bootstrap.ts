@@ -13,10 +13,6 @@ import { ApplicationSessionService } from "./api/application-session-service.ts"
 import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
 import { createApiHandler } from "./api/handler.ts";
-import {
-  createRecruitingEventRoutes,
-  type RecruitingEventRouteService,
-} from "./api/recruiting-event-routes.ts";
 import { createRunRoutes } from "./api/run-routes.ts";
 import { createDiscoveryRoutes } from "./api/discovery-routes.ts";
 import { RunApplicationService } from "./api/run-service.ts";
@@ -36,8 +32,6 @@ import { createDiscoveryConnectorsFromEnvironment } from "./discovery/connectors
 import { DiscoveryRepository } from "./discovery/repository.ts";
 import { DiscoveryService } from "./discovery/service.ts";
 import type { DiscoveryConnector } from "./discovery/types.ts";
-import { RecruitingEventRepository } from "./events/repository.ts";
-import { RecruitingEventService } from "./events/service.ts";
 import { ArtifactStore, DEFAULT_ARTIFACT_ROOT } from "./system/artifacts.ts";
 import { migrateRunOutputLayout } from "./system/run-output-migration.ts";
 import { enforceRunArtifactRetention } from "./system/run-retention.ts";
@@ -69,10 +63,6 @@ export interface PipelineApplicationSessionService extends ApplicationSessionRou
   dispose?(): void | Promise<void>;
 }
 
-export interface PipelineRecruitingEventService extends RecruitingEventRouteService {
-  start(): void;
-  close(): void | Promise<void>;
-}
 
 export interface PipelineApplicationOptions {
   readonly webOrigin?: string;
@@ -98,7 +88,6 @@ export interface PipelineApplicationOptions {
   readonly applicationHarness?: ApplicationHarnessClient;
   readonly applicationSessions?: PipelineApplicationSessionService;
   readonly professionalizeAnswer?: ProfessionalizeApplicationAnswer;
-  readonly recruitingEvents?: PipelineRecruitingEventService;
 }
 
 /** Internal handles are exposed for typed integration tests, not serialized by any route. */
@@ -114,7 +103,6 @@ export interface PipelineApplicationServices {
   readonly discovery?: DiscoveryService;
   readonly auth: ClosableAuthRouteService;
   readonly applicationSessions: PipelineApplicationSessionService;
-  readonly recruitingEvents?: PipelineRecruitingEventService;
 }
 
 export interface PipelineApplication {
@@ -124,11 +112,6 @@ export interface PipelineApplication {
   readonly services: Readonly<PipelineApplicationServices>;
 }
 
-export interface PipelineApplicationWithRecruitingEvents extends PipelineApplication {
-  readonly services: Readonly<PipelineApplicationServices & {
-    readonly recruitingEvents: PipelineRecruitingEventService;
-  }>;
-}
 
 async function closeAll(operations: readonly (() => void | Promise<void>)[]): Promise<void> {
   const errors: unknown[] = [];
@@ -143,16 +126,6 @@ async function closeAll(operations: readonly (() => void | Promise<void>)[]): Pr
   if (errors.length > 1) throw new AggregateError(errors, "Pipeline application close failed");
 }
 
-export function createPipelineApplication(
-  options: PipelineApplicationOptions & (
-    | { readonly pipelineDatabase: Database }
-    | { readonly recruitingEvents: PipelineRecruitingEventService }
-  ),
-): PipelineApplicationWithRecruitingEvents;
-export function createPipelineApplication(
-  options?: PipelineApplicationOptions & { readonly repository?: never },
-): PipelineApplicationWithRecruitingEvents;
-export function createPipelineApplication(options: PipelineApplicationOptions): PipelineApplication;
 export function createPipelineApplication(options: PipelineApplicationOptions = {}): PipelineApplication {
   const webOrigin = options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN;
   createIndeedCallbackUri(webOrigin);
@@ -229,14 +202,6 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     );
   const auth = options.auth ?? defaultAuthService;
   auth.configureAuthCallbackOrigin?.(webOrigin);
-  const recruitingEvents = options.recruitingEvents
-    ?? (
-      pipelineDatabase === undefined
-        ? undefined
-        : new RecruitingEventService({
-            repository: new RecruitingEventRepository(pipelineDatabase),
-          })
-    );
   const applicationAgent = options.applicationAgent
     ?? (browserHarnessToken === undefined
       ? undefined
@@ -261,9 +226,6 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeContext = createContextRoutes(context);
   const routeRuns = createRunRoutes(runs);
   const routeDiscovery = discovery === undefined ? undefined : createDiscoveryRoutes(discovery);
-  const routeRecruitingEvents = recruitingEvents === undefined
-    ? undefined
-    : createRecruitingEventRoutes(recruitingEvents);
   const routeApplicationSessions = createApplicationSessionRoutes(applicationSessions);
   const fetch = createApiHandler({
     internalRoute: routeApplicationAgent,
@@ -271,7 +233,6 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     route: async (request, url) =>
       (await routeAuth(request, url))
       ?? (await routeContext(request, url))
-      ?? (await routeRecruitingEvents?.(request, url))
       ?? (await routeApplicationSessions(request, url))
       ?? (await routeDiscovery?.(request, url))
       ?? (await routeRuns(request, url)),
@@ -288,7 +249,6 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     ...(discovery === undefined ? {} : { discovery }),
     auth,
     applicationSessions,
-    ...(recruitingEvents === undefined ? {} : { recruitingEvents }),
   });
   let closePromise: Promise<void> | undefined;
 
@@ -300,7 +260,6 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
         ...(discovery ? [() => discovery.close()] : []),
         () => worker.close(),
         () => applicationSessions.dispose?.(),
-        ...(recruitingEvents ? [() => recruitingEvents.close()] : []),
         () => closeAuth(),
         () => context.close?.(),
         ...(pipelineDatabase ? [() => pipelineDatabase.close()] : []),

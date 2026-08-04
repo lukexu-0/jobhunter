@@ -10,7 +10,6 @@ import {
   type PipelineApplicationOptions,
   type PipelineApplicationSessionService,
   type PipelineWorkerHandle,
-  type PipelineRecruitingEventService,
 } from "../src/bootstrap.ts";
 import {
   loadJobSourceFromUrl,
@@ -47,7 +46,6 @@ interface IngestionOverrides {
   readonly applicationSessions?: PipelineApplicationSessionService;
   readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
   readonly webOrigin?: string;
-  readonly recruitingEvents?: PipelineRecruitingEventService;
   readonly injectPipelineDatabase?: boolean;
   readonly beforeApplication?: (
     repository: PipelineRepository,
@@ -157,9 +155,6 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     ...(ingestion.applicationSessions
       ? { applicationSessions: ingestion.applicationSessions }
       : {}),
-    ...(ingestion.recruitingEvents
-      ? { recruitingEvents: ingestion.recruitingEvents }
-      : {}),
     loadJobSource: ingestion.loadJobSource ?? (async (jobUrl, signal): Promise<LoadedJobSource> => {
       calls.loadedUrls.push(jobUrl);
       calls.loadedSignals.push(signal);
@@ -200,85 +195,14 @@ describe("pipeline application bootstrap", () => {
     await fixture.app.close();
   });
 
-  test("keeps repository-injected composition usable without a recruiting event service", async () => {
-    const fixture = createFixture(false, { injectPipelineDatabase: false });
-    try {
-      expect(fixture.app.services.pipelineDatabase).toBeUndefined();
-      expect(fixture.app.services.recruitingEvents).toBeUndefined();
-
-      const response = await fixture.app.fetch(
-        new Request("http://127.0.0.1:3457/v1/events"),
-      );
-      expect(response.status).toBe(404);
-
-      await fixture.app.close();
-      expect(fixture.pipelineDatabase.query("SELECT 1").get()).toBeDefined();
-    } finally {
-      fixture.pipelineDatabase.close();
-    }
-  });
-
-  test("composes recruiting event routes and owns the event service lifecycle", async () => {
-    const calls: string[] = [];
-    const run = {
-      id: "scrape-1",
-      trigger: "manual" as const,
-      state: "running" as const,
-      startedAt: 1,
-      sourceCount: 1,
-      succeededSourceCount: 0,
-      failedSourceCount: 0,
-      eventCount: 0,
-    };
-    const recruitingEvents: PipelineRecruitingEventService = {
-      start: () => { calls.push("start"); },
-      close: () => { calls.push("close"); },
-      getDashboard: () => ({
-        preferences: { school: null },
-        schedule: {
-          cadenceHours: 24,
-          nextRunAt: null,
-          running: false,
-          sourceCount: 1,
-        },
-        latestRun: null,
-        events: [],
-        issues: [],
-      }),
-      setPreferences: ({ school }) => {
-        calls.push(`school:${school}`);
-        return { school };
-      },
-      requestScrape: () => {
-        calls.push("scrape");
-        return run;
-      },
-    };
-    const fixture = createFixture(false, { recruitingEvents });
-
-    const dashboard = await fixture.app.fetch(
+  test("does not expose recruiting event routes", async () => {
+    const fixture = createFixture();
+    const response = await fixture.app.fetch(
       new Request("http://127.0.0.1:3457/v1/events"),
     );
-    expect(dashboard.status).toBe(200);
-    expect(await dashboard.json()).toMatchObject({ preferences: { school: null } });
 
-    const preference = await fixture.app.fetch(new Request(
-      "http://127.0.0.1:3457/v1/events/preferences",
-      {
-        method: "PUT",
-        headers: { origin: WEB_ORIGIN, "content-type": "application/json" },
-        body: JSON.stringify({ school: "Example University" }),
-      },
-    ));
-    expect(preference.status).toBe(200);
-
-    const scrape = await fixture.app.fetch(mutation("/v1/events/scrape", {}));
-    expect(scrape.status).toBe(202);
-    expect(await scrape.json()).toEqual({ run });
-    expect(calls).toEqual(["school:Example University", "scrape"]);
-
+    expect(response.status).toBe(404);
     await fixture.app.close();
-    expect(calls).toEqual(["school:Example University", "scrape", "close"]);
   });
 
   test("composes auth, context, and run routes over real in-memory application boundaries", async () => {

@@ -617,7 +617,7 @@ test("migration twelve preserves the live claim and adds four unique empty claim
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
   expect(db.query<{
     id: number;
     run_id: string | null;
@@ -969,6 +969,17 @@ test("fresh databases default to pending while accepting lifecycle statuses", ()
   `);
 
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
+  expect(db.query<{ version: number; applied_at: number }, []>(
+    "SELECT version, applied_at FROM schema_migrations WHERE version >= 21 ORDER BY version",
+  ).all()).toEqual([
+    { version: 21, applied_at: 2_000 },
+    { version: 22, applied_at: 2_000 },
+  ]);
+  expect(db.query<{ count: number }, []>(`
+    SELECT count(*) AS count
+    FROM sqlite_schema
+    WHERE name LIKE 'recruiting_event_%'
+  `).get()).toEqual({ count: 0 });
   expect(db.query<{ name: string }, []>(
     "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'discovery_jobs'",
   ).get()).toEqual({ name: "discovery_jobs" });
@@ -1101,6 +1112,7 @@ test("migration eighteen adds Indeed while preserving version seventeen sources 
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
     { version: 21, applied_at: 2_000 },
+    { version: 22, applied_at: 2_000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1140,7 +1152,7 @@ test("migration eighteen adds Indeed while preserving version seventeen sources 
   ).run()).toThrow();
 });
 
-test("combined migrations preserve a populated recruiting-event version seventeen database", () => {
+test("migration twenty-two deletes recruiting-event storage from a populated version seventeen database", () => {
   const db = versionSeventeenRecruitingEventDatabase();
 
   migratePipelineDatabase(db, 2_000);
@@ -1156,123 +1168,15 @@ test("combined migrations preserve a populated recruiting-event version seventee
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
     { version: 21, applied_at: 2_000 },
+    { version: 22, applied_at: 2_000 },
   ]);
-  expect(db.query<{ id: number; school: string; updated_at: number }, []>(
-    "SELECT id, school, updated_at FROM recruiting_event_preferences",
-  ).all()).toEqual([{ id: 1, school: "State University", updated_at: 1_100 }]);
-  expect(db.query<{
-    id: string;
-    trigger: string;
-    state: string;
-    started_at: number;
-    completed_at: number;
-    preferences_json: string;
-    source_count: number;
-    succeeded_source_count: number;
-    failed_source_count: number;
-    event_count: number;
-  }, []>("SELECT * FROM recruiting_event_scrape_runs").all()).toEqual([{
-    id: "scrape-17",
-    trigger: "manual",
-    state: "completed",
-    started_at: 1_200,
-    completed_at: 1_300,
-    preferences_json: '{"school":"State University"}',
-    source_count: 1,
-    succeeded_source_count: 1,
-    failed_source_count: 0,
-    event_count: 1,
-  }]);
-  expect(db.query<{
-    run_id: string;
-    source_id: string;
-    source_name: string;
-    source_url: string;
-    state: string;
-    parser: string;
-    event_count: number;
-    issue_code: null;
-    issue_message: null;
-    completed_at: number;
-  }, []>("SELECT * FROM recruiting_event_source_attempts").all()).toEqual([{
-    run_id: "scrape-17",
-    source_id: "source-17",
-    source_name: "Career fair source",
-    source_url: "https://events.example/source",
-    state: "succeeded",
-    parser: "deterministic",
-    event_count: 1,
-    issue_code: null,
-    issue_message: null,
-    completed_at: 1_280,
-  }]);
-  expect(db.query<{
-    id: string;
-    fingerprint: string;
-    title: string;
-    organizer: string;
-    start_at: number;
-    end_at: number;
-    timezone: string;
-    location: string;
-    attendance: string;
-    registration_url: string;
-    description: string;
-    eligibility_summary: string;
-    matched_for_applicant: number;
-    first_seen_at: number;
-    last_seen_at: number;
-    last_scrape_run_id: string;
-  }, []>("SELECT * FROM recruiting_events").all()).toEqual([{
-    id: "event-17",
-    fingerprint: "fingerprint-17",
-    title: "Engineering Career Fair",
-    organizer: "State University",
-    start_at: 3_000,
-    end_at: 3_600,
-    timezone: "America/New_York",
-    location: "Student Center",
-    attendance: "hybrid",
-    registration_url: "https://events.example/register",
-    description: "Meet engineering employers.",
-    eligibility_summary: "Open to enrolled students",
-    matched_for_applicant: 1,
-    first_seen_at: 1_250,
-    last_seen_at: 1_280,
-    last_scrape_run_id: "scrape-17",
-  }]);
-  expect(db.query<{
-    event_id: string;
-    source_id: string;
-    source_url: string;
-    first_seen_at: number;
-    last_seen_at: number;
-  }, []>("SELECT * FROM recruiting_event_sources").all()).toEqual([{
-    event_id: "event-17",
-    source_id: "source-17",
-    source_url: "https://events.example/source",
-    first_seen_at: 1_250,
-    last_seen_at: 1_280,
-  }]);
   expect(db.query<{ name: string }, []>(`
     SELECT name
     FROM sqlite_schema
-    WHERE type = 'index'
-      AND name IN (
-        'recruiting_event_one_running_scrape',
-        'recruiting_event_scrape_runs_started',
-        'recruiting_events_upcoming'
-      )
+    WHERE name LIKE 'recruiting_event_%'
     ORDER BY name
-  `).all().map(({ name }) => name)).toEqual([
-    "recruiting_event_one_running_scrape",
-    "recruiting_event_scrape_runs_started",
-    "recruiting_events_upcoming",
-  ]);
+  `).all()).toEqual([]);
   expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
-  expect(() => db.query(
-    "DELETE FROM recruiting_event_scrape_runs WHERE id = 'scrape-17'",
-  ).run()).toThrow();
 
   expect(db.query<{ name: string }, []>(`
     SELECT name
@@ -1342,6 +1246,7 @@ test("combined migrations preserve a populated Indeed discovery version eighteen
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
     { version: 21, applied_at: 2_000 },
+    { version: 22, applied_at: 2_000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1398,43 +1303,11 @@ test("combined migrations preserve a populated Indeed discovery version eighteen
     "INSERT INTO discovery_sources(id, name, kind) VALUES ('unknown', 'Unknown', 'unknown')",
   ).run()).toThrow();
 
-  expect(db.query<{ name: string }, []>(`
-    SELECT name
+  expect(db.query<{ count: number }, []>(`
+    SELECT count(*) AS count
     FROM sqlite_schema
-    WHERE type = 'table'
-      AND name IN (
-        'recruiting_event_preferences',
-        'recruiting_event_scrape_runs',
-        'recruiting_event_source_attempts',
-        'recruiting_events',
-        'recruiting_event_sources'
-      )
-    ORDER BY name
-  `).all().map(({ name }) => name)).toEqual([
-    "recruiting_event_preferences",
-    "recruiting_event_scrape_runs",
-    "recruiting_event_source_attempts",
-    "recruiting_event_sources",
-    "recruiting_events",
-  ]);
-  expect(db.query<{ id: number; school: null; updated_at: number }, []>(
-    "SELECT id, school, updated_at FROM recruiting_event_preferences",
-  ).all()).toEqual([{ id: 1, school: null, updated_at: 0 }]);
-  expect(db.query<{ name: string }, []>(`
-    SELECT name
-    FROM sqlite_schema
-    WHERE type = 'index'
-      AND name IN (
-        'recruiting_event_one_running_scrape',
-        'recruiting_event_scrape_runs_started',
-        'recruiting_events_upcoming'
-      )
-    ORDER BY name
-  `).all().map(({ name }) => name)).toEqual([
-    "recruiting_event_one_running_scrape",
-    "recruiting_event_scrape_runs_started",
-    "recruiting_events_upcoming",
-  ]);
+    WHERE name LIKE 'recruiting_event_%'
+  `).get()).toEqual({ count: 0 });
 
   expect(db.query<{ opportunity_kind: string }, []>(
     "SELECT opportunity_kind FROM runs WHERE id = 'legacy-job'",
@@ -1482,7 +1355,7 @@ test("combined migrations preserve a version seventeen opportunity database", ()
     SELECT count(*) AS count
     FROM sqlite_schema
     WHERE type = 'table' AND name LIKE 'recruiting_event_%'
-  `).get()).toEqual({ count: 5 });
+  `).get()).toEqual({ count: 0 });
   expect(db.query<{ version: number; applied_at: number }, []>(
     "SELECT version, applied_at FROM schema_migrations ORDER BY version",
   ).all()).toEqual([
@@ -1492,6 +1365,7 @@ test("combined migrations preserve a version seventeen opportunity database", ()
     { version: 19, applied_at: 2_000 },
     { version: 20, applied_at: 2_000 },
     { version: 21, applied_at: 2_000 },
+    { version: 22, applied_at: 2_000 },
   ]);
 });
 
@@ -1504,7 +1378,7 @@ test("migrates version seven defaults without changing existing statuses", () =>
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -1541,6 +1415,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 19, applied_at: 2000 },
     { version: 20, applied_at: 2000 },
     { version: 21, applied_at: 2000 },
+    { version: 22, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1582,7 +1457,7 @@ test("migrates existing runs to application status applied atomically", () => {
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
   expect(migrated.query<{
     application_status: string;
     generate_keyword_map: number;
@@ -1616,7 +1491,7 @@ test("migrates version two retention state atomically without changing history",
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);
