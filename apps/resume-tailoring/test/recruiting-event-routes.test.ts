@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createApiHandler } from "../src/api/handler";
-import { createRecruitingEventRoutes } from "../src/api/recruiting-event-routes";
+import {
+  createRecruitingEventRoutes,
+  RecruitingEventScrapeConflictError,
+} from "../src/api/recruiting-event-routes";
 import type {
   RecruitingEventDashboardResponse,
   RecruitingEventScrapeRun,
@@ -95,6 +98,48 @@ describe("recruiting event routes", () => {
       error: {
         code: "INVALID_REQUEST",
         message: "Event scrape request must be an empty object",
+      },
+    });
+  });
+
+  test("rejects an empty school and reports an overlapping scrape", async () => {
+    let preferenceCalls = 0;
+    const route = createRecruitingEventRoutes({
+      getDashboard: () => dashboard,
+      setPreferences: ({ school }) => {
+        preferenceCalls += 1;
+        return { school };
+      },
+      requestScrape: () => {
+        throw new RecruitingEventScrapeConflictError();
+      },
+    });
+    const handler = createApiHandler({ webOrigin: WEB_ORIGIN, route });
+
+    const preference = await handler(new Request(
+      "http://127.0.0.1:3457/v1/events/preferences",
+      {
+        method: "PUT",
+        headers: { origin: WEB_ORIGIN, "content-type": "application/json" },
+        body: JSON.stringify({ school: "   " }),
+      },
+    ));
+    expect(preference.status).toBe(400);
+    expect(preferenceCalls).toBe(0);
+
+    const scrape = await handler(new Request(
+      "http://127.0.0.1:3457/v1/events/scrape",
+      {
+        method: "POST",
+        headers: { origin: WEB_ORIGIN, "content-type": "application/json" },
+        body: "{}",
+      },
+    ));
+    expect(scrape.status).toBe(409);
+    expect(await scrape.json()).toEqual({
+      error: {
+        code: "EVENT_SCRAPE_RUNNING",
+        message: "A recruiting event scrape is already running",
       },
     });
   });

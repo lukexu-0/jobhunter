@@ -86,6 +86,23 @@ function compact(value: string, maximum: number): string {
   return value.replace(/\s+/g, " ").trim().slice(0, maximum);
 }
 
+function identityText(value: string, organizer = false): string {
+  let normalized = compact(value, 300)
+    .normalize("NFKD")
+    .replace(/\p{M}+/gu, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/&/g, " and ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (organizer) {
+    normalized = normalized
+      .replace(/\b(?:incorporated|inc|corporation|corp|company|co|llc|ltd)\b$/u, "")
+      .trim();
+  }
+  return normalized;
+}
+
 function canonicalUrl(value: string): string {
   const url = new URL(value);
   url.hash = "";
@@ -99,8 +116,8 @@ function canonicalUrl(value: string): string {
 
 function fingerprint(candidate: RecruitingEventCandidate): string {
   const identity = [
-    compact(candidate.title, 300).toLocaleLowerCase("en-US"),
-    compact(candidate.organizer, 200).toLocaleLowerCase("en-US"),
+    identityText(candidate.title),
+    identityText(candidate.organizer, true),
     String(candidate.startAt),
   ].join("\u001f");
   return createHash("sha256").update(identity).digest("hex");

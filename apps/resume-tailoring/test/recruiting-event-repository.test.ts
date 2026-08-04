@@ -57,8 +57,8 @@ describe("recruiting event persistence", () => {
     repository.completeSource(run.id, ieee, "deterministic", [event], startedAt + 10);
     repository.completeSource(run.id, nyu, "llm", [{
       ...event,
-      title: "  GLOBAL student career fair  ",
-      organizer: "IEEE ",
+      title: "  GLOBAL student career-fair!  ",
+      organizer: "IEEE, Inc.",
       registrationUrl: "https://events.nyu.edu/global-student-career-fair?utm_source=calendar",
     }], startedAt + 20);
     repository.failSource(
