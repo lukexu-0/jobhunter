@@ -119,10 +119,13 @@ WarningText = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=1_000),
 ]
-_ELEMENT_REF_PATTERN = re.compile(r"^e[1-9][0-9]{0,8}$")
+_ELEMENT_REF_PATTERN = re.compile(r"^(?:f[1-9][0-9]{0,8})?e[1-9][0-9]{0,8}$")
 ElementRef = Annotated[
     str,
-    StringConstraints(strict=True, pattern=r"^e[1-9][0-9]{0,8}$"),
+    StringConstraints(
+        strict=True,
+        pattern=r"^(?:f[1-9][0-9]{0,8})?e[1-9][0-9]{0,8}$",
+    ),
 ]
 def _is_unicode_scalar_text(value: str) -> bool:
     try:

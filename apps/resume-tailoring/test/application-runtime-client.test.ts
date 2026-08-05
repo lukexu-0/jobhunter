@@ -363,9 +363,9 @@ test("mirrors strict additional-information question and request constraints", (
 test("strictly validates credential-free sign-in runtime wire contracts", () => {
   const request = {
     type: "request_sign_in" as const,
-    username_ref: "e1",
-    password_ref: "e42",
-    submit_ref: "e999999999",
+    username_ref: "f2e248",
+    password_ref: "f2e255",
+    submit_ref: "f2e261",
   };
   expect(RequestSignInRuntimeActionSchema.parse(request)).toEqual(request);
   expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
@@ -376,6 +376,8 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
     { ...request, password_ref: " e2" },
     { ...request, submit_ref: "button" },
     { ...request, submit_ref: "e3\n" },
+    { ...request, username_ref: "f0e1" },
+    { ...request, username_ref: "f1e0" },
     { type: "request_sign_in", username_ref: "e1", password_ref: "e2" },
     { ...request, username: "candidate@example.test" },
   ]) {

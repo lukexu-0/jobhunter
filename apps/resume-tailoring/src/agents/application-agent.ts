@@ -432,7 +432,9 @@ function runtimeTool<Schema extends z.ZodObject>(
   return tool<Schema, BrowserApplicationContext, string>(definition);
 }
 
-const PlaywrightToolElementRefSchema = z.string().regex(/^(?:ref=)?e[1-9][0-9]{0,8}$/);
+const PlaywrightToolElementRefSchema = z.string().regex(
+  /^(?:ref=)?(?:f[1-9][0-9]{0,8})?e[1-9][0-9]{0,8}$/,
+);
 
 function canonicalPlaywrightElementRef(value: z.infer<typeof PlaywrightToolElementRefSchema>): string {
   return PlaywrightSnapshotElementRefSchema.parse(
@@ -643,7 +645,7 @@ async function runApplicationAgentWithProfile(
 
   const requestSignIn = runtimeTool({
     name: "request_sign_in",
-    description: "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login form. Pass only the inspected refs for the username/email input, password input, and submit control; raw eN and snapshot ref=eN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
+    description: "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login form. Pass only the inspected refs for the username/email input, password input, and submit control; main-frame eN refs, frame-scoped fNeN refs, and exact snapshot ref=eN or ref=fNeN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
     parameters: SignInToolParameters,
     timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) => runtimeContext.playwrightCliCompleted,

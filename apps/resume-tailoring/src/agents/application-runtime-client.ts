@@ -249,7 +249,9 @@ export const PlaywrightCliRuntimeActionSchema = z.object({
 }).strict().superRefine(validatePlaywrightCliInvocation);
 export type PlaywrightCliRuntimeAction = z.infer<typeof PlaywrightCliRuntimeActionSchema>;
 
-export const PlaywrightSnapshotElementRefSchema = z.string().regex(/^e[1-9][0-9]{0,8}$/);
+export const PlaywrightSnapshotElementRefSchema = z.string().regex(
+  /^(?:f[1-9][0-9]{0,8})?e[1-9][0-9]{0,8}$/,
+);
 
 export const RequestSignInRuntimeActionSchema = z.object({
   type: z.literal("request_sign_in"),

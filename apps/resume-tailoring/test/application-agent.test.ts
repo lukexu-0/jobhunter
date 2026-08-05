@@ -703,14 +703,14 @@ describe("application agent", () => {
           const signIn = functionTool(agent, "request_sign_in");
           const review = functionTool(agent, "request_human_review");
           const signInParameters = {
-            username_ref: "ref=e1",
-            password_ref: "ref=e2",
-            submit_ref: "ref=e3",
+            username_ref: "f2e248",
+            password_ref: "f2e255",
+            submit_ref: "f2e261",
           };
           const canonicalSignInParameters = {
-            username_ref: "e1",
-            password_ref: "e2",
-            submit_ref: "e3",
+            username_ref: "f2e248",
+            password_ref: "f2e255",
+            submit_ref: "f2e261",
           };
           for (const invalidRef of ["aria-ref=e1", "ref=e1\n"]) {
             await expect(signIn.invoke(
@@ -787,7 +787,6 @@ describe("application agent", () => {
           throw new Error("review cancellation must terminate the run");
         },
       );
-
       expect(await runApplicationAgent(
         RUN_INPUT,
         new AbortController().signal,
@@ -797,9 +796,9 @@ describe("application agent", () => {
         { type: "playwright_cli", command: "snapshot", args: [] },
         {
           type: "request_sign_in",
-          username_ref: "e1",
-          password_ref: "e2",
-          submit_ref: "e3",
+          username_ref: "f2e248",
+          password_ref: "f2e255",
+          submit_ref: "f2e261",
         },
         { type: "playwright_cli", command: "snapshot", args: [] },
         { type: "request_human_review", result: VALID_RESULT },
@@ -1194,7 +1193,7 @@ describe("application agent", () => {
         ]);
         expect(agent.tools.map((item) => item.type === "function" ? item.description : undefined)).toEqual([
           EXPECTED_PLAYWRIGHT_CLI_DESCRIPTION,
-          "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login form. Pass only the inspected refs for the username/email input, password input, and submit control; raw eN and snapshot ref=eN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
+          "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login form. Pass only the inspected refs for the username/email input, password input, and submit control; main-frame eN refs, frame-scoped fNeN refs, and exact snapshot ref=eN or ref=fNeN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
           "Pause for browser interaction reserved for the human: 2FA, CAPTCHA, an inaccessible or explicitly manual control, or a required transition to a new origin. Use request_sign_in for ordinary username/password login.",
           "After a successful browser inspection, fill every visible field supported by current facts and upload the supplied resume when its control is visible. Then ask the human one bounded batch of structured questions for the remaining visible fields whose facts are unavailable. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction or already answered questions unless the page explicitly conflicts.",
           "Pause for final human review after every application field and warning has been handled. Summarize candidate-data and application fields, including completed nonstandard widgets. Omit navigation, human-only, and checkpoint controls; every fields_filled item has value_present true, and fields_needing_human contains only genuinely unresolved candidate fields.",

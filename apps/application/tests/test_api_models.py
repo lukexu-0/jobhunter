@@ -1720,9 +1720,9 @@ async def test_request_sign_in_endpoint_returns_only_attempt_status(
         headers=AUTHORIZATION,
         json={
             "type": "request_sign_in",
-            "username_ref": "e1",
-            "password_ref": "e2",
-            "submit_ref": "e3",
+            "username_ref": "f2e248",
+            "password_ref": "f2e255",
+            "submit_ref": "f2e261",
         },
     )
 
@@ -1768,6 +1768,18 @@ async def test_request_sign_in_endpoint_returns_only_attempt_status(
             "username_ref": "e1",
             "password_ref": "e2",
             "submit_ref": "e1234567890",
+        },
+        {
+            "type": "request_sign_in",
+            "username_ref": "f0e1",
+            "password_ref": "e2",
+            "submit_ref": "e3",
+        },
+        {
+            "type": "request_sign_in",
+            "username_ref": "f1e0",
+            "password_ref": "e2",
+            "submit_ref": "e3",
         },
         {
             "type": "request_sign_in",

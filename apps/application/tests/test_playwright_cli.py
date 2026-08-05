@@ -3142,9 +3142,9 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
 
     await runtime.sign_in(
         expected_origin="https://example.com",
-        username_ref="e1",
-        password_ref="e2",
-        submit_ref="e3",
+        username_ref="f2e248",
+        password_ref="f2e255",
+        submit_ref="f2e261",
         username=username,
         password=password,
     )
@@ -3167,9 +3167,9 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     assert len(payload_targets) == 1
     assert payload_targets[0].startswith(f"/proc/{os.getpid()}/fd/")
     assert len(payload_scripts) == 1
-    assert "aria-ref=e1" in payload_scripts[0]
-    assert "aria-ref=e2" in payload_scripts[0]
-    assert "aria-ref=e3" in payload_scripts[0]
+    assert "aria-ref=f2e248" in payload_scripts[0]
+    assert "aria-ref=f2e255" in payload_scripts[0]
+    assert "aria-ref=f2e261" in payload_scripts[0]
     assert json.dumps(username) in payload_scripts[0]
     assert json.dumps(password) in payload_scripts[0]
     assert "const expectedOrigin=\"https://example.com\"" in payload_scripts[0]
