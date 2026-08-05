@@ -91,6 +91,88 @@ describe("GitHub internship table ingestion", () => {
     expect(parsed.unusableCount).toBe(1);
   });
 
+  test("resets continuation inheritance after malformed GFM and HTML rows", async () => {
+    const parsed = await parseGitHubRepositoryTables(`
+| Company | Role | Application |
+| --- | --- | --- |
+| Acme | Software Engineering Intern | [Apply](https://jobs.example.com/1) |
+| malformed | row |
+| ↳ | Data Engineering Intern | [Apply](https://jobs.example.com/2) |
+
+<table>
+<tr><th>Company</th><th>Role</th><th>Application</th></tr>
+<tr><td>Beta</td><td>Hardware Engineering Intern</td><td><a href="https://jobs.example.com/3">Apply</a></td></tr>
+<tr></tr>
+<tr><td>↳</td><td>Firmware Engineering Intern</td><td><a href="https://jobs.example.com/4">Apply</a></td></tr>
+</table>
+`);
+
+    expect(parsed.rows.map(({ company, title }) => ({ company, title }))).toEqual([
+      { company: "Acme", title: "Software Engineering Intern" },
+      { company: "Beta", title: "Hardware Engineering Intern" },
+    ]);
+    expect(parsed.unusableCount).toBe(3);
+  });
+
+  test("keeps the original application URL when a Simplify mirror appears first", async () => {
+    const parsed = await parseGitHubRepositoryTables(`
+| Company | Role | Application |
+| --- | --- | --- |
+| Acme | Software Engineering Intern | [Simplify](https://simplify.jobs/p/6454b1b2-6daf-4a13-9e9f-47209a333d39) [Apply](https://jobs.example.com/internship) |
+`);
+
+    expect(parsed.rows[0]).toMatchObject({
+      applyUrl: "https://jobs.example.com/internship",
+      descriptionUrl: "https://simplify.jobs/p/6454b1b2-6daf-4a13-9e9f-47209a333d39",
+    });
+  });
+
+  test("upgrades source application links to HTTPS", async () => {
+    const parsed = await parseGitHubRepositoryTables(`
+| Company | Role | Application |
+| --- | --- | --- |
+| FocusKPI | AI Business Operations Intern | [Apply](http://focuskpi.applytojob.com/apply/udj57Jky8L/AI-Business-Operations-Intern-Remote-Paid) |
+| Block | Applied Research Intern | [Apply](http://block.xyz/careers/jobs/5108007008?gh_jid=5108007008) |
+`);
+
+    expect(parsed.rows.map(({ applyUrl }) => applyUrl)).toEqual([
+      "https://focuskpi.applytojob.com/apply/udj57Jky8L/AI-Business-Operations-Intern-Remote-Paid",
+      "https://block.xyz/careers/jobs/5108007008?gh_jid=5108007008",
+    ]);
+    expect(parsed.unusableCount).toBe(0);
+  });
+
+  test("does not treat a Non-Internships heading as an internship section", async () => {
+    const parsed = await parseGitHubRepositoryTables(`
+## Non-Internships
+| Name | Year | Note |
+| --- | --- | --- |
+| Acme Full-Time Software Engineer | 2027 | New graduate |
+`);
+
+    expect(parsed.rows).toEqual([]);
+    expect(parsed.nonInternshipCount).toBe(1);
+  });
+
+  test("rejects malformed base64 GitHub contents", async () => {
+    const connector = createGitHubTableConnector({
+      id: "malformed-github-base64",
+      name: "Malformed GitHub fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async () => new Response(JSON.stringify({
+      content: `${Buffer.from(table).toString("base64")}!`,
+      encoding: "base64",
+    }), { headers: { "content-type": "application/json" } })));
+
+    await expect(connector.sync(new AbortController().signal)).rejects.toThrow(
+      "GitHub discovery source is unavailable",
+    );
+  });
+
   test("bounds parser records before processing an oversized repository table", async () => {
     const rows = Array.from({ length: 1_000 }, (_, index) =>
       `<tr><td>Company ${index}</td><td>Software Engineering Intern</td><td><a href="https://jobs.example.com/${index}">Apply</a></td></tr>`,
@@ -547,7 +629,7 @@ ${rows}
 | Highspot | Software Engineer Intern | [Apply](https://jobs.lever.co/highspot/01234567-89ab-cdef-0123-456789abcdef) |
 | Alma | Backend Engineer Intern | [Apply](https://jobs.eu.lever.co/alma/11111111-2222-4333-8444-555555555555/apply) |
 `;
-    const requestedPaths: string[] = [];
+    const requestedEndpoints: string[] = [];
     const connector = createGitHubTableConnector({
       id: "lever-api",
       name: "Lever API fixture",
@@ -561,16 +643,17 @@ ${rows}
       if (host === "api.github.com") {
         return new Response(leverTable, { headers: { "content-type": "text/plain" } });
       }
-      if (host !== "api.lever.co") {
+      if (host !== "api.lever.co" && host !== "api.eu.lever.co") {
         throw new Error("Lever shell should not be requested");
       }
       const parsed = new URL(input);
-      requestedPaths.push(`${parsed.pathname}${parsed.search}`);
+      requestedEndpoints.push(`${host}${parsed.pathname}${parsed.search}`);
       const id = parsed.pathname.split("/").at(-1)!;
       return new Response(JSON.stringify({
         id,
-        descriptionPlain: "Build reliable software for customers with a product engineering team.",
-        openingPlain: "This internship provides ownership of a production feature.",
+        descriptionPlain: "Build reliable software for customers with a product engineering team. This internship provides ownership of a production feature.",
+        openingPlain: "Build reliable software for customers with a product engineering team.",
+        descriptionBodyPlain: "This internship provides ownership of a production feature.",
         lists: [{ text: "Qualifications", content: "Programming experience and strong collaboration skills." }],
         additionalPlain: "Work with a dedicated engineering mentor.",
       }), { headers: { "content-type": "application/json" } });
@@ -581,10 +664,93 @@ ${rows}
     expect(result.completeSnapshot).toBe(true);
     expect(result.items).toHaveLength(2);
     expect(result.items.every((item) => item.description.includes("dedicated engineering mentor"))).toBe(true);
-    expect(requestedPaths).toEqual([
-      "/v0/postings/highspot/01234567-89ab-cdef-0123-456789abcdef?mode=json",
-      "/v0/postings/alma/11111111-2222-4333-8444-555555555555?mode=json",
+    expect(result.items.every((item) =>
+      item.description.match(/Build reliable software/g)?.length === 1)).toBe(true);
+    expect(requestedEndpoints).toEqual([
+      "api.lever.co/v0/postings/highspot/01234567-89ab-cdef-0123-456789abcdef?mode=json",
+      "api.eu.lever.co/v0/postings/alma/11111111-2222-4333-8444-555555555555?mode=json",
     ]);
+  });
+
+  test("falls back to Lever page JSON-LD when the postings API is stale", async () => {
+    const leverTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Cirrus Logic | AI Business Analytics Intern | [Apply](https://jobs.eu.lever.co/cirrus/f85c944c-d437-4685-9f04-c7b79ae65ecb) |
+`;
+    const requestedHosts: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "lever-page-fallback",
+      name: "Lever page fallback fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(leverTable, { headers: { "content-type": "text/plain" } });
+      }
+      requestedHosts.push(host ?? "");
+      if (host === "api.eu.lever.co") {
+        return new Response('{"message":"Document not found"}', {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(`<script type="application/ld+json">${JSON.stringify({
+        "@type": "JobPosting",
+        title: "Fall 2026 Co-Op AI Business Analytics Intern",
+        hiringOrganization: { "@type": "Organization", name: "Cirrus Logic" },
+        description: "<p>Analyze business and product data with engineering partners during the internship.</p>",
+      })}</script>`, { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).toContain("Analyze business and product data");
+    expect(requestedHosts).toEqual(["api.eu.lever.co", "jobs.eu.lever.co"]);
+  });
+
+  test("rejects mismatched Lever page JSON-LD after an API miss", async () => {
+    const leverTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Cirrus Logic | AI Business Analytics Intern | [Apply](https://jobs.eu.lever.co/cirrus/f85c944c-d437-4685-9f04-c7b79ae65ecb) |
+`;
+    const connector = createGitHubTableConnector({
+      id: "lever-page-mismatch",
+      name: "Lever mismatch fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(leverTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host === "api.eu.lever.co") {
+        return new Response('{"message":"Document not found"}', {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(`<script type="application/ld+json">${JSON.stringify({
+        "@type": "JobPosting",
+        title: "Intern",
+        hiringOrganization: { "@type": "Organization", name: "Cirrus Logic" },
+        description: "<p>This unrelated frontend description is long enough to pass sanitization.</p>",
+      })}</script>`, { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.items).toEqual([]);
+    expect(result.completeSnapshot).toBe(false);
   });
 
   test("loads and caches Ashby public job-board descriptions", async () => {
@@ -614,6 +780,7 @@ ${rows}
       expect(new URL(input).pathname).toBe("/posting-api/job-board/ramp");
       boardRequests += 1;
       return new Response(JSON.stringify({
+        metadataPadding: "x".repeat(1024 * 1024),
         jobs: [
           {
             id: "01234567-89ab-cdef-0123-456789abcdef",
@@ -673,8 +840,186 @@ ${rows}
     expect(requested).toEqual(["/v1/boards/jumptrading/jobs/7220680"]);
   });
 
+  test("loads Hudson River Trading wrappers through its Greenhouse board", async () => {
+    const hrtTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| HRT | Software Engineer Intern - C++ or Python | [Apply](https://www.hudsonrivertrading.com/careers/job/?gh_jid=8052083&utm_source=Simplify) |
+`;
+    const requested: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "hrt-greenhouse-api",
+      name: "HRT Greenhouse API fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(hrtTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "boards-api.greenhouse.io") {
+        throw new Error("HRT wrapper should not be requested");
+      }
+      requested.push(new URL(input).pathname);
+      return new Response(JSON.stringify({
+        id: 8052083,
+        content: "<p>Build high-performance trading systems in C++ or Python with quantitative engineers.</p>",
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).toContain("high-performance trading systems");
+    expect(requested).toEqual(["/v1/boards/wehrtyou/jobs/8052083"]);
+  });
+
+  test("loads fixed company career wrappers through their Greenhouse boards", async () => {
+    const wrapperTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Jane Street | Software Engineer Summer Internship | [Apply](https://www.janestreet.com/join-jane-street/position/8599644002) |
+| Tower Research Capital | Quantitative Research Intern | [Apply](https://www.tower-research.com/open-positions/?gh_jid=8024128) |
+| TIFIN | AI Engineering Intern | [Apply](https://tifin.com/careers/apply/?gh_jid=5981740004) |
+| Old Mission Capital | Software Engineer Internship | [Apply](https://www.oldmissioncapital.com/careers/?gh_jid=7796180003) |
+| Samsara | Software Engineer Intern | [Apply](https://www.samsara.com/company/careers/roles/8082091?gh_jid=8082091) |
+`;
+    const requested: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "career-greenhouse-api",
+      name: "Career wrapper Greenhouse fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(wrapperTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "boards-api.greenhouse.io") {
+        throw new Error("Career wrapper should not be requested");
+      }
+      const path = new URL(input).pathname;
+      requested.push(path);
+      const id = path.split("/").at(-1)!;
+      return new Response(JSON.stringify({
+        id,
+        content: `<p>Build production software for official posting ${id} with an experienced team.</p>`,
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(5);
+    expect(requested).toEqual([
+      "/v1/boards/janestreet/jobs/8599644002",
+      "/v1/boards/towerresearchcapital/jobs/8024128",
+      "/v1/boards/tifin/jobs/5981740004",
+      "/v1/boards/oldmissioncapital/jobs/7796180003",
+      "/v1/boards/samsara/jobs/8082091",
+    ]);
+  });
+
+  test("extracts Amazon job detail bodies from official pages", async () => {
+    const amazonTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Amazon | Software Development Engineer Intern | [Apply](https://www.amazon.jobs/en/jobs/10412530/software-development-engineer-intern) |
+`;
+    const connector = createGitHubTableConnector({
+      id: "amazon-job-body",
+      name: "Amazon job body fixture",
+      kind: "zapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(amazonTable, { headers: { "content-type": "text/plain" } });
+      }
+      return new Response(`
+        <nav>Amazon Jobs navigation content that must not become the description.</nav>
+        <div id="job-detail-body">
+          <h2>DESCRIPTION</h2>
+          <p>Design, implement, and test distributed services with an AWS engineering team.</p>
+          <h2>BASIC QUALIFICATIONS</h2>
+          <p>Experience programming in a modern language and studying computer science.</p>
+        </div>
+      `, { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).toContain("distributed services");
+    expect(result.items[0]?.description).not.toContain("navigation content");
+  });
+
+  test("loads Apple job descriptions through the official details API", async () => {
+    const appleTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Apple | Hardware Undergrad Engineering Internships | [Apply](https://jobs.apple.com/en-us/details/200663981/hardware-undergrad-engineering-internships) |
+| Apple | iOS API Developer Internship | [Apply](https://jobs.apple.com/en-us/details/200654858-0240/ios-api-developer) |
+`;
+    const requested: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "apple-job-api",
+      name: "Apple details API fixture",
+      kind: "zapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(appleTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "jobs.apple.com") {
+        throw new Error("Apple job shell should not be requested");
+      }
+      const parsed = new URL(input);
+      requested.push(`${parsed.pathname}${parsed.search}`);
+      const apiId = parsed.pathname.split("/").at(-1)!;
+      const jobNumber = apiId.startsWith("PIPE-") ? apiId.slice(5) : apiId;
+      const baseId = jobNumber.split("-", 1)[0]!;
+      return new Response(JSON.stringify({
+        res: {
+          id: `PIPE-${baseId}`,
+          reqId: `PIPE-${baseId}`,
+          jobNumber,
+          positionId: baseId,
+          postingTitle: "Hardware Engineering Internship",
+          description: "<p>Design, prototype, and validate hardware systems with experienced Apple engineers.</p>",
+          minimumQualifications: "Currently pursuing an engineering degree.",
+          preferredQualifications: "Experience with hardware design, testing, and data analysis.",
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(2);
+    expect(result.items[0]?.description).toContain("Design, prototype, and validate");
+    expect(result.items[0]?.description).toContain("hardware design, testing");
+    expect(requested).toEqual([
+      "/api/v1/jobDetails/200663981?locale=en-us",
+      "/api/v1/jobDetails/200654858-0240?locale=en-us",
+    ]);
+  });
   test("uses a matching Simplify mirror when the primary detail has no description", async () => {
     const primaryUrl = "https://lifeattiktok.com/search/7667935150530840837";
+
     const mirrorTable = `
 | Company | Role | Application |
 | --- | --- | --- |
@@ -758,6 +1103,7 @@ ${rows}
 | Company | Role | Application |
 | --- | --- | --- |
 | Capital One | Technology Intern | [Apply](https://capitalone.wd12.myworkdayjobs.com/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1?utm_source=Simplify) |
+| Capital One | Data Intern | [Apply](https://capitalone.wd12.myworkdayjobs.com/Capital_One/job/McLean-VA/Data-Internship---Summer-2027_R999999) |
 `;
 
     const workdayDescription = "Build cloud software and production services during this ten-week technology internship.";
@@ -775,6 +1121,7 @@ ${rows}
       return new Response(JSON.stringify({
         jobDescription: "This unrelated response description must not replace the nested posting description.",
         jobPostingInfo: {
+          externalUrl: "https://capitalone.wd12.myworkdayjobs.com/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1",
           jobDescription: `<p>${workdayDescription}</p>`,
         },
       }), { headers: { "content-type": "application/json" } });
@@ -791,7 +1138,7 @@ ${rows}
 
     const result = await connector.sync(new AbortController().signal);
 
-    expect(result.completeSnapshot).toBe(true);
+    expect(result.completeSnapshot).toBe(false);
     expect(result.items).toHaveLength(1);
     expect(result.items[0]).toMatchObject({
       company: "Capital One",
@@ -800,6 +1147,7 @@ ${rows}
     });
     expect(requestedPaths).toEqual([
       "/wday/cxs/capitalone/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1",
+      "/wday/cxs/capitalone/Capital_One/job/McLean-VA/Data-Internship---Summer-2027_R999999",
     ]);
   });
   test("uses the Workday site tenant config once when the host tenant is rejected", async () => {
@@ -834,6 +1182,7 @@ ${rows}
       if (path.includes("/wday/cxs/osv_cci/")) {
         return new Response(JSON.stringify({
           jobPostingInfo: {
+            externalUrl: `https://osv-cci.wd1.myworkdayjobs.com/${path.split("/wday/cxs/osv_cci/")[1]}`,
             jobDescription: "Build production commodity-trading software with engineers during this summer internship.",
           },
         }), { headers: { "content-type": "application/json" } });
@@ -850,6 +1199,8 @@ ${rows}
     expect(requestedPaths.filter((path) => path.includes("/wday/cxs/osv_cci/"))).toHaveLength(2);
     expect(result.completeSnapshot).toBe(true);
     expect(result.items).toHaveLength(2);
+    expect(result.items.map((item) => item.requisitionId)).toEqual(["R1347", "R1348"]);
+    expect(new Set(result.items.map((item) => item.sourceItemId)).size).toBe(2);
   });
 
   test("loads Workday recruiting-site descriptions from the public CXS endpoint", async () => {
@@ -880,6 +1231,7 @@ ${rows}
       }
       return new Response(JSON.stringify({
         jobPostingInfo: {
+          externalUrl: "https://wd1.myworkdaysite.com/recruiting/wf/WellsFargoJobs/job/CHARLOTTE-NC/Risk-Development-Intern_R-556123",
           jobDescription: `<p>${workdayDescription}</p>`,
         },
       }), { headers: { "content-type": "application/json" } });
@@ -920,6 +1272,7 @@ ${rows}
       if (path !== expectedPath) throw new Error("Workday path escaped its validated segments");
       return new Response(JSON.stringify({
         jobPostingInfo: {
+          externalUrl: "https://acme.wd1.myworkdayjobs.com/External/job/%252e%252e/%252e%252e/Technology-Intern_R123",
           jobDescription: "Develop production software during this bounded technology internship program.",
         },
       }), { headers: { "content-type": "application/json" } });

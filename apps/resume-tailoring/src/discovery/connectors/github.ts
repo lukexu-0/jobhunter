@@ -62,7 +62,7 @@ const COLUMN_NAMES = {
   year: ["year", "eligible year", "class year"],
 } as const;
 const CLOSED_ROW = /(?:🔒|\bclosed\b|\bexpired\b|~~)/i;
-const INTERNSHIP_TITLE = /\b(?:intern(?:ship)?|co[- ]?op)\b/i;
+const INTERNSHIP_TITLE = /\b(?:intern(?:ships?)?|co[- ]?op)\b/i;
 const CONFIG_PART = /^[A-Za-z0-9._-]{1,100}$/;
 const CONFIG_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._\/-]{1,500}$/;
 const MAX_PARSED_RECORDS = 1_001;
@@ -72,6 +72,7 @@ const DESCRIPTION_SELECTORS = [
   "[data-automation-id='jobPostingDescription']",
   "[data-testid='job-description']",
   "#job-description",
+  "#job-detail-body",
   ".job-description",
   ".jobDescription",
   "article",
@@ -116,23 +117,39 @@ function markdownText(value: string): string {
     .replace(/[*_~`]/g, ""));
 }
 
-function firstUrl(value: string): string | undefined {
-  const markdown = /\[[^\]]*\]\(\s*(https?:\/\/[^\s)]+)(?:\s+[^)]*)?\)/i.exec(value)?.[1];
-  const html = /\bhref\s*=\s*["'](https?:\/\/[^"']+)["']/i.exec(value)?.[1];
-  const autolink = /<\s*(https?:\/\/[^>\s]+)\s*>/i.exec(value)?.[1];
-  const bare = /\bhttps?:\/\/[^\s<>)"']+/i.exec(value)?.[0];
-  const found = markdown ?? html ?? autolink ?? bare;
-  return found?.replace(/&amp;/gi, "&").replace(/\\([()])/g, "$1");
+function applicationUrl(value: string): string | undefined {
+  const mirror = simplifyMirrorUrl(value);
+  for (const match of value.matchAll(/\bhttps?:\/\/[^\s<>)"']+/gi)) {
+    const candidate = match[0]!.replace(/&amp;/gi, "&").replace(/\\([()])/g, "$1");
+    let parsed: URL;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      continue;
+    }
+    const applyToJob = /^[a-z0-9-]{1,63}\.applytojob\.com$/i.test(parsed.hostname)
+      && /^\/apply\/[A-Za-z0-9_-]{1,100}\//.test(parsed.pathname);
+    const blockCareers = parsed.hostname === "block.xyz"
+      && /^\/careers\/jobs\/[0-9]{1,20}\/?$/.test(parsed.pathname);
+    if (parsed.protocol === "http:" && (applyToJob || blockCareers)) {
+      parsed.protocol = "https:";
+      if (parsed.port === "80") parsed.port = "";
+    }
+    const safe = absolutePublicUrl(parsed.href);
+    if (!safe || (mirror && canonicalizeJobUrl(safe) === mirror)) continue;
+    return safe;
+  }
+  return undefined;
 }
 
 function simplifyMirrorUrl(value: string): string | undefined {
-  const candidate = /\bhttps:\/\/simplify\.jobs\/p\/[0-9a-f-]{36}(?:\?[^"'<>\s)]*)?/i.exec(value)?.[0]
+  const candidate = /\bhttps:\/\/simplify\.jobs\/p\/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}(?:\?[^"'<>\s)]*)?/i.exec(value)?.[0]
     ?.replace(/&amp;/gi, "&");
   if (!candidate) return undefined;
   const canonical = canonicalizeJobUrl(candidate);
   if (!canonical) return undefined;
   const url = new URL(canonical);
-  return url.hostname === "simplify.jobs" && /^\/p\/[0-9a-f-]{36}$/i.test(url.pathname)
+  return url.hostname === "simplify.jobs" && /^\/p\/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(url.pathname)
     ? canonical
     : undefined;
 }
@@ -179,7 +196,7 @@ function internshipSectionState(lines: readonly string[]): readonly boolean[] {
     stateBeforeLine[index] = internshipSection;
     const match = /^(#{1,6})\s+(.+)$/.exec(lines[index]!.trim());
     if (!match) continue;
-    if (/\bfellowships?\b/i.test(match[2]!)) {
+    if (/\bnon[-\s]+internships?\b/i.test(match[2]!) || /\bfellowships?\b/i.test(match[2]!)) {
       internshipSection = false;
     } else if (/\binternships?\b/i.test(match[2]!)) {
       internshipSection = true;
@@ -222,7 +239,7 @@ function parsedTableRow(
     return { kind: "non-internship" };
   }
   const applyMarkup = cells[applyIndex]?.markup ?? "";
-  const applyUrl = firstUrl(applyMarkup);
+  const applyUrl = applicationUrl(applyMarkup);
   const descriptionUrl = simplifyMirrorUrl(applyMarkup);
   const rawCompany = cells[companyIndex]?.text ?? "";
   const normalizedRawCompany = normalizeSpace(rawCompany);
@@ -322,6 +339,7 @@ export function parseGitHubInternshipTable(
       const rawCells = splitGfmRow(raw);
       if (rawCells.length !== headers.length) {
         counts.unusable += 1;
+        previousCompany = undefined;
         continue;
       }
       const cells = rawCells.map((markup) => ({ text: markdownText(markup), markup }));
@@ -395,7 +413,10 @@ export async function parseGitHubRepositoryTables(
         }
         rawCells.push(cell);
       }
-      if (rawCells.length === 0) continue;
+      if (rawCells.length === 0) {
+        previousCompany = undefined;
+        continue;
+      }
       const cells = await Promise.all(rawCells.map(async (cell) => ({
         text: normalizeSpace(await htmlToText(cell[2] ?? "")),
         markup: cell[2] ?? "",
@@ -513,6 +534,45 @@ function greenhouseSource(value: URL): GreenhouseSource | undefined {
     if (!candidateJobId || !/^[0-9]{1,20}$/.test(candidateJobId)) return undefined;
     board = "jumptrading";
     jobId = candidateJobId;
+  } else if (value.hostname === "www.hudsonrivertrading.com") {
+    const candidateJobId = value.pathname === "/careers/job/"
+      ? value.searchParams.get("gh_jid")
+      : undefined;
+    if (!candidateJobId || !/^[0-9]{1,20}$/.test(candidateJobId)) return undefined;
+    board = "wehrtyou";
+    jobId = candidateJobId;
+  } else if (value.hostname === "www.janestreet.com") {
+    const match = /^\/join-jane-street\/position\/([0-9]{1,20})\/?$/.exec(value.pathname);
+    if (!match) return undefined;
+    board = "janestreet";
+    jobId = match[1];
+  } else if (value.hostname === "www.tower-research.com") {
+    const candidateJobId = value.pathname === "/open-positions/"
+      ? value.searchParams.get("gh_jid")
+      : undefined;
+    if (!candidateJobId || !/^[0-9]{1,20}$/.test(candidateJobId)) return undefined;
+    board = "towerresearchcapital";
+    jobId = candidateJobId;
+  } else if (value.hostname === "tifin.com") {
+    const candidateJobId = value.pathname === "/careers/apply/"
+      ? value.searchParams.get("gh_jid")
+      : undefined;
+    if (!candidateJobId || !/^[0-9]{1,20}$/.test(candidateJobId)) return undefined;
+    board = "tifin";
+    jobId = candidateJobId;
+  } else if (value.hostname === "www.oldmissioncapital.com") {
+    const candidateJobId = value.pathname === "/careers/"
+      ? value.searchParams.get("gh_jid")
+      : undefined;
+    if (!candidateJobId || !/^[0-9]{1,20}$/.test(candidateJobId)) return undefined;
+    board = "oldmissioncapital";
+    jobId = candidateJobId;
+  } else if (value.hostname === "www.samsara.com") {
+    const match = /^\/company\/careers\/roles\/([0-9]{1,20})\/?$/.exec(value.pathname);
+    const candidateJobId = value.searchParams.get("gh_jid");
+    if (!match || candidateJobId !== match[1]) return undefined;
+    board = "samsara";
+    jobId = match[1];
   } else if (value.hostname !== "job-boards.greenhouse.io" && value.hostname !== "boards.greenhouse.io") {
     return undefined;
   }
@@ -665,30 +725,43 @@ function leverSource(value: URL): LeverSource | undefined {
   const match = /^\/([A-Za-z0-9_-]{1,100})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/apply)?\/?$/i
     .exec(value.pathname);
   if (!match) return undefined;
-  const endpoint = new URL(`https://api.lever.co/v0/postings/${match[1]}/${match[2]}`);
+  const apiHost = value.hostname === "jobs.eu.lever.co" ? "api.eu.lever.co" : "api.lever.co";
+  const endpoint = new URL(`https://${apiHost}/v0/postings/${match[1]}/${match[2]}`);
   endpoint.searchParams.set("mode", "json");
   return { endpoint, postingId: match[2]! };
+}
+
+interface LeverLoadResult {
+  readonly description?: string;
+  readonly pageFallback: boolean;
 }
 
 async function loadLeverDescription(
   client: SafePublicHttpClient,
   source: LeverSource,
   signal: AbortSignal,
-): Promise<string | undefined> {
+): Promise<LeverLoadResult> {
   const response = await client.get(source.endpoint, {
     signal,
-    allowedHosts: ["api.lever.co"],
+    allowedHosts: [source.endpoint.hostname],
     acceptedMediaTypes: ["application/json"],
     maxBodyBytes: 1024 * 1024,
     maxRedirects: 0,
   });
-  if (response.status < 200 || response.status > 299) return undefined;
+  if (response.status === 404) return { pageFallback: true };
+  if (response.status < 200 || response.status > 299) return { pageFallback: false };
   const document = response.json<unknown>();
-  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  if (typeof document !== "object" || document === null || Array.isArray(document)) {
+    return { pageFallback: false };
+  }
   const record = document as Readonly<Record<string, unknown>>;
-  if (nonemptyString(record.id)?.toLowerCase() !== source.postingId.toLowerCase()) return undefined;
-  const fragments = ["descriptionPlain", "descriptionBodyPlain", "openingPlain", "additionalPlain"]
-    .map((name) => nonemptyString(record[name]))
+  if (nonemptyString(record.id)?.toLowerCase() !== source.postingId.toLowerCase()) {
+    return { pageFallback: false };
+  }
+  const description = nonemptyString(record.descriptionPlain);
+  const fragments = (description
+    ? [description]
+    : [nonemptyString(record.openingPlain), nonemptyString(record.descriptionBodyPlain)])
     .filter((fragment): fragment is string => Boolean(fragment));
   if (Array.isArray(record.lists)) {
     for (const list of record.lists) {
@@ -697,8 +770,60 @@ async function loadLeverDescription(
       if (content) fragments.push(content);
     }
   }
-  if (fragments.length === 0) return undefined;
-  return sanitizeDescription(fragments.join("\n"), "html");
+  const additional = nonemptyString(record.additionalPlain);
+  if (additional) fragments.push(additional);
+  if (fragments.length === 0) return { pageFallback: false };
+  const sanitized = await sanitizeDescription(fragments.join("\n"), "html");
+  return sanitized ? { description: sanitized, pageFallback: false } : { pageFallback: false };
+}
+
+async function loadLeverPageDescription(
+  client: SafePublicHttpClient,
+  sourceUrl: URL,
+  company: string,
+  title: string,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.get(sourceUrl, {
+    signal,
+    allowedHosts: [sourceUrl.hostname],
+    acceptedMediaTypes: ["text/html", "application/xhtml+xml"],
+    maxBodyBytes: 1024 * 1024,
+    maxRedirects: 0,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  const expectedCompany = normalizedJobIdentity(company);
+  const expectedTitle = normalizedLeverTitle(title);
+  for (const value of await captureJsonLd(response.text())) {
+    const postings: Readonly<Record<string, unknown>>[] = [];
+    visitJsonObjects(value, (record) => {
+      const type = record["@type"];
+      if (type === "JobPosting" || (Array.isArray(type) && type.includes("JobPosting"))) {
+        postings.push(record);
+      }
+    });
+    for (const posting of postings) {
+      const organization = posting.hiringOrganization;
+      const candidateCompany = typeof organization === "object" && organization !== null && !Array.isArray(organization)
+        ? nonemptyString((organization as Readonly<Record<string, unknown>>).name)
+        : undefined;
+      const candidateTitle = nonemptyString(posting.title);
+      if (
+        !candidateCompany
+        || !candidateTitle
+        || normalizedJobIdentity(candidateCompany) !== expectedCompany
+      ) {
+        continue;
+      }
+      const normalizedTitle = normalizedLeverTitle(candidateTitle);
+      if (normalizedTitle !== expectedTitle) continue;
+      const description = nonemptyString(posting.description);
+      if (!description) continue;
+      const sanitized = await sanitizeDescription(description, "html");
+      if (sanitized) return sanitized;
+    }
+  }
+  return undefined;
 }
 
 interface AshbySource {
@@ -737,7 +862,7 @@ async function loadAshbyBoard(
         signal,
         allowedHosts: ["api.ashbyhq.com"],
         acceptedMediaTypes: ["application/json"],
-        maxBodyBytes: 1024 * 1024,
+        maxBodyBytes: 8 * 1024 * 1024,
         maxRedirects: 0,
       });
       if (response.status < 200 || response.status > 299) return undefined;
@@ -752,6 +877,7 @@ async function loadAshbyBoard(
         const id = nonemptyString(record.id);
         if (!id || !/^[0-9a-f-]{36}$/i.test(id)) continue;
         const html = nonemptyString(record.descriptionHtml);
+
         const text = nonemptyString(record.descriptionPlain);
         if (html) descriptions.set(id.toLowerCase(), { value: html, format: "html" });
         else if (text) descriptions.set(id.toLowerCase(), { value: text, format: "text" });
@@ -772,6 +898,58 @@ async function loadAshbyDescription(
   const board = await loadAshbyBoard(client, source, cache, signal);
   const description = board?.get(source.jobId.toLowerCase());
   return description ? sanitizeDescription(description.value, description.format) : undefined;
+}
+interface AppleJobSource {
+  readonly endpoint: URL;
+  readonly baseId: string;
+  readonly jobNumber: string;
+}
+
+function appleJobSource(value: URL): AppleJobSource | undefined {
+  if (value.hostname !== "jobs.apple.com") return undefined;
+  const match = /^\/([A-Za-z]{2}-[A-Za-z]{2})\/details\/((?:[0-9]{1,20}(?:-[0-9]{1,10})?|PIPE-[0-9]{1,20}))\/[A-Za-z0-9-]{1,200}\/?$/
+    .exec(value.pathname);
+  if (!match) return undefined;
+  const apiId = match[2]!;
+  const jobNumber = apiId.startsWith("PIPE-") ? apiId.slice(5) : apiId;
+  const baseId = jobNumber.split("-", 1)[0]!;
+  const endpoint = new URL(`https://jobs.apple.com/api/v1/jobDetails/${apiId}`);
+  endpoint.searchParams.set("locale", match[1]!.toLowerCase());
+  return { endpoint, baseId, jobNumber };
+}
+
+async function loadAppleJobDescription(
+  client: SafePublicHttpClient,
+  source: AppleJobSource,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.get(source.endpoint, {
+    signal,
+    allowedHosts: ["jobs.apple.com"],
+    acceptedMediaTypes: ["application/json"],
+    maxBodyBytes: 1024 * 1024,
+    maxRedirects: 0,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  const document = response.json<unknown>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  const value = (document as Readonly<Record<string, unknown>>).res;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Readonly<Record<string, unknown>>;
+  if (
+    nonemptyString(record.jobNumber) !== source.jobNumber
+    || nonemptyString(record.positionId) !== source.baseId
+    || nonemptyString(record.id) !== `PIPE-${source.baseId}`
+    || nonemptyString(record.reqId) !== `PIPE-${source.baseId}`
+    || !nonemptyString(record.postingTitle)
+  ) {
+    return undefined;
+  }
+  const fragments = ["jobSummary", "description", "minimumQualifications", "preferredQualifications"]
+    .map((name) => nonemptyString(record[name]))
+    .filter((fragment): fragment is string => Boolean(fragment));
+  if (fragments.length === 0) return undefined;
+  return sanitizeDescription(fragments.join("\n"), "html");
 }
 
 interface OracleCandidateSource {
@@ -931,6 +1109,7 @@ function workdayCxsUrl(value: URL, tenantOverride?: string): URL | undefined {
     && /^wd\d+$/.test(labels[1] ?? "")
     && labels[2] === "myworkdayjobs"
     && labels[3] === "com"
+    && (jobIndex === 1 || jobIndex === 2)
   ) {
     tenant = tenantOverride ?? labels[0];
   } else if (
@@ -970,7 +1149,7 @@ function workdaySiteConfigUrl(value: URL): { readonly endpoint: URL; readonly si
   }
   const rawSegments = value.pathname.split("/").filter(Boolean);
   const jobIndex = rawSegments.findIndex((segment) => segment.toLowerCase() === "job");
-  if (jobIndex < 1) return undefined;
+  if (jobIndex !== 1 && jobIndex !== 2) return undefined;
   const encodedSite = safeWorkdayPathSegment(rawSegments[jobIndex - 1] ?? "");
   if (!encodedSite) return undefined;
   const site = decodeURIComponent(encodedSite);
@@ -1015,11 +1194,56 @@ async function loadWorkdaySiteConfig(
   return pending;
 }
 
-async function workdayDescriptionFromJson(value: unknown): Promise<string | undefined> {
+interface WorkdayPostingIdentity {
+  readonly site: string;
+  readonly postingPath: string;
+  readonly recruitingTenant?: string;
+}
+
+function workdayPostingIdentity(value: URL): WorkdayPostingIdentity | undefined {
+  if (!workdayCxsUrl(value)) return undefined;
+  const segments = value.pathname.split("/").filter(Boolean);
+  const jobIndex = segments.findIndex((segment) => segment.toLowerCase() === "job");
+  const encodedSite = safeWorkdayPathSegment(segments[jobIndex - 1] ?? "");
+  const postingSegments = segments.slice(jobIndex + 1).map(safeWorkdayPathSegment);
+  if (!encodedSite || postingSegments.length === 0 || postingSegments.some((segment) => !segment)) {
+    return undefined;
+  }
+  const recruitingTenant = value.hostname.endsWith(".myworkdaysite.com")
+    ? safeWorkdayPathSegment(segments[1] ?? "")
+    : undefined;
+  if (value.hostname.endsWith(".myworkdaysite.com") && !recruitingTenant) return undefined;
+  return {
+    site: decodeURIComponent(encodedSite).toLowerCase(),
+    postingPath: postingSegments.join("/"),
+    ...(recruitingTenant ? { recruitingTenant: recruitingTenant.toLowerCase() } : {}),
+  };
+}
+
+async function workdayDescriptionFromJson(
+  value: unknown,
+  sourceUrl: URL,
+): Promise<string | undefined> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const posting = (value as Readonly<Record<string, unknown>>).jobPostingInfo;
   if (typeof posting !== "object" || posting === null || Array.isArray(posting)) return undefined;
-  const description = nonemptyString((posting as Readonly<Record<string, unknown>>).jobDescription);
+  const record = posting as Readonly<Record<string, unknown>>;
+  const externalUrl = absolutePublicUrl(nonemptyString(record.externalUrl) ?? "");
+  if (!externalUrl) return undefined;
+  const external = new URL(externalUrl);
+  const expected = workdayPostingIdentity(sourceUrl);
+  const actual = workdayPostingIdentity(external);
+  if (
+    external.origin !== sourceUrl.origin
+    || !expected
+    || !actual
+    || actual.site !== expected.site
+    || actual.postingPath !== expected.postingPath
+    || actual.recruitingTenant !== expected.recruitingTenant
+  ) {
+    return undefined;
+  }
+  const description = nonemptyString(record.jobDescription);
   return description ? sanitizeDescription(description, "html") : undefined;
 }
 
@@ -1038,7 +1262,7 @@ async function loadWorkdayDescription(
     maxBodyBytes: 1024 * 1024,
   });
   if (response.status >= 200 && response.status <= 299) {
-    return workdayDescriptionFromJson(response.json<unknown>());
+    return workdayDescriptionFromJson(response.json<unknown>(), sourceUrl);
   }
   if (response.status !== 422) return undefined;
   const config = await loadWorkdaySiteConfig(client, sourceUrl, configCache, signal);
@@ -1052,7 +1276,7 @@ async function loadWorkdayDescription(
     maxBodyBytes: 1024 * 1024,
   });
   if (corrected.status < 200 || corrected.status > 299) return undefined;
-  return workdayDescriptionFromJson(corrected.json<unknown>());
+  return workdayDescriptionFromJson(corrected.json<unknown>(), sourceUrl);
 }
 
 async function descriptionFromHtml(html: string): Promise<string | undefined> {
@@ -1071,6 +1295,14 @@ async function descriptionFromHtml(html: string): Promise<string | undefined> {
 
 function normalizedJobIdentity(value: string): string {
   return normalizeSpace(value).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function normalizedLeverTitle(value: string): string {
+  const withoutSeasonPrefix = normalizeSpace(value).replace(
+    /^(?:fall|winter|spring|summer)\s+20\d{2}\s+(?:co[- ]?op\s+)?/i,
+    "",
+  );
+  return normalizedJobIdentity(withoutSeasonPrefix);
 }
 
 async function loadSimplifyMirrorDescription(
@@ -1132,6 +1364,8 @@ async function loadSimplifyMirrorDescription(
 async function loadDescription(
   client: SafePublicHttpClient,
   url: string,
+  company: string,
+  title: string,
   workdayConfigCache: WorkdaySiteConfigCache,
   ashbyBoardCache: AshbyBoardCache,
   signal: AbortSignal,
@@ -1152,11 +1386,19 @@ async function loadDescription(
     }
     const lever = leverSource(sourceUrl);
     if (lever) {
-      return await loadLeverDescription(client, lever, signal);
+      const result = await loadLeverDescription(client, lever, signal);
+      if (result.description) return result.description;
+      return result.pageFallback
+        ? await loadLeverPageDescription(client, sourceUrl, company, title, signal)
+        : undefined;
     }
     const ashby = ashbySource(sourceUrl);
     if (ashby) {
       return await loadAshbyDescription(client, ashby, ashbyBoardCache, signal);
+    }
+    const apple = appleJobSource(sourceUrl);
+    if (apple) {
+      return await loadAppleJobDescription(client, apple, signal);
     }
     const oracle = oracleCandidateSource(sourceUrl);
     if (oracle) {
@@ -1189,6 +1431,13 @@ async function loadDescription(
 
 function requisitionFromUrl(url: string): string | undefined {
   const parsed = new URL(url);
+  if (workdayCxsUrl(parsed)) {
+    const postingSegment = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).at(-1) ?? "");
+    const prefixed = /(?:^|_)((?:REQ|JR|R)[-_]?[A-Za-z0-9.-]+)$/i.exec(postingSegment)?.[1];
+    const suffix = /_([A-Za-z0-9.-]{3,100})$/.exec(postingSegment)?.[1];
+    const requisitionId = nonemptyString(prefixed ?? suffix ?? "");
+    if (requisitionId) return requisitionId;
+  }
   const queryId = parsed.searchParams.get("gh_jid") ?? parsed.searchParams.get("jobId") ?? parsed.searchParams.get("job_id");
   const pathId = /(?:jobs?|positions?|requisitions?)[\/_-]([A-Za-z0-9._-]{3,100})(?:\/|$)/i.exec(parsed.pathname)?.[1];
   return nonemptyString(queryId ?? pathId ?? "");
@@ -1221,8 +1470,6 @@ export function createGitHubTableConnector(
   let cached: DiscoverySyncResult | undefined;
   let cachedMarkdown: string | undefined;
   let cachedRevision: string | undefined;
-  const workdayConfigCache: WorkdaySiteConfigCache = new Map();
-  const ashbyBoardCache: AshbyBoardCache = new Map();
   return {
     id: config.id,
     name: config.name,
@@ -1267,7 +1514,15 @@ export function createGitHubTableConnector(
           const encoded = nonemptyString(body.content);
           if (!encoded || body.encoding !== "base64") throw new Error("GitHub discovery source is unavailable");
           try {
-            markdown = Buffer.from(encoded.replace(/\s/g, ""), "base64").toString("utf8");
+            const compact = encoded.replace(/\s/g, "");
+            if (
+              !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)
+            ) {
+              throw new Error("Invalid base64");
+            }
+            const decoded = Buffer.from(compact, "base64");
+            if (decoded.toString("base64") !== compact) throw new Error("Invalid base64");
+            markdown = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
           } catch (error) {
             throw new Error("GitHub discovery source is unavailable", { cause: error });
           }
@@ -1279,6 +1534,8 @@ export function createGitHubTableConnector(
       const parsed = await parseGitHubRepositoryTables(markdown, config.maxRows + 1);
       const truncated = parsed.truncated || parsed.rows.length > config.maxRows;
       const selectedRows = parsed.rows.slice(0, config.maxRows);
+      const workdayConfigCache: WorkdaySiteConfigCache = new Map();
+      const ashbyBoardCache: AshbyBoardCache = new Map();
       let omittedDescriptions = parsed.unusableCount;
       const loaded = await mapConcurrent(selectedRows, config.detailConcurrency, async (row): Promise<DiscoveredJobInput | undefined> => {
         const canonicalUrl = canonicalizeJobUrl(row.applyUrl);
@@ -1289,6 +1546,8 @@ export function createGitHubTableConnector(
         let description = await loadDescription(
           syncClient,
           canonicalUrl,
+          row.company,
+          row.title,
           workdayConfigCache,
           ashbyBoardCache,
           signal,
