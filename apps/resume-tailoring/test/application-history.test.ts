@@ -30,7 +30,7 @@ function otherResult(callId: string): AgentInputItem {
   return { type: "function_call_result", name: "other_tool", callId, output: "ok", status: "completed" };
 }
 
-function playwrightCliCall(callId: string, payload = ""): AgentInputItem {
+function playwrightCliCall(callId: string, payload = ""): FunctionCallItem {
   return {
     type: "function_call",
     name: "playwright_cli",
@@ -47,8 +47,49 @@ function playwrightCliResult(
   callId: string,
   output = "ok",
   status: "completed" | "in_progress" | "incomplete" = "completed",
-): AgentInputItem {
+): FunctionCallResultItem {
   return { type: "function_call_result", name: "playwright_cli", callId, output, status };
+}
+
+function nativePlaywrightCliGroup(callId: string, dt = true): readonly [
+  anchor: AgentInputItem,
+  coveredCall: AgentInputItem,
+  result: AgentInputItem,
+] {
+  const visibleCall = playwrightCliCall(callId);
+  return [
+    {
+      type: "reasoning",
+      id: "reason-native",
+      content: [{ type: "input_text", text: "Inspected the application form." }],
+      rawContent: [{ type: "reasoning_text", text: "Inspected the application form." }],
+      providerData: {
+        jobhunterCodex: {
+          version: 1,
+          kind: "history",
+          payload: {
+            type: "openaiResponsesHistory",
+            provider: "openai-codex",
+            dt,
+            items: [
+              { type: "reasoning", encrypted_content: "encrypted-reasoning", summary: [] },
+              {
+                type: "function_call",
+                call_id: callId,
+                name: "playwright_cli",
+                arguments: visibleCall.arguments,
+              },
+            ],
+          },
+        },
+      },
+    },
+    {
+      ...visibleCall,
+      providerData: { jobhunterCodex: { version: 1, kind: "covered" } },
+    },
+    playwrightCliResult(callId),
+  ];
 }
 
 describe("projectApplicationHistory", () => {
@@ -145,6 +186,31 @@ describe("projectApplicationHistory", () => {
     expect(projected).toHaveLength(34);
   });
 
+  test("prunes a native Codex Playwright response group atomically", () => {
+    const [anchor, coveredCall, matchingResult] = nativePlaywrightCliGroup("native-oldest");
+    const newerPairs: AgentInputItem[] = [];
+    for (let index = 0; index < 16; index += 1) {
+      newerPairs.push(
+        playwrightCliCall(`newer-${index}`),
+        playwrightCliResult(`newer-${index}`),
+      );
+    }
+    const history = [
+      anchor,
+      coveredCall,
+      matchingResult,
+      ...newerPairs,
+    ] satisfies readonly AgentInputItem[];
+
+    const projected = projectApplicationHistory(history);
+
+    expect(projected.includes(anchor)).toBe(false);
+    expect(projected.includes(coveredCall)).toBe(false);
+    expect(projected.includes(matchingResult)).toBe(false);
+    expect(projected).toEqual([APPLICATION_HISTORY_PRUNED_NOTICE, ...newerPairs]);
+    expect(projected.filter((item) => item === APPLICATION_HISTORY_PRUNED_NOTICE)).toHaveLength(1);
+  });
+
   test("prunes oldest Playwright CLI pairs atomically to the byte limit with one notice", () => {
     const largeOutput = "ø".repeat(275_000);
     const oldestCall = playwrightCliCall("oldest", largeOutput);
@@ -173,6 +239,34 @@ describe("projectApplicationHistory", () => {
     expect(projected.includes(oldestResult)).toBe(false);
     expect(projected.filter((item) => item === APPLICATION_HISTORY_PRUNED_NOTICE)).toHaveLength(1);
     expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThanOrEqual(MAX_AGENT_TRANSCRIPT_BYTES);
+  });
+
+  test("treats the latest non-delta native Codex history as a replacement window", () => {
+    const obsoletePrefix = user("x".repeat(MAX_AGENT_TRANSCRIPT_BYTES));
+    const [anchor, coveredCall, matchingResult] = nativePlaywrightCliGroup(
+      "native-replacement",
+      false,
+    );
+    const suffix = user("continue from the replacement history");
+    const history = [
+      obsoletePrefix,
+      anchor,
+      coveredCall,
+      matchingResult,
+      suffix,
+    ] satisfies readonly AgentInputItem[];
+    expect(Buffer.byteLength(JSON.stringify(history))).toBeGreaterThan(MAX_AGENT_TRANSCRIPT_BYTES);
+
+    const projected = projectApplicationHistory(history);
+
+    expect(projected).toEqual([anchor, coveredCall, matchingResult, suffix]);
+    expect(projected[0]).toBe(anchor);
+    expect(projected[3]).toBe(suffix);
+    expect(projected.includes(obsoletePrefix)).toBe(false);
+    expect(projected.includes(APPLICATION_HISTORY_PRUNED_NOTICE)).toBe(false);
+    expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThanOrEqual(
+      MAX_AGENT_TRANSCRIPT_BYTES,
+    );
   });
 
   test("fails with the dedicated provider error when preserved non-browser history overflows", () => {

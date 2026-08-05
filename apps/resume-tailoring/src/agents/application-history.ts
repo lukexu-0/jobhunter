@@ -1,4 +1,5 @@
 import type { AgentInputItem } from "@openai/agents-core";
+import { parseCodexBridge, type CodexBridge } from "../models/agents-mapping.ts";
 import { MAX_AGENT_TRANSCRIPT_BYTES } from "./runner.ts";
 
 export const APPLICATION_HISTORY_PRUNED_NOTICE: AgentInputItem = Object.freeze({
@@ -32,17 +33,83 @@ function isCompletedPlaywrightCliResult(
     && item.status === "completed";
 }
 
+function isNativeAssistantItem(item: AgentInputItem): boolean {
+  return item.type === "function_call"
+    || item.type === "reasoning"
+    || item.type === "compaction"
+    || ((item.type === "message" || item.type === undefined) && item.role === "assistant");
+}
+
+interface NativeHistoryGroup {
+  readonly memberIndexes: number[];
+  readonly playwrightCliCallIndexes: number[];
+}
+
+type CompletePlaywrightCliPair = readonly [callIndex: number, resultIndex: number];
+
 export function projectApplicationHistory(history: readonly AgentInputItem[]): AgentInputItem[] {
+  const bridges: (CodexBridge | undefined)[] = [];
+  let nativeCoverageActive = false;
+  for (const item of history) {
+    let bridge: CodexBridge | undefined;
+    try {
+      bridge = parseCodexBridge(item.providerData, "Application history provider data");
+    } catch {
+      throw new ApplicationHistoryProjectionError();
+    }
+    if (bridge?.kind === "history") {
+      if (!isNativeAssistantItem(item)) throw new ApplicationHistoryProjectionError();
+      nativeCoverageActive = true;
+    } else if (bridge?.kind === "covered") {
+      if (!nativeCoverageActive || !isNativeAssistantItem(item)) {
+        throw new ApplicationHistoryProjectionError();
+      }
+    } else {
+      nativeCoverageActive = false;
+    }
+    bridges.push(bridge);
+  }
+
+  let projectionStartIndex = 0;
+  for (const [index, bridge] of bridges.entries()) {
+    if (bridge?.kind === "history" && bridge.payload.dt === false) {
+      projectionStartIndex = index;
+    }
+  }
+
   const playwrightCliIndexes = new Set<number>();
   const callsById = new Map<string, number[]>();
   const completedResultsById = new Map<string, number[]>();
+  const nativeGroups: NativeHistoryGroup[] = [];
+  const nativeGroupByPlaywrightCliCallIndex = new Map<number, NativeHistoryGroup>();
+  let activeNativeGroup: NativeHistoryGroup | undefined;
 
-  for (const [index, item] of history.entries()) {
+  for (let index = projectionStartIndex; index < history.length; index += 1) {
+    const item = history[index]!;
+    const bridge = bridges[index];
+
+    if (bridge?.kind === "history") {
+      if (!isNativeAssistantItem(item)) throw new ApplicationHistoryProjectionError();
+      activeNativeGroup = { memberIndexes: [index], playwrightCliCallIndexes: [] };
+      nativeGroups.push(activeNativeGroup);
+    } else if (bridge?.kind === "covered") {
+      if (activeNativeGroup === undefined || !isNativeAssistantItem(item)) {
+        throw new ApplicationHistoryProjectionError();
+      }
+      activeNativeGroup.memberIndexes.push(index);
+    } else {
+      activeNativeGroup = undefined;
+    }
+
     if (isPlaywrightCliCall(item)) {
       playwrightCliIndexes.add(index);
       const calls = callsById.get(item.callId) ?? [];
       calls.push(index);
       callsById.set(item.callId, calls);
+      if (activeNativeGroup !== undefined) {
+        activeNativeGroup.playwrightCliCallIndexes.push(index);
+        nativeGroupByPlaywrightCliCallIndex.set(index, activeNativeGroup);
+      }
     } else if (item.type === "function_call_result" && item.name === "playwright_cli") {
       playwrightCliIndexes.add(index);
       if (isCompletedPlaywrightCliResult(item)) {
@@ -53,14 +120,17 @@ export function projectApplicationHistory(history: readonly AgentInputItem[]): A
     }
   }
 
-  const completePairs: Array<readonly [callIndex: number, resultIndex: number]> = [];
+  const completePairs: CompletePlaywrightCliPair[] = [];
+  const completePairByCallIndex = new Map<number, CompletePlaywrightCliPair>();
   for (const [callId, callIndexes] of callsById) {
     if (callIndexes.length !== 1) continue;
     const callIndex = callIndexes[0]!;
     const followingResults = (completedResultsById.get(callId) ?? [])
       .filter((resultIndex) => resultIndex > callIndex);
     if (followingResults.length !== 1) continue;
-    completePairs.push([callIndex, followingResults[0]!]);
+    const pair = [callIndex, followingResults[0]!] as const;
+    completePairs.push(pair);
+    completePairByCallIndex.set(callIndex, pair);
   }
   completePairs.sort((left, right) => left[1] - right[1]);
 
@@ -74,7 +144,8 @@ export function projectApplicationHistory(history: readonly AgentInputItem[]): A
   const includedIndexes = new Set<number>();
   const serializedBytes: number[] = [];
   let includedItemBytes = 0;
-  for (const [index, item] of history.entries()) {
+  for (let index = projectionStartIndex; index < history.length; index += 1) {
+    const item = history[index]!;
     const serialized = JSON.stringify(item);
     if (serialized === undefined) throw new ApplicationHistoryProjectionError();
     const itemBytes = Buffer.byteLength(serialized);
@@ -85,7 +156,31 @@ export function projectApplicationHistory(history: readonly AgentInputItem[]): A
     }
   }
 
-  let pruned = includedIndexes.size !== history.length;
+  const removeIncludedIndex = (index: number): void => {
+    if (includedIndexes.delete(index)) {
+      includedItemBytes -= serializedBytes[index - projectionStartIndex]!;
+    }
+  };
+  const removeNativeGroup = (group: NativeHistoryGroup): void => {
+    for (const index of group.memberIndexes) removeIncludedIndex(index);
+    for (const callIndex of group.playwrightCliCallIndexes) {
+      const pair = completePairByCallIndex.get(callIndex);
+      if (pair !== undefined) removeIncludedIndex(pair[1]);
+    }
+  };
+
+  for (const group of nativeGroups) {
+    let retainGroup = true;
+    for (const callIndex of group.playwrightCliCallIndexes) {
+      if (!retainedPlaywrightCliIndexes.has(callIndex)) {
+        retainGroup = false;
+        break;
+      }
+    }
+    if (!retainGroup) removeNativeGroup(group);
+  }
+
+  let pruned = includedIndexes.size !== history.length - projectionStartIndex;
   const serializedNotice = JSON.stringify(APPLICATION_HISTORY_PRUNED_NOTICE);
   const noticeBytes = Buffer.byteLength(serializedNotice);
   let projectedBytes = 2
@@ -99,9 +194,13 @@ export function projectApplicationHistory(history: readonly AgentInputItem[]): A
       pruned = true;
       projectedBytes += noticeBytes + (includedIndexes.size === 0 ? 0 : 1);
     }
-    includedIndexes.delete(callIndex);
-    includedIndexes.delete(resultIndex);
-    includedItemBytes -= serializedBytes[callIndex]! + serializedBytes[resultIndex]!;
+    const nativeGroup = nativeGroupByPlaywrightCliCallIndex.get(callIndex);
+    if (nativeGroup === undefined) {
+      removeIncludedIndex(callIndex);
+      removeIncludedIndex(resultIndex);
+    } else {
+      removeNativeGroup(nativeGroup);
+    }
     projectedBytes = 2
       + includedItemBytes
       + Math.max(0, includedIndexes.size - 1)
