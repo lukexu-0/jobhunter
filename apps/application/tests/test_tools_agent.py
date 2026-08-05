@@ -653,7 +653,7 @@ async def test_manual_review_after_cancellation_returns_terminal_json() -> None:
 
 
 @pytest.mark.asyncio
-async def test_additional_info_gate_redacts_public_questions_and_persists_original_values(
+async def test_additional_info_gate_publishes_complete_questions_and_persists_redacted_source(
     tmp_path: Path,
 ) -> None:
     store = UserInfoStore(tmp_path / "user-info.json")
@@ -694,9 +694,13 @@ async def test_additional_info_gate_redacts_public_questions_and_persists_origin
     )
     public_questions = detail["questions"]
     assert isinstance(public_questions, list)
-    assert public_questions[0].question == "When is [redacted] available?"
-    assert public_questions[1].options[0].label == "[redacted] choice"
-    assert public_questions[1].options[1].label == "[redacted] choice"
+    assert public_questions[0].question == "When is Ada Secret-Value available?"
+    assert public_questions[1].question == "Who referred private-person@example.test?"
+    assert public_questions[1].options[0].label == "Ada Secret-Value choice"
+    assert (
+        public_questions[1].options[1].label
+        == "private-person@example.test choice"
+    )
     assert [option.id for option in public_questions[1].options] == [
         "name",
         "email",
