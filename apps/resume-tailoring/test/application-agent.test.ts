@@ -6,6 +6,7 @@ import {
   Agent,
   RunContext,
   ToolCallError,
+  type AgentInputItem,
   type Model,
   type ModelProvider,
   type Tool,
@@ -32,6 +33,7 @@ import {
 } from "../src/api/application-agent-routes.ts";
 import {
   AgentDeadlineError,
+  MAX_AGENT_TRANSCRIPT_BYTES,
   type AgentRunner,
   type AgentRunOptions,
 } from "../src/agents/runner.ts";
@@ -407,6 +409,72 @@ describe("application agent", () => {
         newItems: [],
         finalOutput: "x".repeat(transcriptByteCap + 1),
       }),
+    );
+
+    await expect(runApplicationAgent(
+      RUN_INPUT,
+      new AbortController().signal,
+      dependencies,
+    )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+  });
+
+  test("omits an oversized transient screenshot but still appends a small screenshot", async () => {
+    const projectedInput = [{
+      role: "user",
+      content: [{
+        type: "input_text",
+        text: "The application form has a name field and a résumé upload.",
+      }],
+    }] satisfies AgentInputItem[];
+    const smallScreenshotDataUrl = "data:image/png;base64,cHJl";
+    const dependencies = dependenciesWith(
+      async () => {
+        throw new Error("runtime actions must not run");
+      },
+      async (agent, _input, options) => {
+        const context = options.context;
+        if (context === undefined) {
+          throw new Error("application context is required");
+        }
+        const callModelInputFilter = options.callModelInputFilter;
+        if (callModelInputFilter === undefined) {
+          throw new Error("application input filter is required");
+        }
+        context.latestScreenshotDataUrl =
+          `data:image/png;base64,${"A".repeat(MAX_AGENT_TRANSCRIPT_BYTES)}`;
+        const oversizedFiltered = await callModelInputFilter({
+          agent: agent as unknown as Parameters<typeof callModelInputFilter>[0]["agent"],
+          context,
+          modelData: { input: projectedInput },
+        });
+        expect(oversizedFiltered.input).toEqual(projectedInput);
+        expect(oversizedFiltered.input).not.toContainEqual({
+          role: "user",
+          content: [expect.objectContaining({ type: "input_image" })],
+        });
+        expect(Buffer.byteLength(JSON.stringify(oversizedFiltered.input))).toBeLessThanOrEqual(
+          MAX_AGENT_TRANSCRIPT_BYTES,
+        );
+
+        context.latestScreenshotDataUrl = smallScreenshotDataUrl;
+        const smallFiltered = await callModelInputFilter({
+          agent: agent as unknown as Parameters<typeof callModelInputFilter>[0]["agent"],
+          context,
+          modelData: { input: projectedInput },
+        });
+        expect(smallFiltered.input).toEqual([
+          ...projectedInput,
+          {
+            role: "user",
+            content: [{ type: "input_image", image: smallScreenshotDataUrl }],
+          },
+        ]);
+        expect(smallFiltered.input.at(-1)).toEqual({
+          role: "user",
+          content: [{ type: "input_image", image: smallScreenshotDataUrl }],
+        });
+        return { history: [null] };
+      },
     );
 
     await expect(runApplicationAgent(

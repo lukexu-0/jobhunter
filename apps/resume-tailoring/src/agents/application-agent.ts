@@ -39,6 +39,7 @@ import {
   AgentDeadlineError,
   assertBoundedTranscript,
   boundedJson,
+  MAX_AGENT_TRANSCRIPT_BYTES,
   createAttemptRunner,
   runWithDeadline,
   type AgentRuntimeDependencies,
@@ -859,12 +860,30 @@ async function runApplicationAgentWithProfile(
       throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
     }
     const screenshot = filterContext?.latestScreenshotDataUrl;
-    if (screenshot === undefined) return { ...modelData, input: projected };
+    if (
+      screenshot === undefined
+      || Buffer.byteLength(screenshot, "utf8") > MAX_AGENT_TRANSCRIPT_BYTES
+    ) {
+      return { ...modelData, input: projected };
+    }
     const transientImage: AgentInputItem = {
       role: "user",
       content: [{ type: "input_image", image: screenshot }],
     };
-    return { ...modelData, input: [...projected, transientImage] };
+    const candidateInput = [...projected, transientImage];
+    const transcriptLabel = "application agent model input";
+    try {
+      boundedJson(candidateInput, transcriptLabel, MAX_AGENT_TRANSCRIPT_BYTES);
+    } catch (error) {
+      if (
+        error instanceof Error
+        && error.message === `${transcriptLabel} exceeds ${MAX_AGENT_TRANSCRIPT_BYTES} bytes`
+      ) {
+        return { ...modelData, input: projected };
+      }
+      throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+    }
+    return { ...modelData, input: candidateInput };
   };
 
   const agent = new Agent<BrowserApplicationContext, "text">({
