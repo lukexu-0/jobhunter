@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthRouteService } from "../src/api/auth-routes.ts";
 import type { ApplicationAgentRouteService } from "../src/agents/application-agent-service.ts";
 import {
   createPipelineApplication,
+  type PipelineApplication,
   type PipelineApplicationOptions,
   type PipelineApplicationSessionService,
   type PipelineWorkerHandle,
@@ -32,6 +33,7 @@ const WEB_ORIGIN = "http://127.0.0.1:3456";
 const JOB_URL = "https://jobs.example.test/platform";
 const JOB_DESCRIPTION = "Platform Engineer\n\nBuild and maintain a reliable TypeScript platform for job seekers.";
 const HARNESS_TOKEN = "bootstrap-harness-token-0123456789abcdef";
+const MIGRATED_RUN_ID = "11111111-1111-4111-8111-111111111111";
 const fixtures: string[] = [];
 
 afterEach(() => {
@@ -46,6 +48,7 @@ interface IngestionOverrides {
   readonly applicationSessions?: PipelineApplicationSessionService;
   readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
   readonly webOrigin?: string;
+  readonly artifactRoot?: string;
   readonly injectPipelineDatabase?: boolean;
   readonly beforeApplication?: (
     repository: PipelineRepository,
@@ -59,7 +62,8 @@ interface IngestionOverrides {
 function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {}) {
   const pipelineDatabase = openPipelineDatabase(":memory:");
   const contextDatabase = openContextDatabase(":memory:");
-  const artifactRoot = join(mkdtempSync(join(tmpdir(), "pipeline-bootstrap-")), "runs");
+  const artifactRoot = ingestion.artifactRoot
+    ?? join(mkdtempSync(join(tmpdir(), "pipeline-bootstrap-")), "runs");
   fixtures.push(join(artifactRoot, ".."));
   const calls = {
     kick: 0,
@@ -173,6 +177,146 @@ function mutation(path: string, body: object, origin = WEB_ORIGIN): Request {
 }
 
 describe("pipeline application bootstrap", () => {
+  test("imports a launcher-supplied prior numeric root into a custom artifact root", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pipeline-bootstrap-migration-"));
+    fixtures.push(root);
+    const priorRoot = join(root, "checkout-runs");
+    const namespaceRoot = join(root, "runtime");
+    const pipelineDatabasePath = join(namespaceRoot, "pipeline.sqlite");
+    const artifactRoot = join(namespaceRoot, "runs");
+    const originalPath = join(priorRoot, "1", "input", "job-description.txt");
+    const relocatedPath = join(artifactRoot, "1", "input", "job-description.txt");
+    mkdirSync(join(priorRoot, "1", "input"), { recursive: true });
+    mkdirSync(namespaceRoot, { mode: 0o700 });
+    writeFileSync(originalPath, "job");
+    const receiptPath = join(namespaceRoot, ".artifact-import.pending");
+    writeFileSync(receiptPath, `${JSON.stringify({
+      version: 1,
+      priorRoot,
+      pipelineDatabase: pipelineDatabasePath,
+      artifactRoot,
+    })}\n`, { mode: 0o600 });
+    const previousPriorRoot = process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+    const previousReceipt = process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT;
+    const previousPipelineDatabase = process.env.JOBHUNTER_PIPELINE_DATABASE;
+    process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = priorRoot;
+    process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT = receiptPath;
+    process.env.JOBHUNTER_PIPELINE_DATABASE = pipelineDatabasePath;
+    let application: PipelineApplication | undefined;
+    try {
+      const fixture = createFixture(false, {
+        artifactRoot,
+        beforeApplication: (repository, database) => {
+          repository.createRun("job", MIGRATED_RUN_ID);
+          database.query(
+            "INSERT INTO artifacts(id,run_id,revision,attempt_id,stage,kind,sha256,path,byte_size,created_at) VALUES (?,?,1,'','input','job-description',?,?,3,1)",
+          ).run("artifact:migrated", MIGRATED_RUN_ID, "a".repeat(64), originalPath);
+        },
+      });
+      application = fixture.app;
+
+      expect(readFileSync(relocatedPath, "utf8")).toBe("job");
+      expect(existsSync(join(priorRoot, "1"))).toBe(false);
+      expect(
+        fixture.pipelineDatabase.query<{ path: string }, [string]>(
+          "SELECT path FROM artifacts WHERE run_id=?",
+        ).get(MIGRATED_RUN_ID)?.path,
+      ).toBe(relocatedPath);
+    } finally {
+      if (previousPriorRoot === undefined) delete process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+      else process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = previousPriorRoot;
+      if (previousReceipt === undefined) delete process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT;
+      else process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT = previousReceipt;
+      if (previousPipelineDatabase === undefined) delete process.env.JOBHUNTER_PIPELINE_DATABASE;
+      else process.env.JOBHUNTER_PIPELINE_DATABASE = previousPipelineDatabase;
+      if (application !== undefined) await application.close();
+    }
+  });
+
+  test("rejects a non-absolute prior artifact root at the bootstrap boundary", () => {
+    const previousPriorRoot = process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+    process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = "checkout-runs";
+    try {
+      expect(() => createPipelineApplication({
+        webOrigin: WEB_ORIGIN,
+        browserHarnessToken: HARNESS_TOKEN,
+      })).toThrow("JOBHUNTER_PRIOR_ARTIFACT_ROOT must be an absolute canonical path");
+    } finally {
+      if (previousPriorRoot === undefined) delete process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+      else process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = previousPriorRoot;
+    }
+  });
+
+  test("rejects a prior artifact root without its matching launcher receipt", () => {
+    const root = mkdtempSync(join(tmpdir(), "pipeline-bootstrap-receipt-"));
+    fixtures.push(root);
+    const priorRoot = join(root, "checkout-runs");
+    const namespaceRoot = join(root, "runtime");
+    const pipelineDatabasePath = join(namespaceRoot, "pipeline.sqlite");
+    const artifactRoot = join(namespaceRoot, "runs");
+    mkdirSync(namespaceRoot, { mode: 0o700 });
+    const receiptPath = join(namespaceRoot, ".artifact-import.pending");
+    writeFileSync(receiptPath, `${JSON.stringify({
+      version: 1,
+      priorRoot: join(root, "different-runs"),
+      pipelineDatabase: pipelineDatabasePath,
+      artifactRoot,
+    })}\n`, { mode: 0o600 });
+    const previousPriorRoot = process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+    const previousReceipt = process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT;
+    const previousPipelineDatabase = process.env.JOBHUNTER_PIPELINE_DATABASE;
+    process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = priorRoot;
+    process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT = receiptPath;
+    process.env.JOBHUNTER_PIPELINE_DATABASE = pipelineDatabasePath;
+
+    try {
+      expect(() => createFixture(false, { artifactRoot }))
+        .toThrow("Artifact migration receipt does not match the managed storage paths");
+    } finally {
+      if (previousPriorRoot === undefined) delete process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+      else process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = previousPriorRoot;
+      if (previousReceipt === undefined) delete process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT;
+      else process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT = previousReceipt;
+      if (previousPipelineDatabase === undefined) delete process.env.JOBHUNTER_PIPELINE_DATABASE;
+      else process.env.JOBHUNTER_PIPELINE_DATABASE = previousPipelineDatabase;
+    }
+  });
+
+  test("rejects a matching receipt outside the managed storage namespace", () => {
+    const root = mkdtempSync(join(tmpdir(), "pipeline-bootstrap-forged-receipt-"));
+    fixtures.push(root);
+    const priorRoot = join(root, "checkout-runs");
+    const namespaceRoot = join(root, "runtime");
+    const pipelineDatabasePath = join(namespaceRoot, "pipeline.sqlite");
+    const artifactRoot = join(namespaceRoot, "runs");
+    mkdirSync(namespaceRoot, { mode: 0o700 });
+    const receiptPath = join(root, ".artifact-import.pending");
+    writeFileSync(receiptPath, `${JSON.stringify({
+      version: 1,
+      priorRoot,
+      pipelineDatabase: pipelineDatabasePath,
+      artifactRoot,
+    })}\n`, { mode: 0o600 });
+    const previousPriorRoot = process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+    const previousReceipt = process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT;
+    const previousPipelineDatabase = process.env.JOBHUNTER_PIPELINE_DATABASE;
+    process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = priorRoot;
+    process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT = receiptPath;
+    process.env.JOBHUNTER_PIPELINE_DATABASE = pipelineDatabasePath;
+
+    try {
+      expect(() => createFixture(false, { artifactRoot }))
+        .toThrow("Artifact migration receipt must be in the managed storage namespace");
+    } finally {
+      if (previousPriorRoot === undefined) delete process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+      else process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT = previousPriorRoot;
+      if (previousReceipt === undefined) delete process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT;
+      else process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT = previousReceipt;
+      if (previousPipelineDatabase === undefined) delete process.env.JOBHUNTER_PIPELINE_DATABASE;
+      else process.env.JOBHUNTER_PIPELINE_DATABASE = previousPipelineDatabase;
+    }
+  });
+
   test("import and factory construction leave external work idle while health stays no-store", async () => {
     const fixture = createFixture();
     expect(fixture.calls.kick).toBe(0);
