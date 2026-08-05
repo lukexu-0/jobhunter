@@ -702,11 +702,17 @@ describe("application agent", () => {
           const browser = functionTool(agent, "playwright_cli");
           const signIn = functionTool(agent, "request_sign_in");
           const review = functionTool(agent, "request_human_review");
-          const signInParameters = {
-            username_ref: "f2e248",
-            password_ref: "f2e255",
-            submit_ref: "f2e261",
-          };
+          const signInParameters = status === "attempted"
+            ? {
+                username_ref: "f2e248",
+                password_ref: "f2e255",
+                submit_ref: "f2e261",
+              }
+            : {
+                username_ref: "ref=f2e248",
+                password_ref: "ref=f2e255",
+                submit_ref: "ref=f2e261",
+              };
           const canonicalSignInParameters = {
             username_ref: "f2e248",
             password_ref: "f2e255",
