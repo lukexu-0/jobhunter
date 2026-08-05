@@ -214,9 +214,6 @@ export function RunIdentityLink({
       <KindIcon className="application-kind-icon" aria-hidden="true" />
       {title ? (
         <span className="application-link__label">
-          {presentation.visibleKindLabel ? (
-            <span className="table-muted">{presentation.visibleKindLabel} · </span>
-          ) : null}
           {title}
         </span>
       ) : (

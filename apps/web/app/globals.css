@@ -886,11 +886,6 @@ a {
   text-underline-offset: var(--space-1);
 }
 
-.table-muted {
-  color: var(--color-faint);
-  font-size: var(--font-size-xs);
-  font-weight: 400;
-}
 
 .table-placeholder-line {
   display: inline-block;

@@ -54,7 +54,6 @@ describe("opportunity-kind presentation", () => {
     const job = opportunityPresentation("job");
     expect(job).toMatchObject({
       detailKindLabel: "Job",
-      visibleKindLabel: null,
       summaryLabel: "Application summary and keyword comparison",
       titleFallback: "Application",
       organizationFallback: "Organization unavailable",
@@ -68,7 +67,6 @@ describe("opportunity-kind presentation", () => {
     for (const kind of OpportunityKindSchema.options) {
       if (kind === "job") continue;
       const presentation = opportunityPresentation(kind);
-      expect(presentation.visibleKindLabel).not.toBeNull();
       expect(presentation.summaryLabel).not.toBe(job.summaryLabel);
       expect(presentation.titleFallback).not.toBe(job.titleFallback);
       expect(presentation.organizationFallback).not.toBe(job.organizationFallback);
@@ -88,7 +86,12 @@ describe("opportunity-kind presentation", () => {
       const dashboardMarkup = renderToStaticMarkup(
         <RunIdentityLink identity={{}} run={kindRun} />,
       );
-
+      const expectedTitle = opportunityPresentation(kind).dashboardTitleFallback;
+      if (expectedTitle) {
+        expect(dashboardMarkup).toContain(expectedTitle);
+      }
+      expect(dashboardMarkup).not.toContain(`${opportunityPresentation(kind).detailKindLabel} · `);
+      expect(dashboardMarkup).not.toContain(`${opportunityPresentation(kind).detailKindLabel}. `);
       for (const markup of [detailMarkup, dashboardMarkup]) {
         expect(markup.match(/<svg\b[^>]*aria-hidden="true"[^>]*>/g)).toHaveLength(1);
       }
@@ -116,8 +119,9 @@ describe("opportunity-kind presentation", () => {
     expect(detailMarkup).toContain('rel="noreferrer"');
     expect(detailMarkup).not.toContain("View job posting");
 
-    expect(dashboardMarkup).toContain("Event · ");
     expect(dashboardMarkup).toContain("Details unavailable");
+    expect(dashboardMarkup).not.toContain("Event · ");
+    expect(dashboardMarkup).not.toContain("Event. ");
     expect(dashboardMarkup).toContain('aria-label="Open event Details unavailable event-run"');
     expect(dashboardMarkup).not.toContain("Open application");
   });

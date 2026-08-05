@@ -229,19 +229,19 @@ test("shows a decorative mapped kind icon beside every populated application tit
     {
       kind: "hackathon",
       title: "Build Sprint",
-      visibleTitle: "Hackathon · Build Sprint",
+      visibleTitle: "Build Sprint",
       accessibleName: "Open hackathon Build Sprint hackatho…-run",
     },
     {
       kind: "competition",
       title: "Data Challenge",
-      visibleTitle: "Competition · Data Challenge",
+      visibleTitle: "Data Challenge",
       accessibleName: "Open competition Data Challenge competit…-run",
     },
     {
       kind: "event",
       title: "Career Fair",
-      visibleTitle: "Event · Career Fair",
+      visibleTitle: "Career Fair",
       accessibleName: "Open event Career Fair event-ki…-run",
     },
   ] as const;
@@ -266,6 +266,10 @@ test("shows a decorative mapped kind icon beside every populated application tit
     const icon = link.locator("svg");
     await expect(link).toHaveAttribute("aria-label", accessibleName);
     await expect(label).toHaveText(visibleTitle);
+    for (const prefix of ["Job", "Hackathon", "Competition", "Event"]) {
+      await expect(label).not.toContainText(`${prefix} ·`);
+      await expect(label).not.toContainText(`${prefix}. `);
+    }
     await expect(icon).toHaveCount(1);
     await expect(icon).toHaveAttribute("aria-hidden", "true");
     await expect(icon).toHaveCSS("color", "rgb(210, 243, 76)");

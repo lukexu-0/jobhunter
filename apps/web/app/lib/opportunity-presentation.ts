@@ -9,7 +9,6 @@ import {
 
 export interface OpportunityPresentation {
   readonly icon: LucideIcon;
-  readonly visibleKindLabel: string | null;
   readonly detailKindLabel: string;
   readonly summaryLabel: string;
   readonly titleFallback: string;
@@ -25,7 +24,6 @@ export const OPPORTUNITY_PRESENTATION = {
   job: {
     icon: Briefcase,
     detailKindLabel: "Job",
-    visibleKindLabel: null,
     summaryLabel: "Application summary and keyword comparison",
     titleFallback: "Application",
     organizationFallback: "Organization unavailable",
@@ -37,7 +35,6 @@ export const OPPORTUNITY_PRESENTATION = {
   },
   hackathon: {
     icon: Code2,
-    visibleKindLabel: "Hackathon",
     detailKindLabel: "Hackathon",
     summaryLabel: "Hackathon summary and keyword comparison",
     titleFallback: "Hackathon",
@@ -50,7 +47,6 @@ export const OPPORTUNITY_PRESENTATION = {
   },
   competition: {
     icon: Trophy,
-    visibleKindLabel: "Competition",
     detailKindLabel: "Competition",
     summaryLabel: "Competition summary and keyword comparison",
     titleFallback: "Competition",
@@ -63,7 +59,6 @@ export const OPPORTUNITY_PRESENTATION = {
   },
   event: {
     icon: CalendarDays,
-    visibleKindLabel: "Event",
     detailKindLabel: "Event",
     summaryLabel: "Event summary and keyword comparison",
     titleFallback: "Event",
