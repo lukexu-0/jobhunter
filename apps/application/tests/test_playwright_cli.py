@@ -3173,10 +3173,9 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     assert json.dumps(username) in payload_scripts[0]
     assert json.dumps(password) in payload_scripts[0]
     assert "const expectedOrigin=\"https://example.com\"" in payload_scripts[0]
-    origin_check = (
-        "await page.evaluate(()=>location.origin)!==expectedOrigin"
-    )
+    origin_check = "new URL(page.url()).origin!==expectedOrigin"
     assert payload_scripts[0].count(origin_check) == 2
+    assert "page.evaluate(()=>location.origin)" not in payload_scripts[0]
     assert payload_scripts[0].count(".elementHandle()") == 3
     assert payload_scripts[0].index(
         "const submitElement="
@@ -3187,10 +3186,11 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     control_origin_check = (
         "const controlOrigins=await Promise.all("
         "[usernameElement,passwordElement,submitElement].map("
-        "(element)=>element.evaluate("
-        "(node)=>node.ownerDocument.location.origin)));"
+        "async(element)=>{const frame=await element.ownerFrame();"
+        "return frame===null?null:new URL(frame.url()).origin;}));"
     )
     assert control_origin_check in payload_scripts[0]
+    assert "ownerDocument.location.origin" not in payload_scripts[0]
     rejected_control_origin = (
         "if(controlOrigins.some((origin)=>origin!==expectedOrigin))"
         "throw new Error('Unexpected sign-in control origin');"
