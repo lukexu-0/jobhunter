@@ -203,6 +203,7 @@ export function RunIdentityLink({
   readonly run: Pick<RunDto, "id" | "opportunityKind">;
 }) {
   const presentation = opportunityPresentation(run.opportunityKind);
+  const KindIcon = presentation.icon;
   const title = identity.title ?? presentation.dashboardTitleFallback;
   const accessibleName = title
     ? `${presentation.openNamedPrefix} ${title} ${shortRunId(run.id)}`
@@ -210,11 +211,9 @@ export function RunIdentityLink({
 
   return (
     <Link className="application-link" href={`/runs/${encodeURIComponent(run.id)}`} aria-label={accessibleName}>
+      <KindIcon className="application-kind-icon" aria-hidden="true" />
       {title ? (
-        <span>
-          {presentation.visibleKindLabel ? (
-            <span className="table-muted">{presentation.visibleKindLabel} · </span>
-          ) : null}
+        <span className="application-link__label">
           {title}
         </span>
       ) : (

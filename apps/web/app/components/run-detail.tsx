@@ -181,18 +181,22 @@ export function RunIdentitySummary({
   >;
 }) {
   const presentation = opportunityPresentation(run.opportunityKind);
+  const KindIcon = presentation.icon;
   const title = run.titleOverride ?? identity?.title ?? presentation.titleFallback;
   const subtitle =
     run.organizationOverride ?? identity?.organization ?? presentation.organizationFallback;
 
   return (
     <section className={styles.paneSection}>
-      {presentation.visibleKindLabel ? (
-        <p className={styles.eyebrow}>{presentation.visibleKindLabel}</p>
-      ) : null}
-      <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>
-        {APPLICATION_STATUS_LABELS[run.applicationStatus]}
-      </p>
+      <div className={styles.identityStatusRow}>
+        <p className={`${styles.eyebrow} ${styles.opportunityKind}`}>
+          <KindIcon className={styles.icon} aria-hidden="true" />
+          {presentation.detailKindLabel}
+        </p>
+        <p className={`${styles.applicationBadge} ${styles[`applicationBadge--${run.applicationStatus}`]}`}>
+          {APPLICATION_STATUS_LABELS[run.applicationStatus]}
+        </p>
+      </div>
       <h1 className={styles.runTitle}>{title}</h1>
       <p className={styles.runSubtitle}>{subtitle}</p>
       {run.jobUrl ? (

@@ -218,6 +218,73 @@ test("insets application titles from the left table edge", async ({ page }) => {
   expect(linkBox.x - tableBox.x).toBeCloseTo(16, 0);
 });
 
+test("shows a decorative mapped kind icon beside every populated application title", async ({ page }) => {
+  const kinds = [
+    {
+      kind: "job",
+      title: "Backend Engineer",
+      visibleTitle: "Backend Engineer",
+      accessibleName: "Open Backend Engineer job-kind-run",
+    },
+    {
+      kind: "hackathon",
+      title: "Build Sprint",
+      visibleTitle: "Build Sprint",
+      accessibleName: "Open hackathon Build Sprint hackatho…-run",
+    },
+    {
+      kind: "competition",
+      title: "Data Challenge",
+      visibleTitle: "Data Challenge",
+      accessibleName: "Open competition Data Challenge competit…-run",
+    },
+    {
+      kind: "event",
+      title: "Career Fair",
+      visibleTitle: "Career Fair",
+      accessibleName: "Open event Career Fair event-ki…-run",
+    },
+  ] as const;
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        runs: kinds.map(({ kind, title }) => ({
+          ...runFixture(),
+          id: `${kind}-kind-run`,
+          opportunityKind: kind,
+          titleOverride: title,
+        })),
+      }),
+    });
+  });
+  await page.goto("/");
+
+  for (const { accessibleName, visibleTitle } of kinds) {
+    const link = page.getByRole("link", { name: accessibleName, exact: true });
+    const label = link.locator(".application-link__label");
+    const icon = link.locator("svg");
+    await expect(link).toHaveAttribute("aria-label", accessibleName);
+    await expect(label).toHaveText(visibleTitle);
+    for (const prefix of ["Job", "Hackathon", "Competition", "Event"]) {
+      await expect(label).not.toContainText(`${prefix} ·`);
+      await expect(label).not.toContainText(`${prefix}. `);
+    }
+    await expect(icon).toHaveCount(1);
+    await expect(icon).toHaveAttribute("aria-hidden", "true");
+    await expect(icon).toHaveCSS("color", "rgb(210, 243, 76)");
+
+    const [iconBox, labelBox] = await Promise.all([
+      icon.boundingBox(),
+      label.boundingBox(),
+    ]);
+    if (!iconBox || !labelBox) throw new Error("Application kind icon geometry is unavailable");
+    const iconCenter = iconBox.y + iconBox.height / 2;
+    const labelCenter = labelBox.y + labelBox.height / 2;
+    expect(Math.abs(iconCenter - labelCenter)).toBeLessThanOrEqual(1);
+  }
+});
+
 test("renders updated dates in white", async ({ page }) => {
   await interceptAnalyzedRun(page);
   await page.goto("/");

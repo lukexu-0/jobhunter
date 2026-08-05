@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { Briefcase, CalendarDays, Code2, Trophy } from "lucide-react";
 import {
   OpportunityKindSchema,
   type RunDto,
@@ -10,6 +11,13 @@ import {
   OPPORTUNITY_PRESENTATION,
   opportunityPresentation,
 } from "../app/lib/opportunity-presentation";
+
+const EXPECTED_ICONS = {
+  job: Briefcase,
+  hackathon: Code2,
+  competition: Trophy,
+  event: CalendarDays,
+} as const;
 
 function run(opportunityKind: RunDto["opportunityKind"]): RunDto {
   return {
@@ -34,14 +42,18 @@ function run(opportunityKind: RunDto["opportunityKind"]): RunDto {
 }
 
 describe("opportunity-kind presentation", () => {
-  test("exhaustively defines distinct non-job presentation copy", () => {
+  test("exhaustively defines opportunity presentation copy", () => {
     expect(Object.keys(OPPORTUNITY_PRESENTATION).sort()).toEqual(
       [...OpportunityKindSchema.options].sort(),
     );
 
+    for (const kind of OpportunityKindSchema.options) {
+      expect(opportunityPresentation(kind).icon).toBe(EXPECTED_ICONS[kind]);
+    }
+
     const job = opportunityPresentation("job");
     expect(job).toMatchObject({
-      visibleKindLabel: null,
+      detailKindLabel: "Job",
       summaryLabel: "Application summary and keyword comparison",
       titleFallback: "Application",
       organizationFallback: "Organization unavailable",
@@ -55,7 +67,6 @@ describe("opportunity-kind presentation", () => {
     for (const kind of OpportunityKindSchema.options) {
       if (kind === "job") continue;
       const presentation = opportunityPresentation(kind);
-      expect(presentation.visibleKindLabel).not.toBeNull();
       expect(presentation.summaryLabel).not.toBe(job.summaryLabel);
       expect(presentation.titleFallback).not.toBe(job.titleFallback);
       expect(presentation.organizationFallback).not.toBe(job.organizationFallback);
@@ -63,6 +74,27 @@ describe("opportunity-kind presentation", () => {
       expect(presentation.openNamedPrefix).not.toBe(job.openNamedPrefix);
       expect(presentation.dashboardTitleFallback).not.toBeNull();
       expect(presentation.dashboardOrganizationFallback).not.toBeNull();
+    }
+  });
+
+  test("renders one decorative mapped icon on both identity surfaces for every kind", () => {
+    for (const kind of OpportunityKindSchema.options) {
+      const kindRun = run(kind);
+      const detailMarkup = renderToStaticMarkup(
+        <RunIdentitySummary identity={null} run={kindRun} />,
+      );
+      const dashboardMarkup = renderToStaticMarkup(
+        <RunIdentityLink identity={{}} run={kindRun} />,
+      );
+      const expectedTitle = opportunityPresentation(kind).dashboardTitleFallback;
+      if (expectedTitle) {
+        expect(dashboardMarkup).toContain(expectedTitle);
+      }
+      expect(dashboardMarkup).not.toContain(`${opportunityPresentation(kind).detailKindLabel} · `);
+      expect(dashboardMarkup).not.toContain(`${opportunityPresentation(kind).detailKindLabel}. `);
+      for (const markup of [detailMarkup, dashboardMarkup]) {
+        expect(markup.match(/<svg\b[^>]*aria-hidden="true"[^>]*>/g)).toHaveLength(1);
+      }
     }
   });
 
@@ -78,7 +110,7 @@ describe("opportunity-kind presentation", () => {
     expect(opportunityPresentation(eventRun.opportunityKind).summaryLabel).toBe(
       "Event summary and keyword comparison",
     );
-    expect(detailMarkup).toContain(">Event</p>");
+    expect(detailMarkup).toContain("Event</p>");
     expect(detailMarkup).toContain(">Event</h1>");
     expect(detailMarkup).toContain("Organizer unavailable");
     expect(detailMarkup).toContain("View event details");
@@ -87,8 +119,9 @@ describe("opportunity-kind presentation", () => {
     expect(detailMarkup).toContain('rel="noreferrer"');
     expect(detailMarkup).not.toContain("View job posting");
 
-    expect(dashboardMarkup).toContain("Event · ");
     expect(dashboardMarkup).toContain("Details unavailable");
+    expect(dashboardMarkup).not.toContain("Event · ");
+    expect(dashboardMarkup).not.toContain("Event. ");
     expect(dashboardMarkup).toContain('aria-label="Open event Details unavailable event-run"');
     expect(dashboardMarkup).not.toContain("Open application");
   });
@@ -109,7 +142,7 @@ describe("opportunity-kind presentation", () => {
     expect(detailMarkup).toContain("Platform Engineer");
     expect(detailMarkup).toContain("Example Labs");
     expect(detailMarkup).toContain("View job posting");
-    expect(detailMarkup).not.toContain(">Job</p>");
+    expect(detailMarkup).toContain("Job</p>");
     expect(dashboardMarkup).toContain('aria-label="Open Platform Engineer job-run"');
     expect(dashboardMarkup).not.toContain("Job · ");
   });

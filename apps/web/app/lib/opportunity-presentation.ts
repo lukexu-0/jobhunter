@@ -1,7 +1,15 @@
 import type { OpportunityKind } from "@jobhunter/pipeline/contracts";
+import {
+  Briefcase,
+  CalendarDays,
+  Code2,
+  Trophy,
+  type LucideIcon,
+} from "lucide-react";
 
 export interface OpportunityPresentation {
-  readonly visibleKindLabel: string | null;
+  readonly icon: LucideIcon;
+  readonly detailKindLabel: string;
   readonly summaryLabel: string;
   readonly titleFallback: string;
   readonly organizationFallback: string;
@@ -14,7 +22,8 @@ export interface OpportunityPresentation {
 
 export const OPPORTUNITY_PRESENTATION = {
   job: {
-    visibleKindLabel: null,
+    icon: Briefcase,
+    detailKindLabel: "Job",
     summaryLabel: "Application summary and keyword comparison",
     titleFallback: "Application",
     organizationFallback: "Organization unavailable",
@@ -25,7 +34,8 @@ export const OPPORTUNITY_PRESENTATION = {
     dashboardOrganizationFallback: null,
   },
   hackathon: {
-    visibleKindLabel: "Hackathon",
+    icon: Code2,
+    detailKindLabel: "Hackathon",
     summaryLabel: "Hackathon summary and keyword comparison",
     titleFallback: "Hackathon",
     organizationFallback: "Organizer unavailable",
@@ -36,7 +46,8 @@ export const OPPORTUNITY_PRESENTATION = {
     dashboardOrganizationFallback: "Organizer unavailable",
   },
   competition: {
-    visibleKindLabel: "Competition",
+    icon: Trophy,
+    detailKindLabel: "Competition",
     summaryLabel: "Competition summary and keyword comparison",
     titleFallback: "Competition",
     organizationFallback: "Organizer unavailable",
@@ -47,7 +58,8 @@ export const OPPORTUNITY_PRESENTATION = {
     dashboardOrganizationFallback: "Organizer unavailable",
   },
   event: {
-    visibleKindLabel: "Event",
+    icon: CalendarDays,
+    detailKindLabel: "Event",
     summaryLabel: "Event summary and keyword comparison",
     titleFallback: "Event",
     organizationFallback: "Organizer unavailable",

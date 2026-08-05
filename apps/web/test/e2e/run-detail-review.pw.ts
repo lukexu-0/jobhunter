@@ -852,6 +852,39 @@ function approvedIterations(): ResumeIterationListResponse {
   );
 }
 
+test("shows opportunity kind in white beside application status", async ({ page }) => {
+  await installPipeline(page, {
+    run: { ...runFixture(), opportunityKind: "hackathon" },
+  });
+  await page.goto(`/runs/${runId}`);
+
+  const summary = page.getByRole("complementary", {
+    name: "Hackathon summary and keyword comparison",
+  });
+  const kind = summary.locator("p", { hasText: "Hackathon" });
+  const icon = kind.locator("svg");
+  const status = summary.getByText("Pending", { exact: true });
+  await expect(kind).toHaveCSS("color", "rgb(238, 241, 236)");
+  await expect(icon).toHaveCount(1);
+  await expect(icon).toHaveAttribute("aria-hidden", "true");
+  await expect(icon).toHaveCSS("color", "rgb(238, 241, 236)");
+
+  const [kindBox, iconBox, statusBox] = await Promise.all([
+    kind.boundingBox(),
+    icon.boundingBox(),
+    status.boundingBox(),
+  ]);
+  expect(kindBox).not.toBeNull();
+  expect(iconBox).not.toBeNull();
+  expect(statusBox).not.toBeNull();
+  expect(statusBox!.x).toBeGreaterThan(kindBox!.x + kindBox!.width);
+  const kindCenter = kindBox!.y + kindBox!.height / 2;
+  const statusCenter = statusBox!.y + statusBox!.height / 2;
+  const iconCenter = iconBox!.y + iconBox!.height / 2;
+  expect(Math.abs(kindCenter - statusCenter)).toBeLessThanOrEqual(1);
+  expect(Math.abs(iconCenter - kindCenter)).toBeLessThanOrEqual(1);
+});
+
 async function assertNoPrivateHarnessDetails(page: Page, mock: MockPipeline): Promise<void> {
   const serializedResponses = mock.publicResponseBodies.join("\n");
   for (const privateValue of privateHarnessValues) {
