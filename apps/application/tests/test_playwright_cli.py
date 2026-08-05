@@ -3184,6 +3184,24 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     assert payload_scripts[0].rindex(origin_check) < payload_scripts[0].index(
         "await usernameElement.fill(username)"
     )
+    control_origin_check = (
+        "const controlOrigins=await Promise.all("
+        "[usernameElement,passwordElement,submitElement].map("
+        "(element)=>element.evaluate("
+        "(node)=>node.ownerDocument.location.origin)));"
+    )
+    assert control_origin_check in payload_scripts[0]
+    rejected_control_origin = (
+        "if(controlOrigins.some((origin)=>origin!==expectedOrigin))"
+        "throw new Error('Unexpected sign-in control origin');"
+    )
+    assert rejected_control_origin in payload_scripts[0]
+    assert payload_scripts[0].index(
+        "const submitElement="
+    ) < payload_scripts[0].index(control_origin_check)
+    assert payload_scripts[0].index(control_origin_check) < payload_scripts[0].index(
+        "await usernameElement.fill(username)"
+    )
     assert runtime._video_started is False
     assert runtime._artifact_monitor_task is not None
     assert not runtime._artifact_monitor_task.done()
