@@ -30,7 +30,7 @@ import {
   type PublicApplicationSession,
   type PublicArtifact,
 } from "../db/repository.ts";
-import type { ArtifactStore } from "../system/artifacts.ts";
+import { ARTIFACT_LIMITS, type ArtifactStore } from "../system/artifacts.ts";
 import {
   ApplicationHarnessError,
   type ApplicationHarnessClient,
@@ -350,6 +350,7 @@ interface PreparedStart {
   readonly autoSubmit: boolean;
   readonly profile: string;
   readonly pdf: PublicArtifact;
+  readonly tailoredTex: PublicArtifact;
 }
 
 interface PendingTextQuestionIdentity {
@@ -1279,13 +1280,25 @@ export class ApplicationSessionService {
     }
     signal.throwIfAborted();
     const pdf = this.dependencies.repository.getArtifact(runId, "compiled-pdf", run.currentRevision);
-    if (!pdf || pdf.sha256 !== expectedApprovedPdfSha256) throw applicationSourceUnavailable();
+    const tailoredTex = this.dependencies.repository.getArtifact(
+      runId,
+      "tailored-tex",
+      run.currentRevision,
+    );
+    if (
+      !pdf
+      || pdf.revision !== run.currentRevision
+      || pdf.sha256 !== expectedApprovedPdfSha256
+      || !tailoredTex
+      || tailoredTex.revision !== run.currentRevision
+    ) throw applicationSourceUnavailable();
     return {
       jobUrl,
       opportunityKind: run.opportunityKind,
       autoSubmit: run.autoSubmit,
       profile,
       pdf,
+      tailoredTex,
     };
   }
 
@@ -1331,34 +1344,57 @@ export class ApplicationSessionService {
       : preparedInput;
 
     let resumePdf: Uint8Array;
+    let resumeSource: Uint8Array;
     try {
-      const current = this.dependencies.repository.getArtifact(
+      const currentPdf = this.dependencies.repository.getArtifact(
         runId,
         "compiled-pdf",
         session.resumeRevision,
       );
+      const currentSource = this.dependencies.repository.getArtifact(
+        runId,
+        "tailored-tex",
+        session.resumeRevision,
+      );
       if (
-        !current
-        || current.id !== prepared.pdf.id
-        || current.sha256 !== prepared.pdf.sha256
-        || current.sha256 !== session.pdfSha256
-        || current.byteSize !== prepared.pdf.byteSize
+        !currentPdf
+        || currentPdf.revision !== session.resumeRevision
+        || currentPdf.id !== prepared.pdf.id
+        || currentPdf.sha256 !== prepared.pdf.sha256
+        || currentPdf.sha256 !== session.pdfSha256
+        || currentPdf.byteSize !== prepared.pdf.byteSize
+        || !currentSource
+        || currentSource.revision !== session.resumeRevision
+        || currentSource.id !== prepared.tailoredTex.id
+        || currentSource.sha256 !== prepared.tailoredTex.sha256
+        || currentSource.byteSize !== prepared.tailoredTex.byteSize
       ) {
-        throw new Error("approved PDF metadata changed");
+        throw new Error("approved resume artifact metadata changed");
       }
-      const verified = await readVerifiedArtifactBytes(
+      const verifiedPdf = await readVerifiedArtifactBytes(
         this.dependencies.artifacts,
-        current,
+        currentPdf,
         MAX_COMPILED_PDF_BYTES,
       );
       signal.throwIfAborted();
       if (
-        verified.bytes.byteLength < 5
-        || String.fromCharCode(...verified.bytes.subarray(0, 5)) !== "%PDF-"
+        verifiedPdf.bytes.byteLength < 5
+        || String.fromCharCode(...verifiedPdf.bytes.subarray(0, 5)) !== "%PDF-"
       ) {
         throw new Error("approved PDF is not a PDF");
       }
-      resumePdf = verified.bytes;
+      const verifiedSource = await readVerifiedArtifactBytes(
+        this.dependencies.artifacts,
+        currentSource,
+        ARTIFACT_LIMITS.tex,
+      );
+      signal.throwIfAborted();
+      if (verifiedSource.bytes.byteLength < 1) {
+        throw new Error("approved resume source is empty");
+      }
+      new TextDecoder("utf-8", { fatal: true }).decode(verifiedSource.bytes);
+      resumePdf = verifiedPdf.bytes;
+      resumeSource = verifiedSource.bytes;
     } catch (error) {
       if (signal.aborted) signal.throwIfAborted();
       this.#recordLocalClosed(runId, session);
@@ -1373,6 +1409,7 @@ export class ApplicationSessionService {
         autoSubmit: prepared.autoSubmit,
         personalInformationMarkdown: prepared.profile,
         resumePdf,
+        resumeSource,
       }, signal);
     } catch (error) {
       if (signal.aborted) signal.throwIfAborted();

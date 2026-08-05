@@ -33,7 +33,7 @@ import {
   RepositoryConflictError,
   type ActiveStage,
 } from "../src/db/repository.ts";
-import { ArtifactStore } from "../src/system/artifacts.ts";
+import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
 
 const JOB_URL = "https://jobs.example.test/roles/123?source=private";
 const PROFILE = "# Applicant profile\n\nPrivate candidate evidence.\n";
@@ -41,6 +41,9 @@ const FIRST_SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const THIRD_SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const PDF_BYTES = new TextEncoder().encode("%PDF-1.7\nprivate approved resume\n%%EOF\n");
+const TAILORED_TEX_BYTES = new TextEncoder().encode(
+  "\\documentclass{article}\n% exact current Ω source\n",
+);
 
 const databases: Database[] = [];
 const temporaryRoots: string[] = [];
@@ -122,6 +125,7 @@ class FakeHarness implements ApplicationHarnessClient {
     this.createCalls.push({
       ...input,
       resumePdf: Uint8Array.from(input.resumePdf),
+      resumeSource: Uint8Array.from(input.resumeSource),
     });
     if (this.createError) {
       if (this.storeSnapshotBeforeCreateError) {
@@ -192,6 +196,7 @@ async function createApprovedRun(
     readonly skipReview?: boolean;
     readonly jobUrl?: string | null;
     readonly opportunityKind?: OpportunityKind;
+    readonly tailoredTexBytes?: Uint8Array | null;
   },
 ) {
   const run = repository.createRun(
@@ -224,6 +229,23 @@ async function createApprovedRun(
     stage: "visual_qa",
     attempt: attempt.attemptNo,
   });
+  const tex = options.tailoredTexBytes === null
+    ? undefined
+    : await artifacts.write(
+        join(attemptRoot, "resume.tex"),
+        options.tailoredTexBytes ?? TAILORED_TEX_BYTES,
+        ARTIFACT_LIMITS.tex,
+      );
+  if (tex) {
+    repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "tailored-tex",
+      sha256: tex.sha256,
+      path: tex.path,
+      byteSize: tex.bytes,
+    });
+  }
   const pdf = await artifacts.write(
     join(attemptRoot, "resume.pdf"),
     PDF_BYTES,
@@ -241,7 +263,7 @@ async function createApprovedRun(
   repository.transition(claim, "review");
   repository.release(claim);
   if (options.approved !== false) repository.approve(run.id, pdf.sha256);
-  return { pdf, run };
+  return { pdf, run, tex };
 }
 
 async function createTarget(options: {
@@ -251,6 +273,7 @@ async function createTarget(options: {
   skipReview?: boolean;
   jobUrl?: string | null;
   opportunityKind?: OpportunityKind;
+  tailoredTexBytes?: Uint8Array | null;
   profileReader?: () => string | Promise<string>;
   sessionIds?: string[];
   onApplicationSessionReleased?: () => void;
@@ -269,13 +292,16 @@ async function createTarget(options: {
   const artifactRoot = await mkdtemp(join(tmpdir(), "application-session-service-"));
   temporaryRoots.push(artifactRoot);
   const artifacts = new ArtifactStore(artifactRoot);
-  const { pdf, run } = await createApprovedRun(repository, database, artifacts, {
+  const { pdf, run, tex } = await createApprovedRun(repository, database, artifacts, {
     id: "run-1",
     ...(options.approved === undefined ? {} : { approved: options.approved }),
     ...(options.autoSubmit === undefined ? {} : { autoSubmit: options.autoSubmit }),
     ...(options.skipReview === undefined ? {} : { skipReview: options.skipReview }),
     ...(options.jobUrl === undefined ? {} : { jobUrl: options.jobUrl }),
     ...(options.opportunityKind === undefined ? {} : { opportunityKind: options.opportunityKind }),
+    ...(options.tailoredTexBytes === undefined
+      ? {}
+      : { tailoredTexBytes: options.tailoredTexBytes }),
   });
 
   const harness = options.harness === undefined ? new FakeHarness() : options.harness;
@@ -300,6 +326,7 @@ async function createTarget(options: {
     database,
     harness,
     pdf,
+    tex,
     repository,
     runId: run.id,
     service,
@@ -511,6 +538,7 @@ describe("application session service", () => {
       opportunityKind: "job",
       personalInformationMarkdown: PROFILE,
       resumePdf: PDF_BYTES,
+      resumeSource: TAILORED_TEX_BYTES,
       autoSubmit: false,
     });
     expect(view).toMatchObject({ generation: 1, bridgeState: "running", harnessState: "running" });
@@ -519,6 +547,54 @@ describe("application session service", () => {
     expect(serialized).not.toContain(FIRST_SESSION_ID);
     expect(serialized).not.toContain(JOB_URL);
     expect(serialized).not.toContain(PROFILE);
+  });
+
+  test("rejects application start when the current tailored source is missing", async () => {
+    const target = await createTarget({ tailoredTexBytes: null });
+
+    await expect(
+      target.service.start(target.runId, target.pdf.sha256, signal()),
+    ).rejects.toMatchObject({
+      code: "APPLICATION_SOURCE_UNAVAILABLE",
+      status: 409,
+      message: "Application source files are unavailable",
+    });
+    expect(target.repository.getLatestApplicationSession(target.runId)).toBeNull();
+    expect(target.harness!.createCalls).toHaveLength(0);
+  });
+
+  test("rejects corrupt and invalid-UTF-8 current tailored sources", async () => {
+    const corrupt = await createTarget();
+    if (!corrupt.tex) throw new Error("tailored source fixture missing");
+    await writeFile(corrupt.tex.path, Uint8Array.of(0x25));
+    await expect(
+      corrupt.service.start(corrupt.runId, corrupt.pdf.sha256, signal()),
+    ).rejects.toMatchObject({
+      code: "APPLICATION_SOURCE_UNAVAILABLE",
+      status: 409,
+      message: "Application source files are unavailable",
+    });
+    expect(corrupt.repository.getLatestApplicationSession(corrupt.runId)).toMatchObject({
+      generation: 1,
+      bridgeState: "closed",
+    });
+    expect(corrupt.harness!.createCalls).toHaveLength(0);
+
+    const invalidUtf8 = await createTarget({
+      tailoredTexBytes: Uint8Array.of(0xc3, 0x28),
+    });
+    await expect(
+      invalidUtf8.service.start(invalidUtf8.runId, invalidUtf8.pdf.sha256, signal()),
+    ).rejects.toMatchObject({
+      code: "APPLICATION_SOURCE_UNAVAILABLE",
+      status: 409,
+      message: "Application source files are unavailable",
+    });
+    expect(invalidUtf8.repository.getLatestApplicationSession(invalidUtf8.runId)).toMatchObject({
+      generation: 1,
+      bridgeState: "closed",
+    });
+    expect(invalidUtf8.harness!.createCalls).toHaveLength(0);
   });
 
   test("uploads the persisted auto-submit run mode", async () => {
@@ -1370,6 +1446,22 @@ describe("application session service", () => {
       stage: "visual_qa",
       attempt: attempt.attemptNo,
     });
+    const editedSourceBytes = new TextEncoder().encode(
+      "\\documentclass{article}\n% exact edited revision Ω\n",
+    );
+    const editedSource = await target.artifacts.write(
+      join(attemptRoot, "resume.tex"),
+      editedSourceBytes,
+      ARTIFACT_LIMITS.tex,
+    );
+    target.repository.finalizeArtifact(claim, {
+      attemptId: attempt.id,
+      stage: "visual_qa",
+      kind: "tailored-tex",
+      sha256: editedSource.sha256,
+      path: editedSource.path,
+      byteSize: editedSource.bytes,
+    });
     const editedPdfBytes = new TextEncoder().encode(
       "%PDF-1.7\nrevised approved resume\n%%EOF\n",
     );
@@ -1421,6 +1513,7 @@ describe("application session service", () => {
     expect(harness.createCalls[2]).toMatchObject({
       sessionId: THIRD_SESSION_ID,
       resumePdf: editedPdfBytes,
+      resumeSource: editedSourceBytes,
     });
     expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
       generation: 2,
