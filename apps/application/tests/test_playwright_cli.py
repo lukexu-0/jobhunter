@@ -3173,35 +3173,58 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     assert json.dumps(username) in payload_scripts[0]
     assert json.dumps(password) in payload_scripts[0]
     assert "const expectedOrigin=\"https://example.com\"" in payload_scripts[0]
-    origin_check = "new URL(page.url()).origin!==expectedOrigin"
-    assert payload_scripts[0].count(origin_check) == 2
-    assert "page.evaluate(()=>location.origin)" not in payload_scripts[0]
-    assert payload_scripts[0].count(".elementHandle()") == 3
-    assert payload_scripts[0].index(
-        "const submitElement="
-    ) < payload_scripts[0].rindex(origin_check)
-    assert payload_scripts[0].rindex(origin_check) < payload_scripts[0].index(
-        "await usernameElement.fill(username)"
+    expected_url_check = (
+        "const hasExpectedUrl=(url)=>url===expectedOrigin||"
+        "url.startsWith(expectedOrigin+'/');"
+        "if(!hasExpectedUrl(page.url()))"
+        "throw new Error('Unexpected sign-in origin');"
     )
+    assert expected_url_check in payload_scripts[0]
+    assert payload_scripts[0].count(".elementHandle()") == 3
+    cdp_origin_check = (
+        "const cdp=await page.context().newCDPSession(page);"
+        "const frameTree=(await cdp.send('Page.getFrameTree')).frameTree;"
+        "await cdp.detach();"
+        "const frames=[];"
+        "const collectFrames=(tree)=>{frames.push(tree.frame);"
+        "for(const child of tree.childFrames||[])collectFrames(child);};"
+        "collectFrames(frameTree);"
+        "if(frameTree.frame.securityOrigin!==expectedOrigin)"
+        "throw new Error('Unexpected sign-in origin');"
+    )
+    assert cdp_origin_check in payload_scripts[0]
     control_origin_check = (
-        "const controlOrigins=await Promise.all("
+        "const controlOriginsApproved=await Promise.all("
         "[usernameElement,passwordElement,submitElement].map("
         "async(element)=>{const frame=await element.ownerFrame();"
-        "return frame===null?null:new URL(frame.url()).origin;}));"
+        "if(frame===null)return false;"
+        "const frameUrl=frame.url().split('#')[0];"
+        "const frameName=frame.name();"
+        "const matches=frames.filter((candidate)=>"
+        "candidate.url===frameUrl&&(candidate.name||'')===frameName);"
+        "return matches.length>0&&matches.every((candidate)=>"
+        "candidate.securityOrigin===expectedOrigin);}));"
     )
     assert control_origin_check in payload_scripts[0]
-    assert "ownerDocument.location.origin" not in payload_scripts[0]
     rejected_control_origin = (
-        "if(controlOrigins.some((origin)=>origin!==expectedOrigin))"
+        "if(controlOriginsApproved.some((approved)=>!approved))"
         "throw new Error('Unexpected sign-in control origin');"
     )
     assert rejected_control_origin in payload_scripts[0]
+    assert "new URL(" not in payload_scripts[0]
+    assert "page.evaluate(()=>location.origin)" not in payload_scripts[0]
+    assert "ownerDocument.location.origin" not in payload_scripts[0]
     assert payload_scripts[0].index(
         "const submitElement="
-    ) < payload_scripts[0].index(control_origin_check)
-    assert payload_scripts[0].index(control_origin_check) < payload_scripts[0].index(
-        "await usernameElement.fill(username)"
-    )
+    ) < payload_scripts[0].index(cdp_origin_check)
+    for mutation in (
+        "await usernameElement.fill(username)",
+        "await passwordElement.fill(password)",
+        "await submitElement.click()",
+    ):
+        assert payload_scripts[0].index(cdp_origin_check) < payload_scripts[0].index(
+            mutation
+        )
     assert runtime._video_started is False
     assert runtime._artifact_monitor_task is not None
     assert not runtime._artifact_monitor_task.done()
