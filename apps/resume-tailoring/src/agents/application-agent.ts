@@ -173,7 +173,7 @@ const HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser job application for
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -189,7 +189,7 @@ const AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare and submit an appl
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -205,7 +205,7 @@ const NON_JOB_HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser opportunity
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -221,7 +221,7 @@ const NON_JOB_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare and submit
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 

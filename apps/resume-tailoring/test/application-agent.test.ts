@@ -119,7 +119,7 @@ const EXPECTED_HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser job applic
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -135,7 +135,7 @@ const EXPECTED_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare and submi
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -151,7 +151,7 @@ const EXPECTED_NON_JOB_HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser op
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -167,7 +167,7 @@ const EXPECTED_NON_JOB_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare a
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete every machine-actionable field. Prefer saved application, saved global, explicit task, then attributed evidence. Answer candidate questions only from exact supplied or saved facts; otherwise request a batched human reply. Never answer, choose, infer, invent, or transfer facts. Keep anecdotes factual. Upload only the supplied resume. Never expose values or paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -391,6 +391,7 @@ describe("application agent", () => {
         async (agent) => {
           expect(agent.name).toBe("non-job-application");
           expect(agent.instructions).toBe(expectedInstructions);
+          expect(agent.instructions).toContain("Location questions use only exact supplied or saved facts.");
           expect(agent.instructions).toContain("matches organizer and opportunity");
           expect(agent.instructions).not.toContain("matches company and role");
           expect(agent.instructions).not.toContain("Try CAPTCHAs");
@@ -1474,6 +1475,7 @@ describe("application agent", () => {
           throw new Error("application agent instructions must be static");
         }
         expect(agent.instructions).toBe(EXPECTED_HUMAN_REVIEW_AGENT_INSTRUCTIONS);
+        expect(agent.instructions).toContain("Location questions use only exact supplied or saved facts.");
         expect(agent.instructions).toContain("The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.");
         expect(agent.instructions.trim().split(/\s+/).length).toBeLessThanOrEqual(350);
         expect(agent.instructions).not.toContain(RUN_INPUT.task);
@@ -1589,6 +1591,7 @@ describe("application agent", () => {
           throw new Error("application agent instructions must be static");
         }
         expect(agent.instructions).toBe(EXPECTED_AUTO_SUBMIT_AGENT_INSTRUCTIONS);
+        expect(agent.instructions).toContain("Location questions use only exact supplied or saved facts.");
         expect(agent.instructions).toContain("You're good to submit.");
         expect(agent.instructions).toContain("The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.");
         expect(agent.instructions.trim().split(/\s+/).length).toBeLessThanOrEqual(350);
@@ -1881,6 +1884,7 @@ describe("application agent", () => {
       },
       async (agent, _input, options) => {
         expect(agent.instructions).toBe(EXPECTED_HUMAN_REVIEW_AGENT_INSTRUCTIONS);
+        expect(agent.instructions).toContain("Location questions use only exact supplied or saved facts.");
         expect(agent.instructions).toContain("You're good to submit.");
         const context = options.context;
         if (!context) throw new Error("application context is required");
