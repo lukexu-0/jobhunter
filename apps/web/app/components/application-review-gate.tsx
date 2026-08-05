@@ -52,12 +52,18 @@ export function cancelSubmissionDialog(
 interface ApplicationReviewGateProps {
   readonly busyAction: ApplicationSessionCommand["type"] | null;
   readonly busy: boolean;
+  readonly steeringDisabled: boolean;
+  readonly onSteerAndContinue: (
+    command: ApplicationSessionCommand,
+  ) => Promise<void>;
   readonly onCommand: (command: ApplicationSessionCommand) => Promise<void>;
 }
 
 export function ApplicationReviewGate({
   busy,
   busyAction,
+  steeringDisabled,
+  onSteerAndContinue,
   onCommand,
 }: ApplicationReviewGateProps) {
   const [revisionContext, setRevisionContext] = useState("");
@@ -78,13 +84,18 @@ export function ApplicationReviewGate({
 
   const submitRevision = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const submitter = (event.nativeEvent as SubmitEvent).submitter;
+    const steerAndContinue =
+      submitter?.getAttribute("value") === "steer_and_continue";
     const result = buildApplicationRevisionCommand(revisionContext);
     if (!result.success) {
       setValidationError(result.message);
       return;
     }
     setValidationError(null);
-    await onCommand(result.command);
+    await (steerAndContinue
+      ? onSteerAndContinue(result.command)
+      : onCommand(result.command));
   };
 
   return (
@@ -117,6 +128,15 @@ export function ApplicationReviewGate({
           type="submit"
         >
           {busyAction === "revise" ? "Requesting revision…" : "Request application revision"}
+        </button>
+        <button
+          className={styles.secondaryButton}
+          disabled={busy || !revision.success || steeringDisabled}
+          name="revision_action"
+          type="submit"
+          value="steer_and_continue"
+        >
+          Steer and request revision
         </button>
       </form>
       <div className={styles.applicationReadyAction}>

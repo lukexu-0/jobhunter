@@ -17,6 +17,7 @@ import type {
 } from "@jobhunter/pipeline/contracts";
 import {
   ApplicationSessionPanel,
+  canGuideApplicationAgent,
   type ApplicationGateCommandType,
   type ApplicationLifecycleAction,
   type ApplicationSteerCommand,
@@ -57,6 +58,8 @@ export interface ApplicationActionLatch {
 }
 interface ApplicationSteeringLatch {
   state: Exclude<ApplicationSteeringState, "idle">;
+  readonly generation: number;
+  readonly bridgeState: ApplicationSessionSnapshotDto["bridgeState"];
 }
 
 export interface RunReviewWorkspaceProps {
@@ -285,9 +288,15 @@ export function RunReviewWorkspace({
       setApplicationCommandAction(null);
     }
     const steeringLatch = applicationSteeringLatchRef.current;
+    const nextSteeringSnapshot = applicationSnapshot(next);
     if (
       steeringLatch
-      && applicationSnapshot(next)?.bridgeState !== "running"
+      && (
+        !nextSteeringSnapshot
+        || !canGuideApplicationAgent(nextSteeringSnapshot)
+        || nextSteeringSnapshot.generation !== steeringLatch.generation
+        || nextSteeringSnapshot.bridgeState !== steeringLatch.bridgeState
+      )
     ) {
       applicationSteeringLatchRef.current = null;
       setApplicationSteeringState("idle");
@@ -670,7 +679,7 @@ export function RunReviewWorkspace({
     const current = applicationSnapshot(applicationViewRef.current);
     if (
       !current
-      || current.bridgeState !== "running"
+      || !canGuideApplicationAgent(current)
       || applicationSteeringLatchRef.current
     ) {
       return {
@@ -679,7 +688,11 @@ export function RunReviewWorkspace({
       };
     }
 
-    const latch: ApplicationSteeringLatch = { state: "sending" };
+    const latch: ApplicationSteeringLatch = {
+      state: "sending",
+      generation: current.generation,
+      bridgeState: current.bridgeState,
+    };
     applicationSteeringLatchRef.current = latch;
     setApplicationSteeringState("sending");
     try {

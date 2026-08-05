@@ -418,8 +418,25 @@
   line-height: var(--line-base);
 }
 
-.applicationSteeringForm button {
+.applicationSteeringActions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--control-height);
+  gap: var(--space-3);
+}
+
+.applicationSteeringActions > button {
   width: 100%;
+}
+
+.applicationSteeringActions > .applicationSteeringRetry {
+  width: var(--control-height);
+  height: var(--control-height);
+  min-height: var(--control-height);
+  padding: 0;
+}
+
+.applicationSteeringActions > .applicationSteeringContinue {
+  grid-column: 1 / -1;
 }
 
 .applicationSteeringForm textarea:disabled {

@@ -50,6 +50,8 @@ describe("ApplicationReviewGate", () => {
       busy: false,
       busyAction: null,
       onCommand: async () => {},
+      onSteerAndContinue: async () => {},
+      steeringDisabled: false,
     }));
 
     expect(SUBMISSION_CONFIRMATION_TITLE).toBe("Submit this application?");

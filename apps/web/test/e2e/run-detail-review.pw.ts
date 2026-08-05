@@ -1138,7 +1138,7 @@ test("additional-information answers survive conflict reconciliation and clear o
       mock.application = authoritativeQuestions;
     },
   });
-  mock.commandReplies.push({ status: 202 });
+  mock.commandReplies.push({ status: 202 }, { status: 202 });
   queueSse(
     mock,
     eventFixture("snapshot", authoritativeQuestions, {}),
@@ -1183,7 +1183,7 @@ test("additional-information answers survive conflict reconciliation and clear o
       { id: "portfolio_note", status: "declined" },
     ],
   };
-  await page.getByRole("button", { name: "Answer questions" }).click();
+  await page.getByRole("button", { name: "Answer questions", exact: true }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands[0]).toEqual(expectedCommand);
   await expect(page.getByRole("alert").filter({
@@ -1205,9 +1205,13 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(nameQuestion.getByRole("textbox", { name: "Answer", exact: true }))
     .toHaveValue("  Ada Public  ");
 
-  await page.getByRole("button", { name: "Answer questions" }).click();
-  await expect.poll(() => mock.commands.length).toBe(2);
-  expect(mock.commands[1]).toEqual(expectedCommand);
+  const gatedGuidance = "Use only verified profile facts.";
+  await page.getByRole("textbox", { name: "Operator guidance" })
+    .fill(gatedGuidance);
+  await page.getByRole("button", { name: "Steer and answer questions" }).click();
+  await expect.poll(() => mock.commands.length).toBe(3);
+  expect(mock.commands[1]).toEqual({ type: "steer", message: gatedGuidance });
+  expect(mock.commands[2]).toEqual(expectedCommand);
   await expect(page.getByRole("button", { name: "Answering…" })).toBeDisabled();
   await expect(page.getByRole("heading", { name: "Additional information needed" })).toBeVisible();
   await expect(nameQuestion.getByRole("textbox", { name: "Answer", exact: true }))
@@ -1296,7 +1300,7 @@ test("professional answers support keyboard revisions, retain the raw draft, and
     },
   ]);
 
-  await page.getByRole("button", { name: "Answer questions" }).click();
+  await page.getByRole("button", { name: "Answer questions", exact: true }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands[0]).toEqual({
     type: "provide_additional_info",
@@ -1360,7 +1364,7 @@ test("a previous answer can seed the raw draft without leaking storage metadata"
     "I value careful engineering for systems people depend on.",
   );
   await answer.fill("I value careful engineering for dependable systems.");
-  await page.getByRole("button", { name: "Answer questions" }).click();
+  await page.getByRole("button", { name: "Answer questions", exact: true }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands[0]).toEqual({
     type: "provide_additional_info",
@@ -1418,7 +1422,7 @@ test("previous-answer sources cannot replace the dispatched answer while its com
   });
   await expect(useAnswer).toBeEnabled();
 
-  await page.getByRole("button", { name: "Answer questions" }).click();
+  await page.getByRole("button", { name: "Answer questions", exact: true }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands[0]).toEqual({
     type: "provide_additional_info",
@@ -1574,7 +1578,7 @@ test("credential gate sends exact actions, retains failures, clears on progress,
       mock.application = authoritativeCredentials;
     },
   });
-  mock.commandReplies.push({ status: 202 });
+  mock.commandReplies.push({ status: 202 }, { status: 202 });
   queueSse(
     mock,
     eventFixture("credentials_required", changedCredentials, {}),
@@ -1608,9 +1612,15 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   const username = page.getByLabel("Username or email");
   const password = page.getByLabel("Password");
   const signIn = credentialsForm.getByRole("button", { name: "Sign in with credentials" });
-  const save = credentialsForm.getByRole("button", { name: "Save credentials" });
+  const save = credentialsForm.getByRole("button", { name: "Save credentials", exact: true });
+  const steerSignIn = credentialsForm.getByRole("button", {
+    name: "Steer and sign in",
+  });
+  const steerSave = credentialsForm.getByRole("button", {
+    name: "Steer and save credentials",
+  });
   await expect(credentialsForm).toBeVisible();
-  await expect(credentialsForm.getByRole("button")).toHaveCount(2);
+  await expect(credentialsForm.getByRole("button")).toHaveCount(4);
   await expect(page.getByRole("button", { name: "Cancel application" })).toBeVisible();
   await expect(credentialsForm).toHaveAttribute("autocomplete", "off");
   await expect(username).toHaveAttribute("autocomplete", "off");
@@ -1626,13 +1636,24 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   await password.press("Tab");
   await expect(signIn).toBeFocused();
   await signIn.press("Tab");
+  await expect(steerSignIn).toBeFocused();
+  await steerSignIn.press("Tab");
   await expect(save).toBeFocused();
+  await save.press("Tab");
+  await expect(steerSave).toBeFocused();
   expect(await page.evaluate(() =>
     document.documentElement.scrollWidth <= document.documentElement.clientWidth
   )).toBe(true);
   const formBox = await credentialsForm.boundingBox();
   if (!formBox) throw new Error("Credential form has no layout box");
-  for (const control of [username, password, signIn, save]) {
+  for (const control of [
+    username,
+    password,
+    signIn,
+    steerSignIn,
+    save,
+    steerSave,
+  ]) {
     const controlBox = await control.boundingBox();
     if (!controlBox) throw new Error("Credential control has no layout box");
     expect(Math.floor(controlBox.x)).toBeGreaterThanOrEqual(Math.floor(formBox.x));
@@ -1707,14 +1728,21 @@ test("credential gate sends exact actions, retains failures, clears on progress,
 
   const savedUsername = "new-account@example.test";
   const savedPassword = "new account private password";
+  const credentialGuidance = "Use the newly created account.";
+  await page.getByRole("textbox", { name: "Operator guidance" })
+    .fill(credentialGuidance);
   await username.fill(savedUsername);
   await password.fill(savedPassword);
-  await save.evaluate((button) => {
+  await steerSave.evaluate((button) => {
     (button as HTMLButtonElement).click();
     (button as HTMLButtonElement).click();
   });
-  await expect.poll(() => mock.commands.length).toBe(2);
+  await expect.poll(() => mock.commands.length).toBe(3);
   expect(mock.commands[1]).toEqual({
+    type: "steer",
+    message: credentialGuidance,
+  });
+  expect(mock.commands[2]).toEqual({
     type: "save_credentials",
     username: savedUsername,
     password: savedPassword,
@@ -1743,6 +1771,7 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   expect(publicResponses).not.toContain(privateCredentialPassword);
   expect(publicResponses).not.toContain(savedUsername);
   expect(publicResponses).not.toContain(savedPassword);
+  expect(publicResponses).not.toContain(credentialGuidance);
 });
 
 test("credential values survive a network failure while both actions stay latched", async ({ page }) => {
@@ -1790,7 +1819,10 @@ test("credential values survive a network failure while both actions stay latche
     hasText: "The pipeline service could not be reached.",
   })).toBeVisible();
   await expect(credentialsForm.getByRole("button", { name: "Signing in…" })).toBeDisabled();
-  await expect(credentialsForm.getByRole("button", { name: "Save credentials" })).toBeDisabled();
+  await expect(credentialsForm.getByRole("button", {
+    name: "Save credentials",
+    exact: true,
+  })).toBeDisabled();
   await expect(username).toBeDisabled();
   await expect(password).toBeDisabled();
   await expect(username).toHaveValue(privateCredentialUsername);
@@ -2728,7 +2760,7 @@ test("an invalid SSE frame reconciles through authoritative GET and does not ren
   }
 });
 
-test("running guidance is accessible, one-shot, and keeps uncertain delivery latched until state exit", async ({ page }) => {
+test("guidance remains accessible across gates and ambiguous delivery resets on state exit", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const running = snapshotFixture({
     bridgeState: "running",
@@ -2782,6 +2814,8 @@ test("running guidance is accessible, one-shot, and keeps uncertain delivery lat
       body: apiError("APPLICATION_HARNESS_UNAVAILABLE", "private upstream detail"),
       waitFor: ambiguousDelivery.promise,
     },
+    { status: 202 },
+    { status: 202 },
     { status: 202 },
   );
 
@@ -2863,8 +2897,18 @@ test("running guidance is accessible, one-shot, and keeps uncertain delivery lat
   expect(mock.commands).toHaveLength(3);
 
   leaveRunning.resolve();
-  await expect(form).toHaveCount(0);
+  await expect(form).toBeVisible();
   await expect(page.getByRole("heading", { name: "Navigation needed" })).toBeVisible();
+  await expect(guidance).toHaveValue("");
+  await expect(send).toBeEnabled();
+
+  const gatedDraft = "Retry the public checkpoint with the verified address.";
+  await guidance.fill(gatedDraft);
+  await page.getByRole("button", { name: "Steer and continue" }).click();
+  await expect.poll(() => mock.commands.length).toBe(5);
+  expect(mock.commands[3]).toEqual({ type: "steer", message: gatedDraft });
+  expect(mock.commands[4]).toEqual({ type: "continue" });
+
   returnToRunning.resolve();
   await expect(page.getByRole("form", { name: "Guide the application agent" })).toBeVisible();
   await expect(guidance).toHaveValue("");
@@ -2872,14 +2916,50 @@ test("running guidance is accessible, one-shot, and keeps uncertain delivery lat
 
   await guidance.fill("Resume using only the verified public address.");
   await send.click();
-  await expect.poll(() => mock.commands.length).toBe(4);
-  expect(mock.commands[3]).toEqual({
+  await expect.poll(() => mock.commands.length).toBe(6);
+  expect(mock.commands[5]).toEqual({
     type: "steer",
     message: "Resume using only the verified public address.",
   });
   expect(await page.evaluate(
     () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
   )).toBe(true);
+});
+
+test("retry current queues fixed guidance before continuing a navigation gate", async ({ page }) => {
+  const waiting = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    updatedAt: createdAt + 100,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public checkpoint.",
+    },
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: waiting,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const guidance = page.getByRole("textbox", { name: "Operator guidance" });
+  await guidance.fill("Keep this draft for later.");
+  const retryCurrent = page.getByRole("button", { name: "Retry current action" });
+  await expect(retryCurrent).toHaveAttribute("title", "Retry current action");
+  const retryBox = await retryCurrent.boundingBox();
+  expect(retryBox).not.toBeNull();
+  expect(Math.abs(retryBox!.width - retryBox!.height)).toBeLessThanOrEqual(1);
+  await retryCurrent.click();
+
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands).toEqual([
+    { type: "steer", message: "Retry the current action." },
+    { type: "continue" },
+  ]);
+  await expect(guidance).toHaveValue("Keep this draft for later.");
+  await expect(page.getByRole("status").filter({
+    hasText: "Retry guidance queued for the next agent step.",
+  })).toBeVisible();
 });
 
 test("390px workspace has no overflow, exposes keyboard review controls, and announces application state", async ({ page }) => {

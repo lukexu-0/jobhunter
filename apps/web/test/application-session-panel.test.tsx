@@ -78,6 +78,7 @@ describe("ApplicationSessionPanel", () => {
     );
     expect(reserved).toContain("Start applying");
     expect(reserved).toContain("Cancel application");
+    expect(reserved).not.toContain("Guide the application agent");
 
     const lost = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -94,6 +95,7 @@ describe("ApplicationSessionPanel", () => {
     expect(lost).toContain("Retry applying");
     expect(lost).toContain("verify whether the application was submitted");
     expect(lost).not.toContain("Cancel application");
+    expect(lost).not.toContain("Guide the application agent");
 
     const submitting = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -109,6 +111,7 @@ describe("ApplicationSessionPanel", () => {
     expect(submitting).not.toContain("Cancel application");
     expect(submitting).not.toContain("Retry applying");
     expect(submitting).not.toContain("Close browser");
+    expect(submitting).not.toContain("Guide the application agent");
 
     const submitted = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -125,6 +128,7 @@ describe("ApplicationSessionPanel", () => {
     expect(submitted).toContain("stays open until");
     expect(submitted).not.toContain("Cancel application");
     expect(submitted).not.toContain("Retry applying");
+    expect(submitted).not.toContain("Guide the application agent");
 
     const uncertain = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -143,6 +147,7 @@ describe("ApplicationSessionPanel", () => {
     expect(uncertain).toContain("Close browser");
     expect(uncertain).not.toContain("Cancel application");
     expect(uncertain).not.toContain("Retry applying");
+    expect(uncertain).not.toContain("Guide the application agent");
 
     const closedSubmitted = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -158,9 +163,10 @@ describe("ApplicationSessionPanel", () => {
     );
     expect(closedSubmitted).not.toContain("Retry applying");
     expect(closedSubmitted).not.toContain("Close browser");
+    expect(closedSubmitted).not.toContain("Guide the application agent");
   });
 
-  test("renders accessible steering only while the application agent is running", () => {
+  test("renders accessible steering while the application agent is running or gated", () => {
     const running = renderToStaticMarkup(
       <ApplicationSessionPanel {...callbacks} snapshot={snapshot()} />,
     );
@@ -187,8 +193,10 @@ describe("ApplicationSessionPanel", () => {
         })}
       />,
     );
-    expect(waiting).not.toContain("Operator guidance");
-    expect(waiting).not.toContain("Send guidance");
+    expect(waiting).toContain("Operator guidance");
+    expect(waiting).toContain("Send guidance");
+    expect(waiting).toContain("Steer and continue");
+    expect(waiting).toContain('title="Retry current action"');
 
     const ambiguous = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -273,6 +281,7 @@ describe("ApplicationSessionPanel", () => {
     expect(originMarkup).toContain("https://apply.example.com");
     expect(originMarkup).toContain("Restart required");
     expect(originMarkup).not.toContain("Approve origin");
+    expect(originMarkup).not.toContain("Guide the application agent");
   });
 
   test("builds strict credential commands with trimmed usernames and exact passwords", () => {
@@ -393,8 +402,7 @@ describe("ApplicationSessionPanel", () => {
       message: "Enter a password between 1 and 4,096 characters.",
     });
   });
-
-  test("renders one accessible masked credential form with exactly two actions", () => {
+  test("renders accessible credential actions with optional steering", () => {
     const markup = renderToStaticMarkup(
       <ApplicationSessionPanel
         {...callbacks}
@@ -405,7 +413,7 @@ describe("ApplicationSessionPanel", () => {
         })}
       />,
     );
-    const formStart = markup.indexOf("<form");
+    const formStart = markup.indexOf('<form aria-labelledby="application-credentials-heading"');
     const formEnd = markup.indexOf("</form>", formStart);
     const formMarkup = markup.slice(formStart, formEnd);
     const normalizedMarkup = markup.toLowerCase();
@@ -419,10 +427,11 @@ describe("ApplicationSessionPanel", () => {
     expect(normalizedMarkup).not.toContain('autocomplete="username"');
     expect(normalizedMarkup).toContain('type="password"');
     expect(markup).toContain("Sign in with credentials");
+    expect(markup).toContain("Steer and sign in");
+    expect(markup).toContain("Steer and save credentials");
     expect(markup).toContain("Save credentials");
     expect(markup).toContain("private local credential file");
-    expect(markup).toContain("after creating an account in headed Chrome");
-    expect(formMarkup.match(/<button/g)).toHaveLength(2);
+    expect(formMarkup.match(/<button/g)).toHaveLength(4);
     expect(formMarkup).not.toContain("Continue application");
 
     const busyMarkup = renderToStaticMarkup(
@@ -504,6 +513,7 @@ describe("ApplicationSessionPanel", () => {
     expect(markup).toContain("Monday");
     expect(markup.match(/Decline to answer/g)).toHaveLength(4);
     expect(markup).toContain('disabled="" type="submit">Answer questions');
+    expect(markup).toContain("Steer and answer questions");
     expect(markup).toContain("Professionalize");
     expect(markup).toContain('aria-label="Professionalize settings"');
     expect(markup).toContain('aria-expanded="false"');
@@ -524,6 +534,7 @@ describe("ApplicationSessionPanel", () => {
 
     expect(markup).toContain("Review the application");
     expect(markup).toContain("Request application revision");
+    expect(markup).toContain("Steer and request revision");
     expect(markup).toContain("Approve and submit");
     expect(markup).toContain("Submit this application?");
     expect(markup).toContain("This action is irreversible.");
