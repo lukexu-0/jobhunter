@@ -375,6 +375,7 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
     { ...request, username_ref: "e1000000000" },
     { ...request, password_ref: " e2" },
     { ...request, submit_ref: "button" },
+    { ...request, submit_ref: "e3\n" },
     { type: "request_sign_in", username_ref: "e1", password_ref: "e2" },
     { ...request, username: "candidate@example.test" },
   ]) {
