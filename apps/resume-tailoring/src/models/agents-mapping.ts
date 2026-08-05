@@ -65,7 +65,7 @@ function assertKnownKeys(value: object, allowed: Readonly<Record<string, true>>,
   }
 }
 type CodexHistoryPayload = NonNullable<AssistantMessage["providerPayload"]>;
-type CodexBridge =
+export type CodexBridge =
   | { readonly kind: "history"; readonly payload: CodexHistoryPayload }
   | { readonly kind: "covered" };
 type CompactionOutputItem = Extract<AgentOutputItem, { type: "compaction" }>;
@@ -85,7 +85,7 @@ function parseCodexHistoryPayload(value: unknown, label: string): CodexHistoryPa
   return value as unknown as CodexHistoryPayload;
 }
 
-function parseCodexBridge(value: unknown, label: string): CodexBridge | undefined {
+export function parseCodexBridge(value: unknown, label: string): CodexBridge | undefined {
   if (value === undefined) return undefined;
   if (!isRecord(value)) throw new Error(`Invalid ${label}`);
   assertKnownKeys(value, ITEM_PROVIDER_DATA_KEYS, label);
