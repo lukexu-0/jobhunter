@@ -3314,6 +3314,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     record = manager._active
     assert record is not None and record.human_gate is not None
     record.playwright_runtime = FakePlaywrightRuntime()
+    private_question = f"What dates are available for {PROFILE_SECRET}?"
     action = RequestAdditionalInfoRuntimeAction(
         type="request_additional_info",
         questions=[
@@ -3321,7 +3322,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
                 id="availability",
                 key="availability.summer_2027",
                 scope="global",
-                question="What dates are available?",
+                question=private_question,
                 answer_type="text",
             ),
             AdditionalInfoSingleSelectQuestion(
@@ -3391,6 +3392,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         "work_modes",
         "salary",
     ]
+    assert required.detail.questions[0].question == private_question
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.pending_action is not None
     assert snapshot.pending_action.model_dump(mode="json") == {
@@ -3408,6 +3410,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     )[0].session
     assert additional_info_replay.pending_action == snapshot.pending_action
     assert additional_info_replay.expires_at == snapshot.expires_at
+    assert PROFILE_SECRET in additional_info_replay.pending_action.model_dump_json()
     assert (
         await manager.get_additional_info_suggestions(
             created.session_id,
@@ -3451,6 +3454,12 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     assert (tmp_path / "user-info.json").read_bytes() == previous_store
     assert record.human_gate.pending_kind == "additional_info"
 
+    retained_event_ids_before_answers = [
+        event.id
+        for event in record.events
+        if event.event != "additional_info_required"
+    ]
+    next_event_id_before_answers = record.next_event_id
     events_before_answers = len(record.events)
     raw_answer_value = "free june through august"
     answer_value = "I am available from June through August 2027."
@@ -3506,6 +3515,32 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     saved = record.events[-1]
     assert saved.event == "additional_info_saved"
     assert saved.detail.count == 5
+    retained_events = tuple(record.events)
+    assert [event.id for event in retained_events] == [
+        *retained_event_ids_before_answers,
+        next_event_id_before_answers,
+    ]
+    assert saved.id == next_event_id_before_answers
+    assert all(
+        event.event != "additional_info_required" for event in retained_events
+    )
+    retained_public_data = json.dumps(
+        [event.model_dump(mode="json") for event in retained_events]
+    )
+    assert PROFILE_SECRET not in retained_public_data
+    replayed_after_answers = manager._replay_events(
+        manager.get_snapshot(created.session_id),
+        retained_events,
+        None,
+    )
+    replayed_public_data = json.dumps(
+        [event.model_dump(mode="json") for event in replayed_after_answers]
+    )
+    assert PROFILE_SECRET not in replayed_public_data
+    assert all(
+        event.event != "additional_info_required"
+        for event in replayed_after_answers
+    )
     public_data = json.dumps(
         {
             "snapshot": manager.get_snapshot(created.session_id).model_dump(mode="json"),
@@ -3615,6 +3650,20 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     )
     assert record.additional_info_question_count == 99
     await manager.delete(created.session_id)
+    tombstone = manager._tombstones[created.session_id]
+    tombstone_public_data = json.dumps(
+        {
+            "snapshot": tombstone.snapshot.model_dump(mode="json"),
+            "events": [
+                event.model_dump(mode="json") for event in tombstone.events
+            ],
+        }
+    )
+    assert PROFILE_SECRET not in tombstone_public_data
+    assert all(
+        event.event != "additional_info_required"
+        for event in tombstone.events
+    )
 
 
 async def test_runtime_action_rejects_concurrency_without_cancelling_active_call(

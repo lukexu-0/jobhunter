@@ -2036,6 +2036,18 @@ class ApplicationSessionManager:
         )
         record.next_event_id += 1
         async with record.condition:
+            if public_event.session.state != "awaiting_additional_info" and any(
+                retained.event == "additional_info_required"
+                for retained in record.events
+            ):
+                record.events = deque(
+                    (
+                        retained
+                        for retained in record.events
+                        if retained.event != "additional_info_required"
+                    ),
+                    maxlen=record.events.maxlen,
+                )
             record.events.append(public_event)
             record.condition.notify_all()
 
