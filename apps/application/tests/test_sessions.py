@@ -116,7 +116,7 @@ def pdf_bytes(text: str = "Deterministic resume evidence") -> bytes:
     return destination.getvalue()
 
 
-def valid_uploads() -> tuple[UploadFile, UploadFile]:
+def valid_uploads() -> tuple[UploadFile, UploadFile, UploadFile]:
     personal = (
         "---\n"
         "full_name: Ada Lovelace\n"
@@ -124,7 +124,11 @@ def valid_uploads() -> tuple[UploadFile, UploadFile]:
         "---\n"
         "Experienced analytical engineer.\n"
     ).encode()
-    return upload("profile.md", personal), upload("resume.pdf", pdf_bytes())
+    return (
+        upload("profile.md", personal),
+        upload("resume.pdf", pdf_bytes()),
+        upload("resume.tex", b"\\documentclass{article}\nResume evidence.\n"),
+    )
 
 
 def multipart_parts() -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
@@ -146,6 +150,14 @@ def multipart_parts() -> list[tuple[str, tuple[None, str] | tuple[str, bytes, st
             ),
         ),
         ("resume", ("resume.pdf", pdf_bytes(), "application/pdf")),
+        (
+            "resume_source",
+            (
+                "resume.tex",
+                b"\\documentclass{article}\nResume evidence.\n",
+                "text/x-tex",
+            ),
+        ),
     ]
 
 
@@ -650,7 +662,7 @@ async def create_valid(
     opportunity_kind: OpportunityKind = "job",
     allow_domains: Sequence[str] = (),
 ):
-    personal, resume = valid_uploads()
+    personal, resume, resume_source = valid_uploads()
     return await manager.create_session(
         session_id=session_id,
         job_url=JOB_URL,
@@ -660,6 +672,7 @@ async def create_valid(
         max_steps=100,
         personal_information=personal,
         resume=resume,
+        resume_source=resume_source,
         context=[],
         anecdotes=[],
     )
@@ -1132,7 +1145,7 @@ async def test_invalid_create_values_fail_before_storage(
 
     monkeypatch.setattr(sessions_module, "store_uploads", forbidden_storage)
     manager, fakes, root = make_manager(tmp_path, blocked_runner)
-    personal, resume = valid_uploads()
+    personal, resume, resume_source = valid_uploads()
 
     with pytest.raises(HarnessServiceError) as caught:
         await manager.create_session(
@@ -1142,6 +1155,7 @@ async def test_invalid_create_values_fail_before_storage(
             max_steps=max_steps,
             personal_information=personal,
             resume=resume,
+            resume_source=resume_source,
             context=[],
             anecdotes=[],
         )
@@ -2365,7 +2379,7 @@ async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_pa
     assert manager.get_snapshot(created.session_id).state == "closed"
     assert manager._tombstones[created.session_id].events[-1].event == "closed"
     assert fakes.runtimes[0].closed and fakes.models[0].closed
-    personal, resume = valid_uploads()
+    personal, resume, resume_source = valid_uploads()
     with pytest.raises(HarnessServiceError) as caught:
         await manager.create_session(
             job_url=JOB_URL,
@@ -2374,6 +2388,7 @@ async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_pa
             max_steps=100,
             personal_information=personal,
             resume=resume,
+            resume_source=resume_source,
             context=[],
             anecdotes=[],
         )
@@ -2849,7 +2864,7 @@ async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
         raise AssertionError("unreachable")
 
     manager, _fakes, _root = make_manager(tmp_path, stepping_runner)
-    personal, resume = valid_uploads()
+    personal, resume, resume_source = valid_uploads()
     created = await manager.create_session(
         job_url=private_job_url,
         opportunity_kind="job",
@@ -2857,6 +2872,7 @@ async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
         max_steps=100,
         personal_information=personal,
         resume=resume,
+        resume_source=resume_source,
         context=[],
         anecdotes=[],
     )
@@ -3052,6 +3068,106 @@ async def test_transient_cleanup_failure_retries_while_retaining_ownership(
     assert manager._tombstones[created.session_id].events[-1].event == "closed"
 
 
+async def test_create_session_uses_latex_source_as_resume_evidence_and_pdf_for_upload(
+    tmp_path: Path,
+) -> None:
+    latex_source = (
+        b"\\documentclass{article}\n"
+        b"\\begin{document}\n"
+        b"Exact approved LaTeX evidence.\n"
+        b"\\end{document}\n"
+    )
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=manager),
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://harness.test",
+    ) as client:
+        response = await client.post(
+            "/v1/sessions",
+            headers=AUTHORIZATION,
+            files=[
+                *(part for part in multipart_parts() if part[0] != "resume_source"),
+                (
+                    "resume_source",
+                    ("Alex_Example_Resume.tex", latex_source, "text/x-tex"),
+                ),
+            ],
+        )
+
+    assert response.status_code == 202
+    created = response.json()
+    session_id = UUID(created["session_id"])
+    await wait_state(manager, session_id, "running")
+    record = manager._active
+    assert record is not None
+    assert record.stored is not None
+    assert record.application_task is not None
+    task = json.loads(record.application_task)
+    stored_resume = record.stored.resume.path
+
+    assert task["evidence"][0] == {
+        "category": "resume",
+        "name": "Alex_Example_Resume.tex",
+        "text": latex_source.decode("utf-8"),
+    }
+    assert Path(task["job"]["resume"]["path"]) == stored_resume
+    assert task["job"]["resume"]["display_name"] == "resume.pdf"
+    assert stored_resume.read_bytes() == pdf_bytes()
+
+    await manager.delete(session_id)
+
+
+@pytest.mark.parametrize(
+    ("source_name", "source_content"),
+    [
+        ("resume.txt", b"not latex"),
+        ("resume.tex", b""),
+        ("resume.tex", b"\xff"),
+        ("resume.tex", b"x" * (256 * 1024 + 1)),
+    ],
+    ids=["wrong-extension", "empty", "invalid-utf8", "over-byte-limit"],
+)
+async def test_create_session_rejects_invalid_resume_source_with_fixed_error(
+    tmp_path: Path,
+    source_name: str,
+    source_content: bytes,
+) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=manager),
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://harness.test",
+    ) as client:
+        response = await client.post(
+            "/v1/sessions",
+            headers=AUTHORIZATION,
+            files=[
+                *(part for part in multipart_parts() if part[0] != "resume_source"),
+                (
+                    "resume_source",
+                    (source_name, source_content, "text/x-tex"),
+                ),
+            ],
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+
+
 async def test_application_task_preserves_absolute_stored_resume_path(
     tmp_path: Path,
 ) -> None:
@@ -3086,6 +3202,7 @@ async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
         ).encode(),
     )
     resume = upload("resume.pdf", pdf_bytes())
+    resume_source = upload("resume.tex", b"Resume evidence")
     encoded_secret = "ada.private%252525252540example.test"
     job_url = (
         f"https://a.example/Apply/%252525252541/{encoded_secret}/{PROFILE_SECRET}"
@@ -3114,6 +3231,7 @@ async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
         max_steps=100,
         personal_information=personal,
         resume=resume,
+        resume_source=resume_source,
         context=[],
         anecdotes=[],
     )
@@ -3203,6 +3321,7 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
         max_steps=100,
         personal_information=personal,
         resume=upload("resume.pdf", pdf_bytes()),
+        resume_source=upload("resume.tex", b"Resume evidence"),
         context=[],
         anecdotes=[],
     )
@@ -3237,20 +3356,17 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     await manager.delete(created.session_id)
 
 
-
-
-
-
 async def test_candidate_context_process_returns_valid_context_and_closes(
     tmp_path: Path,
 ) -> None:
-    personal, resume = valid_uploads()
+    personal, resume, resume_source = valid_uploads()
     session_id = uuid4()
     stored = await store_uploads(
         tmp_path,
         session_id,
         personal,
         resume,
+        resume_source,
         [],
         [],
     )
@@ -3258,7 +3374,7 @@ async def test_candidate_context_process_returns_valid_context_and_closes(
     try:
         candidate = await asyncio.wait_for(process.result(), timeout=10)
         assert candidate.direct_fields["email"] == PROFILE_SECRET
-        assert "Deterministic resume evidence" in candidate.resume_text
+        assert candidate.resume_text == "\\documentclass{article}\nResume evidence.\n"
         assert process._closed is True
     finally:
         await asyncio.wait_for(process.terminate(), timeout=1)
@@ -3432,7 +3548,7 @@ async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
-    personal, resume = valid_uploads()
+    personal, resume, resume_source = valid_uploads()
     created = await manager.create_session(
         job_url=JOB_URL,
         opportunity_kind="job",
@@ -3440,6 +3556,7 @@ async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces
         max_steps=1,
         personal_information=personal,
         resume=resume,
+        resume_source=resume_source,
         context=[],
         anecdotes=[],
     )
@@ -3557,7 +3674,7 @@ async def test_runtime_playwright_cli_errors_count_toward_step_limit(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
-    personal, resume = valid_uploads()
+    personal, resume, resume_source = valid_uploads()
     created = await manager.create_session(
         job_url=JOB_URL,
         opportunity_kind="job",
@@ -3565,6 +3682,7 @@ async def test_runtime_playwright_cli_errors_count_toward_step_limit(
         max_steps=2,
         personal_information=personal,
         resume=resume,
+        resume_source=resume_source,
         context=[],
         anecdotes=[],
     )

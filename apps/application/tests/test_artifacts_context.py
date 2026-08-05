@@ -25,6 +25,7 @@ from jobhunter_browser_harness.artifacts import (
 from jobhunter_browser_harness.context import (
     MAX_COMBINED_NARRATIVE_CHARACTERS,
     MAX_SOURCE_CHARACTERS,
+    MAX_RESUME_SOURCE_CHARACTERS,
     load_candidate_context,
     render_candidate_evidence,
 )
@@ -120,14 +121,18 @@ async def expect_invalid_artifacts(
     resume: UploadFile,
     contexts: list[UploadFile] | tuple[UploadFile, ...] = (),
     anecdotes: list[UploadFile] | tuple[UploadFile, ...] = (),
+    *,
+    resume_source: UploadFile | None = None,
 ) -> None:
-    all_uploads = (personal, resume, *contexts, *anecdotes)
+    source = resume_source or upload("resume.tex", b"Resume source")
+    all_uploads = (personal, resume, source, *contexts, *anecdotes)
     with pytest.raises(HarnessServiceError) as caught:
         await store_uploads(
             root,
             SESSION_ID,
             personal,
             resume,
+            source,
             contexts,
             anecdotes,
         )
@@ -145,7 +150,7 @@ def stored_upload(directory: Path, name: str, content: bytes) -> StoredUpload:
 def candidate_artifacts(
     directory: Path,
     *,
-    resume_text: str | None = "Resume evidence",
+    resume_source_text: str = "Resume evidence",
     resume_content: bytes | None = None,
     profile_text: str = "Profile evidence",
     context_texts: tuple[str, ...] = (),
@@ -159,7 +164,12 @@ def candidate_artifacts(
     resume = stored_upload(
         directory,
         "candidate-resume.pdf",
-        resume_content if resume_content is not None else pdf_bytes(resume_text),
+        resume_content if resume_content is not None else pdf_bytes(),
+    )
+    resume_source = stored_upload(
+        directory,
+        "candidate-resume.tex",
+        resume_source_text.encode("utf-8"),
     )
     contexts = tuple(
         stored_upload(directory, f"background-{index}.md", text.encode("utf-8"))
@@ -173,6 +183,7 @@ def candidate_artifacts(
         session_directory=directory,
         personal_upload=personal_upload,
         resume=resume,
+        resume_source=resume_source,
         contexts=contexts,
         anecdotes=anecdotes,
         personal=PersonalInformation(direct_fields=direct_fields, narrative=profile_text),
@@ -195,6 +206,10 @@ async def test_store_uploads_uses_private_modes_sanitized_collision_safe_names_a
         b"---\nemail: applicant@example.test\n---\nNarrative\n",
     )
     resume = upload(r"C:\fakepath\Résumé.PDF", pdf_bytes())
+    resume_source = upload(
+        r"C:\fakepath\Alex Example Résumé.TEX",
+        b"\\documentclass{article}\nExact source",
+    )
     contexts = [
         upload("../../notes?.TXT", b"first"),
         upload(r"..\..\notes*.txt", b"second"),
@@ -202,7 +217,13 @@ async def test_store_uploads_uses_private_modes_sanitized_collision_safe_names_a
     anecdote = upload("../../delivery story.md", b"story")
 
     artifacts = await store_uploads(
-        tmp_path, SESSION_ID, personal, resume, contexts, [anecdote]
+        tmp_path,
+        SESSION_ID,
+        personal,
+        resume,
+        resume_source,
+        contexts,
+        [anecdote],
     )
 
     assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
@@ -210,6 +231,7 @@ async def test_store_uploads_uses_private_modes_sanitized_collision_safe_names_a
     assert artifacts.session_directory == tmp_path / str(SESSION_ID)
     assert artifacts.personal_upload.display_name == "My_R_sum_Profile.md"
     assert artifacts.resume.display_name == "R_sum.pdf"
+    assert artifacts.resume_source.display_name == "Alex_Example_R_sum.tex"
     assert [item.display_name for item in artifacts.contexts] == [
         "notes.txt",
         "notes-2.txt",
@@ -218,13 +240,17 @@ async def test_store_uploads_uses_private_modes_sanitized_collision_safe_names_a
     stored = (
         artifacts.personal_upload,
         artifacts.resume,
+        artifacts.resume_source,
         *artifacts.contexts,
         *artifacts.anecdotes,
     )
     assert all(item.path.parent == artifacts.session_directory for item in stored)
     assert all(item.path.name == item.display_name for item in stored)
     assert all(stat.S_IMODE(item.path.stat().st_mode) == 0o600 for item in stored)
-    assert all(item.file.closed for item in (personal, resume, *contexts, anecdote))
+    assert all(
+        item.file.closed
+        for item in (personal, resume, resume_source, *contexts, anecdote)
+    )
 
     with pytest.raises(FrozenInstanceError):
         artifacts.resume = artifacts.personal_upload  # type: ignore[misc]
@@ -272,6 +298,7 @@ async def test_store_uploads_accepts_exact_per_file_and_combined_byte_limits(
         "resume.pdf",
         b"%PDF-" + b"r" * (10 * 1024 * 1024 - len(b"%PDF-")),
     )
+    resume_source = upload("resume.tex", b"t" * (256 * 1024))
     contexts = [
         upload(f"context-{index}.txt", b"c" * (1024 * 1024))
         for index in range(5)
@@ -282,11 +309,18 @@ async def test_store_uploads_accepts_exact_per_file_and_combined_byte_limits(
     ]
 
     artifacts = await store_uploads(
-        tmp_path, SESSION_ID, personal, resume, contexts, anecdotes
+        tmp_path,
+        SESSION_ID,
+        personal,
+        resume,
+        resume_source,
+        contexts,
+        anecdotes,
     )
 
     assert artifacts.personal_upload.path.stat().st_size == 1024 * 1024
     assert artifacts.resume.path.stat().st_size == 10 * 1024 * 1024
+    assert artifacts.resume_source.path.stat().st_size == 256 * 1024
     assert (
         sum(item.path.stat().st_size for item in artifacts.contexts)
         == 5 * 1024 * 1024
@@ -296,9 +330,9 @@ async def test_store_uploads_accepts_exact_per_file_and_combined_byte_limits(
         == 2 * 1024 * 1024
     )
     assert all(
-        item.file.closed for item in (personal, resume, *contexts, *anecdotes)
+        item.file.closed
+        for item in (personal, resume, resume_source, *contexts, *anecdotes)
     )
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -306,6 +340,7 @@ async def test_store_uploads_accepts_exact_per_file_and_combined_byte_limits(
     [
         ("personal", 1024 * 1024 + 1),
         ("resume", 10 * 1024 * 1024 + 1),
+        ("resume_source", 256 * 1024 + 1),
         ("context", 1024 * 1024 + 1),
         ("anecdote", 256 * 1024 + 1),
     ],
@@ -314,18 +349,28 @@ async def test_store_uploads_enforces_each_per_file_byte_limit(
     tmp_path: Path, kind: str, size: int
 ) -> None:
     personal, resume = default_uploads()
+    resume_source = upload("resume.tex", b"Resume evidence")
     contexts: list[UploadFile] = []
     anecdotes: list[UploadFile] = []
     if kind == "personal":
         personal = upload("profile.md", b"p" * size)
     elif kind == "resume":
         resume = upload("resume.pdf", b"%PDF-" + b"p" * (size - 5))
+    elif kind == "resume_source":
+        resume_source = upload("resume.tex", b"t" * size)
     elif kind == "context":
         contexts.append(upload("context.md", b"c" * size))
     else:
         anecdotes.append(upload("anecdote.txt", b"a" * size))
 
-    await expect_invalid_artifacts(tmp_path, personal, resume, contexts, anecdotes)
+    await expect_invalid_artifacts(
+        tmp_path,
+        personal,
+        resume,
+        contexts,
+        anecdotes,
+        resume_source=resume_source,
+    )
 
 
 @pytest.mark.asyncio
@@ -356,9 +401,11 @@ async def test_store_uploads_enforces_combined_byte_limits_without_leaving_parti
     [
         ("personal", "profile.txt", b"profile"),
         ("resume", "resume.txt", b"%PDF-content"),
+        ("resume_source", "resume.txt", b"source"),
         ("context", "context.pdf", b"context"),
         ("anecdote", "anecdote.json", b"anecdote"),
         ("personal", "profile.md", b"\xff"),
+        ("resume_source", "resume.tex", b"\xff"),
         ("context", "context.txt", b"\xff"),
         ("anecdote", "anecdote.md", b"\xff"),
     ],
@@ -367,6 +414,7 @@ async def test_store_uploads_rejects_wrong_extensions_and_non_utf8_text(
     tmp_path: Path, bad_part: str, filename: str, content: bytes
 ) -> None:
     personal, resume = default_uploads()
+    resume_source = upload("resume.tex", b"Resume evidence")
     contexts: list[UploadFile] = []
     anecdotes: list[UploadFile] = []
     replacement = upload(filename, content)
@@ -374,12 +422,21 @@ async def test_store_uploads_rejects_wrong_extensions_and_non_utf8_text(
         personal = replacement
     elif bad_part == "resume":
         resume = replacement
+    elif bad_part == "resume_source":
+        resume_source = replacement
     elif bad_part == "context":
         contexts.append(replacement)
     else:
         anecdotes.append(replacement)
 
-    await expect_invalid_artifacts(tmp_path, personal, resume, contexts, anecdotes)
+    await expect_invalid_artifacts(
+        tmp_path,
+        personal,
+        resume,
+        contexts,
+        anecdotes,
+        resume_source=resume_source,
+    )
 
 
 @pytest.mark.asyncio
@@ -417,7 +474,7 @@ async def test_failed_cleanup_is_retained_and_retried(
     monkeypatch.setattr(artifacts_module, "remove_session_artifacts", fail_once)
     personal, resume = default_uploads(resume_content=b"not a pdf")
     with pytest.raises(HarnessServiceError):
-        await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+        await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
     session_directory = tmp_path / str(SESSION_ID)
     assert session_directory.exists()
     artifacts_module.retry_pending_cleanup()
@@ -464,9 +521,18 @@ class PausingPdfUpload(UploadFile):
 async def test_cancellation_closes_uploads_and_removes_partial_session(tmp_path: Path) -> None:
     personal = upload("profile.md", b"Profile")
     resume = PausingPdfUpload()
+    resume_source = upload("resume.tex", b"Resume evidence")
     context = upload("context.md", b"Context")
     task = asyncio.create_task(
-        store_uploads(tmp_path, SESSION_ID, personal, resume, [context], [])
+        store_uploads(
+            tmp_path,
+            SESSION_ID,
+            personal,
+            resume,
+            resume_source,
+            [context],
+            [],
+        )
     )
     await asyncio.wait_for(resume.paused.wait(), timeout=2)
 
@@ -476,6 +542,7 @@ async def test_cancellation_closes_uploads_and_removes_partial_session(tmp_path:
 
     assert personal.file.closed
     assert resume.file.closed
+    assert resume_source.file.closed
     assert context.file.closed
     assert not (tmp_path / str(SESSION_ID)).exists()
 
@@ -523,7 +590,7 @@ async def test_personal_markdown_without_front_matter_is_entirely_narrative(
     body = b"email: narrative-only@example.test\nSkills and experience.\n"
     personal, resume = default_uploads(personal_content=body)
 
-    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
 
     assert artifacts.personal.direct_fields == ()
     assert artifacts.personal.narrative == body.decode()
@@ -538,7 +605,7 @@ async def test_utf8_bom_front_matter_keeps_direct_values_out_of_narrative(
             "Professional narrative."
         ).encode("utf-8")
     )
-    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
     assert dict(artifacts.personal.direct_fields)["email"] == "private@example.test"
     assert "private@example.test" not in artifacts.personal.narrative
     assert "salary_expectation" not in artifacts.personal.narrative
@@ -551,7 +618,7 @@ async def test_front_matter_body_is_optional_and_body_is_not_parsed_as_fields(
     personal, resume = default_uploads(
         personal_content=b"---\nemail: explicit@example.test\n---"
     )
-    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
     assert artifacts.personal.direct_fields == (("email", "explicit@example.test"),)
     assert artifacts.personal.narrative == ""
     remove_session_artifacts(artifacts.session_directory)
@@ -562,7 +629,7 @@ async def test_front_matter_body_is_optional_and_body_is_not_parsed_as_fields(
             b"phone: this remains prose, not a direct field\n"
         )
     )
-    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
     assert dict(artifacts.personal.direct_fields) == {
         "email": "explicit@example.test"
     }
@@ -602,7 +669,7 @@ async def test_front_matter_accepts_exact_direct_field_allowlist(tmp_path: Path)
     ) + "\n---\nBody"
     personal, resume = default_uploads(personal_content=markdown.encode())
 
-    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
 
     values = dict(artifacts.personal.direct_fields)
     assert set(values) == EXPECTED_DIRECT_FIELDS
@@ -624,7 +691,7 @@ async def test_full_name_is_trimmed_and_split_once_for_missing_components(
         personal_content=f"---\nfull_name: '{full_name}'\n---\n".encode()
     )
 
-    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
     values = dict(artifacts.personal.direct_fields)
 
     assert values["full_name"] == full_name
@@ -650,7 +717,7 @@ async def test_explicit_first_or_last_name_suppresses_derived_components(
         ).encode()
     )
 
-    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, [], [])
+    artifacts = await store_uploads(tmp_path, SESSION_ID, personal, resume, upload("resume.tex", b"Resume evidence"), [], [])
     values = dict(artifacts.personal.direct_fields)
 
     assert values["full_name"] == "Ada Lovelace"
@@ -670,7 +737,7 @@ def test_candidate_context_extracts_and_attributes_every_evidence_category(
     secret = "direct-only-secret@example.test"
     artifacts = candidate_artifacts(
         tmp_path / "session",
-        resume_text="Resume engineering evidence",
+        resume_source_text="Resume engineering evidence",
         profile_text="Profile narrative evidence",
         context_texts=("User-reported context caveat",),
         anecdote_texts=(
@@ -681,7 +748,7 @@ def test_candidate_context_extracts_and_attributes_every_evidence_category(
     )
 
     candidate = load_candidate_context(artifacts)
-    rendered = render_candidate_evidence(candidate, artifacts.resume.display_name)
+    rendered = render_candidate_evidence(candidate, artifacts.resume_source.display_name)
 
     assert candidate.resume_text == "Resume engineering evidence"
     assert candidate.profile_narrative.category == "profile"
@@ -716,37 +783,44 @@ def test_rendered_source_records_cannot_forge_another_category(tmp_path: Path) -
     )
     artifacts = candidate_artifacts(
         tmp_path / "forged-boundary",
-        resume_text="Real resume",
+        resume_source_text="Real resume",
         anecdote_texts=(forged,),
     )
     rendered = render_candidate_evidence(
         load_candidate_context(artifacts),
-        artifacts.resume.display_name,
+        artifacts.resume_source.display_name,
     )
     records = [json.loads(line) for line in rendered.splitlines()[1:]]
     assert [record["category"] for record in records] == ["resume", "profile", "anecdote"]
     assert records[-1]["text"] == forged
 
 
-@pytest.mark.parametrize("failure", ["blank", "encrypted", "corrupt"])
-def test_candidate_context_rejects_unextractable_encrypted_or_malformed_pdf(
-    tmp_path: Path, failure: str, caplog: pytest.LogCaptureFixture
+def test_candidate_context_uses_latex_source_without_parsing_the_pdf(
+    tmp_path: Path,
 ) -> None:
-    secret = "private-resume-byte-secret"
-    if failure == "blank":
-        content = pdf_bytes(None)
-    elif failure == "encrypted":
-        content = pdf_bytes("Encrypted resume", encrypted=True)
-    else:
-        content = f"%PDF-{secret}-not-a-readable-document".encode()
     artifacts = candidate_artifacts(
-        tmp_path / failure,
-        resume_content=content,
-        profile_text="Profile",
+        tmp_path / "source-not-pdf",
+        resume_source_text="Exact LaTeX evidence",
+        resume_content=b"%PDF-private-bytes-not-a-readable-document",
     )
 
+    candidate = load_candidate_context(artifacts)
+
+    assert candidate.resume_text == "Exact LaTeX evidence"
+
+
+@pytest.mark.parametrize("failure", ["invalid_utf8", "missing"])
+def test_candidate_context_rejects_corrupt_or_missing_resume_source(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    artifacts = candidate_artifacts(tmp_path / failure)
+    if failure == "invalid_utf8":
+        artifacts.resume_source.path.write_bytes(b"\xff")
+    else:
+        artifacts.resume_source.path.unlink()
+
     load_context_error(artifacts)
-    assert secret not in caplog.text
 
 
 @pytest.mark.parametrize("failure", ["invalid_utf8", "missing", "unsafe_name"])
@@ -767,6 +841,7 @@ def test_candidate_context_sanitizes_stored_source_failures(
             session_directory=artifacts.session_directory,
             personal_upload=artifacts.personal_upload,
             resume=artifacts.resume,
+            resume_source=artifacts.resume_source,
             contexts=(
                 StoredUpload(
                     path=context_upload.path,
@@ -784,15 +859,20 @@ def test_candidate_context_sanitizes_stored_source_failures(
 def test_each_candidate_source_accepts_exact_character_limit_without_truncation(
     tmp_path: Path, category: str
 ) -> None:
-    bounded = "R" * MAX_SOURCE_CHARACTERS
+    limit = (
+        MAX_RESUME_SOURCE_CHARACTERS
+        if category == "resume"
+        else MAX_SOURCE_CHARACTERS
+    )
+    bounded = "R" * limit
     arguments: dict[str, object] = {
-        "resume_text": "R",
+        "resume_source_text": "R",
         "profile_text": "",
         "context_texts": (),
         "anecdote_texts": (),
     }
     if category == "resume":
-        arguments["resume_text"] = bounded
+        arguments["resume_source_text"] = bounded
     elif category == "profile":
         arguments["profile_text"] = bounded
     elif category == "context":
@@ -810,22 +890,27 @@ def test_each_candidate_source_accepts_exact_character_limit_without_truncation(
         "anecdote": candidate.anecdotes[0].text if candidate.anecdotes else "",
     }[category]
     assert actual == bounded
-    assert len(actual) == MAX_SOURCE_CHARACTERS
+    assert len(actual) == limit
 
 
 @pytest.mark.parametrize("category", ["resume", "profile", "context", "anecdote"])
 def test_each_candidate_source_rejects_one_character_over_limit(
     tmp_path: Path, category: str
 ) -> None:
-    oversized = "X" * (MAX_SOURCE_CHARACTERS + 1)
+    limit = (
+        MAX_RESUME_SOURCE_CHARACTERS
+        if category == "resume"
+        else MAX_SOURCE_CHARACTERS
+    )
+    oversized = "X" * (limit + 1)
     arguments: dict[str, object] = {
-        "resume_text": "R",
+        "resume_source_text": "R",
         "profile_text": "",
         "context_texts": (),
         "anecdote_texts": (),
     }
     if category == "resume":
-        arguments["resume_text"] = oversized
+        arguments["resume_source_text"] = oversized
     elif category == "profile":
         arguments["profile_text"] = oversized
     elif category == "context":
@@ -841,23 +926,20 @@ def test_each_candidate_source_rejects_one_character_over_limit(
 def test_combined_narrative_character_limit_is_exact_and_never_truncates(
     tmp_path: Path, extra_character: bool
 ) -> None:
-    resume = "R"
+    resume = "R" * MAX_RESUME_SOURCE_CHARACTERS
     profile = "P" * MAX_SOURCE_CHARACTERS
-    context = "C" * MAX_SOURCE_CHARACTERS
-    anecdote_length = (
+    context = "C" * (
         MAX_COMBINED_NARRATIVE_CHARACTERS
         - len(resume)
         - len(profile)
-        - len(context)
         + int(extra_character)
     )
-    anecdote = "A" * anecdote_length
     artifacts = candidate_artifacts(
         tmp_path / ("over" if extra_character else "exact"),
-        resume_text=resume,
+        resume_source_text=resume,
         profile_text=profile,
         context_texts=(context,),
-        anecdote_texts=(anecdote,),
+        anecdote_texts=(),
     )
 
     if extra_character:
@@ -868,7 +950,7 @@ def test_combined_narrative_character_limit_is_exact_and_never_truncates(
     assert candidate.resume_text == resume
     assert candidate.profile_narrative.text == profile
     assert candidate.context_sources[0].text == context
-    assert candidate.anecdotes[0].text == anecdote
+    assert candidate.anecdotes == ()
     assert (
         len(candidate.resume_text)
         + len(candidate.profile_narrative.text)

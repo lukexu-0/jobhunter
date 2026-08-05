@@ -14,6 +14,7 @@ class ApplicationRunRequest:
     session: SessionCreateRequest
     candidate: CandidateContext
     resume_display_name: str
+    resume_source_display_name: str
     user_info: UserInfoSnapshot
     resume_upload_path: str | None = None
 
@@ -37,7 +38,7 @@ def build_application_task(request: ApplicationRunRequest) -> str:
         record.as_task_value()
         for record in candidate_evidence_records(
             request.candidate,
-            request.resume_display_name,
+            request.resume_source_display_name,
         )
     ]
     saved = request.user_info.as_task_payload()

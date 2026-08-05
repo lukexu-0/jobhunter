@@ -445,9 +445,17 @@ export class ApplicationSessionService {
       mapRepositoryError(error);
     }
     const pdf = this.dependencies.repository.getArtifact(runId, "compiled-pdf", run.currentRevision);
+    const tailoredTex = this.dependencies.repository.getArtifact(
+      runId,
+      "tailored-tex",
+      run.currentRevision,
+    );
     if (
       !pdf
       || (run.status === "approved" && pdf.sha256 !== run.approvedPdfSha256)
+      || !tailoredTex
+      || tailoredTex.revision !== run.currentRevision
+      || tailoredTex.byteSize < 1
     ) {
       return this.#notStarted("artifacts_pruned");
     }

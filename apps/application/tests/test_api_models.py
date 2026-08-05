@@ -160,6 +160,7 @@ class FakeSessionService:
         max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
+        resume_source: UploadFile,
         context: Sequence[UploadFile],
         anecdotes: Sequence[UploadFile],
     ) -> SessionCreateResponse:
@@ -178,6 +179,10 @@ class FakeSessionService:
                     await personal_information.read(),
                 ),
                 "resume": (resume.filename, await resume.read()),
+                "resume_source": (
+                    resume_source.filename,
+                    await resume_source.read(),
+                ),
                 "context": [
                     (upload.filename, await upload.read()) for upload in context
                 ],
@@ -272,6 +277,10 @@ def multipart_parts(
             ("profile.md", b"---\nfull_name: Test Person\n---\nProfile", "text/markdown"),
         ),
         ("resume", ("resume.pdf", b"%PDF-1.7 synthetic", "application/pdf")),
+        (
+            "resume_source",
+            ("resume.tex", b"\\documentclass{article}\nResume", "text/x-tex"),
+        ),
     ]
     if opportunity_kind is not None:
         parts.insert(0, ("opportunity_kind", (None, opportunity_kind)))
@@ -1075,6 +1084,10 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
         b"---\nfull_name: Test Person\n---\nProfile",
     )
     assert call["resume"] == ("resume.pdf", b"%PDF-1.7 synthetic")
+    assert call["resume_source"] == (
+        "resume.tex",
+        b"\\documentclass{article}\nResume",
+    )
     assert call["context"] == [
         ("context-0.md", b"context 0"),
         ("context-1.md", b"context 1"),
@@ -1121,6 +1134,24 @@ async def test_multipart_rejects_missing_or_invalid_opportunity_kind_before_disp
         "/v1/sessions",
         headers=AUTHORIZATION,
         files=multipart_parts(opportunity_kind=opportunity_kind),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.create_calls == []
+
+
+async def test_multipart_requires_resume_source_before_dispatch(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    response = await client.post(
+        "/v1/sessions",
+        headers=AUTHORIZATION,
+        files=[part for part in multipart_parts() if part[0] != "resume_source"],
     )
 
     assert response.status_code == 422

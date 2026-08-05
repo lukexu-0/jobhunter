@@ -551,6 +551,13 @@ describe("application session service", () => {
 
   test("rejects application start when the current tailored source is missing", async () => {
     const target = await createTarget({ tailoredTexBytes: null });
+    expect(await target.service.get(target.runId)).toEqual({
+      state: "not_started",
+      canStart: false,
+      canStartAfterApproval: false,
+      blockedReason: "artifacts_pruned",
+    });
+
 
     await expect(
       target.service.start(target.runId, target.pdf.sha256, signal()),

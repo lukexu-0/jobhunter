@@ -644,11 +644,12 @@ export class PipelineRepository {
     readonly runId: string;
     readonly approvedPdfSha256: string;
   } | null {
-    const row = this.#db.query<{
+    const rows = this.#db.query<{
       run_id: string;
       approved_pdf_sha256: string;
+      current_revision: number;
     }, []>(`
-      SELECT runs.id AS run_id, runs.approved_pdf_sha256
+      SELECT runs.id AS run_id, runs.approved_pdf_sha256, runs.current_revision
       FROM runs
       WHERE runs.deleted_at IS NULL
         AND runs.status = 'approved'
@@ -681,11 +682,24 @@ export class PipelineRepository {
           WHERE slot_released = 0
         )
       ORDER BY runs.queue_sequence
-      LIMIT 1
-    `).get();
-    return row
-      ? { runId: row.run_id, approvedPdfSha256: row.approved_pdf_sha256 }
-      : null;
+    `).all();
+    for (const row of rows) {
+      const source = this.getArtifact(
+        row.run_id,
+        "tailored-tex",
+        row.current_revision,
+      );
+      if (
+        !source
+        || source.revision !== row.current_revision
+        || source.byteSize < 1
+      ) continue;
+      return {
+        runId: row.run_id,
+        approvedPdfSha256: row.approved_pdf_sha256,
+      };
+    }
+    return null;
   }
 
   reserveApplicationSession(
