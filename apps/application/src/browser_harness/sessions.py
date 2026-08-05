@@ -197,7 +197,9 @@ class _ApplicationSession:
     sign_in_inspection_step: int = 0
     additional_info_question_count: int = 0
     submission_action_started: bool = False
-    steering_command_pending: bool = False
+    steering_epoch: int = 0
+    steering_command_pending_epochs: set[int] = field(default_factory=set)
+    auto_submission_approval_pending: bool = False
     setup_task: asyncio.Task[Any] | None = None
     context_process: CandidateContextProcess | None = None
     resume_upload_path: str | None = None
@@ -764,6 +766,7 @@ class ApplicationSessionManager:
         credential_command: SignInCommand | SaveCredentialsCommand | None = None
         steer_model: PipelineApplicationAgentClient | None = None
         steer_message: str | None = None
+        steer_epoch: int | None = None
         async with record.request_lock:
             if record.finalized or record.final_request is not None:
                 if (
@@ -801,6 +804,7 @@ class ApplicationSessionManager:
                 agent_task = record.agent_task
                 gate = record.human_gate
                 model = record.model
+                steer_epoch = record.steering_epoch
                 if (
                     record.snapshot.state not in _STEERABLE_SESSION_STATES
                     or agent_task is None
@@ -808,7 +812,8 @@ class ApplicationSessionManager:
                     or gate is None
                     or model is None
                     or record.submission_action_started
-                    or record.steering_command_pending
+                    or steer_epoch in record.steering_command_pending_epochs
+                    or record.auto_submission_approval_pending
                     or gate.submission_approved
                 ):
                     raise HarnessServiceError(
@@ -816,7 +821,7 @@ class ApplicationSessionManager:
                         "command_conflict",
                         _COMMAND_CONFLICT_MESSAGE,
                     )
-                record.steering_command_pending = True
+                record.steering_command_pending_epochs.add(steer_epoch)
                 steer_model = model
                 steer_message = command.message
             elif isinstance(command, CancelCommand):
@@ -837,7 +842,13 @@ class ApplicationSessionManager:
                     raise HarnessServiceError(
                         409, "command_conflict", "The session is still starting"
                     )
-                if record.steering_command_pending:
+                if (
+                    record.steering_epoch in record.steering_command_pending_epochs
+                    or (
+                        isinstance(command, SubmitCommand)
+                        and record.steering_command_pending_epochs
+                    )
+                ):
                     raise HarnessServiceError(
                         409,
                         "command_conflict",
@@ -867,7 +878,11 @@ class ApplicationSessionManager:
                 "session_terminal",
                 "The application session has already ended",
             )
-        if steer_model is not None and steer_message is not None:
+        if (
+            steer_model is not None
+            and steer_message is not None
+            and steer_epoch is not None
+        ):
             steering_error: PipelineApplicationAgentError | None = None
             try:
                 await steer_model.steer(steer_message)
@@ -875,12 +890,13 @@ class ApplicationSessionManager:
                 steering_error = error
             finally:
                 async with record.request_lock:
-                    record.steering_command_pending = False
+                    record.steering_command_pending_epochs.discard(steer_epoch)
                     gate = record.human_gate
                     agent_task = record.agent_task
                     steering_still_current = (
                         not record.finalized
                         and record.final_request is None
+                        and record.steering_epoch == steer_epoch
                         and record.snapshot.state in _STEERABLE_SESSION_STATES
                         and gate is not None
                         and not gate.submission_approved
@@ -933,6 +949,7 @@ class ApplicationSessionManager:
         owns_pending = False
         current_task = asyncio.current_task()
         submission_attempt_active = False
+        auto_submission_approval = False
         try:
             async with record.request_lock:
                 if record.finalized or record.final_request is not None:
@@ -988,9 +1005,23 @@ class ApplicationSessionManager:
                         "command_conflict",
                         "A runtime action is already pending",
                     )
+                auto_submission_approval = (
+                    isinstance(action, RequestHumanReviewRuntimeAction)
+                    and record.request.auto_submit
+                )
+                if (
+                    auto_submission_approval
+                    and record.steering_command_pending_epochs
+                ):
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        _COMMAND_CONFLICT_MESSAGE,
+                    )
                 record.runtime_action_pending = True
                 record.runtime_action_task = current_task
                 owns_pending = True
+                record.auto_submission_approval_pending = auto_submission_approval
                 starts_submission = isinstance(
                     action,
                     RequestHumanNavigationRuntimeAction,
@@ -1042,6 +1073,7 @@ class ApplicationSessionManager:
                     if record.runtime_action_task is current_task:
                         record.runtime_action_task = None
                         record.runtime_action_pending = False
+                        record.auto_submission_approval_pending = False
 
     async def _dispatch_runtime_action(
         self,
@@ -1915,6 +1947,7 @@ class ApplicationSessionManager:
     ) -> None:
         if record.finalized or record.final_request is not None:
             return
+        record.steering_epoch += 1
         approved = (
             list(record.human_gate.approved_origins)
             if record.human_gate is not None
