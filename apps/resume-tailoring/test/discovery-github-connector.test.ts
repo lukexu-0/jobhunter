@@ -306,6 +306,7 @@ ${rows}
         throw new Error("Workday shell should not be requested");
       }
       return new Response(JSON.stringify({
+        jobDescription: "This unrelated response description must not replace the nested posting description.",
         jobPostingInfo: {
           jobDescription: `<p>${workdayDescription}</p>`,
         },
@@ -376,6 +377,42 @@ ${rows}
     expect(requestedPaths).toEqual([
       "/wday/cxs/wf/WellsFargoJobs/job/CHARLOTTE-NC/Risk-Development-Intern_R-556123",
     ]);
+  });
+
+  test("keeps encoded Workday posting segments inside the CXS path", async () => {
+    const workdayTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Acme | Technology Intern | [Apply](https://acme.wd1.myworkdayjobs.com/External/job/%252e%252e/%252e%252e/Technology-Intern_R123) |
+`;
+    const expectedPath = "/wday/cxs/acme/External/job/%252e%252e/%252e%252e/Technology-Intern_R123";
+    const requestedPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "workday-encoded-path",
+      name: "Workday encoded-path fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(workdayTable, { headers: { "content-type": "text/plain" } });
+      }
+      const path = new URL(input).pathname;
+      requestedPaths.push(path);
+      if (path !== expectedPath) throw new Error("Workday path escaped its validated segments");
+      return new Response(JSON.stringify({
+        jobPostingInfo: {
+          jobDescription: "Develop production software during this bounded technology internship program.",
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.items).toHaveLength(1);
+    expect(requestedPaths).toEqual([expectedPath]);
   });
 
   test("uses ETag/304 without refetching details", async () => {

@@ -480,14 +480,17 @@ async function sanitizedJsonDescription(
 function safeWorkdayPathSegment(value: string): string | undefined {
   try {
     const decoded = decodeURIComponent(value);
-    return decoded
-      && decoded !== "."
-      && decoded !== ".."
-      && !decoded.includes("/")
-      && !decoded.includes("\\")
-      && decoded.length <= 500
-      ? decoded
-      : undefined;
+    if (
+      !decoded
+      || decoded === "."
+      || decoded === ".."
+      || decoded.includes("/")
+      || decoded.includes("\\")
+      || decoded.length > 500
+    ) {
+      return undefined;
+    }
+    return encodeURIComponent(decoded);
   } catch {
     return undefined;
   }
@@ -525,16 +528,11 @@ function workdayCxsUrl(value: URL): URL | undefined {
 }
 
 async function workdayDescriptionFromJson(value: unknown): Promise<string | undefined> {
-  const descriptions: string[] = [];
-  visitJsonObjects(value, (record) => {
-    const description = nonemptyString(record.jobDescription);
-    if (description) descriptions.push(description);
-  });
-  for (const description of descriptions) {
-    const sanitized = await sanitizeDescription(description, "html");
-    if (sanitized) return sanitized;
-  }
-  return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const posting = (value as Readonly<Record<string, unknown>>).jobPostingInfo;
+  if (typeof posting !== "object" || posting === null || Array.isArray(posting)) return undefined;
+  const description = nonemptyString((posting as Readonly<Record<string, unknown>>).jobDescription);
+  return description ? sanitizeDescription(description, "html") : undefined;
 }
 
 async function loadWorkdayDescription(
