@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
-import type { AgentInputItem, ModelRequest } from "@openai/agents-core";
+import { Agent, Runner, tool, type AgentInputItem, type ModelRequest } from "@openai/agents-core";
 import type {
   ApiKeyResolver,
   AssistantMessage,
@@ -8,8 +8,11 @@ import type {
   Model as OmpModel,
   SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
+import { Flag, isContextOverflow } from "@oh-my-pi/pi-ai/error";
 import { getBundledModel, resolveWireModelId, type Effort } from "@oh-my-pi/pi-catalog";
+import { z } from "zod";
 import { OAuthRequiredError } from "../src/auth/oauth-only-resolver";
+import { projectApplicationHistory } from "../src/agents/application-history";
 import { inspectResumePng } from "../src/models/visual-inspector";
 import { mapAgentsRequest } from "../src/models/agents-mapping";
 import { MODEL_NAME, OAuthCodexModel, type CodexTransport } from "../src/models/oauth-codex-model";
@@ -45,6 +48,47 @@ function assistantMessage(content: AssistantMessage["content"]): AssistantMessag
     content, responseId: "response-1",
     usage: { input: 11, output: 7, cacheRead: 3, cacheWrite: 0, totalTokens: 21, reasoningTokens: 2, cost: ZERO_COST },
     stopReason: content.some((part) => part.type === "toolCall") ? "toolUse" : "stop", timestamp: 1,
+  };
+}
+
+const CONTEXT_OVERFLOW_MESSAGE = "This request exceeds the context window for this model.";
+
+function contextOverflowMessage(content: AssistantMessage["content"] = []): AssistantMessage {
+  return {
+    role: "assistant",
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    model: MODEL_NAME,
+    content,
+    usage: { input: 17, output: 0, cacheRead: 2, cacheWrite: 0, totalTokens: 19, cost: ZERO_COST },
+    stopReason: "error",
+    errorMessage: CONTEXT_OVERFLOW_MESSAGE,
+    timestamp: 1,
+  };
+}
+function abortedContextOverflowMessage(): AssistantMessage {
+  return {
+    ...contextOverflowMessage(),
+    stopReason: "aborted",
+    errorId: Flag.ContextOverflow,
+  };
+}
+
+
+function nativeCompactionMessage(id: string): AssistantMessage {
+  return {
+    ...assistantMessage([]),
+    providerPayload: {
+      type: "openaiResponsesHistory",
+      provider: "openai-codex",
+      dt: true,
+      items: [{
+        type: "compaction",
+        id,
+        encrypted_content: `encrypted-${id}`,
+        created_by: "server",
+      }],
+    },
   };
 }
 
@@ -353,10 +397,8 @@ describe("OAuth Codex Agents model bridge", () => {
       dt: false,
     });
     expect(response.output[0]).toMatchObject({
-      type: "compaction",
-      id: "cmp-1",
-      encrypted_content: "encrypted-compaction",
-      created_by: "server",
+      type: "reasoning",
+      content: [],
       providerData: {
         jobhunterCodex: {
           version: 1,
@@ -369,6 +411,379 @@ describe("OAuth Codex Agents model bridge", () => {
       },
     });
     expect(response.output[1]).toMatchObject({ type: "message", role: "assistant" });
+  });
+
+  test("recovers a completed pre-content context overflow with one native compaction and one replay", async () => {
+    expect(isContextOverflow(contextOverflowMessage())).toBe(true);
+    let resolverFactories = 0;
+    const calls: Array<{ kind: "normal" | "compaction"; context: Context }> = [];
+    const transport: CodexTransport = async function* (_model, context, options) {
+      const kind = options.codexCompaction === undefined ? "normal" : "compaction";
+      calls.push({ kind, context });
+      if (calls.length === 1) {
+        const overflow = contextOverflowMessage();
+        yield { type: "start", partial: overflow };
+        yield { type: "error", reason: "error", error: overflow };
+        return;
+      }
+      const message = calls.length === 2
+        ? nativeCompactionMessage("cmp-completed-overflow")
+        : assistantMessage([{ type: "text", text: "recovered completion" }]);
+      yield { type: "start", partial: message };
+      if (calls.length === 3) yield { type: "text_delta", contentIndex: 0, delta: "recovered completion", partial: message };
+      yield { type: "done", reason: "stop", message };
+    };
+
+    const response = await new OAuthCodexModel("attempt-completed-overflow", {
+      resolverFactory: () => {
+        resolverFactories += 1;
+        return inertResolver();
+      },
+      transport,
+    }).getResponse(modelRequest());
+
+    expect(calls.map(({ kind }) => kind)).toEqual(["normal", "compaction", "normal"]);
+    expect(resolverFactories).toBe(1);
+    expect(calls[0]?.context.systemPrompt).toEqual(calls[2]?.context.systemPrompt);
+    expect(calls[0]?.context.messages[0]).toEqual(calls[2]?.context.messages[0]);
+    const replacementAnchor = calls[2]?.context.messages.at(-1);
+    expect(replacementAnchor?.role).toBe("assistant");
+    if (replacementAnchor?.role !== "assistant") throw new Error("Overflow compaction history anchor missing");
+    expect(replacementAnchor.providerPayload).toMatchObject({
+      type: "openaiResponsesHistory",
+      provider: "openai-codex",
+      dt: false,
+      items: [{ type: "compaction", id: "cmp-completed-overflow", encrypted_content: "encrypted-cmp-completed-overflow" }],
+    });
+    expect(response.output[0]).toMatchObject({
+      type: "reasoning",
+      content: [],
+      providerData: {
+        jobhunterCodex: {
+          version: 1,
+          kind: "history",
+          payload: {
+            type: "openaiResponsesHistory",
+            provider: "openai-codex",
+            dt: false,
+            items: [{
+              type: "compaction",
+              id: "cmp-completed-overflow",
+              encrypted_content: "encrypted-cmp-completed-overflow",
+            }],
+          },
+        },
+      },
+    });
+    expect(response.output[1]).toMatchObject({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "recovered completion" }],
+    });
+    expect(response.usage).toMatchObject({
+      requests: 3,
+      inputTokens: 47,
+      outputTokens: 14,
+      totalTokens: 61,
+    });
+  });
+
+  test("recovers a streamed pre-content context overflow without restarting the external response", async () => {
+    let resolverFactories = 0;
+    const calls: Array<"normal" | "compaction"> = [];
+    const transport: CodexTransport = async function* (_model, _context, options) {
+      calls.push(options.codexCompaction === undefined ? "normal" : "compaction");
+      if (calls.length === 1) {
+        const overflow = contextOverflowMessage();
+        yield { type: "start", partial: overflow };
+        yield { type: "error", reason: "error", error: overflow };
+        return;
+      }
+      const message = calls.length === 2
+        ? nativeCompactionMessage("cmp-stream-overflow")
+        : assistantMessage([{ type: "text", text: "recovered stream" }]);
+      yield { type: "start", partial: message };
+      if (calls.length === 3) yield { type: "text_delta", contentIndex: 0, delta: "recovered stream", partial: message };
+      yield { type: "done", reason: "stop", message };
+    };
+
+    const events = [];
+    for await (const event of new OAuthCodexModel("attempt-stream-overflow", {
+      resolverFactory: () => {
+        resolverFactories += 1;
+        return inertResolver();
+      },
+      transport,
+    }).getStreamedResponse(modelRequest())) events.push(event);
+
+    expect(calls).toEqual(["normal", "compaction", "normal"]);
+    expect(resolverFactories).toBe(1);
+    expect(events.filter((event) => event.type === "response_started")).toHaveLength(1);
+    expect(events.map((event) => event.type)).toEqual(["response_started", "output_text_delta", "response_done"]);
+    expect(events.at(-1)?.type).toBe("response_done");
+    const done = events.at(-1);
+    if (done?.type !== "response_done") throw new Error("Recovered response_done missing");
+    expect(done.response.output[0]).toMatchObject({
+      type: "reasoning",
+      content: [],
+      providerData: {
+        jobhunterCodex: {
+          version: 1,
+          kind: "history",
+          payload: {
+            type: "openaiResponsesHistory",
+            provider: "openai-codex",
+            dt: false,
+            items: [{
+              type: "compaction",
+              id: "cmp-stream-overflow",
+              encrypted_content: "encrypted-cmp-stream-overflow",
+            }],
+          },
+        },
+      },
+    });
+    expect(done.response.output[1]).toMatchObject({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "recovered stream" }],
+    });
+    expect(done.response.usage).toMatchObject({
+      requests: 3,
+      inputTokens: 47,
+      outputTokens: 14,
+      totalTokens: 61,
+    });
+  });
+
+  test("keeps the recovered compaction anchor through the Agents runner into the next turn", async () => {
+    const calls: Array<"normal" | "compaction"> = [];
+    let nextTurnContext: Context | undefined;
+    const transport: CodexTransport = async function* (_model, context, options) {
+      const kind = options.codexCompaction === undefined ? "normal" : "compaction";
+      calls.push(kind);
+      let message: AssistantMessage;
+      if (calls.length === 1) {
+        message = contextOverflowMessage();
+        yield { type: "start", partial: message };
+        yield { type: "error", reason: "error", error: message };
+        return;
+      }
+      if (calls.length === 2) {
+        message = nativeCompactionMessage("cmp-runner-overflow");
+      } else if (calls.length === 3) {
+        message = assistantMessage([{
+          type: "toolCall",
+          id: "call-probe-history",
+          name: "probe_compaction_history",
+          arguments: {},
+        }]);
+      } else if (calls.length === 4) {
+        nextTurnContext = context;
+        message = assistantMessage([{ type: "text", text: "finished" }]);
+      } else {
+        throw new Error("Agents runner made an unexpected model request");
+      }
+      yield { type: "start", partial: message };
+      if (calls.length === 4) yield { type: "text_delta", contentIndex: 0, delta: "finished", partial: message };
+      yield { type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message };
+    };
+    const provider = new OAuthCodexModelProvider("attempt-runner-overflow", {
+      resolverFactory: inertResolver,
+      transport,
+    });
+    const probe = tool({
+      name: "probe_compaction_history",
+      description: "Continue after recovered compaction.",
+      parameters: z.object({}),
+      execute: async () => "observed",
+    });
+    const agent = new Agent({
+      name: "compaction continuity",
+      instructions: "Call the probe, then finish.",
+      model: MODEL_NAME,
+      tools: [probe],
+      modelSettings: {
+        parallelToolCalls: false,
+        store: false,
+        retry: { maxRetries: 0 },
+      },
+    });
+    const runner = new Runner({
+      modelProvider: provider,
+      tracingDisabled: true,
+      toolExecution: { maxFunctionToolConcurrency: 1 },
+    });
+
+    const result = await runner.run(agent, "begin", {
+      maxTurns: 3,
+      signal: new AbortController().signal,
+      callModelInputFilter: ({ modelData }) => ({
+        ...modelData,
+        input: projectApplicationHistory(modelData.input),
+      }),
+    });
+
+    expect(result.finalOutput).toBe("finished");
+    expect(calls).toEqual(["normal", "compaction", "normal", "normal"]);
+    expect(nextTurnContext?.messages.map((message) => message.role)).toEqual(["assistant", "assistant", "toolResult"]);
+    const anchor = nextTurnContext?.messages[0];
+    expect(anchor?.role).toBe("assistant");
+    if (anchor?.role !== "assistant") throw new Error("Recovered runner compaction anchor missing");
+    expect(anchor.providerPayload).toMatchObject({
+      type: "openaiResponsesHistory",
+      provider: "openai-codex",
+      dt: false,
+      items: [{
+        type: "compaction",
+        id: "cmp-runner-overflow",
+        encrypted_content: "encrypted-cmp-runner-overflow",
+      }],
+    });
+  });
+
+  test("surfaces a streamed context overflow after text output without compaction or replay", async () => {
+    const calls: Array<"normal" | "compaction"> = [];
+    const overflow = contextOverflowMessage([{ type: "text", text: "partial output" }]);
+    const transport: CodexTransport = async function* (_model, _context, options) {
+      calls.push(options.codexCompaction === undefined ? "normal" : "compaction");
+      yield { type: "start", partial: overflow };
+      yield { type: "text_delta", contentIndex: 0, delta: "partial output", partial: overflow };
+      yield { type: "error", reason: "error", error: overflow };
+    };
+
+    const events = [];
+    let surfaced: unknown;
+    try {
+      for await (const event of new OAuthCodexModel("attempt-stream-overflow-after-output", {
+        resolverFactory: inertResolver,
+        transport,
+      }).getStreamedResponse(modelRequest())) events.push(event);
+    } catch (error) {
+      surfaced = error;
+    }
+
+    expect(calls).toEqual(["normal"]);
+    expect(events.map((event) => event.type)).toEqual(["response_started", "output_text_delta"]);
+    expect(surfaced).toBeInstanceOf(Error);
+    expect(surfaced).toHaveProperty("message", CONTEXT_OVERFLOW_MESSAGE);
+  });
+  test("surfaces aborted overflows without compaction or replay", async () => {
+    const completedCalls: Array<"normal" | "compaction"> = [];
+    const completedTransport: CodexTransport = async function* (_model, _context, options) {
+      completedCalls.push(options.codexCompaction === undefined ? "normal" : "compaction");
+      const aborted = abortedContextOverflowMessage();
+      yield { type: "start", partial: aborted };
+      yield { type: "error", reason: "aborted", error: aborted };
+    };
+
+    await expect(new OAuthCodexModel("attempt-completed-aborted-overflow", {
+      resolverFactory: inertResolver,
+      transport: completedTransport,
+    }).getResponse(modelRequest())).rejects.toThrow(CONTEXT_OVERFLOW_MESSAGE);
+    expect(completedCalls).toEqual(["normal"]);
+
+    const streamedCalls: Array<"normal" | "compaction"> = [];
+    const streamedTransport: CodexTransport = async function* (_model, _context, options) {
+      streamedCalls.push(options.codexCompaction === undefined ? "normal" : "compaction");
+      const aborted = abortedContextOverflowMessage();
+      yield { type: "start", partial: aborted };
+      yield { type: "error", reason: "aborted", error: aborted };
+    };
+    const events = [];
+    let surfaced: unknown;
+    try {
+      for await (const event of new OAuthCodexModel("attempt-stream-aborted-overflow", {
+        resolverFactory: inertResolver,
+        transport: streamedTransport,
+      }).getStreamedResponse(modelRequest())) events.push(event);
+    } catch (error) {
+      surfaced = error;
+    }
+
+    expect(streamedCalls).toEqual(["normal"]);
+    expect(events.map((event) => event.type)).toEqual(["response_started"]);
+    expect(surfaced).toBeInstanceOf(Error);
+    expect(surfaced).toHaveProperty("message", CONTEXT_OVERFLOW_MESSAGE);
+  });
+
+  test("does not replay when the caller aborts during overflow compaction", async () => {
+    const cancellation = new Error("cancelled during overflow compaction");
+    const buildTransport = (
+      controller: AbortController,
+      calls: Array<"normal" | "compaction">,
+      compactionId: string,
+    ): CodexTransport => async function* (_model, _context, options) {
+      calls.push(options.codexCompaction === undefined ? "normal" : "compaction");
+      if (calls.length === 1) {
+        const overflow = contextOverflowMessage();
+        yield { type: "start", partial: overflow };
+        yield { type: "error", reason: "error", error: overflow };
+        return;
+      }
+      if (calls.length === 2) {
+        const compacted = nativeCompactionMessage(compactionId);
+        yield { type: "start", partial: compacted };
+        controller.abort(cancellation);
+        yield { type: "done", reason: "stop", message: compacted };
+        return;
+      }
+      throw new Error("Model request replayed after cancellation");
+    };
+
+    const completedController = new AbortController();
+    const completedCalls: Array<"normal" | "compaction"> = [];
+    let completedError: unknown;
+    try {
+      await new OAuthCodexModel("attempt-completed-abort-during-compaction", {
+        resolverFactory: inertResolver,
+        transport: buildTransport(completedController, completedCalls, "cmp-completed-aborted"),
+      }).getResponse(modelRequest({ signal: completedController.signal }));
+    } catch (error) {
+      completedError = error;
+    }
+    expect(completedCalls).toEqual(["normal", "compaction"]);
+    expect(completedError).toBe(cancellation);
+
+    const streamedController = new AbortController();
+    const streamedCalls: Array<"normal" | "compaction"> = [];
+    const events = [];
+    let streamedError: unknown;
+    try {
+      for await (const event of new OAuthCodexModel("attempt-stream-abort-during-compaction", {
+        resolverFactory: inertResolver,
+        transport: buildTransport(streamedController, streamedCalls, "cmp-stream-aborted"),
+      }).getStreamedResponse(modelRequest({ signal: streamedController.signal }))) events.push(event);
+    } catch (error) {
+      streamedError = error;
+    }
+    expect(streamedCalls).toEqual(["normal", "compaction"]);
+    expect(events.map((event) => event.type)).toEqual(["response_started"]);
+    expect(streamedError).toBe(cancellation);
+  });
+
+
+  test("surfaces a replay overflow without recursively compacting", async () => {
+    const calls: Array<"normal" | "compaction"> = [];
+    const transport: CodexTransport = async function* (_model, _context, options) {
+      calls.push(options.codexCompaction === undefined ? "normal" : "compaction");
+      if (calls.length === 2) {
+        const compacted = nativeCompactionMessage("cmp-one-shot-overflow");
+        yield { type: "start", partial: compacted };
+        yield { type: "done", reason: "stop", message: compacted };
+        return;
+      }
+      if (calls.length > 3) throw new Error("Unexpected recursive overflow recovery");
+      const overflow = contextOverflowMessage();
+      yield { type: "start", partial: overflow };
+      yield { type: "error", reason: "error", error: overflow };
+    };
+
+    await expect(new OAuthCodexModel("attempt-one-shot-overflow", {
+      resolverFactory: inertResolver,
+      transport,
+    }).getResponse(modelRequest())).rejects.toThrow(CONTEXT_OVERFLOW_MESSAGE);
+    expect(calls).toEqual(["normal", "compaction", "normal"]);
   });
 
   test("emits a valid response_done stream carrying final output and usage", async () => {

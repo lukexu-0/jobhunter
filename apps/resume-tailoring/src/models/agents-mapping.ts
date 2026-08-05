@@ -422,19 +422,31 @@ export function mapAgentsRequest(request: ModelRequest): MappedCodexRequest {
   };
 }
 
+export function mapPiAssistantUsage(message: AssistantMessage): ModelResponse["usage"] {
+  const inputTokens = message.usage.input + message.usage.cacheRead;
+  return new Usage({
+    requests: 1, inputTokens, outputTokens: message.usage.output, totalTokens: message.usage.totalTokens,
+    inputTokensDetails: [{ cached_tokens: message.usage.cacheRead }],
+    outputTokensDetails: message.usage.reasoningTokens === undefined ? [] : [{ reasoning_tokens: message.usage.reasoningTokens }],
+  });
+}
+
 export function mapPiAssistantMessage(message: AssistantMessage): ModelResponse {
   if (message.stopReason === "error" || message.stopReason === "aborted") throw new Error(message.errorMessage ?? `Codex request ${message.stopReason}`);
   const nativeHistory = message.providerPayload === undefined
     ? undefined
     : parseCodexHistoryPayload(message.providerPayload, "Codex response provider history");
   const output: AgentOutputItem[] = [];
+  let hasNativeCompaction = false;
   if (nativeHistory !== undefined) {
     for (const [index, item] of nativeHistory.items.entries()) {
       if (item.type === "compaction") {
-        output.push(parseCompactionItem(item, `Codex response compaction item at index ${index}`));
+        parseCompactionItem(item, `Codex response compaction item at index ${index}`);
+        hasNativeCompaction = true;
       }
     }
   }
+  if (hasNativeCompaction) output.push({ type: "reasoning", content: [] });
   const text = message.content.filter((part) => part.type === "text");
   if (text.length) {
     output.push({
@@ -465,11 +477,6 @@ export function mapPiAssistantMessage(message: AssistantMessage): ModelResponse 
           : { version: 1, kind: "covered" },
       },
     })) as AgentOutputItem[];
-  const inputTokens = message.usage.input + message.usage.cacheRead;
-  const usage = new Usage({
-    requests: 1, inputTokens, outputTokens: message.usage.output, totalTokens: message.usage.totalTokens,
-    inputTokensDetails: [{ cached_tokens: message.usage.cacheRead }],
-    outputTokensDetails: message.usage.reasoningTokens === undefined ? [] : [{ reasoning_tokens: message.usage.reasoningTokens }],
-  });
+  const usage = mapPiAssistantUsage(message);
   return { usage, output: bridgedOutput, ...(message.responseId ? { responseId: message.responseId } : {}) };
 }
