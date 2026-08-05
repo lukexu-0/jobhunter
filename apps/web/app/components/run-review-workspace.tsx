@@ -17,7 +17,11 @@ import type {
 } from "@jobhunter/pipeline/contracts";
 import {
   ApplicationSessionPanel,
+  type ApplicationGateCommandType,
   type ApplicationLifecycleAction,
+  type ApplicationSteerCommand,
+  type ApplicationSteeringState,
+  type ApplicationSteeringSubmissionResult,
 } from "./application-session-panel";
 import {
   APPLICATION_SESSION_EVENT_NAMES,
@@ -42,10 +46,17 @@ const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 
 type ReviewBusyAction = "retry" | "edit" | "approve" | null;
 type ApplicationStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "invalid";
+type ApplicationGateCommand = Exclude<
+  ApplicationSessionCommand,
+  { readonly type: "steer" }
+>;
 export interface ApplicationActionLatch {
   requestPending: boolean;
   projectionAccepted: boolean;
   readonly acceptsProjection: (view: ApplicationSessionView) => boolean;
+}
+interface ApplicationSteeringLatch {
+  state: Exclude<ApplicationSteeringState, "idle">;
 }
 
 export interface RunReviewWorkspaceProps {
@@ -108,7 +119,7 @@ function isTerminalApplicationSnapshot(snapshot: ApplicationSessionSnapshotDto):
 }
 
 function commandProjectionMatcher(
-  command: ApplicationSessionCommand,
+  command: ApplicationGateCommand,
   baseline: ApplicationSessionSnapshotDto,
 ): (view: ApplicationSessionView) => boolean {
   const navigationInstruction = baseline.pendingAction?.type === "human_navigation"
@@ -162,7 +173,7 @@ function commandProjectionMatcher(
 }
 
 export function createApplicationCommandLatch(
-  command: ApplicationSessionCommand,
+  command: ApplicationGateCommand,
   baseline: ApplicationSessionSnapshotDto,
 ): ApplicationActionLatch {
   return {
@@ -244,7 +255,9 @@ export function RunReviewWorkspace({
   const [applicationLifecycleAction, setApplicationLifecycleAction] =
     useState<ApplicationLifecycleAction | null>(null);
   const [applicationCommandAction, setApplicationCommandAction] =
-    useState<ApplicationSessionCommand["type"] | null>(null);
+    useState<ApplicationGateCommandType | null>(null);
+  const [applicationSteeringState, setApplicationSteeringState] =
+    useState<ApplicationSteeringState>("idle");
   const [applicationStreamState, setApplicationStreamState] =
     useState<ApplicationStreamState>("idle");
   const [applicationStreamRecovery, setApplicationStreamRecovery] = useState(0);
@@ -253,6 +266,7 @@ export function RunReviewWorkspace({
   const activeRunIdRef = useRef(run.id);
   const applicationLifecycleLatchRef = useRef<ApplicationActionLatch | null>(null);
   const applicationCommandLatchRef = useRef<ApplicationActionLatch | null>(null);
+  const applicationSteeringLatchRef = useRef<ApplicationSteeringLatch | null>(null);
   activeRunIdRef.current = run.id;
   const installApplicationView = useCallback((next: ApplicationSessionView): boolean => {
     if (activeRunIdRef.current !== run.id) return false;
@@ -269,6 +283,14 @@ export function RunReviewWorkspace({
     if (commandLatch && acceptApplicationActionProjection(commandLatch, next)) {
       applicationCommandLatchRef.current = null;
       setApplicationCommandAction(null);
+    }
+    const steeringLatch = applicationSteeringLatchRef.current;
+    if (
+      steeringLatch
+      && applicationSnapshot(next)?.bridgeState !== "running"
+    ) {
+      applicationSteeringLatchRef.current = null;
+      setApplicationSteeringState("idle");
     }
     onApplicationView(next);
     setApplicationView(next);
@@ -339,8 +361,10 @@ export function RunReviewWorkspace({
     setApplicationLoadError(null);
     applicationLifecycleLatchRef.current = null;
     applicationCommandLatchRef.current = null;
+    applicationSteeringLatchRef.current = null;
     setApplicationLifecycleAction(null);
     setApplicationCommandAction(null);
+    setApplicationSteeringState("idle");
     setIsStartingApplication(false);
     setApplicationError(null);
   }, [onApplicationView, run.id, run.revision]);
@@ -640,7 +664,51 @@ export function RunReviewWorkspace({
     }
   };
 
+  const submitApplicationSteering = async (
+    command: ApplicationSteerCommand,
+  ): Promise<ApplicationSteeringSubmissionResult> => {
+    const current = applicationSnapshot(applicationViewRef.current);
+    if (
+      !current
+      || current.bridgeState !== "running"
+      || applicationSteeringLatchRef.current
+    ) {
+      return {
+        status: "rejected",
+        message: "The application state changed; review the latest session state.",
+      };
+    }
+
+    const latch: ApplicationSteeringLatch = { state: "sending" };
+    applicationSteeringLatchRef.current = latch;
+    setApplicationSteeringState("sending");
+    try {
+      await sendApplicationCommand(run.id, command);
+      if (applicationSteeringLatchRef.current === latch) {
+        applicationSteeringLatchRef.current = null;
+        setApplicationSteeringState("idle");
+      }
+      return { status: "accepted" };
+    } catch (error) {
+      if (applicationSteeringLatchRef.current !== latch) {
+        return { status: "ambiguous" };
+      }
+      if (isDefiniteApplicationRequestRejection(error)) {
+        applicationSteeringLatchRef.current = null;
+        setApplicationSteeringState("idle");
+        return {
+          status: "rejected",
+          message: publicMessage(error, "The guidance could not be queued."),
+        };
+      }
+      latch.state = "ambiguous";
+      setApplicationSteeringState("ambiguous");
+      return { status: "ambiguous" };
+    }
+  };
+
   const submitApplicationCommand = async (command: ApplicationSessionCommand) => {
+    if (command.type === "steer") return;
     if (!snapshot || applicationCommandLatchRef.current) return;
     const latch = createApplicationCommandLatch(command, snapshot);
     applicationCommandLatchRef.current = latch;
@@ -805,11 +873,13 @@ export function RunReviewWorkspace({
               ? "resume"
               : applicationLifecycleAction ?? applicationCommandAction
           }
+          steeringState={applicationSteeringState}
           onCancel={cancelApplication}
           onClose={closeApplication}
           onLoadSuggestions={loadApplicationAnswerSuggestions}
           onProfessionalize={professionalizeApplicationAnswerForQuestion}
           onCommand={submitApplicationCommand}
+          onSteer={submitApplicationSteering}
           onResume={resumeReservedApplication}
           onRetry={retryApplication}
           snapshot={snapshot}
