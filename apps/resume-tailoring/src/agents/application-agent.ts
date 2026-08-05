@@ -432,10 +432,18 @@ function runtimeTool<Schema extends z.ZodObject>(
   return tool<Schema, BrowserApplicationContext, string>(definition);
 }
 
+const PlaywrightToolElementRefSchema = z.string().regex(/^(?:ref=)?e[1-9][0-9]{0,8}$/);
+
+function canonicalPlaywrightElementRef(value: z.infer<typeof PlaywrightToolElementRefSchema>): string {
+  return PlaywrightSnapshotElementRefSchema.parse(
+    value.startsWith("ref=") ? value.slice("ref=".length) : value,
+  );
+}
+
 const SignInToolParameters = z.object({
-  username_ref: PlaywrightSnapshotElementRefSchema,
-  password_ref: PlaywrightSnapshotElementRefSchema,
-  submit_ref: PlaywrightSnapshotElementRefSchema,
+  username_ref: PlaywrightToolElementRefSchema,
+  password_ref: PlaywrightToolElementRefSchema,
+  submit_ref: PlaywrightToolElementRefSchema,
 }).strict();
 
 const HumanNavigationToolParameters = z.object({
@@ -635,7 +643,7 @@ async function runApplicationAgentWithProfile(
 
   const requestSignIn = runtimeTool({
     name: "request_sign_in",
-    description: "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login form. Pass only the inspected refs for the username/email input, password input, and submit control. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
+    description: "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login form. Pass only the inspected refs for the username/email input, password input, and submit control; raw eN and snapshot ref=eN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
     parameters: SignInToolParameters,
     timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) => runtimeContext.playwrightCliCompleted,
@@ -651,7 +659,12 @@ async function runApplicationAgentWithProfile(
       delete runtimeContext.latestScreenshotDataUrl;
       const response = await runtimeAction(
         runtimeContext,
-        { type: "request_sign_in", username_ref, password_ref, submit_ref },
+        {
+          type: "request_sign_in",
+          username_ref: canonicalPlaywrightElementRef(username_ref),
+          password_ref: canonicalPlaywrightElementRef(password_ref),
+          submit_ref: canonicalPlaywrightElementRef(submit_ref),
+        },
         remainingDeadlineMs(runtimeContext),
         actionSignal,
       );
