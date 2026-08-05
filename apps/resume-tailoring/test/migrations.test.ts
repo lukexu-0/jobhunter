@@ -324,7 +324,8 @@ function versionSeventeenDiscoveryDatabase(): Database {
     CREATE TABLE discovery_jobs (
       id TEXT PRIMARY KEY,
       catalog_source_id TEXT NOT NULL,
-      catalog_source_item_id TEXT NOT NULL
+      catalog_source_item_id TEXT NOT NULL,
+      closed INTEGER NOT NULL DEFAULT 0 CHECK (closed IN (0,1))
     ) STRICT;
     CREATE TABLE discovery_sources (
       id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
@@ -441,6 +442,17 @@ function versionEighteenDiscoveryDatabase(): Database {
       'approved-shared-item',
       'url:https://jobs.example/shared',
       'shared-job'
+    );
+    INSERT INTO discovery_jobs(id, catalog_source_id, catalog_source_item_id, closed)
+    VALUES ('closed-shared-job', 'indeed-existing', 'indeed-closed-shared-item', 0);
+    INSERT INTO discovery_observations(source_id, source_item_id, job_id)
+    VALUES ('indeed-existing', 'indeed-closed-shared-item', 'closed-shared-job');
+    INSERT INTO discovery_observations(source_id, source_item_id, job_id, active)
+    VALUES (
+      'simplify-summer-2027',
+      'approved-inactive-only-item',
+      'closed-shared-job',
+      0
     );
     INSERT INTO schema_migrations(version, applied_at) VALUES (18, 1800);
     PRAGMA user_version = 18;
@@ -1290,6 +1302,11 @@ test("migration twenty-three keeps only approved discovery source families", () 
     },
     {
       source_id: "simplify-summer-2027",
+      source_item_id: "approved-inactive-only-item",
+      job_id: "closed-shared-job",
+    },
+    {
+      source_id: "simplify-summer-2027",
       source_item_id: "approved-item",
       job_id: "approved-job",
     },
@@ -1303,8 +1320,9 @@ test("migration twenty-three keeps only approved discovery source families", () 
     id: string;
     catalog_source_id: string;
     catalog_source_item_id: string;
+    closed: number;
   }, []>(`
-    SELECT id, catalog_source_id, catalog_source_item_id
+    SELECT id, catalog_source_id, catalog_source_item_id, closed
     FROM discovery_jobs
     ORDER BY id
   `).all()).toEqual([
@@ -1312,11 +1330,19 @@ test("migration twenty-three keeps only approved discovery source families", () 
       id: "approved-job",
       catalog_source_id: "simplify-summer-2027",
       catalog_source_item_id: "approved-item",
+      closed: 0,
+    },
+    {
+      id: "closed-shared-job",
+      catalog_source_id: "simplify-summer-2027",
+      catalog_source_item_id: "approved-inactive-only-item",
+      closed: 1,
     },
     {
       id: "shared-job",
       catalog_source_id: "simplify-summer-2027",
       catalog_source_item_id: "approved-shared-item",
+      closed: 0,
     },
   ]);
   expect(db.query<{ source_id: string; source_item_id: string; job_id: string }, []>(`

@@ -828,6 +828,17 @@ WHERE NOT EXISTS (
   WHERE discovery_observations.job_id = discovery_jobs.id
 );
 
+UPDATE discovery_jobs AS jobs
+SET closed = CASE
+  WHEN EXISTS (
+    SELECT 1
+    FROM discovery_observations AS observations
+    WHERE observations.job_id = jobs.id
+      AND observations.active = 1
+  ) THEN 0
+  ELSE 1
+END;
+
 CREATE TABLE discovery_sources_v23 (
   id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),

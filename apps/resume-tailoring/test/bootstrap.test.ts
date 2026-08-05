@@ -616,6 +616,12 @@ describe("pipeline application bootstrap", () => {
       webOrigin: "http://jobs.example.test:3456",
     })).toThrow("JOBHUNTER_WEB_ORIGIN must be an exact HTTPS or loopback HTTP origin");
   });
+
+  test("rejects a wildcard HTTPS web origin before constructing dependencies", () => {
+    expect(() => createPipelineApplication({
+      webOrigin: "https://*.example.com",
+    })).toThrow("JOBHUNTER_WEB_ORIGIN must be an exact HTTPS or loopback HTTP origin");
+  });
   test("rejects a short harness token before constructing dependencies", () => {
     expect(() => createPipelineApplication({
       browserHarnessToken: "too-short",

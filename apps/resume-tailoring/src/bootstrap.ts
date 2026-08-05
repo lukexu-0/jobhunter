@@ -119,6 +119,7 @@ function validateWebOrigin(origin: string): string {
     && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
   if (
     (url.protocol !== "https:" && !loopbackHttp)
+    || (url.protocol === "https:" && url.hostname.includes("*"))
     || url.origin !== origin
     || url.username !== ""
     || url.password !== ""
