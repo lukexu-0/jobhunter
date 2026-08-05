@@ -1192,6 +1192,10 @@ export const DiscoveryRoleSchema = z.enum([
   "other",
 ]);
 export type DiscoveryRole = z.infer<typeof DiscoveryRoleSchema>;
+export const DiscoveryRolesSchema = z.array(DiscoveryRoleSchema).min(1).max(7)
+  .refine((roles) => new Set(roles).size === roles.length, "Discovery roles must be unique")
+  .refine((roles) => roles.length === 1 || !roles.includes("other"), "Other must be the only discovery role");
+
 
 export const DiscoveryStatusSchema = z.enum(["open", "queued", "closed"]);
 export type DiscoveryStatus = z.infer<typeof DiscoveryStatusSchema>;
@@ -1216,7 +1220,7 @@ export const DiscoveryJobSchema = z.object({
   title: DiscoveryDisplayTextSchema,
   company: DiscoveryDisplayTextSchema,
   location: z.string().trim().min(1).max(500).nullable(),
-  role: DiscoveryRoleSchema,
+  roles: DiscoveryRolesSchema,
   canonicalUrl: DiscoveryHttpUrlSchema,
   applyUrl: DiscoveryHttpUrlSchema,
   descriptionPreview: z.string().max(500),

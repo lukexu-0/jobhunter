@@ -30,8 +30,11 @@ export interface DiscoveredJobInput {
   readonly location?: string | null | undefined;
   readonly description: string;
   readonly postedAt?: number | null | undefined;
-  readonly role?: DiscoveryRole | undefined;
   readonly requisitionId?: string | undefined;
+}
+
+export interface ClassifiedDiscoveredJobInput extends DiscoveredJobInput {
+  readonly roles: readonly DiscoveryRole[];
 }
 
 export interface DiscoverySyncResult {

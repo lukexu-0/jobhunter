@@ -13,7 +13,7 @@ const job = {
   title: "Software Engineering Intern",
   company: "Example",
   location: "Toronto, ON",
-  role: "software_engineering",
+  roles: ["software_engineering", "machine_learning"],
   canonicalUrl: "https://jobs.example.test/roles/123",
   applyUrl: "https://jobs.example.test/roles/123/apply",
   descriptionPreview: "Build production software with the platform team.",
@@ -37,6 +37,11 @@ describe("discovery HTTP contracts", () => {
     });
     expect(DiscoveryListResponseSchema.safeParse({
       jobs: [{ ...job, description: "full saved description" }],
+      total: 1,
+      lastSyncAt: null,
+    }).success).toBeFalse();
+    expect(DiscoveryListResponseSchema.safeParse({
+      jobs: [{ ...job, roles: ["other", "software_engineering"] }],
       total: 1,
       lastSyncAt: null,
     }).success).toBeFalse();
