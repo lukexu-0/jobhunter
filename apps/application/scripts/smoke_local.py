@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import httpx
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 _BROWSER_HARNESS_ROOT = Path(__file__).resolve().parents[1]
@@ -179,6 +179,7 @@ def make_pdf(text: str) -> bytes:
 def create_inputs(root: Path) -> dict[str, Path]:
     profile = root / "smoke-profile.md"
     resume = root / RESUME_NAME
+    resume_source = root / "Alex_Example_Resume.tex"
     context = root / "smoke-context.md"
     relevant = root / "quartz-incident.md"
     irrelevant = root / "orchid-garden.md"
@@ -191,14 +192,20 @@ def create_inputs(root: Path) -> dict[str, Path]:
         encoding="utf-8",
     )
     resume.write_bytes(make_pdf(RESUME_EVIDENCE))
+    resume_source.write_text(
+        "\\documentclass{article}\n"
+        "\\begin{document}\n"
+        f"{RESUME_EVIDENCE}\n"
+        "\\end{document}\n",
+        encoding="utf-8",
+    )
     context.write_text(f"# Synthetic application context\n\n{CONTEXT_EVIDENCE}\n", encoding="utf-8")
-    extracted = " ".join((page.extract_text() or "") for page in PdfReader(resume).pages)
-    require(RESUME_EVIDENCE in extracted, "Synthetic resume PDF was not text-extractable")
     relevant.write_text(f"# Relevant incident\n\n{RELEVANT_ANECDOTE}\n", encoding="utf-8")
     irrelevant.write_text(f"# Unrelated anecdote\n\n{IRRELEVANT_ANECDOTE}\n", encoding="utf-8")
     return {
         "profile": profile,
         "resume": resume,
+        "resume_source": resume_source,
         "context": context,
         "relevant": relevant,
         "irrelevant": irrelevant,
@@ -212,6 +219,14 @@ def multipart(inputs: dict[str, Path]) -> list[tuple[str, tuple[str, bytes, str]
             (inputs["profile"].name, inputs["profile"].read_bytes(), "text/markdown"),
         ),
         ("resume", (inputs["resume"].name, inputs["resume"].read_bytes(), "application/pdf")),
+        (
+            "resume_source",
+            (
+                inputs["resume_source"].name,
+                inputs["resume_source"].read_bytes(),
+                "text/x-tex",
+            ),
+        ),
         ("context", (inputs["context"].name, inputs["context"].read_bytes(), "text/markdown")),
         (
             "anecdote",

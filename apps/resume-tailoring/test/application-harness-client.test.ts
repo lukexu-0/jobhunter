@@ -6,6 +6,7 @@ import {
   type ApplicationHarnessCreateInput,
 } from "../src/api/application-harness-client";
 import type { ApplicationSessionCommand } from "../src/contracts";
+import { ARTIFACT_LIMITS } from "../src/system/artifacts.ts";
 
 const ORIGIN = "http://127.0.0.1:8765";
 const TOKEN = "test-token-0123456789abcdef-0123456789";
@@ -247,6 +248,7 @@ describe("HttpApplicationHarnessClient", () => {
       },
     });
     const resumePdf = new TextEncoder().encode("%PDF-1.7\napproved resume");
+    const resumeSource = new TextEncoder().encode("\\documentclass{article}\nExact current source");
     const signal = new AbortController().signal;
 
     await expect(client.create({
@@ -256,6 +258,7 @@ describe("HttpApplicationHarnessClient", () => {
       personalInformationMarkdown: "# Applicant\n\nPrivate profile",
       autoSubmit: true,
       resumePdf,
+      resumeSource,
     }, signal)).resolves.toBeUndefined();
 
     expect(capturedUrl).toBe(`${ORIGIN}/v1/sessions`);
@@ -278,6 +281,7 @@ describe("HttpApplicationHarnessClient", () => {
       "auto_submit",
       "personal_information",
       "resume",
+      "resume_source",
       "max_steps",
     ]);
     expect(form.get("session_id")).toBe(SESSION_ID);
@@ -286,14 +290,29 @@ describe("HttpApplicationHarnessClient", () => {
     expect(form.get("auto_submit")).toBe("true");
     expect(form.get("max_steps")).toBe("100");
     const profile = form.get("personal_information");
+    const resumeSourcePart = form.get("resume_source");
     const resume = form.get("resume");
     expect(profile).toBeInstanceOf(File);
+    expect(resumeSourcePart).toBeInstanceOf(File);
     expect(resume).toBeInstanceOf(File);
-    if (!(profile instanceof File) || !(resume instanceof File)) throw new Error("Expected file parts");
+    if (
+      !(profile instanceof File)
+      || !(resumeSourcePart instanceof File)
+      || !(resume instanceof File)
+    ) throw new Error("Expected file parts");
     expect({ name: profile.name, type: profile.type, text: await profile.text() }).toEqual({
       name: "applicant-profile.md",
       type: "text/markdown",
       text: "# Applicant\n\nPrivate profile",
+    });
+    expect({
+      name: resumeSourcePart.name,
+      type: resumeSourcePart.type,
+      bytes: new Uint8Array(await resumeSourcePart.arrayBuffer()),
+    }).toEqual({
+      name: "Alex_Example_Resume.tex",
+      type: "text/x-tex",
+      bytes: resumeSource,
     });
     expect({
       name: resume.name,
@@ -306,6 +325,39 @@ describe("HttpApplicationHarnessClient", () => {
     });
     expect(capturedUrl).not.toContain(TOKEN);
     expect([...form.values()].map((part) => String(part)).join("|")).not.toContain(TOKEN);
+  });
+  test("rejects invalid resume source bytes before network I/O", async () => {
+    let fetchCalls = 0;
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        throw new Error("network must not be called");
+      },
+    });
+    const baseInput: Omit<ApplicationHarnessCreateInput, "resumeSource"> = {
+      sessionId: SESSION_ID,
+      jobUrl: "https://jobs.private.example/roles/123",
+      opportunityKind: "job",
+      autoSubmit: false,
+      personalInformationMarkdown: "# Applicant",
+      resumePdf: new TextEncoder().encode("%PDF-private"),
+    };
+    const invalidSources: unknown[] = [
+      undefined,
+      new Uint8Array(),
+      Uint8Array.of(0xc3, 0x28),
+      new Uint8Array(ARTIFACT_LIMITS.tex + 1),
+    ];
+
+    for (const resumeSource of invalidSources) {
+      await expect(client.create(
+        { ...baseInput, resumeSource } as ApplicationHarnessCreateInput,
+        new AbortController().signal,
+      )).rejects.toEqual(new ApplicationHarnessError("invalid_request"));
+    }
+    expect(fetchCalls).toBe(0);
   });
   test("sends manual review mode explicitly", async () => {
     let form: FormData | undefined;
@@ -330,6 +382,7 @@ describe("HttpApplicationHarnessClient", () => {
       autoSubmit: false,
       personalInformationMarkdown: "# Applicant",
       resumePdf: new TextEncoder().encode("%PDF-private"),
+      resumeSource: new TextEncoder().encode("\\documentclass{article}"),
     }, new AbortController().signal);
 
     expect(form?.get("auto_submit")).toBe("false");
@@ -353,6 +406,7 @@ describe("HttpApplicationHarnessClient", () => {
       personalInformationMarkdown: "# Applicant",
       autoSubmit: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
+      resumeSource: new TextEncoder().encode("\\documentclass{article}"),
     }, new AbortController().signal)).resolves.toBeUndefined();
   });
   test("rejects mismatched caller IDs and non-strict create responses", async () => {
@@ -364,6 +418,7 @@ describe("HttpApplicationHarnessClient", () => {
       personalInformationMarkdown: "# Applicant",
       autoSubmit: false,
       resumePdf: new TextEncoder().encode("%PDF-private"),
+      resumeSource: new TextEncoder().encode("\\documentclass{article}"),
     };
     const invalidBodies = [
       {
@@ -950,6 +1005,7 @@ describe("HttpApplicationHarnessClient", () => {
       autoSubmit: false,
       personalInformationMarkdown: "# Applicant",
       resumePdf: new TextEncoder().encode("%PDF-private"),
+      resumeSource: new TextEncoder().encode("\\documentclass{article}"),
     };
     const responseCases = [
       {

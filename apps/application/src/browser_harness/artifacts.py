@@ -25,6 +25,7 @@ from .models import DIRECT_FIELD_NAMES, HarnessServiceError
 _CHUNK_SIZE: Final = 64 * 1024
 _PERSONAL_LIMIT: Final = 1024 * 1024
 _RESUME_LIMIT: Final = 10 * 1024 * 1024
+_RESUME_SOURCE_LIMIT: Final = 256 * 1024
 _CONTEXT_FILE_LIMIT: Final = 1024 * 1024
 _CONTEXT_TOTAL_LIMIT: Final = 5 * 1024 * 1024
 _ANECDOTE_FILE_LIMIT: Final = 256 * 1024
@@ -56,6 +57,7 @@ class StoredCandidateArtifacts:
     session_directory: Path
     personal_upload: StoredUpload
     resume: StoredUpload
+    resume_source: StoredUpload
     contexts: tuple[StoredUpload, ...]
     anecdotes: tuple[StoredUpload, ...]
     personal: PersonalInformation
@@ -526,13 +528,20 @@ async def store_uploads(
     session_id: UUID | str,
     personal_information: UploadFile,
     resume: UploadFile,
+    resume_source: UploadFile,
     contexts: Sequence[UploadFile],
     anecdotes: Sequence[UploadFile],
 ) -> StoredCandidateArtifacts:
     retry_pending_cleanup()
     context_uploads = tuple(contexts)
     anecdote_uploads = tuple(anecdotes)
-    all_uploads = (personal_information, resume, *context_uploads, *anecdote_uploads)
+    all_uploads = (
+        personal_information,
+        resume,
+        resume_source,
+        *context_uploads,
+        *anecdote_uploads,
+    )
     session_directory: Path | None = None
     session_descriptor: int | None = None
 
@@ -567,6 +576,16 @@ async def store_uploads(
                 decode_utf8=False,
                 require_pdf_magic=True,
             )
+            stored_resume_source, resume_source_size, _ = await _store_upload(
+                resume_source,
+                directory_descriptor=session_descriptor,
+                session_directory=session_directory,
+                allowed_suffixes=frozenset({".tex"}),
+                maximum_bytes=_RESUME_SOURCE_LIMIT,
+                decode_utf8=True,
+            )
+            if resume_source_size < 1:
+                raise ValueError("resume source is empty")
 
             stored_contexts: list[StoredUpload] = []
             context_total = 0
@@ -604,6 +623,7 @@ async def store_uploads(
                 session_directory=session_directory,
                 personal_upload=personal_upload,
                 resume=stored_resume,
+                resume_source=stored_resume_source,
                 contexts=tuple(stored_contexts),
                 anecdotes=tuple(stored_anecdotes),
                 personal=personal,

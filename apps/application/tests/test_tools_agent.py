@@ -262,10 +262,13 @@ def make_request(
     session_directory.mkdir()
     resume = session_directory / "resume.pdf"
     resume.write_bytes(b"%PDF-test")
+    resume_source = session_directory / "resume.tex"
+    resume_source.write_text("Built a deterministic data service.", encoding="utf-8")
     artifacts = UploadedArtifacts(
         session_directory=session_directory,
         personal_information=session_directory / "profile.md",
         resume=resume,
+        resume_source=resume_source,
     )
     session = SessionCreateRequest(
         session_id=SESSION_ID,
@@ -280,6 +283,7 @@ def make_request(
         session=session,
         candidate=make_candidate(),
         resume_display_name="resume.pdf",
+        resume_source_display_name="resume.tex",
         user_info=UserInfoStore(tmp_path / "empty-user-info.json").snapshot(JOB_URL),
     )
 
@@ -957,6 +961,7 @@ def test_task_is_exact_compact_data_envelope_for_current_application(
         ),
         candidate=base_request.candidate,
         resume_display_name=base_request.resume_display_name,
+        resume_source_display_name=base_request.resume_source_display_name,
         user_info=UserInfoStore(store_path).snapshot(JOB_URL),
         resume_upload_path=resolved_resume_path,
     )
@@ -997,7 +1002,7 @@ def test_task_is_exact_compact_data_envelope_for_current_application(
             "evidence": [
                 {
                     "category": "resume",
-                    "name": "resume.pdf",
+                    "name": "resume.tex",
                     "text": "Built a deterministic data service for Example Corp.",
                 },
                 {

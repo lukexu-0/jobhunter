@@ -369,6 +369,7 @@ class ApplicationSessionManager:
         max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
+        resume_source: UploadFile,
         context: Sequence[UploadFile],
         anecdotes: Sequence[UploadFile],
     ) -> SessionCreateResponse:
@@ -464,6 +465,7 @@ class ApplicationSessionManager:
                 session_id,
                 personal_information,
                 resume,
+                resume_source,
                 context,
                 anecdotes,
             )
@@ -490,6 +492,7 @@ class ApplicationSessionManager:
                 session_directory=stored.session_directory,
                 personal_information=stored.personal_upload.path,
                 resume=stored.resume.path,
+                resume_source=stored.resume_source.path,
                 context=tuple(item.path for item in stored.contexts),
                 anecdotes=tuple(item.path for item in stored.anecdotes),
             )
@@ -513,6 +516,7 @@ class ApplicationSessionManager:
                 session=request,
                 candidate=candidate,
                 resume_display_name=stored.resume.display_name,
+                resume_source_display_name=stored.resume_source.display_name,
                 user_info=user_info,
                 resume_upload_path=record.resume_upload_path,
             )
@@ -1506,6 +1510,7 @@ class ApplicationSessionManager:
                         session=request,
                         candidate=candidate,
                         resume_display_name=record.stored.resume.display_name,
+                        resume_source_display_name=record.stored.resume_source.display_name,
                         user_info=record.user_info,
                         resume_upload_path=record.resume_upload_path,
                     ),

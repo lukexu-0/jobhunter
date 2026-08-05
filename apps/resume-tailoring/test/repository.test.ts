@@ -828,7 +828,11 @@ describe("application session ledger", () => {
     const manualRunId = createReview(repo, hash, false, "manual-approved");
     repo.approve(manualRunId, hash);
 
-    const createAutomaticApproval = (id: string, autoSubmit: boolean): string => {
+    const createAutomaticApproval = (
+      id: string,
+      autoSubmit: boolean,
+      includeTailoredSource = true,
+    ): string => {
       const run = repo.createRun("JD", id, false, true, autoSubmit);
       const claim = repo.acquire()!;
       expect(claim.runId).toBe(run.id);
@@ -842,11 +846,22 @@ describe("application session ledger", () => {
         path: `/tmp/${id}.pdf`,
         byteSize: 10,
       });
+      if (includeTailoredSource) {
+        repo.finalizeArtifact(claim, {
+          attemptId: attempt.id,
+          stage: "visual_qa",
+          kind: "tailored-tex",
+          sha256: "a".repeat(64),
+          path: `/tmp/${id}.tex`,
+          byteSize: 10,
+        });
+      }
       repo.finishAttempt(claim, attempt.id, "succeeded");
       repo.completeVisualQa(claim, hash, false);
       repo.release(claim);
       return run.id;
     };
+    createAutomaticApproval("automatic-missing-source", false, false);
     const oldest = createAutomaticApproval("automatic-oldest", false);
     const next = createAutomaticApproval("automatic-next", true);
 
@@ -962,6 +977,14 @@ describe("application session ledger", () => {
       kind: "compiled-pdf",
       sha256: editedHash,
       path: "/tmp/automatic-edited-revision-2.pdf",
+      byteSize: 10,
+    });
+    repo.finalizeArtifact(editedClaim, {
+      attemptId: editedAttempt.id,
+      stage: "visual_qa",
+      kind: "tailored-tex",
+      sha256: "a".repeat(64),
+      path: "/tmp/automatic-edited-revision-2.tex",
       byteSize: 10,
     });
     repo.finishAttempt(editedClaim, editedAttempt.id, "succeeded");

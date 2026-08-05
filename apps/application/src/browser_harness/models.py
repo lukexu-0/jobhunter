@@ -564,6 +564,7 @@ class UploadedArtifacts(FrozenPrivateModel):
     session_directory: Path
     personal_information: Path
     resume: Path
+    resume_source: Path
     context: tuple[Path, ...] = Field(default=(), max_length=10)
     anecdotes: tuple[Path, ...] = Field(default=(), max_length=20)
 

@@ -2,23 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import multiprocessing as mp
 from dataclasses import dataclass
-from pathlib import Path
-from multiprocessing.connection import Connection
 from types import MappingProxyType
 from typing import Literal, Mapping
-
-from pypdf import PdfReader
-import pypdf.filters as pypdf_filters
 
 from .artifacts import StoredCandidateArtifacts, StoredUpload
 from .models import HarnessServiceError, validate_sanitized_basename
 
 MAX_SOURCE_CHARACTERS = 100_000
-MAX_COMBINED_NARRATIVE_CHARACTERS = 250_000
-MAX_PDF_STREAM_BYTES = 2 * 1024 * 1024
+MAX_RESUME_SOURCE_CHARACTERS = 256 * 1024
+_BASE_COMBINED_NARRATIVE_CHARACTERS = 250_000
+MAX_COMBINED_NARRATIVE_CHARACTERS = (
+    _BASE_COMBINED_NARRATIVE_CHARACTERS
+    + MAX_RESUME_SOURCE_CHARACTERS
+    - MAX_SOURCE_CHARACTERS
+)
 
 SourceCategory = Literal["profile", "context", "anecdote"]
 EvidenceCategory = Literal["resume", "profile", "context", "anecdote"]
@@ -45,7 +44,6 @@ class CandidateContext:
     anecdotes: tuple[AttributedSource, ...]
 
 
-
 @dataclass(frozen=True, slots=True)
 class AttributedEvidence:
     category: EvidenceCategory
@@ -56,7 +54,12 @@ class AttributedEvidence:
         if self.category not in {"resume", "profile", "context", "anecdote"}:
             raise ValueError("candidate evidence has an invalid category")
         validate_sanitized_basename(self.name)
-        if len(self.text) > MAX_SOURCE_CHARACTERS:
+        maximum_characters = (
+            MAX_RESUME_SOURCE_CHARACTERS
+            if self.category == "resume"
+            else MAX_SOURCE_CHARACTERS
+        )
+        if len(self.text) > maximum_characters:
             raise ValueError("candidate evidence exceeds the character limit")
 
     def as_task_value(self) -> dict[str, str]:
@@ -71,56 +74,16 @@ def _invalid_context() -> HarnessServiceError:
     return HarnessServiceError(422, "invalid_request", "Candidate context is invalid")
 
 
-def _read_utf8(upload: StoredUpload) -> str:
+def _read_utf8(
+    upload: StoredUpload,
+    *,
+    maximum_characters: int = MAX_SOURCE_CHARACTERS,
+) -> str:
     try:
         text = upload.path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         raise _invalid_context() from None
-    if len(text) > MAX_SOURCE_CHARACTERS:
-        raise _invalid_context()
-    return text
-
-
-def _extract_resume_text(path: Path) -> str:
-    limit_names = (
-        "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
-        "JBIG2_MAX_OUTPUT_LENGTH",
-        "LZW_MAX_OUTPUT_LENGTH",
-        "RUN_LENGTH_MAX_OUTPUT_LENGTH",
-        "ZLIB_MAX_OUTPUT_LENGTH",
-    )
-    previous_limits = {name: getattr(pypdf_filters, name) for name in limit_names}
-    pypdf_logger = logging.getLogger("pypdf")
-    logger_was_disabled = pypdf_logger.disabled
-    logger_level = pypdf_logger.level
-    try:
-        pypdf_logger.disabled = True
-        pypdf_logger.setLevel(logging.CRITICAL + 1)
-        for name in limit_names:
-            setattr(pypdf_filters, name, MAX_PDF_STREAM_BYTES)
-        reader = PdfReader(path)
-        if reader.is_encrypted and reader.decrypt("") == 0:
-            raise _invalid_context()
-        page_text: list[str] = []
-        character_count = 0
-        for page in reader.pages:
-            extracted = (page.extract_text() or "").strip()
-            character_count += len(extracted) + (2 if page_text and extracted else 0)
-            if character_count > MAX_SOURCE_CHARACTERS:
-                raise _invalid_context()
-            if extracted:
-                page_text.append(extracted)
-        text = "\n\n".join(page_text)
-    except HarnessServiceError:
-        raise
-    except Exception:
-        raise _invalid_context() from None
-    finally:
-        pypdf_logger.disabled = logger_was_disabled
-        pypdf_logger.setLevel(logger_level)
-        for name, value in previous_limits.items():
-            setattr(pypdf_filters, name, value)
-    if not text:
+    if len(text) > maximum_characters:
         raise _invalid_context()
     return text
 
@@ -129,7 +92,10 @@ def load_candidate_context(artifacts: StoredCandidateArtifacts) -> CandidateCont
     """Extract bounded, attributed evidence without placing direct fields in prompt text."""
 
     try:
-        resume_text = _extract_resume_text(artifacts.resume.path)
+        resume_text = _read_utf8(
+            artifacts.resume_source,
+            maximum_characters=MAX_RESUME_SOURCE_CHARACTERS,
+        )
         profile = AttributedSource(
             name=artifacts.personal_upload.display_name,
             category="profile",
@@ -149,7 +115,11 @@ def load_candidate_context(artifacts: StoredCandidateArtifacts) -> CandidateCont
             + sum(len(source.text) for source in contexts)
             + sum(len(source.text) for source in anecdotes)
         )
-        if combined_length > MAX_COMBINED_NARRATIVE_CHARACTERS:
+        combined_limit = _BASE_COMBINED_NARRATIVE_CHARACTERS + max(
+            0,
+            len(resume_text) - MAX_SOURCE_CHARACTERS,
+        )
+        if combined_length > combined_limit:
             raise _invalid_context()
         direct_fields = MappingProxyType(dict(artifacts.personal.direct_fields))
         return CandidateContext(
@@ -217,9 +187,6 @@ def render_candidate_evidence(candidate: CandidateContext, resume_name: str) -> 
     return "Candidate evidence sources (one JSON object per line):\n" + "\n".join(
         sections
     )
-
-
-
 
 
 def _serialize_candidate_context(candidate: CandidateContext) -> dict[str, object]:

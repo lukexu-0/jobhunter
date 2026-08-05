@@ -388,6 +388,10 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             "resume.pdf",
             _pdf_bytes("Seven years operating reliable deployment systems."),
         )
+        resume_source = _upload(
+            "resume.tex",
+            b"\\documentclass{article}\nSeven years operating reliable deployment systems.",
+        )
         created = await manager.create_session(
             session_id=_CALLER_SESSION_ID,
             job_url=fixture.posting_url,
@@ -397,6 +401,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             max_steps=20,
             personal_information=personal,
             resume=resume,
+            resume_source=resume_source,
             context=[],
             anecdotes=[
                 _upload("incident.md", _RELEVANT_ANSWER.encode()),

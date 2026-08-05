@@ -22,6 +22,7 @@ import {
   type OpportunityKind,
   type HarnessSessionState,
 } from "../contracts";
+import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 
 const DEFAULT_HARNESS_ORIGIN = "http://127.0.0.1:8765";
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
@@ -81,6 +82,7 @@ export interface ApplicationHarnessCreateInput {
   readonly autoSubmit: boolean;
   readonly personalInformationMarkdown: string;
   readonly resumePdf: Uint8Array;
+  readonly resumeSource: Uint8Array;
 }
 
 export interface ApplicationHarnessSnapshot {
@@ -485,6 +487,20 @@ function isSanitizedBasename(value: string): boolean {
     && !value.includes("/")
     && !value.includes("\\")
     && !/[\u0000-\u001f]/.test(value);
+}
+
+function isValidResumeSource(value: unknown): value is Uint8Array {
+  if (
+    !(value instanceof Uint8Array)
+    || value.byteLength < 1
+    || value.byteLength > ARTIFACT_LIMITS.tex
+  ) return false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeHarnessOrigin(value: string): string {
@@ -914,6 +930,7 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
       || input.resumePdf.byteLength < 5
       || input.resumePdf.byteLength > 10 * 1024 * 1024
       || String.fromCharCode(...input.resumePdf.subarray(0, 5)) !== "%PDF-"
+      || !isValidResumeSource(input.resumeSource)
     ) {
       throw new ApplicationHarnessError("invalid_request");
     }
@@ -931,6 +948,14 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     form.set(
       "resume",
       new File([Uint8Array.from(input.resumePdf).buffer], "Alex_Example_Resume.pdf", { type: "application/pdf" }),
+    );
+    form.set(
+      "resume_source",
+      new File(
+        [Uint8Array.from(input.resumeSource).buffer],
+        "Alex_Example_Resume.tex",
+        { type: "text/x-tex" },
+      ),
     );
     form.set("max_steps", "100");
     const response = await this.#request(
