@@ -16,7 +16,6 @@ from .models import (
     AdditionalInfoDeclinedCommandAnswer,
     AdditionalInfoMultiSelectCommandAnswer,
     AdditionalInfoMultiSelectQuestion,
-    AdditionalInfoOption,
     AdditionalInfoQuestion,
     AdditionalInfoRuntimeActionResponse,
     AdditionalInfoSingleSelectCommandAnswer,
@@ -223,7 +222,7 @@ def _prepare_additional_info_questions(
     if len({(question.scope, question.key) for question in original}) != len(original):
         raise HarnessServiceError(422, "invalid_request", "Request is invalid")
     redaction_values = frozenset(private_values)
-    public: list[AdditionalInfoQuestion] = []
+    public = tuple(question.model_copy(deep=True) for question in original)
     storage: list[AdditionalInfoQuestion] = []
     for question in original:
         safe_question = redact_public_text(
@@ -238,39 +237,7 @@ def _prepare_additional_info_questions(
                 update={"question": safe_question},
             )
         )
-        if isinstance(
-            question,
-            (AdditionalInfoSingleSelectQuestion, AdditionalInfoMultiSelectQuestion),
-        ):
-            safe_options = [
-                AdditionalInfoOption(
-                    id=option.id,
-                    label=redact_public_text(
-                        option.label,
-                        redaction_values,
-                        max_length=200,
-                    )
-                    or "[redacted]",
-                )
-                for option in question.options
-            ]
-            public.append(
-                question.model_copy(
-                    deep=True,
-                    update={
-                        "question": safe_question,
-                        "options": safe_options,
-                    },
-                )
-            )
-        else:
-            public.append(
-                question.model_copy(
-                    deep=True,
-                    update={"question": safe_question},
-                )
-            )
-    return tuple(public), tuple(storage)
+    return public, tuple(storage)
 
 
 def _private_text_values_from_answers(
