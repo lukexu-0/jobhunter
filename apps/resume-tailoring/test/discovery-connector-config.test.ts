@@ -11,7 +11,7 @@ const inertClient = new SafePublicHttpClient({
 });
 
 describe("discovery connector factory", () => {
-  test("constructs only the four approved repository feeds", () => {
+  test("constructs only the five approved repository feeds", () => {
     const connectors = createDiscoveryConnectors({
       env: { GITHUB_TOKEN: "github-token" },
       httpClient: inertClient,
@@ -21,6 +21,11 @@ describe("discovery connector factory", () => {
       {
         id: "simplify-summer-2027",
         name: "Simplify Summer 2027 Internships",
+        kind: "simplify",
+      },
+      {
+        id: "simplify-summer-2027-off-season",
+        name: "Simplify Summer 2027 Off-Season Internships",
         kind: "simplify",
       },
       {
@@ -41,7 +46,7 @@ describe("discovery connector factory", () => {
     ]);
   });
 
-  test("targets the 2027 zapply repository", async () => {
+  test("targets the approved alternate repository files", async () => {
     const requests: URL[] = [];
     const connectors = createDiscoveryConnectors({
       env: { GITHUB_TOKEN: undefined },
@@ -52,12 +57,16 @@ describe("discovery connector factory", () => {
       resolveHost: async () => [{ address: "93.184.216.34", family: 4 }],
     });
 
-    await connectors.find(({ kind }) => kind === "zapply")!
-      .sync(new AbortController().signal);
+    for (const id of ["simplify-summer-2027-off-season", "zapply-underclassmen"]) {
+      await connectors.find((connector) => connector.id === id)!
+        .sync(new AbortController().signal);
+    }
 
-    expect(requests).toHaveLength(1);
-    expect(requests[0]!.pathname)
-      .toBe("/repos/zapplyjobs/Internships-2027/contents/README.md");
-    expect(requests[0]!.searchParams.get("ref")).toBe("main");
+    expect(requests.map(({ pathname }) => pathname)).toEqual([
+      "/repos/SimplifyJobs/Summer2027-Internships/contents/README-Off-Season.md",
+      "/repos/zapplyjobs/Internships-2027/contents/README.md",
+    ]);
+    expect(requests.map((request) => request.searchParams.get("ref")))
+      .toEqual(["dev", "main"]);
   });
 });
