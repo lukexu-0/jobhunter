@@ -25,7 +25,7 @@ describe("discovery connector factory", () => {
       },
       {
         id: "zapply-underclassmen",
-        name: "zapply Underclassmen Internships",
+        name: "zapply 2027 Internships",
         kind: "zapply",
       },
       {
@@ -39,5 +39,25 @@ describe("discovery connector factory", () => {
         kind: "speedyapply",
       },
     ]);
+  });
+
+  test("targets the 2027 zapply repository", async () => {
+    const requests: URL[] = [];
+    const connectors = createDiscoveryConnectors({
+      env: { GITHUB_TOKEN: undefined },
+      fetchImpl: async (input) => {
+        requests.push(new URL(input));
+        return new Response("", { headers: { "content-type": "text/plain" } });
+      },
+      resolveHost: async () => [{ address: "93.184.216.34", family: 4 }],
+    });
+
+    await connectors.find(({ kind }) => kind === "zapply")!
+      .sync(new AbortController().signal);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.pathname)
+      .toBe("/repos/zapplyjobs/Internships-2027/contents/README.md");
+    expect(requests[0]!.searchParams.get("ref")).toBe("main");
   });
 });

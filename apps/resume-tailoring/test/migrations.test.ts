@@ -1366,7 +1366,7 @@ test("migration twenty-three keeps only approved discovery source families", () 
     "INSERT INTO discovery_sources(id, name, kind) VALUES ('indeed', 'Indeed', 'indeed')",
   ).run()).toThrow();
   db.query("INSERT INTO discovery_sources(id, name, kind) VALUES (?, ?, ?)")
-    .run("zapply-underclassmen", "zapply Underclassmen Internships", "zapply");
+    .run("zapply-underclassmen", "zapply 2027 Internships", "zapply");
 
   expect(db.query<{ count: number }, []>(`
     SELECT count(*) AS count

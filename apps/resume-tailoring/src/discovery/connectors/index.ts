@@ -29,10 +29,10 @@ const BUILT_IN_GITHUB_SOURCES: readonly Omit<GitHubTableConnectorConfig, "github
   },
   {
     id: "zapply-underclassmen",
-    name: "zapply Underclassmen Internships",
+    name: "zapply 2027 Internships",
     kind: "zapply",
     owner: "zapplyjobs",
-    repo: "underclassmen-internships",
+    repo: "Internships-2027",
     branch: "main",
     path: "README.md",
   },
