@@ -477,6 +477,83 @@ async function sanitizedJsonDescription(
   return undefined;
 }
 
+function safeWorkdayPathSegment(value: string): string | undefined {
+  try {
+    const decoded = decodeURIComponent(value);
+    return decoded
+      && decoded !== "."
+      && decoded !== ".."
+      && !decoded.includes("/")
+      && !decoded.includes("\\")
+      && decoded.length <= 500
+      ? decoded
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function workdayCxsUrl(value: URL): URL | undefined {
+  const labels = value.hostname.toLowerCase().split(".");
+  const rawSegments = value.pathname.split("/").filter(Boolean);
+  const jobIndex = rawSegments.findIndex((segment) => segment.toLowerCase() === "job");
+  if (jobIndex < 1 || jobIndex === rawSegments.length - 1) return undefined;
+  let tenant: string | undefined;
+  if (
+    labels.length === 4
+    && /^wd\d+$/.test(labels[1] ?? "")
+    && labels[2] === "myworkdayjobs"
+    && labels[3] === "com"
+  ) {
+    tenant = labels[0];
+  } else if (
+    labels.length === 3
+    && /^wd\d+$/.test(labels[0] ?? "")
+    && labels[1] === "myworkdaysite"
+    && labels[2] === "com"
+    && rawSegments[0]?.toLowerCase() === "recruiting"
+    && jobIndex === 3
+  ) {
+    tenant = safeWorkdayPathSegment(rawSegments[1] ?? "");
+  }
+  if (!tenant || !/^[a-z0-9-]{1,100}$/i.test(tenant)) return undefined;
+  const postingSegments = rawSegments.slice(jobIndex - 1).map(safeWorkdayPathSegment);
+  if (postingSegments.some((segment) => segment === undefined)) return undefined;
+  const endpoint = new URL(value.origin);
+  endpoint.pathname = `/wday/cxs/${tenant}/${postingSegments.join("/")}`;
+  return endpoint;
+}
+
+async function workdayDescriptionFromJson(value: unknown): Promise<string | undefined> {
+  const descriptions: string[] = [];
+  visitJsonObjects(value, (record) => {
+    const description = nonemptyString(record.jobDescription);
+    if (description) descriptions.push(description);
+  });
+  for (const description of descriptions) {
+    const sanitized = await sanitizeDescription(description, "html");
+    if (sanitized) return sanitized;
+  }
+  return undefined;
+}
+
+async function loadWorkdayDescription(
+  client: SafePublicHttpClient,
+  sourceUrl: URL,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const endpoint = workdayCxsUrl(sourceUrl);
+  if (!endpoint) return undefined;
+  const response = await client.get(endpoint, {
+    signal,
+    allowedHosts: [sourceUrl.hostname],
+    acceptedMediaTypes: ["application/json"],
+    maxBodyBytes: 1024 * 1024,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  return workdayDescriptionFromJson(response.json<unknown>());
+}
+
 async function descriptionFromHtml(html: string): Promise<string | undefined> {
   for (const value of await captureJsonLd(html)) {
     const description = await sanitizedJsonDescription(value, true);
@@ -493,6 +570,10 @@ async function descriptionFromHtml(html: string): Promise<string | undefined> {
 
 async function loadDescription(client: SafePublicHttpClient, url: string, signal: AbortSignal): Promise<string | undefined> {
   try {
+    const sourceUrl = new URL(url);
+    if (workdayCxsUrl(sourceUrl)) {
+      return await loadWorkdayDescription(client, sourceUrl, signal);
+    }
     const response = await client.get(url, {
       signal,
       acceptedMediaTypes: ["text/html", "application/xhtml+xml", "text/plain", "application/ld+json", "application/json"],
@@ -501,10 +582,10 @@ async function loadDescription(client: SafePublicHttpClient, url: string, signal
     if (response.status < 200 || response.status > 299) return undefined;
     const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
     if (mediaType === "text/plain") return sanitizeDescription(response.text(), "text");
-    if (mediaType === "application/json" || mediaType === "application/ld+json") {
-      return sanitizedJsonDescription(response.json<unknown>(), false);
-    }
-    return descriptionFromHtml(response.text());
+    const description = mediaType === "application/json" || mediaType === "application/ld+json"
+      ? await sanitizedJsonDescription(response.json<unknown>(), false)
+      : await descriptionFromHtml(response.text());
+    return description ?? loadWorkdayDescription(client, response.url, signal);
   } catch (error) {
     signal.throwIfAborted();
     return undefined;

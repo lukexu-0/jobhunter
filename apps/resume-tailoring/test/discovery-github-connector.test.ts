@@ -287,6 +287,97 @@ ${rows}
     expect(result.items.map((item) => item.description)).toEqual([htmlDescription, jsonDescription]);
   });
 
+  test("loads Workday external SPA descriptions from the public CXS endpoint", async () => {
+    const workdayTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Capital One | Technology Intern | [Apply](https://capitalone.wd12.myworkdayjobs.com/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1?utm_source=Simplify) |
+`;
+    const workdayDescription = "Build cloud software and production services during this ten-week technology internship.";
+    const requestedPaths: string[] = [];
+    const fetchImpl: ConnectorFetch = async (input, init) => {
+      const headers = new Headers(init.headers);
+      if (headers.get("host") === "api.github.com") {
+        return new Response(workdayTable, { headers: { "content-type": "text/plain" } });
+      }
+      const path = new URL(input).pathname;
+      requestedPaths.push(path);
+      if (!path.startsWith("/wday/cxs/")) {
+        throw new Error("Workday shell should not be requested");
+      }
+      return new Response(JSON.stringify({
+        jobPostingInfo: {
+          jobDescription: `<p>${workdayDescription}</p>`,
+        },
+      }), { headers: { "content-type": "application/json" } });
+    };
+    const connector = createGitHubTableConnector({
+      id: "workday-external-spa",
+      name: "Workday external SPA fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(fetchImpl));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({
+      company: "Capital One",
+      title: "Technology Intern",
+      description: workdayDescription,
+    });
+    expect(requestedPaths).toEqual([
+      "/wday/cxs/capitalone/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1",
+    ]);
+  });
+
+  test("loads Workday recruiting-site descriptions from the public CXS endpoint", async () => {
+    const workdayTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Wells Fargo | Risk Development Intern | [Apply](https://wd1.myworkdaysite.com/recruiting/wf/WellsFargoJobs/job/CHARLOTTE-NC/Risk-Development-Intern_R-556123) |
+`;
+    const workdayDescription = "Evaluate core risk programs and build analytical tools during this summer internship.";
+    const requestedPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "workday-recruiting-site",
+      name: "Workday recruiting-site fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const headers = new Headers(init.headers);
+      if (headers.get("host") === "api.github.com") {
+        return new Response(workdayTable, { headers: { "content-type": "text/plain" } });
+      }
+      const path = new URL(input).pathname;
+      requestedPaths.push(path);
+      if (!path.startsWith("/wday/cxs/")) {
+        throw new Error("Workday shell should not be requested");
+      }
+      return new Response(JSON.stringify({
+        jobPostingInfo: {
+          jobDescription: `<p>${workdayDescription}</p>`,
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.description).toBe(workdayDescription);
+    expect(requestedPaths).toEqual([
+      "/wday/cxs/wf/WellsFargoJobs/job/CHARLOTTE-NC/Risk-Development-Intern_R-556123",
+    ]);
+  });
+
   test("uses ETag/304 without refetching details", async () => {
     let listRequests = 0;
     let detailRequests = 0;
