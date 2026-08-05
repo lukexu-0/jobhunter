@@ -307,12 +307,459 @@ ${rows}
     expect(result.items.map((item) => item.description)).toEqual([htmlDescription, jsonDescription]);
   });
 
+  test("loads Greenhouse URL variants through the public job-board API", async () => {
+    const greenhouseTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Five Rings | Quantitative Trader Intern | [Apply](https://job-boards.greenhouse.io/fiveringsllc/jobs/5139668008) |
+| Gemini | Software Engineering Intern | [Apply](https://boards.greenhouse.io/embed/job_app?for=gemini&gh_jid=7875125) |
+`;
+    const requestedPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "greenhouse-api",
+      name: "Greenhouse API fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(greenhouseTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "boards-api.greenhouse.io") {
+        throw new Error("Greenhouse HTML shell should not be requested");
+      }
+      const path = new URL(input).pathname;
+      requestedPaths.push(path);
+      const id = Number(path.split("/").at(-1));
+      return new Response(JSON.stringify({
+        id,
+        content: `<p>Build production systems during internship ${id} with an experienced engineering team.</p>`,
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(2);
+    expect(requestedPaths).toEqual([
+      "/v1/boards/fiveringsllc/jobs/5139668008",
+      "/v1/boards/gemini/jobs/7875125",
+    ]);
+  });
+
+  test("loads regional Oracle Candidate Experience descriptions through the public REST endpoint", async () => {
+    const oracleTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| American Express | Software Engineering Intern | [Apply](https://egug.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/26012174) |
+`;
+    const oracleDescription = "Develop production payment systems and collaborate with engineers throughout this internship.";
+    const requested: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "oracle-candidate-api",
+      name: "Oracle Candidate API fixture",
+      kind: "zapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(oracleTable, { headers: { "content-type": "text/plain" } });
+      }
+      const url = new URL(input);
+      requested.push(`${url.pathname}${url.search}`);
+      if (url.pathname !== "/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails") {
+        throw new Error("Oracle Candidate Experience shell should not be requested");
+      }
+      return new Response(JSON.stringify({
+        items: [{
+          Id: 26012174,
+          Title: "Software Engineering Intern",
+          ExternalDescriptionStr: `<p>${oracleDescription}</p>`,
+        }],
+      }), { headers: { "content-type": "application/vnd.oracle.adf.resourcecollection+json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).toBe(oracleDescription);
+    expect(requested).toEqual([
+      "/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails?expand=all&onlyData=true&finder=ById;Id=%2226012174%22,siteNumber=CX_1",
+    ]);
+  });
+
+  test("loads TikTok and ByteDance descriptions through their public supplier APIs", async () => {
+    const tiktokTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| TikTok | Backend Software Engineer Intern | [Apply](https://lifeattiktok.com/search/7668827379083823413) |
+| ByteDance | AI Application Engineer Intern | [Apply](https://joinbytedance.com/search/7668334624594479413) |
+| ByteDance | Platform Engineer Intern | [Apply](https://jobs.bytedance.com/en/position/7668334624594479414/detail) |
+`;
+    const requested: Array<{ host: string | null; path: string; method: string; body: string }> = [];
+    const connector = createGitHubTableConnector({
+      id: "tiktok-supplier-api",
+      name: "TikTok supplier API fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const headers = new Headers(init.headers);
+      const host = headers.get("host");
+      if (host === "api.github.com") {
+        return new Response(tiktokTable, { headers: { "content-type": "text/plain" } });
+      }
+      const path = new URL(input).pathname;
+      const body = String(init.body ?? "");
+      requested.push({ host, path, method: init.method ?? "GET", body });
+      if (!path.startsWith("/api/v1/public/supplier/job/posts/")) {
+        throw new Error("Career-site shell should not be requested");
+      }
+      const id = path.split("/").at(-1)!;
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          job_post_detail: {
+            id,
+            title: `Internship ${id}`,
+            description: `Build production services for posting ${id} with a global engineering team.`,
+            requirement: "Qualifications include software engineering experience and strong collaboration skills.",
+          },
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(3);
+    expect(result.items.every((item) => item.description.includes("Qualifications"))).toBe(true);
+    expect(requested.map(({ host, method }) => ({ host, method }))).toEqual([
+      { host: "api.lifeattiktok.com", method: "POST" },
+      { host: "jobs.bytedance.com", method: "POST" },
+      { host: "jobs.bytedance.com", method: "POST" },
+    ]);
+    expect(requested.every(({ body, path }) =>
+      JSON.parse(body).job_post_id === path.split("/").at(-1))).toBe(true);
+  });
+
+  test("loads SmartRecruiters descriptions through the public posting API", async () => {
+    const smartTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Western Digital | Software Engineering Intern | [Apply](https://jobs.smartrecruiters.com/WesternDigital/744000138727213-summer-2027-software-engineering-internship) |
+`;
+    const requestedPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "smartrecruiters-api",
+      name: "SmartRecruiters API fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(smartTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "api.smartrecruiters.com") {
+        throw new Error("SmartRecruiters shell should not be requested");
+      }
+      requestedPaths.push(new URL(input).pathname);
+      return new Response(JSON.stringify({
+        id: "744000138727213",
+        jobAd: {
+          sections: {
+            companyDescription: { text: "<p>Do not include generic company copy.</p>" },
+            jobDescription: { text: "<p>Build storage software with an engineering team.</p>" },
+            qualifications: { text: "<p>Experience with algorithms and a systems language.</p>" },
+            additionalInformation: { text: "<p>Collaborate in San Jose throughout the internship.</p>" },
+          },
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).not.toContain("generic company copy");
+    expect(result.items[0]?.description).toContain("Experience with algorithms");
+    expect(requestedPaths).toEqual([
+      "/v1/companies/WesternDigital/postings/744000138727213",
+    ]);
+  });
+
+  test("loads Workable descriptions through the public account API", async () => {
+    const workableTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Veeam | Software Developer Intern | [Apply](https://apply.workable.com/veeam-software/j/42A7BC19DE/) |
+`;
+    const requestedPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "workable-api",
+      name: "Workable API fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(workableTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "apply.workable.com") {
+        throw new Error("Workable shell should not be requested");
+      }
+      requestedPaths.push(new URL(input).pathname);
+      return new Response(JSON.stringify({
+        shortcode: "42A7BC19DE",
+        state: "published",
+        description: "<p>Build and test production backup software with the engineering team.</p>",
+        requirements: "<ul><li>Experience with typed programming languages.</li></ul>",
+        benefits: "<p>Work with an experienced mentor throughout the internship.</p>",
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).toContain("typed programming languages");
+    expect(result.items[0]?.description).toContain("experienced mentor");
+    expect(requestedPaths).toEqual([
+      "/api/v2/accounts/veeam-software/jobs/42A7BC19DE",
+    ]);
+  });
+
+  test("loads Lever regional URL variants through the public postings API", async () => {
+    const leverTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Highspot | Software Engineer Intern | [Apply](https://jobs.lever.co/highspot/01234567-89ab-cdef-0123-456789abcdef) |
+| Alma | Backend Engineer Intern | [Apply](https://jobs.eu.lever.co/alma/11111111-2222-4333-8444-555555555555/apply) |
+`;
+    const requestedPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "lever-api",
+      name: "Lever API fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(leverTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "api.lever.co") {
+        throw new Error("Lever shell should not be requested");
+      }
+      const parsed = new URL(input);
+      requestedPaths.push(`${parsed.pathname}${parsed.search}`);
+      const id = parsed.pathname.split("/").at(-1)!;
+      return new Response(JSON.stringify({
+        id,
+        descriptionPlain: "Build reliable software for customers with a product engineering team.",
+        openingPlain: "This internship provides ownership of a production feature.",
+        lists: [{ text: "Qualifications", content: "Programming experience and strong collaboration skills." }],
+        additionalPlain: "Work with a dedicated engineering mentor.",
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(2);
+    expect(result.items.every((item) => item.description.includes("dedicated engineering mentor"))).toBe(true);
+    expect(requestedPaths).toEqual([
+      "/v0/postings/highspot/01234567-89ab-cdef-0123-456789abcdef?mode=json",
+      "/v0/postings/alma/11111111-2222-4333-8444-555555555555?mode=json",
+    ]);
+  });
+
+  test("loads and caches Ashby public job-board descriptions", async () => {
+    const ashbyTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Ramp | Software Engineer Intern | [Apply](https://jobs.ashbyhq.com/ramp/01234567-89ab-cdef-0123-456789abcdef) |
+| Ramp | Product Engineer Intern | [Apply](https://jobs.ashbyhq.com/ramp/11111111-2222-3333-4444-555555555555/application) |
+`;
+    let boardRequests = 0;
+    const connector = createGitHubTableConnector({
+      id: "ashby-api",
+      name: "Ashby API fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(ashbyTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "api.ashbyhq.com") {
+        throw new Error("Ashby job shell should not be requested");
+      }
+      expect(new URL(input).pathname).toBe("/posting-api/job-board/ramp");
+      boardRequests += 1;
+      return new Response(JSON.stringify({
+        jobs: [
+          {
+            id: "01234567-89ab-cdef-0123-456789abcdef",
+            descriptionHtml: "<p>Build financial infrastructure with a production engineering team.</p>",
+          },
+          {
+            id: "11111111-2222-3333-4444-555555555555",
+            descriptionPlain: "Ship product improvements with designers, engineers, and customer teams.",
+          },
+        ],
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(2);
+    expect(result.items[0]?.description).toContain("financial infrastructure");
+    expect(result.items[1]?.description).toContain("product improvements");
+    expect(boardRequests).toBe(1);
+  });
+
+  test("loads Jump Trading wrappers through its Greenhouse board", async () => {
+    const jumpTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Jump Trading | Software Engineer Intern | [Apply](https://www.jumptrading.com/hr/job?gh_jid=7220680) |
+`;
+    const requested: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "jump-greenhouse-api",
+      name: "Jump Greenhouse API fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(jumpTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host !== "boards-api.greenhouse.io") {
+        throw new Error("Jump Trading wrapper should not be requested");
+      }
+      requested.push(new URL(input).pathname);
+      return new Response(JSON.stringify({
+        id: 7220680,
+        content: "<p>Design and build low-latency trading systems with experienced engineers.</p>",
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).toContain("low-latency trading systems");
+    expect(requested).toEqual(["/v1/boards/jumptrading/jobs/7220680"]);
+  });
+
+  test("uses a matching Simplify mirror when the primary detail has no description", async () => {
+    const primaryUrl = "https://lifeattiktok.com/search/7667935150530840837";
+    const mirrorTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| TikTok | Backend Software Engineer Intern - LIVE Foundation Governance Engineering | [Apply](${primaryUrl}) [Simplify](https://simplify.jobs/p/6454b1b2-6daf-4a13-9e9f-47209a333d39?utm_source=GHList) |
+`;
+    const mirrorDescription = "Build backend systems for live-streaming governance with engineers and data scientists.";
+    const connector = createGitHubTableConnector({
+      id: "simplify-mirror",
+      name: "Simplify mirror fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(mirrorTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host === "simplify.jobs") {
+        return new Response(`<script type="application/ld+json">${JSON.stringify({
+          "@type": "JobPosting",
+          title: "Backend Software Engineer Intern, LIVE Foundation Governance Engineering",
+          hiringOrganization: { "@type": "Organization", name: "TikTok" },
+          description: `<p>${mirrorDescription}</p>`,
+        })}</script>`, { headers: { "content-type": "text/html" } });
+      }
+      return new Response("<main>Sign in</main>", { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({
+      canonicalUrl: primaryUrl,
+      applyUrl: primaryUrl,
+      company: "TikTok",
+      description: mirrorDescription,
+    });
+  });
+
+  test("rejects a Simplify mirror for a different job identity", async () => {
+    const mirrorTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| TikTok | Backend Software Engineer Intern | [Apply](https://lifeattiktok.com/search/123) [Simplify](https://simplify.jobs/p/6454b1b2-6daf-4a13-9e9f-47209a333d39) |
+`;
+    const connector = createGitHubTableConnector({
+      id: "mismatched-simplify-mirror",
+      name: "Mismatched Simplify mirror fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      const host = new Headers(init.headers).get("host");
+      if (host === "api.github.com") {
+        return new Response(mirrorTable, { headers: { "content-type": "text/plain" } });
+      }
+      if (host === "simplify.jobs") {
+        return new Response(`<script type="application/ld+json">${JSON.stringify({
+          "@type": "JobPosting",
+          title: "Frontend Engineer Intern",
+          hiringOrganization: { "@type": "Organization", name: "Different Company" },
+          description: "This unrelated description is long enough but belongs to a different job posting.",
+        })}</script>`, { headers: { "content-type": "text/html" } });
+      }
+      return new Response("<main>Sign in</main>", { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.items).toEqual([]);
+    expect(result.completeSnapshot).toBe(false);
+  });
+
   test("loads Workday external SPA descriptions from the public CXS endpoint", async () => {
     const workdayTable = `
 | Company | Role | Application |
 | --- | --- | --- |
 | Capital One | Technology Intern | [Apply](https://capitalone.wd12.myworkdayjobs.com/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1?utm_source=Simplify) |
 `;
+
     const workdayDescription = "Build cloud software and production services during this ten-week technology internship.";
     const requestedPaths: string[] = [];
     const fetchImpl: ConnectorFetch = async (input, init) => {
@@ -354,6 +801,55 @@ ${rows}
     expect(requestedPaths).toEqual([
       "/wday/cxs/capitalone/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1",
     ]);
+  });
+  test("uses the Workday site tenant config once when the host tenant is rejected", async () => {
+    const workdayTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| CCI | Software Engineering Intern | [Apply](https://osv-cci.wd1.myworkdayjobs.com/CCICareers/job/London-UK/Software-Engineering-Intern_R1347) |
+| CCI | Data Engineering Intern | [Apply](https://osv-cci.wd1.myworkdayjobs.com/CCICareers/job/London-UK/Data-Engineering-Intern_R1348) |
+`;
+    const requestedPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "workday-site-tenant",
+      name: "Workday site tenant fixture",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+      detailConcurrency: 2,
+    }, clientFor(async (input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(workdayTable, { headers: { "content-type": "text/plain" } });
+      }
+      const path = new URL(input).pathname;
+      requestedPaths.push(path);
+      if (path === "/CCICareers") {
+        return new Response(`window.workday = window.workday || {
+          tenant: "osv_cci",
+          siteId: "CCICareers",
+        };`, { headers: { "content-type": "text/html" } });
+      }
+      if (path.includes("/wday/cxs/osv_cci/")) {
+        return new Response(JSON.stringify({
+          jobPostingInfo: {
+            jobDescription: "Build production commodity-trading software with engineers during this summer internship.",
+          },
+        }), { headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ errorCode: "HTTP_422", httpStatus: 422 }), {
+        status: 422,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(requestedPaths.filter((path) => path === "/CCICareers")).toHaveLength(1);
+    expect(requestedPaths.filter((path) => path.includes("/wday/cxs/osv_cci/"))).toHaveLength(2);
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items).toHaveLength(2);
   });
 
   test("loads Workday recruiting-site descriptions from the public CXS endpoint", async () => {

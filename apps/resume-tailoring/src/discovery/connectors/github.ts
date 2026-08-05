@@ -38,6 +38,7 @@ export interface ParsedGitHubTableRow {
   readonly title: string;
   readonly location: string | null;
   readonly applyUrl: string;
+  readonly descriptionUrl?: string;
   readonly postedAt: number | null;
 }
 
@@ -124,6 +125,18 @@ function firstUrl(value: string): string | undefined {
   return found?.replace(/&amp;/gi, "&").replace(/\\([()])/g, "$1");
 }
 
+function simplifyMirrorUrl(value: string): string | undefined {
+  const candidate = /\bhttps:\/\/simplify\.jobs\/p\/[0-9a-f-]{36}(?:\?[^"'<>\s)]*)?/i.exec(value)?.[0]
+    ?.replace(/&amp;/gi, "&");
+  if (!candidate) return undefined;
+  const canonical = canonicalizeJobUrl(candidate);
+  if (!canonical) return undefined;
+  const url = new URL(canonical);
+  return url.hostname === "simplify.jobs" && /^\/p\/[0-9a-f-]{36}$/i.test(url.pathname)
+    ? canonical
+    : undefined;
+}
+
 function columnIndex(headers: readonly string[], names: readonly string[]): number {
   return headers.findIndex((header) => names.includes(header));
 }
@@ -208,7 +221,9 @@ function parsedTableRow(
   if (!(zapplyShape && internshipSection) && !INTERNSHIP_TITLE.test(title)) {
     return { kind: "non-internship" };
   }
-  const applyUrl = firstUrl(cells[applyIndex]?.markup ?? "");
+  const applyMarkup = cells[applyIndex]?.markup ?? "";
+  const applyUrl = firstUrl(applyMarkup);
+  const descriptionUrl = simplifyMirrorUrl(applyMarkup);
   const rawCompany = cells[companyIndex]?.text ?? "";
   const normalizedRawCompany = normalizeSpace(rawCompany);
   const company = zapplyShape
@@ -229,6 +244,7 @@ function parsedTableRow(
       location,
       applyUrl,
       postedAt: dateIndex < 0 ? null : tableDate(cells[dateIndex]?.text ?? ""),
+      ...(descriptionUrl && descriptionUrl !== applyUrl ? { descriptionUrl } : {}),
     },
   };
 }
@@ -484,6 +500,406 @@ async function sanitizedJsonDescription(
   }
   return undefined;
 }
+interface GreenhouseSource {
+  readonly endpoint: URL;
+  readonly jobId: string;
+}
+
+function greenhouseSource(value: URL): GreenhouseSource | undefined {
+  let board: string | undefined;
+  let jobId: string | undefined;
+  if (value.hostname === "www.jumptrading.com") {
+    const candidateJobId = value.pathname === "/hr/job" ? value.searchParams.get("gh_jid") : undefined;
+    if (!candidateJobId || !/^[0-9]{1,20}$/.test(candidateJobId)) return undefined;
+    board = "jumptrading";
+    jobId = candidateJobId;
+  } else if (value.hostname !== "job-boards.greenhouse.io" && value.hostname !== "boards.greenhouse.io") {
+    return undefined;
+  }
+  const standard = /^\/([A-Za-z0-9_-]{1,100})\/jobs\/([0-9]{1,20})\/?$/.exec(value.pathname);
+  if (standard) {
+    board = standard[1];
+    jobId = standard[2];
+  } else if (value.hostname === "boards.greenhouse.io" && value.pathname === "/embed/job_app") {
+    const candidateBoard = value.searchParams.get("for");
+    const candidateJobId = value.searchParams.get("gh_jid");
+    if (
+      candidateBoard
+      && /^[A-Za-z0-9_-]{1,100}$/.test(candidateBoard)
+      && candidateJobId
+      && /^[0-9]{1,20}$/.test(candidateJobId)
+    ) {
+      board = candidateBoard;
+      jobId = candidateJobId;
+    }
+  }
+  if (!board || !jobId) return undefined;
+  return {
+    endpoint: new URL(`https://boards-api.greenhouse.io/v1/boards/${board}/jobs/${jobId}`),
+    jobId,
+  };
+}
+
+async function loadGreenhouseDescription(
+  client: SafePublicHttpClient,
+  source: GreenhouseSource,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.get(source.endpoint, {
+    signal,
+    allowedHosts: ["boards-api.greenhouse.io"],
+    acceptedMediaTypes: ["application/json"],
+    maxBodyBytes: 1024 * 1024,
+    maxRedirects: 0,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  const document = response.json<unknown>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  const record = document as Readonly<Record<string, unknown>>;
+  const id = record.id;
+  if (
+    (typeof id !== "string" && (typeof id !== "number" || !Number.isSafeInteger(id)))
+    || String(id) !== source.jobId
+  ) {
+    return undefined;
+  }
+  const content = nonemptyString(record.content);
+  return content ? sanitizeDescription(content, "html") : undefined;
+}
+
+interface SmartRecruitersSource {
+  readonly endpoint: URL;
+  readonly postingId: string;
+}
+
+function smartRecruitersSource(value: URL): SmartRecruitersSource | undefined {
+  if (value.hostname !== "jobs.smartrecruiters.com") return undefined;
+  const match = /^\/([A-Za-z0-9_-]{1,100})\/([0-9]{1,20})(?:-[^/]*)?\/?$/.exec(value.pathname);
+  if (!match) return undefined;
+  const endpoint = new URL(
+    `https://api.smartrecruiters.com/v1/companies/${match[1]}/postings/${match[2]}`,
+  );
+  return { endpoint, postingId: match[2]! };
+}
+
+async function loadSmartRecruitersDescription(
+  client: SafePublicHttpClient,
+  source: SmartRecruitersSource,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.get(source.endpoint, {
+    signal,
+    allowedHosts: ["api.smartrecruiters.com"],
+    acceptedMediaTypes: ["application/json"],
+    maxBodyBytes: 1024 * 1024,
+    maxRedirects: 0,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  const document = response.json<unknown>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  const record = document as Readonly<Record<string, unknown>>;
+  if (nonemptyString(record.id) !== source.postingId) return undefined;
+  const jobAd = record.jobAd;
+  if (typeof jobAd !== "object" || jobAd === null || Array.isArray(jobAd)) return undefined;
+  const sections = (jobAd as Readonly<Record<string, unknown>>).sections;
+  if (typeof sections !== "object" || sections === null || Array.isArray(sections)) return undefined;
+  const sectionRecord = sections as Readonly<Record<string, unknown>>;
+  const fragments = ["jobDescription", "qualifications", "additionalInformation"]
+    .map((name) => sectionRecord[name])
+    .map((section) => (
+      typeof section === "object" && section !== null && !Array.isArray(section)
+        ? nonemptyString((section as Readonly<Record<string, unknown>>).text)
+        : undefined
+    ))
+    .filter((fragment): fragment is string => Boolean(fragment));
+  if (fragments.length === 0) return undefined;
+  return sanitizeDescription(fragments.join("\n"), "html");
+}
+
+interface WorkableSource {
+  readonly endpoint: URL;
+  readonly shortcode: string;
+}
+
+function workableSource(value: URL): WorkableSource | undefined {
+  if (value.hostname !== "apply.workable.com") return undefined;
+  const match = /^\/([A-Za-z0-9_-]{1,100})\/j\/([A-Za-z0-9_-]{1,32})\/?$/.exec(value.pathname);
+  if (!match) return undefined;
+  return {
+    endpoint: new URL(`https://apply.workable.com/api/v2/accounts/${match[1]}/jobs/${match[2]}`),
+    shortcode: match[2]!,
+  };
+}
+
+async function loadWorkableDescription(
+  client: SafePublicHttpClient,
+  source: WorkableSource,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.get(source.endpoint, {
+    signal,
+    allowedHosts: ["apply.workable.com"],
+    acceptedMediaTypes: ["application/json"],
+    maxBodyBytes: 1024 * 1024,
+    maxRedirects: 0,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  const document = response.json<unknown>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  const record = document as Readonly<Record<string, unknown>>;
+  if (record.state !== "published" || nonemptyString(record.shortcode) !== source.shortcode) return undefined;
+  const fragments = ["description", "requirements", "benefits"]
+    .map((name) => nonemptyString(record[name]))
+    .filter((fragment): fragment is string => Boolean(fragment));
+  if (fragments.length === 0) return undefined;
+  return sanitizeDescription(fragments.join("\n"), "html");
+}
+
+interface LeverSource {
+  readonly endpoint: URL;
+  readonly postingId: string;
+}
+
+function leverSource(value: URL): LeverSource | undefined {
+  if (value.hostname !== "jobs.lever.co" && value.hostname !== "jobs.eu.lever.co") return undefined;
+  const match = /^\/([A-Za-z0-9_-]{1,100})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/apply)?\/?$/i
+    .exec(value.pathname);
+  if (!match) return undefined;
+  const endpoint = new URL(`https://api.lever.co/v0/postings/${match[1]}/${match[2]}`);
+  endpoint.searchParams.set("mode", "json");
+  return { endpoint, postingId: match[2]! };
+}
+
+async function loadLeverDescription(
+  client: SafePublicHttpClient,
+  source: LeverSource,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.get(source.endpoint, {
+    signal,
+    allowedHosts: ["api.lever.co"],
+    acceptedMediaTypes: ["application/json"],
+    maxBodyBytes: 1024 * 1024,
+    maxRedirects: 0,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  const document = response.json<unknown>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  const record = document as Readonly<Record<string, unknown>>;
+  if (nonemptyString(record.id)?.toLowerCase() !== source.postingId.toLowerCase()) return undefined;
+  const fragments = ["descriptionPlain", "descriptionBodyPlain", "openingPlain", "additionalPlain"]
+    .map((name) => nonemptyString(record[name]))
+    .filter((fragment): fragment is string => Boolean(fragment));
+  if (Array.isArray(record.lists)) {
+    for (const list of record.lists) {
+      if (typeof list !== "object" || list === null || Array.isArray(list)) continue;
+      const content = nonemptyString((list as Readonly<Record<string, unknown>>).content);
+      if (content) fragments.push(content);
+    }
+  }
+  if (fragments.length === 0) return undefined;
+  return sanitizeDescription(fragments.join("\n"), "html");
+}
+
+interface AshbySource {
+  readonly boardUrl: URL;
+  readonly jobId: string;
+}
+
+interface AshbyDescription {
+  readonly value: string;
+  readonly format: "html" | "text";
+}
+
+type AshbyBoardCache = Map<string, Promise<ReadonlyMap<string, AshbyDescription> | undefined>>;
+
+function ashbySource(value: URL): AshbySource | undefined {
+  if (value.hostname !== "jobs.ashbyhq.com") return undefined;
+  const match = /^\/([A-Za-z0-9_-]{1,100})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/application)?\/?$/i
+    .exec(value.pathname);
+  if (!match) return undefined;
+  return {
+    boardUrl: new URL(`https://api.ashbyhq.com/posting-api/job-board/${match[1]}`),
+    jobId: match[2]!,
+  };
+}
+
+async function loadAshbyBoard(
+  client: SafePublicHttpClient,
+  source: AshbySource,
+  cache: AshbyBoardCache,
+  signal: AbortSignal,
+): Promise<ReadonlyMap<string, AshbyDescription> | undefined> {
+  let pending = cache.get(source.boardUrl.href);
+  if (!pending) {
+    pending = (async () => {
+      const response = await client.get(source.boardUrl, {
+        signal,
+        allowedHosts: ["api.ashbyhq.com"],
+        acceptedMediaTypes: ["application/json"],
+        maxBodyBytes: 1024 * 1024,
+        maxRedirects: 0,
+      });
+      if (response.status < 200 || response.status > 299) return undefined;
+      const document = response.json<unknown>();
+      if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+      const jobs = (document as Readonly<Record<string, unknown>>).jobs;
+      if (!Array.isArray(jobs)) return undefined;
+      const descriptions = new Map<string, AshbyDescription>();
+      for (const job of jobs) {
+        if (typeof job !== "object" || job === null || Array.isArray(job)) continue;
+        const record = job as Readonly<Record<string, unknown>>;
+        const id = nonemptyString(record.id);
+        if (!id || !/^[0-9a-f-]{36}$/i.test(id)) continue;
+        const html = nonemptyString(record.descriptionHtml);
+        const text = nonemptyString(record.descriptionPlain);
+        if (html) descriptions.set(id.toLowerCase(), { value: html, format: "html" });
+        else if (text) descriptions.set(id.toLowerCase(), { value: text, format: "text" });
+      }
+      return descriptions;
+    })();
+    cache.set(source.boardUrl.href, pending);
+  }
+  return pending;
+}
+
+async function loadAshbyDescription(
+  client: SafePublicHttpClient,
+  source: AshbySource,
+  cache: AshbyBoardCache,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const board = await loadAshbyBoard(client, source, cache, signal);
+  const description = board?.get(source.jobId.toLowerCase());
+  return description ? sanitizeDescription(description.value, description.format) : undefined;
+}
+
+interface OracleCandidateSource {
+  readonly endpoint: URL;
+  readonly requisitionId: string;
+}
+
+function oracleCandidateSource(value: URL): OracleCandidateSource | undefined {
+  if (
+    !/^(?:[a-z0-9-]{1,63}\.)?fa(?:\.[a-z0-9-]{1,63})?\.oraclecloud\.com$/i.test(value.hostname)
+  ) {
+    return undefined;
+  }
+  const match = /^\/hcmUI\/CandidateExperience\/[A-Za-z0-9_-]{1,32}\/sites\/([A-Za-z0-9_-]{1,64})\/job\/([0-9]{1,32})\/?$/
+    .exec(value.pathname);
+  if (!match) return undefined;
+  const endpoint = new URL("/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails", value);
+  endpoint.search = `?expand=all&onlyData=true&finder=ById;Id=%22${match[2]}%22,siteNumber=${match[1]}`;
+  return { endpoint, requisitionId: match[2]! };
+}
+
+async function loadOracleCandidateDescription(
+  client: SafePublicHttpClient,
+  source: OracleCandidateSource,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.get(source.endpoint, {
+    signal,
+    allowedHosts: [source.endpoint.hostname],
+    acceptedMediaTypes: ["application/json", "application/vnd.oracle.adf.resourcecollection+json"],
+    maxBodyBytes: 1024 * 1024,
+    maxRedirects: 0,
+  });
+  if (response.status < 200 || response.status > 299) return undefined;
+  const document = response.json<unknown>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  const items = (document as Readonly<Record<string, unknown>>).items;
+  if (!Array.isArray(items) || items.length !== 1) return undefined;
+  const item = items[0];
+  if (typeof item !== "object" || item === null || Array.isArray(item)) return undefined;
+  const record = item as Readonly<Record<string, unknown>>;
+  const id = record.Id;
+  if (
+    (typeof id !== "string" && (typeof id !== "number" || !Number.isSafeInteger(id)))
+    || String(id) !== source.requisitionId
+  ) {
+    return undefined;
+  }
+  const description = nonemptyString(record.ExternalDescriptionStr);
+  return description ? sanitizeDescription(description, "html") : undefined;
+}
+
+
+interface PublicSupplierSource {
+  readonly endpoint: URL;
+  readonly postingId: string;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+function publicSupplierSource(value: URL): PublicSupplierSource | undefined {
+  let postingId: string | undefined;
+  let endpointOrigin: string | undefined;
+  let origin: string | undefined;
+  let websitePath: string | undefined;
+  if (value.hostname === "lifeattiktok.com") {
+    postingId = /^\/(?:[A-Za-z]{2}(?:-[A-Za-z]{2})?\/)?search\/([0-9]{1,32})\/?$/.exec(value.pathname)?.[1];
+    endpointOrigin = "https://api.lifeattiktok.com";
+    origin = "https://lifeattiktok.com";
+    websitePath = "tiktok";
+  } else if (value.hostname === "joinbytedance.com") {
+    postingId = /^\/(?:[A-Za-z]{2}(?:-[A-Za-z]{2})?\/)?search\/([0-9]{1,32})\/?$/.exec(value.pathname)?.[1];
+    endpointOrigin = "https://jobs.bytedance.com";
+    origin = "https://joinbytedance.com";
+    websitePath = "en";
+  } else if (value.hostname === "jobs.bytedance.com") {
+    postingId = /^\/[A-Za-z]{2}(?:-[A-Za-z]{2})?\/position\/([0-9]{1,32})\/detail\/?$/
+      .exec(value.pathname)?.[1];
+    endpointOrigin = "https://jobs.bytedance.com";
+    origin = "https://joinbytedance.com";
+    websitePath = "en";
+  }
+  if (!postingId || !endpointOrigin || !origin || !websitePath) return undefined;
+  return {
+    endpoint: new URL(`/api/v1/public/supplier/job/posts/${postingId}`, endpointOrigin),
+    postingId,
+    headers: {
+      "accept-language": "en-US",
+      "content-type": "application/json",
+      origin,
+      "website-path": websitePath,
+    },
+  };
+}
+
+async function loadPublicSupplierDescription(
+  client: SafePublicHttpClient,
+  source: PublicSupplierSource,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const response = await client.post(
+    source.endpoint,
+    JSON.stringify({ job_post_id: source.postingId }),
+    {
+      signal,
+      headers: source.headers,
+      allowedHosts: [source.endpoint.hostname],
+      acceptedMediaTypes: ["application/json"],
+      maxBodyBytes: 1024 * 1024,
+      maxRedirects: 0,
+    },
+  );
+  if (response.status < 200 || response.status > 299) return undefined;
+  const document = response.json<unknown>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  const envelope = document as Readonly<Record<string, unknown>>;
+  if (envelope.code !== 0) return undefined;
+  const data = envelope.data;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+  const detail = (data as Readonly<Record<string, unknown>>).job_post_detail;
+  if (typeof detail !== "object" || detail === null || Array.isArray(detail)) return undefined;
+  const record = detail as Readonly<Record<string, unknown>>;
+  if (record.id !== source.postingId || !nonemptyString(record.title)) return undefined;
+  const description = nonemptyString(record.description);
+  const requirement = nonemptyString(record.requirement);
+  if (!description) return undefined;
+  const combined = requirement ? `${description}\n\nQualifications\n${requirement}` : description;
+  return sanitizeDescription(combined, "text");
+}
 
 function safeWorkdayPathSegment(value: string): string | undefined {
   try {
@@ -504,7 +920,7 @@ function safeWorkdayPathSegment(value: string): string | undefined {
   }
 }
 
-function workdayCxsUrl(value: URL): URL | undefined {
+function workdayCxsUrl(value: URL, tenantOverride?: string): URL | undefined {
   const labels = value.hostname.toLowerCase().split(".");
   const rawSegments = value.pathname.split("/").filter(Boolean);
   const jobIndex = rawSegments.findIndex((segment) => segment.toLowerCase() === "job");
@@ -516,7 +932,7 @@ function workdayCxsUrl(value: URL): URL | undefined {
     && labels[2] === "myworkdayjobs"
     && labels[3] === "com"
   ) {
-    tenant = labels[0];
+    tenant = tenantOverride ?? labels[0];
   } else if (
     labels.length === 3
     && /^wd\d+$/.test(labels[0] ?? "")
@@ -525,14 +941,78 @@ function workdayCxsUrl(value: URL): URL | undefined {
     && rawSegments[0]?.toLowerCase() === "recruiting"
     && jobIndex === 3
   ) {
-    tenant = safeWorkdayPathSegment(rawSegments[1] ?? "");
+    tenant = tenantOverride ?? safeWorkdayPathSegment(rawSegments[1] ?? "");
   }
-  if (!tenant || !/^[a-z0-9-]{1,100}$/i.test(tenant)) return undefined;
+  if (!tenant || !/^[a-z0-9_-]{1,100}$/i.test(tenant)) return undefined;
   const postingSegments = rawSegments.slice(jobIndex - 1).map(safeWorkdayPathSegment);
   if (postingSegments.some((segment) => segment === undefined)) return undefined;
   const endpoint = new URL(value.origin);
   endpoint.pathname = `/wday/cxs/${tenant}/${postingSegments.join("/")}`;
   return endpoint;
+}
+
+interface WorkdaySiteConfig {
+  readonly tenant: string;
+  readonly site: string;
+}
+
+type WorkdaySiteConfigCache = Map<string, Promise<WorkdaySiteConfig | undefined>>;
+
+function workdaySiteConfigUrl(value: URL): { readonly endpoint: URL; readonly site: string } | undefined {
+  const labels = value.hostname.toLowerCase().split(".");
+  if (
+    labels.length !== 4
+    || !/^wd\d+$/.test(labels[1] ?? "")
+    || labels[2] !== "myworkdayjobs"
+    || labels[3] !== "com"
+  ) {
+    return undefined;
+  }
+  const rawSegments = value.pathname.split("/").filter(Boolean);
+  const jobIndex = rawSegments.findIndex((segment) => segment.toLowerCase() === "job");
+  if (jobIndex < 1) return undefined;
+  const encodedSite = safeWorkdayPathSegment(rawSegments[jobIndex - 1] ?? "");
+  if (!encodedSite) return undefined;
+  const site = decodeURIComponent(encodedSite);
+  const endpoint = new URL(value.origin);
+  endpoint.pathname = `/${encodedSite}`;
+  return { endpoint, site };
+}
+
+async function loadWorkdaySiteConfig(
+  client: SafePublicHttpClient,
+  sourceUrl: URL,
+  cache: WorkdaySiteConfigCache,
+  signal: AbortSignal,
+): Promise<WorkdaySiteConfig | undefined> {
+  const source = workdaySiteConfigUrl(sourceUrl);
+  if (!source) return undefined;
+  let pending = cache.get(source.endpoint.href);
+  if (!pending) {
+    pending = (async () => {
+      try {
+        const response = await client.get(source.endpoint, {
+          signal,
+          allowedHosts: [sourceUrl.hostname],
+          acceptedMediaTypes: ["text/html", "application/xhtml+xml"],
+          maxBodyBytes: 256 * 1024,
+          maxRedirects: 0,
+        });
+        if (response.status < 200 || response.status > 299) return undefined;
+        const assignment = /window\.workday\s*=\s*window\.workday\s*\|\|\s*\{([\s\S]{0,100000}?)\};/i
+          .exec(response.text())?.[1];
+        if (!assignment) return undefined;
+        const tenant = /\btenant\s*:\s*["']([A-Za-z0-9_-]{1,100})["']/i.exec(assignment)?.[1];
+        const site = /\bsiteId\s*:\s*["']([A-Za-z0-9_-]{1,100})["']/i.exec(assignment)?.[1];
+        return tenant && site === source.site ? { tenant, site } : undefined;
+      } catch (error) {
+        signal.throwIfAborted();
+        return undefined;
+      }
+    })();
+    cache.set(source.endpoint.href, pending);
+  }
+  return pending;
 }
 
 async function workdayDescriptionFromJson(value: unknown): Promise<string | undefined> {
@@ -546,6 +1026,7 @@ async function workdayDescriptionFromJson(value: unknown): Promise<string | unde
 async function loadWorkdayDescription(
   client: SafePublicHttpClient,
   sourceUrl: URL,
+  configCache: WorkdaySiteConfigCache,
   signal: AbortSignal,
 ): Promise<string | undefined> {
   const endpoint = workdayCxsUrl(sourceUrl);
@@ -556,8 +1037,22 @@ async function loadWorkdayDescription(
     acceptedMediaTypes: ["application/json"],
     maxBodyBytes: 1024 * 1024,
   });
-  if (response.status < 200 || response.status > 299) return undefined;
-  return workdayDescriptionFromJson(response.json<unknown>());
+  if (response.status >= 200 && response.status <= 299) {
+    return workdayDescriptionFromJson(response.json<unknown>());
+  }
+  if (response.status !== 422) return undefined;
+  const config = await loadWorkdaySiteConfig(client, sourceUrl, configCache, signal);
+  if (!config) return undefined;
+  const correctedEndpoint = workdayCxsUrl(sourceUrl, config.tenant);
+  if (!correctedEndpoint || correctedEndpoint.href === endpoint.href) return undefined;
+  const corrected = await client.get(correctedEndpoint, {
+    signal,
+    allowedHosts: [sourceUrl.hostname],
+    acceptedMediaTypes: ["application/json"],
+    maxBodyBytes: 1024 * 1024,
+  });
+  if (corrected.status < 200 || corrected.status > 299) return undefined;
+  return workdayDescriptionFromJson(corrected.json<unknown>());
 }
 
 async function descriptionFromHtml(html: string): Promise<string | undefined> {
@@ -574,11 +1069,105 @@ async function descriptionFromHtml(html: string): Promise<string | undefined> {
   return undefined;
 }
 
-async function loadDescription(client: SafePublicHttpClient, url: string, signal: AbortSignal): Promise<string | undefined> {
+function normalizedJobIdentity(value: string): string {
+  return normalizeSpace(value).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+async function loadSimplifyMirrorDescription(
+  client: SafePublicHttpClient,
+  url: string,
+  company: string,
+  title: string,
+  signal: AbortSignal,
+): Promise<string | undefined> {
   try {
     const sourceUrl = new URL(url);
+    if (sourceUrl.hostname !== "simplify.jobs" || !/^\/p\/[0-9a-f-]{36}$/i.test(sourceUrl.pathname)) {
+      return undefined;
+    }
+    const response = await client.get(sourceUrl, {
+      signal,
+      allowedHosts: ["simplify.jobs"],
+      acceptedMediaTypes: ["text/html", "application/xhtml+xml"],
+      maxBodyBytes: 1024 * 1024,
+    });
+    if (response.status < 200 || response.status > 299) return undefined;
+    const candidates: Readonly<Record<string, unknown>>[] = [];
+    for (const value of await captureJsonLd(response.text())) {
+      visitJsonObjects(value, (record) => {
+        const type = record["@type"];
+        if (type === "JobPosting" || (Array.isArray(type) && type.includes("JobPosting"))) {
+          candidates.push(record);
+        }
+      });
+    }
+    const expectedCompany = normalizedJobIdentity(company);
+    const expectedTitle = normalizedJobIdentity(title);
+    for (const candidate of candidates) {
+      const candidateTitle = nonemptyString(candidate.title);
+      const organization = candidate.hiringOrganization;
+      const candidateCompany = typeof organization === "object" && organization !== null && !Array.isArray(organization)
+        ? nonemptyString((organization as Readonly<Record<string, unknown>>).name)
+        : undefined;
+      if (
+        !candidateTitle
+        || !candidateCompany
+        || normalizedJobIdentity(candidateTitle) !== expectedTitle
+        || normalizedJobIdentity(candidateCompany) !== expectedCompany
+      ) {
+        continue;
+      }
+      const description = nonemptyString(candidate.description);
+      if (!description) continue;
+      const sanitized = await sanitizeDescription(description, "html");
+      if (sanitized) return sanitized;
+    }
+    return undefined;
+  } catch (error) {
+    signal.throwIfAborted();
+    return undefined;
+  }
+}
+
+async function loadDescription(
+  client: SafePublicHttpClient,
+  url: string,
+  workdayConfigCache: WorkdaySiteConfigCache,
+  ashbyBoardCache: AshbyBoardCache,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  try {
+    const sourceUrl = new URL(url);
+    const greenhouse = greenhouseSource(sourceUrl);
+    if (greenhouse) {
+      return await loadGreenhouseDescription(client, greenhouse, signal);
+    }
+    const smartRecruiters = smartRecruitersSource(sourceUrl);
+    if (smartRecruiters) {
+      return await loadSmartRecruitersDescription(client, smartRecruiters, signal);
+    }
+    const workable = workableSource(sourceUrl);
+    if (workable) {
+      return await loadWorkableDescription(client, workable, signal);
+    }
+    const lever = leverSource(sourceUrl);
+    if (lever) {
+      return await loadLeverDescription(client, lever, signal);
+    }
+    const ashby = ashbySource(sourceUrl);
+    if (ashby) {
+      return await loadAshbyDescription(client, ashby, ashbyBoardCache, signal);
+    }
+    const oracle = oracleCandidateSource(sourceUrl);
+    if (oracle) {
+      return await loadOracleCandidateDescription(client, oracle, signal);
+    }
+    const supplier = publicSupplierSource(sourceUrl);
+    if (supplier) {
+      return await loadPublicSupplierDescription(client, supplier, signal);
+    }
     if (workdayCxsUrl(sourceUrl)) {
-      return await loadWorkdayDescription(client, sourceUrl, signal);
+      return await loadWorkdayDescription(client, sourceUrl, workdayConfigCache, signal);
     }
     const response = await client.get(url, {
       signal,
@@ -591,7 +1180,7 @@ async function loadDescription(client: SafePublicHttpClient, url: string, signal
     const description = mediaType === "application/json" || mediaType === "application/ld+json"
       ? await sanitizedJsonDescription(response.json<unknown>(), false)
       : await descriptionFromHtml(response.text());
-    return description ?? loadWorkdayDescription(client, response.url, signal);
+    return description ?? await loadWorkdayDescription(client, response.url, workdayConfigCache, signal);
   } catch (error) {
     signal.throwIfAborted();
     return undefined;
@@ -632,6 +1221,8 @@ export function createGitHubTableConnector(
   let cached: DiscoverySyncResult | undefined;
   let cachedMarkdown: string | undefined;
   let cachedRevision: string | undefined;
+  const workdayConfigCache: WorkdaySiteConfigCache = new Map();
+  const ashbyBoardCache: AshbyBoardCache = new Map();
   return {
     id: config.id,
     name: config.name,
@@ -695,7 +1286,22 @@ export function createGitHubTableConnector(
           omittedDescriptions += 1;
           return undefined;
         }
-        const description = await loadDescription(syncClient, canonicalUrl, signal);
+        let description = await loadDescription(
+          syncClient,
+          canonicalUrl,
+          workdayConfigCache,
+          ashbyBoardCache,
+          signal,
+        );
+        if (!description && row.descriptionUrl) {
+          description = await loadSimplifyMirrorDescription(
+            syncClient,
+            row.descriptionUrl,
+            row.company,
+            row.title,
+            signal,
+          );
+        }
         if (!description) {
           omittedDescriptions += 1;
           return undefined;
