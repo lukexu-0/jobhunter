@@ -71,6 +71,26 @@ describe("GitHub internship table ingestion", () => {
     expect(programs.nonInternshipCount).toBe(1);
   });
 
+  test("inherits Simplify continuation companies only within one HTML table", async () => {
+    const parsed = await parseGitHubRepositoryTables(`
+<table>
+<tr><th>Company</th><th>Role</th><th>Application</th></tr>
+<tr><td>Acme</td><td>Software Engineering Intern</td><td><a href="https://jobs.example.com/1">Apply</a></td></tr>
+<tr><td>↳</td><td>Data Engineering Intern</td><td><a href="https://jobs.example.com/2">Apply</a></td></tr>
+</table>
+<table>
+<tr><th>Company</th><th>Role</th><th>Application</th></tr>
+<tr><td>↳</td><td>Hardware Engineering Intern</td><td><a href="https://jobs.example.com/3">Apply</a></td></tr>
+</table>
+`);
+
+    expect(parsed.rows.map(({ company, title }) => ({ company, title }))).toEqual([
+      { company: "Acme", title: "Software Engineering Intern" },
+      { company: "Acme", title: "Data Engineering Intern" },
+    ]);
+    expect(parsed.unusableCount).toBe(1);
+  });
+
   test("bounds parser records before processing an oversized repository table", async () => {
     const rows = Array.from({ length: 1_000 }, (_, index) =>
       `<tr><td>Company ${index}</td><td>Software Engineering Intern</td><td><a href="https://jobs.example.com/${index}">Apply</a></td></tr>`,

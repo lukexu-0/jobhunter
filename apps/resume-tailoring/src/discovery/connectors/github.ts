@@ -188,6 +188,7 @@ function parsedTableRow(
   raw: string,
   line: number,
   internshipSection: boolean,
+  inheritedCompany?: string,
 ): ParsedRowOutcome {
   if (CLOSED_ROW.test(raw)) return { kind: "closed" };
   const standardCompanyIndex = columnIndex(headers, COLUMN_NAMES.company);
@@ -209,9 +210,12 @@ function parsedTableRow(
   }
   const applyUrl = firstUrl(cells[applyIndex]?.markup ?? "");
   const rawCompany = cells[companyIndex]?.text ?? "";
+  const normalizedRawCompany = normalizeSpace(rawCompany);
   const company = zapplyShape
     ? companyFromProgramName(title)
-    : normalizeSpace(rawCompany.replace(/^[^\p{L}\p{N}]+/u, ""));
+    : normalizedRawCompany === "↳"
+      ? inheritedCompany ?? ""
+      : normalizeSpace(rawCompany.replace(/^[^\p{L}\p{N}]+/u, ""));
   if (!company || !title || !applyUrl || !absolutePublicUrl(applyUrl)) return { kind: "unusable" };
   const locationIndex = columnIndex(headers, COLUMN_NAMES.location);
   const dateIndex = columnIndex(headers, COLUMN_NAMES.date);
@@ -290,6 +294,7 @@ export function parseGitHubInternshipTable(
     tableCount += 1;
     const internshipSection = sectionState[headerLine] ?? false;
     let rowLine = headerLine + 2;
+    let previousCompany: string | undefined;
     for (; rowLine < lines.length; rowLine += 1) {
       const raw = lines[rowLine]!;
       if (!raw.trim() || !raw.includes("|")) break;
@@ -304,7 +309,9 @@ export function parseGitHubInternshipTable(
         continue;
       }
       const cells = rawCells.map((markup) => ({ text: markdownText(markup), markup }));
-      collectOutcome(parsedTableRow(headers, cells, raw, rowLine + 1, internshipSection), rows, counts);
+      const outcome = parsedTableRow(headers, cells, raw, rowLine + 1, internshipSection, previousCompany);
+      previousCompany = outcome.kind === "row" ? outcome.row.company : undefined;
+      collectOutcome(outcome, rows, counts);
     }
     headerLine = rowLine - 1;
   }
@@ -354,6 +361,7 @@ export async function parseGitHubRepositoryTables(
     let previousRowIndex = 0;
     let rowLine = tableLine;
     let headers: string[] | undefined;
+    let previousCompany: string | undefined;
     for (const rowMatch of table.matchAll(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi)) {
       if (recordsSeen >= limit) {
         truncated = true;
@@ -390,20 +398,20 @@ export async function parseGitHubRepositoryTables(
       }
       if (!headers) continue;
       if (cells.length !== headers.length) {
+        previousCompany = undefined;
         counts.unusable += 1;
         continue;
       }
-      collectOutcome(
-        parsedTableRow(
-          headers,
-          cells,
-          rowMatch[0],
-          rowLine,
-          internshipSection,
-        ),
-        rows,
-        counts,
+      const outcome = parsedTableRow(
+        headers,
+        cells,
+        rowMatch[0],
+        rowLine,
+        internshipSection,
+        previousCompany,
       );
+      previousCompany = outcome.kind === "row" ? outcome.row.company : undefined;
+      collectOutcome(outcome, rows, counts);
     }
   }
   const seen = new Set<string>();
