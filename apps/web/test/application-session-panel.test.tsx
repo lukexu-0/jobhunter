@@ -46,7 +46,7 @@ const callbacks = {
   onRetry: async () => {},
   onResume: async () => {},
   onCommand: async () => {},
-  onSteer: async () => ({ status: "accepted" as const }),
+  onSteer: async () => ({ status: "accepted" as const, current: false as const }),
   onLoadSuggestions: async () => ({ suggestions: [] }),
   onProfessionalize: async () => ({ answer: "Professional answer" }),
 };

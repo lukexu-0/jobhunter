@@ -1224,6 +1224,157 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
 });
 
+test("a changed question gate suppresses stale continuation after steering", async ({ page }) => {
+  const oldQuestion: ApplicationAdditionalInfoQuestion = {
+    id: "old_question",
+    scope: "application",
+    question: "What should the old gate answer?",
+    answerType: "text",
+  };
+  const newQuestion: ApplicationAdditionalInfoQuestion = {
+    id: "new_question",
+    scope: "application",
+    question: "What should the current gate answer?",
+    answerType: "text",
+  };
+  const initial = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [oldQuestion] },
+    updatedAt: createdAt + 100,
+  });
+  const changed = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [newQuestion] },
+    updatedAt: createdAt + 200,
+  });
+  const steerReply = deferred();
+  const gateFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: initial,
+  });
+  let staleSteerSettled = false;
+  mock.commandReplies.push(
+    {
+      status: 202,
+      waitFor: steerReply.promise,
+      before: () => {
+        staleSteerSettled = true;
+      },
+    },
+    { status: 202 },
+  );
+  queueSse(
+    mock,
+    eventFixture("snapshot", changed, {}),
+    2,
+    gateFrame.promise,
+    () => {
+      mock.application = changed;
+    },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByRole("textbox", { name: "Operator guidance" })
+    .fill("Use the current question only.");
+  await page.getByRole("group", { name: oldQuestion.question })
+    .getByRole("textbox", { name: "Answer", exact: true })
+    .fill("Stale answer");
+  await page.getByRole("button", { name: "Steer and answer questions" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+
+  gateFrame.resolve();
+  await expect(page.getByRole("group", { name: newQuestion.question })).toBeVisible();
+  const currentGuidance = page.getByRole("textbox", { name: "Operator guidance" });
+  await currentGuidance.fill("Use the current gate.");
+  await page.getByRole("button", { name: "Send guidance" }).click();
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands[1]).toEqual({
+    type: "steer",
+    message: "Use the current gate.",
+  });
+  await expect(page.getByRole("status").filter({
+    hasText: "Guidance queued for the next agent step.",
+  })).toBeVisible();
+
+  steerReply.resolve();
+  await expect.poll(() => staleSteerSettled).toBe(true);
+  await page.waitForTimeout(50);
+  expect(mock.commands).toEqual([
+    { type: "steer", message: "Use the current question only." },
+    { type: "steer", message: "Use the current gate." },
+  ]);
+});
+
+test("an authoritative replacement gate clears ambiguous steering delivery", async ({ page }) => {
+  const oldQuestion: ApplicationAdditionalInfoQuestion = {
+    id: "old_question",
+    scope: "application",
+    question: "What should the old gate answer?",
+    answerType: "text",
+  };
+  const newQuestion: ApplicationAdditionalInfoQuestion = {
+    id: "new_question",
+    scope: "application",
+    question: "What should the current gate answer?",
+    answerType: "text",
+  };
+  const initial = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [oldQuestion] },
+    updatedAt: createdAt + 100,
+  });
+  const changed = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions: [newQuestion] },
+    updatedAt: createdAt + 200,
+  });
+  const gateFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: initial,
+  });
+  mock.commandReplies.push(
+    {
+      status: 503,
+      body: apiError("APPLICATION_HARNESS_UNAVAILABLE", "private upstream detail"),
+    },
+    { status: 202 },
+  );
+  queueSse(
+    mock,
+    eventFixture("snapshot", changed, {}),
+    2,
+    gateFrame.promise,
+    () => {
+      mock.application = changed;
+    },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  const guidance = page.getByRole("textbox", { name: "Operator guidance" });
+  const send = page.getByRole("button", { name: "Send guidance" });
+  await guidance.fill("Use the old gate.");
+  await send.click();
+  await expect(page.getByRole("alert").filter({
+    hasText: "Guidance delivery could not be confirmed",
+  })).toBeVisible();
+  await expect(send).toBeDisabled();
+
+  gateFrame.resolve();
+  await expect(page.getByRole("group", { name: newQuestion.question })).toBeVisible();
+  await expect(send).toBeEnabled();
+  await guidance.fill("Use the current gate.");
+  await send.click();
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands).toEqual([
+    { type: "steer", message: "Use the old gate." },
+    { type: "steer", message: "Use the current gate." },
+  ]);
+});
+
 test("professional answers support keyboard revisions, retain the raw draft, and survive conflicts", async ({ page }) => {
   const question: ApplicationAdditionalInfoQuestion = {
     id: "motivation",
@@ -2924,6 +3075,91 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
   expect(await page.evaluate(
     () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
   )).toBe(true);
+});
+
+test("cancelling during steering suppresses navigation continuation", async ({ page }) => {
+  const waiting = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    updatedAt: createdAt + 100,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public checkpoint.",
+    },
+  });
+  const steerReply = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: waiting,
+  });
+  mock.commandReplies.push(
+    { status: 202, waitFor: steerReply.promise },
+    { status: 202 },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByRole("textbox", { name: "Operator guidance" })
+    .fill("Retry the checkpoint once.");
+  await page.getByRole("button", { name: "Steer and continue" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  await expect(page.getByRole("button", { name: "Continue application" }))
+    .toBeDisabled();
+
+  await page.getByRole("button", { name: "Cancel application" }).click();
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands).toEqual([
+    { type: "steer", message: "Retry the checkpoint once." },
+    { type: "cancel" },
+  ]);
+
+  steerReply.resolve();
+  await expect(page.getByRole("status").filter({
+    hasText: "Guidance was queued, but the application state changed.",
+  })).toBeVisible();
+  await page.waitForTimeout(50);
+  expect(mock.commands).toHaveLength(2);
+});
+
+test("ordinary navigation continues after ambiguous steering settles", async ({ page }) => {
+  const waiting = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    updatedAt: createdAt + 100,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public checkpoint.",
+    },
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: waiting,
+  });
+  mock.commandReplies.push(
+    {
+      status: 503,
+      body: apiError("APPLICATION_HARNESS_UNAVAILABLE", "private upstream detail"),
+    },
+    { status: 202 },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  await page.getByRole("textbox", { name: "Operator guidance" })
+    .fill("Retry the checkpoint once.");
+  await page.getByRole("button", { name: "Send guidance" }).click();
+  await expect(page.getByRole("alert").filter({
+    hasText: "Guidance delivery could not be confirmed",
+  })).toBeVisible();
+
+  const continueApplication = page.getByRole("button", {
+    name: "Continue application",
+  });
+  await expect(continueApplication).toBeEnabled();
+  await continueApplication.click();
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands).toEqual([
+    { type: "steer", message: "Retry the checkpoint once." },
+    { type: "continue" },
+  ]);
 });
 
 test("retry current queues fixed guidance before continuing a navigation gate", async ({ page }) => {

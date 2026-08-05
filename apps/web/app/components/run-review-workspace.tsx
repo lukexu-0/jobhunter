@@ -22,6 +22,7 @@ import {
   type ApplicationLifecycleAction,
   type ApplicationSteerCommand,
   type ApplicationSteeringState,
+  type ApplicationSteeringContinuationToken,
   type ApplicationSteeringSubmissionResult,
 } from "./application-session-panel";
 import {
@@ -60,6 +61,7 @@ interface ApplicationSteeringLatch {
   state: Exclude<ApplicationSteeringState, "idle">;
   readonly generation: number;
   readonly bridgeState: ApplicationSessionSnapshotDto["bridgeState"];
+  readonly pendingActionKey: string;
 }
 
 export interface RunReviewWorkspaceProps {
@@ -265,15 +267,19 @@ export function RunReviewWorkspace({
     useState<ApplicationStreamState>("idle");
   const [applicationStreamRecovery, setApplicationStreamRecovery] = useState(0);
   const applicationRequestVersion = useRef(0);
+  const applicationActionEpochRef = useRef(0);
+  const applicationViewEpochRef = useRef(0);
   const applicationViewRef = useRef<ApplicationSessionView | null>(null);
-  const activeRunIdRef = useRef(run.id);
+  const applicationContextKey = `${run.id}:${run.revision}`;
+  const activeRunContextRef = useRef<string | null>(applicationContextKey);
   const applicationLifecycleLatchRef = useRef<ApplicationActionLatch | null>(null);
   const applicationCommandLatchRef = useRef<ApplicationActionLatch | null>(null);
   const applicationSteeringLatchRef = useRef<ApplicationSteeringLatch | null>(null);
-  activeRunIdRef.current = run.id;
+  activeRunContextRef.current = applicationContextKey;
   const installApplicationView = useCallback((next: ApplicationSessionView): boolean => {
-    if (activeRunIdRef.current !== run.id) return false;
+    if (activeRunContextRef.current !== applicationContextKey) return false;
     if (!shouldAcceptApplicationView(applicationViewRef.current, next)) return false;
+    applicationViewEpochRef.current += 1;
     applicationViewRef.current = next;
     setApplicationLoadError(null);
     setApplicationStreamError(null);
@@ -296,6 +302,8 @@ export function RunReviewWorkspace({
         || !canGuideApplicationAgent(nextSteeringSnapshot)
         || nextSteeringSnapshot.generation !== steeringLatch.generation
         || nextSteeringSnapshot.bridgeState !== steeringLatch.bridgeState
+        || JSON.stringify(nextSteeringSnapshot.pendingAction)
+          !== steeringLatch.pendingActionKey
       )
     ) {
       applicationSteeringLatchRef.current = null;
@@ -304,7 +312,7 @@ export function RunReviewWorkspace({
     onApplicationView(next);
     setApplicationView(next);
     return true;
-  }, [onApplicationView, run.id]);
+  }, [applicationContextKey, onApplicationView]);
   const refreshApplicationView = useCallback(async (): Promise<boolean> => {
     return installApplicationView(await getApplicationSession(run.id));
   }, [installApplicationView, run.id]);
@@ -312,8 +320,8 @@ export function RunReviewWorkspace({
     error: unknown,
     fallback: string,
   ): Promise<void> => {
-    const requestRunId = run.id;
-    if (activeRunIdRef.current !== requestRunId) return;
+    const requestContext = applicationContextKey;
+    if (activeRunContextRef.current !== requestContext) return;
     const message = publicMessage(error, fallback);
     setApplicationError(message);
     try {
@@ -321,8 +329,8 @@ export function RunReviewWorkspace({
     } catch {
       // Retain the latest confirmed projection and the fixed public failure.
     }
-    if (activeRunIdRef.current === requestRunId) setApplicationError(message);
-  }, [refreshApplicationView, run.id]);
+    if (activeRunContextRef.current === requestContext) setApplicationError(message);
+  }, [applicationContextKey, refreshApplicationView]);
   const loadApplicationAnswerSuggestions = useCallback((
     questionId: string,
     signal: AbortSignal,
@@ -377,6 +385,15 @@ export function RunReviewWorkspace({
     setIsStartingApplication(false);
     setApplicationError(null);
   }, [onApplicationView, run.id, run.revision]);
+
+  useEffect(() => {
+    activeRunContextRef.current = applicationContextKey;
+    return () => {
+      if (activeRunContextRef.current === applicationContextKey) {
+        activeRunContextRef.current = null;
+      }
+    };
+  }, [applicationContextKey]);
 
   useEffect(() => {
     setAcknowledgeVisualIssues(false);
@@ -541,8 +558,9 @@ export function RunReviewWorkspace({
   };
 
   const startApplication = async (pdfSha256: string) => {
-    const requestRunId = run.id;
-    if (activeRunIdRef.current !== requestRunId) return;
+    const requestContext = applicationContextKey;
+    if (activeRunContextRef.current !== requestContext) return;
+    applicationActionEpochRef.current += 1;
     setIsStartingApplication(true);
     setApplicationError(null);
     try {
@@ -553,7 +571,7 @@ export function RunReviewWorkspace({
         "The resume is approved, but the application assistant could not start.",
       );
     } finally {
-      if (activeRunIdRef.current === requestRunId) setIsStartingApplication(false);
+      if (activeRunContextRef.current === requestContext) setIsStartingApplication(false);
     }
   };
 
@@ -566,6 +584,7 @@ export function RunReviewWorkspace({
   };
 
   const settleApplicationLifecycleRequest = (latch: ApplicationActionLatch) => {
+    if (activeRunContextRef.current !== applicationContextKey) return;
     if (
       applicationLifecycleLatchRef.current === latch
       && settleApplicationActionRequest(latch)
@@ -576,6 +595,7 @@ export function RunReviewWorkspace({
   };
 
   const settleApplicationCommandRequest = (latch: ApplicationActionLatch) => {
+    if (activeRunContextRef.current !== applicationContextKey) return;
     if (
       applicationCommandLatchRef.current === latch
       && settleApplicationActionRequest(latch)
@@ -597,6 +617,7 @@ export function RunReviewWorkspace({
       acceptsProjection: lifecycleProjectionMatcher("retry", snapshot),
     };
     applicationLifecycleLatchRef.current = latch;
+    applicationActionEpochRef.current += 1;
     setApplicationLifecycleAction("retry");
     setApplicationError(null);
     try {
@@ -609,7 +630,11 @@ export function RunReviewWorkspace({
         error,
         "The application assistant could not be retried.",
       );
-      if (definiteRejection && applicationLifecycleLatchRef.current === latch) {
+      if (
+        definiteRejection
+        && activeRunContextRef.current === applicationContextKey
+        && applicationLifecycleLatchRef.current === latch
+      ) {
         applicationLifecycleLatchRef.current = null;
         setApplicationLifecycleAction(null);
       }
@@ -624,6 +649,7 @@ export function RunReviewWorkspace({
       acceptsProjection: lifecycleProjectionMatcher("cancel", snapshot),
     };
     applicationLifecycleLatchRef.current = latch;
+    applicationActionEpochRef.current += 1;
     setApplicationLifecycleAction("cancel");
     setApplicationError(null);
     try {
@@ -641,7 +667,11 @@ export function RunReviewWorkspace({
         error,
         "The application assistant could not be cancelled.",
       );
-      if (definiteRejection && applicationLifecycleLatchRef.current === latch) {
+      if (
+        definiteRejection
+        && activeRunContextRef.current === applicationContextKey
+        && applicationLifecycleLatchRef.current === latch
+      ) {
         applicationLifecycleLatchRef.current = null;
         setApplicationLifecycleAction(null);
       }
@@ -656,6 +686,7 @@ export function RunReviewWorkspace({
       acceptsProjection: lifecycleProjectionMatcher("close", snapshot),
     };
     applicationLifecycleLatchRef.current = latch;
+    applicationActionEpochRef.current += 1;
     setApplicationLifecycleAction("close");
     setApplicationError(null);
     try {
@@ -666,7 +697,11 @@ export function RunReviewWorkspace({
       const definiteRejection = isDefiniteApplicationRequestRejection(error);
       if (!definiteRejection) settleApplicationLifecycleRequest(latch);
       await refreshAfterApplicationFailure(error, "The browser could not be closed.");
-      if (definiteRejection && applicationLifecycleLatchRef.current === latch) {
+      if (
+        definiteRejection
+        && activeRunContextRef.current === applicationContextKey
+        && applicationLifecycleLatchRef.current === latch
+      ) {
         applicationLifecycleLatchRef.current = null;
         setApplicationLifecycleAction(null);
       }
@@ -680,7 +715,10 @@ export function RunReviewWorkspace({
     if (
       !current
       || !canGuideApplicationAgent(current)
+      || activeRunContextRef.current !== applicationContextKey
       || applicationSteeringLatchRef.current
+      || applicationLifecycleLatchRef.current
+      || applicationCommandLatchRef.current
     ) {
       return {
         status: "rejected",
@@ -688,22 +726,61 @@ export function RunReviewWorkspace({
       };
     }
 
+    const requestRunId = run.id;
+    const requestContext = applicationContextKey;
+    const requestVersion = applicationRequestVersion.current;
+    const viewEpoch = applicationViewEpochRef.current;
     const latch: ApplicationSteeringLatch = {
       state: "sending",
       generation: current.generation,
       bridgeState: current.bridgeState,
+      pendingActionKey: JSON.stringify(current.pendingAction),
     };
+    const actionEpoch = applicationActionEpochRef.current;
     applicationSteeringLatchRef.current = latch;
     setApplicationSteeringState("sending");
     try {
-      await sendApplicationCommand(run.id, command);
-      if (applicationSteeringLatchRef.current === latch) {
+      await sendApplicationCommand(requestRunId, command);
+      const ownsLatch = applicationSteeringLatchRef.current === latch;
+      const isCurrent = applicationRequestVersion.current === requestVersion
+        && applicationActionEpochRef.current === actionEpoch
+        && applicationViewEpochRef.current === viewEpoch
+        && activeRunContextRef.current === requestContext
+        && ownsLatch;
+      if (ownsLatch) {
         applicationSteeringLatchRef.current = null;
-        setApplicationSteeringState("idle");
+        if (activeRunContextRef.current === requestContext) {
+          setApplicationSteeringState("idle");
+        }
       }
-      return { status: "accepted" };
+      return isCurrent
+        ? {
+          status: "accepted",
+          current: true,
+          continuationToken: {
+            runId: requestRunId,
+            requestVersion,
+            actionEpoch,
+            viewEpoch,
+            generation: latch.generation,
+            bridgeState: latch.bridgeState,
+            pendingActionKey: latch.pendingActionKey,
+          },
+        }
+        : { status: "accepted", current: false };
     } catch (error) {
-      if (applicationSteeringLatchRef.current !== latch) {
+      const ownsLatch = applicationSteeringLatchRef.current === latch;
+      if (
+        applicationRequestVersion.current !== requestVersion
+        || activeRunContextRef.current !== requestContext
+        || !ownsLatch
+      ) {
+        if (ownsLatch) {
+          applicationSteeringLatchRef.current = null;
+          if (activeRunContextRef.current === requestContext) {
+            setApplicationSteeringState("idle");
+          }
+        }
         return { status: "ambiguous" };
       }
       if (isDefiniteApplicationRequestRejection(error)) {
@@ -720,11 +797,35 @@ export function RunReviewWorkspace({
     }
   };
 
-  const submitApplicationCommand = async (command: ApplicationSessionCommand) => {
+  const submitApplicationCommand = async (
+    command: ApplicationSessionCommand,
+    continuationToken?: ApplicationSteeringContinuationToken,
+  ) => {
     if (command.type === "steer") return;
-    if (!snapshot || applicationCommandLatchRef.current) return;
-    const latch = createApplicationCommandLatch(command, snapshot);
+    const current = applicationSnapshot(applicationViewRef.current);
+    if (
+      !current
+      || activeRunContextRef.current !== applicationContextKey
+      || applicationCommandLatchRef.current
+      || applicationLifecycleLatchRef.current
+      || applicationSteeringLatchRef.current?.state === "sending"
+    ) return;
+    if (
+      continuationToken
+      && (
+        continuationToken.runId !== run.id
+        || continuationToken.requestVersion !== applicationRequestVersion.current
+        || continuationToken.actionEpoch !== applicationActionEpochRef.current
+        || continuationToken.viewEpoch !== applicationViewEpochRef.current
+        || continuationToken.generation !== current.generation
+        || continuationToken.bridgeState !== current.bridgeState
+        || continuationToken.pendingActionKey
+          !== JSON.stringify(current.pendingAction)
+      )
+    ) return;
+    const latch = createApplicationCommandLatch(command, current);
     applicationCommandLatchRef.current = latch;
+    applicationActionEpochRef.current += 1;
     setApplicationCommandAction(command.type);
     setApplicationError(null);
     try {
@@ -739,6 +840,7 @@ export function RunReviewWorkspace({
       );
       if (
         definiteRejection
+        && activeRunContextRef.current === applicationContextKey
         && applicationCommandLatchRef.current === latch
       ) {
         applicationCommandLatchRef.current = null;
@@ -748,19 +850,19 @@ export function RunReviewWorkspace({
   };
 
   const submitApproval = async () => {
-    const approvalRunId = run.id;
+    const approvalContext = applicationContextKey;
     if (!canReview || approvalDisabled) return;
     setActionError(null);
     try {
       const approved = await onApprove(acknowledgeVisualIssues);
-      if (activeRunIdRef.current !== approvalRunId) return;
+      if (activeRunContextRef.current !== approvalContext) return;
       if (!approved.currentPdfSha256) {
         setActionError("The resume was approved, but its PDF is unavailable to apply.");
         return;
       }
       await startApplication(approved.currentPdfSha256);
     } catch (error) {
-      if (activeRunIdRef.current === approvalRunId) {
+      if (activeRunContextRef.current === approvalContext) {
         setActionError(publicMessage(error, "The resume could not be approved."));
       }
     }

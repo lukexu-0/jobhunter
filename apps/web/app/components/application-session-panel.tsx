@@ -31,8 +31,22 @@ export type ApplicationSteerCommand = Extract<
   { readonly type: "steer" }
 >;
 export type ApplicationSteeringState = "idle" | "sending" | "ambiguous";
+export interface ApplicationSteeringContinuationToken {
+  readonly runId: string;
+  readonly requestVersion: number;
+  readonly actionEpoch: number;
+  readonly viewEpoch: number;
+  readonly generation: number;
+  readonly bridgeState: ApplicationSessionBridgeState;
+  readonly pendingActionKey: string;
+}
 export type ApplicationSteeringSubmissionResult =
-  | { readonly status: "accepted" }
+  | {
+    readonly status: "accepted";
+    readonly current: true;
+    readonly continuationToken: ApplicationSteeringContinuationToken;
+  }
+  | { readonly status: "accepted"; readonly current: false }
   | { readonly status: "rejected"; readonly message: string }
   | { readonly status: "ambiguous" };
 
@@ -58,7 +72,10 @@ export interface ApplicationSessionPanelProps {
     signal: AbortSignal,
   ) => Promise<ApplicationProfessionalizeResponse>;
   readonly onResume: () => Promise<void>;
-  readonly onCommand: (command: ApplicationSessionCommand) => Promise<void>;
+  readonly onCommand: (
+    command: ApplicationSessionCommand,
+    continuationToken?: ApplicationSteeringContinuationToken,
+  ) => Promise<void>;
   readonly onSteer: (
     command: ApplicationSteerCommand,
   ) => Promise<ApplicationSteeringSubmissionResult>;
@@ -133,6 +150,8 @@ export const AMBIGUOUS_STEERING_MESSAGE =
   "Guidance delivery could not be confirmed. Do not send it again until the application state changes.";
 export const STEERING_SUCCESS_MESSAGE =
   "Guidance queued for the next agent step.";
+export const STEERING_STATE_CHANGED_MESSAGE =
+  "Guidance was queued, but the application state changed. Use the current action to continue.";
 export const RETRY_CURRENT_GUIDANCE = "Retry the current action.";
 export const RETRY_CURRENT_SUCCESS_MESSAGE =
   "Retry guidance queued for the next agent step.";
@@ -314,9 +333,14 @@ export function ApplicationSessionPanel({
     useState<string | null>(null);
   const [steeringDeliveryStatus, setSteeringDeliveryStatus] =
     useState<string | null>(null);
-  const steeringSubmissionPendingRef = useRef(false);
-  const steeringSnapshotIdentity =
-    `${snapshot.generation}:${snapshot.bridgeState}`;
+  const steeringSubmissionPendingRef = useRef<symbol | null>(null);
+  const steeringSnapshotIdentity = [
+    snapshot.generation,
+    snapshot.bridgeState,
+    JSON.stringify(snapshot.pendingAction),
+    snapshot.submissionPhase,
+    snapshot.terminalAt,
+  ].join(":");
   const currentSteeringSnapshotIdentityRef = useRef(
     steeringSnapshotIdentity,
   );
@@ -332,16 +356,22 @@ export function ApplicationSessionPanel({
     previousSteeringSnapshotIdentityRef.current = steeringSnapshotIdentity;
     setSteeringDraft("");
     setSteeringValidationError(null);
+    steeringSubmissionPendingRef.current = null;
     setSteeringDeliveryError(null);
     setSteeringDeliveryStatus(null);
   }, [steeringSnapshotIdentity]);
+  useEffect(() => () => {
+    steeringSubmissionPendingRef.current = null;
+  }, []);
   const steeringDisabled = busy || steeringState !== "idle";
   const submitSteering = async (
-    continuation?: () => Promise<void>,
+    continuation?: (
+      continuationToken?: ApplicationSteeringContinuationToken,
+    ) => Promise<void>,
     message = steeringDraft,
     clearDraft = true,
   ): Promise<void> => {
-    if (steeringDisabled || steeringSubmissionPendingRef.current) return;
+    if (steeringDisabled || steeringSubmissionPendingRef.current !== null) return;
     const result = buildApplicationSteerCommand(message);
     if (!result.success) {
       setSteeringValidationError(result.message);
@@ -352,27 +382,39 @@ export function ApplicationSessionPanel({
     setSteeringValidationError(null);
     setSteeringDeliveryError(null);
     setSteeringDeliveryStatus(null);
-    steeringSubmissionPendingRef.current = true;
+    const submissionToken = Symbol();
+    steeringSubmissionPendingRef.current = submissionToken;
     const submittedSnapshotIdentity = steeringSnapshotIdentity;
     try {
       const submission = await onSteer(result.command);
-      if (
-        currentSteeringSnapshotIdentityRef.current
-        !== submittedSnapshotIdentity
-      ) return;
+      if (steeringSubmissionPendingRef.current !== submissionToken) return;
+      const stateIsCurrent =
+        currentSteeringSnapshotIdentityRef.current === submittedSnapshotIdentity;
       if (submission.status === "accepted") {
         if (clearDraft) setSteeringDraft("");
+        const canContinue = stateIsCurrent && submission.current;
         setSteeringDeliveryStatus(
-          clearDraft ? STEERING_SUCCESS_MESSAGE : RETRY_CURRENT_SUCCESS_MESSAGE,
+          canContinue
+            ? clearDraft
+              ? STEERING_SUCCESS_MESSAGE
+              : RETRY_CURRENT_SUCCESS_MESSAGE
+            : STEERING_STATE_CHANGED_MESSAGE,
         );
-        if (continuation) await continuation();
-      } else if (submission.status === "rejected") {
-        setSteeringDeliveryError(submission.message);
+        if (continuation && canContinue) {
+          await continuation(submission.continuationToken);
+        }
       } else {
-        setSteeringDeliveryError(AMBIGUOUS_STEERING_MESSAGE);
+        if (!stateIsCurrent) return;
+        if (submission.status === "rejected") {
+          setSteeringDeliveryError(submission.message);
+        } else {
+          setSteeringDeliveryError(AMBIGUOUS_STEERING_MESSAGE);
+        }
       }
     } finally {
-      steeringSubmissionPendingRef.current = false;
+      if (steeringSubmissionPendingRef.current === submissionToken) {
+        steeringSubmissionPendingRef.current = null;
+      }
     }
   };
   const cancelDisabled = busy
@@ -465,7 +507,8 @@ export function ApplicationSessionPanel({
           onSubmit={submitSteering}
           onRetry={() => submitSteering(
             pendingAction?.type === "human_navigation"
-              ? () => onCommand(simpleApplicationGateCommand(pendingAction))
+              ? (token) =>
+                onCommand(simpleApplicationGateCommand(pendingAction), token)
               : undefined,
             RETRY_CURRENT_GUIDANCE,
             false,
@@ -474,8 +517,8 @@ export function ApplicationSessionPanel({
           validationError={steeringValidationError}
           {...(pendingAction?.type === "human_navigation"
             ? {
-              onContinue: () =>
-                onCommand(simpleApplicationGateCommand(pendingAction)),
+              onContinue: (token?: ApplicationSteeringContinuationToken) =>
+                onCommand(simpleApplicationGateCommand(pendingAction), token),
             }
             : {})}
         />
@@ -487,7 +530,7 @@ export function ApplicationSessionPanel({
           busy={busy || steeringState === "sending"}
           busyAction={commandBusy}
           onSteerAndContinue={(command) =>
-            submitSteering(() => onCommand(command))}
+            submitSteering((token) => onCommand(command, token))}
           onSubmit={onCommand}
           steeringDisabled={steeringDisabled}
         />
@@ -497,7 +540,7 @@ export function ApplicationSessionPanel({
           <p>{pendingAction.instruction}</p>
           <button
             className={styles.primaryButton}
-            disabled={busy}
+            disabled={busy || steeringState === "sending"}
             onClick={() => void onCommand(simpleApplicationGateCommand(pendingAction))}
             type="button"
           >
@@ -520,7 +563,7 @@ export function ApplicationSessionPanel({
           onLoadSuggestions={onLoadSuggestions}
           onProfessionalize={onProfessionalize}
           onSteerAndContinue={(command) =>
-            submitSteering(() => onCommand(command))}
+            submitSteering((token) => onCommand(command, token))}
           onSubmit={onCommand}
           questions={pendingAction.questions}
           submitting={actionBusy === "provide_additional_info"}
@@ -531,7 +574,7 @@ export function ApplicationSessionPanel({
           busy={busy || steeringState === "sending"}
           busyAction={commandBusy}
           onSteerAndContinue={(command) =>
-            submitSteering(() => onCommand(command))}
+            submitSteering((token) => onCommand(command, token))}
           onCommand={onCommand}
           steeringDisabled={steeringDisabled}
         />
