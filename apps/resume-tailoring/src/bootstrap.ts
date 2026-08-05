@@ -1,5 +1,15 @@
 import type { Database } from "bun:sqlite";
 import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
+import {
   createApplicationAgentRoutes,
   type ApplicationAgentRouteService,
 } from "./api/application-agent-routes.ts";
@@ -132,6 +142,98 @@ function validateWebOrigin(origin: string): string {
   return origin;
 }
 
+function priorArtifactRootFromEnvironment(artifactRoot: string): string | undefined {
+  const root = process.env.JOBHUNTER_PRIOR_ARTIFACT_ROOT;
+  const receipt = process.env.JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT;
+  if (root !== undefined && (root.length === 0 || !isAbsolute(root) || resolve(root) !== root)) {
+    throw new Error("JOBHUNTER_PRIOR_ARTIFACT_ROOT must be an absolute canonical path");
+  }
+  if (receipt !== undefined && (receipt.length === 0 || !isAbsolute(receipt) || resolve(receipt) !== receipt)) {
+    throw new Error("JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT must be an absolute canonical path");
+  }
+  if (root === undefined && receipt === undefined) return undefined;
+  if (root === undefined || receipt === undefined) {
+    throw new Error("Prior artifact migration requires its launcher receipt");
+  }
+
+  const pipelineDatabase = process.env.JOBHUNTER_PIPELINE_DATABASE;
+  if (
+    pipelineDatabase === undefined
+    || !isAbsolute(pipelineDatabase)
+    || resolve(pipelineDatabase) !== pipelineDatabase
+  ) {
+    throw new Error("Prior artifact migration requires its managed pipeline database path");
+  }
+  const artifactRootPath = resolve(artifactRoot);
+  const expectedReceiptPath = resolve(dirname(pipelineDatabase), ".artifact-import.pending");
+  if (receipt !== expectedReceiptPath) {
+    throw new Error("Artifact migration receipt must be in the managed storage namespace");
+  }
+  if (realpathSync(dirname(receipt)) !== dirname(receipt)) {
+    throw new Error("Artifact migration receipt namespace must be canonical");
+  }
+
+  const receiptStatus = lstatSync(receipt);
+  if (
+    receiptStatus.isSymbolicLink()
+    || !receiptStatus.isFile()
+    || receiptStatus.size < 1
+    || receiptStatus.size > 4_096
+    || receiptStatus.nlink !== 1
+    || realpathSync(receipt) !== receipt
+    || typeof process.geteuid !== "function"
+    || receiptStatus.uid !== process.geteuid()
+    || (receiptStatus.mode & 0o777) !== 0o600
+  ) {
+    throw new Error("Artifact migration receipt must be a private launcher-owned file");
+  }
+
+  const descriptor = openSync(receipt, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let contents: Buffer;
+  try {
+    const openedStatus = fstatSync(descriptor);
+    if (
+      openedStatus.dev !== receiptStatus.dev
+      || openedStatus.ino !== receiptStatus.ino
+      || openedStatus.size !== receiptStatus.size
+    ) {
+      throw new Error("Artifact migration receipt changed while it was opened");
+    }
+    contents = Buffer.alloc(openedStatus.size);
+    let offset = 0;
+    while (offset < contents.length) {
+      const bytesRead = readSync(
+        descriptor,
+        contents,
+        offset,
+        contents.length - offset,
+        offset,
+      );
+      if (bytesRead === 0) throw new Error("Artifact migration receipt is incomplete");
+      offset += bytesRead;
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+
+  const expectedContents = `${JSON.stringify({
+    version: 1,
+    priorRoot: root,
+    pipelineDatabase,
+    artifactRoot: artifactRootPath,
+  })}\n`;
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(contents);
+  } catch (error) {
+    throw new Error("Artifact migration receipt must contain valid UTF-8", { cause: error });
+  }
+  if (decoded !== expectedContents) {
+    throw new Error("Artifact migration receipt does not match the managed storage paths");
+  }
+  return root;
+}
+
 
 async function closeAll(operations: readonly (() => void | Promise<void>)[]): Promise<void> {
   const errors: unknown[] = [];
@@ -154,10 +256,15 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   if (browserHarnessToken !== undefined && browserHarnessToken.length < 32) {
     throw new Error("JOBHUNTER_HARNESS_TOKEN must contain at least 32 characters");
   }
-  const pipelineDatabase = options.pipelineDatabase ?? (options.repository ? undefined : openPipelineDatabase());
   const artifacts = options.artifacts ?? new ArtifactStore();
-  if (pipelineDatabase && artifacts.root === DEFAULT_ARTIFACT_ROOT) {
-    migrateRunOutputLayout(pipelineDatabase, { outputRoot: artifacts.root });
+  const priorArtifactRoot = priorArtifactRootFromEnvironment(artifacts.root);
+  const pipelineDatabase = options.pipelineDatabase ?? (options.repository ? undefined : openPipelineDatabase());
+  if (pipelineDatabase && priorArtifactRoot !== undefined) {
+    migrateRunOutputLayout(pipelineDatabase, {
+      outputRoot: artifacts.root,
+      legacyRoots: [],
+      priorOutputRoots: [priorArtifactRoot],
+    });
   }
   const repository = options.repository ?? new PipelineRepository(pipelineDatabase!);
   repository.reconcileAttemptingApplicationSubmissions();

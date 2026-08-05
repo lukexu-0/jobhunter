@@ -118,6 +118,76 @@ describe("discovery source reconciliation", () => {
       .toBe("open");
   });
 
+  test("resolves only requested active source items across repository instances", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let nextId = 0;
+    const first = new DiscoveryRepository(database, {
+      now: () => 1_000,
+      idFactory: () => `job-${++nextId}`,
+    });
+    first.reconcileSource(source("source-a", "Alpha", [
+      item(),
+      item({
+        sourceItemId: "item-2",
+        canonicalUrl: "https://board.example.test/jobs/456",
+        applyUrl: "https://board.example.test/jobs/456/apply",
+      }),
+    ]));
+    const restarted = new DiscoveryRepository(database, { now: () => 2_000 });
+    const requested = [{
+      sourceItemId: "item-1",
+      canonicalUrl: "https://board.example.test/jobs/123",
+    }];
+
+    expect(restarted.findActiveSourceItemKeys("source-a", requested)).toEqual(requested);
+    expect(restarted.loadActiveSourceItems("source-a", requested)).toEqual([{
+      ...requested[0]!,
+      description: DESCRIPTION,
+    }]);
+    restarted.reconcileSource(source("source-a", "Alpha", [], false));
+    expect(restarted.findActiveSourceItemKeys("source-a", requested)).toHaveLength(1);
+    restarted.reconcileSource(source("source-a", "Alpha", []));
+    expect(restarted.findActiveSourceItemKeys("source-a", requested)).toEqual([]);
+  });
+
+  test("rejects active source item lookups beyond the parser bound", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database);
+    const candidates = Array.from({ length: 10_001 }, (_, index) => ({
+      sourceItemId: `item-${index}`,
+      canonicalUrl: `https://board.example.test/jobs/${index}`,
+    }));
+
+    expect(() => repository.findActiveSourceItemKeys("source-a", candidates))
+      .toThrow("at most 10000 source items may be resolved at once");
+  });
+
+  test("returns one bounded match when active observations share a canonical URL", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let nextId = 0;
+    const repository = new DiscoveryRepository(database, {
+      idFactory: () => `job-${++nextId}`,
+    });
+    repository.reconcileSource(source(
+      "source-a",
+      "Alpha",
+      Array.from({ length: 3 }, (_, index) => item({
+        sourceItemId: `alias-${index}`,
+      })),
+      false,
+    ));
+
+    const found = repository.findActiveSourceItemKeys("source-a", [{
+      sourceItemId: "unseen-alias",
+      canonicalUrl: "https://board.example.test/jobs/123",
+    }]);
+    expect(found).toHaveLength(1);
+    expect(repository.loadActiveSourceItems("source-a", found)).toHaveLength(1);
+  });
+
   test("does not treat gh_jid on unrelated custom hosts as a shared Greenhouse tenant", () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);

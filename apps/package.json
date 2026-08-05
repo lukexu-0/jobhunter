@@ -12,6 +12,6 @@
     "start": "bun scripts/serve.ts start",
     "typecheck": "bun run --cwd resume-tailoring typecheck && bun run --cwd web typecheck",
     "build": "bun run --cwd resume-tailoring build && bun run --cwd web build",
-    "test": "bun test --cwd resume-tailoring && bun test --cwd web"
+    "test": "bun test scripts/launch-config.test.ts && bun test --cwd resume-tailoring && bun test --cwd web"
   }
 }

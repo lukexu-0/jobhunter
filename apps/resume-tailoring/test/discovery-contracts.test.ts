@@ -5,6 +5,7 @@ import {
   DiscoveryListResponseSchema,
   DiscoveryQueueRequestSchema,
   DiscoverySyncRequestSchema,
+  DiscoverySyncResponseSchema,
   type DiscoveryJob,
 } from "../src/contracts/index.ts";
 
@@ -64,5 +65,39 @@ describe("discovery HTTP contracts", () => {
     }).success).toBeFalse();
     expect(DiscoverySyncRequestSchema.parse({})).toEqual({});
     expect(DiscoverySyncRequestSchema.safeParse({ unexpected: true }).success).toBeFalse();
+  });
+
+  test("requires per-source and aggregate omitted-recent counts", () => {
+    const response = {
+      sources: [{
+        sourceId: "simplify",
+        sourceName: "Simplify",
+        status: "succeeded" as const,
+        completeSnapshot: false,
+        received: 12,
+        created: 10,
+        updated: 2,
+        closed: 0,
+        omittedRecent: 3,
+      }],
+      totals: {
+        sources: 1,
+        succeeded: 1,
+        failed: 0,
+        received: 12,
+        created: 10,
+        updated: 2,
+        closed: 0,
+        omittedRecent: 3,
+      },
+      completedAt: 1_700_000_000_000,
+    };
+
+    expect(DiscoverySyncResponseSchema.parse(response)).toEqual(response);
+    const { omittedRecent: _omittedRecent, ...incompleteSource } = response.sources[0]!;
+    expect(DiscoverySyncResponseSchema.safeParse({
+      ...response,
+      sources: [incompleteSource],
+    }).success).toBeFalse();
   });
 });

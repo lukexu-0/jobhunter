@@ -28,6 +28,15 @@ const BUILT_IN_GITHUB_SOURCES: readonly Omit<GitHubTableConnectorConfig, "github
     path: "README.md",
   },
   {
+    id: "simplify-summer-2027-off-season",
+    name: "Simplify Summer 2027 Off-Season Internships",
+    kind: "simplify",
+    owner: "SimplifyJobs",
+    repo: "Summer2027-Internships",
+    branch: "dev",
+    path: "README-Off-Season.md",
+  },
+  {
     id: "zapply-underclassmen",
     name: "zapply 2027 Internships",
     kind: "zapply",

@@ -1053,7 +1053,16 @@ describe("pipeline discovery requests", () => {
   test("validates sync and queue responses instead of exposing upstream data", async () => {
     const syncResponse = {
       sources: [],
-      totals: { sources: 0, succeeded: 0, failed: 0, received: 0, created: 0, updated: 0, closed: 0 },
+      totals: {
+        sources: 0,
+        succeeded: 0,
+        failed: 0,
+        received: 0,
+        created: 0,
+        updated: 0,
+        closed: 0,
+        omittedRecent: 0,
+      },
       completedAt: 10,
     };
     setFetchMock(async (input) => input.toString().endsWith("/sync")
@@ -1067,6 +1076,10 @@ describe("pipeline discovery requests", () => {
     await expect(queueDiscoveryJobs({ jobIds: ["job-1"] })).rejects.toMatchObject({
       code: "INVALID_RESPONSE",
     });
+
+    const { omittedRecent: _omittedRecent, ...incompleteTotals } = syncResponse.totals;
+    setFetchMock(async () => json({ ...syncResponse, totals: incompleteTotals }));
+    await expect(syncDiscoveryJobs()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
 
     setFetchMock(async () => json({ ...syncResponse, upstreamBody: "private" }));
     await expect(syncDiscoveryJobs()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });

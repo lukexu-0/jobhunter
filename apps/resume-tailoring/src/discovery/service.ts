@@ -22,6 +22,7 @@ import {
 import { DiscoveryHttpBudget } from "./connectors/http.ts";
 import type {
   DiscoveryConnector,
+  DiscoveryConnectorSyncContext,
   DiscoverySourceKind,
 } from "./types.ts";
 
@@ -53,6 +54,7 @@ const ConnectorEnvelopeSchema = z.object({
   items: z.array(z.unknown()).max(100_000),
   completeSnapshot: z.boolean(),
   provenance: z.string().trim().min(1).max(1_000).optional(),
+  omittedRecent: z.number().int().nonnegative().max(100_000).default(0),
 }).strict();
 
 const ConnectorResultSchema = z.object({
@@ -63,7 +65,10 @@ const ConnectorResultSchema = z.object({
     ),
   completeSnapshot: z.boolean(),
   provenance: z.string().trim().min(1).max(1_000).optional(),
+  omittedRecent: z.number().int().nonnegative().max(100_000),
 }).strict();
+
+const DISCOVERY_RECENT_WINDOW_MS = 30 * 86_400_000;
 
 const MAX_SYNC_CONCURRENCY = 4;
 const MAX_SYNC_DURATION_MS = 120_000;
@@ -105,6 +110,7 @@ function validatedConnectorResult(value: unknown): ConnectorResult {
   return ConnectorResultSchema.parse({
     items,
     completeSnapshot: envelope.completeSnapshot && omitted === 0,
+    omittedRecent: envelope.omittedRecent + omitted,
     ...(provenance === undefined ? {} : { provenance }),
   });
 }
@@ -142,12 +148,13 @@ async function abortable<T>(
 async function synchronizeConnector(
   connector: DiscoveryConnector,
   signal: AbortSignal,
+  context: DiscoveryConnectorSyncContext,
   budget: DiscoveryHttpBudget,
   activeOperations: Set<Promise<unknown>>,
 ): Promise<ConnectorSyncOutcome> {
   try {
     const result = validatedConnectorResult(
-      await abortable(() => connector.sync(signal, budget), signal, activeOperations),
+      await abortable(() => connector.sync(signal, context, budget), signal, activeOperations),
     );
     return { connector, result };
   } catch (error) {
@@ -281,6 +288,7 @@ export class DiscoveryService {
         maxRequests: MAX_SYNC_REQUESTS,
         maxBytes: MAX_SYNC_BYTES,
       });
+      const recentCutoff = Math.max(0, this.#now() - DISCOVERY_RECENT_WINDOW_MS);
       const pending: Array<ConnectorSyncOutcome | undefined> =
         new Array(this.dependencies.connectors.length);
       let nextConnector = 0;
@@ -288,9 +296,17 @@ export class DiscoveryService {
         while (nextConnector < this.dependencies.connectors.length) {
           const index = nextConnector;
           nextConnector += 1;
+          const connector = this.dependencies.connectors[index]!;
           pending[index] = await synchronizeConnector(
-            this.dependencies.connectors[index]!,
+            connector,
             connectorSignal,
+            {
+              recentCutoff,
+              findKnownItems: (candidates) =>
+                this.dependencies.repository.findActiveSourceItemKeys(connector.id, candidates),
+              loadKnownItems: (candidates) =>
+                this.dependencies.repository.loadActiveSourceItems(connector.id, candidates),
+            },
             budget,
             this.#activeConnectorOperations,
           );
@@ -325,6 +341,7 @@ export class DiscoveryService {
             created: 0,
             updated: 0,
             closed: 0,
+            omittedRecent: 0,
             error: publicSourceError(outcome.error),
           });
           continue;
@@ -343,6 +360,7 @@ export class DiscoveryService {
             sourceName: outcome.connector.name,
             status: "succeeded",
             completeSnapshot: outcome.result.completeSnapshot,
+            omittedRecent: outcome.result.omittedRecent,
             ...counts,
             ...(outcome.result.provenance === undefined
               ? {}
@@ -359,6 +377,7 @@ export class DiscoveryService {
             created: 0,
             updated: 0,
             closed: 0,
+            omittedRecent: outcome.result.omittedRecent,
             error: publicSourceError(error),
           });
         }
@@ -373,6 +392,7 @@ export class DiscoveryService {
           created: sources.reduce((total, source) => total + source.created, 0),
           updated: sources.reduce((total, source) => total + source.updated, 0),
           closed: sources.reduce((total, source) => total + source.closed, 0),
+          omittedRecent: sources.reduce((total, source) => total + source.omittedRecent, 0),
         },
         completedAt: this.#now(),
       };

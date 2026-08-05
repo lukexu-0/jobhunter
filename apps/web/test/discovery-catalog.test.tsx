@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   DISCOVERY_LIST_MAX_OFFSET,
   type DiscoveryJob,
+  type DiscoverySyncResponse,
 } from "@jobhunter/pipeline/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   DiscoveryCatalog,
+  DiscoverySyncNotice,
   boundedDiscoveryListOffset,
   discoveryPageWindow,
   discoveryQueueSkipLabel,
@@ -117,5 +119,51 @@ describe("DiscoveryCatalog selection", () => {
       hasPrevious: true,
       hasNext: false,
     });
+  });
+
+  test("reports recent jobs omitted by each incomplete source", () => {
+    const result = {
+      sources: [
+        {
+          sourceId: "simplify",
+          sourceName: "Simplify",
+          status: "succeeded",
+          completeSnapshot: false,
+          received: 10,
+          created: 8,
+          updated: 2,
+          closed: 0,
+          omittedRecent: 2,
+        },
+        {
+          sourceId: "zapply",
+          sourceName: "zapply",
+          status: "succeeded",
+          completeSnapshot: true,
+          received: 4,
+          created: 4,
+          updated: 0,
+          closed: 0,
+          omittedRecent: 0,
+        },
+      ],
+      totals: {
+        sources: 2,
+        succeeded: 2,
+        failed: 0,
+        received: 14,
+        created: 12,
+        updated: 2,
+        closed: 0,
+        omittedRecent: 2,
+      },
+      completedAt: 1_700_000_000_000,
+    } satisfies DiscoverySyncResponse;
+
+    const markup = renderToStaticMarkup(<DiscoverySyncNotice result={result} />);
+
+    expect(markup).toContain("2 recent omitted");
+    expect(markup).toContain("Recent jobs omitted: Simplify (2).");
+    expect(markup).not.toContain("zapply (0)");
   });
 });
