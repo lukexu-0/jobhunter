@@ -77,6 +77,7 @@ from .models import (
     RuntimeActionResponse,
     RevisionAppliedDetail,
     SessionCommand,
+    SteerCommand,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionSnapshot,
@@ -115,6 +116,9 @@ _PLAYWRIGHT_CLI_TIMEOUT_MESSAGE = (
     "Playwright CLI execution timed out after 120 seconds."
 )
 _BROWSER_RUNTIME_ERROR_MESSAGE = "Browser runtime failed."
+_COMMAND_CONFLICT_MESSAGE = (
+    "The application state changed; review the latest session state"
+)
 _SESSION_TIMEOUT_DIAGNOSTIC_MESSAGE = "Application session expired."
 _REDACTED_STDERR_EXCERPT = "[redacted]"
 _READ_ONLY_PLAYWRIGHT_CLI_COMMANDS = frozenset(
@@ -749,6 +753,8 @@ class ApplicationSessionManager:
         expired = False
         credential_gate: HumanGate | None = None
         credential_command: SignInCommand | SaveCredentialsCommand | None = None
+        steer_model: PipelineApplicationAgentClient | None = None
+        steer_message: str | None = None
         async with record.request_lock:
             if record.finalized or record.final_request is not None:
                 if (
@@ -782,6 +788,26 @@ class ApplicationSessionManager:
                     "command_conflict",
                     "Only closing the browser is allowed after a submission outcome",
                 )
+            elif isinstance(command, SteerCommand):
+                agent_task = record.agent_task
+                gate = record.human_gate
+                model = record.model
+                if (
+                    record.snapshot.state != "running"
+                    or agent_task is None
+                    or agent_task.done()
+                    or gate is None
+                    or gate.pending_kind is not None
+                    or model is None
+                    or record.submission_action_started
+                ):
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        _COMMAND_CONFLICT_MESSAGE,
+                    )
+                steer_model = model
+                steer_message = command.message
             elif isinstance(command, CancelCommand):
                 if record.submission_action_started:
                     await self._park_submission_uncertain(record)
@@ -824,6 +850,23 @@ class ApplicationSessionManager:
                 "session_terminal",
                 "The application session has already ended",
             )
+
+        if steer_model is not None and steer_message is not None:
+            try:
+                await steer_model.steer(steer_message)
+            except PipelineApplicationAgentError as error:
+                if error.code == "command_conflict":
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        _COMMAND_CONFLICT_MESSAGE,
+                    ) from None
+                raise HarnessServiceError(
+                    503,
+                    "pipeline_unavailable",
+                    "The local pipeline model service is unavailable",
+                ) from None
+            return
 
         if credential_gate is not None and credential_command is not None:
             username, password = credential_command.credentials()

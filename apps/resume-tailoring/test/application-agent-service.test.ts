@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   ApplicationAgentFailure,
+  type ApplicationAgentDependencies,
   type ApplicationAgentRunInput,
   type ApplicationRunResult,
 } from "../src/agents/application-agent";
@@ -10,6 +11,7 @@ import {
   APPLICATION_AGENT_REASONING,
   ApplicationAgentService,
 } from "../src/agents/application-agent-service";
+import { ApplicationAgentSteeringConflict } from "../src/agents/application-agent-steering.ts";
 import type { AuthStatusResponse } from "../src/contracts";
 
 const TOKEN = "test-token-0123456789abcdef-0123456789";
@@ -185,16 +187,78 @@ describe("ApplicationAgentService", () => {
     expect(runCalls[0]?.[0]).toEqual(INPUT);
     expect(runCalls[0]?.[1]).toBe(signal);
     expect(guardFactoryCalls).toEqual([SESSION_ID]);
-    expect(runCalls[0]?.[2]).toEqual({
+    expect(runCalls[0]?.[2]).toMatchObject({
       providerFactory: agentRuntime.providerFactory,
       runtimeClient,
       submissionGuard,
+      steeringInbox: expect.any(Object),
     });
     const serializedSuccess = JSON.stringify(success);
     expect(serializedSuccess).not.toContain(TOKEN);
     expect(serializedSuccess).not.toContain(RUNTIME_URL);
     expect(serializedSuccess).not.toContain(DIRECT_VALUE);
     expect(JSON.stringify(runCalls[0]?.[2])).not.toContain(TOKEN);
+  });
+
+  test("registers one bounded inbox only for the active invocation and closes it in finally", async () => {
+    const privateMessage = "PRIVATE OPERATOR GUIDANCE";
+    const { promise: runStarted, resolve: markRunStarted } = Promise.withResolvers<void>();
+    const { promise: runResult, resolve: finishRun } =
+      Promise.withResolvers<ApplicationRunResult>();
+    let steeringInbox: ApplicationAgentDependencies["steeringInbox"];
+    const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
+      authStatusReader: connectedStatus,
+      runtimeClientFactory: () => ({
+        action: async () => { throw new Error("unused"); },
+      }),
+      runApplicationAgent: async (_input, _signal, dependencies) => {
+        steeringInbox = dependencies.steeringInbox;
+        markRunStarted();
+        return runResult;
+      },
+    });
+    const signal = new AbortController().signal;
+
+    expect(() => service.steer(
+      SESSION_ID,
+      { message: privateMessage },
+      signal,
+    )).toThrow(ApplicationAgentSteeringConflict);
+    const invocation = service.invoke(INPUT, signal);
+    await runStarted;
+
+    expect(service.steer(
+      SESSION_ID,
+      { message: `\u001c  ${privateMessage}  \u0085` },
+      signal,
+    )).toBeUndefined();
+    for (let index = 1; index < 16; index += 1) {
+      expect(service.steer(
+        SESSION_ID,
+        { message: `guidance-${index}` },
+        signal,
+      )).toBeUndefined();
+    }
+    expect(() => service.steer(
+      SESSION_ID,
+      { message: "queue overflow" },
+      signal,
+    )).toThrow(ApplicationAgentSteeringConflict);
+    expect(steeringInbox?.snapshot()?.messages).toEqual([
+      privateMessage,
+      ...Array.from({ length: 15 }, (_, index) => `guidance-${index + 1}`),
+    ]);
+
+    finishRun(RESULT);
+    await expect(invocation).resolves.toMatchObject({ result: RESULT });
+    expect(steeringInbox?.snapshot()).toBeUndefined();
+    expect(() => service.steer(
+      SESSION_ID,
+      { message: "late guidance" },
+      signal,
+    )).toThrow(ApplicationAgentSteeringConflict);
+    expect(String(new ApplicationAgentSteeringConflict())).not.toContain(privateMessage);
   });
 
   test("routes jobs and non-job opportunities to separate application-agent runners", async () => {
@@ -470,7 +534,7 @@ describe("ApplicationAgentService", () => {
     expect(await invocation).toBe(abortReason);
   });
 
-  test("settles with the exact abort reason while OAuth preflight remains pending", async () => {
+  test("registers steering before OAuth preflight and closes it on preflight abort", async () => {
     const controller = new AbortController();
     const abortReason = new Error("caller stopped pending OAuth preflight");
     const {
@@ -489,10 +553,20 @@ describe("ApplicationAgentService", () => {
     const invocation = service.invoke(INPUT, controller.signal)
       .catch((error: unknown) => error);
     await authStarted;
+    expect(service.steer(
+      SESSION_ID,
+      { message: "guidance queued during preflight" },
+      controller.signal,
+    )).toBeUndefined();
     controller.abort(abortReason);
     const outcome = await invocation;
 
     expect(outcome).toBe(abortReason);
+    expect(() => service.steer(
+      SESSION_ID,
+      { message: "late guidance" },
+      new AbortController().signal,
+    )).toThrow(ApplicationAgentSteeringConflict);
   });
 
   test("preserves abort identity when OAuth preflight fails concurrently", async () => {

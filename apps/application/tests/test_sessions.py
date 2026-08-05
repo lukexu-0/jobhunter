@@ -75,6 +75,7 @@ from jobhunter_browser_harness.models import (
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
     ReviseCommand,
+    SteerCommand,
     SESSION_ERROR_MESSAGES,
 )
 from jobhunter_browser_harness.pipeline_agent import PipelineApplicationAgentError
@@ -223,6 +224,10 @@ class FakeModel:
     run_result: ApplicationRunResult | None = None
     run_calls: list[dict[str, Any]] = field(default_factory=list)
     run_error: Exception | None = None
+    steer_calls: list[str] = field(default_factory=list)
+    steer_started: asyncio.Event = field(default_factory=asyncio.Event)
+    steer_blocker: asyncio.Event | None = None
+    steer_error: PipelineApplicationAgentError | None = None
 
     async def check_ready(self) -> None:
         self.order.append("model.check_ready")
@@ -249,6 +254,14 @@ class FakeModel:
         if self.run_result is None:
             raise AssertionError("No synthetic application-agent result configured")
         return self.run_result
+
+    async def steer(self, message: str) -> None:
+        self.steer_calls.append(message)
+        self.steer_started.set()
+        if self.steer_blocker is not None:
+            await self.steer_blocker.wait()
+        if self.steer_error is not None:
+            raise self.steer_error
 
 
     async def aclose(self) -> None:
@@ -438,6 +451,8 @@ class Fakes:
         model_close_blocker: asyncio.Event | None = None,
         agent_result: ApplicationRunResult | None = None,
         agent_error: Exception | None = None,
+        steer_blocker: asyncio.Event | None = None,
+        steer_error: PipelineApplicationAgentError | None = None,
     ) -> None:
         self.order = order if order is not None else []
         self.ready_error = ready_error
@@ -450,6 +465,8 @@ class Fakes:
         self.model_close_blocker = model_close_blocker
         self.agent_result = agent_result
         self.agent_error = agent_error
+        self.steer_blocker = steer_blocker
+        self.steer_error = steer_error
         self.models: list[FakeModel] = []
         self.runtimes: list[FakePlaywrightRuntime] = []
         self.runtime_factory_calls: list[dict[str, Any]] = []
@@ -465,6 +482,8 @@ class Fakes:
             close_blocker=self.model_close_blocker,
             run_result=self.agent_result,
             run_error=self.agent_error,
+            steer_blocker=self.steer_blocker,
+            steer_error=self.steer_error,
         )
         self.models.append(model)
         return model
@@ -683,6 +702,218 @@ async def blocked_runner(
 ) -> ApplicationRunResult:
     await asyncio.Future()
     raise AssertionError("unreachable")
+
+
+async def test_steer_dispatches_only_to_the_live_model_without_durable_projection(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    snapshot_before = record.snapshot
+    events_before = tuple(record.events)
+    gate = record.human_gate
+    assert gate is not None
+    redaction_values_before = gate.redaction_values
+    user_info_path = tmp_path / "user-info.json"
+    user_info_before = user_info_path.read_bytes() if user_info_path.exists() else None
+    guidance = "private operator correction"
+
+    await manager.command(
+        created.session_id,
+        SteerCommand(type="steer", message=f"  {guidance}  "),
+    )
+
+    assert fakes.models[0].steer_calls == [guidance]
+    assert record.snapshot == snapshot_before
+    assert tuple(record.events) == events_before
+    user_info_after = user_info_path.read_bytes() if user_info_path.exists() else None
+    assert user_info_after == user_info_before
+    assert gate.redaction_values == redaction_values_before
+    assert guidance not in record.snapshot.model_dump_json()
+    assert all(guidance not in event.model_dump_json() for event in record.events)
+
+    await manager.delete(created.session_id)
+    tombstone = manager._tombstones[created.session_id]
+    assert guidance not in tombstone.snapshot.model_dump_json()
+    assert all(guidance not in event.model_dump_json() for event in tombstone.events)
+
+
+async def test_steer_rejects_non_running_gate_stale_and_submission_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    guidance = "must not be dispatched"
+
+    async def assert_conflict() -> None:
+        with pytest.raises(HarnessServiceError) as raised:
+            await manager.command(
+                created.session_id,
+                SteerCommand(type="steer", message=guidance),
+            )
+        assert_service_error(
+            raised.value,
+            409,
+            "command_conflict",
+            "The application state changed; review the latest session state",
+        )
+        assert fakes.models[0].steer_calls == []
+
+    running_snapshot = record.snapshot
+    record.snapshot = record.snapshot.model_copy(update={"state": "awaiting_human_review"})
+    await assert_conflict()
+    record.snapshot = running_snapshot
+
+    live_agent_task = record.agent_task
+    assert live_agent_task is not None
+    completed_task = asyncio.create_task(asyncio.sleep(0))
+    await completed_task
+    record.agent_task = completed_task
+    await assert_conflict()
+    record.agent_task = live_agent_task
+
+    model = record.model
+    record.model = None
+    await assert_conflict()
+    record.model = model
+
+    record.submission_action_started = True
+    await assert_conflict()
+    record.submission_action_started = False
+
+    monkeypatch.setattr(HumanGate, "pending_kind", property(lambda _gate: "review"))
+    await assert_conflict()
+
+    await manager.delete(created.session_id)
+
+
+async def test_steer_deadline_wins_before_private_dispatch(tmp_path: Path) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    record.deadline_monotonic = asyncio.get_running_loop().time()
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.command(
+            created.session_id,
+            SteerCommand(type="steer", message="too late"),
+        )
+
+    assert_service_error(
+        raised.value,
+        409,
+        "session_terminal",
+        "The application session has already ended",
+    )
+    assert fakes.models[0].steer_calls == []
+    await record.closed_event.wait()
+
+
+@pytest.mark.parametrize(
+    ("pipeline_error", "status", "code", "message"),
+    [
+        (
+            PipelineApplicationAgentError(
+                "command_conflict",
+                "The application state changed; review the latest session state",
+            ),
+            409,
+            "command_conflict",
+            "The application state changed; review the latest session state",
+        ),
+        (
+            PipelineApplicationAgentError(
+                "pipeline_unavailable",
+                "The local pipeline model service is unavailable",
+            ),
+            503,
+            "pipeline_unavailable",
+            "The local pipeline model service is unavailable",
+        ),
+    ],
+)
+async def test_steer_maps_private_failures_to_fixed_public_errors(
+    tmp_path: Path,
+    pipeline_error: PipelineApplicationAgentError,
+    status: int,
+    code: str,
+    message: str,
+) -> None:
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=Fakes(steer_error=pipeline_error),
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    guidance = "private operator guidance"
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.command(
+            created.session_id,
+            SteerCommand(type="steer", message=guidance),
+        )
+
+    assert_service_error(raised.value, status, code, message)
+    assert guidance not in str(raised.value)
+    assert fakes.models[0].steer_calls == [guidance]
+    await manager.delete(created.session_id)
+
+
+async def test_cancel_is_not_blocked_by_in_flight_steer_and_remains_authoritative(
+    tmp_path: Path,
+) -> None:
+    steer_blocker = asyncio.Event()
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=Fakes(
+            steer_blocker=steer_blocker,
+            steer_error=PipelineApplicationAgentError(
+                "command_conflict",
+                "The application state changed; review the latest session state",
+            ),
+        ),
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    model = fakes.models[0]
+
+    steer_task = asyncio.create_task(
+        manager.command(
+            created.session_id,
+            SteerCommand(type="steer", message="do not retain me"),
+        )
+    )
+    await model.steer_started.wait()
+    await asyncio.wait_for(
+        manager.command(created.session_id, CancelCommand(type="cancel")),
+        timeout=1,
+    )
+    assert not steer_task.done()
+
+    steer_blocker.set()
+    with pytest.raises(HarnessServiceError) as raised:
+        await steer_task
+    assert_service_error(
+        raised.value,
+        409,
+        "command_conflict",
+        "The application state changed; review the latest session state",
+    )
+    await record.closed_event.wait()
+    assert manager.get_snapshot(created.session_id).state == "cancelled"
 
 
 @pytest.mark.parametrize(

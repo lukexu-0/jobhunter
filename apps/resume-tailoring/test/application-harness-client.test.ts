@@ -450,8 +450,10 @@ describe("HttpApplicationHarnessClient", () => {
     });
     const signInPassword = "PRIVATE SIGN IN PASSWORD";
     const savedPassword = "PRIVATE SAVED PASSWORD";
+    const steeringMessage = "PRIVATE OPERATOR GUIDANCE";
     const commands: ApplicationSessionCommand[] = [
       { type: "continue" },
+      { type: "steer", message: steeringMessage },
       { type: "approve_origin", origin: "https://ats.example.test" },
       {
         type: "sign_in",
@@ -504,7 +506,7 @@ describe("HttpApplicationHarnessClient", () => {
       accept: "application/json",
       "content-type": "application/json",
     });
-    for (const secret of [signInPassword, savedPassword]) {
+    for (const secret of [signInPassword, savedPassword, steeringMessage]) {
       expect(
         calls.slice(0, -1).filter(({ init }) => String(init.body).includes(secret)),
       ).toHaveLength(1);

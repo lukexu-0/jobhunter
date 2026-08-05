@@ -135,6 +135,17 @@ def _is_unicode_scalar_text(value: str) -> bool:
     return True
 
 
+def normalize_steer_message(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("message is invalid")
+    trimmed = value.strip()
+    if (
+        not 1 <= len(trimmed) <= 8_000
+        or "\x00" in trimmed
+        or not _is_unicode_scalar_text(trimmed)
+    ):
+        raise ValueError("message is invalid")
+    return trimmed
 
 
 AdditionalInfoQuestionId = Annotated[
@@ -966,6 +977,16 @@ class ReviseCommand(PublicModel):
     ]
 
 
+class SteerCommand(PublicModel):
+    type: Literal["steer"]
+    message: str = Field(repr=False)
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def _validate_message(cls, value: object) -> str:
+        return normalize_steer_message(value)
+
+
 class SubmitCommand(PublicModel):
     type: Literal["submit"]
 
@@ -992,6 +1013,7 @@ SessionCommand: TypeAlias = Annotated[
     ContinueCommand
     | ApproveOriginCommand
     | ReviseCommand
+    | SteerCommand
     | SubmitCommand
     | CancelCommand
     | ProvideAdditionalInfoCommand

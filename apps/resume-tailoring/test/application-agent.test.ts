@@ -21,6 +21,10 @@ import {
   type ApplicationAgentDependencies,
   type BrowserApplicationContext,
 } from "../src/agents/application-agent.ts";
+import {
+  APPLICATION_AGENT_STEERING_PREFIX,
+  ApplicationAgentSteeringInbox,
+} from "../src/agents/application-agent-steering.ts";
 import { REPOSITORY_ROOT } from "../src/context/manifest.ts";
 import {
   ApplicationRuntimeError,
@@ -276,10 +280,12 @@ function dependenciesWith(
     async claim(): Promise<void> {},
     async finalize(): Promise<void> {},
   },
+  steeringInbox?: ApplicationAgentDependencies["steeringInbox"],
 ): ApplicationAgentDependencies {
   return {
     runtimeClient: { action },
     submissionGuard,
+    ...(steeringInbox === undefined ? {} : { steeringInbox }),
     providerFactory(attemptSessionId): ModelProvider {
       expect(attemptSessionId).toBe(RUN_INPUT.sessionId);
       return fakeProvider();
@@ -482,6 +488,231 @@ describe("application agent", () => {
       new AbortController().signal,
       dependencies,
     )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+  });
+
+  test("appends queued guidance in FIFO order before the screenshot and consumes each batch once", async () => {
+    const inbox = new ApplicationAgentSteeringInbox();
+    expect(inbox.enqueue("Use the distributed-systems example.")).toBeTrue();
+    expect(inbox.enqueue("Keep the answer under 100 words.")).toBeTrue();
+    const projectedInput = [{
+      role: "user",
+      content: [{ type: "input_text", text: "Projected application history." }],
+    }] satisfies AgentInputItem[];
+    const immutableProjectedInput = structuredClone(projectedInput);
+    const screenshot = "data:image/png;base64,cHJl";
+    const dependencies = dependenciesWith(
+      async () => {
+        throw new Error("runtime actions must not run");
+      },
+      async (agent, _input, options) => {
+        const context = options.context;
+        const filter = options.callModelInputFilter;
+        if (context === undefined || filter === undefined) {
+          throw new Error("application model filter context is required");
+        }
+        context.latestScreenshotDataUrl = screenshot;
+        const first = await filter({
+          agent: agent as unknown as Parameters<typeof filter>[0]["agent"],
+          context,
+          modelData: { input: projectedInput },
+        });
+        expect(first.input).toEqual([
+          ...projectedInput,
+          {
+            role: "user",
+            content: [{
+              type: "input_text",
+              text: `${APPLICATION_AGENT_STEERING_PREFIX}Use the distributed-systems example.`,
+            }],
+          },
+          {
+            role: "user",
+            content: [{
+              type: "input_text",
+              text: `${APPLICATION_AGENT_STEERING_PREFIX}Keep the answer under 100 words.`,
+            }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_image", image: screenshot }],
+          },
+        ]);
+        expect(projectedInput).toEqual(immutableProjectedInput);
+        expect(inbox.snapshot()).toBeUndefined();
+
+        expect(inbox.enqueue("Use a neutral tone.")).toBeTrue();
+        delete context.latestScreenshotDataUrl;
+        const second = await filter({
+          agent: agent as unknown as Parameters<typeof filter>[0]["agent"],
+          context,
+          modelData: { input: projectedInput },
+        });
+        expect(second.input).toEqual([
+          ...projectedInput,
+          {
+            role: "user",
+            content: [{
+              type: "input_text",
+              text: `${APPLICATION_AGENT_STEERING_PREFIX}Use a neutral tone.`,
+            }],
+          },
+        ]);
+        expect(inbox.snapshot()).toBeUndefined();
+        return { history: [null] };
+      },
+      undefined,
+      inbox,
+    );
+
+    const failure = await runApplicationAgent(
+      RUN_INPUT,
+      new AbortController().signal,
+      dependencies,
+    ).catch((error: unknown) => error);
+    expect(failure).toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+    expect(String(failure)).not.toContain("distributed-systems");
+    expect(JSON.stringify(RUN_INPUT)).not.toContain("distributed-systems");
+  });
+
+  test("fails closed on guidance transcript overflow without consuming the pending batch", async () => {
+    const privateMessage = "PRIVATE OPERATOR GUIDANCE";
+    const inbox = new ApplicationAgentSteeringInbox();
+    expect(inbox.enqueue(privateMessage)).toBeTrue();
+    const emptyProjectedInput = [{
+      role: "user",
+      content: [{ type: "input_text", text: "" }],
+    }] satisfies AgentInputItem[];
+    const fixedBytes = Buffer.byteLength(JSON.stringify(emptyProjectedInput), "utf8");
+    const projectedInput = [{
+      role: "user",
+      content: [{
+        type: "input_text",
+        text: "x".repeat(MAX_AGENT_TRANSCRIPT_BYTES - fixedBytes),
+      }],
+    }] satisfies AgentInputItem[];
+    expect(Buffer.byteLength(JSON.stringify(projectedInput), "utf8"))
+      .toBe(MAX_AGENT_TRANSCRIPT_BYTES);
+    const dependencies = dependenciesWith(
+      async () => {
+        throw new Error("runtime actions must not run");
+      },
+      async (agent, _input, options) => {
+        const context = options.context;
+        const filter = options.callModelInputFilter;
+        if (context === undefined || filter === undefined) {
+          throw new Error("application model filter context is required");
+        }
+        let filterFailure: unknown;
+        try {
+          await filter({
+            agent: agent as unknown as Parameters<typeof filter>[0]["agent"],
+            context,
+            modelData: { input: projectedInput },
+          });
+        } catch (error) {
+          filterFailure = error;
+        }
+        expect(filterFailure).toEqual(
+          new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"),
+        );
+        expect(String(filterFailure)).not.toContain(privateMessage);
+        expect(inbox.snapshot()?.messages).toEqual([privateMessage]);
+        return { history: [null] };
+      },
+      undefined,
+      inbox,
+    );
+
+    await expect(runApplicationAgent(
+      RUN_INPUT,
+      new AbortController().signal,
+      dependencies,
+    )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
+    expect(inbox.snapshot()?.messages).toEqual([privateMessage]);
+  });
+
+  test("closes and drops steering synchronously when the first submission action starts", async () => {
+    const privateMessage = "PRIVATE GUIDANCE QUEUED DURING THE PRIOR MODEL TURN";
+    const inbox = new ApplicationAgentSteeringInbox();
+    const claimStarted = Promise.withResolvers<void>();
+    const releaseClaim = Promise.withResolvers<void>();
+    const projectedInput = [{
+      role: "user",
+      content: [{ type: "input_text", text: "Projected pre-submission history." }],
+    }] satisfies AgentInputItem[];
+    const dependencies = dependenciesWith(
+      async (request) => {
+        if (request.type === "request_human_review") {
+          return {
+            type: "submit",
+            instruction: "You're good to submit.",
+            result: VALID_RESULT,
+          };
+        }
+        if (request.type === "playwright_cli" && request.command === "click") {
+          return SUBMIT_EXECUTION_RESULT;
+        }
+        throw new Error(`unexpected runtime action ${request.type}`);
+      },
+      async (agent, _input, options) => {
+        const context = options.context;
+        const filter = options.callModelInputFilter;
+        if (context === undefined || filter === undefined) {
+          throw new Error("application model filter context is required");
+        }
+        const preClaim = await filter({
+          agent: agent as unknown as Parameters<typeof filter>[0]["agent"],
+          context,
+          modelData: { input: projectedInput },
+        });
+        expect(preClaim.input).toEqual(projectedInput);
+        expect(inbox.enqueue(privateMessage)).toBeTrue();
+        expect(inbox.snapshot()?.messages).toEqual([privateMessage]);
+
+        const runContext = inspectedRunContext(context);
+        await functionTool(agent, "request_human_review").invoke(
+          runContext,
+          JSON.stringify({ result: VALID_RESULT }),
+        );
+        const submissionAction = functionTool(agent, "playwright_cli").invoke(
+          runContext,
+          JSON.stringify({ command: "click", args: ["#submit"] }),
+        );
+        await claimStarted.promise;
+
+        expect(context.submissionActionStarted).toBeTrue();
+        expect(context.submissionClaimed).toBeFalse();
+        expect(inbox.snapshot()).toBeUndefined();
+        expect(inbox.enqueue("late guidance")).toBeFalse();
+
+        releaseClaim.resolve();
+        await submissionAction;
+        const postClaim = await filter({
+          agent: agent as unknown as Parameters<typeof filter>[0]["agent"],
+          context,
+          modelData: { input: projectedInput },
+        });
+        expect(JSON.stringify(postClaim.input)).not.toContain(privateMessage);
+        expect(JSON.stringify(postClaim.input)).not.toContain("late guidance");
+        throw new Error("stop after observing the post-claim model input");
+      },
+      {
+        async markReviewReady(): Promise<void> {},
+        async claim(): Promise<void> {
+          claimStarted.resolve();
+          await releaseClaim.promise;
+        },
+        async finalize(): Promise<void> {},
+      },
+      inbox,
+    );
+
+    await expect(runApplicationAgent(
+      AUTO_SUBMIT_RUN_INPUT,
+      new AbortController().signal,
+      dependencies,
+    )).rejects.toThrow("stop after observing the post-claim model input");
+    expect(inbox.enqueue("after run")).toBeFalse();
   });
 
   test("maps malformed transcript history to a fixed provider failure", async () => {
@@ -2333,6 +2564,9 @@ describe("application agent", () => {
         reasoning: "high",
         result: await runApplicationAgent(input, signal, dependencies),
       }),
+      steer: () => {
+        throw new Error("steering must not run");
+      },
     }, token);
     const request = new Request(
       `http://127.0.0.1:3457${APPLICATION_AGENT_PATH}`,

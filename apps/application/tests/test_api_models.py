@@ -51,6 +51,7 @@ from jobhunter_browser_harness.models import (
     SignInRuntimeActionResponse,
     SubmitCommand,
     ReviseCommand,
+    SteerCommand,
     SessionCommand,
     SubmittedApplicationResult,
     SubmissionUncertainApplicationResult,
@@ -753,6 +754,7 @@ def test_session_snapshot_releases_slot_only_after_terminal_cleanup() -> None:
         ({"type": "continue"}, ContinueCommand),
         ({"type": "approve_origin", "origin": "HTTPS://ATS.Example/"}, ApproveOriginCommand),
         ({"type": "revise", "context": "  Correct this field.  "}, ReviseCommand),
+        ({"type": "steer", "message": "  Use the updated operator guidance.  "}, SteerCommand),
         ({"type": "submit"}, SubmitCommand),
         ({"type": "cancel"}, CancelCommand),
         (
@@ -800,6 +802,8 @@ def test_command_union_uses_strict_discriminators(
         assert command.origin == "https://ats.example"
     if isinstance(command, ReviseCommand):
         assert command.context == "Correct this field."
+    if isinstance(command, SteerCommand):
+        assert command.message == "Use the updated operator guidance."
     if isinstance(command, (SignInCommand, SaveCredentialsCommand)):
         assert command.credentials()[0] == "ada@example.test"
         if isinstance(command, SignInCommand):
@@ -903,6 +907,36 @@ def test_revision_command_accepts_twenty_thousand_trimmed_characters() -> None:
     assert command.context == context
 
 
+def test_steer_command_accepts_eight_thousand_unicode_scalars_after_edge_trim() -> None:
+    message = "\U0001f680" * 8_000
+    command = COMMAND_ADAPTER.validate_python(
+        {"type": "steer", "message": f" \n{message}\t "}
+    )
+
+    assert isinstance(command, SteerCommand)
+    assert command.message == message
+    assert message not in repr(command)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "",
+        " \n\t ",
+        "contains\x00nul",
+        "\ud800",
+        "\udfff",
+        "x" * 8_001,
+        "\U0001f680" * 8_001,
+    ],
+)
+def test_steer_command_rejects_empty_nul_non_scalar_and_oversize_text(
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        COMMAND_ADAPTER.validate_python({"type": "steer", "message": message})
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -917,6 +951,8 @@ def test_revision_command_accepts_twenty_thousand_trimmed_characters() -> None:
         {"type": "revise", "context": ""},
         {"type": "revise", "context": "   "},
         {"type": "revise", "context": "x" * 20_001},
+        {"type": "steer"},
+        {"type": "steer", "message": "valid", "extra": True},
         {"type": "sign_in", "username": "", "password": "password"},
         {"type": "sign_in", "username": "\ud800", "password": "password"},
         {"type": "sign_in", "username": "user@example.test", "password": "\ud800"},
@@ -1350,6 +1386,7 @@ async def test_sse_rejects_invalid_or_negative_last_event_id(
         ({"type": "continue"}, ContinueCommand),
         ({"type": "approve_origin", "origin": "https://ats.example"}, ApproveOriginCommand),
         ({"type": "revise", "context": "  use corrected fact  "}, ReviseCommand),
+        ({"type": "steer", "message": "  use the changed posting details  "}, SteerCommand),
         ({"type": "submit"}, SubmitCommand),
         ({"type": "cancel"}, CancelCommand),
         (
@@ -1393,6 +1430,8 @@ async def test_command_endpoint_dispatches_typed_commands_and_returns_202(
         assert dispatched.credentials()[0] == "ada@example.test"
     if isinstance(dispatched, ReviseCommand):
         assert dispatched.context == "use corrected fact"
+    if isinstance(dispatched, SteerCommand):
+        assert dispatched.message == "use the changed posting details"
 
 
 async def test_command_endpoint_rejects_bad_discriminator_without_dispatch(
@@ -1411,6 +1450,30 @@ async def test_command_endpoint_rejects_bad_discriminator_without_dispatch(
         "message": "Request is invalid",
     }
     assert "secret" not in response.text
+    assert service.command_calls == []
+
+
+async def test_invalid_steer_command_returns_fixed_error_without_message(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    private_message = "private operator guidance"
+
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/commands",
+        headers=AUTHORIZATION,
+        json={
+            "type": "steer",
+            "message": f"{private_message}\x00",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert private_message not in response.text
     assert service.command_calls == []
 
 

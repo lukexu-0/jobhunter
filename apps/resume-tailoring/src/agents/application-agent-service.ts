@@ -1,4 +1,8 @@
-import type { AuthStatusResponse } from "../contracts";
+import {
+  ApplicationAgentSteerRequestSchema,
+  type ApplicationAgentSteerRequest,
+  type AuthStatusResponse,
+} from "../contracts";
 import { getAuthStatus } from "../auth/service";
 import {
   ApplicationAgentFailure,
@@ -16,6 +20,10 @@ import {
   type ApplicationRuntimeClient,
 } from "./application-runtime-client";
 import type { AgentRuntimeDependencies } from "./runner";
+import {
+  ApplicationAgentSteeringConflict,
+  ApplicationAgentSteeringInbox,
+} from "./application-agent-steering.ts";
 
 export const APPLICATION_AGENT_MODEL_PROVIDER = "openai-codex" as const;
 export const APPLICATION_AGENT_MODEL = "gpt-5.6-sol" as const;
@@ -70,6 +78,11 @@ export interface ApplicationAgentRouteService {
     input: ApplicationAgentRunInput,
     signal: AbortSignal,
   ): Promise<ApplicationAgentSuccess>;
+  steer(
+    sessionId: string,
+    input: ApplicationAgentSteerRequest,
+    signal: AbortSignal,
+  ): void;
 }
 
 async function runAbortable<T>(
@@ -96,6 +109,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
   readonly #runtimeClientFactory: ApplicationRuntimeClientFactory;
   readonly #submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly #agentRuntime: AgentRuntimeDependencies;
+  readonly #steeringInboxes = new Map<string, ApplicationAgentSteeringInbox>();
 
   constructor(
     harnessToken: string,
@@ -139,6 +153,26 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
     };
   }
 
+  steer(
+    sessionId: string,
+    unparsedInput: ApplicationAgentSteerRequest,
+    signal: AbortSignal,
+  ): void {
+    const parsedSessionId = ApplicationAgentRunInputSchema.shape.sessionId.safeParse(
+      sessionId,
+    );
+    const parsedInput = ApplicationAgentSteerRequestSchema.safeParse(unparsedInput);
+    if (!parsedSessionId.success || !parsedInput.success) {
+      throw new ApplicationAgentFailure("INVALID_REQUEST");
+    }
+    signal.throwIfAborted();
+    const inbox = this.#steeringInboxes.get(parsedSessionId.data);
+    if (inbox === undefined || !inbox.enqueue(parsedInput.data.message)) {
+      throw new ApplicationAgentSteeringConflict();
+    }
+    signal.throwIfAborted();
+  }
+
   async invoke(
     unparsedInput: ApplicationAgentRunInput,
     signal: AbortSignal,
@@ -149,61 +183,74 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
     }
     const input = parsedInput.data;
     signal.throwIfAborted();
-    try {
-      await this.status(signal);
-    } catch (error) {
-      if (signal.aborted) throw signal.reason;
-      throw error;
-    }
-    signal.throwIfAborted();
-    let result: ApplicationRunResult;
-    try {
-      const runtimeClient = this.#runtimeClientFactory(
-        input.runtimeUrl,
-        input.sessionId,
-        this.#harnessToken,
-      );
-      const submissionGuard = this.#submissionGuardFactory(input.sessionId);
-      const runner = input.opportunityKind === "job"
-        ? this.#runApplicationAgent
-        : this.#runNonJobApplicationAgent;
-      const unparsedResult = await runner(input, signal, {
-        ...this.#agentRuntime,
-        runtimeClient,
-        submissionGuard,
-      });
-      signal.throwIfAborted();
-      const parsedResult = ApplicationRunResultSchema.safeParse(unparsedResult);
-      if (!parsedResult.success) {
-        throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
-      result = parsedResult.data;
-    } catch (error) {
-      if (signal.aborted) throw signal.reason;
-      if (error instanceof ApplicationAgentFailure) throw error;
-      let oauthConnected = false;
-      try {
-        const currentStatus = await runAbortable(
-          () => this.#authStatusReader(),
-          signal,
-        );
-        signal.throwIfAborted();
-        oauthConnected = currentStatus.providers.some(
-          (provider) => provider.provider === APPLICATION_AGENT_MODEL_PROVIDER
-            && provider.state === "connected",
-        );
-      } catch {
-        if (signal.aborted) throw signal.reason;
-        throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
-      }
-      if (!oauthConnected) throw new ApplicationAgentFailure("OAUTH_REQUIRED");
+    if (this.#steeringInboxes.has(input.sessionId)) {
       throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
     }
-    return {
-      modelProvider: APPLICATION_AGENT_MODEL_PROVIDER,
-      model: APPLICATION_AGENT_MODEL,
-      reasoning: APPLICATION_AGENT_REASONING,
-      result,
-    };
+    const steeringInbox = new ApplicationAgentSteeringInbox();
+    this.#steeringInboxes.set(input.sessionId, steeringInbox);
+    try {
+      try {
+        await this.status(signal);
+      } catch (error) {
+        if (signal.aborted) throw signal.reason;
+        throw error;
+      }
+      signal.throwIfAborted();
+      let result: ApplicationRunResult;
+      try {
+        const runtimeClient = this.#runtimeClientFactory(
+          input.runtimeUrl,
+          input.sessionId,
+          this.#harnessToken,
+        );
+        const submissionGuard = this.#submissionGuardFactory(input.sessionId);
+        const runner = input.opportunityKind === "job"
+          ? this.#runApplicationAgent
+          : this.#runNonJobApplicationAgent;
+        const unparsedResult = await runner(input, signal, {
+          ...this.#agentRuntime,
+          runtimeClient,
+          submissionGuard,
+          steeringInbox,
+        });
+        signal.throwIfAborted();
+        const parsedResult = ApplicationRunResultSchema.safeParse(unparsedResult);
+        if (!parsedResult.success) {
+          throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
+        }
+        result = parsedResult.data;
+      } catch (error) {
+        if (signal.aborted) throw signal.reason;
+        if (error instanceof ApplicationAgentFailure) throw error;
+        let oauthConnected = false;
+        try {
+          const currentStatus = await runAbortable(
+            () => this.#authStatusReader(),
+            signal,
+          );
+          signal.throwIfAborted();
+          oauthConnected = currentStatus.providers.some(
+            (provider) => provider.provider === APPLICATION_AGENT_MODEL_PROVIDER
+              && provider.state === "connected",
+          );
+        } catch {
+          if (signal.aborted) throw signal.reason;
+          throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+        }
+        if (!oauthConnected) throw new ApplicationAgentFailure("OAUTH_REQUIRED");
+        throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+      }
+      return {
+        modelProvider: APPLICATION_AGENT_MODEL_PROVIDER,
+        model: APPLICATION_AGENT_MODEL,
+        reasoning: APPLICATION_AGENT_REASONING,
+        result,
+      };
+    } finally {
+      steeringInbox.close();
+      if (this.#steeringInboxes.get(input.sessionId) === steeringInbox) {
+        this.#steeringInboxes.delete(input.sessionId);
+      }
+    }
   }
 }

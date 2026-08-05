@@ -1062,8 +1062,22 @@ const ApplicationCredentialUsernameSchema = z.string()
 const ApplicationCredentialPasswordSchema = z.string()
   .refine((value) => hasCredentialTextLength(value, 1, 4_096));
 
+export const ApplicationSteeringMessageSchema = z.string()
+  .transform(stripPythonWhitespace)
+  .refine((value) => hasCredentialTextLength(value, 1, 8_000));
+export const ApplicationAgentSteerRequestSchema = z.object({
+  message: ApplicationSteeringMessageSchema,
+}).strict();
+export type ApplicationAgentSteerRequest = z.infer<
+  typeof ApplicationAgentSteerRequestSchema
+>;
+
 export const ApplicationSessionCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("continue") }).strict(),
+  z.object({
+    type: z.literal("steer"),
+    message: ApplicationSteeringMessageSchema,
+  }).strict(),
   z.object({
     type: z.literal("sign_in"),
     username: ApplicationCredentialUsernameSchema,

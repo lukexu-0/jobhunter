@@ -1912,6 +1912,51 @@ describe("application session service", () => {
     });
   });
 
+  test("forwards steering only for running sessions without persisting or projecting its text", async () => {
+    const privateMessage = "PRIVATE OPERATOR GUIDANCE";
+    const runningHarness = new FakeHarness();
+    runningHarness.snapshotAfterCreate = harnessSnapshot("running");
+    const running = await createTarget({ harness: runningHarness });
+    await running.service.start(running.runId, running.pdf.sha256, signal());
+    const durableBefore = JSON.stringify(
+      running.repository.getLatestApplicationSession(running.runId),
+    );
+
+    await expect(running.service.command(
+      running.runId,
+      { type: "steer", message: privateMessage },
+      signal(),
+    )).resolves.toBeUndefined();
+
+    expect(runningHarness.commandCalls).toEqual([{
+      sessionId: FIRST_SESSION_ID,
+      command: { type: "steer", message: privateMessage },
+    }]);
+    expect(JSON.stringify(
+      running.repository.getLatestApplicationSession(running.runId),
+    )).toBe(durableBefore);
+    const publicProjection = JSON.stringify(await running.service.get(running.runId));
+    expect(publicProjection).not.toContain(privateMessage);
+
+    const gatedHarness = new FakeHarness();
+    gatedHarness.snapshotAfterCreate = {
+      ...harnessSnapshot("awaiting_human_navigation"),
+      pendingAction: { type: "human_navigation", instruction: "Complete the CAPTCHA." },
+    };
+    const gated = await createTarget({ harness: gatedHarness });
+    await gated.service.start(gated.runId, gated.pdf.sha256, signal());
+    await expect(gated.service.command(
+      gated.runId,
+      { type: "steer", message: privateMessage },
+      signal(),
+    )).rejects.toMatchObject({
+      code: "APPLICATION_COMMAND_CONFLICT",
+      message: "The application state changed; review the latest session state",
+      status: 409,
+    });
+    expect(gatedHarness.commandCalls).toHaveLength(0);
+  });
+
   test("forwards credentials only to the harness and retains only the durable gate marker", async () => {
     const harness = new FakeHarness();
     harness.snapshotAfterCreate = {
@@ -2176,6 +2221,15 @@ describe("application session service", () => {
         message: "The application submission cannot be retried",
         status: 409,
       });
+    await expect(target.service.command(
+      target.runId,
+      { type: "steer", message: "late guidance" },
+      signal(),
+    )).rejects.toMatchObject({
+      code: "APPLICATION_COMMAND_CONFLICT",
+      message: "The application state changed; review the latest session state",
+      status: 409,
+    });
     expect(target.harness!.commandCalls).toEqual([]);
     target.harness!.deleteError = new ApplicationHarnessError("session_not_found");
     await target.service.close(target.runId, signal());
