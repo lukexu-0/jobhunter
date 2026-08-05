@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 23;
+export const PIPELINE_SCHEMA_VERSION = 24;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -864,6 +864,66 @@ DROP TABLE discovery_sources;
 ALTER TABLE discovery_sources_v23 RENAME TO discovery_sources;
 `;
 
+const migration24 = `
+CREATE TABLE discovery_jobs_v24 (
+  id TEXT PRIMARY KEY,
+  catalog_source_id TEXT NOT NULL CHECK (length(catalog_source_id) BETWEEN 1 AND 200),
+  catalog_source_item_id TEXT NOT NULL CHECK (length(catalog_source_item_id) BETWEEN 1 AND 500),
+  title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 500),
+  company TEXT NOT NULL CHECK (length(company) BETWEEN 1 AND 500),
+  location TEXT CHECK (location IS NULL OR length(location) BETWEEN 1 AND 500),
+  canonical_url TEXT NOT NULL CHECK (length(canonical_url) BETWEEN 1 AND 2048),
+  apply_url TEXT NOT NULL CHECK (length(apply_url) BETWEEN 1 AND 2048),
+  description TEXT NOT NULL CHECK (length(description) BETWEEN 40 AND 50000),
+  posted_at INTEGER,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  closed INTEGER NOT NULL DEFAULT 0 CHECK (closed IN (0,1)),
+  CHECK (posted_at IS NULL OR posted_at >= 0),
+  CHECK (first_seen_at >= 0 AND last_seen_at >= first_seen_at)
+) STRICT;
+
+INSERT INTO discovery_jobs_v24(
+  id, catalog_source_id, catalog_source_item_id,
+  title, company, location, canonical_url, apply_url,
+  description, posted_at, first_seen_at, last_seen_at, closed
+)
+SELECT
+  id, catalog_source_id, catalog_source_item_id,
+  title, company, location, canonical_url, apply_url,
+  description, posted_at, first_seen_at, last_seen_at, closed
+FROM discovery_jobs;
+
+CREATE TABLE discovery_job_roles (
+  job_id TEXT NOT NULL REFERENCES discovery_jobs_v24(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (
+    role IN (
+      'software_engineering',
+      'machine_learning',
+      'data',
+      'security',
+      'product',
+      'hardware',
+      'other'
+    )
+  ),
+  PRIMARY KEY (job_id, role)
+) STRICT;
+
+INSERT INTO discovery_job_roles(job_id, role)
+SELECT id, role
+FROM discovery_jobs;
+
+DROP TABLE discovery_jobs;
+ALTER TABLE discovery_jobs_v24 RENAME TO discovery_jobs;
+
+CREATE INDEX discovery_jobs_recency
+  ON discovery_jobs(closed, coalesce(posted_at, first_seen_at) DESC, id);
+CREATE INDEX discovery_job_roles_role_job
+  ON discovery_job_roles(role, job_id);
+`;
+
+
 function hasOpportunityKindColumn(db: Database): boolean {
   return db.query<{ name: string }, []>("PRAGMA table_info(runs)")
     .all()
@@ -989,6 +1049,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 23) {
         db.exec(migration23);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(23, now);
+      }
+      if (version < 24) {
+        db.exec(migration24);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(24, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

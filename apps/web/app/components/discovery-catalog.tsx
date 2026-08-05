@@ -50,6 +50,10 @@ const ROLE_LABELS: Record<DiscoveryRole, string> = {
   other: "Other",
 };
 
+export function discoveryRoleLabel(roles: readonly DiscoveryRole[]): string {
+  return roles.map((role) => ROLE_LABELS[role]).join(" · ");
+}
+
 const QUEUE_SKIP_LABELS: Record<DiscoveryQueueSkipReason, string> = {
   already_queued: "Already queued",
   not_found: "No longer available",
@@ -296,7 +300,7 @@ function DiscoveryJobRow({
       <article className="discovery-row__body">
         <header className="discovery-row__heading">
           <div>
-            <p className="discovery-row__role">{ROLE_LABELS[job.role]}</p>
+            <p className="discovery-row__role">{discoveryRoleLabel(job.roles)}</p>
             <h3>{job.title}</h3>
             <p className="discovery-row__company">{job.company}</p>
           </div>

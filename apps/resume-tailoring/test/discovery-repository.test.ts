@@ -2,16 +2,19 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
 import { DiscoveryListRequestSchema } from "../src/contracts/index.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
-import { classifyDiscoveryRole } from "../src/discovery/classification.ts";
 import { parsePostedAt } from "../src/discovery/connectors/normalize.ts";
 import { discoveryDedupeKeys, normalizeDiscoveryUrl } from "../src/discovery/normalize.ts";
 import { DiscoveryRepository } from "../src/discovery/repository.ts";
-import type { DiscoveredJobInput } from "../src/discovery/types.ts";
+import type { DiscoveredJobInput, DiscoveryRole } from "../src/discovery/types.ts";
 
 const databases: Database[] = [];
 const DESCRIPTION = "Build reliable production software with careful testing, ownership, collaboration, and measurable customer impact.";
 
-function item(overrides: Partial<DiscoveredJobInput> = {}): DiscoveredJobInput {
+type ClassifiedItem = DiscoveredJobInput & {
+  readonly roles: readonly DiscoveryRole[];
+};
+
+function item(overrides: Partial<ClassifiedItem> = {}): ClassifiedItem {
   return {
     sourceItemId: "item-1",
     sourceUrl: "https://board.example.test/jobs/123?utm_source=feed",
@@ -21,11 +24,12 @@ function item(overrides: Partial<DiscoveredJobInput> = {}): DiscoveredJobInput {
     company: "Example, Inc.",
     location: "Toronto, ON",
     description: DESCRIPTION,
+    roles: ["software_engineering"],
     ...overrides,
   };
 }
 
-function source(id: string, name: string, items: readonly DiscoveredJobInput[], completeSnapshot = true) {
+function source(id: string, name: string, items: readonly ClassifiedItem[], completeSnapshot = true) {
   return { id, name, kind: "simplify" as const, items, completeSnapshot };
 }
 
@@ -78,19 +82,32 @@ describe("discovery normalization and role classification", () => {
     expect(parsePostedAt("1960-01-01T00:00:00Z")).toBeNull();
     expect(parsePostedAt("999999999 months ago")).toBeNull();
   });
-
-  test("prioritizes machine learning over generic software and classifies role families", () => {
-    expect(classifyDiscoveryRole("Machine Learning Software Engineer Intern")).toBe("machine_learning");
-    expect(classifyDiscoveryRole("Cybersecurity Analyst Intern")).toBe("security");
-    expect(classifyDiscoveryRole("Data Science Intern")).toBe("data");
-    expect(classifyDiscoveryRole("Technical Product Manager Intern")).toBe("product");
-    expect(classifyDiscoveryRole("Embedded Hardware Intern")).toBe("hardware");
-    expect(classifyDiscoveryRole("Backend Developer Intern")).toBe("software_engineering");
-    expect(classifyDiscoveryRole("Legal Intern")).toBe("other");
-  });
 });
 
 describe("discovery source reconciliation", () => {
+  test("stores multiple roles and matches a job through any selected role", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, {
+      now: () => 1_000,
+      idFactory: () => "job-1",
+    });
+
+    repository.reconcileSource(source("source-a", "Alpha", [item({
+      roles: ["software_engineering", "machine_learning"],
+    })]));
+
+    const all = repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null }));
+    expect(all.jobs[0]?.roles).toEqual(["software_engineering", "machine_learning"]);
+    expect(repository.list(DiscoveryListRequestSchema.parse({
+      maxAgeDays: null,
+      role: "machine_learning",
+    })).total).toBe(1);
+    expect(repository.list(DiscoveryListRequestSchema.parse({
+      maxAgeDays: null,
+      role: "security",
+    })).total).toBe(0);
+  });
   test("deduplicates cross-source observations and retains every source name", () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);

@@ -11,19 +11,20 @@ import {
   boundedDiscoveryListOffset,
   discoveryPageWindow,
   discoveryQueueSkipLabel,
+  discoveryRoleLabel,
   discoverySelectionAfterTransition,
   orderedSelectedDiscoveryJobIds,
   pruneDiscoverySelection,
   toggleAllDiscoverySelection,
 } from "../app/components/discovery-catalog";
 
-function job(id: string, role: DiscoveryJob["role"]): DiscoveryJob {
+function job(id: string, roles: DiscoveryJob["roles"]): DiscoveryJob {
   return {
     id,
-    title: `${role} intern`,
+    title: `${roles.join(" ")} intern`,
     company: "Example Labs",
     location: "Remote",
-    role,
+    roles,
     canonicalUrl: `https://example.com/jobs/${id}`,
     applyUrl: `https://example.com/jobs/${id}/apply`,
     descriptionPreview: "Work with a small engineering team on production systems.",
@@ -36,8 +37,8 @@ function job(id: string, role: DiscoveryJob["role"]): DiscoveryJob {
 }
 
 const softwareJobs = [
-  job("swe-1", "software_engineering"),
-  job("swe-2", "software_engineering"),
+  job("swe-1", ["software_engineering"]),
+  job("swe-2", ["software_engineering"]),
 ];
 
 describe("DiscoveryCatalog selection", () => {
@@ -49,7 +50,7 @@ describe("DiscoveryCatalog selection", () => {
   });
 
   test("preserves still-visible selections after refresh and queues them in result order", () => {
-    const refreshed = [softwareJobs[1]!, job("ml-1", "machine_learning")];
+    const refreshed = [softwareJobs[1]!, job("ml-1", ["machine_learning"])];
     const selected = pruneDiscoverySelection(new Set(["swe-1", "swe-2", "missing"]), refreshed);
 
     expect([...selected]).toEqual(["swe-2"]);
@@ -71,6 +72,11 @@ describe("DiscoveryCatalog selection", () => {
 
   test("uses a safe public label for unexpected queue failures", () => {
     expect(discoveryQueueSkipLabel("queue_failed")).toBe("Could not be queued");
+  });
+
+  test("labels every role assigned to a job", () => {
+    expect(discoveryRoleLabel(["software_engineering", "machine_learning"]))
+      .toBe("Software engineering · Machine learning");
   });
 
   test("renders accessible loading controls with the seven-day filter selected by default", () => {

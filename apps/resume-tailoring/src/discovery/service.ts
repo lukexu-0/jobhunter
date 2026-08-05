@@ -2,7 +2,6 @@ import { z } from "zod";
 import {
   DiscoveryListResponseSchema,
   DiscoveryQueueResponseSchema,
-  DiscoveryRoleSchema,
   DiscoverySyncResponseSchema,
   JobDescriptionSchema,
   type DiscoveryListRequest,
@@ -20,7 +19,13 @@ import {
   type DiscoverySourceDescriptor,
 } from "./repository.ts";
 import { DiscoveryHttpBudget } from "./connectors/http.ts";
+import {
+  classifyDiscoveryRolesWithLuna,
+  type DiscoveryRoleClassification,
+  type DiscoveryRoleClassificationJob,
+} from "./role-classifier.ts";
 import type {
+  ClassifiedDiscoveredJobInput,
   DiscoveryConnector,
   DiscoveryConnectorSyncContext,
   DiscoverySourceKind,
@@ -46,7 +51,6 @@ const ConnectorItemSchema = z.object({
   location: z.string().trim().min(1).max(500).nullable().optional(),
   description: JobDescriptionSchema,
   postedAt: z.number().int().nonnegative().max(MAX_DISCOVERY_TIMESTAMP).nullable().optional(),
-  role: DiscoveryRoleSchema.optional(),
   requisitionId: z.string().trim().min(1).max(500).optional(),
 }).strict();
 
@@ -186,11 +190,18 @@ export interface DiscoveryRunService {
   kick(): void;
 }
 
+export type ClassifyDiscoveryRoles = (
+  jobs: readonly DiscoveryRoleClassificationJob[],
+  signal?: AbortSignal,
+) => Promise<readonly DiscoveryRoleClassification[]>;
+
+
 export interface DiscoveryServiceDependencies {
   readonly repository: DiscoveryRepository;
   readonly runs: DiscoveryRunService;
   readonly connectors: readonly DiscoveryConnector[];
   readonly now?: () => number;
+  readonly classifyRoles?: ClassifyDiscoveryRoles;
 }
 
 
@@ -209,6 +220,7 @@ function publicSourceError(error: unknown): string {
 
 export class DiscoveryService {
   readonly #now: () => number;
+  readonly #classifyRoles: ClassifyDiscoveryRoles;
   readonly #shutdown = new AbortController();
   readonly #activeConnectorOperations = new Set<Promise<unknown>>();
   #syncing = false;
@@ -217,6 +229,7 @@ export class DiscoveryService {
   #closePromise: Promise<void> | undefined;
   constructor(private readonly dependencies: DiscoveryServiceDependencies) {
     this.#now = dependencies.now ?? Date.now;
+    this.#classifyRoles = dependencies.classifyRoles ?? classifyDiscoveryRolesWithLuna;
     if (dependencies.connectors.length > 100) {
       throw new Error("at most 100 discovery connectors may be configured");
     }
@@ -233,6 +246,31 @@ export class DiscoveryService {
 
   list(options: DiscoveryListRequest): DiscoveryListResponse {
     return DiscoveryListResponseSchema.parse(this.dependencies.repository.list(options));
+  }
+
+  async #classifyItems(
+    items: ConnectorResult["items"],
+    signal: AbortSignal,
+  ): Promise<readonly ClassifiedDiscoveredJobInput[]> {
+    if (items.length === 0) return [];
+    const classifications = await this.#classifyRoles(items.map((item) => ({
+      id: item.sourceItemId,
+      title: item.title,
+      company: item.company,
+      location: item.location ?? null,
+      description: item.description,
+    })), signal);
+    const rolesById = new Map(classifications.map(({ id, roles }) => [id, roles]));
+    if (
+      rolesById.size !== items.length
+      || items.some((item) => !rolesById.has(item.sourceItemId))
+    ) {
+      throw new Error("Discovery role classifier must return every source item exactly once");
+    }
+    return items.map((item) => ({
+      ...item,
+      roles: rolesById.get(item.sourceItemId)!,
+    }));
   }
 
   sync(signal: AbortSignal): Promise<DiscoverySyncResponse> {
@@ -347,9 +385,11 @@ export class DiscoveryService {
           continue;
         }
         try {
+          const items = await this.#classifyItems(outcome.result.items, cancellationSignal);
+          cancellationSignal.throwIfAborted();
           const counts = this.dependencies.repository.reconcileSource({
             ...descriptor,
-            items: outcome.result.items,
+            items,
             completeSnapshot: outcome.result.completeSnapshot,
             ...(outcome.result.provenance === undefined
               ? {}
@@ -367,6 +407,7 @@ export class DiscoveryService {
               : { provenance: outcome.result.provenance }),
           });
         } catch (error) {
+          cancellationSignal.throwIfAborted();
           this.dependencies.repository.recordSourceFailure(descriptor, error);
           sources.push({
             sourceId: outcome.connector.id,

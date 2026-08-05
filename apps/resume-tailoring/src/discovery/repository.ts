@@ -1,18 +1,18 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import {
+  DiscoveryRolesSchema,
   JobDescriptionSchema,
   type DiscoveryJob,
   type DiscoveryListRequest,
 } from "../contracts/index.ts";
-import { classifyDiscoveryRole } from "./classification.ts";
 import {
   discoveryDedupeKeys,
   normalizeDiscoveryUrl,
   normalizeRequisitionId,
 } from "./normalize.ts";
 import type {
-  DiscoveredJobInput,
+  ClassifiedDiscoveredJobInput,
   DiscoveryKnownItem,
   DiscoveryKnownItemKey,
   DiscoveryRole,
@@ -24,7 +24,7 @@ interface DiscoveryJobRow {
   title: string;
   company: string;
   location: string | null;
-  role: DiscoveryRole;
+  roles: string;
   canonical_url: string;
   apply_url: string;
   description: string;
@@ -55,7 +55,7 @@ export interface DiscoverySourceDescriptor {
 }
 
 export interface DiscoverySourceReconcileInput extends DiscoverySourceDescriptor {
-  readonly items: readonly DiscoveredJobInput[];
+  readonly items: readonly ClassifiedDiscoveredJobInput[];
   readonly completeSnapshot: boolean;
   readonly provenance?: string;
 }
@@ -110,13 +110,14 @@ function publicJob(row: DiscoveryJobRow): DiscoveryJob {
   if (!Array.isArray(sourceNames) || sourceNames.some((name) => typeof name !== "string")) {
     throw new Error("discovery source names are corrupt");
   }
+  const roles = DiscoveryRolesSchema.parse(JSON.parse(row.roles));
   const status = row.run_id !== null ? "queued" : row.closed === 1 ? "closed" : "open";
   return {
     id: row.id,
     title: row.title,
     company: row.company,
     location: row.location,
-    role: row.role,
+    roles,
     canonicalUrl: row.canonical_url,
     applyUrl: row.apply_url,
     descriptionPreview: descriptionPreview(row.description),
@@ -171,6 +172,15 @@ export class DiscoveryRepository {
       VALUES (?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind
     `).run(source.id, source.name, source.kind);
+  }
+
+  #replaceJobRoles(jobId: string, rolesInput: readonly DiscoveryRole[]): void {
+    const roles = DiscoveryRolesSchema.parse(rolesInput);
+    this.database.query("DELETE FROM discovery_job_roles WHERE job_id = ?").run(jobId);
+    const insert = this.database.query(
+      "INSERT INTO discovery_job_roles(job_id, role) VALUES (?, ?)",
+    );
+    for (const role of roles) insert.run(jobId, role);
   }
 
   recordSourceFailure(source: DiscoverySourceDescriptor, error: unknown): void {
@@ -376,7 +386,7 @@ export class DiscoveryRepository {
         const sourceUrl = parsedSourceUrl.href;
         const description = JobDescriptionSchema.parse(rawItem.description);
         const location = rawItem.location?.trim() || null;
-        const role = rawItem.role ?? classifyDiscoveryRole(rawItem.title);
+        const roles = DiscoveryRolesSchema.parse(rawItem.roles);
         const item = { ...rawItem, canonicalUrl, applyUrl, location };
         const keys = discoveryDedupeKeys(item);
         const candidates = this.#candidateRows(input.id, rawItem.sourceItemId, keys);
@@ -386,9 +396,9 @@ export class DiscoveryRepository {
           this.database.query(`
             INSERT INTO discovery_jobs(
               id, catalog_source_id, catalog_source_item_id,
-              title, company, location, role, canonical_url, apply_url,
+              title, company, location, canonical_url, apply_url,
               description, posted_at, first_seen_at, last_seen_at, closed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
           `).run(
             jobId,
             input.id,
@@ -396,7 +406,6 @@ export class DiscoveryRepository {
             rawItem.title.trim(),
             rawItem.company.trim(),
             location,
-            role,
             canonicalUrl,
             applyUrl,
             description,
@@ -404,6 +413,7 @@ export class DiscoveryRepository {
             now,
             now,
           );
+          this.#replaceJobRoles(jobId, roles);
           created += 1;
         } else {
           for (const duplicate of candidates.slice(1)) {
@@ -421,7 +431,7 @@ export class DiscoveryRepository {
           ) {
             this.database.query(`
               UPDATE discovery_jobs
-              SET title = ?, company = ?, location = ?, role = ?,
+              SET title = ?, company = ?, location = ?,
                   canonical_url = ?, apply_url = ?,
                   description = CASE WHEN length(description) > length(?) THEN description ELSE ? END,
                   posted_at = CASE
@@ -434,7 +444,6 @@ export class DiscoveryRepository {
               rawItem.title.trim(),
               rawItem.company.trim(),
               location,
-              role,
               canonicalUrl,
               applyUrl,
               description,
@@ -444,6 +453,7 @@ export class DiscoveryRepository {
               rawItem.postedAt ?? null,
               jobId,
             );
+            this.#replaceJobRoles(jobId, roles);
           }
           updated.add(jobId);
         }
@@ -503,7 +513,11 @@ export class DiscoveryRepository {
     const where: string[] = [];
     const parameters: Array<string | number> = [];
     if (options.role !== undefined) {
-      where.push("jobs.role = ?");
+      where.push(`EXISTS (
+        SELECT 1
+        FROM discovery_job_roles role_filter
+        WHERE role_filter.job_id = jobs.id AND role_filter.role = ?
+      )`);
       parameters.push(options.role);
     }
     if (options.maxAgeDays !== null) {
@@ -535,11 +549,28 @@ export class DiscoveryRepository {
     `).get(...parameters)?.total ?? 0;
     const rows = this.database.query<DiscoveryJobRow, Array<string | number>>(`
       SELECT
-        jobs.id, jobs.title, jobs.company, jobs.location, jobs.role,
+        jobs.id, jobs.title, jobs.company, jobs.location,
         jobs.canonical_url, jobs.apply_url,
         substr(jobs.description, 1, 501) AS description,
         jobs.posted_at, jobs.first_seen_at, jobs.last_seen_at, jobs.closed,
         links.run_id,
+        coalesce((
+          SELECT json_group_array(role)
+          FROM (
+            SELECT job_roles.role
+            FROM discovery_job_roles job_roles
+            WHERE job_roles.job_id = jobs.id
+            ORDER BY CASE job_roles.role
+              WHEN 'software_engineering' THEN 0
+              WHEN 'machine_learning' THEN 1
+              WHEN 'data' THEN 2
+              WHEN 'security' THEN 3
+              WHEN 'product' THEN 4
+              WHEN 'hardware' THEN 5
+              WHEN 'other' THEN 6
+            END
+          )
+        ), '[]') AS roles,
         coalesce((
           SELECT json_group_array(source_name)
           FROM (

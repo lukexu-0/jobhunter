@@ -8,8 +8,9 @@ import { DiscoveryJobQueueConflictError } from "../src/db/repository.ts";
 import { createGitHubTableConnector } from "../src/discovery/connectors/github.ts";
 import { SafePublicHttpClient, type ConnectorFetch } from "../src/discovery/connectors/http.ts";
 import { DiscoveryRepository } from "../src/discovery/repository.ts";
-import { DiscoveryService } from "../src/discovery/service.ts";
+import { DiscoveryService, type ClassifyDiscoveryRoles } from "../src/discovery/service.ts";
 import type {
+  ClassifiedDiscoveredJobInput,
   DiscoveredJobInput,
   DiscoveryConnector,
   DiscoverySyncResult,
@@ -31,6 +32,18 @@ function input(id: string, title = "Software Engineering Intern"): DiscoveredJob
     description: DESCRIPTION,
   };
 }
+
+function classifiedInput(
+  id: string,
+  title = "Software Engineering Intern",
+): ClassifiedDiscoveredJobInput {
+  return { ...input(id, title), roles: ["software_engineering"] };
+}
+
+const classifyAsSoftware: ClassifyDiscoveryRoles = async (jobs) => jobs.map((job) => ({
+  id: job.id,
+  roles: ["software_engineering"],
+}));
 
 function run(id: string): RunDto {
   return {
@@ -99,6 +112,123 @@ describe("discovery synchronization", () => {
     })).toThrow("unsupported discovery connector kind");
   });
 
+  test("classifies full saved jobs before reconciliation and persists every selected role", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, {
+      now: () => 1_000,
+      idFactory: () => "job-1",
+    });
+    const classifiedInputs: unknown[] = [];
+    const service = new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [connector("working", async () => ({
+        items: [input("one", "Machine Learning Platform Engineer Intern")],
+        completeSnapshot: true,
+      }))],
+      classifyRoles: async (jobs) => {
+        classifiedInputs.push(...jobs);
+        return jobs.map((job) => ({
+          id: job.id,
+          roles: ["software_engineering", "machine_learning"] as const,
+        }));
+      },
+    });
+
+
+    const result = await service.sync(new AbortController().signal);
+
+    expect(result.totals).toMatchObject({ succeeded: 1, failed: 0, created: 1 });
+    expect(classifiedInputs).toEqual([{
+      id: "one",
+      title: "Machine Learning Platform Engineer Intern",
+      company: "Example",
+      location: null,
+      description: DESCRIPTION,
+    }]);
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0]?.roles)
+      .toEqual(["software_engineering", "machine_learning"]);
+  });
+  test("preserves the prior source snapshot when Luna classification fails", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, {
+      now: () => 1_000,
+      idFactory: () => "job-1",
+    });
+    let failClassification = false;
+    const service = new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [connector("working", async () => ({
+        items: [input("one")],
+        completeSnapshot: true,
+      }))],
+      classifyRoles: async (jobs) => {
+        if (failClassification) throw new Error("model transport unavailable");
+        return jobs.map((job) => ({
+          id: job.id,
+          roles: ["software_engineering"] as const,
+        }));
+      },
+    });
+    expect((await service.sync(new AbortController().signal)).totals.created).toBe(1);
+    failClassification = true;
+
+    const failed = await service.sync(new AbortController().signal);
+
+    expect(failed.sources[0]).toMatchObject({
+      status: "failed",
+      completeSnapshot: false,
+      received: 0,
+      closed: 0,
+    });
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs)
+      .toHaveLength(1);
+  });
+
+  test("propagates cancellation during role classification without recording a source failure", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database);
+    const classificationStarted = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled role classification");
+    const service = new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [connector("working", async () => ({
+        items: [input("one")],
+        completeSnapshot: true,
+      }))],
+      classifyRoles: async (_jobs, signal) => {
+        if (!signal) throw new Error("Expected classification cancellation signal");
+        classificationStarted.resolve();
+        const aborted = Promise.withResolvers<never>();
+        signal.addEventListener("abort", () => aborted.reject(signal.reason), { once: true });
+        return aborted.promise;
+      },
+    });
+    const syncing = service.sync(controller.signal);
+    await classificationStarted.promise;
+    controller.abort(reason);
+
+    await expect(syncing).rejects.toBe(reason);
+    expect(database.query<{ count: number }, []>(
+      "SELECT count(*) AS count FROM discovery_sources",
+    ).get()).toEqual({ count: 0 });
+  });
+
   test("keeps successful source data when another source fails and redacts upstream URLs", async () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);
@@ -108,6 +238,7 @@ describe("discovery synchronization", () => {
     });
     const service = new DiscoveryService({
       repository,
+      classifyRoles: classifyAsSoftware,
       runs: {
         createRunFromDescription: async () => run("unused"),
         kick: () => undefined,
@@ -171,6 +302,7 @@ describe("discovery synchronization", () => {
 
     const first = new DiscoveryService({
       repository,
+      classifyRoles: classifyAsSoftware,
       runs,
       connectors: [createGitHubTableConnector(
         githubConfig,
@@ -185,6 +317,7 @@ describe("discovery synchronization", () => {
     now = Date.parse("2026-08-04T00:00:00Z");
     const restarted = new DiscoveryService({
       repository,
+      classifyRoles: classifyAsSoftware,
       runs,
       connectors: [createGitHubTableConnector(
         githubConfig,
@@ -433,6 +566,7 @@ describe("discovery synchronization", () => {
     } as DiscoveredJobInput;
     const service = new DiscoveryService({
       repository,
+      classifyRoles: classifyAsSoftware,
       runs: {
         createRunFromDescription: async () => run("unused"),
         kick: () => undefined,
@@ -472,14 +606,14 @@ describe("discovery queueing", () => {
       id: "open-source",
       name: "Open source",
       kind: "simplify",
-      items: [input("open"), input("race")],
+      items: [classifiedInput("open"), classifiedInput("race")],
       completeSnapshot: true,
     });
     repository.reconcileSource({
       id: "closed-source",
       name: "Closed source",
       kind: "simplify",
-      items: [input("closed", "Data Science Intern")],
+      items: [classifiedInput("closed", "Data Science Intern")],
       completeSnapshot: true,
     });
     repository.reconcileSource({
@@ -540,9 +674,9 @@ describe("discovery queueing", () => {
       name: "Mixed source",
       kind: "simplify",
       items: [
-        input("first", "First internship"),
-        input("failing", "Failing internship"),
-        input("last", "Last internship"),
+        classifiedInput("first", "First internship"),
+        classifiedInput("failing", "Failing internship"),
+        classifiedInput("last", "Last internship"),
       ],
       completeSnapshot: true,
     });
@@ -594,7 +728,10 @@ describe("discovery queueing", () => {
       id: "abort-source",
       name: "Abort source",
       kind: "simplify",
-      items: [input("first", "First internship"), input("abort", "Abort internship")],
+      items: [
+        classifiedInput("first", "First internship"),
+        classifiedInput("abort", "Abort internship"),
+      ],
       completeSnapshot: true,
     });
     const jobs = repository.list(DiscoveryListRequestSchema.parse({
