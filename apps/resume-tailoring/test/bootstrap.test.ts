@@ -630,6 +630,7 @@ describe("pipeline application bootstrap", () => {
 
   test("wires the authenticated application agent before public origin policy", async () => {
     let invocations = 0;
+    let steers = 0;
     const result = {
       status: "cancelled" as const,
       company: null,
@@ -659,6 +660,9 @@ describe("pipeline application bootstrap", () => {
           reasoning: "high",
           result,
         };
+      },
+      steer: () => {
+        steers += 1;
       },
     };
     const fixture = createFixture(false, {
@@ -693,6 +697,23 @@ describe("pipeline application bootstrap", () => {
       result,
     });
     expect(invocations).toBe(1);
+    const steerResponse = await fixture.app.fetch(
+      new Request(
+        "http://127.0.0.1:3457/v1/internal/application-agent/123e4567-e89b-42d3-a456-426614174000/steer",
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${HARNESS_TOKEN}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ message: "Use the platform example." }),
+        },
+      ),
+    );
+    expect(steerResponse.status).toBe(202);
+    expect(steerResponse.headers.get("cache-control")).toBe("no-store");
+    expect(await steerResponse.text()).toBe("");
+    expect(steers).toBe(1);
     await fixture.app.close();
   });
 

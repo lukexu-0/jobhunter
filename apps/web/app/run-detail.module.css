@@ -396,6 +396,50 @@
   color: var(--color-muted);
 }
 
+.applicationSteeringForm {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-4);
+  background: var(--color-surface-raised);
+}
+
+.applicationSteeringIntro {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.applicationSteeringIntro p {
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-base);
+}
+
+.applicationSteeringForm button {
+  width: 100%;
+}
+
+.applicationSteeringForm textarea:disabled {
+  border-color: var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-faint);
+  cursor: not-allowed;
+}
+
+.applicationSteeringStatus {
+  margin: 0;
+  color: var(--color-good);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-base);
+}
+
+.applicationSteeringStatus:empty {
+  display: none;
+}
+
 .applicationGate {
   display: grid;
   gap: var(--space-3);

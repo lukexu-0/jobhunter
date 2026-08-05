@@ -1,4 +1,8 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  ApplicationAgentSteerRequestSchema,
+  type ApplicationAgentSteerRequest,
+} from "../contracts/index.ts";
 import { apiResponse } from "./handler.ts";
 import {
   ApplicationAgentFailure,
@@ -7,9 +11,16 @@ import {
   type ApplicationAgentFailureCode,
   type ApplicationRunResult,
 } from "../agents/application-agent.ts";
+import {
+  APPLICATION_AGENT_STEERING_CONFLICT_MESSAGE,
+  ApplicationAgentSteeringConflict,
+} from "../agents/application-agent-steering.ts";
 
 export const APPLICATION_AGENT_PATH = "/v1/internal/application-agent";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+const MAX_STEER_REQUEST_BYTES = 128 * 1024;
+const APPLICATION_AGENT_STEER_PATH =
+  /^\/v1\/internal\/application-agent\/([^/]+)\/steer$/;
 const DEFAULT_BODY_TIMEOUT_MS = 300_000;
 
 class RequestTooLargeError extends Error {}
@@ -48,9 +59,13 @@ function serviceErrorResponse(error: unknown): Response {
   return apiResponse.error("MODEL_PROVIDER_FAILED", "The model request failed", 502);
 }
 
-async function readJsonBody(request: Request, signal: AbortSignal): Promise<unknown> {
+async function readJsonBody(
+  request: Request,
+  signal: AbortSignal,
+  maxBytes = MAX_REQUEST_BYTES,
+): Promise<unknown> {
   const contentLength = request.headers.get("content-length");
-  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_REQUEST_BYTES) {
+  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
     throw new RequestTooLargeError();
   }
   if (request.body === null) throw new SyntaxError("Missing JSON body");
@@ -69,7 +84,7 @@ async function readJsonBody(request: Request, signal: AbortSignal): Promise<unkn
       const chunk = await runAbortable(() => reader.read(), signal);
       if (chunk.done) break;
       bytesRead += chunk.value.byteLength;
-      if (bytesRead > MAX_REQUEST_BYTES) {
+      if (bytesRead > maxBytes) {
         await reader.cancel().catch(() => undefined);
         throw new RequestTooLargeError();
       }
@@ -101,6 +116,11 @@ export interface ApplicationAgentSuccess {
 export interface ApplicationAgentRouteService {
   status(signal?: AbortSignal): Promise<ApplicationAgentStatus> | ApplicationAgentStatus;
   invoke(input: ApplicationAgentRunInput, signal: AbortSignal): Promise<ApplicationAgentSuccess>;
+  steer(
+    sessionId: string,
+    input: ApplicationAgentSteerRequest,
+    signal: AbortSignal,
+  ): Promise<void> | void;
 }
 
 export interface ApplicationAgentRouteOptions {
@@ -113,7 +133,14 @@ export function createApplicationAgentRoutes(
   options: ApplicationAgentRouteOptions = {},
 ) {
   return async function routeApplicationAgent(request: Request, url: URL): Promise<Response | null> {
-    if (url.pathname !== APPLICATION_AGENT_PATH || (request.method !== "GET" && request.method !== "POST")) {
+    const steerPath = APPLICATION_AGENT_STEER_PATH.exec(url.pathname);
+    const isInvokePath = url.pathname === APPLICATION_AGENT_PATH;
+    if (
+      !(
+        (isInvokePath && (request.method === "GET" || request.method === "POST"))
+        || (steerPath !== null && request.method === "POST")
+      )
+    ) {
       return null;
     }
     if (token === undefined || token.length === 0 || service === undefined) {
@@ -124,7 +151,7 @@ export function createApplicationAgentRoutes(
     if (!timingSafeEqual(expectedAuthorization, presentedAuthorization)) {
       return apiResponse.error("UNAUTHORIZED", "Unauthorized", 401);
     }
-    if (request.method === "GET") {
+    if (isInvokePath && request.method === "GET") {
       try {
         const status = await service.status(request.signal);
         request.signal.throwIfAborted();
@@ -136,7 +163,63 @@ export function createApplicationAgentRoutes(
     }
     const mediaType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
     if (mediaType !== "application/json") {
-      return apiResponse.error("JSON_REQUIRED", "Model requests must use application/json", 415);
+      return apiResponse.error(
+        "JSON_REQUIRED",
+        steerPath === null
+          ? "Model requests must use application/json"
+          : "Steering requests must use application/json",
+        415,
+      );
+    }
+    if (steerPath !== null) {
+      const bodyTimeoutSignal = AbortSignal.timeout(
+        Math.min(options.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS, 5_000),
+      );
+      const bodySignal = AbortSignal.any([request.signal, bodyTimeoutSignal]);
+      let sessionId: string;
+      let input: ApplicationAgentSteerRequest;
+      try {
+        sessionId = ApplicationAgentRunInputSchema.shape.sessionId.parse(
+          steerPath[1],
+        );
+        input = ApplicationAgentSteerRequestSchema.parse(
+          await readJsonBody(request, bodySignal, MAX_STEER_REQUEST_BYTES),
+        );
+      } catch (error) {
+        if (request.signal.aborted) throw request.signal.reason;
+        if (bodyTimeoutSignal.aborted) {
+          return apiResponse.error("MODEL_TIMEOUT", "The model request timed out", 504);
+        }
+        if (error instanceof RequestTooLargeError) {
+          return apiResponse.error(
+            "REQUEST_TOO_LARGE",
+            "The steering request is too large",
+            413,
+          );
+        }
+        return apiResponse.error("INVALID_REQUEST", "Request is invalid", 422);
+      }
+      try {
+        await runAbortable(
+          () => service.steer(sessionId, input, request.signal),
+          request.signal,
+        );
+        request.signal.throwIfAborted();
+        return new Response(null, {
+          status: 202,
+          headers: { "cache-control": "no-store" },
+        });
+      } catch (error) {
+        if (request.signal.aborted) throw request.signal.reason;
+        if (error instanceof ApplicationAgentSteeringConflict) {
+          return apiResponse.error(
+            "APPLICATION_COMMAND_CONFLICT",
+            APPLICATION_AGENT_STEERING_CONFLICT_MESSAGE,
+            409,
+          );
+        }
+        return serviceErrorResponse(error);
+      }
     }
     const bodyTimeoutSignal = AbortSignal.timeout(options.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS);
     const bodySignal = AbortSignal.any([request.signal, bodyTimeoutSignal]);

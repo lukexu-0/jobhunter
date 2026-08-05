@@ -6,6 +6,7 @@ import {
 } from "../src/api/application-agent-routes.ts";
 import { createApiHandler } from "../src/api/handler.ts";
 import { ApplicationAgentFailure } from "../src/agents/application-agent.ts";
+import { ApplicationAgentSteeringConflict } from "../src/agents/application-agent-steering.ts";
 
 const API_ORIGIN = "http://127.0.0.1:3457";
 const TOKEN = "test-token-0123456789abcdef-0123456789";
@@ -54,6 +55,9 @@ function fakeService(overrides: Partial<ApplicationAgentRouteService> = {}): App
     invoke: async () => {
       throw new Error("unexpected invoke");
     },
+    steer: async () => {
+      throw new Error("unexpected steer");
+    },
     ...overrides,
   };
 }
@@ -74,11 +78,14 @@ describe("application agent HTTP boundary", () => {
       [`${APPLICATION_AGENT_PATH}/`, "GET"],
       ["/v1/internal/application-agent-extra", "POST"],
       ["/v1/internal/Application-agent", "GET"],
+      [`${APPLICATION_AGENT_PATH}/${INPUT.sessionId}/steer`, "GET"],
+      [`${APPLICATION_AGENT_PATH}/${INPUT.sessionId}/steer/`, "POST"],
+      [`${APPLICATION_AGENT_PATH}//steer`, "POST"],
     ] as const) {
       expect(await route(request(path, { method }), new URL(`${API_ORIGIN}${path}`))).toBeNull();
     }
   });
-  test("returns the same hidden-route 404 for GET and POST when no token is configured", async () => {
+  test("returns the same hidden-route 404 for every route when no token is configured", async () => {
     for (const token of [undefined, ""]) {
       const route = createApplicationAgentRoutes(fakeService(), token);
       for (const method of ["GET", "POST"]) {
@@ -89,6 +96,16 @@ describe("application agent HTTP boundary", () => {
         expect(response?.status).toBe(404);
         expect(await response?.json()).toEqual({ error: { code: "NOT_FOUND", message: "Route not found" } });
       }
+      const steerPath = `${APPLICATION_AGENT_PATH}/${INPUT.sessionId}/steer`;
+      const steerResponse = await route(request(steerPath, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "private guidance" }),
+      }), new URL(`${API_ORIGIN}${steerPath}`));
+      expect(steerResponse?.status).toBe(404);
+      expect(await steerResponse?.json()).toEqual({
+        error: { code: "NOT_FOUND", message: "Route not found" },
+      });
     }
   });
   test("uses constant-time exact bearer comparison with an undifferentiated 401", async () => {
@@ -127,6 +144,114 @@ describe("application agent HTTP boundary", () => {
       reasoning: "high",
       oauth: "connected",
     });
+  });
+
+  test("queues an authenticated strict steer request with an empty no-store 202", async () => {
+    const steerPath = `${APPLICATION_AGENT_PATH}/${INPUT.sessionId}/steer`;
+    const calls: unknown[][] = [];
+    const route = createApplicationAgentRoutes(fakeService({
+      steer: async (...args) => {
+        calls.push(args);
+      },
+    }), TOKEN);
+    const steerRequest = request(steerPath, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ message: "\u001c  Prefer the platform example. \u0085" }),
+    });
+
+    const response = await route(steerRequest, new URL(`${API_ORIGIN}${steerPath}`));
+
+    expect(response?.status).toBe(202);
+    expect(response?.headers.get("cache-control")).toBe("no-store");
+    expect(await response?.text()).toBe("");
+    expect(calls).toEqual([[
+      INPUT.sessionId,
+      { message: "Prefer the platform example." },
+      steerRequest.signal,
+    ]]);
+  });
+
+  test("rejects unauthenticated or invalid steer requests before the service", async () => {
+    const steerPath = `${APPLICATION_AGENT_PATH}/${INPUT.sessionId}/steer`;
+    let calls = 0;
+    const route = createApplicationAgentRoutes(fakeService({
+      steer: async () => {
+        calls += 1;
+      },
+    }), TOKEN);
+    const unauthorized = await route(request(steerPath, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "private guidance" }),
+    }), new URL(`${API_ORIGIN}${steerPath}`));
+    expect(unauthorized?.status).toBe(401);
+
+    for (const body of [
+      {},
+      { message: " " },
+      { message: "x".repeat(8_001) },
+      { message: "before\u0000after" },
+      { message: "\ud800" },
+      { message: "valid", extra: true },
+    ]) {
+      const response = await route(request(steerPath, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }), new URL(`${API_ORIGIN}${steerPath}`));
+      expect(response?.status).toBe(422);
+      expect(await response?.json()).toEqual({
+        error: { code: "INVALID_REQUEST", message: "Request is invalid" },
+      });
+    }
+    const invalidSessionPath = `${APPLICATION_AGENT_PATH}/not-a-session/steer`;
+    const invalidSession = await route(request(invalidSessionPath, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ message: "private guidance" }),
+    }), new URL(`${API_ORIGIN}${invalidSessionPath}`));
+    expect(invalidSession?.status).toBe(422);
+    expect(calls).toBe(0);
+  });
+
+  test("maps every unavailable steering inbox to one fixed conflict without text", async () => {
+    const privateMessage = "PRIVATE OPERATOR GUIDANCE";
+    const steerPath = `${APPLICATION_AGENT_PATH}/${INPUT.sessionId}/steer`;
+    const route = createApplicationAgentRoutes(fakeService({
+      steer: async () => {
+        throw new ApplicationAgentSteeringConflict();
+      },
+    }), TOKEN);
+
+    const response = await route(request(steerPath, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ message: privateMessage }),
+    }), new URL(`${API_ORIGIN}${steerPath}`));
+
+    expect(response?.status).toBe(409);
+    expect(response?.headers.get("cache-control")).toBe("no-store");
+    const responseText = await response?.text();
+    expect(responseText).toBe(JSON.stringify({
+      error: {
+        code: "APPLICATION_COMMAND_CONFLICT",
+        message: "The application state changed; review the latest session state",
+      },
+    }));
+    expect(responseText).not.toContain(privateMessage);
   });
   test("passes the request signal into authenticated GET status reads", async () => {
     const controller = new AbortController();

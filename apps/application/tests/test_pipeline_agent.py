@@ -23,6 +23,7 @@ _REAL_ASYNC_CLIENT = httpx.AsyncClient
 _SESSION_ID = UUID("52aa48d2-c3c8-40df-80de-d213631a04aa")
 _TOKEN = "unit-test-token-0123456789abcdef"
 _AGENT_PATH = "/v1/internal/application-agent"
+_STEER_PATH = f"{_AGENT_PATH}/{_SESSION_ID}/steer"
 
 Handler = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
 
@@ -216,6 +217,203 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
         '"maxTurns":37,"deadlineMs":12345}'
     )
 
+
+async def test_steer_posts_exact_authenticated_path_body_and_requires_empty_202(
+    build_client: Callable[..., ClientHarness],
+) -> None:
+    harness = build_client(
+        lambda _request: httpx.Response(
+            202,
+            content=b"",
+            headers={"cache-control": "no-store"},
+        )
+    )
+
+    assert await harness.agent.steer("  Prefer the operator-updated location.  ") is None
+
+    assert len(harness.requests) == 1
+    request = harness.requests[0]
+    assert request.method == "POST"
+    assert request.url == httpx.URL(f"http://127.0.0.1:3457{_STEER_PATH}")
+    assert request.headers["Authorization"] == f"Bearer {_TOKEN}"
+    assert request.headers["Content-Type"] == "application/json"
+    assert request.read() == b'{"message":"Prefer the operator-updated location."}'
+    assert request.extensions["timeout"] == {
+        "connect": 5.0,
+        "read": 5.0,
+        "write": 5.0,
+        "pool": 5.0,
+    }
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "",
+        " \n ",
+        "contains\x00nul",
+        "\ud800",
+        "x" * 8_001,
+        "\U0001f680" * 8_001,
+    ],
+)
+async def test_steer_rejects_invalid_text_before_network_io(
+    build_client: Callable[..., ClientHarness],
+    message: str,
+) -> None:
+    harness = build_client(lambda _request: httpx.Response(202))
+
+    with pytest.raises(ValueError, match="message is invalid"):
+        await harness.agent.steer(message)
+
+    assert harness.requests == []
+
+
+async def test_steer_maps_private_conflict_without_echoing_guidance(
+    build_client: Callable[..., ClientHarness],
+) -> None:
+    message = "private operator guidance"
+    private_detail = f"closed while handling {message}"
+    harness = build_client(
+        lambda _request: httpx.Response(
+            409,
+            json={
+                "error": {
+                    "code": "APPLICATION_COMMAND_CONFLICT",
+                    "message": private_detail,
+                }
+            },
+        )
+    )
+
+    with pytest.raises(PipelineApplicationAgentError) as raised:
+        await harness.agent.steer(message)
+
+    _assert_public_error(
+        raised.value,
+        "command_conflict",
+        "The application state changed; review the latest session state",
+        message,
+        private_detail,
+    )
+    assert len(harness.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "secret"),
+    [
+        (
+            httpx.Response(
+                409,
+                json={
+                    "error": {
+                        "code": "UNKNOWN_PRIVATE_CONFLICT",
+                        "message": "private stale detail",
+                    }
+                },
+            ),
+            "private stale detail",
+        ),
+        (
+            httpx.Response(202, content=b"unexpected private success body"),
+            "unexpected private success body",
+        ),
+        (
+            httpx.Response(500, content=b"private pipeline failure"),
+            "private pipeline failure",
+        ),
+    ],
+)
+async def test_steer_maps_malformed_or_private_failures_without_retry_or_leakage(
+    build_client: Callable[..., ClientHarness],
+    response: httpx.Response,
+    secret: str,
+) -> None:
+    harness = build_client(lambda _request: response)
+
+    with pytest.raises(PipelineApplicationAgentError) as raised:
+        await harness.agent.steer("operator text")
+
+    _assert_public_error(
+        raised.value,
+        "pipeline_unavailable",
+        "The local pipeline model service is unavailable",
+        "operator text",
+        secret,
+    )
+    assert len(harness.requests) == 1
+
+
+async def test_steer_lost_response_is_not_retried(
+    build_client: Callable[..., ClientHarness],
+) -> None:
+    secret = "private lost-response detail"
+
+    def lost_response(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError(secret, request=request)
+
+    harness = build_client(lost_response)
+
+    with pytest.raises(PipelineApplicationAgentError) as raised:
+        await harness.agent.steer("send exactly once")
+
+    _assert_public_error(
+        raised.value,
+        "pipeline_unavailable",
+        "The local pipeline model service is unavailable",
+        "send exactly once",
+        secret,
+    )
+    assert len(harness.requests) == 1
+
+
+async def test_steer_close_race_is_fixed_and_not_retried(
+    build_client: Callable[..., ClientHarness],
+) -> None:
+    secret = "private concurrent-close detail"
+
+    def closed_during_request(_request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(secret)
+
+    harness = build_client(closed_during_request)
+
+    with pytest.raises(PipelineApplicationAgentError) as raised:
+        await harness.agent.steer("send at most once")
+
+    _assert_public_error(
+        raised.value,
+        "pipeline_unavailable",
+        "The local pipeline model service is unavailable",
+        "send at most once",
+        secret,
+    )
+    assert len(harness.requests) == 1
+
+
+async def test_steer_request_runs_concurrently_with_active_agent_request(
+    build_client: Callable[..., ClientHarness],
+) -> None:
+    run_started = asyncio.Event()
+    release_run = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == _AGENT_PATH:
+            run_started.set()
+            await release_run.wait()
+            return httpx.Response(200, json=_success_payload())
+        assert request.url.path == _STEER_PATH
+        return httpx.Response(202)
+
+    harness = build_client(handler)
+    run_task = asyncio.create_task(_run(harness.agent))
+    await run_started.wait()
+
+    assert await harness.agent.steer("continue with the corrected detail") is None
+    assert len(harness.requests) == 2
+    assert not run_task.done()
+
+    release_run.set()
+    await run_task
 
 @pytest.mark.parametrize(
     ("method", "expected_code", "expected_message"),
@@ -618,6 +816,15 @@ async def test_close_is_idempotent_and_rejects_new_requests(
         raised.value,
         "pipeline_unavailable",
         "The local pipeline model service is unavailable",
+    )
+    assert len(harness.requests) == request_count
+    with pytest.raises(PipelineApplicationAgentError) as steer_raised:
+        await harness.agent.steer("must not be sent")
+    _assert_public_error(
+        steer_raised.value,
+        "pipeline_unavailable",
+        "The local pipeline model service is unavailable",
+        "must not be sent",
     )
     assert len(harness.requests) == request_count
 

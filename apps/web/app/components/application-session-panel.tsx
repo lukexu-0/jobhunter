@@ -1,14 +1,16 @@
 "use client";
 
-import type {
-  ApplicationAnswerSuggestionsResponse,
-  ApplicationProfessionalizeRequest,
-  ApplicationProfessionalizeResponse,
-  ApplicationFieldResult,
-  ApplicationPendingAction,
-  ApplicationSessionBridgeState,
-  ApplicationSessionCommand,
-  ApplicationSessionSnapshotDto,
+import { useRef, useState, type FormEvent } from "react";
+import {
+  ApplicationSessionCommandSchema,
+  type ApplicationAnswerSuggestionsResponse,
+  type ApplicationProfessionalizeRequest,
+  type ApplicationProfessionalizeResponse,
+  type ApplicationFieldResult,
+  type ApplicationPendingAction,
+  type ApplicationSessionBridgeState,
+  type ApplicationSessionCommand,
+  type ApplicationSessionSnapshotDto,
 } from "@jobhunter/pipeline/contracts";
 import { ApplicationAdditionalInfoForm } from "./application-additional-info-form";
 import { ApplicationCredentialsForm } from "./application-credentials-form";
@@ -16,9 +18,22 @@ import { ApplicationReviewGate } from "./application-review-gate";
 import styles from "../run-detail.module.css";
 
 export type ApplicationLifecycleAction = "cancel" | "close" | "resume" | "retry";
+export type ApplicationGateCommandType = Exclude<
+  ApplicationSessionCommand["type"],
+  "steer"
+>;
 export type ApplicationPanelAction =
   | ApplicationLifecycleAction
-  | ApplicationSessionCommand["type"];
+  | ApplicationGateCommandType;
+export type ApplicationSteerCommand = Extract<
+  ApplicationSessionCommand,
+  { readonly type: "steer" }
+>;
+export type ApplicationSteeringState = "idle" | "sending" | "ambiguous";
+export type ApplicationSteeringSubmissionResult =
+  | { readonly status: "accepted" }
+  | { readonly status: "rejected"; readonly message: string }
+  | { readonly status: "ambiguous" };
 
 type SimpleApplicationPendingAction = Extract<
   ApplicationPendingAction,
@@ -28,6 +43,7 @@ type SimpleApplicationPendingAction = Extract<
 export interface ApplicationSessionPanelProps {
   readonly snapshot: ApplicationSessionSnapshotDto;
   readonly actionBusy: ApplicationPanelAction | null;
+  readonly steeringState: ApplicationSteeringState;
   readonly onCancel: () => Promise<void>;
   readonly onClose: () => Promise<void>;
   readonly onRetry: () => Promise<void>;
@@ -42,6 +58,9 @@ export interface ApplicationSessionPanelProps {
   ) => Promise<ApplicationProfessionalizeResponse>;
   readonly onResume: () => Promise<void>;
   readonly onCommand: (command: ApplicationSessionCommand) => Promise<void>;
+  readonly onSteer: (
+    command: ApplicationSteerCommand,
+  ) => Promise<ApplicationSteeringSubmissionResult>;
 }
 
 const STATE_LABELS: Readonly<Record<ApplicationSessionBridgeState, string>> = {
@@ -92,6 +111,136 @@ export function simpleApplicationGateCommand(
   return { type: "continue" };
 }
 
+const INVALID_STEERING_MESSAGE =
+  "Enter guidance between 1 and 8,000 Unicode characters without null characters.";
+export const AMBIGUOUS_STEERING_MESSAGE =
+  "Guidance delivery could not be confirmed. Do not send it again until the application state changes.";
+export const STEERING_SUCCESS_MESSAGE =
+  "Guidance queued for the next agent step.";
+
+export type ApplicationSteerCommandResult =
+  | { readonly success: true; readonly command: ApplicationSteerCommand }
+  | { readonly success: false; readonly message: string };
+
+export function buildApplicationSteerCommand(
+  message: string,
+): ApplicationSteerCommandResult {
+  const parsed = ApplicationSessionCommandSchema.safeParse({
+    type: "steer",
+    message,
+  });
+  if (parsed.success && parsed.data.type === "steer") {
+    return { success: true, command: parsed.data };
+  }
+  return { success: false, message: INVALID_STEERING_MESSAGE };
+}
+
+function ApplicationSteeringForm({
+  actionBusy,
+  steeringState,
+  onSteer,
+}: {
+  readonly actionBusy: boolean;
+  readonly steeringState: ApplicationSteeringState;
+  readonly onSteer: (
+    command: ApplicationSteerCommand,
+  ) => Promise<ApplicationSteeringSubmissionResult>;
+}) {
+  const [draft, setDraft] = useState("");
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
+  const [deliveryStatus, setDeliveryStatus] = useState<string | null>(null);
+  const submissionPendingRef = useRef(false);
+  const disabled = actionBusy || steeringState !== "idle";
+  const error = validationError
+    ?? deliveryError
+    ?? (steeringState === "ambiguous" ? AMBIGUOUS_STEERING_MESSAGE : null);
+  const descriptionId = "application-steering-guidance";
+  const errorId = "application-steering-error";
+  const describedBy = error ? `${descriptionId} ${errorId}` : descriptionId;
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (disabled || submissionPendingRef.current) return;
+    const result = buildApplicationSteerCommand(draft);
+    if (!result.success) {
+      setValidationError(result.message);
+      setDeliveryError(null);
+      setDeliveryStatus(null);
+      return;
+    }
+
+    setValidationError(null);
+    setDeliveryError(null);
+    setDeliveryStatus(null);
+    submissionPendingRef.current = true;
+    try {
+      const submission = await onSteer(result.command);
+      if (submission.status === "accepted") {
+        setDraft("");
+        setDeliveryStatus(STEERING_SUCCESS_MESSAGE);
+      } else if (submission.status === "rejected") {
+        setDeliveryError(submission.message);
+      } else {
+        setDeliveryError(AMBIGUOUS_STEERING_MESSAGE);
+      }
+    } finally {
+      submissionPendingRef.current = false;
+    }
+  };
+
+  return (
+    <form
+      aria-labelledby="application-steering-heading"
+      className={styles.applicationSteeringForm}
+      noValidate
+      onSubmit={(event) => void submit(event)}
+    >
+      <div className={styles.applicationSteeringIntro}>
+        <h3 id="application-steering-heading">Guide the application agent</h3>
+        <p id={descriptionId}>
+          Delivered once before the next agent step. Guidance is not saved to
+          your profile or application facts.
+        </p>
+      </div>
+      <label className={styles.workspaceField} htmlFor="application-steering-message">
+        <span>Operator guidance</span>
+        <textarea
+          aria-describedby={describedBy}
+          aria-invalid={error ? true : undefined}
+          disabled={disabled}
+          id="application-steering-message"
+          name="message"
+          onChange={(event) => {
+            setDraft(event.currentTarget.value);
+            setValidationError(null);
+            setDeliveryError(null);
+            setDeliveryStatus(null);
+          }}
+          required
+          value={draft}
+        />
+      </label>
+      {error ? (
+        <p className={styles.panelError} id={errorId} role="alert">
+          {error}
+        </p>
+      ) : null}
+      <button className={styles.secondaryButton} disabled={disabled} type="submit">
+        {steeringState === "sending" ? "Sending guidance…" : "Send guidance"}
+      </button>
+      <p
+        aria-atomic="true"
+        aria-live="polite"
+        className={styles.applicationSteeringStatus}
+        role="status"
+      >
+        {deliveryStatus}
+      </p>
+    </form>
+  );
+}
+
 function FieldList({ fields }: { readonly fields: readonly ApplicationFieldResult[] }) {
   if (fields.length === 0) return <p>None reported.</p>;
   return (
@@ -118,6 +267,7 @@ function TextList({ values }: { readonly values: readonly string[] }) {
 export function ApplicationSessionPanel({
   snapshot,
   actionBusy,
+  steeringState,
   onCancel,
   onClose,
   onRetry,
@@ -125,6 +275,7 @@ export function ApplicationSessionPanel({
   onProfessionalize,
   onResume,
   onCommand,
+  onSteer,
 }: ApplicationSessionPanelProps) {
   const terminal = TERMINAL_STATES.has(snapshot.bridgeState);
   const finalSubmission = snapshot.submissionPhase === "submitted"
@@ -208,6 +359,14 @@ export function ApplicationSessionPanel({
           <TextList values={snapshot.warnings} />
         </div>
       </div>
+
+      {snapshot.bridgeState === "running" ? (
+        <ApplicationSteeringForm
+          actionBusy={busy}
+          onSteer={onSteer}
+          steeringState={steeringState}
+        />
+      ) : null}
 
       {pendingAction?.type === "credentials" ? (
         <ApplicationCredentialsForm

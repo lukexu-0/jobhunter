@@ -8,12 +8,20 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .models import ApplicationRunResult, OpportunityKind
+from .models import (
+    ApplicationRunResult,
+    OpportunityKind,
+    normalize_steer_message,
+)
 
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
 REASONING = "high"
 _AGENT_PATH = "/v1/internal/application-agent"
+_STEER_TIMEOUT_SECONDS = 5.0
+_COMMAND_CONFLICT_MESSAGE = (
+    "The application state changed; review the latest session state"
+)
 
 
 class PipelineApplicationAgentError(RuntimeError):
@@ -27,6 +35,10 @@ class PipelineApplicationAgentError(RuntimeError):
 
 _ERROR_RESPONSES: Final[dict[tuple[int, str], tuple[str, str]]] = {
     (422, "INVALID_REQUEST"): ("invalid_request", "Request is invalid"),
+    (409, "APPLICATION_COMMAND_CONFLICT"): (
+        "command_conflict",
+        _COMMAND_CONFLICT_MESSAGE,
+    ),
     (409, "OAUTH_REQUIRED"): (
         "oauth_required",
         "Connect OpenAI Codex in Provider access",
@@ -183,6 +195,23 @@ class PipelineApplicationAgentClient:
             ) from None
         return success.result
 
+    async def steer(self, message: str) -> None:
+        normalized = normalize_steer_message(message)
+        response = await self._send(
+            "POST",
+            path=f"{_AGENT_PATH}/{self._session_id}/steer",
+            json={"message": normalized},
+            timeout=_STEER_TIMEOUT_SECONDS,
+            timeout_is_model_error=False,
+            allow_command_conflict=True,
+            expected_status=202,
+        )
+        if response.content:
+            raise PipelineApplicationAgentError(
+                "pipeline_unavailable",
+                "The local pipeline model service is unavailable",
+            )
+
     async def aclose(self) -> None:
         if self._closed:
             return
@@ -199,9 +228,12 @@ class PipelineApplicationAgentClient:
         self,
         method: str,
         *,
+        path: str = _AGENT_PATH,
         json: dict[str, Any] | None = None,
         timeout: float | None = None,
         timeout_is_model_error: bool,
+        allow_command_conflict: bool = False,
+        expected_status: int = 200,
     ) -> httpx.Response:
         if self._closed:
             raise PipelineApplicationAgentError(
@@ -211,11 +243,11 @@ class PipelineApplicationAgentClient:
         try:
             if timeout is None:
                 response = await self._client.request(
-                    method, _AGENT_PATH, json=json
+                    method, path, json=json
                 )
             else:
                 response = await self._client.request(
-                    method, _AGENT_PATH, json=json, timeout=timeout
+                    method, path, json=json, timeout=timeout
                 )
         except httpx.TimeoutException as error:
             if timeout_is_model_error:
@@ -231,7 +263,12 @@ class PipelineApplicationAgentClient:
                 "pipeline_unavailable",
                 "The local pipeline model service is unavailable",
             ) from error
-        if response.status_code != 200:
+        except RuntimeError as error:
+            raise PipelineApplicationAgentError(
+                "pipeline_unavailable",
+                "The local pipeline model service is unavailable",
+            ) from error
+        if response.status_code != expected_status:
             gateway_code: str | None = None
             try:
                 body = response.json()
@@ -247,7 +284,12 @@ class PipelineApplicationAgentClient:
                 (response.status_code, gateway_code or "")
             )
             if mapped is not None and (
-                timeout_is_model_error or gateway_code == "OAUTH_REQUIRED"
+                timeout_is_model_error
+                or gateway_code == "OAUTH_REQUIRED"
+                or (
+                    allow_command_conflict
+                    and gateway_code == "APPLICATION_COMMAND_CONFLICT"
+                )
             ):
                 raise PipelineApplicationAgentError(*mapped)
             if response.status_code == 401:

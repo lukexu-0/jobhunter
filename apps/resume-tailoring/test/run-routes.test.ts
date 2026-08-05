@@ -997,6 +997,30 @@ describe("application session HTTP routes", () => {
     }
   });
 
+  test("normalizes and forwards strict steering with an empty no-store 202", async () => {
+    const received: ApplicationSessionCommand[] = [];
+    const target = applicationService({
+      command: async (_runId, command) => {
+        received.push(command);
+      },
+    });
+    const privateMessage = "Prefer the distributed-systems example.";
+
+    const response = await applicationRequest(
+      target,
+      "/v1/runs/run-1/application/commands",
+      post({
+        type: "steer",
+        message: `\u001c  ${privateMessage}  \u0085`,
+      }),
+    );
+
+    expect(response.status).toBe(202);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.text()).toBe("");
+    expect(received).toEqual([{ type: "steer", message: privateMessage }]);
+  });
+
   test("rejects malformed requests through the public Origin and JSON boundary", async () => {
     let starts = 0;
     let suggestions = 0;
@@ -1097,6 +1121,11 @@ describe("application session HTTP routes", () => {
       { type: "approve_origin", origin: "https://example.test/path" },
       { type: "provide_additional_info", answers: [] },
       { type: "ready" },
+      { type: "steer", message: " " },
+      { type: "steer", message: "x".repeat(8_001) },
+      { type: "steer", message: "before\u0000after" },
+      { type: "steer", message: "\ud800" },
+      { type: "steer", message: "valid", extra: true },
       { type: "sign_in", username: " ", password: "private" },
       { type: "sign_in", username: "😀".repeat(321), password: "private" },
       { type: "sign_in", username: "applicant@example.test", password: "" },

@@ -974,7 +974,11 @@ export class ApplicationSessionService {
     } catch (error) {
       mapRepositoryError(error);
     }
-    if (session && retainedSubmissionFinal(session)) {
+    if (
+      session
+      && command.type !== "steer"
+      && retainedSubmissionFinal(session)
+    ) {
       throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
     }
     if (
@@ -982,6 +986,13 @@ export class ApplicationSessionService {
       || !isLive(session)
       || session.bridgeState === "reserved"
       || session.submissionPhase === "attempting"
+      || (
+        command.type === "steer"
+        && (
+          session.bridgeState !== "running"
+          || retainedSubmissionFinal(session)
+        )
+      )
       || (
         command.type === "submit"
         && session.bridgeState !== "awaiting_human_review"

@@ -3,6 +3,7 @@ import type { ApplicationSessionSnapshotDto } from "@jobhunter/pipeline/contract
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   ApplicationSessionPanel,
+  buildApplicationSteerCommand,
   simpleApplicationGateCommand,
 } from "../app/components/application-session-panel";
 import { buildApplicationCredentialCommand } from "../app/components/application-credentials-form";
@@ -39,11 +40,13 @@ function snapshot(
 
 const callbacks = {
   actionBusy: null,
+  steeringState: "idle" as const,
   onCancel: async () => {},
   onClose: async () => {},
   onRetry: async () => {},
   onResume: async () => {},
   onCommand: async () => {},
+  onSteer: async () => ({ status: "accepted" as const }),
   onLoadSuggestions: async () => ({ suggestions: [] }),
   onProfessionalize: async () => ({ answer: "Professional answer" }),
 };
@@ -155,6 +158,83 @@ describe("ApplicationSessionPanel", () => {
     );
     expect(closedSubmitted).not.toContain("Retry applying");
     expect(closedSubmitted).not.toContain("Close browser");
+  });
+
+  test("renders accessible steering only while the application agent is running", () => {
+    const running = renderToStaticMarkup(
+      <ApplicationSessionPanel {...callbacks} snapshot={snapshot()} />,
+    );
+    expect(running).toContain('aria-labelledby="application-steering-heading"');
+    expect(running).toContain("Guide the application agent");
+    expect(running).toContain("Operator guidance");
+    expect(running).toContain("Delivered once before the next agent step.");
+    expect(running).toContain("not saved to your profile or application facts");
+    expect(running).toContain("Send guidance");
+    expect(running).toContain('aria-live="polite"');
+    expect(running.indexOf("Guide the application agent"))
+      .toBeGreaterThan(running.indexOf("Warnings"));
+
+    const waiting = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "awaiting_human_navigation",
+          harnessState: "awaiting_human_navigation",
+          pendingAction: {
+            type: "human_navigation",
+            instruction: "Complete the checkpoint.",
+          },
+        })}
+      />,
+    );
+    expect(waiting).not.toContain("Operator guidance");
+    expect(waiting).not.toContain("Send guidance");
+
+    const ambiguous = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        steeringState="ambiguous"
+        snapshot={snapshot()}
+      />,
+    );
+    expect(ambiguous).toContain("Guidance delivery could not be confirmed");
+    expect(ambiguous).toContain('disabled=""');
+    expect(ambiguous).toContain("Cancel application");
+  });
+
+  test("builds trimmed steering commands with Unicode-scalar bounds", () => {
+    expect(buildApplicationSteerCommand(
+      "\u001c\u001d  Check the public salary field.  \u001e\u001f",
+    )).toEqual({
+      success: true,
+      command: {
+        type: "steer",
+        message: "Check the public salary field.",
+      },
+    });
+    expect(buildApplicationSteerCommand("\ufeffKeep the byte-order mark\ufeff"))
+      .toEqual({
+        success: true,
+        command: {
+          type: "steer",
+          message: "\ufeffKeep the byte-order mark\ufeff",
+        },
+      });
+    expect(buildApplicationSteerCommand("\u{1f642}".repeat(8_000)).success)
+      .toBeTrue();
+    for (const invalid of [
+      "",
+      "\u001c\u001d\u001e\u001f",
+      "\u{1f642}".repeat(8_001),
+      "contains\u0000nul",
+      "\ud800",
+      "\udfff",
+    ]) {
+      expect(buildApplicationSteerCommand(invalid)).toEqual({
+        success: false,
+        message: "Enter guidance between 1 and 8,000 Unicode characters without null characters.",
+      });
+    }
   });
 
   test("renders navigation and keeps legacy origin snapshots non-actionable", () => {

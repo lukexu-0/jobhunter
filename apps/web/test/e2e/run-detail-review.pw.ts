@@ -2728,6 +2728,160 @@ test("an invalid SSE frame reconciles through authoritative GET and does not ren
   }
 });
 
+test("running guidance is accessible, one-shot, and keeps uncertain delivery latched until state exit", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const running = snapshotFixture({
+    bridgeState: "running",
+    updatedAt: createdAt + 100,
+  });
+  const waiting = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    updatedAt: createdAt + 200,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public checkpoint.",
+    },
+  });
+  const resumed = snapshotFixture({
+    bridgeState: "running",
+    updatedAt: createdAt + 300,
+  });
+  const leaveRunning = deferred();
+  const returnToRunning = deferred();
+  const ambiguousDelivery = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: running,
+  });
+  queueSse(
+    mock,
+    eventFixture("human_navigation_required", waiting, {
+      instruction: "Complete the public checkpoint.",
+    }),
+    2,
+    leaveRunning.promise,
+  );
+  queueSse(
+    mock,
+    eventFixture("snapshot", resumed, {}),
+    3,
+    returnToRunning.promise,
+  );
+  mock.commandReplies.push(
+    { status: 202 },
+    {
+      status: 409,
+      body: apiError(
+        "APPLICATION_COMMAND_CONFLICT",
+        "The application state changed; review the latest session state",
+      ),
+    },
+    {
+      status: 503,
+      body: apiError("APPLICATION_HARNESS_UNAVAILABLE", "private upstream detail"),
+      waitFor: ambiguousDelivery.promise,
+    },
+    { status: 202 },
+  );
+
+  await page.goto(`/runs/${runId}`);
+  const form = page.getByRole("form", { name: "Guide the application agent" });
+  const guidance = page.getByRole("textbox", { name: "Operator guidance" });
+  const send = page.getByRole("button", { name: "Send guidance" });
+  const cancel = page.getByRole("button", { name: "Cancel application" });
+  await expect(form).toBeVisible();
+  await expect(guidance).toHaveAttribute(
+    "aria-describedby",
+    "application-steering-guidance",
+  );
+  await expect(page.getByText(
+    "Delivered once before the next agent step. Guidance is not saved to your profile or application facts.",
+    { exact: true },
+  )).toBeVisible();
+  expect(await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+  )).toBe(true);
+  const formBox = await form.boundingBox();
+  expect(formBox).not.toBeNull();
+  expect(formBox!.x + formBox!.width).toBeLessThanOrEqual(390);
+
+  await guidance.fill("contains\u0000nul");
+  await send.click();
+  await expect(page.getByRole("alert").filter({
+    hasText: "Enter guidance between 1 and 8,000 Unicode characters without null characters.",
+  })).toBeVisible();
+  expect(mock.commands).toEqual([]);
+
+  await guidance.fill("First line");
+  await guidance.press("Enter");
+  await guidance.type("Second line");
+  await expect(guidance).toHaveValue("First line\nSecond line");
+  expect(mock.commands).toEqual([]);
+  await guidance.fill("\u001c  Check the public salary field.  \u001f");
+  await guidance.focus();
+  await guidance.press("Tab");
+  await expect(send).toBeFocused();
+  await send.press("Enter");
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({
+    type: "steer",
+    message: "Check the public salary field.",
+  });
+  await expect(guidance).toHaveValue("");
+  const queuedStatus = page.getByRole("status").filter({
+    hasText: "Guidance queued for the next agent step.",
+  });
+  await expect(queuedStatus).toHaveText("Guidance queued for the next agent step.");
+  await expect(queuedStatus).toHaveAttribute("aria-live", "polite");
+
+  const rejectedDraft = "Check only the public compensation field.";
+  await guidance.fill(rejectedDraft);
+  await send.click();
+  await expect.poll(() => mock.commands.length).toBe(2);
+  expect(mock.commands[1]).toEqual({ type: "steer", message: rejectedDraft });
+  await expect(guidance).toHaveValue(rejectedDraft);
+  await expect(page.getByRole("alert").filter({
+    hasText: "The application state changed; review the latest session state",
+  })).toBeVisible();
+  await expect(send).toBeEnabled();
+
+  const ambiguousDraft = "Use the alternate public office location.";
+  await guidance.fill(ambiguousDraft);
+  await send.click();
+  await expect.poll(() => mock.commands.length).toBe(3);
+  expect(mock.commands[2]).toEqual({ type: "steer", message: ambiguousDraft });
+  await expect(page.getByRole("button", { name: "Sending guidance…" })).toBeDisabled();
+  await expect(cancel).toBeEnabled();
+  ambiguousDelivery.resolve();
+  await expect(guidance).toHaveValue(ambiguousDraft);
+  await expect(page.getByRole("alert").filter({
+    hasText: "Guidance delivery could not be confirmed",
+  })).toBeVisible();
+  await expect(send).toBeDisabled();
+  await expect(cancel).toBeEnabled();
+  expect(mock.commands).toHaveLength(3);
+
+  leaveRunning.resolve();
+  await expect(form).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Navigation needed" })).toBeVisible();
+  returnToRunning.resolve();
+  await expect(page.getByRole("form", { name: "Guide the application agent" })).toBeVisible();
+  await expect(guidance).toHaveValue("");
+  await expect(send).toBeEnabled();
+
+  await guidance.fill("Resume using only the verified public address.");
+  await send.click();
+  await expect.poll(() => mock.commands.length).toBe(4);
+  expect(mock.commands[3]).toEqual({
+    type: "steer",
+    message: "Resume using only the verified public address.",
+  });
+  expect(await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+  )).toBe(true);
+});
+
 test("390px workspace has no overflow, exposes keyboard review controls, and announces application state", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const mock = await installPipeline(page);

@@ -603,6 +603,10 @@ describe("pipeline application session requests", () => {
       username: "account-name",
       password: "saved password",
     })).resolves.toBeUndefined();
+    await expect(sendApplicationCommand(id, {
+      type: "steer",
+      message: "\u001c  Check the public salary field.  \u001f",
+    })).resolves.toBeUndefined();
     await expect(sendApplicationCommand(id, { type: "submit" })).resolves.toBeUndefined();
     await expect(closeApplicationSession(id)).resolves.toBeUndefined();
     expect(applicationEventsHref(id)).toBe(
@@ -664,6 +668,18 @@ describe("pipeline application session requests", () => {
             type: "save_credentials",
             username: "account-name",
             password: "saved password",
+          }),
+          cache: "no-store",
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        },
+      },
+      {
+        input: "/api/pipeline/runs/run%20%2F1%3F/application/commands",
+        init: {
+          body: JSON.stringify({
+            type: "steer",
+            message: "Check the public salary field.",
           }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -832,6 +848,22 @@ describe("pipeline application session requests", () => {
       username: "account-name",
       password: "",
     })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "steer",
+      message: "\u{1f642}".repeat(8_001),
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "steer",
+      message: "guidance\u0000text",
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand("run-1", {
+      type: "steer",
+      message: "\ud800",
+    })).toThrow(PipelineClientError);
+    expect(() => sendApplicationCommand(
+      "run-1",
+      { type: "steer", message: "valid", extra: true } as never,
+    )).toThrow(PipelineClientError);
     expect(fetchCalls).toBe(0);
 
     setFetchMock(async () => json({
