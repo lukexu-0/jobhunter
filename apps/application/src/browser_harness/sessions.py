@@ -119,6 +119,14 @@ _BROWSER_RUNTIME_ERROR_MESSAGE = "Browser runtime failed."
 _COMMAND_CONFLICT_MESSAGE = (
     "The application state changed; review the latest session state"
 )
+_STEERABLE_SESSION_STATES = frozenset(
+    {
+        "running",
+        "awaiting_human_navigation",
+        "awaiting_additional_info",
+        "awaiting_human_review",
+    }
+)
 _SESSION_TIMEOUT_DIAGNOSTIC_MESSAGE = "Application session expired."
 _REDACTED_STDERR_EXCERPT = "[redacted]"
 _READ_ONLY_PLAYWRIGHT_CLI_COMMANDS = frozenset(
@@ -793,11 +801,10 @@ class ApplicationSessionManager:
                 gate = record.human_gate
                 model = record.model
                 if (
-                    record.snapshot.state != "running"
+                    record.snapshot.state not in _STEERABLE_SESSION_STATES
                     or agent_task is None
                     or agent_task.done()
                     or gate is None
-                    or gate.pending_kind is not None
                     or model is None
                     or record.submission_action_started
                 ):

@@ -741,22 +741,47 @@ async def test_steer_dispatches_only_to_the_live_model_without_durable_projectio
     assert all(guidance not in event.model_dump_json() for event in tombstone.events)
 
 
-async def test_steer_rejects_non_running_gate_stale_and_submission_generations(
+async def test_steer_accepts_a_pending_gate_but_rejects_inactive_generations(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
-    assert record is not None
-    guidance = "must not be dispatched"
+    assert (
+        record is not None
+        and record.human_gate is not None
+        and record.playwright_runtime is not None
+    )
+    guidance = "use the corrected sign-in instructions"
+    navigation = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanNavigationRuntimeAction(
+                type="request_human_navigation",
+                instruction="Complete the account sign-in.",
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "navigation")
+
+    await manager.command(
+        created.session_id,
+        SteerCommand(type="steer", message=guidance),
+    )
+
+    assert fakes.models[0].steer_calls == [guidance]
+    assert manager.get_snapshot(created.session_id).state == "awaiting_human_navigation"
+    assert record.human_gate.pending_kind == "navigation"
+    assert not navigation.done()
+    await manager.command(created.session_id, ContinueCommand(type="continue"))
+    assert isinstance(await navigation, ContinueRuntimeActionResponse)
 
     async def assert_conflict() -> None:
         with pytest.raises(HarnessServiceError) as raised:
             await manager.command(
                 created.session_id,
-                SteerCommand(type="steer", message=guidance),
+                SteerCommand(type="steer", message="must not be dispatched"),
             )
         assert_service_error(
             raised.value,
@@ -764,12 +789,7 @@ async def test_steer_rejects_non_running_gate_stale_and_submission_generations(
             "command_conflict",
             "The application state changed; review the latest session state",
         )
-        assert fakes.models[0].steer_calls == []
-
-    running_snapshot = record.snapshot
-    record.snapshot = record.snapshot.model_copy(update={"state": "awaiting_human_review"})
-    await assert_conflict()
-    record.snapshot = running_snapshot
+        assert fakes.models[0].steer_calls == [guidance]
 
     live_agent_task = record.agent_task
     assert live_agent_task is not None
@@ -787,9 +807,6 @@ async def test_steer_rejects_non_running_gate_stale_and_submission_generations(
     record.submission_action_started = True
     await assert_conflict()
     record.submission_action_started = False
-
-    monkeypatch.setattr(HumanGate, "pending_kind", property(lambda _gate: "review"))
-    await assert_conflict()
 
     await manager.delete(created.session_id)
 

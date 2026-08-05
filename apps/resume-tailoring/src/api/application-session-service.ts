@@ -65,6 +65,13 @@ const LIVE_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
   submitted: true,
   submission_uncertain: true,
 });
+const STEERABLE_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
+  running: true,
+  awaiting_human_navigation: true,
+  awaiting_additional_info: true,
+  awaiting_human_review: true,
+});
+
 
 function waitForSlotReleaseRetry(): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
@@ -989,7 +996,7 @@ export class ApplicationSessionService {
       || (
         command.type === "steer"
         && (
-          session.bridgeState !== "running"
+          STEERABLE_APPLICATION_STATES[session.bridgeState] !== true
           || retainedSubmissionFinal(session)
         )
       )

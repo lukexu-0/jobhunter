@@ -1912,7 +1912,7 @@ describe("application session service", () => {
     });
   });
 
-  test("forwards steering only for running sessions without persisting or projecting its text", async () => {
+  test("forwards transient steering for running and gated sessions without persistence", async () => {
     const privateMessage = "PRIVATE OPERATOR GUIDANCE";
     const runningHarness = new FakeHarness();
     runningHarness.snapshotAfterCreate = harnessSnapshot("running");
@@ -1938,23 +1938,34 @@ describe("application session service", () => {
     const publicProjection = JSON.stringify(await running.service.get(running.runId));
     expect(publicProjection).not.toContain(privateMessage);
 
-    const gatedHarness = new FakeHarness();
-    gatedHarness.snapshotAfterCreate = {
-      ...harnessSnapshot("awaiting_human_navigation"),
-      pendingAction: { type: "human_navigation", instruction: "Complete the CAPTCHA." },
-    };
-    const gated = await createTarget({ harness: gatedHarness });
-    await gated.service.start(gated.runId, gated.pdf.sha256, signal());
-    await expect(gated.service.command(
-      gated.runId,
-      { type: "steer", message: privateMessage },
-      signal(),
-    )).rejects.toMatchObject({
-      code: "APPLICATION_COMMAND_CONFLICT",
-      message: "The application state changed; review the latest session state",
-      status: 409,
-    });
-    expect(gatedHarness.commandCalls).toHaveLength(0);
+    const gatedSnapshots: ApplicationHarnessSnapshot[] = [
+      {
+        ...harnessSnapshot("awaiting_human_navigation"),
+        pendingAction: {
+          type: "human_navigation",
+          instruction: "Complete the CAPTCHA.",
+        },
+      },
+      harnessTextQuestionSnapshot(),
+      harnessReviewSnapshot(),
+    ];
+    for (const snapshot of gatedSnapshots) {
+      const gatedHarness = new FakeHarness();
+      gatedHarness.snapshotAfterCreate = snapshot;
+      const gated = await createTarget({ harness: gatedHarness });
+      await gated.service.start(gated.runId, gated.pdf.sha256, signal());
+      await expect(gated.service.command(
+        gated.runId,
+        { type: "steer", message: privateMessage },
+        signal(),
+      )).resolves.toBeUndefined();
+      expect(gatedHarness.commandCalls).toEqual([{
+        sessionId: FIRST_SESSION_ID,
+        command: { type: "steer", message: privateMessage },
+      }]);
+      expect(JSON.stringify(await gated.service.get(gated.runId)))
+        .not.toContain(privateMessage);
+    }
   });
 
   test("forwards credentials only to the harness and retains only the durable gate marker", async () => {
