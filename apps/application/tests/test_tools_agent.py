@@ -854,7 +854,7 @@ async def test_additional_info_invalid_and_failed_commands_leave_gate_pending(
 
 
 @pytest.mark.asyncio
-async def test_additional_info_public_redaction_respects_wire_length_limits(
+async def test_additional_info_complete_public_wire_limits_and_bounded_persisted_redaction(
     tmp_path: Path,
 ) -> None:
     store = UserInfoStore(tmp_path / "user-info.json")
@@ -888,12 +888,26 @@ async def test_additional_info_public_redaction_respects_wire_length_limits(
 
     _state, _event, detail = await publisher.next_event()
     question = detail["questions"][0]
-    assert len(question.question) == 500
-    assert question.question.endswith("…")
-    assert len(question.options[0].label) == 200
-    assert question.options[0].label.endswith("…")
-    await gate.cancel()
+    assert question.question == "x" * 500
+    assert question.options[0].label == "x" * 200
+    assert question.options[1].label == "safe"
+
+    await gate.provide_additional_info(
+        (
+            AdditionalInfoSingleSelectCommandAnswer(
+                id="bounded",
+                status="answered",
+                option_id="first",
+            ),
+        )
+    )
     await pending
+
+    disk = json.loads((tmp_path / "user-info.json").read_text(encoding="utf-8"))
+    persisted_question = disk["global"]["bounded.answer"]["question"]
+    assert len(persisted_question) == 500
+    assert persisted_question.startswith("[redacted]")
+    assert persisted_question.endswith("…")
 
 def test_task_is_exact_compact_data_envelope_for_current_application(
     tmp_path: Path,
