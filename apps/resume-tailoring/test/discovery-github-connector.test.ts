@@ -7,6 +7,10 @@ import {
 } from "../src/discovery/connectors/github";
 import { SafePublicHttpClient, type ConnectorFetch } from "../src/discovery/connectors/http";
 import { captureHtmlElements } from "../src/discovery/connectors/normalize";
+import type {
+  DiscoveryConnectorSyncContext,
+  DiscoveryKnownItem,
+} from "../src/discovery/types";
 
 const table = await Bun.file(new URL("fixtures/discovery/github/table.md", import.meta.url)).text();
 const detail = await Bun.file(new URL("fixtures/discovery/github/detail.html", import.meta.url)).text();
@@ -19,6 +23,23 @@ function clientFor(fetchImpl: ConnectorFetch): SafePublicHttpClient {
     fetchImpl,
     resolveHost: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
   });
+}
+
+function syncContext(
+  recentCutoff: number,
+  knownItems: readonly DiscoveryKnownItem[] = [],
+): DiscoveryConnectorSyncContext {
+  return {
+    recentCutoff,
+    findKnownItems: (candidates) => knownItems.filter((item) =>
+      candidates.some((candidate) =>
+        candidate.sourceItemId === item.sourceItemId
+        || candidate.canonicalUrl === item.canonicalUrl)),
+    loadKnownItems: (candidates) => knownItems.filter((item) =>
+      candidates.some((candidate) =>
+        candidate.sourceItemId === item.sourceItemId
+        || candidate.canonicalUrl === item.canonicalUrl)),
+  };
 }
 
 describe("GitHub internship table ingestion", () => {
@@ -171,6 +192,215 @@ ${rows}
       .toEqual(["Bearer private-token"]);
     expect(seen.filter((request) => request.host !== "api.github.com").every((request) => request.authorization === null))
       .toBe(true);
+  });
+
+  test("fetches only recent unknown details and reuses remembered rows at any age", async () => {
+    const source = `
+| Company | Role | Location | Application | Date |
+| --- | --- | --- | --- | --- |
+| Recent Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/recent) | 2026-07-05 |
+| Old Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/old) | 2026-07-04 |
+| Undated Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/undated) | |
+| Remembered Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/remembered) | 2026-01-01 |
+`;
+    const detailPaths: string[] = [];
+    const client = clientFor(async (input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      detailPaths.push(new URL(input).pathname);
+      return new Response(detail, { headers: { "content-type": "text/html" } });
+    });
+    const config = {
+      id: "incremental",
+      name: "Incremental internships",
+      kind: "simplify" as const,
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    };
+    const first = await createGitHubTableConnector(config, client).sync(
+      new AbortController().signal,
+      syncContext(0),
+    );
+    const remembered = first.items.find(({ canonicalUrl }) =>
+      canonicalUrl === "https://jobs.example.com/remembered");
+    expect(remembered).toBeDefined();
+    detailPaths.length = 0;
+
+    const second = await createGitHubTableConnector(config, client).sync(
+      new AbortController().signal,
+      syncContext(Date.parse("2026-07-05T00:00:00Z"), [{
+        sourceItemId: remembered!.sourceItemId,
+        canonicalUrl: remembered!.canonicalUrl,
+        description: remembered!.description,
+      }]),
+    );
+
+    expect(second.items.map(({ canonicalUrl }) => canonicalUrl)).toEqual([
+      "https://jobs.example.com/recent",
+      "https://jobs.example.com/undated",
+      "https://jobs.example.com/remembered",
+    ]);
+    expect(detailPaths).toEqual(["/recent", "/undated"]);
+    expect(second).toMatchObject({ completeSnapshot: true, omittedRecent: 0 });
+    expect(second.provenance).toContain("descriptions reused: 1");
+  });
+
+  test("scans past old rows so a later recent posting is still acquired", async () => {
+    const source = `
+| Company | Role | Application | Date |
+| --- | --- | --- | --- |
+| Old One | Software Engineering Intern | [Apply](https://jobs.example.com/old-one) | 2026-01-01 |
+| Old Two | Software Engineering Intern | [Apply](https://jobs.example.com/old-two) | 2026-01-02 |
+| Recent Co | Software Engineering Intern | [Apply](https://jobs.example.com/recent) | 2026-07-05 |
+`;
+    const detailPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "recent-after-old",
+      name: "Recent after old",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+      maxRows: 1,
+    }, clientFor(async (input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      detailPaths.push(new URL(input).pathname);
+      return new Response(detail, { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(
+      new AbortController().signal,
+      syncContext(Date.parse("2026-07-05T00:00:00Z")),
+    );
+
+    expect(result.items.map(({ canonicalUrl }) => canonicalUrl))
+      .toEqual(["https://jobs.example.com/recent"]);
+    expect(detailPaths).toEqual(["/recent"]);
+    expect(result).toMatchObject({ completeSnapshot: true, omittedRecent: 0 });
+  });
+
+  test("counts recent rows omitted by the per-source acquisition cap", async () => {
+    const source = `
+| Company | Role | Application | Date |
+| --- | --- | --- | --- |
+| Recent One | Software Engineering Intern | [Apply](https://jobs.example.com/recent-one) | 2026-07-05 |
+| Recent Two | Software Engineering Intern | [Apply](https://jobs.example.com/recent-two) | 2026-07-06 |
+`;
+    let detailRequests = 0;
+    const connector = createGitHubTableConnector({
+      id: "capped-recent",
+      name: "Capped recent",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+      maxRows: 1,
+    }, clientFor(async (_input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      detailRequests += 1;
+      return new Response(detail, { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(
+      new AbortController().signal,
+      syncContext(Date.parse("2026-07-05T00:00:00Z")),
+    );
+
+    expect(result.items).toHaveLength(1);
+    expect(detailRequests).toBe(1);
+    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 1 });
+  });
+
+  test("bounds persisted identity lookup at the repository scan limit", async () => {
+    const rows = Array.from({ length: 10_001 }, (_, index) =>
+      `| Company ${index} | Software Engineering Intern | [Apply](https://jobs.example.com/${index}) | 2026-07-05 |`,
+    ).join("\n");
+    const source = `| Company | Role | Application | Date |
+| --- | --- | --- | --- |
+${rows}`;
+    let lookupCandidates = 0;
+    const connector = createGitHubTableConnector({
+      id: "bounded-lookup",
+      name: "Bounded lookup",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+      maxRows: 1,
+    }, clientFor(async (_input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      return new Response(detail, { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal, {
+      ...syncContext(Date.parse("2026-07-05T00:00:00Z")),
+      findKnownItems: (candidates) => {
+        lookupCandidates = candidates.length;
+        return [];
+      },
+    });
+
+    expect(lookupCandidates).toBe(10_000);
+    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 10_000 });
+  });
+
+  test("prioritizes unknown recent rows over remembered rows at the acquisition cap", async () => {
+    const source = `
+| Company | Role | Application | Date |
+| --- | --- | --- | --- |
+| Remembered Co | Software Engineering Intern | [Apply](https://jobs.example.com/remembered) | 2026-07-05 |
+| Unknown Co | Software Engineering Intern | [Apply](https://jobs.example.com/unknown) | 2026-07-06 |
+`;
+    const detailPaths: string[] = [];
+    const connector = createGitHubTableConnector({
+      id: "unknown-priority",
+      name: "Unknown priority",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+      maxRows: 1,
+    }, clientFor(async (input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      detailPaths.push(new URL(input).pathname);
+      return new Response(detail, { headers: { "content-type": "text/html" } });
+    }));
+
+    const knownItem = {
+      sourceItemId: "remembered",
+      canonicalUrl: "https://jobs.example.com/remembered",
+      description: "Previously saved internship description with enough detail to remain valid.",
+    };
+    let loadedKnownItems = 0;
+    const context = syncContext(Date.parse("2026-07-05T00:00:00Z"), [knownItem]);
+    const result = await connector.sync(new AbortController().signal, {
+      ...context,
+      loadKnownItems: (candidates) => {
+        loadedKnownItems += candidates.length;
+        return context.loadKnownItems(candidates);
+      },
+    });
+
+    expect(result.items.map(({ canonicalUrl }) => canonicalUrl))
+      .toEqual(["https://jobs.example.com/unknown"]);
+    expect(detailPaths).toEqual(["/unknown"]);
+    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 0 });
+    expect(loadedKnownItems).toBe(0);
   });
 
   test("never follows a contents API redirect off api.github.com", async () => {
@@ -385,8 +615,8 @@ ${rows}
     const result = await connector.sync(new AbortController().signal);
 
     expect(result.items).toHaveLength(1);
-    expect(result.completeSnapshot).toBe(false);
-    expect(result.provenance).toContain("omitted descriptions: 1");
+    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 1 });
+    expect(result.provenance).toContain("omitted recent: 1");
   });
 
   test("treats a header-only table as partial instead of closing prior jobs", async () => {

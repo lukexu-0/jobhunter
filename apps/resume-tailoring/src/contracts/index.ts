@@ -1260,6 +1260,7 @@ export const DiscoverySourceSyncSummarySchema = z.object({
   created: z.number().int().nonnegative().max(100_000),
   updated: z.number().int().nonnegative().max(100_000),
   closed: z.number().int().nonnegative().max(100_000),
+  omittedRecent: z.number().int().nonnegative().max(100_000),
   provenance: z.string().trim().min(1).max(1_000).optional(),
   error: z.string().trim().min(1).max(500).optional(),
 }).strict();
@@ -1275,6 +1276,7 @@ export const DiscoverySyncResponseSchema = z.object({
     created: z.number().int().nonnegative().max(10_000_000),
     updated: z.number().int().nonnegative().max(10_000_000),
     closed: z.number().int().nonnegative().max(10_000_000),
+    omittedRecent: z.number().int().nonnegative().max(10_000_000),
   }).strict(),
   completedAt: z.number().int().nonnegative(),
 }).strict();

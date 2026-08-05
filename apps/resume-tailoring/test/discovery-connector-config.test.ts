@@ -46,7 +46,7 @@ describe("discovery connector factory", () => {
     ]);
   });
 
-  test("targets the approved alternate repository files", async () => {
+  test("targets every approved repository table", async () => {
     const requests: URL[] = [];
     const connectors = createDiscoveryConnectors({
       env: { GITHUB_TOKEN: undefined },
@@ -57,16 +57,18 @@ describe("discovery connector factory", () => {
       resolveHost: async () => [{ address: "93.184.216.34", family: 4 }],
     });
 
-    for (const id of ["simplify-summer-2027-off-season", "zapply-underclassmen"]) {
-      await connectors.find((connector) => connector.id === id)!
-        .sync(new AbortController().signal);
+    for (const connector of connectors) {
+      await connector.sync(new AbortController().signal);
     }
 
     expect(requests.map(({ pathname }) => pathname)).toEqual([
+      "/repos/SimplifyJobs/Summer2027-Internships/contents/README.md",
       "/repos/SimplifyJobs/Summer2027-Internships/contents/README-Off-Season.md",
       "/repos/zapplyjobs/Internships-2027/contents/README.md",
+      "/repos/speedyapply/2027-SWE-College-Jobs/contents/README.md",
+      "/repos/speedyapply/2027-AI-College-Jobs/contents/README.md",
     ]);
     expect(requests.map((request) => request.searchParams.get("ref")))
-      .toEqual(["dev", "main"]);
+      .toEqual(["dev", "dev", "main", "main", "main"]);
   });
 });

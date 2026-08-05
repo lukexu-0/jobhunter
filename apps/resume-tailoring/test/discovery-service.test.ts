@@ -5,9 +5,15 @@ import { createApiHandler } from "../src/api/handler.ts";
 import { DiscoveryListRequestSchema, type RunDto } from "../src/contracts/index.ts";
 import { openPipelineDatabase } from "../src/db/database.ts";
 import { DiscoveryJobQueueConflictError } from "../src/db/repository.ts";
+import { createGitHubTableConnector } from "../src/discovery/connectors/github.ts";
+import { SafePublicHttpClient, type ConnectorFetch } from "../src/discovery/connectors/http.ts";
 import { DiscoveryRepository } from "../src/discovery/repository.ts";
 import { DiscoveryService } from "../src/discovery/service.ts";
-import type { DiscoveredJobInput, DiscoveryConnector } from "../src/discovery/types.ts";
+import type {
+  DiscoveredJobInput,
+  DiscoveryConnector,
+  DiscoverySyncResult,
+} from "../src/discovery/types.ts";
 
 const ORIGIN = "http://127.0.0.1:3456";
 const DESCRIPTION = "Build reliable production software with careful testing, ownership, collaboration, and measurable customer impact.";
@@ -48,11 +54,23 @@ function run(id: string): RunDto {
   };
 }
 
+type TestDiscoverySyncResult = Omit<DiscoverySyncResult, "omittedRecent"> & {
+  readonly omittedRecent?: number;
+};
+
 function connector(
   id: string,
-  sync: DiscoveryConnector["sync"],
+  sync: (...parameters: Parameters<DiscoveryConnector["sync"]>) => Promise<TestDiscoverySyncResult>,
 ): DiscoveryConnector {
-  return { id, name: `Source ${id}`, kind: "simplify", sync };
+  return {
+    id,
+    name: `Source ${id}`,
+    kind: "simplify",
+    sync: async (...parameters) => ({
+      omittedRecent: 0,
+      ...await sync(...parameters),
+    }),
+  };
 }
 
 afterEach(() => {
@@ -108,6 +126,79 @@ describe("discovery synchronization", () => {
     expect(result.totals).toMatchObject({ sources: 2, succeeded: 1, failed: 1, created: 1 });
     expect(result.sources[1]?.error).not.toContain("upstream.example.test");
     expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(1);
+  });
+
+  test("reuses persisted source items after restart instead of refetching old details", async () => {
+    let now = Date.parse("2026-01-10T00:00:00Z");
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, {
+      now: () => now,
+      idFactory: () => "job-1",
+    });
+    const source = `
+| Company | Role | Location | Application | Date |
+| --- | --- | --- | --- | --- |
+| Remembered Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/remembered) | 2026-01-01 |
+`;
+    let detailRequests = 0;
+    const fetchImpl: ConnectorFetch = async (_input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      detailRequests += 1;
+      return new Response(`<div class="job-description">${DESCRIPTION}</div>`, {
+        headers: { "content-type": "text/html" },
+      });
+    };
+    const githubConfig = {
+      id: "restart-source",
+      name: "Restart source",
+      kind: "simplify" as const,
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    };
+    const clientOptions = {
+      fetchImpl,
+      resolveHost: async () => [{ address: "93.184.216.34", family: 4 as const }],
+    };
+    const runs = {
+      createRunFromDescription: async () => run("unused"),
+      kick: () => undefined,
+    };
+
+    const first = new DiscoveryService({
+      repository,
+      runs,
+      connectors: [createGitHubTableConnector(
+        githubConfig,
+        new SafePublicHttpClient(clientOptions),
+      )],
+      now: () => now,
+    });
+    expect((await first.sync(new AbortController().signal)).sources[0])
+      .toMatchObject({ received: 1, omittedRecent: 0 });
+    expect(detailRequests).toBe(1);
+
+    now = Date.parse("2026-08-04T00:00:00Z");
+    const restarted = new DiscoveryService({
+      repository,
+      runs,
+      connectors: [createGitHubTableConnector(
+        githubConfig,
+        new SafePublicHttpClient(clientOptions),
+      )],
+      now: () => now,
+    });
+    expect((await restarted.sync(new AbortController().signal)).sources[0])
+      .toMatchObject({ received: 1, omittedRecent: 0 });
+    expect(detailRequests).toBe(1);
+    expect(repository.list(DiscoveryListRequestSchema.parse({
+      maxAgeDays: null,
+      status: "all",
+    })).jobs[0]?.status).toBe("open");
   });
 
   test("rejects private literals and public HTTP connector destinations", async () => {
@@ -359,8 +450,10 @@ describe("discovery synchronization", () => {
       completeSnapshot: false,
       received: 1,
       created: 1,
+      omittedRecent: 3,
       provenance: "service omitted invalid records: 3",
     });
+    expect(result.totals.omittedRecent).toBe(3);
     expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(1);
   });
 

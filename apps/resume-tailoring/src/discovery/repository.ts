@@ -13,6 +13,8 @@ import {
 } from "./normalize.ts";
 import type {
   DiscoveredJobInput,
+  DiscoveryKnownItem,
+  DiscoveryKnownItemKey,
   DiscoveryRole,
   DiscoverySourceKind,
 } from "./types.ts";
@@ -40,6 +42,10 @@ interface CandidateRow {
   catalog_source_item_id: string;
   first_seen_at: number;
   run_id: string | null;
+}
+
+interface ActiveSourceItemDescriptionRow extends DiscoveryKnownItemKey {
+  readonly description: string;
 }
 
 export interface DiscoverySourceDescriptor {
@@ -81,6 +87,8 @@ export interface DiscoveryRepositoryOptions {
 }
 
 const DAY_MS = 86_400_000;
+const MAX_ACTIVE_SOURCE_ITEM_CANDIDATES = 10_000;
+const ACTIVE_SOURCE_ITEM_QUERY_BATCH_SIZE = 400;
 
 function descriptionPreview(description: string): string {
   const compact = description.replace(/\s+/g, " ").trim();
@@ -175,6 +183,89 @@ export class DiscoveryRepository {
         WHERE id = ?
       `).run(now, safeSourceError(error), source.id);
     });
+  }
+
+  findActiveSourceItemKeys(
+    sourceId: string,
+    candidates: readonly DiscoveryKnownItemKey[],
+  ): readonly DiscoveryKnownItemKey[] {
+    if (candidates.length > MAX_ACTIVE_SOURCE_ITEM_CANDIDATES) {
+      throw new Error("at most 10000 source items may be resolved at once");
+    }
+    const found = new Map<string, DiscoveryKnownItemKey>();
+    for (
+      let offset = 0;
+      offset < candidates.length;
+      offset += ACTIVE_SOURCE_ITEM_QUERY_BATCH_SIZE
+    ) {
+      const batch = candidates.slice(offset, offset + ACTIVE_SOURCE_ITEM_QUERY_BATCH_SIZE);
+      const sourceItemIds = [...new Set(batch.map(({ sourceItemId }) => sourceItemId))];
+      const canonicalUrls = [...new Set(batch.map(({ canonicalUrl }) => canonicalUrl))];
+      const sourceItemPlaceholders = sourceItemIds.map(() => "?").join(",");
+      const canonicalUrlPlaceholders = canonicalUrls.map(() => "?").join(",");
+      const rows = this.database.query<DiscoveryKnownItemKey, string[]>(`
+        SELECT observations.source_item_id AS sourceItemId,
+               observations.canonical_url AS canonicalUrl
+        FROM discovery_observations observations
+        WHERE observations.source_id = ? AND observations.active = 1
+          AND observations.source_item_id IN (${sourceItemPlaceholders})
+        UNION
+        SELECT min(observations.source_item_id) AS sourceItemId,
+               observations.canonical_url AS canonicalUrl
+        FROM discovery_observations observations
+        WHERE observations.source_id = ? AND observations.active = 1
+          AND observations.canonical_url IN (${canonicalUrlPlaceholders})
+        GROUP BY observations.canonical_url
+        ORDER BY sourceItemId
+      `).all(sourceId, ...sourceItemIds, sourceId, ...canonicalUrls);
+      const bySourceItemId = new Map(rows.map((row) => [row.sourceItemId, row] as const));
+      const byCanonicalUrl = new Map(rows.map((row) => [row.canonicalUrl, row] as const));
+      for (const candidate of batch) {
+        const matched = bySourceItemId.get(candidate.sourceItemId)
+          ?? byCanonicalUrl.get(candidate.canonicalUrl);
+        if (matched !== undefined) found.set(matched.sourceItemId, matched);
+      }
+    }
+    return [...found.values()];
+  }
+
+  loadActiveSourceItems(
+    sourceId: string,
+    candidates: readonly DiscoveryKnownItemKey[],
+  ): readonly DiscoveryKnownItem[] {
+    if (candidates.length > MAX_ACTIVE_SOURCE_ITEM_CANDIDATES) {
+      throw new Error("at most 10000 source items may be resolved at once");
+    }
+    const found = new Map<string, DiscoveryKnownItem>();
+    for (
+      let offset = 0;
+      offset < candidates.length;
+      offset += ACTIVE_SOURCE_ITEM_QUERY_BATCH_SIZE
+    ) {
+      const sourceItemIds = [...new Set(
+        candidates
+          .slice(offset, offset + ACTIVE_SOURCE_ITEM_QUERY_BATCH_SIZE)
+          .map(({ sourceItemId }) => sourceItemId),
+      )];
+      const placeholders = sourceItemIds.map(() => "?").join(",");
+      const rows = this.database.query<ActiveSourceItemDescriptionRow, string[]>(`
+        SELECT observations.source_item_id AS sourceItemId,
+               observations.canonical_url AS canonicalUrl,
+               jobs.description
+        FROM discovery_observations observations
+        JOIN discovery_jobs jobs ON jobs.id = observations.job_id
+        WHERE observations.source_id = ? AND observations.active = 1
+          AND observations.source_item_id IN (${placeholders})
+        ORDER BY observations.source_item_id
+      `).all(sourceId, ...sourceItemIds);
+      for (const row of rows) {
+        found.set(row.sourceItemId, {
+          ...row,
+          description: JobDescriptionSchema.parse(row.description),
+        });
+      }
+    }
+    return [...found.values()];
   }
 
   #candidateRows(sourceId: string, sourceItemId: string, keys: readonly string[]): CandidateRow[] {

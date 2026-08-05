@@ -1,6 +1,7 @@
 import type {
   DiscoveredJobInput,
   DiscoveryConnector,
+  DiscoveryKnownItemKey,
   DiscoverySourceKind,
   DiscoverySyncResult,
 } from "../types";
@@ -64,7 +65,8 @@ const CLOSED_ROW = /(?:🔒|\bclosed\b|\bexpired\b|~~)/i;
 const INTERNSHIP_TITLE = /\b(?:intern(?:ship)?|co[- ]?op)\b/i;
 const CONFIG_PART = /^[A-Za-z0-9._-]{1,100}$/;
 const CONFIG_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._\/-]{1,500}$/;
-const MAX_PARSED_RECORDS = 1_001;
+const MAX_SCANNED_RECORDS = 10_000;
+const MAX_PARSED_RECORDS = MAX_SCANNED_RECORDS + 1;
 const MAX_HTML_TABLES = 100;
 const MAX_HTML_CELLS_PER_ROW = 100;
 const DESCRIPTION_SELECTORS = [
@@ -549,7 +551,7 @@ export function createGitHubTableConnector(
     id: config.id,
     name: config.name,
     kind: config.kind,
-    async sync(signal, budget) {
+    async sync(signal, context, budget) {
       const syncClient = budget ? client.withBudget(budget) : client;
       const contentsUrl = new URL(`https://api.github.com/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents/${config.path.split("/").map(encodeURIComponent).join("/")}`);
       contentsUrl.searchParams.set("ref", config.branch);
@@ -598,44 +600,160 @@ export function createGitHubTableConnector(
           markdown = response.text();
         }
       }
-      const parsed = await parseGitHubRepositoryTables(markdown, config.maxRows + 1);
-      const truncated = parsed.truncated || parsed.rows.length > config.maxRows;
-      const selectedRows = parsed.rows.slice(0, config.maxRows);
-      let omittedDescriptions = parsed.unusableCount;
-      const loaded = await mapConcurrent(selectedRows, config.detailConcurrency, async (row): Promise<DiscoveredJobInput | undefined> => {
+      const recentCutoff = context?.recentCutoff ?? 0;
+      if (!Number.isSafeInteger(recentCutoff) || recentCutoff < 0) {
+        throw new Error("Invalid discovery recent cutoff");
+      }
+      const parsed = await parseGitHubRepositoryTables(markdown, MAX_PARSED_RECORDS);
+      type CandidateRow = {
+        readonly row: ParsedGitHubTableRow;
+        readonly canonicalUrl: string;
+        readonly requisitionId: string | undefined;
+        readonly sourceItemId: string;
+      };
+      const candidateRows: CandidateRow[] = [];
+      let omittedRecords = parsed.unusableCount;
+      let omittedRecent = 0;
+      for (let index = MAX_SCANNED_RECORDS; index < parsed.rows.length; index += 1) {
+        const row = parsed.rows[index]!;
+        if (row.postedAt === null || row.postedAt >= recentCutoff) omittedRecent += 1;
+      }
+      const scannedRowCount = Math.min(parsed.rows.length, MAX_SCANNED_RECORDS);
+      for (let index = 0; index < scannedRowCount; index += 1) {
+        const row = parsed.rows[index]!;
+        const recent = row.postedAt === null || row.postedAt >= recentCutoff;
         const canonicalUrl = canonicalizeJobUrl(row.applyUrl);
         if (!canonicalUrl) {
-          omittedDescriptions += 1;
-          return undefined;
-        }
-        const description = await loadDescription(syncClient, canonicalUrl, signal);
-        if (!description) {
-          omittedDescriptions += 1;
-          return undefined;
+          omittedRecords += 1;
+          if (recent) omittedRecent += 1;
+          continue;
         }
         const requisitionId = requisitionFromUrl(canonicalUrl);
-        return {
-          sourceItemId: requisitionId
-            ? `${config.id}:${requisitionId}:${stableSourceItemId(canonicalUrl)}`
-            : `${config.id}:${stableSourceItemId(row.company, row.title, row.location ?? "", canonicalUrl)}`,
-          sourceUrl: `https://github.com/${config.owner}/${config.repo}/blob/${encodeURIComponent(config.branch)}/${config.path}#L${row.line}`,
+        const sourceItemId = requisitionId
+          ? `${config.id}:${requisitionId}:${stableSourceItemId(canonicalUrl)}`
+          : `${config.id}:${stableSourceItemId(row.company, row.title, row.location ?? "", canonicalUrl)}`;
+        candidateRows.push({
+          row,
           canonicalUrl,
-          applyUrl: canonicalUrl,
-          title: row.title,
-          company: row.company,
-          location: row.location,
-          description,
-          postedAt: row.postedAt,
-          ...(requisitionId ? { requisitionId } : {}),
-        };
-      });
+          requisitionId,
+          sourceItemId,
+        });
+      }
+      const knownItems = context?.findKnownItems(candidateRows.map(
+        ({ sourceItemId, canonicalUrl }) => ({ sourceItemId, canonicalUrl }),
+      )) ?? [];
+      const knownBySourceItemId = new Map(
+        knownItems.map((item) => [item.sourceItemId, item] as const),
+      );
+      const knownByCanonicalUrl = new Map<string, DiscoveryKnownItemKey>();
+      for (const item of knownItems) {
+        if (!knownByCanonicalUrl.has(item.canonicalUrl)) {
+          knownByCanonicalUrl.set(item.canonicalUrl, item);
+        }
+      }
+      type PreparedRow = CandidateRow & {
+        readonly remembered: DiscoveryKnownItemKey | undefined;
+      };
+      const unknownRecentRows: PreparedRow[] = [];
+      const rememberedRecentRows: PreparedRow[] = [];
+      const rememberedOlderRows: PreparedRow[] = [];
+      let olderSkipped = 0;
+      for (const candidate of candidateRows) {
+        const recent = candidate.row.postedAt === null
+          || candidate.row.postedAt >= recentCutoff;
+        const remembered = knownBySourceItemId.get(candidate.sourceItemId)
+          ?? knownByCanonicalUrl.get(candidate.canonicalUrl);
+        const prepared = { ...candidate, remembered };
+        if (recent && remembered) rememberedRecentRows.push(prepared);
+        else if (recent) unknownRecentRows.push(prepared);
+        else if (remembered) rememberedOlderRows.push(prepared);
+        else olderSkipped += 1;
+      }
+      const selectedUnknownCount = Math.min(unknownRecentRows.length, config.maxRows);
+      omittedRecent += unknownRecentRows.length - selectedUnknownCount;
+      let remainingCapacity = config.maxRows - selectedUnknownCount;
+      const selectedRememberedRecentCount = Math.min(
+        rememberedRecentRows.length,
+        remainingCapacity,
+      );
+      remainingCapacity -= selectedRememberedRecentCount;
+      const selectedRememberedOlderCount = Math.min(
+        rememberedOlderRows.length,
+        remainingCapacity,
+      );
+      const selectedRows = [
+        ...unknownRecentRows.slice(0, selectedUnknownCount),
+        ...rememberedRecentRows.slice(0, selectedRememberedRecentCount),
+        ...rememberedOlderRows.slice(0, selectedRememberedOlderCount),
+      ];
+      const selectedKnownKeys = new Map<string, DiscoveryKnownItemKey>();
+      for (const { remembered } of selectedRows) {
+        if (remembered !== undefined) {
+          selectedKnownKeys.set(remembered.sourceItemId, remembered);
+        }
+      }
+      const rememberedItems = context?.loadKnownItems([...selectedKnownKeys.values()]) ?? [];
+      const descriptionsBySourceItemId = new Map(
+        rememberedItems.map((item) => [item.sourceItemId, item.description] as const),
+      );
+      const descriptionsByCanonicalUrl = new Map(
+        rememberedItems.map((item) => [item.canonicalUrl, item.description] as const),
+      );
+      const omittedRemembered = (
+        rememberedRecentRows.length - selectedRememberedRecentCount
+      ) + (rememberedOlderRows.length - selectedRememberedOlderCount);
+      const eligibleRows = unknownRecentRows.length
+        + rememberedRecentRows.length
+        + rememberedOlderRows.length;
+      const truncated = parsed.truncated
+        || parsed.rows.length > MAX_SCANNED_RECORDS
+        || eligibleRows > config.maxRows;
+      let reusedDescriptions = 0;
+      const loaded = await mapConcurrent(
+        selectedRows,
+        config.detailConcurrency,
+        async (prepared): Promise<DiscoveredJobInput | undefined> => {
+          const { canonicalUrl, requisitionId, row, sourceItemId } = prepared;
+          let description: string | undefined;
+          if (prepared.remembered === undefined) {
+            description = await loadDescription(syncClient, canonicalUrl, signal);
+          } else {
+            description = descriptionsBySourceItemId.get(prepared.remembered.sourceItemId)
+              ?? descriptionsByCanonicalUrl.get(prepared.remembered.canonicalUrl);
+            if (description === undefined) {
+              throw new Error("Remembered discovery description is unavailable");
+            }
+            reusedDescriptions += 1;
+          }
+          if (!description) {
+            omittedRecords += 1;
+            omittedRecent += 1;
+            return undefined;
+          }
+          return {
+            sourceItemId,
+            sourceUrl: `https://github.com/${config.owner}/${config.repo}/blob/${encodeURIComponent(config.branch)}/${config.path}#L${row.line}`,
+            canonicalUrl,
+            applyUrl: canonicalUrl,
+            title: row.title,
+            company: row.company,
+            location: row.location,
+            description,
+            postedAt: row.postedAt,
+            ...(requisitionId ? { requisitionId } : {}),
+          };
+        },
+      );
+      const recentCandidates = unknownRecentRows.length + rememberedRecentRows.length;
       const result: DiscoverySyncResult = {
         items: loaded.filter((item): item is DiscoveredJobInput => item !== undefined),
         completeSnapshot: parsed.tableCount > 0
           && parsed.rows.length + parsed.closedCount + parsed.nonInternshipCount + parsed.unusableCount > 0
           && !truncated
-          && omittedDescriptions === 0,
-        provenance: `${config.owner}/${config.repo}@${revision}:${config.path}; tables: ${parsed.tableCount}; rows: ${parsed.rows.length}; closed: ${parsed.closedCount}; non-internships: ${parsed.nonInternshipCount}; omitted descriptions: ${omittedDescriptions}`.slice(0, 500),
+          && omittedRecords === 0
+          && omittedRemembered === 0,
+        omittedRecent,
+        provenance: `${config.owner}/${config.repo}@${revision}:${config.path}; tables: ${parsed.tableCount}; rows: ${parsed.rows.length}; recent candidates: ${recentCandidates}; recent unknown: ${unknownRecentRows.length}; recent remembered: ${rememberedRecentRows.length}; older remembered: ${rememberedOlderRows.length}; descriptions reused: ${reusedDescriptions}; older skipped: ${olderSkipped}; closed: ${parsed.closedCount}; non-internships: ${parsed.nonInternshipCount}; omitted records: ${omittedRecords}; omitted recent: ${omittedRecent}`.slice(0, 500),
       };
       if (response.status !== 304) {
         etag = response.headers.get("etag") ?? undefined;

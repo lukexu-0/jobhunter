@@ -174,17 +174,21 @@ export function orderedSelectedDiscoveryJobIds(
   return ordered;
 }
 
-function SyncNotice({ result }: { readonly result: DiscoverySyncResponse }) {
+export function DiscoverySyncNotice({ result }: { readonly result: DiscoverySyncResponse }) {
   const { totals } = result;
   const failedSources = result.sources
     .filter((source) => source.status === "failed")
     .map((source) => source.sourceName);
+  const omittedSources = result.sources
+    .filter((source) => source.omittedRecent > 0)
+    .map((source) => `${source.sourceName} (${source.omittedRecent.toLocaleString()})`);
   const summary = [
     `${totals.succeeded} of ${totals.sources} sources synced`,
     `${totals.received.toLocaleString()} received`,
     `${totals.created.toLocaleString()} new`,
     `${totals.updated.toLocaleString()} updated`,
     `${totals.closed.toLocaleString()} closed`,
+    `${totals.omittedRecent.toLocaleString()} recent omitted`,
   ].join(" · ");
 
   return (
@@ -194,6 +198,7 @@ function SyncNotice({ result }: { readonly result: DiscoverySyncResponse }) {
     >
       <p>{summary}.</p>
       {failedSources.length > 0 ? <p>Failed sources: {failedSources.join(", ")}.</p> : null}
+      {omittedSources.length > 0 ? <p>Recent jobs omitted: {omittedSources.join(", ")}.</p> : null}
     </div>
   );
 }
@@ -537,7 +542,7 @@ export function DiscoveryCatalog() {
 
       <section className="discovery-notices" aria-label="Discovery updates" aria-live="polite">
         {syncError ? <p className="dashboard-alert" role="alert">{syncError}</p> : null}
-        {syncResult ? <SyncNotice result={syncResult} /> : null}
+        {syncResult ? <DiscoverySyncNotice result={syncResult} /> : null}
         {queueError ? <p className="dashboard-alert" role="alert">{queueError}</p> : null}
         {queueResult ? <QueueNotice result={queueResult} /> : null}
       </section>

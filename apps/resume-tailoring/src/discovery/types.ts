@@ -34,9 +34,29 @@ export interface DiscoveredJobInput {
   readonly requisitionId?: string | undefined;
 }
 
+export interface DiscoveryKnownItemKey {
+  readonly sourceItemId: string;
+  readonly canonicalUrl: string;
+}
+
+export interface DiscoveryKnownItem extends DiscoveryKnownItemKey {
+  readonly description: string;
+}
+
+export interface DiscoveryConnectorSyncContext {
+  readonly recentCutoff: number;
+  readonly findKnownItems: (
+    candidates: readonly DiscoveryKnownItemKey[],
+  ) => readonly DiscoveryKnownItemKey[];
+  readonly loadKnownItems: (
+    candidates: readonly DiscoveryKnownItemKey[],
+  ) => readonly DiscoveryKnownItem[];
+}
+
 export interface DiscoverySyncResult {
   readonly items: readonly DiscoveredJobInput[];
   readonly completeSnapshot: boolean;
+  readonly omittedRecent: number;
   readonly provenance?: string;
 }
 
@@ -44,5 +64,9 @@ export interface DiscoveryConnector {
   readonly id: string;
   readonly name: string;
   readonly kind: DiscoverySourceKind;
-  sync(signal: AbortSignal, budget?: DiscoveryHttpBudget): Promise<DiscoverySyncResult>;
+  sync(
+    signal: AbortSignal,
+    context?: DiscoveryConnectorSyncContext,
+    budget?: DiscoveryHttpBudget,
+  ): Promise<DiscoverySyncResult>;
 }
