@@ -79,7 +79,7 @@ function discoveredJob(overrides: Partial<DiscoveryJob> = {}): DiscoveryJob {
     title: "Machine Learning Intern",
     company: "Example Labs",
     location: null,
-    role: "machine_learning",
+    roles: ["machine_learning"],
     canonicalUrl: "https://example.com/jobs/ml-intern",
     applyUrl: "https://example.com/jobs/ml-intern/apply",
     descriptionPreview: "Build and evaluate production machine learning systems.",
