@@ -9,10 +9,11 @@ import {
   type ModelSpec,
   type SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
+import { isContextOverflow } from "@oh-my-pi/pi-ai/error";
 import type { Effort } from "@oh-my-pi/pi-catalog";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { createOAuthOnlyApiKeyResolver } from "../auth/oauth-only-resolver";
-import { mapAgentsRequest, mapPiAssistantMessage } from "./agents-mapping";
+import { mapAgentsRequest, mapPiAssistantMessage, mapPiAssistantUsage } from "./agents-mapping";
 
 export const MODEL_NAME = "gpt-5.6-sol" as const;
 // pi-catalog publishes Effort as an ambient const enum; these are its exact wire values.
@@ -78,6 +79,21 @@ interface PreparedCodexCall {
     readonly output: ModelResponse["output"][number];
     readonly usage: ModelResponse["usage"];
   };
+  readonly recoveryUsage?: ModelResponse["usage"];
+}
+
+class CodexResponseError extends Error {
+  readonly assistantMessage: AssistantMessage;
+  readonly contentEmitted: boolean;
+  readonly reason: "aborted" | "error";
+
+  constructor(assistantMessage: AssistantMessage, reason: "aborted" | "error", contentEmitted: boolean) {
+    super(assistantMessage.errorMessage ?? `Codex request ${reason}`);
+    this.name = "CodexResponseError";
+    this.assistantMessage = assistantMessage;
+    this.contentEmitted = contentEmitted;
+    this.reason = reason;
+  }
 }
 
 function estimateInputTokens(context: Context): number {
@@ -102,31 +118,52 @@ export class OAuthCodexModel implements AgentsModel {
   }
   async #completedResponse(context: Context, options: SimpleStreamOptions): Promise<AssistantMessage> {
     let completed: AssistantMessage | undefined;
+    let contentEmitted = false;
     for await (const event of this.#transport(OMP_CODEX_MODEL, context, options)) {
-      if (event.type === "done") completed = event.message;
-      if (event.type === "error") throw new Error(event.error.errorMessage ?? `Codex request ${event.reason}`);
+      if (event.type === "error") {
+        throw new CodexResponseError(event.error, event.reason, contentEmitted);
+      }
+      if (event.type === "done") {
+        completed = event.message;
+        continue;
+      }
+      if (event.type !== "start") contentEmitted = true;
     }
     if (!completed) throw new Error("Codex transport ended without a completed response");
     return completed;
   }
 
+  #isRecoverableOverflow(error: unknown, signal?: AbortSignal): error is CodexResponseError {
+    return error instanceof CodexResponseError
+      && error.reason === "error"
+      && error.assistantMessage.stopReason === "error"
+      && !error.contentEmitted
+      && error.assistantMessage.content.length === 0
+      && signal?.aborted !== true
+      && isContextOverflow(error.assistantMessage);
+  }
+
   async #prepareCall(request: ModelRequest): Promise<PreparedCodexCall> {
     const { context, options, compactThreshold } = mapAgentsRequest(request);
     const apiKey = this.#resolverFactory("openai-codex", this.#attemptSessionId, MODEL_NAME, request.signal);
-    const transportOptions: SimpleStreamOptions = {
-      ...options,
-      apiKey,
-      sessionId: this.#attemptSessionId,
-      preferWebsockets: false,
-      ...(request.signal ? { signal: request.signal } : {}),
+    const prepared: PreparedCodexCall = {
+      context,
+      transportOptions: {
+        ...options,
+        apiKey,
+        sessionId: this.#attemptSessionId,
+        preferWebsockets: false,
+        ...(request.signal ? { signal: request.signal } : {}),
+      },
     };
-    if (compactThreshold === undefined || estimateInputTokens(context) < compactThreshold) {
-      return { context, transportOptions };
-    }
+    if (compactThreshold === undefined || estimateInputTokens(context) < compactThreshold) return prepared;
+    return this.#compactPrepared(prepared);
+  }
 
+  async #compactPrepared(prepared: PreparedCodexCall): Promise<PreparedCodexCall> {
     const operationId = `${this.#attemptSessionId}:pre-turn:${++this.#compactionSequence}`;
-    const compacted = await this.#completedResponse(context, {
-      ...transportOptions,
+    const compacted = await this.#completedResponse(prepared.context, {
+      ...prepared.transportOptions,
       codexCompaction: {
         operationId,
         trigger: "auto",
@@ -136,12 +173,13 @@ export class OAuthCodexModel implements AgentsModel {
         strategy: "prefix_compaction",
       },
     });
-    const rawCompactionResponse = mapPiAssistantMessage(compacted);
-    const rawCompactionOutput = rawCompactionResponse.output.filter((item) => item.type === "compaction");
+    mapPiAssistantMessage(compacted);
+    const rawCompactionItems = compacted.providerPayload?.items
+      .filter((item) => item.type === "compaction") ?? [];
     if (
       compacted.providerPayload === undefined
       || compacted.providerPayload.dt !== true
-      || rawCompactionOutput.length !== 1
+      || rawCompactionItems.length !== 1
     ) {
       throw new Error("Codex pre-turn compaction returned no unique native compaction item");
     }
@@ -150,63 +188,105 @@ export class OAuthCodexModel implements AgentsModel {
       providerPayload: { ...compacted.providerPayload, dt: false },
     };
     const replacementResponse = mapPiAssistantMessage(replacementMessage);
-    const replacementOutput = replacementResponse.output.filter((item) => item.type === "compaction");
-    if (replacementOutput.length !== 1 || replacementOutput[0] === undefined) {
+    const replacementOutput = replacementResponse.output[0];
+    if (replacementOutput?.type !== "reasoning") {
       throw new Error("Codex pre-turn compaction could not construct replacement history");
     }
     return {
-      context: { ...context, messages: [...context.messages, replacementMessage] },
-      transportOptions,
-      compaction: { output: replacementOutput[0], usage: replacementResponse.usage },
+      context: { ...prepared.context, messages: [...prepared.context.messages, replacementMessage] },
+      transportOptions: prepared.transportOptions,
+      compaction: { output: replacementOutput, usage: replacementResponse.usage },
+    };
+  }
+  async #recoverPrepared(prepared: PreparedCodexCall, error: CodexResponseError): Promise<PreparedCodexCall> {
+    const recoveryUsage = mapPiAssistantUsage(error.assistantMessage);
+    return {
+      ...await this.#compactPrepared(prepared),
+      recoveryUsage,
     };
   }
 
+
   #prependCompaction(response: ModelResponse, prepared: PreparedCodexCall): ModelResponse {
-    if (prepared.compaction === undefined) return response;
-    prepared.compaction.usage.add(response.usage);
+    let usage = response.usage;
+    if (prepared.compaction !== undefined) {
+      prepared.compaction.usage.add(usage);
+      usage = prepared.compaction.usage;
+    }
+    if (prepared.recoveryUsage !== undefined) {
+      prepared.recoveryUsage.add(usage);
+      usage = prepared.recoveryUsage;
+    }
+    if (prepared.compaction === undefined && prepared.recoveryUsage === undefined) return response;
     return {
       ...response,
-      usage: prepared.compaction.usage,
-      output: [prepared.compaction.output, ...response.output],
+      usage,
+      output: prepared.compaction === undefined
+        ? response.output
+        : [prepared.compaction.output, ...response.output],
     };
   }
 
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    const prepared = await this.#prepareCall(request);
-    const completed = await this.#completedResponse(prepared.context, prepared.transportOptions);
+    let prepared = await this.#prepareCall(request);
+    let completed: AssistantMessage;
+    try {
+      completed = await this.#completedResponse(prepared.context, prepared.transportOptions);
+    } catch (error) {
+      if (prepared.compaction !== undefined || !this.#isRecoverableOverflow(error, request.signal)) throw error;
+      prepared = await this.#recoverPrepared(prepared, error);
+      request.signal?.throwIfAborted();
+      completed = await this.#completedResponse(prepared.context, prepared.transportOptions);
+    }
     return this.#prependCompaction(mapPiAssistantMessage(completed), prepared);
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<ResponseStreamEvent> {
-    const prepared = await this.#prepareCall(request);
-    const stream = this.#transport(OMP_CODEX_MODEL, prepared.context, prepared.transportOptions);
+    let prepared = await this.#prepareCall(request);
+    let recovered = false;
     const localResponseId = `${this.#attemptSessionId}:${++this.#requestSequence}`;
     yield { type: "response_started" };
-    for await (const event of stream) {
-      if (event.type === "text_delta") yield { type: "output_text_delta", delta: event.delta };
-      if (event.type === "error") throw new Error(event.error.errorMessage ?? `Codex request ${event.reason}`);
-      if (event.type === "done") {
-        const response = this.#prependCompaction(mapPiAssistantMessage(event.message), prepared);
-        yield {
-          type: "response_done",
-          response: {
-            id: response.responseId ?? localResponseId,
-            ...(response.requestId ? { requestId: response.requestId } : {}),
-            usage: {
-              requests: response.usage.requests,
-              inputTokens: response.usage.inputTokens,
-              outputTokens: response.usage.outputTokens,
-              totalTokens: response.usage.totalTokens,
-              inputTokensDetails: response.usage.inputTokensDetails,
-              outputTokensDetails: response.usage.outputTokensDetails,
+
+    streamAttempt: while (true) {
+      let contentEmitted = false;
+      for await (const event of this.#transport(OMP_CODEX_MODEL, prepared.context, prepared.transportOptions)) {
+        if (event.type === "start") continue;
+        if (event.type === "error") {
+          const error = new CodexResponseError(event.error, event.reason, contentEmitted);
+          if (!recovered && prepared.compaction === undefined && this.#isRecoverableOverflow(error, request.signal)) {
+            prepared = await this.#recoverPrepared(prepared, error);
+            request.signal?.throwIfAborted();
+            recovered = true;
+            continue streamAttempt;
+          }
+          throw error;
+        }
+
+        contentEmitted = true;
+        if (event.type === "text_delta") yield { type: "output_text_delta", delta: event.delta };
+        if (event.type === "done") {
+          const response = this.#prependCompaction(mapPiAssistantMessage(event.message), prepared);
+          yield {
+            type: "response_done",
+            response: {
+              id: response.responseId ?? localResponseId,
+              ...(response.requestId ? { requestId: response.requestId } : {}),
+              usage: {
+                requests: response.usage.requests,
+                inputTokens: response.usage.inputTokens,
+                outputTokens: response.usage.outputTokens,
+                totalTokens: response.usage.totalTokens,
+                inputTokensDetails: response.usage.inputTokensDetails,
+                outputTokensDetails: response.usage.outputTokensDetails,
+              },
+              output: response.output.map((item) => protocol.OutputModelItem.parse(item)),
             },
-            output: response.output.map((item) => protocol.OutputModelItem.parse(item)),
-          },
-        };
-        return;
+          };
+          return;
+        }
       }
+      throw new Error("Codex transport ended without a response_done event");
     }
-    throw new Error("Codex transport ended without a response_done event");
   }
 }
