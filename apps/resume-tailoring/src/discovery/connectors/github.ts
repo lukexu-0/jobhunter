@@ -1195,9 +1195,10 @@ async function loadWorkdaySiteConfig(
 }
 
 interface WorkdayPostingIdentity {
+  readonly tenant: string;
+  readonly shard: string;
   readonly site: string;
   readonly postingPath: string;
-  readonly recruitingTenant?: string;
 }
 
 function workdayPostingIdentity(value: URL): WorkdayPostingIdentity | undefined {
@@ -1209,14 +1210,18 @@ function workdayPostingIdentity(value: URL): WorkdayPostingIdentity | undefined 
   if (!encodedSite || postingSegments.length === 0 || postingSegments.some((segment) => !segment)) {
     return undefined;
   }
-  const recruitingTenant = value.hostname.endsWith(".myworkdaysite.com")
-    ? safeWorkdayPathSegment(segments[1] ?? "")
-    : undefined;
-  if (value.hostname.endsWith(".myworkdaysite.com") && !recruitingTenant) return undefined;
+  const labels = value.hostname.toLowerCase().split(".");
+  const myWorkdayJobs = labels[2] === "myworkdayjobs";
+  const encodedTenant = myWorkdayJobs
+    ? safeWorkdayPathSegment(labels[0] ?? "")
+    : safeWorkdayPathSegment(segments[1] ?? "");
+  const shard = myWorkdayJobs ? labels[1] : labels[0];
+  if (!encodedTenant || !shard) return undefined;
   return {
+    tenant: decodeURIComponent(encodedTenant).toLowerCase(),
+    shard,
     site: decodeURIComponent(encodedSite).toLowerCase(),
     postingPath: postingSegments.join("/"),
-    ...(recruitingTenant ? { recruitingTenant: recruitingTenant.toLowerCase() } : {}),
   };
 }
 
@@ -1234,12 +1239,12 @@ async function workdayDescriptionFromJson(
   const expected = workdayPostingIdentity(sourceUrl);
   const actual = workdayPostingIdentity(external);
   if (
-    external.origin !== sourceUrl.origin
-    || !expected
+    !expected
     || !actual
+    || actual.tenant !== expected.tenant
+    || actual.shard !== expected.shard
     || actual.site !== expected.site
     || actual.postingPath !== expected.postingPath
-    || actual.recruitingTenant !== expected.recruitingTenant
   ) {
     return undefined;
   }

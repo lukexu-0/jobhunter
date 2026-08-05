@@ -1247,6 +1247,38 @@ ${rows}
     ]);
   });
 
+
+  test("accepts a matching Workday recruiting-host external URL", async () => {
+    const workdayTable = `
+| Company | Role | Application |
+| --- | --- | --- |
+| Magna | Computer Vision Engineering Intern | [Apply](https://magna.wd3.myworkdayjobs.com/en-US/magna/job/Troy-Michigan-US/R-D--Computer-Vision-Engineering-Intern_R00253444-1) |
+`;
+    const connector = createGitHubTableConnector({
+      id: "workday-recruiting-alias",
+      name: "Workday recruiting alias fixture",
+      kind: "speedyapply",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(workdayTable, { headers: { "content-type": "text/plain" } });
+      }
+      return new Response(JSON.stringify({
+        jobPostingInfo: {
+          externalUrl: "https://wd3.myworkdaysite.com/recruiting/magna/Magna/job/Troy-Michigan-US/R-D--Computer-Vision-Engineering-Intern_R00253444-1",
+          jobDescription: "Develop and validate computer-vision systems with an automotive research engineering team.",
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }));
+
+    const result = await connector.sync(new AbortController().signal);
+
+    expect(result.completeSnapshot).toBe(true);
+    expect(result.items[0]?.description).toContain("computer-vision systems");
+  });
   test("keeps encoded Workday posting segments inside the CXS path", async () => {
     const workdayTable = `
 | Company | Role | Application |
