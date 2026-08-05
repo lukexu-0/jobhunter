@@ -932,6 +932,55 @@ async def test_cancel_is_not_blocked_by_in_flight_steer_and_remains_authoritativ
     await record.closed_event.wait()
     assert manager.get_snapshot(created.session_id).state == "cancelled"
 
+async def test_gate_commands_conflict_while_steering_dispatch_is_in_flight(
+    tmp_path: Path,
+) -> None:
+    steer_blocker = asyncio.Event()
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=Fakes(steer_blocker=steer_blocker),
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+
+    navigation = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanNavigationRuntimeAction(
+                type="request_human_navigation",
+                instruction="Complete the public checkpoint.",
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "navigation")
+    steering = asyncio.create_task(
+        manager.command(
+            created.session_id,
+            SteerCommand(type="steer", message="retry the current action"),
+        )
+    )
+    await asyncio.wait_for(fakes.models[0].steer_started.wait(), timeout=1)
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.command(created.session_id, ContinueCommand(type="continue"))
+    assert_service_error(
+        raised.value,
+        409,
+        "command_conflict",
+        "The application state changed; review the latest session state",
+    )
+    assert record.human_gate.pending_kind == "navigation"
+    assert not navigation.done()
+
+    steer_blocker.set()
+    await steering
+    await manager.command(created.session_id, ContinueCommand(type="continue"))
+    assert isinstance(await navigation, ContinueRuntimeActionResponse)
+    await manager.delete(created.session_id)
+
 
 @pytest.mark.parametrize(
     ("job_url", "opportunity_kind", "origins", "max_steps"),
@@ -4193,6 +4242,90 @@ async def test_manual_review_returns_exact_submit_permission(
     assert record.human_gate.submission_approved is True
     await manager.delete(created.session_id)
 
+async def test_steer_rejects_after_submission_approval_before_browser_action(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+
+    review = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanReviewRuntimeAction(
+                type="request_human_review",
+                result=review_result(),
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "review")
+    await manager.command(created.session_id, SubmitCommand(type="submit"))
+    assert isinstance(await review, SubmitRuntimeActionResponse)
+    assert record.human_gate.submission_approved is True
+    assert record.submission_action_started is False
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.command(
+            created.session_id,
+            SteerCommand(type="steer", message="late guidance"),
+        )
+    assert_service_error(
+        raised.value,
+        409,
+        "command_conflict",
+        "The application state changed; review the latest session state",
+    )
+    assert fakes.models[0].steer_calls == []
+    await manager.delete(created.session_id)
+
+
+async def test_submission_approval_rejects_while_steering_is_in_flight(
+    tmp_path: Path,
+) -> None:
+    steer_blocker = asyncio.Event()
+    fakes = Fakes(steer_blocker=steer_blocker)
+    manager, fakes, _ = make_manager(tmp_path, blocked_runner, fakes=fakes)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+
+    review = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestHumanReviewRuntimeAction(
+                type="request_human_review",
+                result=review_result(),
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "review")
+    steering = asyncio.create_task(
+        manager.command(
+            created.session_id,
+            SteerCommand(type="steer", message="finish this guidance first"),
+        )
+    )
+    await asyncio.wait_for(fakes.models[0].steer_started.wait(), timeout=1)
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.command(created.session_id, SubmitCommand(type="submit"))
+    assert_service_error(
+        raised.value,
+        409,
+        "command_conflict",
+        "The application state changed; review the latest session state",
+    )
+    assert record.human_gate.submission_approved is False
+
+    steer_blocker.set()
+    await steering
+    await manager.command(created.session_id, SubmitCommand(type="submit"))
+    assert isinstance(await review, SubmitRuntimeActionResponse)
+    assert record.human_gate.submission_approved is True
+    assert fakes.models[0].steer_calls == ["finish this guidance first"]
+    await manager.delete(created.session_id)
 
 async def test_first_approved_playwright_cli_execution_failure_parks_uncertainty_without_cleanup(
     tmp_path: Path,

@@ -197,6 +197,7 @@ class _ApplicationSession:
     sign_in_inspection_step: int = 0
     additional_info_question_count: int = 0
     submission_action_started: bool = False
+    steering_command_pending: bool = False
     setup_task: asyncio.Task[Any] | None = None
     context_process: CandidateContextProcess | None = None
     resume_upload_path: str | None = None
@@ -807,12 +808,15 @@ class ApplicationSessionManager:
                     or gate is None
                     or model is None
                     or record.submission_action_started
+                    or record.steering_command_pending
+                    or gate.submission_approved
                 ):
                     raise HarnessServiceError(
                         409,
                         "command_conflict",
                         _COMMAND_CONFLICT_MESSAGE,
                     )
+                record.steering_command_pending = True
                 steer_model = model
                 steer_message = command.message
             elif isinstance(command, CancelCommand):
@@ -832,6 +836,12 @@ class ApplicationSessionManager:
                 if gate is None:
                     raise HarnessServiceError(
                         409, "command_conflict", "The session is still starting"
+                    )
+                if record.steering_command_pending:
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        _COMMAND_CONFLICT_MESSAGE,
                     )
                 if isinstance(command, ContinueCommand):
                     await gate.continue_navigation()
@@ -857,12 +867,36 @@ class ApplicationSessionManager:
                 "session_terminal",
                 "The application session has already ended",
             )
-
         if steer_model is not None and steer_message is not None:
+            steering_error: PipelineApplicationAgentError | None = None
             try:
                 await steer_model.steer(steer_message)
             except PipelineApplicationAgentError as error:
-                if error.code == "command_conflict":
+                steering_error = error
+            finally:
+                async with record.request_lock:
+                    record.steering_command_pending = False
+                    gate = record.human_gate
+                    agent_task = record.agent_task
+                    steering_still_current = (
+                        not record.finalized
+                        and record.final_request is None
+                        and record.snapshot.state in _STEERABLE_SESSION_STATES
+                        and gate is not None
+                        and not gate.submission_approved
+                        and agent_task is not None
+                        and not agent_task.done()
+                        and record.model is steer_model
+                        and not record.submission_action_started
+                    )
+            if not steering_still_current:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    _COMMAND_CONFLICT_MESSAGE,
+                )
+            if steering_error is not None:
+                if steering_error.code == "command_conflict":
                     raise HarnessServiceError(
                         409,
                         "command_conflict",
@@ -874,6 +908,8 @@ class ApplicationSessionManager:
                     "The local pipeline model service is unavailable",
                 ) from None
             return
+
+
 
         if credential_gate is not None and credential_command is not None:
             username, password = credential_command.credentials()
