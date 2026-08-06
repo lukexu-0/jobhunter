@@ -785,6 +785,12 @@ function fetchInit(
   const literalHost = parseAddress(hostname, false);
   const headers = new Headers(request?.headers);
   if (!headers.has("accept")) headers.set("accept", "text/html, application/xhtml+xml, text/plain");
+  if (!headers.has("user-agent")) {
+    headers.set(
+      "user-agent",
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    );
+  }
   headers.set("accept-encoding", "identity");
   headers.set("host", logicalUrl.host);
   const init: BunFetchRequestInit = {
