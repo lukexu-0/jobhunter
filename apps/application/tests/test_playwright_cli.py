@@ -1236,6 +1236,59 @@ async def test_runtime_execute_timeout_and_output_bounds(session_dir: Path, cli_
 
     await runtime.close()
 
+def test_navigation_guard_rearm_reuses_persistent_state_and_handler() -> None:
+    script = PlaywrightCliRuntime._guard_script(
+        ("https://example.com", "https://another.com")
+    )
+
+    rearm = (
+        "if(state){"
+        "const handoffChanged=state.handoffPending&&state.handoffChanged;"
+    )
+    assert rearm in script
+    assert (
+        "state={allowed,armed:true,handler:null,"
+        "handoffPending:false,handoffChanged:false};"
+    ) in script
+    assert "state.handler=handler;" in script
+    assert "state.allowed.some(" in script
+    assert script.index(rearm) < script.index("context.route('**/*',handler)")
+    assert script.count("context.route('**/*',handler)") == 1
+    assert script.count("const handler=async route=>{") == 1
+    assert "unroute" not in script
+
+
+def test_navigation_guard_handler_bypasses_routes_while_disarmed() -> None:
+    script = PlaywrightCliRuntime._guard_script(("https://example.com",))
+
+    bypass = (
+        "if(!state.armed){"
+        "if(state.handoffPending)state.handoffChanged=true;"
+        "return route.continue();}"
+    )
+    assert bypass in script
+    assert script.index("const handler=async route=>{") < script.index(bypass)
+    assert script.index(
+        "if(!request.isNavigationRequest())return route.continue();"
+    ) < script.index(bypass)
+
+
+def test_navigation_guard_rearm_rejects_a_navigation_seen_after_handoff() -> None:
+    script = PlaywrightCliRuntime._guard_script(("https://example.com",))
+    suspension = PlaywrightCliRuntime._suspend_guard_script()
+
+    marker = "if(state.handoffPending)state.handoffChanged=true;"
+    rearm = (
+        "const handoffChanged=state.handoffPending&&state.handoffChanged;"
+        "state.allowed=allowed;state.armed=true;"
+        "state.handoffPending=false;state.handoffChanged=false;"
+        "if(handoffChanged)throw new Error('navigation changed during guard handoff');"
+    )
+    assert marker in script
+    assert rearm in script
+    assert "state.handoffPending=false;state.handoffChanged=false;" in suspension
+
+
 @pytest.mark.asyncio
 async def test_runtime_origin_updates(session_dir: Path, cli_script: Path) -> None:
     launch = ResolvedBrowserLaunch(cdp_url="http://127.0.0.1:9222", executable_path=None, user_data_dir=None)
@@ -1270,14 +1323,16 @@ async def test_runtime_origin_updates(session_dir: Path, cli_script: Path) -> No
     spawns.clear()
     await runtime.set_approved_origins(["https://example.com", "https://another.com"])
 
-    # set_approved_origins re-installs guard script (runs run-code)
+    # set_approved_origins rearms the persistent guard state via run-code.
     assert len(spawns) == 1
     assert spawns[0][3] == "run-code"
     assert "another.com" in spawns[0][4]
+    assert runtime._current_metadata is None
 
     # Verification that the approved origins check now allows navigation to another.com
     spawns.clear()
     res = await runtime.execute("goto", ["https://another.com/jobs"])
+    assert [spawn[3] for spawn in spawns[:2]] == ["run-code", "goto"]
     assert res.exit_code == 0
 
     await runtime.close()
@@ -1316,14 +1371,90 @@ async def test_runtime_suspend_navigation_guard(session_dir: Path, cli_script: P
     spawns.clear()
     await runtime.suspend_navigation_guard()
 
-    # suspend_navigation_guard runs unroute script (run-code)
+    # Suspension keeps the persistent route installed and only disarms its state.
     assert len(spawns) == 1
     assert spawns[0][3] == "run-code"
-    assert "unroute" in spawns[0][4]
+    assert "state.armed=false" in spawns[0][4]
+    assert "unroute" not in spawns[0][4]
+    assert runtime._guard_armed is False
+
+    assert await runtime.get_current_page_url() == "https://example.com/jobs/1"
+    handoff_script = spawns[1][4]
+    assert (
+        "if(guard&&!guard.armed&&!guard.handoffPending){"
+        "guard.handoffPending=true;guard.handoffChanged=false;}"
+    ) in handoff_script
 
     # Verify that model execution is disabled while navigation guard is suspended
     with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
         await runtime.execute("click", ["e3"])
+    assert len(spawns) == 2
+
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_recovers_ambiguous_guard_suspension_before_next_action(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    suspension_started = False
+    suspension_calls = 0
+    calls: list[str] = []
+
+    def mock_process_factory(*argv: str, **kwargs: Any) -> DummyProcess:
+        nonlocal suspension_calls
+        command = argv[3]
+        calls.append(command)
+        stdout = b""
+        exit_code = 0
+        if command == "run-code":
+            if suspension_started:
+                suspension_calls += 1
+                if suspension_calls == 1:
+                    exit_code = 1
+            stdout = json.dumps({
+                "result": json.dumps({
+                    "url": "https://example.com/jobs/1",
+                    "title": "Software Engineer",
+                    "currentIndex": 0,
+                    "tabs": [{
+                        "url": "https://example.com/jobs/1",
+                        "title": "Software Engineer",
+                    }],
+                })
+            }).encode("utf-8")
+        return DummyProcess(argv=argv, exit_code=exit_code, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000001"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=mock_process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    suspension_started = True
+    calls.clear()
+
+    with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
+        await runtime.suspend_navigation_guard()
+
+    assert calls == ["run-code", "run-code"]
+    assert runtime._guard_armed is True
+    assert runtime._current_metadata is None
+
+    calls.clear()
+    result = await runtime.execute("click", ["e3"])
+
+    assert result.exit_code == 0
+    assert calls[0] == "run-code"
+    assert calls[1] == "click"
 
     await runtime.close()
 
@@ -1354,7 +1485,11 @@ async def test_runtime_logs_fixed_metadata_when_guard_suspension_times_out(
         return DummyProcess(
             argv=argv,
             stdout=stdout,
-            timed_out=suspension_started and command == "run-code",
+            timed_out=(
+                suspension_started
+                and command == "run-code"
+                and "state.armed=false" in argv[4]
+            ),
         )
 
     monkeypatch.setattr(
@@ -1473,6 +1608,9 @@ async def test_runtime_logs_fixed_metadata_when_guard_invocation_fails(
         "stdoutTruncated": False,
         "stderrTruncated": False,
     }]
+    assert runtime._closed is True
+    assert runtime._started is False
+    assert runtime._guard_armed is False
 
 @pytest.mark.asyncio
 async def test_runtime_idempotent_cleanup(session_dir: Path, cli_script: Path) -> None:
