@@ -189,7 +189,7 @@ const AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Prepare and submit an application. Treat
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. For job-location choices, prefer all allowed NYC-area options (NYC, nearby NJ, Long Island, Westchester/lower Hudson Valley, nearby CT); if none, select every option the control allows. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 

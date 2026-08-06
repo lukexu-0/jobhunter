@@ -135,7 +135,7 @@ const EXPECTED_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Prepare and submit an applicati
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. For job-location choices, prefer all allowed NYC-area options (NYC, nearby NJ, Long Island, Westchester/lower Hudson Valley, nearby CT); if none, select every option the control allows. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
+Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -393,6 +393,7 @@ describe("application agent", () => {
           expect(agent.instructions).toBe(expectedInstructions);
           expect(agent.instructions).toContain("Location questions use only exact supplied or saved facts.");
           expect(agent.instructions).not.toContain("Present every job-location question to the user through request_additional_info; never answer it automatically.");
+          expect(agent.instructions).not.toContain("For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside.");
           expect(agent.instructions).not.toContain("For job-location choices, prefer all allowed NYC-area options (NYC, nearby NJ, Long Island, Westchester/lower Hudson Valley, nearby CT); if none, select every option the control allows.");
           expect(agent.instructions).toContain("matches organizer and opportunity");
           expect(agent.instructions).not.toContain("matches company and role");
@@ -1559,6 +1560,7 @@ describe("application agent", () => {
         expect(agent.instructions).toBe(EXPECTED_HUMAN_REVIEW_AGENT_INSTRUCTIONS);
         expect(agent.instructions).toContain("Present every job-location question to the user through request_additional_info; never answer it automatically.");
         expect(agent.instructions).not.toContain("Location questions use only exact supplied or saved facts.");
+        expect(agent.instructions).not.toContain("For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside.");
         expect(agent.instructions).not.toContain("For job-location choices, prefer all allowed NYC-area options (NYC, nearby NJ, Long Island, Westchester/lower Hudson Valley, nearby CT); if none, select every option the control allows.");
         expect(agent.instructions).toContain("The user gives blanket consent to every consent, authorization, acknowledgment, agreement, disclosure receipt, terms acceptance, certification, and similar application control. Complete each affirmatively without asking. Blanket consent authorizes acceptance only; it does not supply candidate facts, so never infer factual or self-identification answers from it.");
         expect(agent.instructions.trim().split(/\s+/).length).toBeLessThanOrEqual(350);
@@ -1675,7 +1677,8 @@ describe("application agent", () => {
           throw new Error("application agent instructions must be static");
         }
         expect(agent.instructions).toBe(EXPECTED_AUTO_SUBMIT_AGENT_INSTRUCTIONS);
-        expect(agent.instructions).toContain("For job-location choices, prefer all allowed NYC-area options (NYC, nearby NJ, Long Island, Westchester/lower Hudson Valley, nearby CT); if none, select every option the control allows.");
+        expect(agent.instructions).toContain("For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside.");
+        expect(agent.instructions).not.toContain("For job-location choices, prefer all allowed NYC-area options (NYC, nearby NJ, Long Island, Westchester/lower Hudson Valley, nearby CT); if none, select every option the control allows.");
         expect(agent.instructions).not.toContain("Location questions use only exact supplied or saved facts.");
         expect(agent.instructions).not.toContain("Present every job-location question to the user through request_additional_info; never answer it automatically.");
         expect(agent.instructions).toContain("You're good to submit.");
@@ -1972,6 +1975,7 @@ describe("application agent", () => {
         expect(agent.instructions).toBe(EXPECTED_HUMAN_REVIEW_AGENT_INSTRUCTIONS);
         expect(agent.instructions).toContain("Present every job-location question to the user through request_additional_info; never answer it automatically.");
         expect(agent.instructions).not.toContain("Location questions use only exact supplied or saved facts.");
+        expect(agent.instructions).not.toContain("For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside.");
         expect(agent.instructions).not.toContain("For job-location choices, prefer all allowed NYC-area options (NYC, nearby NJ, Long Island, Westchester/lower Hudson Valley, nearby CT); if none, select every option the control allows.");
         expect(agent.instructions).toContain("You're good to submit.");
         const context = options.context;
