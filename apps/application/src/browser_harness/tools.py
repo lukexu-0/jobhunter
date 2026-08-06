@@ -689,10 +689,13 @@ class HumanGate:
             await pending.runtime.set_approved_origins(approved_origins)
             self._approved_origins.append(canonical_origin)
             pending.future.set_result(("approve", None))
+
+    @staticmethod
+    def _consume_credential_command_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
     async def sign_in(self, username: str, password: str) -> None:
-        current_task = asyncio.current_task()
-        if current_task is None:
-            raise RuntimeError("Credential command has no owning task")
         async with self._lock:
             pending = self._require_pending("credentials")
             if (
@@ -707,12 +710,37 @@ class HumanGate:
                 and not self._credential_command_task.done()
             ):
                 raise self._conflict("A credential command is already pending")
-            self._credential_command_task = current_task
-            runtime = pending.runtime
-            login_origin = pending.login_origin
-            username_ref = pending.username_ref
-            password_ref = pending.password_ref
-            submit_ref = pending.submit_ref
+            credential_task = asyncio.create_task(
+                self._complete_sign_in(
+                    pending=pending,
+                    runtime=pending.runtime,
+                    login_origin=pending.login_origin,
+                    username_ref=pending.username_ref,
+                    password_ref=pending.password_ref,
+                    submit_ref=pending.submit_ref,
+                    username=username,
+                    password=password,
+                )
+            )
+            credential_task.add_done_callback(
+                self._consume_credential_command_result
+            )
+            self._credential_command_task = credential_task
+        await asyncio.shield(credential_task)
+
+    async def _complete_sign_in(
+        self,
+        *,
+        pending: _PendingGate,
+        runtime: BrowserGateRuntime,
+        login_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> None:
+        credential_task = asyncio.current_task()
         try:
             await self._perform_sign_in(
                 runtime=runtime,
@@ -730,13 +758,10 @@ class HumanGate:
                 pending.future.set_result(("sign_in", None))
         finally:
             async with self._lock:
-                if self._credential_command_task is current_task:
+                if self._credential_command_task is credential_task:
                     self._credential_command_task = None
 
     async def save_credentials(self, username: str, password: str) -> None:
-        current_task = asyncio.current_task()
-        if current_task is None:
-            raise RuntimeError("Credential command has no owning task")
         async with self._lock:
             pending = self._require_pending("credentials")
             if pending.login_origin is None or pending.credential_store is None:
@@ -746,11 +771,34 @@ class HumanGate:
                 and not self._credential_command_task.done()
             ):
                 raise self._conflict("A credential command is already pending")
-            self._credential_command_task = current_task
             self._activate_credential_redaction(username, password)
-            runtime = pending.runtime
-            credential_store = pending.credential_store
-            login_origin = pending.login_origin
+            credential_task = asyncio.create_task(
+                self._complete_save_credentials(
+                    pending=pending,
+                    runtime=pending.runtime,
+                    credential_store=pending.credential_store,
+                    login_origin=pending.login_origin,
+                    username=username,
+                    password=password,
+                )
+            )
+            credential_task.add_done_callback(
+                self._consume_credential_command_result
+            )
+            self._credential_command_task = credential_task
+        await asyncio.shield(credential_task)
+
+    async def _complete_save_credentials(
+        self,
+        *,
+        pending: _PendingGate,
+        runtime: BrowserGateRuntime,
+        credential_store: CredentialStore,
+        login_origin: str,
+        username: str,
+        password: str,
+    ) -> None:
+        credential_task = asyncio.current_task()
         try:
             try:
                 live_origin = (
@@ -788,7 +836,7 @@ class HumanGate:
                 pending.future.set_result(("save_credentials", None))
         finally:
             async with self._lock:
-                if self._credential_command_task is current_task:
+                if self._credential_command_task is credential_task:
                     self._credential_command_task = None
 
 

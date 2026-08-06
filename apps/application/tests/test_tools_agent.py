@@ -15,6 +15,7 @@ from jobhunter_browser_harness.agent import (
     build_application_task,
 )
 from jobhunter_browser_harness.context import AttributedSource, CandidateContext
+from jobhunter_browser_harness.credentials import CredentialStore
 from jobhunter_browser_harness.models import (
     AdditionalInfoOption,
     AdditionalInfoSingleSelectCommandAnswer,
@@ -59,6 +60,67 @@ class FakeRuntime:
 
     async def suspend_navigation_guard(self) -> None:
         self.calls.append(("suspend_navigation_guard", None))
+
+
+class CredentialRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mutation_started = asyncio.Event()
+        self.mutation_release = asyncio.Event()
+        self.mutation_finished = asyncio.Event()
+        self.sign_in_calls: list[dict[str, str]] = []
+        self.activated_private_values: list[tuple[str, ...]] = []
+
+    async def suppress_private_capture(self) -> None:
+        self.calls.append(("suppress_private_capture", None))
+
+    async def sign_in(
+        self,
+        *,
+        expected_origin: str,
+        username_ref: str,
+        password_ref: str,
+        submit_ref: str,
+        username: str,
+        password: str,
+    ) -> None:
+        self.mutation_started.set()
+        await self.mutation_release.wait()
+        self.sign_in_calls.append(
+            {
+                "expected_origin": expected_origin,
+                "username_ref": username_ref,
+                "password_ref": password_ref,
+                "submit_ref": submit_ref,
+                "username": username,
+                "password": password,
+            }
+        )
+        self.mutation_finished.set()
+
+    async def verify_origin_and_activate_private_values(
+        self,
+        expected_origin: str,
+        values: Sequence[str],
+    ) -> str | None:
+        self.mutation_started.set()
+        await self.mutation_release.wait()
+        activated = tuple(values)
+        self.activated_private_values.append(activated)
+        self.mutation_finished.set()
+        return expected_origin
+
+
+class PublicationBlockingCredentialStore(CredentialStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.upsert_finished = asyncio.Event()
+        self.return_release = asyncio.Event()
+
+    async def upsert(self, origin: str, username: str, password: str) -> None:
+        await super().upsert(origin, username, password)
+        self.upsert_finished.set()
+        await self.return_release.wait()
 
 
 class EventPublisher:
@@ -150,6 +212,112 @@ def make_gate(
         action_timeout=action_timeout,
     )
     return gate, publisher
+
+
+@pytest.mark.asyncio
+async def test_sign_in_requester_cancellation_after_browser_mutation_resolves_gate(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    gate, publisher = make_gate(action_timeout=5)
+    runtime = CredentialRuntime()
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    gated = asyncio.create_task(
+        gate.request_sign_in(
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            runtime=runtime,
+            credential_store=credential_store,
+        )
+    )
+    assert await publisher.next_event() == (
+        "awaiting_human_navigation",
+        "credentials_required",
+        {},
+    )
+
+    command = asyncio.create_task(
+        gate.sign_in("person@example.test", "private-password")
+    )
+    await asyncio.wait_for(runtime.mutation_started.wait(), timeout=1)
+    await gate._lock.acquire()
+    try:
+        runtime.mutation_release.set()
+        await asyncio.wait_for(runtime.mutation_finished.wait(), timeout=1)
+        command.cancel()
+        await asyncio.sleep(0)
+    finally:
+        gate._lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await command
+
+    try:
+        result = await asyncio.wait_for(asyncio.shield(gated), timeout=1)
+    except TimeoutError:
+        await gate.cancel()
+        await asyncio.gather(gated, return_exceptions=True)
+        raise
+    assert result.metadata == {"sign_in_status": "attempted"}
+    assert await publisher.next_event(after=1) == ("running", None, {})
+    assert len(runtime.sign_in_calls) == 1
+    assert gate._credential_command_task is None
+
+
+@pytest.mark.asyncio
+async def test_save_credentials_requester_cancellation_after_upsert_resolves_gate(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    gate, publisher = make_gate(action_timeout=5)
+    runtime = CredentialRuntime()
+    runtime.mutation_release.set()
+    credential_store = PublicationBlockingCredentialStore(
+        tmp_path / "credentials.json"
+    )
+    gated = asyncio.create_task(
+        gate.request_sign_in(
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            runtime=runtime,
+            credential_store=credential_store,
+        )
+    )
+    assert await publisher.next_event() == (
+        "awaiting_human_navigation",
+        "credentials_required",
+        {},
+    )
+
+    username = "created@example.test"
+    password = "created-password"
+    command = asyncio.create_task(gate.save_credentials(username, password))
+    await asyncio.wait_for(credential_store.upsert_finished.wait(), timeout=1)
+    await gate._lock.acquire()
+    try:
+        credential_store.return_release.set()
+        await asyncio.sleep(0)
+        command.cancel()
+        await asyncio.sleep(0)
+    finally:
+        gate._lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await command
+
+    try:
+        result = await asyncio.wait_for(asyncio.shield(gated), timeout=1)
+    except TimeoutError:
+        await gate.cancel()
+        await asyncio.gather(gated, return_exceptions=True)
+        raise
+    assert result.metadata == {"sign_in_status": "saved"}
+    assert await publisher.next_event(after=1) == ("running", None, {})
+    saved = credential_store.credentials_for_origin(JOB_ORIGIN)
+    assert [(item.username, item.password) for item in saved] == [
+        (username, password)
+    ]
+    assert gate._credential_command_task is None
 
 
 def test_human_gate_does_not_retain_domain_scoped_sensitive_data() -> None:

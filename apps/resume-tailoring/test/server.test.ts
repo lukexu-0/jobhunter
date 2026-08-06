@@ -45,3 +45,43 @@ test("only long-lived application routes disable Bun's default idle timeout", as
     await server.stop(true);
   }
 }, 18_000);
+
+test("credential command POSTs can outlive Bun's default idle timeout", async () => {
+  const server = startPipelineHttpServer(
+    {
+      // This integration check must cross Bun's real 10-second socket idle timeout.
+      fetch: async () => {
+        await Bun.sleep(12_000);
+        return new Response("completed");
+      },
+    },
+    { port: 0 },
+  );
+  try {
+    const [
+      credentialCommandRequest,
+      samePathGetRequest,
+      unrelatedRunRequest,
+    ] = await Promise.allSettled([
+      fetch(
+        `http://127.0.0.1:${server.port}/v1/runs/run-1/application/commands`,
+        { method: "POST" },
+      ),
+      fetch(`http://127.0.0.1:${server.port}/v1/runs/run-1/application/commands`),
+      fetch(
+        `http://127.0.0.1:${server.port}/v1/runs/run-1/application/retry`,
+        { method: "POST" },
+      ),
+    ]);
+
+    expect(credentialCommandRequest.status).toBe("fulfilled");
+    if (credentialCommandRequest.status === "fulfilled") {
+      expect(credentialCommandRequest.value.status).toBe(200);
+      expect(await credentialCommandRequest.value.text()).toBe("completed");
+    }
+    expect(samePathGetRequest.status).toBe("rejected");
+    expect(unrelatedRunRequest.status).toBe("rejected");
+  } finally {
+    await server.stop(true);
+  }
+}, 18_000);
