@@ -186,9 +186,15 @@ function diagnosticErrorChain(error: unknown): readonly ApplicationAgentDiagnost
     let name = "NonError";
     let message = "";
     let cause: unknown;
-    if (current instanceof Error) {
+    let currentError: Error | undefined;
+    try {
+      if (current instanceof Error) currentError = current;
+    } catch {
+      currentError = undefined;
+    }
+    if (currentError !== undefined) {
       try {
-        const candidateName = current.name;
+        const candidateName = currentError.name;
         name = typeof candidateName === "string"
           && SAFE_ERROR_NAMES[candidateName] === true
           ? candidateName
@@ -197,7 +203,7 @@ function diagnosticErrorChain(error: unknown): readonly ApplicationAgentDiagnost
         name = "Error";
       }
       try {
-        const candidateMessage = current.message;
+        const candidateMessage = currentError.message;
         message = typeof candidateMessage === "string"
           ? candidateMessage.slice(0, MAX_DIAGNOSTIC_CLASSIFICATION_CHARS).toLowerCase()
           : "";
@@ -205,7 +211,7 @@ function diagnosticErrorChain(error: unknown): readonly ApplicationAgentDiagnost
         message = "";
       }
       try {
-        cause = current.cause;
+        cause = currentError.cause;
       } catch {
         cause = undefined;
       }

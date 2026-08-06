@@ -457,6 +457,48 @@ describe("ApplicationAgentService", () => {
     expect(serializedDiagnostics).not.toContain(assistantSecret);
   });
 
+
+  test("logs fixed unknown metadata when a hostile proxy hides its Error prototype", async () => {
+    const proxySecret = `proxy payload for ${DIRECT_VALUE}`;
+    let prototypeReads = 0;
+    const hostileError = new Proxy(new Error(proxySecret), {
+      getPrototypeOf(target) {
+        prototypeReads += 1;
+        if (prototypeReads === 1) return Reflect.getPrototypeOf(target);
+        throw new Error("prototype unavailable");
+      },
+    });
+    const diagnostics: unknown[] = [];
+    const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
+      authStatusReader: connectedStatus,
+      runtimeClientFactory: () => ({
+        action: async () => { throw new Error("unused"); },
+      }),
+      runApplicationAgent: async () => {
+        throw hostileError;
+      },
+      diagnosticSink: (diagnostic: unknown) => {
+        diagnostics.push(diagnostic);
+      },
+    });
+
+    const failure = await service.invoke(
+      INPUT,
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApplicationAgentFailure);
+    expect((failure as ApplicationAgentFailure).code).toBe("MODEL_PROVIDER_FAILED");
+    expect(diagnostics).toEqual([{
+      event: "application_agent_failure",
+      sessionId: SESSION_ID,
+      phase: "agent_run",
+      errorChain: [{ name: "NonError", category: "unknown" }],
+    }]);
+    expect(JSON.stringify(diagnostics)).not.toContain(proxySecret);
+    expect(JSON.stringify(diagnostics)).not.toContain(DIRECT_VALUE);
+  });
   test("turns a provider failure during a logout race into OAuth required", async () => {
     let authReads = 0;
     const diagnostics: unknown[] = [];
