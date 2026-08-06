@@ -5,6 +5,7 @@ import {
   type ApplicationAgentRunInput,
   type ApplicationRunResult,
 } from "../src/agents/application-agent";
+import { ApplicationRuntimeError } from "../src/agents/application-runtime-client.ts";
 import {
   APPLICATION_AGENT_MODEL,
   APPLICATION_AGENT_MODEL_PROVIDER,
@@ -455,6 +456,56 @@ describe("ApplicationAgentService", () => {
     expect(serializedDiagnostics).not.toContain(RUNTIME_URL);
     expect(serializedDiagnostics).not.toContain(DIRECT_VALUE);
     expect(serializedDiagnostics).not.toContain(assistantSecret);
+  });
+
+  test("logs the fixed runtime cause when a typed model failure crosses the service boundary", async () => {
+    const privateRuntimePayload = `runtime response for ${DIRECT_VALUE}`;
+    const runtimeError = Object.assign(
+      new ApplicationRuntimeError("model_failed"),
+      { privateRuntimePayload },
+    );
+    const modelFailure = new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+    Object.defineProperty(modelFailure, "cause", { value: runtimeError });
+    const diagnostics: unknown[] = [];
+    const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
+      authStatusReader: connectedStatus,
+      runtimeClientFactory: () => ({
+        action: async () => { throw new Error("unused"); },
+      }),
+      runApplicationAgent: async () => {
+        throw modelFailure;
+      },
+      diagnosticSink: (diagnostic: unknown) => {
+        diagnostics.push(diagnostic);
+      },
+    });
+
+    const failure = await service.invoke(
+      INPUT,
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBe(modelFailure);
+    expect(diagnostics).toEqual([{
+      event: "application_agent_failure",
+      sessionId: SESSION_ID,
+      phase: "agent_run",
+      errorChain: [
+        {
+          name: "ApplicationAgentFailure",
+          category: "provider_error",
+          code: "MODEL_PROVIDER_FAILED",
+        },
+        {
+          name: "ApplicationRuntimeError",
+          category: "provider_error",
+          code: "model_failed",
+        },
+      ],
+    }]);
+    expect(JSON.stringify(diagnostics)).not.toContain(privateRuntimePayload);
+    expect(JSON.stringify(diagnostics)).not.toContain(DIRECT_VALUE);
   });
 
 

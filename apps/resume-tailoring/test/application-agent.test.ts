@@ -1173,7 +1173,10 @@ describe("application agent", () => {
               password_ref: "e2",
               submit_ref: "e3",
             }),
-          )).rejects.toEqual(expectedFailure);
+          )).rejects.toMatchObject({
+            code: expectedFailure.code,
+            message: expectedFailure.message,
+          });
           expect(context.playwrightCliCompleted).toBe(false);
           expect(context.postNavigationInspectionRequired).toBe(true);
           expect(context.latestScreenshotDataUrl).toBeUndefined();
@@ -1185,7 +1188,10 @@ describe("application agent", () => {
         RUN_INPUT,
         new AbortController().signal,
         dependencies,
-      )).rejects.toEqual(expectedFailure);
+      )).rejects.toMatchObject({
+        code: expectedFailure.code,
+        message: expectedFailure.message,
+      });
     }
   });
 
@@ -2507,6 +2513,7 @@ describe("application agent", () => {
         expect(error).toBeInstanceOf(ApplicationAgentFailure);
         if (!(error instanceof ApplicationAgentFailure)) throw error;
         expect(error.code).toBe(expectedCode);
+        expect(error.cause).toBe(runtimeError);
         expect(error.message).not.toContain("private provider response");
       }
     }
@@ -2540,7 +2547,10 @@ describe("application agent", () => {
       RUN_INPUT,
       new AbortController().signal,
       dependencies,
-    )).rejects.toEqual(new ApplicationAgentFailure("BROWSER_FAILED"));
+    )).rejects.toMatchObject({
+      code: "BROWSER_FAILED",
+      message: "The browser session failed",
+    });
   });
 
   test("maps a runtime model timeout through the public error boundary", async () => {
@@ -2642,7 +2652,10 @@ describe("application agent", () => {
         deadlineInput,
         new AbortController().signal,
         dependencies,
-      )).rejects.toEqual(new ApplicationAgentFailure("MODEL_TIMEOUT"));
+      )).rejects.toMatchObject({
+        code: "MODEL_TIMEOUT",
+        message: "The model request timed out",
+      });
     } finally {
       now.mockRestore();
     }
@@ -2746,7 +2759,10 @@ describe("application agent", () => {
       RUN_INPUT,
       new AbortController().signal,
       dependencies,
-    )).rejects.toEqual(new ApplicationAgentFailure("MODEL_TIMEOUT"));
+    )).rejects.toMatchObject({
+      code: "MODEL_TIMEOUT",
+      message: "The model request timed out",
+    });
   });
   test("propagates the active tool-call abort signal to runtime HTTP", async () => {
     const outerController = new AbortController();

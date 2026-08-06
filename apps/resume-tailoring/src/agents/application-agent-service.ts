@@ -63,6 +63,7 @@ export type ApplicationAgentDiagnosticSink = (
 const MAX_DIAGNOSTIC_CAUSE_DEPTH = 4;
 const MAX_DIAGNOSTIC_CLASSIFICATION_CHARS = 2_048;
 const SAFE_DIAGNOSTIC_CODES: Readonly<Record<string, true>> = Object.freeze({
+  MODEL_PROVIDER_FAILED: true,
   ABORT_ERR: true,
   ECONNABORTED: true,
   ECONNREFUSED: true,
@@ -78,11 +79,14 @@ const SAFE_DIAGNOSTIC_CODES: Readonly<Record<string, true>> = Object.freeze({
   context_length_exceeded: true,
   internal_error: true,
   model_error: true,
+  model_failed: true,
   rate_limit_exceeded: true,
   server_error: true,
 });
 const SAFE_ERROR_NAMES: Readonly<Record<string, true>> = Object.freeze({
   AbortError: true,
+  ApplicationAgentFailure: true,
+  ApplicationRuntimeError: true,
   AggregateError: true,
   ApplicationHistoryProjectionError: true,
   CodexResponseError: true,
@@ -163,7 +167,9 @@ function diagnosticCategory(
     return "network";
   }
   if (
-    code === "internal_error"
+    code === "MODEL_PROVIDER_FAILED"
+    || code === "model_failed"
+    || code === "internal_error"
     || code === "model_error"
     || code === "server_error"
     || /provider.*(?:failed|error)|model error|server error|internal error|service unavailable|overloaded/.test(message)
@@ -462,7 +468,16 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
         result = parsedResult.data;
       } catch (error) {
         if (signal.aborted) throw signal.reason;
-        if (error instanceof ApplicationAgentFailure) throw error;
+        if (error instanceof ApplicationAgentFailure) {
+          if (error.code === "MODEL_PROVIDER_FAILED") {
+            reportApplicationAgentFailure(
+              this.#diagnosticSink,
+              input.sessionId,
+              error,
+            );
+          }
+          throw error;
+        }
         let oauthConnected = false;
         try {
           const currentStatus = await runAbortable(

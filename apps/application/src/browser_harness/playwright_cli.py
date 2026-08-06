@@ -5,6 +5,7 @@ import ctypes
 import base64
 import inspect
 import json
+import logging
 import math
 import os
 import platform
@@ -33,6 +34,8 @@ from .models import (
     validate_job_url,
     validate_loopback_http_url,
 )
+logger = logging.getLogger(__name__)
+
 
 _MAX_ARGUMENT_ITEMS = 64
 _MAX_ARGUMENT_BYTES = 8_192
@@ -2409,6 +2412,31 @@ class PlaywrightCliRuntime:
                 timeout=_LIFECYCLE_TIMEOUT_SECONDS,
                 capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
             )
+            reported_cli_error = self._reported_cli_error(result)
+            if result.timed_out or result.exit_code != 0 or reported_cli_error:
+                error_category = (
+                    "timeout"
+                    if result.timed_out
+                    else "process_exit"
+                    if result.exit_code != 0
+                    else "cli_error"
+                )
+                logger.error(
+                    json.dumps(
+                        {
+                            "event": "playwright_cli_lifecycle_failure",
+                            "sessionId": str(self._session_id),
+                            "operation": "suspend_navigation_guard",
+                            "errorCategory": error_category,
+                            "exitCode": result.exit_code,
+                            "timedOut": result.timed_out,
+                            "reportedCliError": reported_cli_error,
+                            "stdoutTruncated": result.stdout_truncated,
+                            "stderrTruncated": result.stderr_truncated,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
             self._require_success(result)
             self._guard_armed = False
 

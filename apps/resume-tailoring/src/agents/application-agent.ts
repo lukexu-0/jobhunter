@@ -126,8 +126,8 @@ const APPLICATION_AGENT_FAILURE_MESSAGES: Readonly<Record<ApplicationAgentFailur
 };
 
 export class ApplicationAgentFailure extends Error {
-  constructor(readonly code: ApplicationAgentFailureCode) {
-    super(APPLICATION_AGENT_FAILURE_MESSAGES[code]);
+  constructor(readonly code: ApplicationAgentFailureCode, options?: ErrorOptions) {
+    super(APPLICATION_AGENT_FAILURE_MESSAGES[code], options);
     this.name = "ApplicationAgentFailure";
   }
 }
@@ -381,11 +381,15 @@ async function runtimeAction(
         && toolAbortReason.name === "TimeoutError"
       )
     ) {
-      throw new ApplicationAgentFailure("MODEL_TIMEOUT");
+      const cause = error instanceof DOMException && error.name === "TimeoutError"
+        ? error
+        : toolAbortReason;
+      throw new ApplicationAgentFailure("MODEL_TIMEOUT", { cause });
     }
     if (signal.aborted) {
       throw toolAbortReason ?? new DOMException("Aborted", "AbortError");
     }
+    if (error instanceof ApplicationAgentFailure) throw error;
     if (error instanceof ApplicationRuntimeError) {
       const code = error.code === "model_timeout"
         ? "MODEL_TIMEOUT"
@@ -394,9 +398,9 @@ async function runtimeAction(
           : error.code === "browser_failed"
             ? "BROWSER_FAILED"
             : "MODEL_PROVIDER_FAILED";
-      throw new ApplicationAgentFailure(code);
+      throw new ApplicationAgentFailure(code, { cause: error });
     }
-    throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+    throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED", { cause: error });
   }
 }
 
