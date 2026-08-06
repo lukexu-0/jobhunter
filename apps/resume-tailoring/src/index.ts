@@ -2,7 +2,10 @@ import "./auth/service.ts";
 import { bootstrapAgentRuntime } from "./agents/runner.ts";
 import { createPipelineApplication, type PipelineApplication } from "./bootstrap.ts";
 import { APPLICATION_AGENT_PATH } from "./api/application-agent-routes.ts";
-import { APPLICATION_EVENT_STREAM_PATH } from "./api/application-session-routes.ts";
+import {
+  APPLICATION_COMMAND_PATH,
+  APPLICATION_EVENT_STREAM_PATH,
+} from "./api/application-session-routes.ts";
 import { resolveBrowserHarnessToken } from "./system/harness-token.ts";
 
 const hostname = "127.0.0.1";
@@ -38,6 +41,10 @@ export function startPipelineHttpServer(
         (
           request.method === "POST"
           && url.pathname === APPLICATION_AGENT_PATH
+        )
+        || (
+          request.method === "POST"
+          && APPLICATION_COMMAND_PATH.test(url.pathname)
         )
         || (
           request.method === "GET"

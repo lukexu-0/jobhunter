@@ -155,6 +155,8 @@ function mappedError(error: unknown): Response {
 
 export const APPLICATION_EVENT_STREAM_PATH =
   /^\/v1\/runs\/[^/]+\/application\/events$/;
+export const APPLICATION_COMMAND_PATH =
+  /^\/v1\/runs\/[^/]+\/application\/commands$/;
 const APPLICATION_EVENT_ID = /^([1-9]\d*):(0|[1-9]\d*)$/;
 const EVENT_STREAM_HEADERS = {
   "cache-control": "no-store",
@@ -368,8 +370,7 @@ export function createApplicationSessionRoutes(service: ApplicationSessionRouteS
       }
       if (
         request.method === "POST"
-        && segments[4] === "commands"
-        && segments.length === 5
+        && APPLICATION_COMMAND_PATH.test(url.pathname)
       ) {
         const body = ApplicationSessionCommandSchema.safeParse(await parseBody(request));
         if (!body.success) {
