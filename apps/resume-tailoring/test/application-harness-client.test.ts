@@ -508,6 +508,7 @@ describe("HttpApplicationHarnessClient", () => {
     const steeringMessage = "PRIVATE OPERATOR GUIDANCE";
     const commands: ApplicationSessionCommand[] = [
       { type: "continue" },
+      { type: "continue_without_additional_info" },
       { type: "steer", message: steeringMessage },
       { type: "approve_origin", origin: "https://ats.example.test" },
       {

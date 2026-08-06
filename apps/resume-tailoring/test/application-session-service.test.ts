@@ -2068,6 +2068,50 @@ describe("application session service", () => {
     }
   });
 
+  test("forwards additional-information continuation only from its pending gate without persistence", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessTextQuestionSnapshot(
+      "Which listed job locations can you accept?",
+      "job_location",
+    );
+    const target = await createTarget({ harness });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    const durableBefore = JSON.stringify(
+      target.repository.getLatestApplicationSession(target.runId),
+    );
+    const command = {
+      type: "continue_without_additional_info",
+    } as const satisfies ApplicationSessionCommand;
+
+    await expect(target.service.command(target.runId, command, signal()))
+      .resolves.toBeUndefined();
+    expect(harness.commandCalls).toEqual([{
+      sessionId: FIRST_SESSION_ID,
+      command,
+    }]);
+    expect(JSON.stringify(
+      target.repository.getLatestApplicationSession(target.runId),
+    )).toBe(durableBefore);
+    await expect(target.service.get(target.runId)).resolves.toMatchObject({
+      bridgeState: "awaiting_additional_info",
+      pendingAction: {
+        type: "additional_info",
+        questions: [expect.objectContaining({ id: "job_location" })],
+      },
+    });
+
+    const runningHarness = new FakeHarness();
+    runningHarness.snapshotAfterCreate = harnessSnapshot("running");
+    const running = await createTarget({ harness: runningHarness });
+    await running.service.start(running.runId, running.pdf.sha256, signal());
+    await expect(running.service.command(running.runId, command, signal()))
+      .rejects.toMatchObject({
+        code: "APPLICATION_COMMAND_CONFLICT",
+        status: 409,
+      });
+    expect(runningHarness.commandCalls).toEqual([]);
+  });
+
   test("forwards credentials only to the harness and retains only the durable gate marker", async () => {
     const harness = new FakeHarness();
     harness.snapshotAfterCreate = {

@@ -58,11 +58,13 @@ from jobhunter_browser_harness.models import (
     PlaywrightCliResultRuntimeActionResponse,
     PlaywrightCliRuntimeAction,
     ContinueRuntimeActionResponse,
+    ContinueWithoutAdditionalInfoRuntimeActionResponse,
     CancelCommand,
     SaveCredentialsCommand,
     SignInCommand,
     SignInRuntimeActionResponse,
     ContinueCommand,
+    ContinueWithoutAdditionalInfoCommand,
     OpportunityKind,
     HarnessConfig,
     ProvideAdditionalInfoCommand,
@@ -3831,6 +3833,76 @@ async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagno
         "private code"
         not in manager.get_snapshot(created.session_id).model_dump_json()
     )
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_additional_info_continue_resumes_same_run_without_persistence(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    record.playwright_runtime = FakePlaywrightRuntime()
+    await manager.runtime_action(
+        created.session_id,
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
+    )
+    store_path = tmp_path / "user-info.json"
+    store_before = store_path.read_bytes()
+    pending = asyncio.create_task(
+        manager.runtime_action(
+            created.session_id,
+            RequestAdditionalInfoRuntimeAction(
+                type="request_additional_info",
+                questions=[
+                    AdditionalInfoTextQuestion(
+                        id="availability",
+                        key="availability.summer_2027",
+                        scope="global",
+                        question="What dates are you available?",
+                        answer_type="text",
+                    )
+                ],
+            ),
+        )
+    )
+    await wait_until(lambda: record.human_gate.pending_kind == "additional_info")
+
+    with pytest.raises(HarnessServiceError) as navigation_continue:
+        await manager.command(
+            created.session_id,
+            ContinueCommand(type="continue"),
+        )
+    assert_service_error(
+        navigation_continue.value,
+        409,
+        "command_conflict",
+        "No matching human gate is pending",
+    )
+    assert pending.done() is False
+    assert manager.get_snapshot(created.session_id).state == "awaiting_additional_info"
+
+    await manager.command(
+        created.session_id,
+        ContinueWithoutAdditionalInfoCommand(
+            type="continue_without_additional_info"
+        ),
+    )
+    response = await pending
+
+    assert response == ContinueWithoutAdditionalInfoRuntimeActionResponse(
+        type="continue_without_additional_info"
+    )
+    assert manager._active is record
+    assert record.session_id == created.session_id
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.state == "running"
+    assert snapshot.pending_action is None
+    assert record.human_gate.pending_kind is None
+    assert store_path.read_bytes() == store_before
+    assert all(event.event != "additional_info_saved" for event in record.events)
     await manager.delete(created.session_id)
 
 

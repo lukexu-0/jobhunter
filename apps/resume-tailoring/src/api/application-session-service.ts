@@ -993,6 +993,7 @@ export class ApplicationSessionService {
     if (
       session
       && command.type !== "steer"
+      && command.type !== "continue_without_additional_info"
       && retainedSubmissionFinal(session)
     ) {
       throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
@@ -1008,6 +1009,10 @@ export class ApplicationSessionService {
           STEERABLE_APPLICATION_STATES[session.bridgeState] !== true
           || retainedSubmissionFinal(session)
         )
+      )
+      || (
+        command.type === "continue_without_additional_info"
+        && session.bridgeState !== "awaiting_additional_info"
       )
       || (
         command.type === "submit"

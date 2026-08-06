@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type {
+  ApplicationAdditionalInfoQuestion,
   ApplicationSessionSnapshotDto,
   ResumeIterationDto,
   RunDto,
@@ -288,5 +289,59 @@ describe("RunReviewWorkspace", () => {
       }),
     )).toBeTrue();
     expect(isApplicationActionLatchBusy(cancelledSignInLatch)).toBeFalse();
+  });
+
+  test("keeps additional-information Continue busy until its exact gate changes or disappears", () => {
+    const questions: ApplicationAdditionalInfoQuestion[] = [{
+      id: "location",
+      scope: "application",
+      question: "Which locations can you work from?",
+      answerType: "text",
+    }];
+    const baseline = reviewSnapshot({
+      bridgeState: "awaiting_additional_info",
+      harnessState: "awaiting_additional_info",
+      pendingAction: { type: "additional_info", questions },
+    });
+
+    const changedQuestionsLatch = createApplicationCommandLatch(
+      { type: "continue_without_additional_info" },
+      baseline,
+    );
+    expect(settleApplicationActionRequest(changedQuestionsLatch)).toBeFalse();
+    expect(acceptApplicationActionProjection(changedQuestionsLatch, reviewSnapshot({
+      bridgeState: "awaiting_additional_info",
+      harnessState: "awaiting_additional_info",
+      pendingAction: { type: "additional_info", questions },
+      updatedAt: baseline.updatedAt + 1,
+    }))).toBeFalse();
+    expect(isApplicationActionLatchBusy(changedQuestionsLatch)).toBeTrue();
+    expect(acceptApplicationActionProjection(changedQuestionsLatch, reviewSnapshot({
+      bridgeState: "awaiting_additional_info",
+      harnessState: "awaiting_additional_info",
+      pendingAction: {
+        type: "additional_info",
+        questions: [{
+          ...questions[0],
+          question: "Which locations are you willing to commute to?",
+        }],
+      },
+      updatedAt: baseline.updatedAt + 2,
+    }))).toBeTrue();
+    expect(isApplicationActionLatchBusy(changedQuestionsLatch)).toBeFalse();
+
+    const departedGateLatch = createApplicationCommandLatch(
+      { type: "continue_without_additional_info" },
+      baseline,
+    );
+    expect(acceptApplicationActionProjection(departedGateLatch, reviewSnapshot({
+      bridgeState: "running",
+      harnessState: "running",
+      pendingAction: null,
+      updatedAt: baseline.updatedAt + 1,
+    }))).toBeFalse();
+    expect(isApplicationActionLatchBusy(departedGateLatch)).toBeTrue();
+    expect(settleApplicationActionRequest(departedGateLatch)).toBeTrue();
+    expect(isApplicationActionLatchBusy(departedGateLatch)).toBeFalse();
   });
 });

@@ -1224,6 +1224,75 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
 });
 
+test("additional-information Continue sends no answers and stays busy across a same-gate projection", async ({ page }) => {
+  const questions: ApplicationAdditionalInfoQuestion[] = [{
+    id: "location",
+    scope: "application",
+    question: "Which locations can you work from?",
+    answerType: "text",
+  }];
+  const initial = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions },
+    updatedAt: createdAt + 100,
+  });
+  const sameGate = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions },
+    updatedAt: createdAt + 200,
+    company: "Same gate projection",
+  });
+  const progressed = snapshotFixture({
+    bridgeState: "running",
+    updatedAt: createdAt + 300,
+    company: "Progressed projection",
+  });
+  const sameGateFrame = deferred();
+  const progressFrame = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: initial,
+  });
+  queueSse(
+    mock,
+    eventFixture("snapshot", sameGate, {}),
+    2,
+    sameGateFrame.promise,
+  );
+  queueSse(
+    mock,
+    eventFixture("snapshot", progressed, {}),
+    3,
+    progressFrame.promise,
+  );
+
+  await page.goto(`/runs/${runId}`);
+  const continueButton = page.getByRole("button", { name: "Continue", exact: true });
+  await expect(continueButton).toBeVisible();
+  await expect(continueButton).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Answer questions", exact: true }))
+    .toBeDisabled();
+
+  await continueButton.click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands[0]).toEqual({ type: "continue_without_additional_info" });
+  const continuingButton = page.getByRole("button", { name: "Continuing…", exact: true });
+  await expect(continuingButton).toBeDisabled();
+
+  sameGateFrame.resolve();
+  await expect(page.getByText("Same gate projection", { exact: true })).toBeVisible();
+  await expect(continuingButton).toBeDisabled();
+  expect(mock.commands).toEqual([{ type: "continue_without_additional_info" }]);
+
+  progressFrame.resolve();
+  await expect(page.getByText("Progressed projection", { exact: true })).toBeVisible();
+  await expect(continuingButton).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Additional information needed" }))
+    .toHaveCount(0);
+  expect(mock.commands).toEqual([{ type: "continue_without_additional_info" }]);
+});
+
 test("a changed question gate suppresses stale continuation after steering", async ({ page }) => {
   const oldQuestion: ApplicationAdditionalInfoQuestion = {
     id: "old_question",

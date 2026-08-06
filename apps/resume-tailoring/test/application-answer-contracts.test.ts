@@ -60,6 +60,25 @@ describe("application answer public contracts", () => {
     });
   });
 
+  test("keeps navigation continue separate from strict additional-information continuation", () => {
+    expect(ApplicationSessionCommandSchema.parse({ type: "continue" })).toEqual({
+      type: "continue",
+    });
+    expect(ApplicationSessionCommandSchema.parse({
+      type: "continue_without_additional_info",
+    })).toEqual({
+      type: "continue_without_additional_info",
+    });
+    expect(ApplicationSessionCommandSchema.safeParse({
+      type: "continue_without_additional_info",
+      answers: [],
+    }).success).toBe(false);
+    expect(ApplicationSessionCommandSchema.safeParse({
+      type: "continue_without_additional_info",
+      extra: true,
+    }).success).toBe(false);
+  });
+
   test("strictly validates bounded suggestion and professionalization DTOs by Unicode code point", () => {
     expect(ApplicationAnswerSuggestionsResponseSchema.parse({
       suggestions: [{

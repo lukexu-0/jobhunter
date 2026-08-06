@@ -18,6 +18,7 @@ from .models import (
     AdditionalInfoMultiSelectQuestion,
     AdditionalInfoQuestion,
     AdditionalInfoRuntimeActionResponse,
+    ContinueWithoutAdditionalInfoRuntimeActionResponse,
     AdditionalInfoSingleSelectCommandAnswer,
     AdditionalInfoSingleSelectQuestion,
     AdditionalInfoTextCommandAnswer,
@@ -45,6 +46,7 @@ ReviewSnapshotSink = Callable[[ReviewApplicationResult], Awaitable[None]]
 GateKind = Literal["navigation", "credentials", "origin", "additional_info", "review"]
 DecisionKind = Literal[
     "continue",
+    "continue_without_additional_info",
     "sign_in",
     "save_credentials",
     "approve",
@@ -602,6 +604,20 @@ class HumanGate:
         )
         if decision == "cancel":
             return await self._cancelled_result(runtime)
+        if decision == "continue_without_additional_info" and payload is None:
+            response = ContinueWithoutAdditionalInfoRuntimeActionResponse(
+                type="continue_without_additional_info"
+            )
+            return GateResult(
+                success=True,
+                extracted_content=response.model_dump_json(),
+                long_term_memory=(
+                    "The human chose Continue without providing answers. Re-inspect "
+                    "the current application step and attempt to continue "
+                    "without inferring or fabricating information. Re-ask only if the "
+                    "site still requires the information."
+                ),
+            )
         if decision != "additional_info" or not isinstance(payload, tuple):
             raise RuntimeError("Additional-information gate returned an invalid result")
         response = AdditionalInfoRuntimeActionResponse(
@@ -865,6 +881,12 @@ class HumanGate:
                 {"count": len(accepted)},
             )
             pending.future.set_result(("additional_info", accepted))
+
+    async def continue_without_additional_info(self) -> None:
+        async with self._lock:
+            pending = self._require_pending("additional_info")
+            await self._publish("running", None, {})
+            pending.future.set_result(("continue_without_additional_info", None))
 
     async def revise(self, context: str) -> None:
         trimmed = context.strip()

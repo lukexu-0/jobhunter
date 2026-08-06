@@ -7,12 +7,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import UploadFile
-from pydantic import ValidationError
+from pydantic import Field, TypeAdapter, ValidationError
 
 from .credentials import CredentialStore
 from .agent import ApplicationRunRequest, build_application_task
@@ -36,6 +36,7 @@ from .models import (
     AdditionalInfoRequiredDetail,
     ApplicationAnswerSuggestionsResponse,
     AdditionalInfoRuntimeActionResponse,
+    ContinueWithoutAdditionalInfoRuntimeActionResponse,
     AdditionalInfoSavedDetail,
     AgentStepDetail,
     PlaywrightCliDiagnostic,
@@ -55,6 +56,7 @@ from .models import (
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     ContinueCommand,
+    ContinueWithoutAdditionalInfoCommand,
     EmptyEventDetail,
     HarnessConfig,
     ProvideAdditionalInfoCommand,
@@ -102,6 +104,13 @@ from .user_info import UserInfoSnapshot, UserInfoStore
 
 
 logger = logging.getLogger(__name__)
+_ADDITIONAL_INFO_GATE_RESPONSE_ADAPTER = TypeAdapter(
+    Annotated[
+        AdditionalInfoRuntimeActionResponse
+        | ContinueWithoutAdditionalInfoRuntimeActionResponse,
+        Field(discriminator="type"),
+    ]
+)
 _EVENT_LIMIT = 256
 _TOMBSTONE_LIMIT = 32
 _HEARTBEAT_SECONDS = 15.0
@@ -860,6 +869,8 @@ class ApplicationSessionManager:
                     )
                 if isinstance(command, ContinueCommand):
                     await gate.continue_navigation()
+                elif isinstance(command, ContinueWithoutAdditionalInfoCommand):
+                    await gate.continue_without_additional_info()
                 elif isinstance(command, ApproveOriginCommand):
                     await gate.approve_origin(command.origin)
                 elif isinstance(command, ReviseCommand):
@@ -1296,7 +1307,7 @@ class ApplicationSessionManager:
             if terminal is not None:
                 return terminal
             try:
-                return AdditionalInfoRuntimeActionResponse.model_validate_json(
+                return _ADDITIONAL_INFO_GATE_RESPONSE_ADAPTER.validate_json(
                     gate_result.extracted_content
                 )
             except (TypeError, ValidationError):

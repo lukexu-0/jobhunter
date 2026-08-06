@@ -1074,6 +1074,7 @@ export type ApplicationAgentSteerRequest = z.infer<
 
 export const ApplicationSessionCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("continue") }).strict(),
+  z.object({ type: z.literal("continue_without_additional_info") }).strict(),
   z.object({
     type: z.literal("steer"),
     message: ApplicationSteeringMessageSchema,
