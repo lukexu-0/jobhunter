@@ -944,6 +944,99 @@ async def test_additional_info_gate_publishes_complete_questions_and_persists_re
 
 
 @pytest.mark.asyncio
+async def test_additional_info_continue_resumes_without_persisting_answers(
+    tmp_path: Path,
+) -> None:
+    class TrackingUserInfoStore(UserInfoStore):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.merge_calls = 0
+
+        async def merge(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
+            self.merge_calls += 1
+            return await super().merge(*args, **kwargs)
+
+    store_path = tmp_path / "user-info.json"
+    store = TrackingUserInfoStore(store_path)
+    before_store = store_path.read_bytes()
+    before_facts = store.snapshot(JOB_URL).as_task_payload()
+    gate, publisher = make_gate(user_info_store=store)
+    runtime = FakeRuntime()
+    questions = (
+        AdditionalInfoTextQuestion(
+            id="availability",
+            key="availability.summer_2027",
+            scope="global",
+            question="What dates are you available?",
+            answer_type="text",
+        ),
+        AdditionalInfoSingleSelectQuestion(
+            id="referral",
+            key="referral.source",
+            scope="application",
+            question="How did you hear about this position?",
+            answer_type="single_select",
+            options=[
+                AdditionalInfoOption(id="friend", label="A friend"),
+                AdditionalInfoOption(id="board", label="Job board"),
+            ],
+        ),
+    )
+    pending = asyncio.create_task(gate.request_additional_info(questions, runtime))
+
+    assert (await publisher.next_event())[:2] == (
+        "awaiting_additional_info",
+        "additional_info_required",
+    )
+    await gate.continue_without_additional_info()
+    with pytest.raises(HarnessServiceError) as repeated:
+        await gate.continue_without_additional_info()
+    result = await pending
+
+    assert_conflict(repeated.value)
+    assert json.loads(result.extracted_content) == {
+        "type": "continue_without_additional_info"
+    }
+    assert result.is_done is False
+    assert result.success is True
+    assert gate.pending_kind is None
+    assert publisher.events[-1] == ("running", None, {})
+    assert all(event != "additional_info_saved" for _state, event, _detail in publisher.events)
+    assert store.merge_calls == 0
+    assert store_path.read_bytes() == before_store
+    assert store.snapshot(JOB_URL).as_task_payload() == before_facts
+
+
+@pytest.mark.asyncio
+async def test_additional_info_continue_conflicts_in_wrong_pending_state() -> None:
+    gate, publisher = make_gate()
+    runtime = FakeRuntime()
+
+    with pytest.raises(HarnessServiceError) as without_gate:
+        await gate.continue_without_additional_info()
+    assert_conflict(without_gate.value)
+
+    navigation = asyncio.create_task(
+        gate.request_human_navigation("Complete navigation.", runtime)
+    )
+    await publisher.next_event()
+    with pytest.raises(HarnessServiceError) as wrong_gate:
+        await gate.continue_without_additional_info()
+
+    assert_conflict(wrong_gate.value)
+    assert gate.pending_kind == "navigation"
+    assert publisher.events == [
+        (
+            "awaiting_human_navigation",
+            "human_navigation_required",
+            {"instruction": "Complete navigation."},
+        )
+    ]
+    await gate.continue_navigation()
+    await navigation
+
+
+@pytest.mark.asyncio
 async def test_additional_info_invalid_and_failed_commands_leave_gate_pending(
     tmp_path: Path,
 ) -> None:

@@ -27,11 +27,13 @@ from jobhunter_browser_harness.models import (
     CancelledApplicationResult,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
+    ContinueWithoutAdditionalInfoRuntimeActionResponse,
     ProvideAdditionalInfoCommand,
     ApproveOriginCommand,
     BrowserLaunchConfig,
     CancelCommand,
     ContinueCommand,
+    ContinueWithoutAdditionalInfoCommand,
     SaveCredentialsCommand,
     SignInCommand,
     FieldResult,
@@ -761,6 +763,10 @@ def test_session_snapshot_releases_slot_only_after_terminal_cleanup() -> None:
     ("payload", "command_type"),
     [
         ({"type": "continue"}, ContinueCommand),
+        (
+            {"type": "continue_without_additional_info"},
+            ContinueWithoutAdditionalInfoCommand,
+        ),
         ({"type": "approve_origin", "origin": "HTTPS://ATS.Example/"}, ApproveOriginCommand),
         ({"type": "revise", "context": "  Correct this field.  "}, ReviseCommand),
         ({"type": "steer", "message": "  Use the updated operator guidance.  "}, SteerCommand),
@@ -821,6 +827,37 @@ def test_command_union_uses_strict_discriminators(
         assert projected["username"] == "**********"
         assert projected["password"] == "**********"
         assert "ada@example.test" not in repr(command)
+
+
+def test_additional_info_continue_is_distinct_from_navigation_and_strict() -> None:
+    navigation = COMMAND_ADAPTER.validate_python({"type": "continue"})
+    additional_info = COMMAND_ADAPTER.validate_python(
+        {"type": "continue_without_additional_info"}
+    )
+    response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {"type": "continue_without_additional_info"}
+    )
+
+    assert isinstance(navigation, ContinueCommand)
+    assert isinstance(additional_info, ContinueWithoutAdditionalInfoCommand)
+    assert isinstance(
+        response,
+        ContinueWithoutAdditionalInfoRuntimeActionResponse,
+    )
+    assert additional_info.model_dump(mode="json") == {
+        "type": "continue_without_additional_info"
+    }
+    assert response.model_dump(mode="json") == {
+        "type": "continue_without_additional_info"
+    }
+    for adapter in (COMMAND_ADAPTER, RUNTIME_ACTION_RESPONSE_ADAPTER):
+        with pytest.raises(ValidationError):
+            adapter.validate_python(
+                {
+                    "type": "continue_without_additional_info",
+                    "answers": [],
+                }
+            )
 
 
 def test_text_additional_info_command_requires_distinct_trimmed_raw_and_final_values() -> None:
@@ -952,6 +989,10 @@ def test_steer_command_rejects_empty_nul_non_scalar_and_oversize_text(
         {},
         {"type": "unknown"},
         {"type": "continue", "extra": "rejected"},
+        {
+            "type": "continue_without_additional_info",
+            "extra": "rejected",
+        },
         {"type": "submit", "context": "not allowed"},
         {"type": "ready"},
         {"type": "approve_origin"},
@@ -1415,6 +1456,10 @@ async def test_sse_rejects_invalid_or_negative_last_event_id(
     ("payload", "command_type"),
     [
         ({"type": "continue"}, ContinueCommand),
+        (
+            {"type": "continue_without_additional_info"},
+            ContinueWithoutAdditionalInfoCommand,
+        ),
         ({"type": "approve_origin", "origin": "https://ats.example"}, ApproveOriginCommand),
         ({"type": "revise", "context": "  use corrected fact  "}, ReviseCommand),
         ({"type": "steer", "message": "  use the changed posting details  "}, SteerCommand),
@@ -2070,6 +2115,7 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
             },
         },
         {"type": "continue"},
+        {"type": "continue_without_additional_info"},
         {"type": "revise", "context": "Use the corrected date.", "revision_count": 1},
         {
             "type": "submit",
@@ -2118,6 +2164,13 @@ def test_runtime_action_unions_reject_unknown_properties() -> None:
     with pytest.raises(ValidationError):
         RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
             {"type": "continue", "unexpected": True}
+        )
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {
+                "type": "continue_without_additional_info",
+                "unexpected": True,
+            }
         )
     with pytest.raises(ValidationError):
         RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(

@@ -622,6 +622,41 @@ describe("HttpApplicationRuntimeClient", () => {
     expect((requests[0]?.init as RequestInit & { timeout?: boolean }).timeout).toBe(false);
     expect(requests[0]?.init.signal).toBeInstanceOf(AbortSignal);
   });
+
+  test("accepts the strict continue-without-additional-info response without answer payloads", async () => {
+    const requests: unknown[] = [];
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ type: "continue_without_additional_info" });
+      },
+    );
+    const action: RuntimeActionRequest = {
+      type: "request_additional_info",
+      questions: [...ADDITIONAL_INFO_QUESTIONS],
+    };
+
+    await expect(client.action(
+      action,
+      new AbortController().signal,
+      1_000,
+    )).resolves.toEqual({
+      type: "continue_without_additional_info",
+    });
+    expect(requests).toEqual([action]);
+    expect(RuntimeActionResponseSchema.safeParse({
+      type: "continue_without_additional_info",
+      answers: [],
+    }).success).toBe(false);
+    expect(RuntimeActionResponseSchema.safeParse({
+      type: "continue_without_additional_info",
+      unexpected: true,
+    }).success).toBe(false);
+  });
+
   test("validates and serializes every runtime action variant", async () => {
     expect(RuntimeActionRequestSchema.parse({
       type: "playwright_cli",

@@ -51,6 +51,12 @@ const callbacks = {
   onProfessionalize: async () => ({ answer: "Professional answer" }),
 };
 
+function buttonOpeningTag(markup: string, label: string): string {
+  const labelIndex = markup.indexOf(`>${label}</button>`);
+  expect(labelIndex).toBeGreaterThanOrEqual(0);
+  return markup.slice(markup.lastIndexOf("<button", labelIndex), labelIndex);
+}
+
 describe("ApplicationSessionPanel", () => {
   test("renders projected progress and only state-valid lifecycle controls", () => {
     const running = renderToStaticMarkup(
@@ -512,12 +518,35 @@ describe("ApplicationSessionPanel", () => {
     expect(markup).toContain("Remote");
     expect(markup).toContain("Monday");
     expect(markup.match(/Decline to answer/g)).toHaveLength(4);
-    expect(markup).toContain('disabled="" type="submit">Answer questions');
+    expect(buttonOpeningTag(markup, "Answer questions")).toContain("disabled");
     expect(markup).toContain("Steer and answer questions");
     expect(markup).toContain("Professionalize");
     expect(markup).toContain('aria-label="Professionalize settings"');
     expect(markup).toContain('aria-expanded="false"');
     expect(markup).toContain("Previous answers");
+    expect(markup).toContain("without saving answers");
+    expect(buttonOpeningTag(markup, "Continue")).not.toContain("disabled");
+
+    const continuingMarkup = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        actionBusy="continue_without_additional_info"
+        snapshot={snapshot({
+          bridgeState: "awaiting_additional_info",
+          harnessState: "awaiting_additional_info",
+          pendingAction: {
+            type: "additional_info",
+            questions: [{
+              id: "motivation",
+              scope: "application",
+              question: "Why are you interested in this role?",
+              answerType: "text",
+            }],
+          },
+        })}
+      />,
+    );
+    expect(buttonOpeningTag(continuingMarkup, "Continuing…")).toContain("disabled");
   });
 
   test("renders transient revision guidance and the submission confirmation", () => {
