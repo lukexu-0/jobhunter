@@ -123,10 +123,27 @@ function isTerminalApplicationSnapshot(snapshot: ApplicationSessionSnapshotDto):
     || snapshot.bridgeState === "lost";
 }
 
+function additionalInfoContinueProjectionMatcher(
+  baseline: ApplicationSessionSnapshotDto,
+): (view: ApplicationSessionView) => boolean {
+  if (baseline.pendingAction?.type !== "additional_info") return () => false;
+  const baselineQuestions = JSON.stringify(baseline.pendingAction.questions);
+  return (view) => {
+    const next = applicationSnapshot(view);
+    if (!next) return false;
+    if (next.generation < baseline.generation) return false;
+    return next.pendingAction?.type !== "additional_info"
+      || JSON.stringify(next.pendingAction.questions) !== baselineQuestions;
+  };
+}
+
 function commandProjectionMatcher(
   command: ApplicationGateCommand,
   baseline: ApplicationSessionSnapshotDto,
 ): (view: ApplicationSessionView) => boolean {
+  if (command.type === "continue_without_additional_info") {
+    return additionalInfoContinueProjectionMatcher(baseline);
+  }
   const navigationInstruction = baseline.pendingAction?.type === "human_navigation"
     ? baseline.pendingAction.instruction
     : null;

@@ -955,6 +955,10 @@ class ContinueCommand(PublicModel):
     type: Literal["continue"]
 
 
+class ContinueWithoutAdditionalInfoCommand(PublicModel):
+    type: Literal["continue_without_additional_info"]
+
+
 class ApproveOriginCommand(PublicModel):
     type: Literal["approve_origin"]
     origin: StrictText
@@ -1012,6 +1016,7 @@ class ProvideAdditionalInfoCommand(PublicModel):
 
 SessionCommand: TypeAlias = Annotated[
     ContinueCommand
+    | ContinueWithoutAdditionalInfoCommand
     | ApproveOriginCommand
     | ReviseCommand
     | SteerCommand
@@ -1300,6 +1305,10 @@ class ContinueRuntimeActionResponse(PublicModel):
     type: Literal["continue"]
 
 
+class ContinueWithoutAdditionalInfoRuntimeActionResponse(PublicModel):
+    type: Literal["continue_without_additional_info"]
+
+
 class ReviseRuntimeActionResponse(PublicModel):
     type: Literal["revise"]
     context: Annotated[
@@ -1338,6 +1347,7 @@ RuntimeActionResponse: TypeAlias = Annotated[
     PlaywrightCliResultRuntimeActionResponse
     | SignInRuntimeActionResponse
     | ContinueRuntimeActionResponse
+    | ContinueWithoutAdditionalInfoRuntimeActionResponse
     | ReviseRuntimeActionResponse
     | SubmitRuntimeActionResponse
     | CancelRuntimeActionResponse

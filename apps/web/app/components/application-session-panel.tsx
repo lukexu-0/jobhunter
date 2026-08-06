@@ -104,6 +104,7 @@ const ACTION_STATUS_LABELS: Readonly<Record<ApplicationPanelAction, string>> = {
   cancel: "Cancelling application",
   close: "Closing browser",
   continue: "Continuing application",
+  continue_without_additional_info: "Continuing without answers",
   sign_in: "Signing in with credentials",
   save_credentials: "Saving credentials",
   approve_origin: "Approving origin",
@@ -560,8 +561,11 @@ export function ApplicationSessionPanel({
         <ApplicationAdditionalInfoForm
           key={`${snapshot.generation}:${JSON.stringify(pendingAction.questions)}`}
           busy={busy || steeringState === "sending"}
+          continuing={actionBusy === "continue_without_additional_info"}
           onLoadSuggestions={onLoadSuggestions}
           onProfessionalize={onProfessionalize}
+          onContinue={() =>
+            onCommand({ type: "continue_without_additional_info" })}
           onSteerAndContinue={(command) =>
             submitSteering((token) => onCommand(command, token))}
           onSubmit={onCommand}

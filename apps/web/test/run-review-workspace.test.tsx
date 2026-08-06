@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type {
+  ApplicationAdditionalInfoQuestion,
   ApplicationSessionSnapshotDto,
   ResumeIterationDto,
   RunDto,
@@ -291,12 +292,12 @@ describe("RunReviewWorkspace", () => {
   });
 
   test("keeps additional-information Continue busy until its exact gate changes or disappears", () => {
-    const questions = [{
+    const questions: ApplicationAdditionalInfoQuestion[] = [{
       id: "location",
       scope: "application",
       question: "Which locations can you work from?",
       answerType: "text",
-    }] as const;
+    }];
     const baseline = reviewSnapshot({
       bridgeState: "awaiting_additional_info",
       harnessState: "awaiting_additional_info",

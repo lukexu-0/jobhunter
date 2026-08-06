@@ -26,6 +26,7 @@ import styles from "../run-detail.module.css";
 
 interface ApplicationAdditionalInfoFormProps {
   readonly submitting: boolean;
+  readonly continuing: boolean;
   readonly questions: readonly ApplicationAdditionalInfoQuestion[];
   readonly busy: boolean;
   readonly steeringDisabled: boolean;
@@ -38,6 +39,7 @@ interface ApplicationAdditionalInfoFormProps {
     request: ApplicationProfessionalizeRequest,
     signal: AbortSignal,
   ) => Promise<ApplicationProfessionalizeResponse>;
+  readonly onContinue: () => Promise<void>;
   readonly onSteerAndContinue: (
     command: ApplicationSessionCommand,
   ) => Promise<void>;
@@ -92,9 +94,11 @@ function answeredValue(
 export function ApplicationAdditionalInfoForm({
   questions,
   busy,
+  continuing,
   submitting,
   steeringDisabled,
   onLoadSuggestions,
+  onContinue,
   onProfessionalize,
   onSteerAndContinue,
   onSubmit,
@@ -436,7 +440,10 @@ export function ApplicationAdditionalInfoForm({
     <form className={styles.applicationAdditionalInfoForm} noValidate onSubmit={(event) => void submit(event)}>
       <div>
         <h3>Additional information needed</h3>
-        <p>Provide an answer or explicitly decline each question.</p>
+        <p>
+          Provide an answer or explicitly decline each question. Continue attempts
+          progress without saving answers.
+        </p>
       </div>
       {questions.map((question) => {
         const draft = drafts[question.id];
@@ -557,6 +564,7 @@ export function ApplicationAdditionalInfoForm({
                         <input
                           aria-describedby={`${settingsId}-description`}
                           checked
+                          disabled={busy}
                           name={`${settingsId}-prompt`}
                           readOnly
                           type="radio"
@@ -817,6 +825,14 @@ export function ApplicationAdditionalInfoForm({
         type="submit"
       >
         {submitting ? "Answering…" : "Answer questions"}
+      </button>
+      <button
+        className={styles.secondaryButton}
+        disabled={busy || answerToolBusy}
+        onClick={() => void onContinue()}
+        type="button"
+      >
+        {continuing ? "Continuing…" : "Continue"}
       </button>
       <button
         className={styles.secondaryButton}
