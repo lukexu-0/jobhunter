@@ -2045,6 +2045,41 @@ class PlaywrightCliRuntime:
         ):
             raise PlaywrightCliRuntimeError("browser_failed")
 
+    def _report_guard_suspension_failure(
+        self,
+        *,
+        error_category: Literal[
+            "timeout",
+            "process_exit",
+            "cli_error",
+            "runtime_error",
+        ],
+        exit_code: int | None,
+        timed_out: bool,
+        reported_cli_error: bool,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    ) -> None:
+        try:
+            logger.error(
+                json.dumps(
+                    {
+                        "event": "playwright_cli_lifecycle_failure",
+                        "sessionId": str(self._session_id),
+                        "operation": "suspend_navigation_guard",
+                        "errorCategory": error_category,
+                        "exitCode": exit_code,
+                        "timedOut": timed_out,
+                        "reportedCliError": reported_cli_error,
+                        "stdoutTruncated": stdout_truncated,
+                        "stderrTruncated": stderr_truncated,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        except Exception:
+            pass
+
     async def start(self, job_url: str) -> None:
         async with self._operation_lock:
             if self._started or self._opened or self._closed:
@@ -2406,12 +2441,24 @@ class PlaywrightCliRuntime:
         async with self._operation_lock:
             if not self._opened or self._closed or not self._guard_armed:
                 return
-            result = await self._invoke(
-                "run-code",
-                [self._suspend_guard_script()],
-                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
-                capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
-            )
+            try:
+                result = await self._invoke(
+                    "run-code",
+                    [self._suspend_guard_script()],
+                    timeout=_LIFECYCLE_TIMEOUT_SECONDS,
+                    capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+                )
+            except PlaywrightCliRuntimeError as error:
+                timed_out = error.code == "session_timeout"
+                self._report_guard_suspension_failure(
+                    error_category="timeout" if timed_out else "runtime_error",
+                    exit_code=None,
+                    timed_out=timed_out,
+                    reported_cli_error=False,
+                    stdout_truncated=False,
+                    stderr_truncated=False,
+                )
+                raise
             reported_cli_error = self._reported_cli_error(result)
             if result.timed_out or result.exit_code != 0 or reported_cli_error:
                 error_category = (
@@ -2421,21 +2468,13 @@ class PlaywrightCliRuntime:
                     if result.exit_code != 0
                     else "cli_error"
                 )
-                logger.error(
-                    json.dumps(
-                        {
-                            "event": "playwright_cli_lifecycle_failure",
-                            "sessionId": str(self._session_id),
-                            "operation": "suspend_navigation_guard",
-                            "errorCategory": error_category,
-                            "exitCode": result.exit_code,
-                            "timedOut": result.timed_out,
-                            "reportedCliError": reported_cli_error,
-                            "stdoutTruncated": result.stdout_truncated,
-                            "stderrTruncated": result.stderr_truncated,
-                        },
-                        separators=(",", ":"),
-                    )
+                self._report_guard_suspension_failure(
+                    error_category=error_category,
+                    exit_code=result.exit_code,
+                    timed_out=result.timed_out,
+                    reported_cli_error=reported_cli_error,
+                    stdout_truncated=result.stdout_truncated,
+                    stderr_truncated=result.stderr_truncated,
                 )
             self._require_success(result)
             self._guard_armed = False

@@ -1400,6 +1400,80 @@ async def test_runtime_logs_fixed_metadata_when_guard_suspension_times_out(
         "stderrTruncated": False,
     }]
 
+    def fail_logging(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("logging failed")
+
+    monkeypatch.setattr(playwright_cli.logger, "error", fail_logging)
+    with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
+        await runtime.suspend_navigation_guard()
+
+
+@pytest.mark.asyncio
+async def test_runtime_logs_fixed_metadata_when_guard_invocation_fails(
+    session_dir: Path,
+    cli_script: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    suspension_started = False
+
+    def mock_process_factory(*argv: str, **kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        if suspension_started and command == "run-code":
+            raise OSError("private process failure")
+        stdout = b""
+        if command == "run-code":
+            stdout = json.dumps({
+                "result": json.dumps({
+                    "url": "https://example.com/jobs/1",
+                    "title": "Software Engineer",
+                    "currentIndex": 0,
+                    "tabs": [{
+                        "url": "https://example.com/jobs/1",
+                        "title": "Software Engineer",
+                    }],
+                })
+            }).encode("utf-8")
+        return DummyProcess(argv=argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000002"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=mock_process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    suspension_started = True
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="jobhunter_browser_harness.playwright_cli",
+    ):
+        with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
+            await runtime.suspend_navigation_guard()
+
+    messages = [
+        json.loads(record.message)
+        for record in caplog.records
+        if "playwright_cli_lifecycle_failure" in record.message
+    ]
+    assert messages == [{
+        "event": "playwright_cli_lifecycle_failure",
+        "sessionId": "00000000-0000-0000-0000-000000000002",
+        "operation": "suspend_navigation_guard",
+        "errorCategory": "runtime_error",
+        "exitCode": None,
+        "timedOut": False,
+        "reportedCliError": False,
+        "stdoutTruncated": False,
+        "stderrTruncated": False,
+    }]
+
 @pytest.mark.asyncio
 async def test_runtime_idempotent_cleanup(session_dir: Path, cli_script: Path) -> None:
     launch = ResolvedBrowserLaunch(cdp_url="http://127.0.0.1:9222", executable_path=None, user_data_dir=None)
