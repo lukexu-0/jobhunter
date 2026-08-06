@@ -29,6 +29,237 @@ export const APPLICATION_AGENT_MODEL_PROVIDER = "openai-codex" as const;
 export const APPLICATION_AGENT_MODEL = "gpt-5.6-sol" as const;
 export const APPLICATION_AGENT_REASONING = "high" as const;
 
+export type ApplicationAgentDiagnosticCategory =
+  | "aborted"
+  | "connection_closed"
+  | "context_overflow"
+  | "invalid_response"
+  | "network"
+  | "provider_authentication"
+  | "provider_error"
+  | "rate_limited"
+  | "stream_first_event_timeout"
+  | "stream_idle_timeout"
+  | "timeout"
+  | "unknown";
+
+export interface ApplicationAgentDiagnosticError {
+  readonly name: string;
+  readonly category: ApplicationAgentDiagnosticCategory;
+  readonly code?: string;
+}
+
+export interface ApplicationAgentFailureDiagnostic {
+  readonly event: "application_agent_failure";
+  readonly sessionId: string;
+  readonly phase: "agent_run";
+  readonly errorChain: readonly ApplicationAgentDiagnosticError[];
+}
+
+export type ApplicationAgentDiagnosticSink = (
+  diagnostic: ApplicationAgentFailureDiagnostic,
+) => void | PromiseLike<void>;
+
+const MAX_DIAGNOSTIC_CAUSE_DEPTH = 4;
+const MAX_DIAGNOSTIC_CLASSIFICATION_CHARS = 2_048;
+const SAFE_DIAGNOSTIC_CODES: Readonly<Record<string, true>> = Object.freeze({
+  ABORT_ERR: true,
+  ECONNABORTED: true,
+  ECONNREFUSED: true,
+  ECONNRESET: true,
+  EHOSTUNREACH: true,
+  ENETUNREACH: true,
+  EPIPE: true,
+  ETIMEDOUT: true,
+  UND_ERR_BODY_TIMEOUT: true,
+  UND_ERR_CONNECT_TIMEOUT: true,
+  UND_ERR_HEADERS_TIMEOUT: true,
+  UND_ERR_SOCKET: true,
+  context_length_exceeded: true,
+  internal_error: true,
+  model_error: true,
+  rate_limit_exceeded: true,
+  server_error: true,
+});
+const SAFE_ERROR_NAMES: Readonly<Record<string, true>> = Object.freeze({
+  AbortError: true,
+  AggregateError: true,
+  ApplicationHistoryProjectionError: true,
+  CodexResponseError: true,
+  DOMException: true,
+  Error: true,
+  FetchError: true,
+  MaxTurnsExceededError: true,
+  ModelBehaviorError: true,
+  RangeError: true,
+  RunError: true,
+  SyntaxError: true,
+  TimeoutError: true,
+  ToolCallError: true,
+  TypeError: true,
+  ZodError: true,
+});
+
+
+function diagnosticCategory(
+  message: string,
+  code: string | undefined,
+): ApplicationAgentDiagnosticCategory {
+  if (
+    code === "UND_ERR_BODY_TIMEOUT"
+    || /sse stream stalled|idle timeout|timed out while waiting for (?:the )?next event/.test(message)
+  ) {
+    return "stream_idle_timeout";
+  }
+  if (
+    code === "UND_ERR_HEADERS_TIMEOUT"
+    || /sse stream timed out while waiting for (?:the )?first event|timeout waiting for (?:the )?first/.test(message)
+  ) {
+    return "stream_first_event_timeout";
+  }
+  if (
+    code === "ECONNRESET"
+    || code === "EPIPE"
+    || code === "UND_ERR_SOCKET"
+    || /socket hang up|socket connection was closed|connection (?:was )?closed|connection reset|broken pipe/.test(message)
+  ) {
+    return "connection_closed";
+  }
+  if (
+    code === "rate_limit_exceeded"
+    || /rate.?limit|too many requests|\b429\b/.test(message)
+  ) {
+    return "rate_limited";
+  }
+  if (
+    /unauthori[sz]ed|forbidden|authentication|\b401\b|\b403\b|token (?:has )?expired/.test(message)
+  ) {
+    return "provider_authentication";
+  }
+  if (
+    code === "context_length_exceeded"
+    || /context (?:length|limit|overflow|window)|maximum context/.test(message)
+  ) {
+    return "context_overflow";
+  }
+  if (code === "ABORT_ERR" || /abort|cancel/.test(message)) return "aborted";
+  if (
+    code === "ETIMEDOUT"
+    || code === "UND_ERR_CONNECT_TIMEOUT"
+    || /timeout|timed out/.test(message)
+  ) {
+    return "timeout";
+  }
+  if (/invalid (?:model )?(?:output|response)|malformed|parse error|invalid json/.test(message)) {
+    return "invalid_response";
+  }
+  if (
+    code === "ECONNABORTED"
+    || code === "ECONNREFUSED"
+    || code === "EHOSTUNREACH"
+    || code === "ENETUNREACH"
+    || /network|fetch failed|connection refused|host unreachable/.test(message)
+  ) {
+    return "network";
+  }
+  if (
+    code === "internal_error"
+    || code === "model_error"
+    || code === "server_error"
+    || /provider.*(?:failed|error)|model error|server error|internal error|service unavailable|overloaded/.test(message)
+  ) {
+    return "provider_error";
+  }
+  return "unknown";
+}
+
+function diagnosticErrorChain(error: unknown): readonly ApplicationAgentDiagnosticError[] {
+  const chain: ApplicationAgentDiagnosticError[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (
+    current !== undefined
+    && chain.length < MAX_DIAGNOSTIC_CAUSE_DEPTH
+    && !seen.has(current)
+  ) {
+    seen.add(current);
+    let name = "NonError";
+    let message = "";
+    let cause: unknown;
+    if (current instanceof Error) {
+      try {
+        const candidateName = current.name;
+        name = typeof candidateName === "string"
+          && SAFE_ERROR_NAMES[candidateName] === true
+          ? candidateName
+          : "Error";
+      } catch {
+        name = "Error";
+      }
+      try {
+        const candidateMessage = current.message;
+        message = typeof candidateMessage === "string"
+          ? candidateMessage.slice(0, MAX_DIAGNOSTIC_CLASSIFICATION_CHARS).toLowerCase()
+          : "";
+      } catch {
+        message = "";
+      }
+      try {
+        cause = current.cause;
+      } catch {
+        cause = undefined;
+      }
+    }
+    let code: string | undefined;
+    if (current !== null && typeof current === "object") {
+      try {
+        const candidate = "code" in current ? current.code : undefined;
+        if (
+          typeof candidate === "string"
+          && SAFE_DIAGNOSTIC_CODES[candidate] === true
+        ) {
+          code = candidate;
+        }
+      } catch {
+        code = undefined;
+      }
+    }
+    chain.push({
+      name,
+      category: diagnosticCategory(message, code),
+      ...(code === undefined ? {} : { code }),
+    });
+    current = cause;
+  }
+  return chain;
+}
+
+function defaultApplicationAgentDiagnosticSink(
+  diagnostic: ApplicationAgentFailureDiagnostic,
+): void {
+  console.error(JSON.stringify(diagnostic));
+}
+
+function reportApplicationAgentFailure(
+  sink: ApplicationAgentDiagnosticSink,
+  sessionId: string,
+  error: unknown,
+): void {
+  try {
+    const result = sink({
+      event: "application_agent_failure",
+      sessionId,
+      phase: "agent_run",
+      errorChain: diagnosticErrorChain(error),
+    });
+    if (result !== undefined) {
+      void Promise.resolve(result).catch(() => undefined);
+    }
+  } catch {
+    // Diagnostics must never alter the fixed application failure response.
+  }
+}
+
 export interface ApplicationAgentStatus {
   modelProvider: typeof APPLICATION_AGENT_MODEL_PROVIDER;
   model: typeof APPLICATION_AGENT_MODEL;
@@ -70,6 +301,7 @@ export interface ApplicationAgentServiceOptions {
   readonly runtimeClientFactory?: ApplicationRuntimeClientFactory;
   readonly submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly agentRuntime?: AgentRuntimeDependencies;
+  readonly diagnosticSink?: ApplicationAgentDiagnosticSink;
 }
 
 export interface ApplicationAgentRouteService {
@@ -109,6 +341,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
   readonly #runtimeClientFactory: ApplicationRuntimeClientFactory;
   readonly #submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly #agentRuntime: AgentRuntimeDependencies;
+  readonly #diagnosticSink: ApplicationAgentDiagnosticSink;
   readonly #steeringInboxes = new Map<string, ApplicationAgentSteeringInbox>();
 
   constructor(
@@ -126,6 +359,8 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
         new HttpApplicationRuntimeClient(runtimeUrl, sessionId, bearerToken));
     this.#submissionGuardFactory = options.submissionGuardFactory;
     this.#agentRuntime = options.agentRuntime ?? {};
+    this.#diagnosticSink = options.diagnosticSink
+      ?? defaultApplicationAgentDiagnosticSink;
   }
 
   async status(signal?: AbortSignal): Promise<ApplicationAgentStatus> {
@@ -235,9 +470,19 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
           );
         } catch {
           if (signal.aborted) throw signal.reason;
+          reportApplicationAgentFailure(
+            this.#diagnosticSink,
+            input.sessionId,
+            error,
+          );
           throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
         }
         if (!oauthConnected) throw new ApplicationAgentFailure("OAUTH_REQUIRED");
+        reportApplicationAgentFailure(
+          this.#diagnosticSink,
+          input.sessionId,
+          error,
+        );
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
       return {

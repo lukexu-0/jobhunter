@@ -380,8 +380,86 @@ describe("ApplicationAgentService", () => {
     expect(String(failure)).not.toContain(DIRECT_VALUE);
   });
 
+  test("logs a classified diagnostic without provider or applicant data when masking an untyped failure", async () => {
+    const providerSecret = `${TOKEN}:${RUNTIME_URL}:${DIRECT_VALUE}`;
+    const assistantSecret = `assistant payload for ${DIRECT_VALUE}`;
+    const diagnosticFailureSecret = `diagnostic sink failure for ${DIRECT_VALUE}`;
+    let timeoutMessageReads = 0;
+    let providerNameReads = 0;
+    const timeout = Object.assign(
+      new Error(),
+      {
+        name: "CodexResponseError",
+        code: "UND_ERR_BODY_TIMEOUT",
+        assistantMessage: { providerPayload: assistantSecret },
+      },
+    );
+    timeout.cause = timeout;
+    Object.defineProperty(timeout, "message", {
+      get: () => {
+        timeoutMessageReads += 1;
+        return timeoutMessageReads === 1
+          ? `OpenAI Codex SSE stream stalled while waiting for the next event. ${assistantSecret}`
+          : assistantSecret;
+      },
+    });
+    const diagnostics: unknown[] = [];
+    const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
+      authStatusReader: connectedStatus,
+      runtimeClientFactory: () => ({
+        action: async () => { throw new Error("unused"); },
+      }),
+      runApplicationAgent: async () => {
+        const failure = new Error(providerSecret, { cause: timeout });
+        Object.defineProperty(failure, "name", {
+          get: () => {
+            providerNameReads += 1;
+            return providerNameReads === 1 ? "Error" : DIRECT_VALUE;
+          },
+        });
+        throw failure;
+      },
+      diagnosticSink: async (diagnostic: unknown) => {
+        diagnostics.push(diagnostic);
+        throw new Error(diagnosticFailureSecret);
+      },
+    });
+
+    const failure = await service.invoke(
+      INPUT,
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
+    await Promise.resolve();
+
+    expect(failure).toBeInstanceOf(ApplicationAgentFailure);
+    expect(providerNameReads).toBe(1);
+    expect(timeoutMessageReads).toBe(1);
+    expect((failure as ApplicationAgentFailure).code).toBe("MODEL_PROVIDER_FAILED");
+    expect((failure as Error).message).toBe("The model request failed");
+    expect(diagnostics).toEqual([{
+      event: "application_agent_failure",
+      sessionId: SESSION_ID,
+      phase: "agent_run",
+      errorChain: [
+        { name: "Error", category: "unknown" },
+        {
+          name: "CodexResponseError",
+          category: "stream_idle_timeout",
+          code: "UND_ERR_BODY_TIMEOUT",
+        },
+      ],
+    }]);
+    const serializedDiagnostics = JSON.stringify(diagnostics);
+    expect(serializedDiagnostics).not.toContain(TOKEN);
+    expect(serializedDiagnostics).not.toContain(RUNTIME_URL);
+    expect(serializedDiagnostics).not.toContain(DIRECT_VALUE);
+    expect(serializedDiagnostics).not.toContain(assistantSecret);
+  });
+
   test("turns a provider failure during a logout race into OAuth required", async () => {
     let authReads = 0;
+    const diagnostics: unknown[] = [];
     const service = new ApplicationAgentService(TOKEN, {
       submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: () => {
@@ -400,6 +478,9 @@ describe("ApplicationAgentService", () => {
       runApplicationAgent: async () => {
         throw new Error(`provider failure: ${DIRECT_VALUE}`);
       },
+      diagnosticSink: (diagnostic: unknown) => {
+        diagnostics.push(diagnostic);
+      },
     });
 
     const failure = await service.invoke(
@@ -411,6 +492,7 @@ describe("ApplicationAgentService", () => {
     expect(failure).toBeInstanceOf(ApplicationAgentFailure);
     expect((failure as ApplicationAgentFailure).code).toBe("OAUTH_REQUIRED");
     expect(String(failure)).not.toContain(DIRECT_VALUE);
+    expect(diagnostics).toEqual([]);
   });
 
   test("preserves abort identity during the provider-failure OAuth reread", async () => {
