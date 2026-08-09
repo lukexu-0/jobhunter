@@ -553,10 +553,29 @@ describe("job source loading", () => {
     expect(headers.get("host")).toBe("jobs.example.test");
     expect(headers.get("accept")).toBe("text/html, application/xhtml+xml, text/plain");
     expect(headers.get("accept-encoding")).toBe("identity");
+    expect(headers.get("user-agent")).toBe(
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    );
     expect(attempts[0]!.init.redirect).toBe("manual");
     expect(attempts[0]!.init.decompress).toBe(false);
     expect(attempts[0]!.init.tls).toEqual({ rejectUnauthorized: true, serverName: "jobs.example.test" });
     expect(attempts[0]!.init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  test("preserves an explicit caller User-Agent for pinned public requests", async () => {
+    let observedHeaders: Headers | undefined;
+    const { response: fetched } = await fetchPinnedPublicHttp("https://jobs.example.test/role", {
+      signal: new AbortController().signal,
+      headers: { "User-Agent": "jobhunter-source-test/1.0" },
+      resolveHost: resolvePublic,
+      fetchImpl: async (_input, init) => {
+        observedHeaders = new Headers(init.headers);
+        return response(VALID_TEXT);
+      },
+    });
+
+    expect(await fetched.text()).toBe(VALID_TEXT);
+    expect(observedHeaders?.get("user-agent")).toBe("jobhunter-source-test/1.0");
   });
 
   test("tries validated addresses in resolver order only for connection failures", async () => {
