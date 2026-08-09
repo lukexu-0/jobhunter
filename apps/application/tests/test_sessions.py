@@ -298,6 +298,7 @@ class FakePlaywrightRuntime:
     results: list[PlaywrightCliExecutionResult] | None = None
     blocker: asyncio.Event | None = None
     error: PlaywrightCliRuntimeError | None = None
+    suspend_navigation_guard_error: PlaywrightCliRuntimeError | None = None
     start_error: PlaywrightCliRuntimeError | None = None
     private_sign_in_error: PlaywrightCliRuntimeError | None = None
     activate_private_values_error: PlaywrightCliRuntimeError | None = None
@@ -358,6 +359,8 @@ class FakePlaywrightRuntime:
         self.navigation_guard_suspended = False
 
     async def suspend_navigation_guard(self) -> None:
+        if self.suspend_navigation_guard_error is not None:
+            raise self.suspend_navigation_guard_error
         self.navigation_guard_suspended = True
 
     async def suppress_private_capture(self) -> None:
@@ -3672,6 +3675,54 @@ async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
     await manager.delete(created.session_id)
 
 
+@pytest.mark.parametrize(
+    ("error_code", "status_code"),
+    [
+        ("browser_failed", 502),
+        ("session_timeout", 504),
+    ],
+)
+async def test_runtime_human_navigation_maps_guard_suspension_runtime_errors(
+    tmp_path: Path,
+    error_code: Literal["browser_failed", "session_timeout"],
+    status_code: int,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    runtime = fakes.runtimes[0]
+    private_error = PlaywrightCliRuntimeError(error_code)
+    private_error.args = ("private Playwright guard failure detail",)
+    runtime.suspend_navigation_guard_error = private_error
+    snapshot_before = record.snapshot
+    events_before = tuple(record.events)
+
+    with pytest.raises(HarnessServiceError) as raised:
+        await manager.runtime_action(
+            created.session_id,
+            RequestHumanNavigationRuntimeAction(
+                type="request_human_navigation",
+                instruction="Complete the account sign-in.",
+            ),
+        )
+
+    assert_service_error(
+        raised.value,
+        status_code,
+        error_code,
+        SESSION_ERROR_MESSAGES[error_code],
+    )
+    assert "private Playwright guard failure detail" not in str(raised.value)
+    assert record.snapshot == snapshot_before
+    assert tuple(record.events) == events_before
+    assert record.human_gate.pending_kind is None
+    assert record.runtime_action_pending is False
+    assert record.runtime_action_task is None
+    await manager.delete(created.session_id)
+
+
 async def test_runtime_playwright_cli_errors_count_toward_step_limit(
     tmp_path: Path,
 ) -> None:
@@ -4733,6 +4784,60 @@ async def test_first_approved_playwright_cli_execution_failure_parks_uncertainty
     with pytest.raises(HarnessServiceError) as close_only:
         await manager.command(created.session_id, CancelCommand(type="cancel"))
     assert close_only.value.code == "command_conflict"
+    await manager.delete(created.session_id)
+
+
+async def test_first_approved_human_navigation_guard_failure_parks_uncertainty_without_cleanup(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager, auto_submit=True)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None and record.human_gate is not None
+    runtime = fakes.runtimes[0]
+
+    review = await manager.runtime_action(
+        created.session_id,
+        RequestHumanReviewRuntimeAction(
+            type="request_human_review",
+            result=review_result(),
+        ),
+    )
+    assert isinstance(review, SubmitRuntimeActionResponse)
+    runtime.suspend_navigation_guard_error = PlaywrightCliRuntimeError(
+        "browser_failed"
+    )
+
+    with pytest.raises(HarnessServiceError) as failed:
+        await manager.runtime_action(
+            created.session_id,
+            RequestHumanNavigationRuntimeAction(
+                type="request_human_navigation",
+                instruction="Complete the final submission.",
+            ),
+        )
+
+    assert_service_error(
+        failed.value,
+        502,
+        "browser_failed",
+        SESSION_ERROR_MESSAGES["browser_failed"],
+    )
+    snapshot = manager.get_snapshot(created.session_id)
+    assert snapshot.state == "submission_uncertain"
+    assert snapshot.pending_action is None
+    assert [event.event for event in tuple(record.events)[-2:]] == [
+        "submission_started",
+        "submission_uncertain",
+    ]
+    assert manager._active is record
+    assert record.final_request is None
+    assert record.finalized is False
+    assert record.runtime_action_pending is False
+    assert record.runtime_action_task is None
+    assert runtime.closed is False
+    assert fakes.models[0].closed is False
     await manager.delete(created.session_id)
 
 

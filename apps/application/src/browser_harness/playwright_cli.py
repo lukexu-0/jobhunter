@@ -5,6 +5,7 @@ import ctypes
 import base64
 import inspect
 import json
+import logging
 import math
 import os
 import platform
@@ -33,6 +34,8 @@ from .models import (
     validate_job_url,
     validate_loopback_http_url,
 )
+logger = logging.getLogger(__name__)
+
 
 _MAX_ARGUMENT_ITEMS = 64
 _MAX_ARGUMENT_BYTES = 8_192
@@ -2042,6 +2045,41 @@ class PlaywrightCliRuntime:
         ):
             raise PlaywrightCliRuntimeError("browser_failed")
 
+    def _report_guard_suspension_failure(
+        self,
+        *,
+        error_category: Literal[
+            "timeout",
+            "process_exit",
+            "cli_error",
+            "runtime_error",
+        ],
+        exit_code: int | None,
+        timed_out: bool,
+        reported_cli_error: bool,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    ) -> None:
+        try:
+            logger.error(
+                json.dumps(
+                    {
+                        "event": "playwright_cli_lifecycle_failure",
+                        "sessionId": str(self._session_id),
+                        "operation": "suspend_navigation_guard",
+                        "errorCategory": error_category,
+                        "exitCode": exit_code,
+                        "timedOut": timed_out,
+                        "reportedCliError": reported_cli_error,
+                        "stdoutTruncated": stdout_truncated,
+                        "stderrTruncated": stderr_truncated,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        except Exception:
+            pass
+
     async def start(self, job_url: str) -> None:
         async with self._operation_lock:
             if self._started or self._opened or self._closed:
@@ -2383,7 +2421,9 @@ class PlaywrightCliRuntime:
         async with self._operation_lock:
             if not self._opened or self._closed:
                 raise PlaywrightCliRuntimeError("browser_failed")
-            metadata = await self._metadata()
+            metadata = await self._metadata(
+                mark_navigation_handoff=not self._guard_armed
+            )
             self._current_metadata = metadata
             return metadata.url
 
@@ -2403,14 +2443,84 @@ class PlaywrightCliRuntime:
         async with self._operation_lock:
             if not self._opened or self._closed or not self._guard_armed:
                 return
-            result = await self._invoke(
-                "run-code",
-                [self._suspend_guard_script()],
-                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
-                capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
-            )
-            self._require_success(result)
             self._guard_armed = False
+            self._current_metadata = None
+            try:
+                result = await self._invoke(
+                    "run-code",
+                    [self._suspend_guard_script()],
+                    timeout=_LIFECYCLE_TIMEOUT_SECONDS,
+                    capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+                )
+            except asyncio.CancelledError:
+                self._report_guard_suspension_failure(
+                    error_category="runtime_error",
+                    exit_code=None,
+                    timed_out=False,
+                    reported_cli_error=False,
+                    stdout_truncated=False,
+                    stderr_truncated=False,
+                )
+                await self._recover_failed_guard_suspension_unlocked()
+                raise
+            except PlaywrightCliRuntimeError as error:
+                timed_out = error.code == "session_timeout"
+                self._report_guard_suspension_failure(
+                    error_category="timeout" if timed_out else "runtime_error",
+                    exit_code=None,
+                    timed_out=timed_out,
+                    reported_cli_error=False,
+                    stdout_truncated=False,
+                    stderr_truncated=False,
+                )
+                await self._recover_failed_guard_suspension_unlocked()
+                raise
+            reported_cli_error = self._reported_cli_error(result)
+            if result.timed_out or result.exit_code != 0 or reported_cli_error:
+                error_category = (
+                    "timeout"
+                    if result.timed_out
+                    else "process_exit"
+                    if result.exit_code != 0
+                    else "cli_error"
+                )
+                self._report_guard_suspension_failure(
+                    error_category=error_category,
+                    exit_code=result.exit_code,
+                    timed_out=result.timed_out,
+                    reported_cli_error=reported_cli_error,
+                    stdout_truncated=result.stdout_truncated,
+                    stderr_truncated=result.stderr_truncated,
+                )
+                try:
+                    self._require_success(result)
+                except PlaywrightCliRuntimeError:
+                    await self._recover_failed_guard_suspension_unlocked()
+                    raise
+
+    async def _recover_failed_guard_suspension_unlocked(self) -> None:
+        async def recover() -> None:
+            try:
+                await self._install_navigation_guard(self._approved_origins)
+            except BaseException:
+                self._started = False
+                self._guard_armed = False
+                self._current_metadata = None
+                try:
+                    await self._emergency_budget_cleanup_unlocked()
+                except BaseException:
+                    self._started = False
+                    self._guard_armed = False
+                    self._current_metadata = None
+
+        recovery_task = asyncio.create_task(
+            recover(),
+            name=f"playwright-guard-recovery-{self._session_id}",
+        )
+        try:
+            await asyncio.shield(recovery_task)
+        except asyncio.CancelledError:
+            await recovery_task
 
     def _native_browser_ownership(self) -> _NativeBrowserOwnership | None:
         if self._launch.cdp_url is not None:
@@ -2675,6 +2785,7 @@ class PlaywrightCliRuntime:
             raise PlaywrightCliRuntimeError("browser_failed") from None
 
     async def _install_navigation_guard(self, origins: tuple[str, ...]) -> None:
+        self._current_metadata = None
         result = await self._invoke(
             "run-code",
             [self._guard_script(origins)],
@@ -2692,22 +2803,32 @@ class PlaywrightCliRuntime:
             "async (page) => {"
             "const context=page.context();"
             "const key=Symbol.for('jobhunter.playwrightCli.navigationGuard');"
-            "const previous=context[key];"
             f"const allowed={encoded};"
+            "let state=context[key];"
+            "if(state){"
+            "const handoffChanged=state.handoffPending&&state.handoffChanged;"
+            "state.allowed=allowed;state.armed=true;"
+            "state.handoffPending=false;state.handoffChanged=false;"
+            "if(handoffChanged)throw new Error('navigation changed during guard handoff');"
+            "return {armed:true};}"
+            "state={allowed,armed:true,handler:null,"
+            "handoffPending:false,handoffChanged:false};"
             "const handler=async route=>{"
             "const request=route.request();"
             "if(!request.isNavigationRequest())return route.continue();"
             "let topLevel=false;"
             "try{topLevel=request.frame().parentFrame()===null;}catch{}"
             "if(!topLevel)return route.continue();"
+            "if(!state.armed){"
+            "if(state.handoffPending)state.handoffChanged=true;"
+            "return route.continue();}"
             "const url=request.url();"
             "if(url==='about:blank')return route.continue();"
-            "if(allowed.some(origin=>url===origin||url.startsWith(origin+'/')))return route.continue();"
+            "if(state.allowed.some(origin=>url===origin||url.startsWith(origin+'/')))return route.continue();"
             "return route.abort('blockedbyclient');};"
+            "state.handler=handler;"
             "await context.route('**/*',handler);"
-            "try{if(previous?.armed)await context.unroute('**/*',previous.handler);}"
-            "catch(error){await context.unroute('**/*',handler).catch(()=>{});throw error;}"
-            "context[key]={handler,armed:true};"
+            "context[key]=state;"
             "return {armed:true};}"
         )
 
@@ -2718,7 +2839,8 @@ class PlaywrightCliRuntime:
             "const context=page.context();"
             "const key=Symbol.for('jobhunter.playwrightCli.navigationGuard');"
             "const state=context[key];"
-            "if(state?.armed){await context.unroute('**/*',state.handler);state.armed=false;}"
+            "if(state){state.armed=false;"
+            "state.handoffPending=false;state.handoffChanged=false;}"
             "return {armed:false};}"
         )
 
@@ -2977,9 +3099,22 @@ class PlaywrightCliRuntime:
             )
         self._require_success(restored)
 
-    async def _metadata(self) -> _PageMetadata:
+    async def _metadata(
+        self,
+        *,
+        mark_navigation_handoff: bool = False,
+    ) -> _PageMetadata:
+        handoff = (
+            "const context=page.context();"
+            "const guard=context[Symbol.for('jobhunter.playwrightCli.navigationGuard')];"
+            "if(guard&&!guard.armed&&!guard.handoffPending){"
+            "guard.handoffPending=true;guard.handoffChanged=false;}"
+            if mark_navigation_handoff
+            else ""
+        )
         script = (
             "async (page) => {"
+            f"{handoff}"
             "const clip=(value,limit)=>Array.from(value.slice(0,limit*2)).slice(0,limit).join('');"
             "const pages=page.context().pages();"
             "return {"

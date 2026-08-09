@@ -1074,6 +1074,15 @@ class ApplicationSessionManager:
                 ):
                     await self._park_submission_uncertain(record)
                 return response
+        except PlaywrightCliRuntimeError as error:
+            if submission_attempt_active:
+                await self._park_submission_uncertain(record)
+            public = session_error(error.code)
+            raise HarnessServiceError(
+                504 if error.code == "session_timeout" else 502,
+                public.code,
+                public.message,
+            ) from None
         except asyncio.CancelledError:
             if submission_attempt_active:
                 await self._park_submission_uncertain(record)
