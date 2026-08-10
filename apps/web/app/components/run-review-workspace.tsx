@@ -448,7 +448,6 @@ export function RunReviewWorkspace({
     let source: EventSource;
     let disposed = false;
     let mounted = true;
-    let refreshInFlight = false;
     let recoveryTimer: number | null = null;
     const scheduleRecovery = (message: string) => {
       setApplicationStreamState("invalid");
@@ -520,25 +519,35 @@ export function RunReviewWorkspace({
     };
     source.onerror = () => {
       if (disposed) return;
+      disposed = true;
+      source.close();
       setApplicationStreamState("reconnecting");
-      if (refreshInFlight) return;
-      refreshInFlight = true;
-      void refreshApplicationView().then(() => {
-        if (disposed) return;
+      void refreshApplicationView().catch(() => {
+        // Retain the latest confirmed projection while the fresh source is scheduled.
+      }).finally(() => {
+        if (!mounted) return;
         const current = applicationSnapshot(applicationViewRef.current);
         if (
           !current
           || current.generation !== liveGeneration
           || !isStreamableApplicationSnapshot(current)
         ) {
-          disposed = true;
-          source.close();
           setApplicationStreamState("idle");
+          return;
         }
-      }).catch(() => {
-        // Native EventSource retries transient failures while confirmed content remains visible.
-      }).finally(() => {
-        refreshInFlight = false;
+        recoveryTimer = window.setTimeout(() => {
+          if (!mounted) return;
+          const latest = applicationSnapshot(applicationViewRef.current);
+          if (
+            !latest
+            || latest.generation !== liveGeneration
+            || !isStreamableApplicationSnapshot(latest)
+          ) {
+            setApplicationStreamState("idle");
+            return;
+          }
+          setApplicationStreamRecovery((recovery) => recovery + 1);
+        }, 1_000);
       });
     };
     return () => {

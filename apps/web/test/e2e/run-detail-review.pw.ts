@@ -131,8 +131,9 @@ test.beforeAll(async () => {
       return;
     }
     const cursor = Array.isArray(rawCursor) ? rawCursor[0] ?? null : rawCursor ?? null;
+    const connectionOrdinal = nativeSseScenario.headers.length + 1;
     nativeSseScenario.headers.push(cursor);
-    const resumed = cursor === "2:7";
+    const resumed = connectionOrdinal > 1;
     if (resumed) {
       await nativeSseScenario.waitForResume;
       nativeSseScenario.onResume();
@@ -841,6 +842,80 @@ function questionFixtures(): ApplicationAdditionalInfoQuestion[] {
   ];
 }
 
+async function installControlledEventSource(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const instances: EventTarget[] = [];
+    class ControlledEventSource extends EventTarget {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 2;
+      readonly url: string;
+      readonly withCredentials = false;
+      readyState = ControlledEventSource.OPEN;
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+
+      constructor(url: string | URL) {
+        super();
+        this.url = String(url);
+        instances.push(this);
+        window.setTimeout(() => this.onopen?.(new Event("open")), 0);
+      }
+
+      close(): void {
+        this.readyState = ControlledEventSource.CLOSED;
+      }
+    }
+    Object.defineProperty(window, "EventSource", {
+      configurable: true,
+      value: ControlledEventSource,
+    });
+    Object.defineProperty(window, "__applicationEventSources", {
+      configurable: true,
+      value: instances,
+    });
+  });
+}
+
+async function controlledEventSourceCount(page: Page): Promise<number> {
+  return page.evaluate(() => (
+    window as typeof window & { __applicationEventSources: EventTarget[] }
+  ).__applicationEventSources.length);
+}
+
+async function emitControlledEventSourceError(page: Page, sourceIndex: number): Promise<void> {
+  await page.evaluate((index) => {
+    const sources = (
+      window as typeof window & {
+        __applicationEventSources: Array<EventTarget & {
+          onerror: ((event: Event) => void) | null;
+        }>;
+      }
+    ).__applicationEventSources;
+    sources[index]?.onerror?.(new Event("error"));
+  }, sourceIndex);
+}
+
+async function emitControlledApplicationEvent(
+  page: Page,
+  event: ApplicationSessionEventDto,
+  cursor: number,
+  sourceIndex: number,
+): Promise<void> {
+  await page.evaluate(({ data, eventName, index, lastEventId }) => {
+    const sources = (
+      window as typeof window & { __applicationEventSources: EventTarget[] }
+    ).__applicationEventSources;
+    sources[index]?.dispatchEvent(new MessageEvent(eventName, { data, lastEventId }));
+  }, {
+    data: JSON.stringify(event),
+    eventName: event.event,
+    index: sourceIndex,
+    lastEventId: `${event.generation}:${cursor}`,
+  });
+}
+
 function approvedRun(): RunDto {
   return runFixture({ status: "approved", revision: 2, origin: "human-comments", pdfSha256: pdfHash2 });
 }
@@ -1222,6 +1297,82 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
   mock.application = progressed;
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
+});
+
+test("additional-information answers recover through a fresh EventSource after an error", async ({ page }) => {
+  const questions = [questionFixtures()[0]!];
+  const awaitingAnswers = snapshotFixture({
+    bridgeState: "awaiting_additional_info",
+    pendingAction: { type: "additional_info", questions },
+    updatedAt: createdAt + 100,
+  });
+  const running = snapshotFixture({
+    bridgeState: "running",
+    updatedAt: createdAt + 200,
+  });
+  const savedEvent = eventFixture("additional_info_saved", running, { count: questions.length });
+  const expectedCommand: ApplicationSessionCommand = {
+    type: "provide_additional_info",
+    answers: [{
+      id: "legal_name",
+      status: "answered",
+      raw_value: "Ada Public",
+      value: "Ada Public",
+    }],
+  };
+  await installControlledEventSource(page);
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: awaitingAnswers,
+  });
+  mock.commandReplies.push({ status: 202 });
+
+  await page.goto(`/runs/${runId}`);
+  const questionGate = page.getByRole("heading", { name: "Additional information needed" });
+  const nameAnswer = page
+    .getByRole("group", { name: "What name should appear?" })
+    .getByRole("textbox", { name: "Answer", exact: true });
+  await expect(questionGate).toBeVisible();
+  await expect.poll(() => controlledEventSourceCount(page)).toBe(1);
+  await nameAnswer.fill("  Ada Public  ");
+  await page.getByRole("button", { name: "Answer questions", exact: true }).click();
+
+  await expect.poll(() => mock.commands.length).toBe(1);
+  expect(mock.commands).toEqual([expectedCommand]);
+  const confirmedApplicationReads = mock.applicationGetCount;
+  await emitControlledEventSourceError(page, 0);
+  await emitControlledEventSourceError(page, 0);
+  expect(await page.evaluate(() => {
+    const sources = (
+      window as typeof window & {
+        __applicationEventSources: Array<EventTarget & { readyState: number }>;
+      }
+    ).__applicationEventSources;
+    return sources[0]?.readyState;
+  })).toBe(2);
+
+  const reconnectNotice = page.getByRole("status").filter({
+    hasText: "Reconnecting to live application updates. The latest confirmed state remains visible.",
+  });
+  await expect(reconnectNotice).toBeVisible();
+  await expect(questionGate).toBeVisible();
+  await expect(nameAnswer).toHaveValue("  Ada Public  ");
+  await expect.poll(() => mock.applicationGetCount).toBe(confirmedApplicationReads + 1);
+  await expect.poll(
+    () => controlledEventSourceCount(page),
+    { intervals: [50, 100, 250], timeout: 1_500 },
+  ).toBe(2);
+  expect(mock.commands).toEqual([expectedCommand]);
+
+  mock.application = running;
+  await emitControlledApplicationEvent(page, savedEvent, 2, 1);
+
+  await expect(questionGate).toHaveCount(0);
+  await expect(reconnectNotice).toHaveCount(0);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  expect(await controlledEventSourceCount(page)).toBe(2);
+  expect(mock.commands).toEqual([expectedCommand]);
 });
 
 test("additional-information Continue sends no answers and stays busy across a same-gate projection", async ({ page }) => {
@@ -2745,7 +2896,7 @@ test("lost, failed, and closed generations retry with the approved hash and fres
   expect(mock.sseHeaders.slice(0, 2)).toEqual([null, null]);
 });
 
-test("finite SSE replay preserves the current gate, reconnects with its qualified cursor, and reconciles lost", async ({ page }) => {
+test("finite SSE replay preserves the current gate, reconnects with a fresh source for durable recovery, and reconciles lost", async ({ page }) => {
   const olderNavigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
     generation: 2,
@@ -2815,8 +2966,7 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
   }
   await expect(page.getByText("Stale navigation instruction.", { exact: true })).toHaveCount(0);
   await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(2);
-  expect(mock.sseHeaders[0]).toBeNull();
-  await expect.poll(() => JSON.stringify(mock.sseHeaders)).toContain("2:7");
+  await expect.poll(() => mock.sseHeaders.slice(0, 2)).toEqual([null, null]);
   resumeFrame.resolve();
 
   await expect(page.getByRole("status").filter({ hasText: "Connection lost" })).toBeVisible();
@@ -2825,6 +2975,9 @@ test("finite SSE replay preserves the current gate, reconnects with its qualifie
   await expect(page.getByText("Stale Generation Company", { exact: true })).toHaveCount(0);
   expect(mock.applicationGetCount).toBeGreaterThanOrEqual(3);
   expect(mock.runGetCount).toBe(1);
+  expect(mock.commands).toEqual([]);
+  expect(mock.startBodies).toEqual([]);
+  expect(mock.retryBodies).toEqual([]);
   await assertNoPrivateHarnessDetails(page, mock);
 });
 
@@ -2844,39 +2997,7 @@ test("an invalid live frame reconnects before a later gate command can wedge", a
   const recoveredEvent = eventFixture("origin_approval_required", origin, {
     origin: "https://recovered.example.test",
   });
-  await page.addInitScript(() => {
-    const instances: EventTarget[] = [];
-    class ControlledEventSource extends EventTarget {
-      static readonly CONNECTING = 0;
-      static readonly OPEN = 1;
-      static readonly CLOSED = 2;
-      readonly url: string;
-      readonly withCredentials = false;
-      readyState = ControlledEventSource.OPEN;
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-
-      constructor(url: string | URL) {
-        super();
-        this.url = String(url);
-        instances.push(this);
-        window.setTimeout(() => this.onopen?.(new Event("open")), 0);
-      }
-
-      close(): void {
-        this.readyState = ControlledEventSource.CLOSED;
-      }
-    }
-    Object.defineProperty(window, "EventSource", {
-      configurable: true,
-      value: ControlledEventSource,
-    });
-    Object.defineProperty(window, "__applicationEventSources", {
-      configurable: true,
-      value: instances,
-    });
-  });
+  await installControlledEventSource(page);
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
@@ -2885,9 +3006,7 @@ test("an invalid live frame reconnects before a later gate command can wedge", a
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByText("Use the public navigation step.", { exact: true })).toBeVisible();
-  const initialSourceCount = await page.evaluate(() => (
-    window as typeof window & { __applicationEventSources: EventTarget[] }
-  ).__applicationEventSources.length);
+  const initialSourceCount = await controlledEventSourceCount(page);
   await page.evaluate(() => {
     const sources = (
       window as typeof window & { __applicationEventSources: EventTarget[] }
@@ -2902,18 +3021,8 @@ test("an invalid live frame reconnects before a later gate command can wedge", a
     hasText: "The application service returned an invalid live update.",
   })).toBeVisible();
   await expect.poll(() => mock.applicationGetCount).toBeGreaterThanOrEqual(2);
-  await expect.poll(() => page.evaluate(() => (
-    window as typeof window & { __applicationEventSources: EventTarget[] }
-  ).__applicationEventSources.length)).toBeGreaterThan(initialSourceCount);
-  await page.evaluate(({ data }) => {
-    const sources = (
-      window as typeof window & { __applicationEventSources: EventTarget[] }
-    ).__applicationEventSources;
-    sources.at(-1)?.dispatchEvent(new MessageEvent("origin_approval_required", {
-      data,
-      lastEventId: "2:9",
-    }));
-  }, { data: JSON.stringify(recoveredEvent) });
+  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(initialSourceCount);
+  await emitControlledApplicationEvent(page, recoveredEvent, 9, initialSourceCount);
 
   await expect(page.getByText("https://recovered.example.test", { exact: true })).toBeVisible();
   await expect(page.getByRole("alert").filter({

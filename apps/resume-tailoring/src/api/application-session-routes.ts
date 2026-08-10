@@ -163,6 +163,8 @@ const EVENT_STREAM_HEADERS = {
   "content-type": "text/event-stream; charset=utf-8",
   "x-accel-buffering": "no",
 } as const;
+const APPLICATION_EVENT_HEARTBEAT_MS = 15_000;
+const APPLICATION_EVENT_HEARTBEAT = ": heartbeat\n\n";
 
 function parseApplicationEventId(value: string): ApplicationSessionEventCursor | undefined {
   const match = APPLICATION_EVENT_ID.exec(value);
@@ -182,11 +184,36 @@ function eventStreamResponse(
   const iterator = events[Symbol.asyncIterator]();
   const encoder = new TextEncoder();
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let pendingNext: Promise<IteratorResult<ApplicationSessionStreamItem>> | undefined;
+  let cancelHeartbeat: (() => void) | undefined;
   let finalized = false;
 
+  const clearHeartbeatTimer = (): void => {
+    const cancel = cancelHeartbeat;
+    cancelHeartbeat = undefined;
+    cancel?.();
+  };
+  const waitForHeartbeat = (): Promise<boolean> => {
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    let pending = true;
+    const timer = setTimeout(() => {
+      if (!pending) return;
+      pending = false;
+      cancelHeartbeat = undefined;
+      resolve(true);
+    }, APPLICATION_EVENT_HEARTBEAT_MS);
+    cancelHeartbeat = () => {
+      if (!pending) return;
+      pending = false;
+      clearTimeout(timer);
+      resolve(false);
+    };
+    return promise;
+  };
   const finalize = async (returnIterator: boolean): Promise<void> => {
     if (finalized) return;
     finalized = true;
+    clearHeartbeatTimer();
     signal.removeEventListener("abort", abort);
     if (returnIterator) await iterator.return?.();
   };
@@ -209,8 +236,25 @@ function eventStreamResponse(
     async pull(streamController) {
       if (finalized) return;
       try {
-        const item = await iterator.next();
+        pendingNext ??= iterator.next();
+        const outcome = await Promise.race([
+          pendingNext.then((item) => ({ type: "item" as const, item })),
+          waitForHeartbeat().then((elapsed) => ({
+            type: "heartbeat" as const,
+            elapsed,
+          })),
+        ]);
+        clearHeartbeatTimer();
         if (finalized) return;
+        if (outcome.type === "heartbeat") {
+          if (outcome.elapsed) {
+            streamController.enqueue(encoder.encode(APPLICATION_EVENT_HEARTBEAT));
+          }
+          return;
+        }
+
+        pendingNext = undefined;
+        const item = outcome.item;
         if (item.done) {
           await finalize(false);
           streamController.close();
