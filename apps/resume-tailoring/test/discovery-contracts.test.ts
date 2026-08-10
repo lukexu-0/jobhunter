@@ -4,6 +4,7 @@ import {
   DiscoveryListRequestSchema,
   DiscoveryListResponseSchema,
   DiscoveryQueueRequestSchema,
+  DiscoveryQueueResponseSchema,
   DiscoverySyncRequestSchema,
   DiscoverySyncResponseSchema,
   type DiscoveryJob,
@@ -18,6 +19,7 @@ const job = {
   canonicalUrl: "https://jobs.example.test/roles/123",
   applyUrl: "https://jobs.example.test/roles/123/apply",
   descriptionPreview: "Build production software with the platform team.",
+  queueable: true,
   postedAt: 1_700_000_000_000,
   firstSeenAt: 1_700_000_100_000,
   lastSeenAt: 1_700_000_200_000,
@@ -71,19 +73,26 @@ describe("discovery HTTP contracts", () => {
     expect(DiscoverySyncRequestSchema.parse({})).toEqual({});
     expect(DiscoverySyncRequestSchema.safeParse({ unexpected: true }).success).toBeFalse();
   });
+  test("accepts description-unavailable as a queue skip reason", () => {
+    expect(DiscoveryQueueResponseSchema.parse({
+      queued: [],
+      skipped: [{ jobId: "job-1", reason: "description_unavailable" }],
+    }).skipped).toEqual([{ jobId: "job-1", reason: "description_unavailable" }]);
+  });
 
-  test("requires per-source and aggregate omitted-recent counts", () => {
+
+  test("requires per-source and aggregate description-unavailable counts", () => {
     const response = {
       sources: [{
         sourceId: "simplify",
         sourceName: "Simplify",
         status: "succeeded" as const,
-        completeSnapshot: false,
+        completeSnapshot: true,
         received: 12,
         created: 10,
         updated: 2,
         closed: 0,
-        omittedRecent: 3,
+        descriptionUnavailable: 3,
       }],
       totals: {
         sources: 1,
@@ -93,16 +102,31 @@ describe("discovery HTTP contracts", () => {
         created: 10,
         updated: 2,
         closed: 0,
-        omittedRecent: 3,
+        descriptionUnavailable: 3,
       },
       completedAt: 1_700_000_000_000,
     };
-
     expect(DiscoverySyncResponseSchema.parse(response)).toEqual(response);
-    const { omittedRecent: _omittedRecent, ...incompleteSource } = response.sources[0]!;
+    const { descriptionUnavailable: _descriptionUnavailable, ...incompleteSource } =
+      response.sources[0]!;
     expect(DiscoverySyncResponseSchema.safeParse({
       ...response,
       sources: [incompleteSource],
     }).success).toBeFalse();
+  });
+
+  test("projects unavailable descriptions and queue eligibility explicitly", () => {
+    expect(DiscoveryListResponseSchema.parse({
+      jobs: [{
+        ...job,
+        descriptionPreview: null,
+        queueable: false,
+      }],
+      total: 1,
+      lastSyncAt: null,
+    }).jobs[0]).toMatchObject({
+      descriptionPreview: null,
+      queueable: false,
+    });
   });
 });

@@ -47,7 +47,7 @@ const ClassificationJobSchema = z.object({
   title: z.string().trim().min(1).max(500),
   company: z.string().trim().min(1).max(500),
   location: z.string().trim().min(1).max(500).nullable(),
-  description: JobDescriptionSchema,
+  description: JobDescriptionSchema.nullable(),
 }).strict();
 
 const RoleSetSchema = z.array(DiscoveryRoleSchema).min(1).max(DISCOVERY_ROLES.length)
@@ -104,7 +104,7 @@ export interface DiscoveryRoleClassificationJob {
   readonly title: string;
   readonly company: string;
   readonly location: string | null;
-  readonly description: string;
+  readonly description: string | null;
 }
 
 export interface DiscoveryRoleClassification {

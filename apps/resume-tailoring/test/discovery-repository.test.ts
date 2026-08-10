@@ -78,6 +78,18 @@ describe("discovery normalization and role classification", () => {
     expect(keys.some((key) => key.startsWith("lever:"))).toBe(false);
   });
 
+  test("does not create a fallback identity without a description fingerprint", () => {
+    const keys = discoveryDedupeKeys(item({
+      canonicalUrl: "https://jobs.example.test/first",
+      applyUrl: "https://jobs.example.test/first/apply",
+      description: null,
+      postedAt: Date.parse("2026-08-03T00:00:00Z"),
+    }));
+
+    expect(keys.some((key) => key.startsWith("fallback:"))).toBe(false);
+    expect(keys.filter((key) => key.startsWith("url:"))).toHaveLength(2);
+  });
+
   test("rejects absolute and relative dates before the Unix epoch", () => {
     expect(parsePostedAt("1960-01-01T00:00:00Z")).toBeNull();
     expect(parsePostedAt("999999999 months ago")).toBeNull();
@@ -394,7 +406,42 @@ describe("discovery source reconciliation", () => {
       WHERE dedupe_key = ? ORDER BY job_id
     `).all(`url:${normalizeDiscoveryUrl(betaPosting.canonicalUrl)}`).map((row) => row.job_id))
       .toEqual([alphaJobId, betaJobId].sort());
-    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null, status: "queued" })).total).toBe(2);
+    expect(repository.list(
+      DiscoveryListRequestSchema.parse({ maxAgeDays: null, status: "queued" }),
+    ).jobs).toEqual([
+      expect.objectContaining({ queueable: false }),
+      expect.objectContaining({ queueable: false }),
+    ]);
+  });
+
+  test("keeps distinct undetailed same-day postings when their URLs differ", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let nextId = 0;
+    const repository = new DiscoveryRepository(database, {
+      now: () => Date.parse("2026-08-03T00:00:00Z"),
+      idFactory: () => `job-${++nextId}`,
+    });
+    const postedAt = Date.parse("2026-08-01T12:00:00Z");
+
+    repository.reconcileSource(source("source-a", "Alpha", [
+      item({
+        sourceItemId: "first",
+        canonicalUrl: "https://alpha.example.test/jobs/first",
+        applyUrl: "https://alpha.example.test/apply/first",
+        description: null,
+        postedAt,
+      }),
+      item({
+        sourceItemId: "second",
+        canonicalUrl: "https://beta.example.test/jobs/second",
+        applyUrl: "https://beta.example.test/apply/second",
+        description: null,
+        postedAt,
+      }),
+    ]));
+
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(2);
   });
 
   test("uses posting date in fallback dedupe without merging recurring roles", () => {
@@ -515,7 +562,7 @@ describe("discovery source reconciliation", () => {
     expect(repository.list(DiscoveryListRequestSchema.parse({
       maxAgeDays: null,
       status: "closed",
-    })).jobs[0]?.status).toBe("closed");
+    })).jobs[0]).toMatchObject({ status: "closed", queueable: false });
 
     now = 5_000;
     repository.reconcileSource(source("source-a", "Alpha", [item()]));
@@ -551,6 +598,126 @@ describe("discovery source reconciliation", () => {
     expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(2);
   });
 
+  test("lets a non-catalog observation enrich a null description without taking ownership", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let now = 1_000;
+    const repository = new DiscoveryRepository(database, {
+      now: () => now,
+      idFactory: () => "job-1",
+    });
+    repository.reconcileSource(source("source-a", "Alpha", [item({ description: null })]));
+
+    now = 2_000;
+    repository.reconcileSource(source("source-b", "Beta", [item({
+      sourceItemId: "beta-item",
+      sourceUrl: "https://github.com/example/beta",
+      description: DESCRIPTION,
+    })]));
+    now = 3_000;
+    repository.reconcileSource(source("source-c", "Gamma", [item({
+      sourceItemId: "gamma-item",
+      sourceUrl: "https://github.com/example/gamma",
+      description: null,
+    })]));
+
+    expect(database.query<{
+      catalog_source_id: string;
+      description: string | null;
+    }, []>(
+      "SELECT catalog_source_id, description FROM discovery_jobs",
+    ).get()).toEqual({
+      catalog_source_id: "source-a",
+      description: DESCRIPTION,
+    });
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0])
+      .toMatchObject({
+        descriptionPreview: DESCRIPTION,
+        queueable: true,
+        sourceNames: ["Alpha", "Beta", "Gamma"],
+      });
+  });
+
+  test("keeps the best saved description when converging duplicate jobs", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let now = 1_000;
+    let nextId = 0;
+    const repository = new DiscoveryRepository(database, {
+      now: () => now,
+      idFactory: () => `job-${++nextId}`,
+    });
+    const shortDescription = "Build production software with a focused team.";
+    repository.reconcileSource(source("source-a", "Alpha", [item({
+      canonicalUrl: "https://alpha.example.test/jobs/original",
+      applyUrl: "https://alpha.example.test/jobs/original/apply",
+      description: shortDescription,
+    })]));
+    repository.reconcileSource(source("source-b", "Beta", [item({
+      sourceItemId: "beta-item",
+      canonicalUrl: "https://beta.example.test/jobs/shared",
+      applyUrl: "https://beta.example.test/jobs/shared/apply",
+      description: DESCRIPTION,
+    })]));
+
+    now = 2_000;
+    repository.reconcileSource(source("source-a", "Alpha", [item({
+      canonicalUrl: "https://beta.example.test/jobs/shared",
+      applyUrl: "https://beta.example.test/jobs/shared/apply",
+      description: null,
+    })]));
+
+    expect(database.query<{ id: string; description: string | null }, []>(
+      "SELECT id, description FROM discovery_jobs",
+    ).all()).toEqual([{ id: "job-1", description: DESCRIPTION }]);
+    expect(database.query<{ job_id: string }, []>(
+      "SELECT job_id FROM discovery_observations ORDER BY source_id",
+    ).all()).toEqual([{ job_id: "job-1" }, { job_id: "job-1" }]);
+  });
+
+  test("persists unavailable descriptions, enriches them later, and never erases saved detail", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let now = 1_000;
+    const repository = new DiscoveryRepository(database, {
+      now: () => now,
+      idFactory: () => "job-1",
+    });
+
+    repository.reconcileSource(source("source-a", "Alpha", [item({ description: null })]));
+    const unavailable = repository.list(DiscoveryListRequestSchema.parse({
+      maxAgeDays: null,
+      search: "software",
+    })).jobs[0]!;
+    expect(unavailable).toMatchObject({
+      descriptionPreview: null,
+      queueable: false,
+    });
+    expect(repository.getQueueCandidate(unavailable.id)?.description).toBeNull();
+    expect(repository.loadActiveSourceItems("source-a", [{
+      sourceItemId: "item-1",
+      canonicalUrl: "https://board.example.test/jobs/123",
+    }])).toEqual([{
+      sourceItemId: "item-1",
+      canonicalUrl: "https://board.example.test/jobs/123",
+      description: null,
+    }]);
+
+    now = 2_000;
+    repository.reconcileSource(source("source-a", "Alpha", [item({ description: DESCRIPTION })]));
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0])
+      .toMatchObject({
+        descriptionPreview: DESCRIPTION,
+        queueable: true,
+      });
+
+    now = 3_000;
+    repository.reconcileSource(source("source-a", "Alpha", [item({ description: null })]));
+    expect(database.query<{ description: string | null }, []>(
+      "SELECT description FROM discovery_jobs WHERE id = 'job-1'",
+    ).get()).toEqual({ description: DESCRIPTION });
+  });
+
   test("returns a bounded Unicode-safe preview while retaining the full description", () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);
@@ -564,6 +731,7 @@ describe("discovery source reconciliation", () => {
     const preview = repository.list(
       DiscoveryListRequestSchema.parse({ maxAgeDays: null }),
     ).jobs[0]!.descriptionPreview;
+    if (preview === null) throw new Error("Expected an enriched description preview");
     expect(preview.length).toBeLessThanOrEqual(500);
     expect(preview.endsWith("…")).toBeTrue();
     const beforeEllipsis = preview.charCodeAt(preview.length - 2);

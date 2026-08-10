@@ -1407,9 +1407,9 @@ describe("saved discovery descriptions", () => {
     target.pipelineDatabase.query(`
       INSERT INTO discovery_jobs(
         id, catalog_source_id, catalog_source_item_id,
-        title, company, location, role, canonical_url, apply_url,
+        title, company, location, canonical_url, apply_url,
         description, posted_at, first_seen_at, last_seen_at, closed
-      ) VALUES (?, 'fixture-source', 'fixture-item', ?, ?, NULL, 'software_engineering', ?, ?, ?, NULL, 90, 90, 0)
+      ) VALUES (?, 'fixture-source', 'fixture-item', ?, ?, NULL, ?, ?, ?, NULL, 90, 90, 0)
     `).run(
       "discovery-job-1",
       "Software Engineering Intern",
@@ -1418,6 +1418,9 @@ describe("saved discovery descriptions", () => {
       JOB_URL,
       JOB_DESCRIPTION,
     );
+    target.pipelineDatabase.query(
+      "INSERT INTO discovery_job_roles(job_id, role) VALUES (?, 'software_engineering')",
+    ).run("discovery-job-1");
 
     const run = await target.service.createRunFromDescription(
       "discovery-job-1",
@@ -1468,9 +1471,9 @@ describe("saved discovery descriptions", () => {
     target.pipelineDatabase.query(`
       INSERT INTO discovery_jobs(
         id, catalog_source_id, catalog_source_item_id,
-        title, company, location, role, canonical_url, apply_url,
+        title, company, location, canonical_url, apply_url,
         description, posted_at, first_seen_at, last_seen_at, closed
-      ) VALUES (?, 'fixture-source', 'fixture-item-blocked', ?, ?, NULL, 'software_engineering', ?, ?, ?, NULL, 90, 90, 0)
+      ) VALUES (?, 'fixture-source', 'fixture-item-blocked', ?, ?, NULL, ?, ?, ?, NULL, 90, 90, 0)
     `).run(
       "discovery-job-blocked",
       "Software Engineering Intern",
@@ -1479,6 +1482,9 @@ describe("saved discovery descriptions", () => {
       JOB_URL,
       JOB_DESCRIPTION,
     );
+    target.pipelineDatabase.query(
+      "INSERT INTO discovery_job_roles(job_id, role) VALUES (?, 'software_engineering')",
+    ).run("discovery-job-blocked");
 
     await expect(target.service.createRunFromDescription(
       "discovery-job-blocked",

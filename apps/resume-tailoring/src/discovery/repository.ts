@@ -27,7 +27,7 @@ interface DiscoveryJobRow {
   roles: string;
   canonical_url: string;
   apply_url: string;
-  description: string;
+  description: string | null;
   posted_at: number | null;
   first_seen_at: number;
   last_seen_at: number;
@@ -45,7 +45,7 @@ interface CandidateRow {
 }
 
 interface ActiveSourceItemDescriptionRow extends DiscoveryKnownItemKey {
-  readonly description: string;
+  readonly description: string | null;
 }
 
 export interface DiscoverySourceDescriptor {
@@ -76,7 +76,7 @@ export interface DiscoveryListResult {
 export interface DiscoveryQueueCandidate {
   readonly id: string;
   readonly canonicalUrl: string;
-  readonly description: string;
+  readonly description: string | null;
   readonly closed: boolean;
   readonly queuedRunId?: string;
 }
@@ -90,7 +90,8 @@ const DAY_MS = 86_400_000;
 const MAX_ACTIVE_SOURCE_ITEM_CANDIDATES = 10_000;
 const ACTIVE_SOURCE_ITEM_QUERY_BATCH_SIZE = 400;
 
-function descriptionPreview(description: string): string {
+function descriptionPreview(description: string | null): string | null {
+  if (description === null) return null;
   const compact = description.replace(/\s+/g, " ").trim();
   if (compact.length <= 500) return compact;
   let end = 499;
@@ -121,6 +122,7 @@ function publicJob(row: DiscoveryJobRow): DiscoveryJob {
     canonicalUrl: row.canonical_url,
     applyUrl: row.apply_url,
     descriptionPreview: descriptionPreview(row.description),
+    queueable: status === "open" && row.description !== null,
     postedAt: row.posted_at,
     firstSeenAt: row.first_seen_at,
     lastSeenAt: row.last_seen_at,
@@ -271,7 +273,7 @@ export class DiscoveryRepository {
       for (const row of rows) {
         found.set(row.sourceItemId, {
           ...row,
-          description: JobDescriptionSchema.parse(row.description),
+          description: JobDescriptionSchema.nullable().parse(row.description),
         });
       }
     }
@@ -329,9 +331,15 @@ export class DiscoveryRepository {
     this.database.query(`
       UPDATE discovery_jobs
       SET first_seen_at = min(first_seen_at, (SELECT first_seen_at FROM discovery_jobs WHERE id = ?)),
-          last_seen_at = max(last_seen_at, (SELECT last_seen_at FROM discovery_jobs WHERE id = ?))
+          last_seen_at = max(last_seen_at, (SELECT last_seen_at FROM discovery_jobs WHERE id = ?)),
+          description = CASE
+            WHEN coalesce(length(description), -1) >= coalesce((
+              SELECT length(description) FROM discovery_jobs WHERE id = ?
+            ), -1) THEN description
+            ELSE (SELECT description FROM discovery_jobs WHERE id = ?)
+          END
       WHERE id = ?
-    `).run(duplicateId, duplicateId, canonicalId);
+    `).run(duplicateId, duplicateId, duplicateId, duplicateId, canonicalId);
     this.database.query("UPDATE discovery_observations SET job_id = ? WHERE job_id = ?")
       .run(canonicalId, duplicateId);
     this.database.query("UPDATE discovery_dedupe_keys SET job_id = ? WHERE job_id = ?")
@@ -384,7 +392,7 @@ export class DiscoveryRepository {
           throw new Error("discovery source URL must be HTTP(S) without credentials");
         }
         const sourceUrl = parsedSourceUrl.href;
-        const description = JobDescriptionSchema.parse(rawItem.description);
+        const description = JobDescriptionSchema.nullable().parse(rawItem.description);
         const location = rawItem.location?.trim() || null;
         const roles = DiscoveryRolesSchema.parse(rawItem.roles);
         const item = { ...rawItem, canonicalUrl, applyUrl, location };
@@ -421,9 +429,15 @@ export class DiscoveryRepository {
           }
           this.database.query(`
             UPDATE discovery_jobs
-            SET last_seen_at = max(last_seen_at, ?), closed = 0
+            SET last_seen_at = max(last_seen_at, ?),
+                closed = 0,
+                description = CASE
+                  WHEN ? IS NULL THEN description
+                  WHEN description IS NULL OR length(description) <= length(?) THEN ?
+                  ELSE description
+                END
             WHERE id = ?
-          `).run(now, jobId);
+          `).run(now, description, description, description, jobId);
           const catalog = candidates[0]!;
           if (
             catalog.catalog_source_id === input.id
@@ -433,7 +447,6 @@ export class DiscoveryRepository {
               UPDATE discovery_jobs
               SET title = ?, company = ?, location = ?,
                   canonical_url = ?, apply_url = ?,
-                  description = CASE WHEN length(description) > length(?) THEN description ELSE ? END,
                   posted_at = CASE
                     WHEN posted_at IS NULL THEN ?
                     WHEN ? IS NULL THEN posted_at
@@ -446,8 +459,6 @@ export class DiscoveryRepository {
               location,
               canonicalUrl,
               applyUrl,
-              description,
-              description,
               rawItem.postedAt ?? null,
               rawItem.postedAt ?? null,
               rawItem.postedAt ?? null,
@@ -535,7 +546,7 @@ export class DiscoveryRepository {
         lower(jobs.title) LIKE ? ESCAPE '\\'
         OR lower(jobs.company) LIKE ? ESCAPE '\\'
         OR lower(coalesce(jobs.location, '')) LIKE ? ESCAPE '\\'
-        OR lower(jobs.description) LIKE ? ESCAPE '\\'
+        OR lower(coalesce(jobs.description, '')) LIKE ? ESCAPE '\\'
       )`);
       const pattern = `%${escaped}%`;
       parameters.push(pattern, pattern, pattern, pattern);
@@ -598,7 +609,7 @@ export class DiscoveryRepository {
     const row = this.database.query<{
       id: string;
       canonical_url: string;
-      description: string;
+      description: string | null;
       closed: number;
       run_id: string | null;
     }, [string]>(`
