@@ -1208,11 +1208,11 @@ test("additional-information answers survive conflict reconciliation and clear o
   const gatedGuidance = "Use only verified profile facts.";
   await page.getByRole("textbox", { name: "Operator guidance" })
     .fill(gatedGuidance);
-  await page.getByRole("button", { name: "Steer and answer questions" }).click();
-  await expect.poll(() => mock.commands.length).toBe(3);
+  await page.getByRole("button", { name: "Send guidance" }).click();
+  await expect.poll(() => mock.commands.length).toBe(2);
   expect(mock.commands[1]).toEqual({ type: "steer", message: gatedGuidance });
-  expect(mock.commands[2]).toEqual(expectedCommand);
-  await expect(page.getByRole("button", { name: "Answering…" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Answer questions", exact: true }))
+    .toBeEnabled();
   await expect(page.getByRole("heading", { name: "Additional information needed" })).toBeVisible();
   await expect(nameQuestion.getByRole("textbox", { name: "Answer", exact: true }))
     .toHaveValue("  Ada Public  ");
@@ -1350,7 +1350,7 @@ test("a changed question gate suppresses stale continuation after steering", asy
   await page.getByRole("group", { name: oldQuestion.question })
     .getByRole("textbox", { name: "Answer", exact: true })
     .fill("Stale answer");
-  await page.getByRole("button", { name: "Steer and answer questions" }).click();
+  await page.getByRole("button", { name: "Send guidance" }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
 
   gateFrame.resolve();
@@ -1798,7 +1798,7 @@ test("credential gate sends exact actions, retains failures, clears on progress,
       mock.application = authoritativeCredentials;
     },
   });
-  mock.commandReplies.push({ status: 202 }, { status: 202 });
+  mock.commandReplies.push({ status: 202 });
   queueSse(
     mock,
     eventFixture("credentials_required", changedCredentials, {}),
@@ -1833,14 +1833,8 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   const password = page.getByLabel("Password");
   const signIn = credentialsForm.getByRole("button", { name: "Sign in with credentials" });
   const save = credentialsForm.getByRole("button", { name: "Save credentials", exact: true });
-  const steerSignIn = credentialsForm.getByRole("button", {
-    name: "Steer and sign in",
-  });
-  const steerSave = credentialsForm.getByRole("button", {
-    name: "Steer and save credentials",
-  });
   await expect(credentialsForm).toBeVisible();
-  await expect(credentialsForm.getByRole("button")).toHaveCount(4);
+  await expect(credentialsForm.getByRole("button")).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Cancel application" })).toBeVisible();
   await expect(credentialsForm).toHaveAttribute("autocomplete", "off");
   await expect(username).toHaveAttribute("autocomplete", "off");
@@ -1856,11 +1850,7 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   await password.press("Tab");
   await expect(signIn).toBeFocused();
   await signIn.press("Tab");
-  await expect(steerSignIn).toBeFocused();
-  await steerSignIn.press("Tab");
   await expect(save).toBeFocused();
-  await save.press("Tab");
-  await expect(steerSave).toBeFocused();
   expect(await page.evaluate(() =>
     document.documentElement.scrollWidth <= document.documentElement.clientWidth
   )).toBe(true);
@@ -1870,9 +1860,7 @@ test("credential gate sends exact actions, retains failures, clears on progress,
     username,
     password,
     signIn,
-    steerSignIn,
     save,
-    steerSave,
   ]) {
     const controlBox = await control.boundingBox();
     if (!controlBox) throw new Error("Credential control has no layout box");
@@ -1948,21 +1936,14 @@ test("credential gate sends exact actions, retains failures, clears on progress,
 
   const savedUsername = "new-account@example.test";
   const savedPassword = "new account private password";
-  const credentialGuidance = "Use the newly created account.";
-  await page.getByRole("textbox", { name: "Operator guidance" })
-    .fill(credentialGuidance);
   await username.fill(savedUsername);
   await password.fill(savedPassword);
-  await steerSave.evaluate((button) => {
+  await save.evaluate((button) => {
     (button as HTMLButtonElement).click();
     (button as HTMLButtonElement).click();
   });
-  await expect.poll(() => mock.commands.length).toBe(3);
+  await expect.poll(() => mock.commands.length).toBe(2);
   expect(mock.commands[1]).toEqual({
-    type: "steer",
-    message: credentialGuidance,
-  });
-  expect(mock.commands[2]).toEqual({
     type: "save_credentials",
     username: savedUsername,
     password: savedPassword,
@@ -1991,7 +1972,6 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   expect(publicResponses).not.toContain(privateCredentialPassword);
   expect(publicResponses).not.toContain(savedUsername);
   expect(publicResponses).not.toContain(savedPassword);
-  expect(publicResponses).not.toContain(credentialGuidance);
 });
 
 test("credential values survive a network failure while both actions stay latched", async ({ page }) => {
@@ -3036,7 +3016,6 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
     },
     { status: 202 },
     { status: 202 },
-    { status: 202 },
   );
 
   await page.goto(`/runs/${runId}`);
@@ -3050,7 +3029,7 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
     "application-steering-guidance",
   );
   await expect(page.getByText(
-    "Delivered once before the next agent step. Guidance is not saved to your profile or application facts.",
+    "Delivered once before the next agent step. If an action is waiting, delivery releases it immediately. Guidance is not saved to your profile or application facts.",
     { exact: true },
   )).toBeVisible();
   expect(await page.evaluate(
@@ -3124,10 +3103,9 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
 
   const gatedDraft = "Retry the public checkpoint with the verified address.";
   await guidance.fill(gatedDraft);
-  await page.getByRole("button", { name: "Steer and continue" }).click();
-  await expect.poll(() => mock.commands.length).toBe(5);
+  await page.getByRole("button", { name: "Send guidance" }).click();
+  await expect.poll(() => mock.commands.length).toBe(4);
   expect(mock.commands[3]).toEqual({ type: "steer", message: gatedDraft });
-  expect(mock.commands[4]).toEqual({ type: "continue" });
 
   returnToRunning.resolve();
   await expect(page.getByRole("form", { name: "Guide the application agent" })).toBeVisible();
@@ -3136,8 +3114,8 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
 
   await guidance.fill("Resume using only the verified public address.");
   await send.click();
-  await expect.poll(() => mock.commands.length).toBe(6);
-  expect(mock.commands[5]).toEqual({
+  await expect.poll(() => mock.commands.length).toBe(5);
+  expect(mock.commands[4]).toEqual({
     type: "steer",
     message: "Resume using only the verified public address.",
   });
@@ -3169,7 +3147,7 @@ test("cancelling during steering suppresses navigation continuation", async ({ p
   await page.goto(`/runs/${runId}`);
   await page.getByRole("textbox", { name: "Operator guidance" })
     .fill("Retry the checkpoint once.");
-  await page.getByRole("button", { name: "Steer and continue" }).click();
+  await page.getByRole("button", { name: "Send guidance" }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
   await expect(page.getByRole("button", { name: "Continue application" }))
     .toBeDisabled();
@@ -3231,7 +3209,7 @@ test("ordinary navigation continues after ambiguous steering settles", async ({ 
   ]);
 });
 
-test("retry current queues fixed guidance before continuing a navigation gate", async ({ page }) => {
+test("retry current sends only fixed guidance at a navigation gate", async ({ page }) => {
   const waiting = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
     updatedAt: createdAt + 100,
@@ -3256,10 +3234,9 @@ test("retry current queues fixed guidance before continuing a navigation gate", 
   expect(Math.abs(retryBox!.width - retryBox!.height)).toBeLessThanOrEqual(1);
   await retryCurrent.click();
 
-  await expect.poll(() => mock.commands.length).toBe(2);
+  await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands).toEqual([
     { type: "steer", message: "Retry the current action." },
-    { type: "continue" },
   ]);
   await expect(guidance).toHaveValue("Keep this draft for later.");
   await expect(page.getByRole("status").filter({

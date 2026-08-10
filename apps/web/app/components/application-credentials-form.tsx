@@ -37,10 +37,6 @@ export type ApplicationCredentialCommandResult =
 interface ApplicationCredentialsFormProps {
   readonly busy: boolean;
   readonly busyAction: ApplicationSessionCommand["type"] | null;
-  readonly steeringDisabled: boolean;
-  readonly onSteerAndContinue: (
-    command: ApplicationSessionCommand,
-  ) => Promise<void>;
   readonly onSubmit: (command: ApplicationSessionCommand) => Promise<void>;
 }
 
@@ -82,8 +78,6 @@ export function buildApplicationCredentialCommand(
 export function ApplicationCredentialsForm({
   busy,
   busyAction,
-  steeringDisabled,
-  onSteerAndContinue,
   onSubmit,
 }: ApplicationCredentialsFormProps) {
   const [username, setUsername] = useState("");
@@ -99,13 +93,10 @@ export function ApplicationCredentialsForm({
     event.preventDefault();
     if (busy || submissionPendingRef.current) return;
     const submitter = (event.nativeEvent as SubmitEvent).submitter;
-    const action = submitter?.getAttribute("value");
     const type: ApplicationCredentialCommandType =
-      action === "save_credentials" || action === "steer_save_credentials"
+      submitter?.getAttribute("value") === "save_credentials"
         ? "save_credentials"
         : "sign_in";
-    const steerAndContinue =
-      action === "steer_sign_in" || action === "steer_save_credentials";
     const result = buildApplicationCredentialCommand(type, username, password);
     if (!result.success) {
       setValidationError(result);
@@ -119,9 +110,7 @@ export function ApplicationCredentialsForm({
     setValidationError(null);
     submissionPendingRef.current = true;
     try {
-      await (steerAndContinue
-        ? onSteerAndContinue(result.command)
-        : onSubmit(result.command));
+      await onSubmit(result.command);
     } finally {
       submissionPendingRef.current = false;
     }
@@ -150,7 +139,8 @@ export function ApplicationCredentialsForm({
         <h3 id="application-credentials-heading">Credentials needed</h3>
         <p id={descriptionId}>
           Enter the username or email and password for this application site.
-          Signing in uses them for this browser attempt without saving them.
+          Signing in uses them for this browser attempt and saves them for
+          future sign-ins after the browser action succeeds.
         </p>
       </div>
       <div className={styles.applicationCredentialFields}>
@@ -217,15 +207,6 @@ export function ApplicationCredentialsForm({
           {busyAction === "sign_in" ? "Signing in…" : "Sign in with credentials"}
         </button>
         <button
-          className={styles.secondaryButton}
-          disabled={busy || steeringDisabled}
-          name="credential_action"
-          type="submit"
-          value="steer_sign_in"
-        >
-          Steer and sign in
-        </button>
-        <button
           aria-describedby={saveDescriptionId}
           className={styles.secondaryButton}
           disabled={busy}
@@ -234,16 +215,6 @@ export function ApplicationCredentialsForm({
           value="save_credentials"
         >
           {busyAction === "save_credentials" ? "Saving credentials…" : "Save credentials"}
-        </button>
-        <button
-          aria-describedby={saveDescriptionId}
-          className={styles.secondaryButton}
-          disabled={busy || steeringDisabled}
-          name="credential_action"
-          type="submit"
-          value="steer_save_credentials"
-        >
-          Steer and save credentials
         </button>
       </div>
     </form>

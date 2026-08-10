@@ -22,7 +22,6 @@ import {
   type ApplicationLifecycleAction,
   type ApplicationSteerCommand,
   type ApplicationSteeringState,
-  type ApplicationSteeringContinuationToken,
   type ApplicationSteeringSubmissionResult,
 } from "./application-session-panel";
 import {
@@ -770,21 +769,10 @@ export function RunReviewWorkspace({
           setApplicationSteeringState("idle");
         }
       }
-      return isCurrent
-        ? {
-          status: "accepted",
-          current: true,
-          continuationToken: {
-            runId: requestRunId,
-            requestVersion,
-            actionEpoch,
-            viewEpoch,
-            generation: latch.generation,
-            bridgeState: latch.bridgeState,
-            pendingActionKey: latch.pendingActionKey,
-          },
-        }
-        : { status: "accepted", current: false };
+      return {
+        status: "accepted",
+        current: isCurrent,
+      };
     } catch (error) {
       const ownsLatch = applicationSteeringLatchRef.current === latch;
       if (
@@ -816,7 +804,6 @@ export function RunReviewWorkspace({
 
   const submitApplicationCommand = async (
     command: ApplicationSessionCommand,
-    continuationToken?: ApplicationSteeringContinuationToken,
   ) => {
     if (command.type === "steer") return;
     const current = applicationSnapshot(applicationViewRef.current);
@@ -826,19 +813,6 @@ export function RunReviewWorkspace({
       || applicationCommandLatchRef.current
       || applicationLifecycleLatchRef.current
       || applicationSteeringLatchRef.current?.state === "sending"
-    ) return;
-    if (
-      continuationToken
-      && (
-        continuationToken.runId !== run.id
-        || continuationToken.requestVersion !== applicationRequestVersion.current
-        || continuationToken.actionEpoch !== applicationActionEpochRef.current
-        || continuationToken.viewEpoch !== applicationViewEpochRef.current
-        || continuationToken.generation !== current.generation
-        || continuationToken.bridgeState !== current.bridgeState
-        || continuationToken.pendingActionKey
-          !== JSON.stringify(current.pendingAction)
-      )
     ) return;
     const latch = createApplicationCommandLatch(command, current);
     applicationCommandLatchRef.current = latch;
