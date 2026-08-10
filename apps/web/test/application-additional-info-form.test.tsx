@@ -22,7 +22,6 @@ const callbacks = {
   onContinue: async () => {},
   onLoadSuggestions: async () => ({ suggestions: [] }),
   onProfessionalize: async () => ({ answer: "Professional answer" }),
-  onSteerAndContinue: async () => {},
   onSubmit: async () => {},
 };
 
@@ -40,7 +39,6 @@ describe("ApplicationAdditionalInfoForm", () => {
         busy={false}
         continuing={false}
         questions={questions}
-        steeringDisabled={false}
         submitting={false}
       />,
     );
@@ -57,7 +55,6 @@ describe("ApplicationAdditionalInfoForm", () => {
         busy
         continuing
         questions={questions}
-        steeringDisabled={false}
         submitting={false}
       />,
     );

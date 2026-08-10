@@ -1304,6 +1304,10 @@ class SignInRuntimeActionResponse(PublicModel):
 class ContinueRuntimeActionResponse(PublicModel):
     type: Literal["continue"]
 
+class InterruptedRuntimeActionResponse(PublicModel):
+    type: Literal["interrupted"]
+
+
 
 class ContinueWithoutAdditionalInfoRuntimeActionResponse(PublicModel):
     type: Literal["continue_without_additional_info"]
@@ -1347,6 +1351,7 @@ RuntimeActionResponse: TypeAlias = Annotated[
     PlaywrightCliResultRuntimeActionResponse
     | SignInRuntimeActionResponse
     | ContinueRuntimeActionResponse
+    | InterruptedRuntimeActionResponse
     | ContinueWithoutAdditionalInfoRuntimeActionResponse
     | ReviseRuntimeActionResponse
     | SubmitRuntimeActionResponse

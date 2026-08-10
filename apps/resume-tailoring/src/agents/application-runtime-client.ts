@@ -377,6 +377,13 @@ export const ContinueRuntimeActionResponseSchema = z.object({
 export type ContinueRuntimeActionResponse = z.infer<
   typeof ContinueRuntimeActionResponseSchema
 >;
+
+export const InterruptedRuntimeActionResponseSchema = z.object({
+  type: z.literal("interrupted"),
+}).strict();
+export type InterruptedRuntimeActionResponse = z.infer<
+  typeof InterruptedRuntimeActionResponseSchema
+>;
 export const ContinueWithoutAdditionalInfoRuntimeActionResponseSchema = z.object({
   type: z.literal("continue_without_additional_info"),
 }).strict();
@@ -478,6 +485,7 @@ export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   PlaywrightCliResultRuntimeActionResponseSchema,
   SignInRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
+  InterruptedRuntimeActionResponseSchema,
   ContinueWithoutAdditionalInfoRuntimeActionResponseSchema,
   ReviseRuntimeActionResponseSchema,
   SubmitRuntimeActionResponseSchema,

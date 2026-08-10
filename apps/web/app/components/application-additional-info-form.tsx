@@ -29,7 +29,6 @@ interface ApplicationAdditionalInfoFormProps {
   readonly continuing: boolean;
   readonly questions: readonly ApplicationAdditionalInfoQuestion[];
   readonly busy: boolean;
-  readonly steeringDisabled: boolean;
   readonly onLoadSuggestions: (
     questionId: string,
     signal: AbortSignal,
@@ -40,9 +39,6 @@ interface ApplicationAdditionalInfoFormProps {
     signal: AbortSignal,
   ) => Promise<ApplicationProfessionalizeResponse>;
   readonly onContinue: () => Promise<void>;
-  readonly onSteerAndContinue: (
-    command: ApplicationSessionCommand,
-  ) => Promise<void>;
   readonly onSubmit: (command: ApplicationSessionCommand) => Promise<void>;
 }
 
@@ -96,11 +92,9 @@ export function ApplicationAdditionalInfoForm({
   busy,
   continuing,
   submitting,
-  steeringDisabled,
   onLoadSuggestions,
   onContinue,
   onProfessionalize,
-  onSteerAndContinue,
   onSubmit,
 }: ApplicationAdditionalInfoFormProps) {
   const [drafts, setDrafts] = useState<AdditionalInfoDrafts>({});
@@ -419,9 +413,6 @@ export function ApplicationAdditionalInfoForm({
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const submitter = (event.nativeEvent as SubmitEvent).submitter;
-    const steerAndContinue =
-      submitter?.getAttribute("value") === "steer_and_continue";
     const result = buildAdditionalInfoCommand(questions, drafts);
     if (!result.success) {
       setValidationError(result);
@@ -431,9 +422,7 @@ export function ApplicationAdditionalInfoForm({
       return;
     }
     setValidationError(null);
-    await (steerAndContinue
-      ? onSteerAndContinue(result.command)
-      : onSubmit(result.command));
+    await onSubmit(result.command);
   };
 
   return (
@@ -833,15 +822,6 @@ export function ApplicationAdditionalInfoForm({
         type="button"
       >
         {continuing ? "Continuing…" : "Continue"}
-      </button>
-      <button
-        className={styles.secondaryButton}
-        disabled={busy || answerToolBusy || !formComplete || steeringDisabled}
-        name="question_action"
-        type="submit"
-        value="steer_and_continue"
-      >
-        Steer and answer questions
       </button>
     </form>
   );

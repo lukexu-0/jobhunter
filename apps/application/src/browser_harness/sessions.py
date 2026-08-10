@@ -55,6 +55,7 @@ from .models import (
     PlaywrightCliRuntimeAction,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
+    InterruptedRuntimeActionResponse,
     ContinueCommand,
     ContinueWithoutAdditionalInfoCommand,
     EmptyEventDetail,
@@ -920,6 +921,8 @@ class ApplicationSessionManager:
                         and record.model is steer_model
                         and not record.submission_action_started
                     )
+                    if steering_error is None and steering_still_current:
+                        await gate.interrupt()
             if not steering_still_current:
                 raise HarnessServiceError(
                     409,
@@ -1240,6 +1243,8 @@ class ApplicationSessionManager:
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
                 return terminal
+            if gate_result.interrupted:
+                return InterruptedRuntimeActionResponse(type="interrupted")
             return ContinueRuntimeActionResponse(type="continue")
 
         if isinstance(action, RequestSignInRuntimeAction):
@@ -1274,6 +1279,8 @@ class ApplicationSessionManager:
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
                 return terminal
+            if gate_result.interrupted:
+                return InterruptedRuntimeActionResponse(type="interrupted")
             status = (
                 gate_result.metadata.get("sign_in_status")
                 if gate_result.metadata is not None
@@ -1315,6 +1322,8 @@ class ApplicationSessionManager:
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
                 return terminal
+            if gate_result.interrupted:
+                return InterruptedRuntimeActionResponse(type="interrupted")
             try:
                 return _ADDITIONAL_INFO_GATE_RESPONSE_ADAPTER.validate_json(
                     gate_result.extracted_content
@@ -1338,6 +1347,8 @@ class ApplicationSessionManager:
             terminal = self._runtime_gate_terminal_response(gate_result)
             if terminal is not None:
                 return terminal
+            if gate_result.interrupted:
+                return InterruptedRuntimeActionResponse(type="interrupted")
             if gate.submission_approved:
                 try:
                     approved_result = ReviewApplicationResult.model_validate_json(

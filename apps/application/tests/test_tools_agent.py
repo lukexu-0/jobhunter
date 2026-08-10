@@ -222,6 +222,8 @@ async def test_sign_in_requester_cancellation_after_browser_mutation_resolves_ga
     gate, publisher = make_gate(action_timeout=5)
     runtime = CredentialRuntime()
     credential_store = CredentialStore(tmp_path / "credentials.json")
+    username = "person@example.test"
+    password = "corrected-private-password$$"
     gated = asyncio.create_task(
         gate.request_sign_in(
             username_ref="e1",
@@ -236,10 +238,9 @@ async def test_sign_in_requester_cancellation_after_browser_mutation_resolves_ga
         "credentials_required",
         {},
     )
+    await credential_store.upsert(JOB_ORIGIN, username, "stale-private-password")
 
-    command = asyncio.create_task(
-        gate.sign_in("person@example.test", "private-password")
-    )
+    command = asyncio.create_task(gate.sign_in(username, password))
     await asyncio.wait_for(runtime.mutation_started.wait(), timeout=1)
     await gate._lock.acquire()
     try:
@@ -261,7 +262,84 @@ async def test_sign_in_requester_cancellation_after_browser_mutation_resolves_ga
     assert result.metadata == {"sign_in_status": "attempted"}
     assert await publisher.next_event(after=1) == ("running", None, {})
     assert len(runtime.sign_in_calls) == 1
+    saved = credential_store.credentials_for_origin(JOB_ORIGIN)
+    assert [(item.username, item.password) for item in saved] == [
+        (username, password)
+    ]
     assert gate._credential_command_task is None
+
+
+@pytest.mark.asyncio
+async def test_interrupt_does_not_release_running_sign_in_mutation(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    gate, publisher = make_gate(action_timeout=5)
+    runtime = CredentialRuntime()
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    username = "person@example.test"
+    password = "corrected-private-password$$"
+    gated = asyncio.create_task(
+        gate.request_sign_in(
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            runtime=runtime,
+            credential_store=credential_store,
+        )
+    )
+    assert await publisher.next_event() == (
+        "awaiting_human_navigation",
+        "credentials_required",
+        {},
+    )
+
+    command = asyncio.create_task(gate.sign_in(username, password))
+    await asyncio.wait_for(runtime.mutation_started.wait(), timeout=1)
+    assert await gate.interrupt() is False
+    assert gate.pending_kind == "credentials"
+
+    runtime.mutation_release.set()
+    await command
+    result = await asyncio.wait_for(gated, timeout=1)
+    assert result.metadata == {"sign_in_status": "attempted"}
+    saved = credential_store.credentials_for_origin(JOB_ORIGIN)
+    assert [(item.username, item.password) for item in saved] == [
+        (username, password)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_sign_in_does_not_replace_saved_credentials(
+    tmp_path: Path,
+) -> None:
+    class FailingCredentialRuntime(CredentialRuntime):
+        async def sign_in(self, **_kwargs: str) -> None:
+            self.mutation_started.set()
+            await self.mutation_release.wait()
+            raise RuntimeError("private browser failure")
+
+    tmp_path.chmod(0o700)
+    gate, _publisher = make_gate(action_timeout=5)
+    runtime = FailingCredentialRuntime()
+    runtime.mutation_release.set()
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    username = "person@example.test"
+    await credential_store.upsert(JOB_ORIGIN, username, "known-good-password")
+
+    with pytest.raises(HarnessServiceError):
+        await gate.request_sign_in(
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            runtime=runtime,
+            credential_store=credential_store,
+        )
+
+    saved = credential_store.credentials_for_origin(JOB_ORIGIN)
+    assert [(item.username, item.password) for item in saved] == [
+        (username, "known-good-password")
+    ]
 
 
 @pytest.mark.asyncio
@@ -417,6 +495,87 @@ def make_result(
             "revision_count": 0,
             "submit_attempted": False,
         }
+    )
+
+@pytest.mark.asyncio
+async def test_interrupt_releases_every_pending_human_tool_gate(
+    tmp_path: Path,
+) -> None:
+    async def assert_interrupted(
+        gate: HumanGate,
+        publisher: EventPublisher,
+        task: asyncio.Task[Any],
+        kind: str,
+    ) -> None:
+        await publisher.next_event()
+        assert gate.pending_kind == kind
+        assert await gate.interrupt() is True
+        result = await asyncio.wait_for(task, timeout=1)
+        assert result.interrupted is True
+        assert result.extracted_content == '{"type":"interrupted"}'
+        assert publisher.events[-1] == ("running", None, {})
+        assert await gate.interrupt() is False
+
+    navigation_gate, navigation_publisher = make_gate(action_timeout=5)
+    navigation_task = asyncio.create_task(
+        navigation_gate.request_human_navigation(
+            "Complete the public checkpoint.",
+            FakeRuntime(),
+        )
+    )
+    await assert_interrupted(
+        navigation_gate,
+        navigation_publisher,
+        navigation_task,
+        "navigation",
+    )
+
+    credentials_gate, credentials_publisher = make_gate(action_timeout=5)
+    credentials_task = asyncio.create_task(
+        credentials_gate.request_sign_in(
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            runtime=CredentialRuntime(),
+            credential_store=CredentialStore(tmp_path / "credentials.json"),
+        )
+    )
+    await assert_interrupted(
+        credentials_gate,
+        credentials_publisher,
+        credentials_task,
+        "credentials",
+    )
+
+    question = AdditionalInfoTextQuestion.model_validate(
+        {
+            "id": "availability",
+            "key": "availability.start_date",
+            "scope": "global",
+            "question": "When can you start?",
+            "answer_type": "text",
+        }
+    )
+    additional_gate, additional_publisher = make_gate(action_timeout=5)
+    additional_task = asyncio.create_task(
+        additional_gate.request_additional_info([question], FakeRuntime())
+    )
+    await assert_interrupted(
+        additional_gate,
+        additional_publisher,
+        additional_task,
+        "additional_info",
+    )
+
+    review_gate, review_publisher = make_gate(action_timeout=5)
+    review_task = asyncio.create_task(
+        review_gate.request_human_review(make_result(), FakeRuntime())
+    )
+    await assert_interrupted(
+        review_gate,
+        review_publisher,
+        review_task,
+        "review",
     )
 
 

@@ -201,7 +201,7 @@ describe("ApplicationSessionPanel", () => {
     );
     expect(waiting).toContain("Operator guidance");
     expect(waiting).toContain("Send guidance");
-    expect(waiting).toContain("Steer and continue");
+    expect(waiting).not.toContain("Steer and continue");
     expect(waiting).toContain('title="Retry current action"');
 
     const ambiguous = renderToStaticMarkup(
@@ -433,11 +433,11 @@ describe("ApplicationSessionPanel", () => {
     expect(normalizedMarkup).not.toContain('autocomplete="username"');
     expect(normalizedMarkup).toContain('type="password"');
     expect(markup).toContain("Sign in with credentials");
-    expect(markup).toContain("Steer and sign in");
-    expect(markup).toContain("Steer and save credentials");
+    expect(markup).not.toContain("Steer and sign in");
+    expect(markup).not.toContain("Steer and save credentials");
     expect(markup).toContain("Save credentials");
     expect(markup).toContain("private local credential file");
-    expect(formMarkup.match(/<button/g)).toHaveLength(4);
+    expect(formMarkup.match(/<button/g)).toHaveLength(2);
     expect(formMarkup).not.toContain("Continue application");
 
     const busyMarkup = renderToStaticMarkup(
@@ -519,7 +519,7 @@ describe("ApplicationSessionPanel", () => {
     expect(markup).toContain("Monday");
     expect(markup.match(/Decline to answer/g)).toHaveLength(4);
     expect(buttonOpeningTag(markup, "Answer questions")).toContain("disabled");
-    expect(markup).toContain("Steer and answer questions");
+    expect(markup).not.toContain("Steer and answer questions");
     expect(markup).toContain("Professionalize");
     expect(markup).toContain('aria-label="Professionalize settings"');
     expect(markup).toContain('aria-expanded="false"');
@@ -563,7 +563,7 @@ describe("ApplicationSessionPanel", () => {
 
     expect(markup).toContain("Review the application");
     expect(markup).toContain("Request application revision");
-    expect(markup).toContain("Steer and request revision");
+    expect(markup).not.toContain("Steer and request revision");
     expect(markup).toContain("Approve and submit");
     expect(markup).toContain("Submit this application?");
     expect(markup).toContain("This action is irreversible.");

@@ -257,6 +257,8 @@ const NON_JOB_APPLICATION_AGENT_PROFILE: ApplicationAgentProfile = {
 const HUMAN_REVIEW_DESCRIPTION = "Pause for final human review after every application field and warning has been handled. Summarize candidate-data and application fields, including completed nonstandard widgets. Omit navigation, human-only, and checkpoint controls; every fields_filled item has value_present true, and fields_needing_human contains only genuinely unresolved candidate fields.";
 const AUTO_SUBMIT_REVIEW_DESCRIPTION = "Record the final application summary and authorize automatic submission after every application field and warning has been handled and no required fact remains unresolved. Include candidate-data and application fields, including completed nonstandard widgets. Omit navigation, human-only, and checkpoint controls; every fields_filled item has value_present true, and fields_needing_human must be empty.";
 const CONTINUE_WITHOUT_ADDITIONAL_INFO_RESULT = "The human chose Continue without providing answers. Re-inspect the current application step and attempt to continue without inferring or fabricating information. Re-ask only if the site still requires the information.";
+const INTERRUPTED_ACTION_RESULT =
+  "Operator guidance interrupted the pending action. Follow the latest operator guidance before continuing.";
 
 const PLAYWRIGHT_CLI_AGENT_REFERENCE_RELATIVE_PATH =
   "apps/application/src/browser_harness/playwright-cli-agent.md";
@@ -694,6 +696,7 @@ async function runApplicationAgentWithProfile(
         actionSignal,
       );
       if (response.type === "cancel") throw new ApplicationAgentCancelled(response.result);
+      if (response.type === "interrupted") return INTERRUPTED_ACTION_RESULT;
       if (response.type !== "sign_in") {
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
@@ -718,6 +721,7 @@ async function runApplicationAgentWithProfile(
         actionSignal,
       );
       if (response.type === "cancel") throw new ApplicationAgentCancelled(response.result);
+      if (response.type === "interrupted") return INTERRUPTED_ACTION_RESULT;
       if (response.type !== "continue") {
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
@@ -743,6 +747,7 @@ async function runApplicationAgentWithProfile(
         actionSignal,
       );
       if (response.type === "cancel") throw new ApplicationAgentCancelled(response.result);
+      if (response.type === "interrupted") return INTERRUPTED_ACTION_RESULT;
       if (response.type === "continue_without_additional_info") {
         return CONTINUE_WITHOUT_ADDITIONAL_INFO_RESULT;
       }
@@ -776,6 +781,7 @@ async function runApplicationAgentWithProfile(
         remainingDeadlineMs(runtimeContext),
         actionSignal,
       );
+      if (response.type === "interrupted") return INTERRUPTED_ACTION_RESULT;
       if (response.type === "revise" && !input.autoSubmit) {
         return JSON.stringify(response);
       }

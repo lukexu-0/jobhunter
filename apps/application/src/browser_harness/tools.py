@@ -18,6 +18,7 @@ from .models import (
     AdditionalInfoMultiSelectQuestion,
     AdditionalInfoQuestion,
     AdditionalInfoRuntimeActionResponse,
+    InterruptedRuntimeActionResponse,
     ContinueWithoutAdditionalInfoRuntimeActionResponse,
     AdditionalInfoSingleSelectCommandAnswer,
     AdditionalInfoSingleSelectQuestion,
@@ -53,6 +54,7 @@ DecisionKind = Literal[
     "additional_info",
     "revise",
     "submit",
+    "interrupted",
     "cancel",
 ]
 GatePayload: TypeAlias = str | tuple[AcceptedAdditionalInfoAnswer, ...] | None
@@ -92,6 +94,7 @@ class GateResult:
     extracted_content: str | None = None
     long_term_memory: str | None = None
     metadata: dict[str, object] | None = None
+    interrupted: bool = False
 
 
 @dataclass(slots=True)
@@ -433,6 +436,8 @@ class HumanGate:
                     or "Human action is required"
                 },
             )
+            if decision == "interrupted":
+                return self._interrupted_result()
             if decision == "cancel":
                 return await self._cancelled_result(runtime)
             try:
@@ -534,6 +539,8 @@ class HumanGate:
             submit_ref=submit_ref,
             credential_store=credential_store,
         )
+        if decision == "interrupted":
+            return self._interrupted_result()
         if decision == "cancel":
             return await self._cancelled_result(runtime)
         status = "saved" if decision == "save_credentials" else "attempted"
@@ -602,6 +609,8 @@ class HumanGate:
             questions=tuple(questions),
             storage_questions=storage_questions,
         )
+        if decision == "interrupted":
+            return self._interrupted_result()
         if decision == "cancel":
             return await self._cancelled_result(runtime)
         if decision == "continue_without_additional_info" and payload is None:
@@ -652,6 +661,8 @@ class HumanGate:
                 event="review_required",
                 detail={},
             )
+            if decision == "interrupted":
+                return self._interrupted_result()
             if decision == "revise" and context is not None:
                 return GateResult(
                     extracted_content=(
@@ -719,6 +730,7 @@ class HumanGate:
                 or pending.username_ref is None
                 or pending.password_ref is None
                 or pending.submit_ref is None
+                or pending.credential_store is None
             ):
                 raise RuntimeError("Credential gate is incomplete")
             if (
@@ -730,6 +742,7 @@ class HumanGate:
                 self._complete_sign_in(
                     pending=pending,
                     runtime=pending.runtime,
+                    credential_store=pending.credential_store,
                     login_origin=pending.login_origin,
                     username_ref=pending.username_ref,
                     password_ref=pending.password_ref,
@@ -749,6 +762,7 @@ class HumanGate:
         *,
         pending: _PendingGate,
         runtime: BrowserGateRuntime,
+        credential_store: CredentialStore,
         login_origin: str,
         username_ref: str,
         password_ref: str,
@@ -767,6 +781,7 @@ class HumanGate:
                 username=username,
                 password=password,
             )
+            await credential_store.upsert(login_origin, username, password)
             async with self._lock:
                 if self._pending is not pending:
                     raise self._conflict("The credential gate changed")
@@ -910,6 +925,18 @@ class HumanGate:
             self._submission_approved = True
             pending.future.set_result(("submit", None))
 
+    async def interrupt(self) -> bool:
+        async with self._lock:
+            pending = self._pending
+            if pending is None or pending.future.done():
+                return False
+            credential_task = self._credential_command_task
+            if credential_task is not None and not credential_task.done():
+                return False
+            await self._publish("running", None, {})
+            pending.future.set_result(("interrupted", None))
+            return True
+
     async def cancel(self) -> None:
         current_task = asyncio.current_task()
         async with self._lock:
@@ -1040,6 +1067,19 @@ class HumanGate:
             value for value in (username, password) if value
         )
         self._credential_values_activated = True
+
+    @staticmethod
+    def _interrupted_result() -> GateResult:
+        response = InterruptedRuntimeActionResponse(type="interrupted")
+        return GateResult(
+            success=True,
+            interrupted=True,
+            extracted_content=response.model_dump_json(),
+            long_term_memory=(
+                "Operator guidance interrupted the pending action. Follow the "
+                "latest operator guidance before continuing."
+            ),
+        )
 
     async def _cancelled_result(
         self,
