@@ -58,6 +58,7 @@ from jobhunter_browser_harness.models import (
     PlaywrightCliResultRuntimeActionResponse,
     PlaywrightCliRuntimeAction,
     ContinueRuntimeActionResponse,
+    InterruptedRuntimeActionResponse,
     ContinueWithoutAdditionalInfoRuntimeActionResponse,
     CancelCommand,
     SaveCredentialsCommand,
@@ -759,7 +760,7 @@ async def test_steer_dispatches_only_to_the_live_model_without_durable_projectio
     assert all(guidance not in event.model_dump_json() for event in tombstone.events)
 
 
-async def test_steer_accepts_a_pending_gate_but_rejects_inactive_generations(
+async def test_steer_interrupts_a_pending_gate_but_rejects_inactive_generations(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
@@ -789,11 +790,9 @@ async def test_steer_accepts_a_pending_gate_but_rejects_inactive_generations(
     )
 
     assert fakes.models[0].steer_calls == [guidance]
-    assert manager.get_snapshot(created.session_id).state == "awaiting_human_navigation"
-    assert record.human_gate.pending_kind == "navigation"
-    assert not navigation.done()
-    await manager.command(created.session_id, ContinueCommand(type="continue"))
-    assert isinstance(await navigation, ContinueRuntimeActionResponse)
+    assert manager.get_snapshot(created.session_id).state == "running"
+    assert record.human_gate.pending_kind is None
+    assert isinstance(await navigation, InterruptedRuntimeActionResponse)
 
     async def assert_conflict() -> None:
         with pytest.raises(HarnessServiceError) as raised:
@@ -995,8 +994,8 @@ async def test_gate_commands_conflict_while_steering_dispatch_is_in_flight(
 
     steer_blocker.set()
     await steering
-    await manager.command(created.session_id, ContinueCommand(type="continue"))
-    assert isinstance(await navigation, ContinueRuntimeActionResponse)
+    assert record.human_gate.pending_kind is None
+    assert isinstance(await navigation, InterruptedRuntimeActionResponse)
     await manager.delete(created.session_id)
 
 async def test_new_gate_can_steer_while_superseded_steer_is_unresolved(
@@ -1053,8 +1052,7 @@ async def test_new_gate_can_steer_while_superseded_steer_is_unresolved(
         "guidance for the running step",
         "guidance for the new gate",
     ]
-    await manager.command(created.session_id, ContinueCommand(type="continue"))
-    assert isinstance(await navigation, ContinueRuntimeActionResponse)
+    assert isinstance(await navigation, InterruptedRuntimeActionResponse)
     await manager.delete(created.session_id)
 
 
@@ -4676,9 +4674,16 @@ async def test_submission_approval_rejects_while_steering_is_in_flight(
 
     steer_blocker.set()
     await steering
-    await manager.command(created.session_id, SubmitCommand(type="submit"))
-    assert isinstance(await review, SubmitRuntimeActionResponse)
-    assert record.human_gate.submission_approved is True
+    assert isinstance(await review, InterruptedRuntimeActionResponse)
+    with pytest.raises(HarnessServiceError) as raised_after_steering:
+        await manager.command(created.session_id, SubmitCommand(type="submit"))
+    assert_service_error(
+        raised_after_steering.value,
+        409,
+        "command_conflict",
+        "No matching human gate is pending",
+    )
+    assert record.human_gate.submission_approved is False
     assert fakes.models[0].steer_calls == ["finish this guidance first"]
     await manager.delete(created.session_id)
 
@@ -5720,7 +5725,10 @@ async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screens
     }
     assert username not in response.model_dump_json()
     assert password not in response.model_dump_json()
-    assert credential_store.credentials_for_origin("https://jobs.example") == ()
+    saved = credential_store.credentials_for_origin("https://jobs.example")
+    assert [(item.username, item.password) for item in saved] == [
+        (username, password)
+    ]
     assert runtime.video_recording is False
     assert runtime.sign_in_calls == [
         {

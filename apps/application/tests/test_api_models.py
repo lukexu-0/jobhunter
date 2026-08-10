@@ -2115,6 +2115,7 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
             },
         },
         {"type": "continue"},
+        {"type": "interrupted"},
         {"type": "continue_without_additional_info"},
         {"type": "revise", "context": "Use the corrected date.", "revision_count": 1},
         {
@@ -2164,6 +2165,10 @@ def test_runtime_action_unions_reject_unknown_properties() -> None:
     with pytest.raises(ValidationError):
         RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
             {"type": "continue", "unexpected": True}
+        )
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {"type": "interrupted", "unexpected": True}
         )
     with pytest.raises(ValidationError):
         RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(

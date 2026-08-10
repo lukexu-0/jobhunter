@@ -17,6 +17,7 @@ import {
   SubmissionUncertainApplicationResultSchema,
   ApplicationRuntimeError,
   HttpApplicationRuntimeClient,
+  InterruptedRuntimeActionResponseSchema,
   RequestAdditionalInfoRuntimeActionSchema,
   RequestSignInRuntimeActionSchema,
   PLAYWRIGHT_CLI_READ_ONLY_COMMANDS,
@@ -397,6 +398,20 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
     { type: "sign_in", status: "saved", username: "candidate@example.test" },
   ]) {
     expect(SignInRuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
+    expect(RuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
+  }
+});
+
+test("strictly validates the interrupted runtime response", () => {
+  const response = { type: "interrupted" as const };
+  expect(InterruptedRuntimeActionResponseSchema.parse(response)).toEqual(response);
+  expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
+  for (const invalidResponse of [
+    { type: "interrupted", extra: true },
+    { type: "interrupted", message: "private guidance" },
+  ]) {
+    expect(InterruptedRuntimeActionResponseSchema.safeParse(invalidResponse).success)
+      .toBe(false);
     expect(RuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
   }
 });

@@ -349,6 +349,70 @@ describe("application agent", () => {
     expect(() => ApplicationRunResultSchema.parse({ ...VALID_SUBMITTED_RESULT, extra: true })).toThrow();
   });
 
+  test("treats every interrupted human gate as a normal tool result", async () => {
+    const interruptionMessage =
+      "Operator guidance interrupted the pending action. Follow the latest operator guidance before continuing.";
+    const cases = [
+      {
+        toolName: "request_sign_in",
+        actionType: "request_sign_in",
+        input: { username_ref: "e1", password_ref: "e2", submit_ref: "e3" },
+      },
+      {
+        toolName: "request_human_navigation",
+        actionType: "request_human_navigation",
+        input: { instruction: "Complete the public checkpoint." },
+      },
+      {
+        toolName: "request_additional_info",
+        actionType: "request_additional_info",
+        input: {
+          questions: [{
+            id: "availability",
+            key: "availability.start_date",
+            scope: "global",
+            question: "When can you start?",
+            answer_type: "text",
+          }],
+        },
+      },
+      {
+        toolName: "request_human_review",
+        actionType: "request_human_review",
+        input: { result: VALID_RESULT },
+      },
+    ] as const;
+
+    for (const gateCase of cases) {
+      const runtimeRequests: RuntimeActionRequest[] = [];
+      const stopMessage = `stop after ${gateCase.toolName}`;
+      const dependencies = dependenciesWith(
+        async (request) => {
+          runtimeRequests.push(request);
+          return { type: "interrupted" };
+        },
+        async (agent, _input, options) => {
+          const context = options.context;
+          if (!context) throw new Error("application context is required");
+          const output = await functionTool(agent, gateCase.toolName).invoke(
+            inspectedRunContext(context),
+            JSON.stringify(gateCase.input),
+          );
+          expect(output).toBe(interruptionMessage);
+          throw new Error(stopMessage);
+        },
+      );
+
+      await expect(runApplicationAgent(
+        RUN_INPUT,
+        new AbortController().signal,
+        dependencies,
+      )).rejects.toThrow(stopMessage);
+      expect(runtimeRequests).toHaveLength(1);
+      expect(runtimeRequests[0]?.type).toBe(gateCase.actionType);
+    }
+  });
+
   test("uses the exact credential boundary for every non-job instruction profile", async () => {
     const cases = [
       {
