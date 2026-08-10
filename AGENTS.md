@@ -51,7 +51,16 @@ cd apps && bun run build
 cd apps && bun run start
 ```
 
-`bun run dev` starts the pipeline on `127.0.0.1:3557`, waits up to 30 seconds for health, then starts Next on `127.0.0.1:3556`; a separately launched development harness uses `8865`. Stable `bun run start` uses pipeline/web/harness ports `3457`/`3456`/`8765`, requires a prior build, and is allowed only from the primary checkout on `main`. In linked worktrees, use development mode and development storage only.
+### Development and stable systems
+
+| System | Workspace command | Web | Pipeline | Harness target | Storage namespace |
+| --- | --- | --- | --- | --- | --- |
+| Development | `cd apps && bun run dev` | `127.0.0.1:3556` | `127.0.0.1:3557` | `127.0.0.1:8865` | `<data-root>/development/<encoded-branch>` |
+| Stable production | `cd apps && bun run build && bun run start` | `127.0.0.1:3456` | `127.0.0.1:3457` | `127.0.0.1:8765` | `<data-root>/production` |
+
+The workspace commands start only the pipeline and Next.js web process. **They do not spawn the Python application harness.** A complete development or stable system therefore requires a separately launched `jobhunter-browser-harness` process on the matching harness port, configured to call the matching pipeline URL. Keep development and stable harness ports, Chrome profiles, user-information files, credentials files, and storage namespaces separate.
+
+Stable production requires a prior build and may run only from the primary checkout on `main`. Linked worktrees must use the development system and development storage. See `info/docs/apps/index.html` and `info/docs/apps/browser-harness/application.html` for the complete harness commands.
 
 Focused commands:
 
