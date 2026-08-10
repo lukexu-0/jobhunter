@@ -26,11 +26,9 @@ function clientFor(fetchImpl: ConnectorFetch): SafePublicHttpClient {
 }
 
 function syncContext(
-  recentCutoff: number,
   knownItems: readonly DiscoveryKnownItem[] = [],
 ): DiscoveryConnectorSyncContext {
   return {
-    recentCutoff,
     findKnownItems: (candidates) => knownItems.filter((item) =>
       candidates.some((candidate) =>
         candidate.sourceItemId === item.sourceItemId
@@ -43,10 +41,10 @@ function syncContext(
 }
 
 describe("GitHub internship table ingestion", () => {
-  test("parses escaped pipes, inline links, dates, closed rows, and internship rows", () => {
+  test("parses every structurally valid standard row without title filtering", () => {
     const parsed = parseGitHubInternshipTable(table);
 
-    expect(parsed.rows).toHaveLength(2);
+    expect(parsed.rows).toHaveLength(3);
     expect(parsed.rows[0]).toMatchObject({
       company: "Acme | Labs",
       title: "Software Engineering Intern",
@@ -54,19 +52,28 @@ describe("GitHub internship table ingestion", () => {
       applyUrl: "https://jobs.acme.example/roles/eng-123?utm_source=github",
       postedAt: Date.parse("2026-07-28T00:00:00Z"),
     });
+    expect(parsed.rows[2]).toMatchObject({
+      company: "Retail Co",
+      title: "Store Associate",
+      applyUrl: "https://retail.example/jobs/7",
+    });
     expect(parsed.closedCount).toBe(1);
-    expect(parsed.nonInternshipCount).toBe(1);
+    expect(parsed.nonInternshipCount).toBe(0);
   });
 
-  test("does not infer an internship from the application URL alone", () => {
+  test("accepts a standard row regardless of application URL or title terms", () => {
     const parsed = parseGitHubInternshipTable(`
 | Company | Role | Application |
 | --- | --- | --- |
 | Retail Co | Store Associate | [Apply](https://retail.example/internships/7) |
 `);
 
-    expect(parsed.rows).toEqual([]);
-    expect(parsed.nonInternshipCount).toBe(1);
+    expect(parsed.rows).toHaveLength(1);
+    expect(parsed.rows[0]).toMatchObject({
+      company: "Retail Co",
+      title: "Store Associate",
+    });
+    expect(parsed.nonInternshipCount).toBe(0);
   });
 
   test("parses current Simplify HTML and zapply section table shapes", async () => {
@@ -163,12 +170,12 @@ describe("GitHub internship table ingestion", () => {
     expect(parsed.unusableCount).toBe(0);
   });
 
-  test("does not treat a Non-Internships heading as an internship section", async () => {
+  test("excludes zapply-shaped rows outside an internship section even when the title says intern", async () => {
     const parsed = await parseGitHubRepositoryTables(`
 ## Non-Internships
 | Name | Year | Note |
 | --- | --- | --- |
-| Acme Full-Time Software Engineer | 2027 | New graduate |
+| [Acme Software Intern](https://jobs.example.com/acme) | 2027 | New graduate |
 `);
 
     expect(parsed.rows).toEqual([]);
@@ -279,7 +286,7 @@ ${rows}
     const result = await connector.sync(new AbortController().signal);
 
     expect(result.completeSnapshot).toBe(true);
-    expect(result.items).toHaveLength(2);
+    expect(result.items).toHaveLength(3);
     expect(result.items[0]).toMatchObject({
       company: "Acme | Labs",
       title: "Software Engineering Intern",
@@ -296,14 +303,14 @@ ${rows}
       .toBe(true);
   });
 
-  test("fetches only recent unknown details and reuses remembered rows at any age", async () => {
+  test("fetches unknown details at every age and reuses non-null remembered descriptions", async () => {
     const source = `
 | Company | Role | Location | Application | Date |
 | --- | --- | --- | --- | --- |
 | Recent Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/recent) | 2026-07-05 |
-| Old Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/old) | 2026-07-04 |
+| Old Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/old) | 2025-01-01 |
 | Undated Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/undated) | |
-| Remembered Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/remembered) | 2026-01-01 |
+| Remembered Co | Software Engineering Intern | Remote | [Apply](https://jobs.example.com/remembered) | 2024-01-01 |
 `;
     const detailPaths: string[] = [];
     const client = clientFor(async (input, init) => {
@@ -313,55 +320,49 @@ ${rows}
       detailPaths.push(new URL(input).pathname);
       return new Response(detail, { headers: { "content-type": "text/html" } });
     });
-    const config = {
+    const connector = createGitHubTableConnector({
       id: "incremental",
       name: "Incremental internships",
-      kind: "simplify" as const,
+      kind: "simplify",
       owner: "example",
       repo: "internships",
       branch: "main",
       path: "README.md",
-    };
-    const first = await createGitHubTableConnector(config, client).sync(
-      new AbortController().signal,
-      syncContext(0),
-    );
-    const remembered = first.items.find(({ canonicalUrl }) =>
-      canonicalUrl === "https://jobs.example.com/remembered");
-    expect(remembered).toBeDefined();
-    detailPaths.length = 0;
+    }, client);
+    const rememberedDescription = "Previously saved description with enough role detail to remain reusable.";
 
-    const second = await createGitHubTableConnector(config, client).sync(
+    const result = await connector.sync(
       new AbortController().signal,
-      syncContext(Date.parse("2026-07-05T00:00:00Z"), [{
-        sourceItemId: remembered!.sourceItemId,
-        canonicalUrl: remembered!.canonicalUrl,
-        description: remembered!.description,
+      syncContext([{
+        sourceItemId: "remembered",
+        canonicalUrl: "https://jobs.example.com/remembered",
+        description: rememberedDescription,
       }]),
     );
 
-    expect(second.items.map(({ canonicalUrl }) => canonicalUrl)).toEqual([
+    expect(result.items.map(({ canonicalUrl }) => canonicalUrl)).toEqual([
       "https://jobs.example.com/recent",
+      "https://jobs.example.com/old",
       "https://jobs.example.com/undated",
       "https://jobs.example.com/remembered",
     ]);
-    expect(detailPaths).toEqual(["/recent", "/undated"]);
-    expect(second).toMatchObject({ completeSnapshot: true, omittedRecent: 0 });
-    expect(second.provenance).toContain("descriptions reused: 1");
+    expect(result.items.at(-1)?.description).toBe(rememberedDescription);
+    expect(detailPaths).toEqual(["/recent", "/old", "/undated"]);
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 0 });
+    expect(result.provenance).toContain("descriptions reused: 1");
   });
 
-  test("scans past old rows so a later recent posting is still acquired", async () => {
+  test("limits detail enrichment without omitting rows or preferring newer postings", async () => {
     const source = `
 | Company | Role | Application | Date |
 | --- | --- | --- | --- |
-| Old One | Software Engineering Intern | [Apply](https://jobs.example.com/old-one) | 2026-01-01 |
-| Old Two | Software Engineering Intern | [Apply](https://jobs.example.com/old-two) | 2026-01-02 |
+| Old One | Software Engineering Intern | [Apply](https://jobs.example.com/old-one) | 2025-01-01 |
 | Recent Co | Software Engineering Intern | [Apply](https://jobs.example.com/recent) | 2026-07-05 |
 `;
     const detailPaths: string[] = [];
     const connector = createGitHubTableConnector({
-      id: "recent-after-old",
-      name: "Recent after old",
+      id: "age-neutral-cap",
+      name: "Age-neutral cap",
       kind: "simplify",
       owner: "example",
       repo: "internships",
@@ -378,26 +379,117 @@ ${rows}
 
     const result = await connector.sync(
       new AbortController().signal,
-      syncContext(Date.parse("2026-07-05T00:00:00Z")),
+      syncContext(),
     );
 
-    expect(result.items.map(({ canonicalUrl }) => canonicalUrl))
-      .toEqual(["https://jobs.example.com/recent"]);
-    expect(detailPaths).toEqual(["/recent"]);
-    expect(result).toMatchObject({ completeSnapshot: true, omittedRecent: 0 });
+    expect(result.items.map(({ canonicalUrl }) => canonicalUrl)).toEqual([
+      "https://jobs.example.com/old-one",
+      "https://jobs.example.com/recent",
+    ]);
+    expect(result.items[0]?.description).not.toBeNull();
+    expect(result.items[1]?.description).toBeNull();
+    expect(detailPaths).toEqual(["/old-one"]);
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 1 });
+    expect(result.provenance).toContain("detail deferred: 1");
   });
 
-  test("counts recent rows omitted by the per-source acquisition cap", async () => {
-    const source = `
-| Company | Role | Application | Date |
+  test("emits every valid row beyond the default 1,000-row detail cap", async () => {
+    const rows = Array.from({ length: 1_001 }, (_, index) =>
+      `| Company ${index} | Software Engineering Intern | [Apply](https://jobs.example.com/${index}) | 2026-07-05 |`,
+    ).join("\n");
+    const source = `| Company | Role | Application | Date |
 | --- | --- | --- | --- |
-| Recent One | Software Engineering Intern | [Apply](https://jobs.example.com/recent-one) | 2026-07-05 |
-| Recent Two | Software Engineering Intern | [Apply](https://jobs.example.com/recent-two) | 2026-07-06 |
-`;
+${rows}`;
     let detailRequests = 0;
     const connector = createGitHubTableConnector({
-      id: "capped-recent",
-      name: "Capped recent",
+      id: "detail-capped",
+      name: "Detail-capped source",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      detailRequests += 1;
+      return new Response(detail, { headers: { "content-type": "text/html" } });
+    }));
+
+    const result = await connector.sync(
+      new AbortController().signal,
+      syncContext(),
+    );
+
+    expect(result.items).toHaveLength(1_001);
+    expect(detailRequests).toBe(1_000);
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 1 });
+  });
+
+  test("loads remembered descriptions in bounded batches and reuses all of them", async () => {
+    const rows = Array.from({ length: 1_001 }, (_, index) =>
+      `| Company ${index} | Software Engineering Intern | [Apply](https://jobs.example.com/${index}) | 2026-07-05 |`,
+    ).join("\n");
+    const source = `| Company | Role | Application | Date |
+| --- | --- | --- | --- |
+${rows}`;
+    const knownByCanonicalUrl = new Map(Array.from({ length: 1_001 }, (_, index) => {
+      const canonicalUrl = `https://jobs.example.com/${index}`;
+      return [canonicalUrl, {
+        sourceItemId: `known-${index}`,
+        canonicalUrl,
+        description: `Saved description ${index} with enough role details for reuse without enrichment.`,
+      }] as const;
+    }));
+    const loadedBatchSizes: number[] = [];
+    const connector = createGitHubTableConnector({
+      id: "remembered-batches",
+      name: "Remembered description batches",
+      kind: "simplify",
+      owner: "example",
+      repo: "internships",
+      branch: "main",
+      path: "README.md",
+    }, clientFor(async (_input, init) => {
+      if (new Headers(init.headers).get("host") === "api.github.com") {
+        return new Response(source, { headers: { "content-type": "text/plain" } });
+      }
+      throw new Error("Remembered descriptions must not be enriched again");
+    }));
+
+    const result = await connector.sync(new AbortController().signal, {
+      findKnownItems: (candidates) => candidates.flatMap((candidate) => {
+        const item = knownByCanonicalUrl.get(candidate.canonicalUrl);
+        return item ? [item] : [];
+      }),
+      loadKnownItems: (candidates) => {
+        loadedBatchSizes.push(candidates.length);
+        return candidates.flatMap((candidate) => {
+          const item = knownByCanonicalUrl.get(candidate.canonicalUrl);
+          return item ? [item] : [];
+        });
+      },
+    });
+
+    expect(result.items).toHaveLength(1_001);
+    expect(result.items.every(({ description }) => description !== null)).toBe(true);
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 0 });
+    expect(loadedBatchSizes).toEqual([1_000, 1]);
+  });
+
+  test("emits every scanned row and marks an over-limit repository incomplete", async () => {
+    const rows = Array.from({ length: 10_001 }, (_, index) =>
+      `| Company ${index} | Software Engineering Intern | [Apply](https://jobs.example.com/${index}) | 2026-07-05 |`,
+    ).join("\n");
+    const source = `| Company | Role | Application | Date |
+| --- | --- | --- | --- |
+${rows}`;
+    let lookupCandidates = 0;
+    let detailRequests = 0;
+    const connector = createGitHubTableConnector({
+      id: "bounded-lookup",
+      name: "Bounded lookup",
       kind: "simplify",
       owner: "example",
       repo: "internships",
@@ -412,42 +504,8 @@ ${rows}
       return new Response(detail, { headers: { "content-type": "text/html" } });
     }));
 
-    const result = await connector.sync(
-      new AbortController().signal,
-      syncContext(Date.parse("2026-07-05T00:00:00Z")),
-    );
-
-    expect(result.items).toHaveLength(1);
-    expect(detailRequests).toBe(1);
-    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 1 });
-  });
-
-  test("bounds persisted identity lookup at the repository scan limit", async () => {
-    const rows = Array.from({ length: 10_001 }, (_, index) =>
-      `| Company ${index} | Software Engineering Intern | [Apply](https://jobs.example.com/${index}) | 2026-07-05 |`,
-    ).join("\n");
-    const source = `| Company | Role | Application | Date |
-| --- | --- | --- | --- |
-${rows}`;
-    let lookupCandidates = 0;
-    const connector = createGitHubTableConnector({
-      id: "bounded-lookup",
-      name: "Bounded lookup",
-      kind: "simplify",
-      owner: "example",
-      repo: "internships",
-      branch: "main",
-      path: "README.md",
-      maxRows: 1,
-    }, clientFor(async (_input, init) => {
-      if (new Headers(init.headers).get("host") === "api.github.com") {
-        return new Response(source, { headers: { "content-type": "text/plain" } });
-      }
-      return new Response(detail, { headers: { "content-type": "text/html" } });
-    }));
-
     const result = await connector.sync(new AbortController().signal, {
-      ...syncContext(Date.parse("2026-07-05T00:00:00Z")),
+      ...syncContext(),
       findKnownItems: (candidates) => {
         lookupCandidates = candidates.length;
         return [];
@@ -455,10 +513,12 @@ ${rows}`;
     });
 
     expect(lookupCandidates).toBe(10_000);
-    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 10_000 });
+    expect(result.items).toHaveLength(10_000);
+    expect(detailRequests).toBe(1);
+    expect(result).toMatchObject({ completeSnapshot: false, descriptionUnavailable: 9_999 });
   });
 
-  test("prioritizes unknown recent rows over remembered rows at the acquisition cap", async () => {
+  test("reuses remembered descriptions without spending the detail cap", async () => {
     const source = `
 | Company | Role | Application | Date |
 | --- | --- | --- | --- |
@@ -467,8 +527,8 @@ ${rows}`;
 `;
     const detailPaths: string[] = [];
     const connector = createGitHubTableConnector({
-      id: "unknown-priority",
-      name: "Unknown priority",
+      id: "remembered-reuse",
+      name: "Remembered description reuse",
       kind: "simplify",
       owner: "example",
       repo: "internships",
@@ -489,7 +549,7 @@ ${rows}`;
       description: "Previously saved internship description with enough detail to remain valid.",
     };
     let loadedKnownItems = 0;
-    const context = syncContext(Date.parse("2026-07-05T00:00:00Z"), [knownItem]);
+    const context = syncContext([knownItem]);
     const result = await connector.sync(new AbortController().signal, {
       ...context,
       loadKnownItems: (candidates) => {
@@ -498,11 +558,14 @@ ${rows}`;
       },
     });
 
-    expect(result.items.map(({ canonicalUrl }) => canonicalUrl))
-      .toEqual(["https://jobs.example.com/unknown"]);
+    expect(result.items.map(({ canonicalUrl }) => canonicalUrl)).toEqual([
+      "https://jobs.example.com/remembered",
+      "https://jobs.example.com/unknown",
+    ]);
+    expect(result.items[0]?.description).toBe(knownItem.description);
     expect(detailPaths).toEqual(["/unknown"]);
-    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 0 });
-    expect(loadedKnownItems).toBe(0);
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 0 });
+    expect(loadedKnownItems).toBe(1);
   });
 
   test("never follows a contents API redirect off api.github.com", async () => {
@@ -752,7 +815,7 @@ ${rows}`;
 
     expect(result.completeSnapshot).toBe(true);
     expect(result.items).toHaveLength(3);
-    expect(result.items.every((item) => item.description.includes("Qualifications"))).toBe(true);
+    expect(result.items.every((item) => item.description?.includes("Qualifications") === true)).toBe(true);
     expect(requested.map(({ host, method }) => ({ host, method }))).toEqual([
       { host: "api.lifeattiktok.com", method: "POST" },
       { host: "jobs.bytedance.com", method: "POST" },
@@ -893,9 +956,10 @@ ${rows}`;
 
     expect(result.completeSnapshot).toBe(true);
     expect(result.items).toHaveLength(2);
-    expect(result.items.every((item) => item.description.includes("dedicated engineering mentor"))).toBe(true);
     expect(result.items.every((item) =>
-      item.description.match(/Build reliable software/g)?.length === 1)).toBe(true);
+      item.description?.includes("dedicated engineering mentor") === true)).toBe(true);
+    expect(result.items.every((item) =>
+      item.description?.match(/Build reliable software/g)?.length === 1)).toBe(true);
     expect(requestedEndpoints).toEqual([
       "api.lever.co/v0/postings/highspot/01234567-89ab-cdef-0123-456789abcdef?mode=json",
       "api.eu.lever.co/v0/postings/alma/11111111-2222-4333-8444-555555555555?mode=json",
@@ -979,8 +1043,9 @@ ${rows}`;
 
     const result = await connector.sync(new AbortController().signal);
 
-    expect(result.items).toEqual([]);
-    expect(result.completeSnapshot).toBe(false);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.description).toBeNull();
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 1 });
   });
 
   test("loads and caches Ashby public job-board descriptions", async () => {
@@ -1324,8 +1389,9 @@ ${rows}`;
 
     const result = await connector.sync(new AbortController().signal);
 
-    expect(result.items).toEqual([]);
-    expect(result.completeSnapshot).toBe(false);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.description).toBeNull();
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 1 });
   });
 
   test("loads Workday external SPA descriptions from the public CXS endpoint", async () => {
@@ -1368,13 +1434,14 @@ ${rows}`;
 
     const result = await connector.sync(new AbortController().signal);
 
-    expect(result.completeSnapshot).toBe(false);
-    expect(result.items).toHaveLength(1);
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 1 });
+    expect(result.items).toHaveLength(2);
     expect(result.items[0]).toMatchObject({
       company: "Capital One",
       title: "Technology Intern",
       description: workdayDescription,
     });
+    expect(result.items[1]?.description).toBeNull();
     expect(requestedPaths).toEqual([
       "/wday/cxs/capitalone/Capital_One/job/McLean-VA/Technology-Internship-Program---Summer-2027_R244387-1",
       "/wday/cxs/capitalone/Capital_One/job/McLean-VA/Data-Internship---Summer-2027_R999999",
@@ -1546,7 +1613,7 @@ ${rows}`;
     expect(requestedPaths).toEqual([expectedPath]);
   });
 
-  test("uses ETag/304 without refetching details", async () => {
+  test("uses ETag/304 while reusing remembered non-null descriptions", async () => {
     let listRequests = 0;
     let detailRequests = 0;
     const fetchImpl: ConnectorFetch = async (_input, init) => {
@@ -1573,13 +1640,16 @@ ${rows}`;
     }, clientFor(fetchImpl));
 
     const first = await connector.sync(new AbortController().signal);
-    const second = await connector.sync(new AbortController().signal);
+    const second = await connector.sync(
+      new AbortController().signal,
+      syncContext(first.items),
+    );
 
-    expect(second).toEqual(first);
-    expect(detailRequests).toBe(2);
+    expect(second.items).toEqual(first.items);
+    expect(detailRequests).toBe(3);
   });
 
-  test("retries details from cached source text after an incomplete ETag result", async () => {
+  test("retries a remembered null description from cached source text after ETag/304", async () => {
     const oneRowTable = `
 | Company | Role | Application |
 | --- | --- | --- |
@@ -1615,16 +1685,26 @@ ${rows}`;
     }, clientFor(fetchImpl));
 
     const first = await connector.sync(new AbortController().signal);
-    const second = await connector.sync(new AbortController().signal);
+    const second = await connector.sync(
+      new AbortController().signal,
+      syncContext(first.items),
+    );
 
-    expect(first.completeSnapshot).toBe(false);
-    expect(first.items).toEqual([]);
-    expect(second.completeSnapshot).toBe(true);
-    expect(second.items).toHaveLength(1);
+    expect(first).toMatchObject({
+      completeSnapshot: true,
+      descriptionUnavailable: 1,
+    });
+    expect(first.items).toHaveLength(1);
+    expect(first.items[0]?.description).toBeNull();
+    expect(second).toMatchObject({
+      completeSnapshot: true,
+      descriptionUnavailable: 0,
+    });
+    expect(second.items[0]?.description).toContain("Responsibilities");
     expect(detailRequests).toBe(2);
   });
 
-  test("omits rows without a usable fetched description and marks the snapshot partial", async () => {
+  test("keeps rows with unavailable descriptions in a complete snapshot", async () => {
     const fetchImpl: ConnectorFetch = async (_input, init) => {
       const host = new Headers(init.headers).get("host");
       if (host === "api.github.com") return new Response(table, { headers: { "content-type": "text/plain" } });
@@ -1643,9 +1723,10 @@ ${rows}`;
 
     const result = await connector.sync(new AbortController().signal);
 
-    expect(result.items).toHaveLength(1);
-    expect(result).toMatchObject({ completeSnapshot: false, omittedRecent: 1 });
-    expect(result.provenance).toContain("omitted recent: 1");
+    expect(result.items).toHaveLength(3);
+    expect(result.items.find(({ company }) => company === "Vision Co")?.description).toBeNull();
+    expect(result).toMatchObject({ completeSnapshot: true, descriptionUnavailable: 1 });
+    expect(result.provenance).toContain("descriptions unavailable: 1");
   });
 
   test("treats a header-only table as partial instead of closing prior jobs", async () => {

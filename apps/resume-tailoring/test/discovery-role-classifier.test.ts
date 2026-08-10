@@ -121,6 +121,40 @@ describe("Discovery Luna role classifier", () => {
       toolChoice: { type: "function", name: "classify_discovery_job_roles" },
     });
   });
+  test("classifies a valid job when detail enrichment left its description unavailable", async () => {
+    let transported: unknown;
+    const jobs = [{
+      id: "job-without-description",
+      title: "Software Engineer Intern",
+      company: "Acme",
+      location: null,
+      description: null,
+    }] as const;
+
+    const result = await classifyDiscoveryRolesWithLuna(jobs, undefined, {
+      transport: async (_model, context) => {
+        const message = context.messages[0];
+        if (message?.role !== "user" || typeof message.content !== "string") {
+          throw new Error("Expected one JSON user message");
+        }
+        transported = JSON.parse(message.content);
+        return toolMessage({
+          classifications: [{
+            id: "job-without-description",
+            roles: ["software_engineering"],
+          }],
+        });
+      },
+      resolverFactory: () => inertResolver(),
+    });
+
+    expect(transported).toEqual({ jobs });
+    expect(result).toEqual([{
+      id: "job-without-description",
+      roles: ["software_engineering"],
+    }]);
+  });
+
 
   test("rejects duplicate job outputs and contradictory other classifications", async () => {
     const invalidArguments = [{

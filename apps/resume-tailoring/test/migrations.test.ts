@@ -605,6 +605,152 @@ function versionSeventeenOpportunityDatabase(): Database {
   `);
   return db;
 }
+function versionTwentyFourDiscoveryDatabase(): Database {
+  const db = new Database(":memory:");
+  databases.push(db);
+  db.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY
+    ) STRICT;
+    CREATE TABLE discovery_sources (
+      id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 200),
+      name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 500),
+      kind TEXT NOT NULL CHECK (kind IN ('simplify','zapply','speedyapply')),
+      last_sync_at INTEGER,
+      last_success_at INTEGER,
+      last_sync_status TEXT CHECK (
+        last_sync_status IS NULL OR last_sync_status IN ('succeeded','failed')
+      ),
+      last_error TEXT,
+      provenance TEXT
+    ) STRICT;
+    CREATE TABLE discovery_jobs (
+      id TEXT PRIMARY KEY,
+      catalog_source_id TEXT NOT NULL CHECK (length(catalog_source_id) BETWEEN 1 AND 200),
+      catalog_source_item_id TEXT NOT NULL CHECK (length(catalog_source_item_id) BETWEEN 1 AND 500),
+      title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 500),
+      company TEXT NOT NULL CHECK (length(company) BETWEEN 1 AND 500),
+      location TEXT CHECK (location IS NULL OR length(location) BETWEEN 1 AND 500),
+      canonical_url TEXT NOT NULL CHECK (length(canonical_url) BETWEEN 1 AND 2048),
+      apply_url TEXT NOT NULL CHECK (length(apply_url) BETWEEN 1 AND 2048),
+      description TEXT NOT NULL CHECK (length(description) BETWEEN 40 AND 50000),
+      posted_at INTEGER,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      closed INTEGER NOT NULL DEFAULT 0 CHECK (closed IN (0,1)),
+      CHECK (posted_at IS NULL OR posted_at >= 0),
+      CHECK (first_seen_at >= 0 AND last_seen_at >= first_seen_at)
+    ) STRICT;
+    CREATE TABLE discovery_job_roles (
+      job_id TEXT NOT NULL REFERENCES discovery_jobs(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK (
+        role IN (
+          'software_engineering',
+          'machine_learning',
+          'data',
+          'security',
+          'product',
+          'hardware',
+          'other'
+        )
+      ),
+      PRIMARY KEY (job_id, role)
+    ) STRICT;
+    CREATE TABLE discovery_observations (
+      source_id TEXT NOT NULL REFERENCES discovery_sources(id) ON DELETE RESTRICT,
+      source_item_id TEXT NOT NULL CHECK (length(source_item_id) BETWEEN 1 AND 500),
+      job_id TEXT NOT NULL REFERENCES discovery_jobs(id) ON DELETE RESTRICT,
+      source_url TEXT NOT NULL CHECK (length(source_url) BETWEEN 1 AND 2048),
+      canonical_url TEXT NOT NULL CHECK (length(canonical_url) BETWEEN 1 AND 2048),
+      apply_url TEXT NOT NULL CHECK (length(apply_url) BETWEEN 1 AND 2048),
+      requisition_id TEXT,
+      active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      PRIMARY KEY (source_id, source_item_id),
+      CHECK (first_seen_at >= 0 AND last_seen_at >= first_seen_at)
+    ) STRICT;
+    CREATE TABLE discovery_dedupe_keys (
+      source_id TEXT NOT NULL,
+      source_item_id TEXT NOT NULL,
+      dedupe_key TEXT NOT NULL CHECK (length(dedupe_key) BETWEEN 1 AND 4096),
+      job_id TEXT NOT NULL REFERENCES discovery_jobs(id) ON DELETE RESTRICT,
+      PRIMARY KEY (source_id, source_item_id, dedupe_key),
+      FOREIGN KEY (source_id, source_item_id)
+        REFERENCES discovery_observations(source_id, source_item_id) ON DELETE CASCADE
+    ) STRICT;
+    CREATE TABLE discovery_run_links (
+      job_id TEXT PRIMARY KEY REFERENCES discovery_jobs(id) ON DELETE RESTRICT,
+      run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+      created_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX discovery_jobs_recency
+      ON discovery_jobs(closed, coalesce(posted_at, first_seen_at) DESC, id);
+    CREATE INDEX discovery_job_roles_role_job
+      ON discovery_job_roles(role, job_id);
+    CREATE INDEX discovery_observations_job
+      ON discovery_observations(job_id, active, source_id);
+    CREATE INDEX discovery_dedupe_keys_key
+      ON discovery_dedupe_keys(dedupe_key, job_id);
+    CREATE INDEX discovery_dedupe_keys_job
+      ON discovery_dedupe_keys(job_id);
+
+    INSERT INTO runs(id) VALUES ('run-queued');
+    INSERT INTO discovery_sources(id, name, kind, last_sync_at, last_success_at)
+    VALUES ('simplify-2027', 'Simplify 2027', 'simplify', 2000, 1900);
+    INSERT INTO discovery_jobs(
+      id, catalog_source_id, catalog_source_item_id, title, company, location,
+      canonical_url, apply_url, description, posted_at, first_seen_at, last_seen_at, closed
+    ) VALUES
+      (
+        'job-open', 'simplify-2027', 'item-open', 'Software Engineer Intern',
+        'Example', 'Remote', 'https://jobs.example.test/open',
+        'https://jobs.example.test/open/apply',
+        'A complete saved description that migration twenty-five must preserve.',
+        1700, 1800, 2000, 0
+      ),
+      (
+        'job-queued', 'simplify-2027', 'item-queued', 'Machine Learning Intern',
+        'Example', NULL, 'https://jobs.example.test/queued',
+        'https://jobs.example.test/queued/apply',
+        'Another complete saved description that migration twenty-five must preserve.',
+        NULL, 1800, 2000, 0
+      );
+    INSERT INTO discovery_job_roles(job_id, role) VALUES
+      ('job-open', 'software_engineering'),
+      ('job-open', 'security'),
+      ('job-queued', 'machine_learning');
+    INSERT INTO discovery_observations(
+      source_id, source_item_id, job_id, source_url, canonical_url, apply_url,
+      requisition_id, active, first_seen_at, last_seen_at
+    ) VALUES
+      (
+        'simplify-2027', 'item-open', 'job-open', 'https://github.com/example/open',
+        'https://jobs.example.test/open', 'https://jobs.example.test/open/apply',
+        'REQ-OPEN', 1, 1800, 2000
+      ),
+      (
+        'simplify-2027', 'item-queued', 'job-queued', 'https://github.com/example/queued',
+        'https://jobs.example.test/queued', 'https://jobs.example.test/queued/apply',
+        NULL, 1, 1800, 2000
+      );
+    INSERT INTO discovery_dedupe_keys(source_id, source_item_id, dedupe_key, job_id)
+    VALUES
+      ('simplify-2027', 'item-open', 'url:https://jobs.example.test/open', 'job-open'),
+      ('simplify-2027', 'item-queued', 'url:https://jobs.example.test/queued', 'job-queued');
+    INSERT INTO discovery_run_links(job_id, run_id, created_at)
+    VALUES ('job-queued', 'run-queued', 2000);
+    INSERT INTO schema_migrations(version, applied_at) VALUES (24, 2400);
+    PRAGMA user_version = 24;
+  `);
+  return db;
+}
+
 const SUBMISSION_UNCERTAIN_WARNING =
   "The application submission could not be verified. Check the headed browser if it is still available, then close this session.";
 
@@ -679,7 +825,7 @@ test("migration twelve preserves the live claim and adds four unique empty claim
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
   expect(db.query<{
     id: number;
     run_id: string | null;
@@ -1038,6 +1184,7 @@ test("fresh databases default to pending while accepting lifecycle statuses", ()
     { version: 22, applied_at: 2_000 },
     { version: 23, applied_at: 2_000 },
     { version: 24, applied_at: 2_000 },
+    { version: 25, applied_at: 2_000 },
   ]);
   expect(db.query<{ count: number }, []>(`
     SELECT count(*) AS count
@@ -1180,6 +1327,7 @@ test("migration twenty-three removes retired version seventeen discovery sources
     { version: 22, applied_at: 2_000 },
     { version: 23, applied_at: 2_000 },
     { version: 24, applied_at: 2_000 },
+    { version: 25, applied_at: 2_000 },
   ]);
   expect(db.query<{ id: string }, []>("SELECT id FROM discovery_sources").all()).toEqual([]);
   expect(db.query<{ job_id: string }, []>("SELECT job_id FROM discovery_observations").all())
@@ -1215,6 +1363,7 @@ test("migration twenty-two deletes recruiting-event storage from a populated ver
     { version: 22, applied_at: 2_000 },
     { version: 23, applied_at: 2_000 },
     { version: 24, applied_at: 2_000 },
+    { version: 25, applied_at: 2_000 },
   ]);
   expect(db.query<{ name: string }, []>(`
     SELECT name
@@ -1297,6 +1446,7 @@ test("migration twenty-three keeps only approved discovery source families", () 
     { version: 22, applied_at: 2_000 },
     { version: 23, applied_at: 2_000 },
     { version: 24, applied_at: 2_000 },
+    { version: 25, applied_at: 2_000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1422,6 +1572,93 @@ test("migration twenty-three keeps only approved discovery source families", () 
   ).run()).toThrow();
 });
 
+test("migration twenty-five makes discovery descriptions nullable without losing catalog state", () => {
+  const db = versionTwentyFourDiscoveryDatabase();
+
+  migratePipelineDatabase(db, 2_500);
+
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version)
+    .toBe(25);
+  expect(db.query<{ version: number; applied_at: number }, []>(
+    "SELECT version, applied_at FROM schema_migrations ORDER BY version",
+  ).all()).toEqual([
+    { version: 24, applied_at: 2_400 },
+    { version: 25, applied_at: 2_500 },
+  ]);
+  expect(db.query<{ required: number }, []>(`
+    SELECT "notnull" AS required
+    FROM pragma_table_info('discovery_jobs')
+    WHERE name = 'description'
+  `).get()).toEqual({ required: 0 });
+  expect(db.query<{ id: string; description: string | null }, []>(
+    "SELECT id, description FROM discovery_jobs ORDER BY id",
+  ).all()).toEqual([
+    {
+      id: "job-open",
+      description: "A complete saved description that migration twenty-five must preserve.",
+    },
+    {
+      id: "job-queued",
+      description: "Another complete saved description that migration twenty-five must preserve.",
+    },
+  ]);
+  expect(db.query<{ job_id: string; role: string }, []>(
+    "SELECT job_id, role FROM discovery_job_roles ORDER BY job_id, role",
+  ).all()).toEqual([
+    { job_id: "job-open", role: "security" },
+    { job_id: "job-open", role: "software_engineering" },
+    { job_id: "job-queued", role: "machine_learning" },
+  ]);
+  expect(db.query<{ source_item_id: string; job_id: string }, []>(
+    "SELECT source_item_id, job_id FROM discovery_observations ORDER BY source_item_id",
+  ).all()).toEqual([
+    { source_item_id: "item-open", job_id: "job-open" },
+    { source_item_id: "item-queued", job_id: "job-queued" },
+  ]);
+  expect(db.query<{ source_item_id: string; job_id: string }, []>(
+    "SELECT source_item_id, job_id FROM discovery_dedupe_keys ORDER BY source_item_id",
+  ).all()).toEqual([
+    { source_item_id: "item-open", job_id: "job-open" },
+    { source_item_id: "item-queued", job_id: "job-queued" },
+  ]);
+  expect(db.query<{ job_id: string; run_id: string }, []>(
+    "SELECT job_id, run_id FROM discovery_run_links",
+  ).all()).toEqual([{ job_id: "job-queued", run_id: "run-queued" }]);
+  expect(db.query<{ name: string }, []>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'index' AND name LIKE 'discovery_%'
+    ORDER BY name
+  `).all().map(({ name }) => name)).toEqual([
+    "discovery_dedupe_keys_job",
+    "discovery_dedupe_keys_key",
+    "discovery_job_roles_role_job",
+    "discovery_jobs_recency",
+    "discovery_observations_job",
+  ]);
+  expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
+  db.query("UPDATE discovery_jobs SET description = NULL WHERE id = 'job-open'").run();
+  expect(db.query<{ description: string | null }, []>(
+    "SELECT description FROM discovery_jobs WHERE id = 'job-open'",
+  ).get()).toEqual({ description: null });
+});
+
+test("migration twenty-five is a no-op for an already-current nullable schema", () => {
+  const db = versionTwentyFourDiscoveryDatabase();
+  migratePipelineDatabase(db, 2_500);
+  db.query("UPDATE discovery_jobs SET description = NULL WHERE id = 'job-open'").run();
+
+  migratePipelineDatabase(db, 3_000);
+
+  expect(db.query<{ version: number; applied_at: number }, []>(
+    "SELECT version, applied_at FROM schema_migrations WHERE version = 25",
+  ).all()).toEqual([{ version: 25, applied_at: 2_500 }]);
+  expect(db.query<{ description: string | null }, []>(
+    "SELECT description FROM discovery_jobs WHERE id = 'job-open'",
+  ).get()).toEqual({ description: null });
+  expect(db.query<{ table: string }, []>("PRAGMA foreign_key_check").all()).toEqual([]);
+});
+
 test("migration twenty classifies legacy runs as jobs and constrains opportunity kinds", () => {
   const db = versionSixteenDatabase();
 
@@ -1472,6 +1709,7 @@ test("combined migrations preserve a version seventeen opportunity database", ()
     { version: 22, applied_at: 2_000 },
     { version: 23, applied_at: 2_000 },
     { version: 24, applied_at: 2_000 },
+    { version: 25, applied_at: 2_000 },
   ]);
 });
 
@@ -1484,7 +1722,7 @@ test("migrates version seven defaults without changing existing statuses", () =>
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -1524,6 +1762,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 22, applied_at: 2000 },
     { version: 23, applied_at: 2000 },
     { version: 24, applied_at: 2000 },
+    { version: 25, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1565,7 +1804,7 @@ test("migrates existing runs to application status applied atomically", () => {
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
   expect(migrated.query<{
     application_status: string;
     generate_keyword_map: number;
@@ -1599,7 +1838,7 @@ test("migrates version two retention state atomically without changing history",
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

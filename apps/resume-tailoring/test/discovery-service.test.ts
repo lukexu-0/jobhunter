@@ -67,8 +67,8 @@ function run(id: string): RunDto {
   };
 }
 
-type TestDiscoverySyncResult = Omit<DiscoverySyncResult, "omittedRecent"> & {
-  readonly omittedRecent?: number;
+type TestDiscoverySyncResult = Omit<DiscoverySyncResult, "descriptionUnavailable"> & {
+  readonly descriptionUnavailable?: number;
 };
 
 function connector(
@@ -80,7 +80,7 @@ function connector(
     name: `Source ${id}`,
     kind: "simplify",
     sync: async (...parameters) => ({
-      omittedRecent: 0,
+      descriptionUnavailable: 0,
       ...await sync(...parameters),
     }),
   };
@@ -153,6 +153,54 @@ describe("discovery synchronization", () => {
     expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0]?.roles)
       .toEqual(["software_engineering", "machine_learning"]);
   });
+  test("classifies and reconciles description-unavailable jobs without making the snapshot partial", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, {
+      now: () => 1_000,
+      idFactory: () => "job-1",
+    });
+    const classifiedInputs: unknown[] = [];
+    const service = new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [connector("working", async () => ({
+        items: [{ ...input("one"), description: null }],
+        completeSnapshot: true,
+        descriptionUnavailable: 1,
+      }))],
+      classifyRoles: async (jobs) => {
+        classifiedInputs.push(...jobs);
+        return jobs.map((job) => ({
+          id: job.id,
+          roles: ["software_engineering"] as const,
+        }));
+      },
+    });
+
+    const result = await service.sync(new AbortController().signal);
+
+    expect(classifiedInputs).toEqual([{
+      id: "one",
+      title: "Software Engineering Intern",
+      company: "Example",
+      location: null,
+      description: null,
+    }]);
+    expect(result.sources[0]).toMatchObject({
+      completeSnapshot: true,
+      descriptionUnavailable: 1,
+      received: 1,
+      created: 1,
+    });
+    expect(result.totals.descriptionUnavailable).toBe(1);
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0])
+      .toMatchObject({ descriptionPreview: null, queueable: false });
+  });
+
   test("preserves the prior source snapshot when Luna classification fails", async () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);
@@ -311,7 +359,7 @@ describe("discovery synchronization", () => {
       now: () => now,
     });
     expect((await first.sync(new AbortController().signal)).sources[0])
-      .toMatchObject({ received: 1, omittedRecent: 0 });
+      .toMatchObject({ received: 1, descriptionUnavailable: 0 });
     expect(detailRequests).toBe(1);
 
     now = Date.parse("2026-08-04T00:00:00Z");
@@ -326,7 +374,7 @@ describe("discovery synchronization", () => {
       now: () => now,
     });
     expect((await restarted.sync(new AbortController().signal)).sources[0])
-      .toMatchObject({ received: 1, omittedRecent: 0 });
+      .toMatchObject({ received: 1, descriptionUnavailable: 0 });
     expect(detailRequests).toBe(1);
     expect(repository.list(DiscoveryListRequestSchema.parse({
       maxAgeDays: null,
@@ -584,10 +632,10 @@ describe("discovery synchronization", () => {
       completeSnapshot: false,
       received: 1,
       created: 1,
-      omittedRecent: 3,
+      descriptionUnavailable: 0,
       provenance: "service omitted invalid records: 3",
     });
-    expect(result.totals.omittedRecent).toBe(3);
+    expect(result.totals.descriptionUnavailable).toBe(0);
     expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(1);
   });
 
@@ -660,6 +708,47 @@ describe("discovery queueing", () => {
     expect(savedDescriptions).toEqual([DESCRIPTION, DESCRIPTION]);
     expect(kicks).toBe(1);
   });
+  test("skips a missing saved description before attempting run creation", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, {
+      now: () => 1_000,
+      idFactory: () => "job-unavailable",
+    });
+    repository.reconcileSource({
+      id: "open-source",
+      name: "Open source",
+      kind: "simplify",
+      items: [{ ...classifiedInput("unavailable"), description: null }],
+      completeSnapshot: true,
+    });
+    let runCreations = 0;
+    const service = new DiscoveryService({
+      repository,
+      connectors: [],
+      runs: {
+        createRunFromDescription: async () => {
+          runCreations += 1;
+          return run("unexpected");
+        },
+        kick: () => undefined,
+      },
+    });
+
+    const result = await service.queue({
+      jobIds: ["job-unavailable"],
+      generateKeywordMap: true,
+      skipReview: false,
+      autoSubmit: false,
+    });
+
+    expect(result).toEqual({
+      queued: [],
+      skipped: [{ jobId: "job-unavailable", reason: "description_unavailable" }],
+    });
+    expect(runCreations).toBe(0);
+  });
+
 
   test("returns successful batch members and a safe skip when one run creation fails", async () => {
     const database = openPipelineDatabase(":memory:");

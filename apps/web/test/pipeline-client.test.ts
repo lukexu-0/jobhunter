@@ -83,6 +83,7 @@ function discoveredJob(overrides: Partial<DiscoveryJob> = {}): DiscoveryJob {
     canonicalUrl: "https://example.com/jobs/ml-intern",
     applyUrl: "https://example.com/jobs/ml-intern/apply",
     descriptionPreview: "Build and evaluate production machine learning systems.",
+    queueable: true,
     postedAt: null,
     firstSeenAt: 1_775_174_400_000,
     lastSeenAt: 1_775_174_460_000,
@@ -996,10 +997,10 @@ describe("pipeline artifacts", () => {
 });
 
 describe("pipeline discovery requests", () => {
-  test("builds the complete filtered list query and validates its response", async () => {
+  test("builds the complete filtered list query and validates nullable preview queueability", async () => {
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const response = {
-      jobs: [discoveredJob()],
+      jobs: [discoveredJob({ descriptionPreview: null, queueable: false })],
       total: 1,
       lastSyncAt: 1_775_174_460_000,
     };
@@ -1039,11 +1040,28 @@ describe("pipeline discovery requests", () => {
     );
   });
 
+  test("requires queueability in list responses", async () => {
+    const { queueable: _queueable, ...jobWithoutQueueable } = discoveredJob();
+    setFetchMock(async () => json({
+      jobs: [jobWithoutQueueable],
+      total: 1,
+      lastSyncAt: null,
+    }));
+
+    await expect(listDiscoveryJobs({
+      maxAgeDays: null,
+      status: "all",
+      search: "",
+      limit: 1_000,
+      offset: 0,
+    })).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+  });
+
   test("queues selected jobs once with the exact run modes and validates the result", async () => {
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const response = {
       queued: [{ jobId: "job-2", run: run() }],
-      skipped: [{ jobId: "job-1", reason: "already_queued" as const }],
+      skipped: [{ jobId: "job-1", reason: "description_unavailable" as const }],
     };
     capture(json(response), requests);
 
@@ -1093,7 +1111,7 @@ describe("pipeline discovery requests", () => {
         created: 0,
         updated: 0,
         closed: 0,
-        omittedRecent: 0,
+        descriptionUnavailable: 0,
       },
       completedAt: 10,
     };
@@ -1109,7 +1127,7 @@ describe("pipeline discovery requests", () => {
       code: "INVALID_RESPONSE",
     });
 
-    const { omittedRecent: _omittedRecent, ...incompleteTotals } = syncResponse.totals;
+    const { descriptionUnavailable: _descriptionUnavailable, ...incompleteTotals } = syncResponse.totals;
     setFetchMock(async () => json({ ...syncResponse, totals: incompleteTotals }));
     await expect(syncDiscoveryJobs()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
 

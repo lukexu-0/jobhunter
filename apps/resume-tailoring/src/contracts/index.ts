@@ -1238,7 +1238,8 @@ export const DiscoveryJobSchema = z.object({
   roles: DiscoveryRolesSchema,
   canonicalUrl: DiscoveryHttpUrlSchema,
   applyUrl: DiscoveryHttpUrlSchema,
-  descriptionPreview: z.string().max(500),
+  descriptionPreview: z.string().max(500).nullable(),
+  queueable: z.boolean(),
   postedAt: z.number().int().nonnegative().nullable(),
   firstSeenAt: z.number().int().nonnegative(),
   lastSeenAt: z.number().int().nonnegative(),
@@ -1279,7 +1280,7 @@ export const DiscoverySourceSyncSummarySchema = z.object({
   created: z.number().int().nonnegative().max(100_000),
   updated: z.number().int().nonnegative().max(100_000),
   closed: z.number().int().nonnegative().max(100_000),
-  omittedRecent: z.number().int().nonnegative().max(100_000),
+  descriptionUnavailable: z.number().int().nonnegative().max(100_000),
   provenance: z.string().trim().min(1).max(1_000).optional(),
   error: z.string().trim().min(1).max(500).optional(),
 }).strict();
@@ -1295,7 +1296,7 @@ export const DiscoverySyncResponseSchema = z.object({
     created: z.number().int().nonnegative().max(10_000_000),
     updated: z.number().int().nonnegative().max(10_000_000),
     closed: z.number().int().nonnegative().max(10_000_000),
-    omittedRecent: z.number().int().nonnegative().max(10_000_000),
+    descriptionUnavailable: z.number().int().nonnegative().max(10_000_000),
   }).strict(),
   completedAt: z.number().int().nonnegative(),
 }).strict();
@@ -1314,6 +1315,7 @@ export const DiscoveryQueueSkipReasonSchema = z.enum([
   "already_queued",
   "not_found",
   "closed",
+  "description_unavailable",
   "queue_failed",
 ]);
 export type DiscoveryQueueSkipReason = z.infer<typeof DiscoveryQueueSkipReasonSchema>;

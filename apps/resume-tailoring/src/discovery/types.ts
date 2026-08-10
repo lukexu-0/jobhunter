@@ -28,7 +28,7 @@ export interface DiscoveredJobInput {
   readonly title: string;
   readonly company: string;
   readonly location?: string | null | undefined;
-  readonly description: string;
+  readonly description: string | null;
   readonly postedAt?: number | null | undefined;
   readonly requisitionId?: string | undefined;
 }
@@ -39,11 +39,10 @@ export interface DiscoveryKnownItemKey {
 }
 
 export interface DiscoveryKnownItem extends DiscoveryKnownItemKey {
-  readonly description: string;
+  readonly description: string | null;
 }
 
 export interface DiscoveryConnectorSyncContext {
-  readonly recentCutoff: number;
   readonly findKnownItems: (
     candidates: readonly DiscoveryKnownItemKey[],
   ) => readonly DiscoveryKnownItemKey[];
@@ -59,7 +58,7 @@ export interface ClassifiedDiscoveredJobInput extends DiscoveredJobInput {
 export interface DiscoverySyncResult {
   readonly items: readonly DiscoveredJobInput[];
   readonly completeSnapshot: boolean;
-  readonly omittedRecent: number;
+  readonly descriptionUnavailable: number;
   readonly provenance?: string;
 }
 

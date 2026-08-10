@@ -97,7 +97,11 @@ export function discoveryDedupeKeys(input: Pick<
     const ats = atsIdentity(url);
     if (ats && !ats.endsWith(":")) keys.add(ats);
   }
-  if (input.postedAt !== null && input.postedAt !== undefined) {
+  if (
+    input.postedAt !== null
+    && input.postedAt !== undefined
+    && input.description !== null
+  ) {
     const postedDay = new Date(input.postedAt).toISOString().slice(0, 10);
     const descriptionFingerprint = createHash("sha256")
       .update(normalizedText(input.description))

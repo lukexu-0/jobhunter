@@ -56,6 +56,7 @@ export function discoveryRoleLabel(roles: readonly DiscoveryRole[]): string {
 
 const QUEUE_SKIP_LABELS: Record<DiscoveryQueueSkipReason, string> = {
   already_queued: "Already queued",
+  description_unavailable: "Description unavailable",
   not_found: "No longer available",
   closed: "Closed",
   queue_failed: "Could not be queued",
@@ -146,10 +147,9 @@ export function pruneDiscoverySelection(
   selected: ReadonlySet<string>,
   jobs: readonly DiscoveryJob[],
 ): Set<string> {
-  const visibleIds = new Set(jobs.map((job) => job.id));
-  const next = discoverySelectionAfterTransition(selected, "refresh");
-  for (const id of next) {
-    if (!visibleIds.has(id)) next.delete(id);
+  const next = new Set<string>();
+  for (const job of jobs) {
+    if (job.queueable && selected.has(job.id)) next.add(job.id);
   }
   return next;
 }
@@ -158,9 +158,17 @@ export function toggleAllDiscoverySelection(
   selected: ReadonlySet<string>,
   jobs: readonly DiscoveryJob[],
 ): Set<string> {
-  const allSelected = jobs.length > 0 && jobs.every((job) => selected.has(job.id));
-  const next = new Set(selected);
+  const next = new Set<string>();
+  let queueableCount = 0;
   for (const job of jobs) {
+    if (!job.queueable) continue;
+    queueableCount += 1;
+    if (selected.has(job.id)) next.add(job.id);
+  }
+
+  const allSelected = queueableCount > 0 && next.size === queueableCount;
+  for (const job of jobs) {
+    if (!job.queueable) continue;
     if (allSelected) next.delete(job.id);
     else next.add(job.id);
   }
@@ -173,7 +181,7 @@ export function orderedSelectedDiscoveryJobIds(
 ): string[] {
   const ordered: string[] = [];
   for (const job of jobs) {
-    if (selected.has(job.id)) ordered.push(job.id);
+    if (job.queueable && selected.has(job.id)) ordered.push(job.id);
   }
   return ordered;
 }
@@ -183,16 +191,16 @@ export function DiscoverySyncNotice({ result }: { readonly result: DiscoverySync
   const failedSources = result.sources
     .filter((source) => source.status === "failed")
     .map((source) => source.sourceName);
-  const omittedSources = result.sources
-    .filter((source) => source.omittedRecent > 0)
-    .map((source) => `${source.sourceName} (${source.omittedRecent.toLocaleString()})`);
+  const unavailableSources = result.sources
+    .filter((source) => source.descriptionUnavailable > 0)
+    .map((source) => `${source.sourceName} (${source.descriptionUnavailable.toLocaleString()})`);
   const summary = [
     `${totals.succeeded} of ${totals.sources} sources synced`,
     `${totals.received.toLocaleString()} received`,
     `${totals.created.toLocaleString()} new`,
     `${totals.updated.toLocaleString()} updated`,
     `${totals.closed.toLocaleString()} closed`,
-    `${totals.omittedRecent.toLocaleString()} recent omitted`,
+    `${totals.descriptionUnavailable.toLocaleString()} descriptions unavailable`,
   ].join(" · ");
 
   return (
@@ -202,7 +210,9 @@ export function DiscoverySyncNotice({ result }: { readonly result: DiscoverySync
     >
       <p>{summary}.</p>
       {failedSources.length > 0 ? <p>Failed sources: {failedSources.join(", ")}.</p> : null}
-      {omittedSources.length > 0 ? <p>Recent jobs omitted: {omittedSources.join(", ")}.</p> : null}
+      {unavailableSources.length > 0
+        ? <p>Descriptions unavailable: {unavailableSources.join(", ")}.</p>
+        : null}
     </div>
   );
 }
@@ -274,7 +284,7 @@ function RunOption({ checked, description, disabled, id, label, onChange }: RunO
   );
 }
 
-function DiscoveryJobRow({
+export function DiscoveryJobRow({
   busy,
   job,
   onToggle,
@@ -285,17 +295,33 @@ function DiscoveryJobRow({
   readonly onToggle: (jobId: string, checked: boolean) => void;
   readonly selected: boolean;
 }) {
+  const selectionUnavailableReason = job.queueable
+    ? null
+    : job.status === "closed"
+      ? "Closed jobs cannot be queued."
+      : job.queuedRunId || job.status === "queued"
+        ? "This job is already queued."
+        : job.descriptionPreview === null
+          ? "Job description unavailable; this role cannot be queued yet."
+          : "This job is not available to queue.";
+  const selectionReasonId = selectionUnavailableReason
+    ? `discovery-selection-${job.id}-reason`
+    : undefined;
   const observedDate = formattedDate(job.postedAt ?? job.firstSeenAt);
   return (
     <li className="discovery-row" data-status={job.status}>
       <label className="discovery-row__selector">
         <input
+          aria-describedby={selectionReasonId}
           aria-label={`Select ${job.title} at ${job.company}`}
-          checked={selected}
-          disabled={busy}
+          checked={job.queueable && selected}
+          disabled={busy || !job.queueable}
           onChange={(event) => onToggle(job.id, event.currentTarget.checked)}
           type="checkbox"
         />
+        {selectionUnavailableReason ? (
+          <span className="visually-hidden" id={selectionReasonId}>{selectionUnavailableReason}</span>
+        ) : null}
       </label>
       <article className="discovery-row__body">
         <header className="discovery-row__heading">
@@ -324,7 +350,11 @@ function DiscoveryJobRow({
             <span>{job.sourceNames.join(" · ")}</span>
           </li>
         </ul>
-        <p className="discovery-row__preview">{job.descriptionPreview || "No description preview available."}</p>
+        <p className="discovery-row__preview">
+          {job.descriptionPreview === null
+            ? "Description unavailable. Sync again later to retry job details."
+            : job.descriptionPreview}
+        </p>
       </article>
       <div className="discovery-row__actions">
         <a
@@ -417,16 +447,18 @@ export function DiscoveryCatalog() {
 
   const jobs = catalog?.jobs ?? EMPTY_JOBS;
   const pageWindow = discoveryPageWindow(offset, MAX_DISCOVERY_RESULTS, catalog?.total ?? 0);
-  const selectedVisibleCount = useMemo(
-    () => jobs.reduce((count, job) => count + (selected.has(job.id) ? 1 : 0), 0),
-    [jobs, selected],
-  );
-  const allVisibleSelected = jobs.length > 0 && selectedVisibleCount === jobs.length;
-  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected;
   const selectedIds = useMemo(
     () => orderedSelectedDiscoveryJobIds(jobs, selected),
     [jobs, selected],
   );
+  const selectedVisibleCount = selectedIds.length;
+  const queueableVisibleCount = useMemo(
+    () => jobs.reduce((count, job) => count + (job.queueable ? 1 : 0), 0),
+    [jobs],
+  );
+  const allVisibleSelected = queueableVisibleCount > 0
+    && selectedVisibleCount === queueableVisibleCount;
+  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected;
   const isMutating = mutation !== null;
   const isSelectionBusy = isMutating || isLoading;
 
@@ -450,7 +482,9 @@ export function DiscoveryCatalog() {
     setQueueError(null);
     setSelected((current) => {
       const next = new Set(current);
-      if (checked) next.add(jobId);
+      const queueable = jobs.some((job) => job.id === jobId && job.queueable);
+      if (checked && !queueable) next.delete(jobId);
+      else if (checked) next.add(jobId);
       else next.delete(jobId);
       return next;
     });
@@ -636,9 +670,8 @@ export function DiscoveryCatalog() {
         <div className="discovery-selection-bar">
           <label className="discovery-select-all">
             <input
-              aria-label="Select all visible jobs"
               checked={allVisibleSelected}
-              disabled={isSelectionBusy || jobs.length === 0}
+              disabled={isSelectionBusy || queueableVisibleCount === 0}
               onChange={() => {
                 setQueueError(null);
                 setSelected((current) => toggleAllDiscoverySelection(current, jobs));
@@ -646,7 +679,7 @@ export function DiscoveryCatalog() {
               ref={selectAllRef}
               type="checkbox"
             />
-            <span>Select all {jobs.length.toLocaleString()} visible jobs</span>
+            <span>Select all {queueableVisibleCount.toLocaleString()} queueable jobs</span>
           </label>
           <button
             className="control control--quiet"
@@ -768,7 +801,7 @@ export function DiscoveryCatalog() {
                 job={job}
                 key={job.id}
                 onToggle={toggleJob}
-                selected={selected.has(job.id)}
+                selected={job.queueable && selected.has(job.id)}
               />
             ))}
           </ul>

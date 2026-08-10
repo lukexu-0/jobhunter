@@ -49,7 +49,7 @@ const ConnectorItemSchema = z.object({
   title: z.string().trim().min(1).max(500),
   company: z.string().trim().min(1).max(500),
   location: z.string().trim().min(1).max(500).nullable().optional(),
-  description: JobDescriptionSchema,
+  description: JobDescriptionSchema.nullable(),
   postedAt: z.number().int().nonnegative().max(MAX_DISCOVERY_TIMESTAMP).nullable().optional(),
   requisitionId: z.string().trim().min(1).max(500).optional(),
 }).strict();
@@ -58,7 +58,7 @@ const ConnectorEnvelopeSchema = z.object({
   items: z.array(z.unknown()).max(100_000),
   completeSnapshot: z.boolean(),
   provenance: z.string().trim().min(1).max(1_000).optional(),
-  omittedRecent: z.number().int().nonnegative().max(100_000).default(0),
+  descriptionUnavailable: z.number().int().nonnegative().max(100_000),
 }).strict();
 
 const ConnectorResultSchema = z.object({
@@ -69,10 +69,9 @@ const ConnectorResultSchema = z.object({
     ),
   completeSnapshot: z.boolean(),
   provenance: z.string().trim().min(1).max(1_000).optional(),
-  omittedRecent: z.number().int().nonnegative().max(100_000),
+  descriptionUnavailable: z.number().int().nonnegative().max(100_000),
 }).strict();
 
-const DISCOVERY_RECENT_WINDOW_MS = 30 * 86_400_000;
 
 const MAX_SYNC_CONCURRENCY = 4;
 const MAX_SYNC_DURATION_MS = 120_000;
@@ -114,7 +113,7 @@ function validatedConnectorResult(value: unknown): ConnectorResult {
   return ConnectorResultSchema.parse({
     items,
     completeSnapshot: envelope.completeSnapshot && omitted === 0,
-    omittedRecent: envelope.omittedRecent + omitted,
+    descriptionUnavailable: items.filter(({ description }) => description === null).length,
     ...(provenance === undefined ? {} : { provenance }),
   });
 }
@@ -326,7 +325,6 @@ export class DiscoveryService {
         maxRequests: MAX_SYNC_REQUESTS,
         maxBytes: MAX_SYNC_BYTES,
       });
-      const recentCutoff = Math.max(0, this.#now() - DISCOVERY_RECENT_WINDOW_MS);
       const pending: Array<ConnectorSyncOutcome | undefined> =
         new Array(this.dependencies.connectors.length);
       let nextConnector = 0;
@@ -339,7 +337,6 @@ export class DiscoveryService {
             connector,
             connectorSignal,
             {
-              recentCutoff,
               findKnownItems: (candidates) =>
                 this.dependencies.repository.findActiveSourceItemKeys(connector.id, candidates),
               loadKnownItems: (candidates) =>
@@ -379,7 +376,7 @@ export class DiscoveryService {
             created: 0,
             updated: 0,
             closed: 0,
-            omittedRecent: 0,
+            descriptionUnavailable: 0,
             error: publicSourceError(outcome.error),
           });
           continue;
@@ -400,7 +397,7 @@ export class DiscoveryService {
             sourceName: outcome.connector.name,
             status: "succeeded",
             completeSnapshot: outcome.result.completeSnapshot,
-            omittedRecent: outcome.result.omittedRecent,
+            descriptionUnavailable: outcome.result.descriptionUnavailable,
             ...counts,
             ...(outcome.result.provenance === undefined
               ? {}
@@ -418,7 +415,7 @@ export class DiscoveryService {
             created: 0,
             updated: 0,
             closed: 0,
-            omittedRecent: outcome.result.omittedRecent,
+            descriptionUnavailable: outcome.result.descriptionUnavailable,
             error: publicSourceError(error),
           });
         }
@@ -433,7 +430,10 @@ export class DiscoveryService {
           created: sources.reduce((total, source) => total + source.created, 0),
           updated: sources.reduce((total, source) => total + source.updated, 0),
           closed: sources.reduce((total, source) => total + source.closed, 0),
-          omittedRecent: sources.reduce((total, source) => total + source.omittedRecent, 0),
+          descriptionUnavailable: sources.reduce(
+            (total, source) => total + source.descriptionUnavailable,
+            0,
+          ),
         },
         completedAt: this.#now(),
       };
@@ -464,6 +464,10 @@ export class DiscoveryService {
         }
         if (candidate.closed) {
           skipped.push({ jobId, reason: "closed" });
+          continue;
+        }
+        if (candidate.description === null) {
+          skipped.push({ jobId, reason: "description_unavailable" });
           continue;
         }
         try {
