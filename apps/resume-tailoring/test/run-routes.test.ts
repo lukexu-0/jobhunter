@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import {
   createApplicationSessionRoutes,
   type ApplicationSessionRouteService,
@@ -1327,6 +1327,95 @@ describe("application session HTTP routes", () => {
       + "event: snapshot\n"
       + "data: {\"generation\":2,\"session\":{\"generation\":2,\"bridgeState\":\"running\",\"harnessState\":\"running\",\"submissionPhase\":\"not_attempted\",\"createdAt\":1,\"updatedAt\":2,\"terminalAt\":null,\"expiresAt\":60001,\"company\":\"Example Corp\",\"role\":\"Staff Engineer\",\"fieldsFilled\":[],\"fieldsNeedingHuman\":[],\"filesAttached\":[\"resume.pdf\"],\"warnings\":[],\"revisionCount\":0,\"playwrightCliDiagnostics\":[],\"pendingAction\":null,\"error\":null},\"event\":\"snapshot\",\"detail\":{}}\n\n",
     );
+  });
+
+  test("heartbeats an idle event stream without advancing its iterator", async () => {
+    const HEARTBEAT_INTERVAL_MS = 15_000;
+    const nextResult = Promise.withResolvers<IteratorResult<ApplicationSessionStreamItem>>();
+    let nextCalls = 0;
+    let nextCallsInFlight = 0;
+    let maximumConcurrentNextCalls = 0;
+    let returnCalls = 0;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const settleMicrotasks = async (): Promise<void> => {
+      for (let index = 0; index < 5; index += 1) await Promise.resolve();
+    };
+    const target = applicationService({
+      events: () => ({
+        [Symbol.asyncIterator]() {
+          return {
+            next(): Promise<IteratorResult<ApplicationSessionStreamItem>> {
+              nextCalls += 1;
+              nextCallsInFlight += 1;
+              maximumConcurrentNextCalls = Math.max(
+                maximumConcurrentNextCalls,
+                nextCallsInFlight,
+              );
+              return nextResult.promise.finally(() => {
+                nextCallsInFlight -= 1;
+              });
+            },
+            async return(): Promise<IteratorResult<ApplicationSessionStreamItem>> {
+              returnCalls += 1;
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      }),
+    });
+
+    vi.useFakeTimers();
+    try {
+      const response = await applicationRequest(
+        target,
+        "/v1/runs/run-1/application/events",
+      );
+      reader = response.body!.getReader();
+      let heartbeatSettled = false;
+      const heartbeatRead = reader.read().then((result) => {
+        heartbeatSettled = true;
+        return result;
+      });
+      await settleMicrotasks();
+      expect(nextCalls).toBe(1);
+
+      vi.advanceTimersByTime(HEARTBEAT_INTERVAL_MS - 1);
+      await settleMicrotasks();
+      expect(heartbeatSettled).toBe(false);
+      vi.advanceTimersByTime(1);
+      await settleMicrotasks();
+      expect(heartbeatSettled).toBe(true);
+
+      const heartbeat = await heartbeatRead;
+      expect(heartbeat.done).toBe(false);
+      expect(new TextDecoder().decode(heartbeat.value)).toBe(": heartbeat\n\n");
+      expect(nextCalls).toBe(1);
+      expect(maximumConcurrentNextCalls).toBe(1);
+
+      const eventRead = reader.read();
+      await settleMicrotasks();
+      expect(nextCalls).toBe(1);
+      expect(maximumConcurrentNextCalls).toBe(1);
+      nextResult.resolve({
+        done: false,
+        value: { id: "2:7", event: applicationEvent },
+      });
+      const event = await eventRead;
+      expect(event.done).toBe(false);
+      expect(new TextDecoder().decode(event.value)).toBe(
+        "id: 2:7\n"
+        + "event: snapshot\n"
+        + "data: {\"generation\":2,\"session\":{\"generation\":2,\"bridgeState\":\"running\",\"harnessState\":\"running\",\"submissionPhase\":\"not_attempted\",\"createdAt\":1,\"updatedAt\":2,\"terminalAt\":null,\"expiresAt\":60001,\"company\":\"Example Corp\",\"role\":\"Staff Engineer\",\"fieldsFilled\":[],\"fieldsNeedingHuman\":[],\"filesAttached\":[\"resume.pdf\"],\"warnings\":[],\"revisionCount\":0,\"playwrightCliDiagnostics\":[],\"pendingAction\":null,\"error\":null},\"event\":\"snapshot\",\"detail\":{}}\n\n",
+      );
+
+      await reader.cancel("view closed");
+      expect(returnCalls).toBe(1);
+    } finally {
+      const cancellation = reader?.cancel("test cleanup");
+      nextResult.resolve({ done: true, value: undefined });
+      await cancellation?.catch(() => {});
+      vi.useRealTimers();
+    }
   });
 
   test("rejects ambiguous or unsafe Last-Event-ID values before opening a stream", async () => {
