@@ -730,6 +730,11 @@ a {
   font-weight: 700;
 }
 
+.application-status-control option {
+  background: var(--color-surface);
+  color: #fff;
+}
+
 .application-status-control--pending {
   --application-status-color: var(--color-application-pending);
 }
@@ -767,6 +772,13 @@ a {
 
 .application-status-control--accepted {
   --application-status-color: var(--color-application-accepted);
+}
+
+.application-status-control--oa_received,
+.application-status-control--rejected,
+.application-status-control--accepted {
+  background: var(--application-status-color);
+  color: var(--color-canvas);
 }
 
 .application-status-control--failed {

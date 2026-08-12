@@ -2024,7 +2024,7 @@ test("uses the dark palette and accessible lifecycle status presentation", async
     "--color-application-accepted": "#79cf92",
     "--color-application-failed": "#ef8179",
   } as const;
-  const expectedStatusText = "#ffffff";
+  const expectedNeutralStatusText = "#ffffff";
   await page.setViewportSize({ width: 1_672, height: 941 });
   await interceptRuns(page, [
     ...lifecycleRuns,
@@ -2066,8 +2066,13 @@ test("uses the dark palette and accessible lifecycle status presentation", async
     const expectedStatusColor = status === "pending"
       ? expectedColors["--color-warning"]
       : expectedColors[`--color-application-${status}`];
-    const expectedBackground = expectedColors["--color-surface"];
-    const expectedForeground = expectedStatusText;
+    const isFilled = status === "oa_received" || status === "rejected" || status === "accepted";
+    const expectedBackground = isFilled
+      ? expectedStatusColor
+      : expectedColors["--color-surface"];
+    const expectedForeground = isFilled
+      ? expectedColors["--color-canvas"]
+      : expectedNeutralStatusText;
     const control = page.locator(`select.application-status-control--${status}`);
     const style = await control.evaluate((element) => {
       const computed = getComputedStyle(element);
@@ -2087,6 +2092,22 @@ test("uses the dark palette and accessible lifecycle status presentation", async
       fontSize: "15px",
     });
     expect(contrastRatio(expectedForeground, expectedBackground)).toBeGreaterThanOrEqual(4.5);
+    const optionStyles = await control.locator("option").evaluateAll((options) => (
+      options.map((option) => {
+        const computed = getComputedStyle(option);
+        return {
+          backgroundColor: computed.backgroundColor,
+          color: computed.color,
+        };
+      })
+    ));
+    expect(optionStyles).not.toHaveLength(0);
+    for (const optionStyle of optionStyles) {
+      expect(optionStyle).toEqual({
+        backgroundColor: cssRgb(expectedColors["--color-surface"]),
+        color: cssRgb(expectedNeutralStatusText),
+      });
+    }
   }
 
   const updatedDateFontSizes = await page.getByRole("table").locator("time").evaluateAll((elements) => (
