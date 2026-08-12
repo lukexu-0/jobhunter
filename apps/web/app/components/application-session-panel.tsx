@@ -394,6 +394,24 @@ export function ApplicationSessionPanel({
         {stateLabel}
       </p>
 
+      {snapshot.warnings.length > 0 ? (
+        <div
+          aria-label="Application warnings"
+          className={styles.applicationWarningAlert}
+          role="alert"
+        >
+          {snapshot.warnings.length === 1 ? (
+            snapshot.warnings[0]
+          ) : (
+            <ul className={styles.applicationWarningList}>
+              {snapshot.warnings.map((warning, index) => (
+                <li key={`${index}:${warning}`}>{warning}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+
       {pendingAction?.type === "credentials" ? (
         <ApplicationCredentialsForm
           key={`${snapshot.generation}:credentials`}

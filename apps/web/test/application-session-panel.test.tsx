@@ -30,7 +30,7 @@ function snapshot(
       { label: "Portfolio URL", fieldType: "text", valuePresent: false, note: "Needs confirmation" },
     ],
     filesAttached: ["resume.pdf"],
-    warnings: ["Review the highlighted field"],
+    warnings: [],
     revisionCount: 1,
     pendingAction: null,
     error: null,
@@ -78,7 +78,7 @@ describe("ApplicationSessionPanel", () => {
       "Files attached",
       "resume.pdf",
       "Warnings",
-      "Review the highlighted field",
+      "None reported",
     ]) {
       expect(running).not.toContain(omitted);
     }
@@ -184,6 +184,32 @@ describe("ApplicationSessionPanel", () => {
     expect(closedSubmitted).not.toContain("Retry applying");
     expect(closedSubmitted).not.toContain("Close browser");
     expect(closedSubmitted).not.toContain("Steer the agent");
+  });
+
+  test("renders actionable warnings in one accessible alert only when present", () => {
+    const firstWarning = "Confirm the public salary range.";
+    const secondWarning = "Review the relocation answer before submitting.";
+    const running = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({ warnings: [firstWarning, secondWarning] })}
+      />,
+    );
+    expect(running.match(/aria-label="Application warnings"/g)).toHaveLength(1);
+    expect(running.match(/role="alert"/g)).toHaveLength(1);
+    expect(running.split(firstWarning)).toHaveLength(2);
+    expect(running.split(secondWarning)).toHaveLength(2);
+    expect(running.indexOf(firstWarning)).toBeLessThan(running.indexOf(secondWarning));
+    expect(running).not.toContain(">Warnings<");
+    expect(running).not.toContain("None reported");
+
+    const withoutWarnings = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({ warnings: [] })}
+      />,
+    );
+    expect(withoutWarnings).not.toContain('aria-label="Application warnings"');
   });
 
   test("renders accessible steering while the application agent is running or gated", () => {

@@ -190,11 +190,18 @@ def sanitize_application_result(
             note="Filled" if field.value_present else "Needs human review",
         )
 
-    warnings = (
-        ["The application agent reported warnings; review all listed fields before submitting."]
-        if result.warnings
-        else []
-    )
+    warnings = [
+        redacted
+        for warning in result.warnings
+        if (
+            redacted := redact_public_text(
+                warning,
+                redaction_values,
+                max_length=1000,
+            )
+        )
+        is not None
+    ]
     return ReviewApplicationResult(
         status="ready_for_submission",
         company=redact_public_text(result.company, redaction_values),

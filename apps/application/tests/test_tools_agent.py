@@ -443,7 +443,10 @@ def test_public_redaction_and_result_sanitization_remove_direct_values() -> None
                 }
             ],
             "files_attached": ["candidate-resume.pdf"],
-            "warnings": ["Ada Secret-Value needs review"],
+            "warnings": [
+                "Confirm the work authorization answer before submitting.",
+                "Ada%20Secret-Value needs review",
+            ],
         }
     )
 
@@ -462,8 +465,12 @@ def test_public_redaction_and_result_sanitization_remove_direct_values() -> None
     assert sanitized.fields_filled[0].note == "Filled"
     assert sanitized.files_attached == ["resume.pdf"]
     assert sanitized.warnings == [
-        "The application agent reported warnings; review all listed fields before submitting."
+        "Confirm the work authorization answer before submitting.",
+        "[redacted] needs review",
     ]
+    serialized = sanitized.model_dump_json()
+    assert all(value not in serialized for value in direct_values.values())
+    assert "Ada%20Secret-Value" not in serialized
     assert sanitized.revision_count == 4
     assert sanitized.submit_attempted is False
 

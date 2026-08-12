@@ -3265,13 +3265,17 @@ async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
     await manager.delete(created.session_id)
 
 
-async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
+async def test_encoded_gate_result_and_file_values_project_actionable_warnings(
     tmp_path: Path,
 ) -> None:
     raw_secret = "ada.private%40example.test"
     normalized_secret = "ada.private@example.test"
     encoded_secret = "ada.private%25252540example.test"
     private_job_url = f"https://jobs.example/openings/{encoded_secret}?private=yes"
+    expected_warnings = [
+        "Confirm the portfolio URL before submitting.",
+        "Account [redacted] needs a final review.",
+    ]
     def private_result() -> ReviewApplicationResult:
         return ReviewApplicationResult(
             status="ready_for_submission",
@@ -3288,7 +3292,10 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
                 }
             ],
             files_attached=[f"{encoded_secret}.pdf"],
-            warnings=[encoded_secret],
+            warnings=[
+                "Confirm the portfolio URL before submitting.",
+                f"Account {encoded_secret} needs a final review.",
+            ],
             submit_attempted=False,
         )
 
@@ -3341,9 +3348,7 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
     assert review_snapshot.fields_filled[0].label == "[redacted]"
     assert review_snapshot.fields_filled[0].note == "Filled"
     assert review_snapshot.files_attached == ["resume.pdf"]
-    assert review_snapshot.warnings == [
-        "The application agent reported warnings; review all listed fields before submitting."
-    ]
+    assert review_snapshot.warnings == expected_warnings
     record = manager._active
     assert record is not None
     public = json.dumps(
@@ -3352,6 +3357,8 @@ async def test_encoded_gate_result_and_file_values_are_redacted_or_generic(
             "events": [event.model_dump(mode="json") for event in record.events],
         }
     )
+    assert expected_warnings[0] in public
+    assert expected_warnings[1] in public
     assert raw_secret not in public
     assert normalized_secret not in public
     assert encoded_secret not in public

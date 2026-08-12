@@ -2456,8 +2456,11 @@ test("navigation, human review, submit approval, and close use exact public comm
   await expect(
     applicationPanel.getByText("Salary expectation", { exact: true }),
   ).toHaveCount(0);
-  await expect(applicationPanel.getByText("Confirm the public salary range.", { exact: true }))
-    .toHaveCount(0);
+  const applicationWarnings = applicationPanel.getByRole("alert", {
+    name: "Application warnings",
+  });
+  await expect(applicationWarnings).toBeVisible();
+  await expect(applicationWarnings).toHaveText("Confirm the public salary range.");
   const requestRevisionButton = page.getByRole("button", { name: "Request application revision" });
   const submitButton = page.getByRole("button", { name: "Approve and submit" }).first();
   await expect(requestRevisionButton).toBeDisabled();

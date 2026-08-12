@@ -373,6 +373,20 @@
   text-transform: uppercase;
 }
 
+.applicationWarningAlert {
+  border-left: var(--border-width) solid var(--color-warning);
+  padding: var(--space-3);
+  background: var(--color-canvas);
+  color: var(--color-warning);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-normal);
+}
+
+.applicationWarningList {
+  margin: 0;
+  padding-left: var(--space-5);
+}
+
 .applicationSteeringForm {
   display: grid;
   min-width: 0;
