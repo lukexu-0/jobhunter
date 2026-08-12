@@ -429,6 +429,7 @@ describe("RunApplicationService", () => {
       skipReview: true,
       autoSubmit: true,
       jobUrl: JOB_URL,
+      isApplying: false,
     });
     expect(listed).toHaveLength(1);
     expect(listed[0]).toMatchObject({
@@ -437,6 +438,7 @@ describe("RunApplicationService", () => {
       skipReview: true,
       autoSubmit: true,
       jobUrl: JOB_URL,
+      isApplying: false,
     });
     expect(retrieved).toMatchObject({
       queueSequence: 1,
@@ -444,7 +446,99 @@ describe("RunApplicationService", () => {
       skipReview: true,
       autoSubmit: true,
       jobUrl: JOB_URL,
+      isApplying: false,
     });
+    const legacyDto = { ...created };
+    delete legacyDto.isApplying;
+    expect(RunDtoSchema.parse(legacyDto)).not.toHaveProperty("isApplying");
+  });
+
+  test("projects the latest application session without per-run list lookups", async () => {
+    const target = fixture();
+    const applying = await target.service.createRun(JOB_URL);
+    const pdf = await finalizeReviewPdf(target, applying.id);
+    const approved = await target.service.approveRun(applying.id, pdf.sha256, false);
+    expect(approved.isApplying).toBe(false);
+
+    const sessionId = "93939393-9393-4393-8393-939393939393";
+    target.repository.reserveApplicationSession(
+      applying.id,
+      null,
+      sessionId,
+      pdf.sha256,
+    );
+    const ordinary = await target.service.createRun(`${JOB_URL}&ordinary=1`);
+
+    await expect(target.service.getRun(applying.id)).resolves.toMatchObject({
+      isApplying: true,
+    });
+    await expect(
+      target.service.updateApplicationStatus(applying.id, "oa_received"),
+    ).resolves.toMatchObject({
+      applicationStatus: "oa_received",
+      isApplying: true,
+    });
+
+    const originalBatchProjection =
+      target.repository.listApplyingRunIds.bind(target.repository);
+    const originalSingleProjection =
+      target.repository.isRunApplying.bind(target.repository);
+    let batchProjectionCalls = 0;
+    target.repository.listApplyingRunIds = (runIds) => {
+      batchProjectionCalls += 1;
+      return originalBatchProjection(runIds);
+    };
+    target.repository.isRunApplying = () => {
+      throw new Error("list projection queried application state per run");
+    };
+    const listed = await target.service.listRuns();
+    target.repository.listApplyingRunIds = originalBatchProjection;
+    target.repository.isRunApplying = originalSingleProjection;
+
+    expect(batchProjectionCalls).toBe(1);
+    expect(listed.find(({ id }) => id === applying.id)?.isApplying).toBe(true);
+    expect(listed.find(({ id }) => id === ordinary.id)?.isApplying).toBe(false);
+
+    target.repository.recordApplicationSnapshot(applying.id, {
+      slotReleased: false,
+      generation: 1,
+      sessionId,
+      bridgeState: "awaiting_human_review",
+      publicSnapshot: { state: "awaiting_human_review" },
+    });
+    target.repository.claimApplicationSubmission(sessionId);
+    target.repository.recordApplicationSnapshot(applying.id, {
+      slotReleased: false,
+      generation: 1,
+      sessionId,
+      bridgeState: "submitting",
+      publicSnapshot: { state: "submitting" },
+    });
+    await expect(target.service.getRun(applying.id)).resolves.toMatchObject({
+      isApplying: true,
+    });
+
+    target.repository.finalizeApplicationSubmission(sessionId, "submitted");
+    target.repository.recordApplicationSnapshot(applying.id, {
+      slotReleased: false,
+      generation: 1,
+      sessionId,
+      bridgeState: "submitted",
+      publicSnapshot: { state: "submitted" },
+    });
+
+    await expect(target.service.getRun(applying.id)).resolves.toMatchObject({
+      isApplying: false,
+    });
+    await expect(
+      target.service.updateApplicationStatus(applying.id, "rejected"),
+    ).resolves.toMatchObject({
+      applicationStatus: "rejected",
+      isApplying: false,
+    });
+    expect(
+      (await target.service.listRuns()).find(({ id }) => id === applying.id),
+    ).toMatchObject({ isApplying: false });
   });
   test("omits the job URL for legacy runs", async () => {
     const target = fixture();

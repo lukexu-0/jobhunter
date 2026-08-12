@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+  ACTIVE_APPLICATION_SESSION_BRIDGE_STATES,
   ApplicationAnswerSuggestionsResponseSchema,
   ApplicationProfessionalizeResponseSchema,
   ApplicationSessionEventDtoSchema,
@@ -53,15 +54,10 @@ const PROFILE_RELATIVE_PATH = "apps/user-info/current-context/personal/applicant
 const LOST_WARNING = "Verify whether the application was submitted before retrying.";
 const SLOT_RELEASE_RETRY_DELAY_MS = 250;
 
-const LIVE_APPLICATION_STATES: Readonly<Record<string, true>> = Object.freeze({
-  reserved: true,
-  starting: true,
-  running: true,
-  awaiting_human_navigation: true,
-  awaiting_origin_approval: true,
-  awaiting_additional_info: true,
-  awaiting_human_review: true,
-  submitting: true,
+const LIVE_APPLICATION_STATES: Readonly<
+  Partial<Record<ApplicationSessionBridgeState, true>>
+> = Object.freeze({
+  ...ACTIVE_APPLICATION_SESSION_BRIDGE_STATES,
   submitted: true,
   submission_uncertain: true,
 });
