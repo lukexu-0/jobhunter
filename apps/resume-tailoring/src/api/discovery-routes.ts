@@ -13,6 +13,8 @@ import {
 } from "../contracts/index.ts";
 import { apiResponse } from "./handler.ts";
 
+export const DISCOVERY_SYNC_PATH = "/v1/discovery/sync";
+
 export interface DiscoveryRouteService {
   list(options: DiscoveryListRequest): DiscoveryListResponse | Promise<DiscoveryListResponse>;
   sync(signal: AbortSignal): Promise<DiscoverySyncResponse>;
@@ -154,7 +156,7 @@ export function createDiscoveryRoutes(service: DiscoveryRouteService) {
         return mappedError(error);
       }
     }
-    if (url.pathname === "/v1/discovery/sync" && request.method === "POST") {
+    if (url.pathname === DISCOVERY_SYNC_PATH && request.method === "POST") {
       try {
         const body = DiscoverySyncRequestSchema.safeParse(await parseBody(request));
         if (!body.success) {

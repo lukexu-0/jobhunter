@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     "./contracts": "./src/contracts/index.ts",
+    "./discovery-config": "./src/discovery/config.ts",
     "./package.json": "./package.json"
   },
   "scripts": {
