@@ -10,7 +10,7 @@ import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
 import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
 
-const PAGE_SIZE = 8;
+const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
 const POLL_INTERVAL_MS = 3_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 const MAX_CONCURRENT_RUN_CREATIONS = 5;
@@ -19,6 +19,17 @@ const EMPTY_RUNS: RunDto[] = [];
 const ROW_INTERACTIVE_SELECTOR = "a, button, input, select, textarea, summary, [contenteditable='true']";
 const FOCUSABLE_INTERACTIVE_SELECTOR = "a[href], area[href], button:not(:disabled), input:not(:disabled):not([type='hidden']), select:not(:disabled), textarea:not(:disabled), summary, iframe, audio[controls], video[controls], [contenteditable]:not([contenteditable='false']), [tabindex]";
 const SELECTABLE_APPLICATION_STATUSES = APPLICATION_STATUSES.filter((status) => status !== "failed");
+const DASHBOARD_STATUS_FILTERS = [
+  "pending",
+  "applying",
+  "did_not_apply",
+  "applied",
+  "oa_received",
+  "oa_completed",
+  "rejected",
+  "interview",
+  "accepted",
+] as const;
 
 
 const IS_TERMINAL_STATUS: Record<RunStatus, boolean> = {
@@ -43,6 +54,7 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 
 type SortDirection = "newest" | "oldest";
+type StatusFilter = ApplicationStatus | "all" | "applying";
 type IdentityField = "title" | "organization";
 type OpportunityKindSelection = OpportunityKind | "auto";
 
@@ -250,9 +262,10 @@ export function RunDashboard() {
   const [isLoading, setIsLoading] = useState(showInitialLoading.current);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<ApplicationStatus | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0]);
   const [jobUrl, setJobUrl] = useState("");
   const [opportunityKind, setOpportunityKind] = useState<OpportunityKindSelection>("auto");
   const [skipReview, setSkipReview] = useState(false);
@@ -328,12 +341,21 @@ export function RunDashboard() {
     };
   }, [load]);
 
-  const hasActiveRuns = runs.some((run) => !IS_TERMINAL_STATUS[run.status]);
+  const hasActiveRuns = runs.some((run) => run.isApplying === true || !IS_TERMINAL_STATUS[run.status]);
 
   useEffect(() => {
     if (!hasActiveRuns) return;
-    const interval = window.setInterval(() => void load(), POLL_INTERVAL_MS);
-    return () => window.clearInterval(interval);
+    let cancelled = false;
+    let timeout = 0;
+    const poll = async () => {
+      await load();
+      if (!cancelled) timeout = window.setTimeout(() => void poll(), POLL_INTERVAL_MS);
+    };
+    timeout = window.setTimeout(() => void poll(), POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
   }, [hasActiveRuns, load]);
 
   useEffect(() => {
@@ -552,7 +574,11 @@ export function RunDashboard() {
   const filteredRuns = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return runs
-      .filter((run) => statusFilter === "all" || run.applicationStatus === statusFilter)
+      .filter((run) => {
+        if (statusFilter === "all") return true;
+        if (statusFilter === "applying") return run.isApplying === true;
+        return run.isApplying !== true && run.applicationStatus === statusFilter;
+      })
       .filter((run) => {
         if (!normalizedQuery) return true;
         const identity = effectiveRunIdentity(run, jobIdentities[run.id]);
@@ -560,16 +586,21 @@ export function RunDashboard() {
           .filter((value): value is string => Boolean(value))
           .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
       })
-      .sort((left, right) =>
-        sortDirection === "newest" ? right.updatedAt - left.updatedAt : left.updatedAt - right.updatedAt,
-      );
+      .sort((left, right) => {
+        const leftBucket = left.isApplying ? 0 : left.applicationStatus === "rejected" ? 2 : 1;
+        const rightBucket = right.isApplying ? 0 : right.applicationStatus === "rejected" ? 2 : 1;
+        if (leftBucket !== rightBucket) return leftBucket - rightBucket;
+        return sortDirection === "newest"
+          ? right.updatedAt - left.updatedAt
+          : left.updatedAt - right.updatedAt;
+      });
   }, [jobIdentities, query, runs, sortDirection, statusFilter]);
 
-  const totalPages = Math.max(1, Math.ceil(filteredRuns.length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(filteredRuns.length / pageSize));
   const safePage = Math.min(currentPage, totalPages);
-  const visibleRuns = filteredRuns.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
-  const firstVisible = filteredRuns.length === 0 ? 0 : (safePage - 1) * PAGE_SIZE + 1;
-  const lastVisible = Math.min(safePage * PAGE_SIZE, filteredRuns.length);
+  const visibleRuns = filteredRuns.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const firstVisible = filteredRuns.length === 0 ? 0 : (safePage - 1) * pageSize + 1;
+  const lastVisible = Math.min(safePage * pageSize, filteredRuns.length);
 
   useEffect(() => {
     if (currentPage !== safePage) setCurrentPage(safePage);
@@ -580,7 +611,7 @@ export function RunDashboard() {
     setCurrentPage(1);
   };
 
-  const updateStatus = (value: ApplicationStatus | "all") => {
+  const updateStatus = (value: StatusFilter) => {
     setStatusFilter(value);
     setCurrentPage(1);
   };
@@ -868,9 +899,32 @@ export function RunDashboard() {
             <div className="applications-toolbar__actions">
               <label className="select-control">
                 <span>State</span>
-                <select aria-label="Filter applications by state" value={statusFilter} onChange={(event) => updateStatus(event.target.value as ApplicationStatus | "all")}>
+                <select
+                  aria-label="Filter applications by state"
+                  value={statusFilter}
+                  onChange={(event) => updateStatus(event.target.value as StatusFilter)}
+                >
                   <option value="all">All states</option>
-                  {SELECTABLE_APPLICATION_STATUSES.map((status) => <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>)}
+                  {DASHBOARD_STATUS_FILTERS.map((status) => (
+                    <option value={status} key={status}>
+                      {status === "applying" ? "Applying" : APPLICATION_STATUS_LABELS[status]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="select-control">
+                <span>Per page</span>
+                <select
+                  aria-label="Applications per page"
+                  value={pageSize}
+                  onChange={(event) => {
+                    setPageSize(Number(event.target.value));
+                    setCurrentPage(1);
+                  }}
+                >
+                  {PAGE_SIZE_OPTIONS.map((option) => (
+                    <option value={option} key={option}>{option}</option>
+                  ))}
                 </select>
               </label>
               <button
@@ -974,20 +1028,29 @@ export function RunDashboard() {
                         }</td>
                         <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
                         <td>
-                          <select
-                            aria-label={`Application state for ${shortRunId(run.id)}`}
-                            className={`application-status-control application-status-control--${run.applicationStatus}`}
-                            value={run.applicationStatus}
-                            disabled={busyRunIds.has(run.id)}
-                            onChange={(event) => {
-                              void changeApplicationStatus(run.id, event.target.value as ApplicationStatus);
-                            }}
-                          >
-                            {run.applicationStatus === "failed" ? <option value="failed" disabled>{APPLICATION_STATUS_LABELS.failed}</option> : null}
-                            {SELECTABLE_APPLICATION_STATUSES.map((status) => (
-                              <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>
-                            ))}
-                          </select>
+                          {run.isApplying ? (
+                            <span
+                              aria-label={`Application state for ${shortRunId(run.id)}: Applying`}
+                              className="application-status-control application-status-control--applying"
+                            >
+                              Applying
+                            </span>
+                          ) : (
+                            <select
+                              aria-label={`Application state for ${shortRunId(run.id)}`}
+                              className={`application-status-control application-status-control--${run.applicationStatus}`}
+                              value={run.applicationStatus}
+                              disabled={busyRunIds.has(run.id)}
+                              onChange={(event) => {
+                                void changeApplicationStatus(run.id, event.target.value as ApplicationStatus);
+                              }}
+                            >
+                              {run.applicationStatus === "failed" ? <option value="failed" disabled>{APPLICATION_STATUS_LABELS.failed}</option> : null}
+                              {SELECTABLE_APPLICATION_STATUSES.map((status) => (
+                                <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>
+                              ))}
+                            </select>
+                          )}
                         </td>
                         <td>
                           <button

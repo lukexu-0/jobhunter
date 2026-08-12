@@ -1,7 +1,11 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { CLAIM_TTL_MS, createClaimToken, isProcessIdentityAlive, type ClaimTokenFactory, type RunClaim } from "../worker/claims.ts";
-import { OpportunityKindSchema, type OpportunityKind } from "../contracts/index.ts";
+import {
+  ACTIVE_APPLICATION_SESSION_BRIDGE_STATES,
+  OpportunityKindSchema,
+  type OpportunityKind,
+} from "../contracts/index.ts";
 
 export const RUN_STATUSES = ["queued", "analyzing", "tailoring", "editing", "compiling", "repairing", "deterministic_qa", "visual_qa", "review", "approved", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
@@ -638,6 +642,39 @@ export class PipelineRepository {
       LIMIT 1
     `).get(runId);
     return row ? publicApplicationSession(row) : null;
+  }
+
+  isRunApplying(runId: string): boolean {
+    const latest = this.getLatestApplicationSession(runId);
+    return latest !== null
+      && ACTIVE_APPLICATION_SESSION_BRIDGE_STATES[latest.bridgeState] === true;
+  }
+
+  listApplyingRunIds(runIds: readonly string[]): ReadonlySet<string> {
+    if (runIds.length === 0) return new Set();
+    const placeholders = runIds.map(() => "?").join(",");
+    const latest = this.#db.query<{
+      run_id: string;
+      bridge_state: ApplicationSessionBridgeState;
+    }, string[]>(`
+      SELECT sessions.run_id, sessions.bridge_state
+      FROM run_application_sessions AS sessions
+      INNER JOIN (
+        SELECT run_id, max(generation) AS generation
+        FROM run_application_sessions
+        WHERE run_id IN (${placeholders})
+        GROUP BY run_id
+      ) AS latest
+        ON latest.run_id = sessions.run_id
+       AND latest.generation = sessions.generation
+    `).all(...runIds);
+    const applyingRunIds = new Set<string>();
+    for (const row of latest) {
+      if (ACTIVE_APPLICATION_SESSION_BRIDGE_STATES[row.bridge_state] === true) {
+        applyingRunIds.add(row.run_id);
+      }
+    }
+    return applyingRunIds;
   }
 
   getNextAutomaticApplicationStart(): {

@@ -14,6 +14,7 @@ function runFixture(id: string, applicationStatus: ApplicationStatus, status: Ru
     opportunityKind: "job",
     status,
     applicationStatus,
+    isApplying: false,
     revision: 1,
     origin: "initial",
     queueSequence: 1,
@@ -301,12 +302,12 @@ const lifecycleRuns: readonly RunDto[] = [
   runFixture("lifecycle-failed", "failed", "review"),
 ];
 
-async function interceptRuns(page: Page): Promise<void> {
+async function interceptRuns(page: Page, runs: readonly RunDto[] = lifecycleRuns): Promise<void> {
   await page.route("**/api/pipeline/runs", async (route) => {
     expect(route.request().method()).toBe("GET");
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify({ runs: lifecycleRuns }),
+      body: JSON.stringify({ runs }),
     });
   });
 }
@@ -1500,6 +1501,7 @@ test("filters by selectable application state and keeps stored Failed display-on
   await expect(state.locator("option")).toHaveText([
     "All states",
     "Pending",
+    "Applying",
     "Did not apply",
     "Applied",
     "OA received",
@@ -1995,9 +1997,8 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
   }
 });
 
-test("uses the original dark palette across surfaces and states", async ({ page }) => {
+test("uses the dark palette and accessible lifecycle status presentation", async ({ page }) => {
   const expectedColors = {
-    white: "#fff",
     "--color-canvas": "#050606",
     "--color-surface": "#090b0b",
     "--color-surface-raised": "#111413",
@@ -2018,16 +2019,19 @@ test("uses the original dark palette across surfaces and states", async ({ page 
     "--color-application-applied": "#c2a7ef",
     "--color-application-oa_received": "#e3c66f",
     "--color-application-oa_completed": "#8fd4c0",
-    "--color-application-rejected": "#e8ad73",
+    "--color-application-rejected": "#ef5a5a",
     "--color-application-interview": "#79cae8",
     "--color-application-accepted": "#79cf92",
     "--color-application-failed": "#ef8179",
   } as const;
-  const { white: expectedStatusText, ...expectedRootColors } = expectedColors;
+  const expectedNeutralStatusText = "#ffffff";
   await page.setViewportSize({ width: 1_672, height: 941 });
-  await interceptRuns(page);
+  await interceptRuns(page, [
+    ...lifecycleRuns,
+    runFixture("lifecycle-pending", "pending", "queued"),
+  ]);
   await page.goto("/");
-  await expect(page.locator(".application-status-control")).toHaveCount(8);
+  await expect(page.locator("select.application-status-control")).toHaveCount(9);
 
   const rootStyle = await page.evaluate((tokens) => {
     const style = getComputedStyle(document.documentElement);
@@ -2035,9 +2039,9 @@ test("uses the original dark palette across surfaces and states", async ({ page 
       colorScheme: style.colorScheme,
       tokens: Object.fromEntries(tokens.map((token) => [token, style.getPropertyValue(token).trim()])),
     };
-  }, Object.keys(expectedRootColors));
+  }, Object.keys(expectedColors));
   expect(rootStyle.colorScheme).toBe("dark");
-  expect(rootStyle.tokens).toEqual(expectedRootColors);
+  expect(rootStyle.tokens).toEqual(expectedColors);
 
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-canvas"]));
   expect(await page.locator(".app-navigation").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(cssRgb(expectedColors["--color-surface"]));
@@ -2049,6 +2053,7 @@ test("uses the original dark palette across surfaces and states", async ({ page 
   expect(await applicationsLink.evaluate((element) => getComputedStyle(element).outlineColor)).toBe(cssRgb(expectedColors["--color-focus"]));
 
   for (const status of [
+    "pending",
     "did_not_apply",
     "applied",
     "oa_received",
@@ -2058,8 +2063,17 @@ test("uses the original dark palette across surfaces and states", async ({ page 
     "accepted",
     "failed",
   ] as const) {
-    const token = `--color-application-${status}` as keyof typeof expectedColors;
-    const control = page.locator(`.application-status-control--${status}`);
+    const expectedStatusColor = status === "pending"
+      ? expectedColors["--color-warning"]
+      : expectedColors[`--color-application-${status}`];
+    const isFilled = status === "oa_received" || status === "rejected" || status === "accepted";
+    const expectedBackground = isFilled
+      ? expectedStatusColor
+      : expectedColors["--color-surface"];
+    const expectedForeground = isFilled
+      ? expectedColors["--color-canvas"]
+      : expectedNeutralStatusText;
+    const control = page.locator(`select.application-status-control--${status}`);
     const style = await control.evaluate((element) => {
       const computed = getComputedStyle(element);
       return {
@@ -2067,15 +2081,39 @@ test("uses the original dark palette across surfaces and states", async ({ page 
         color: computed.color,
         borderColor: computed.borderColor,
         backgroundColor: computed.backgroundColor,
+        fontSize: computed.fontSize,
       };
     });
     expect(style).toEqual({
-      statusColor: expectedColors[token],
-      color: cssRgb(expectedStatusText),
-      borderColor: cssRgb(expectedColors[token]),
-      backgroundColor: cssRgb(expectedColors["--color-surface"]),
+      statusColor: expectedStatusColor,
+      color: cssRgb(expectedForeground),
+      borderColor: cssRgb(expectedStatusColor),
+      backgroundColor: cssRgb(expectedBackground),
+      fontSize: "15px",
     });
+    expect(contrastRatio(expectedForeground, expectedBackground)).toBeGreaterThanOrEqual(4.5);
+    const optionStyles = await control.locator("option").evaluateAll((options) => (
+      options.map((option) => {
+        const computed = getComputedStyle(option);
+        return {
+          backgroundColor: computed.backgroundColor,
+          color: computed.color,
+        };
+      })
+    ));
+    expect(optionStyles).not.toHaveLength(0);
+    for (const optionStyle of optionStyles) {
+      expect(optionStyle).toEqual({
+        backgroundColor: cssRgb(expectedColors["--color-surface"]),
+        color: cssRgb(expectedNeutralStatusText),
+      });
+    }
   }
+
+  const updatedDateFontSizes = await page.getByRole("table").locator("time").evaluateAll((elements) => (
+    [...new Set(elements.map((element) => getComputedStyle(element).fontSize))]
+  ));
+  expect(updatedDateFontSizes).toEqual(["15px"]);
 
   const foregroundTokens = [
     "--color-text",
@@ -2101,6 +2139,37 @@ test("uses the original dark palette across surfaces and states", async ({ page 
     expect(contrastRatio(expectedColors[token], expectedColors["--color-canvas"])).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(expectedColors[token], expectedColors["--color-surface"])).toBeGreaterThanOrEqual(4.5);
   }
+});
+
+test("renders Applying as a hollow info status at dashboard typography", async ({ page }) => {
+  const infoColor = "#83c6ef";
+  const surfaceColor = "#090b0b";
+  const statusTextColor = "#ffffff";
+  await interceptRuns(page, [{
+    ...runFixture("lifecycle-applying", "applied", "approved"),
+    isApplying: true,
+  }]);
+  await page.goto("/");
+
+  const applyingControl = page.locator("span.application-status-control--applying");
+  await expect(page.locator("select.application-status-control--applying")).toHaveCount(0);
+  await expect(applyingControl).toHaveText("Applying");
+  const style = await applyingControl.evaluate((element) => {
+    const computed = getComputedStyle(element);
+    return {
+      color: computed.color,
+      borderColor: computed.borderColor,
+      backgroundColor: computed.backgroundColor,
+      fontSize: computed.fontSize,
+    };
+  });
+  expect(style).toEqual({
+    color: cssRgb(statusTextColor),
+    borderColor: cssRgb(infoColor),
+    backgroundColor: cssRgb(surfaceColor),
+    fontSize: "15px",
+  });
+  expect(contrastRatio(statusTextColor, surfaceColor)).toBeGreaterThanOrEqual(4.5);
 });
 
 test("uses route-workspace breakpoints for detail panes", async ({ page }) => {

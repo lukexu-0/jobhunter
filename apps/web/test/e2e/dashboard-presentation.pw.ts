@@ -32,6 +32,29 @@ function runFixture(): RunDto {
   };
 }
 
+function dashboardRun({
+  id,
+  title,
+  updatedAt,
+  applicationStatus = "pending",
+  isApplying = false,
+}: {
+  id: string;
+  title: string;
+  updatedAt: number;
+  applicationStatus?: RunDto["applicationStatus"];
+  isApplying?: boolean;
+}): RunDto {
+  return {
+    ...runFixture(),
+    id,
+    titleOverride: title,
+    updatedAt,
+    applicationStatus,
+    isApplying,
+  };
+}
+
 async function interceptAnalyzedRun(page: Page): Promise<void> {
   const run: RunDto = {
     ...runFixture(),
@@ -439,7 +462,7 @@ test("scrolls the applications table locally only when five columns do not fit",
   );
 });
 
-test("uses the shared lifecycle order and exposes a square accessible row action menu without an arrow", async ({ page }) => {
+test("uses the shared filter and lifecycle orders and exposes a square accessible row action menu without an arrow", async ({ page }) => {
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -458,12 +481,23 @@ test("uses the shared lifecycle order and exposes a square accessible row action
     "Interview",
     "Accepted",
   ];
+  const filterStatusLabels = [
+    "Pending",
+    "Applying",
+    "Did not apply",
+    "Applied",
+    "OA received",
+    "OA completed",
+    "Rejected",
+    "Interview",
+    "Accepted",
+  ];
   const filter = page.getByRole("combobox", { name: "Filter applications by state" });
   const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
   const trigger = row.getByRole("button", { name: "Actions for presenta…-run" });
 
-  await expect(filter.locator("option")).toHaveText(["All states", ...statusLabels]);
+  await expect(filter.locator("option")).toHaveText(["All states", ...filterStatusLabels]);
   await expect(rowStatus.locator("option")).toHaveText(statusLabels);
   await expect(row.getByRole("link", { name: "Open application presenta…-run" })).toHaveCount(1);
   await expect(row.locator(".row-arrow")).toHaveCount(0);
@@ -585,7 +619,7 @@ test("renders application status text with stronger contrast", async ({ page }) 
 
   const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
   await expect(rowStatus).toHaveCSS("color", "rgb(255, 255, 255)");
-  await expect(rowStatus).toHaveCSS("font-size", "13px");
+  await expect(rowStatus).toHaveCSS("font-size", "15px");
 });
 
 test("keeps the action trigger inset and its menu and dialog usable at narrow widths", async ({ page }) => {
@@ -895,4 +929,147 @@ test("requires delete confirmation and removes a run only after a successful bod
   await expect(page.getByRole("searchbox", { name: "Search applications" })).toBeFocused();
   await expect(page.getByText("No applications yet. Enter an opportunity URL above to initialize one.")).toBeVisible();
   expect(deleteBodies).toEqual([null, null]);
+});
+
+test("prioritizes Applying, keeps Rejected last in both date directions, and restores completed runs to date order", async ({ page }) => {
+  const baseTime = 1_700_000_000_000;
+  const applyingRun = dashboardRun({
+    id: "applying-priority",
+    title: "Applying oldest",
+    updatedAt: baseTime + 300,
+    isApplying: true,
+  });
+  const completedApplyingRun: RunDto = {
+    ...applyingRun,
+    isApplying: false,
+  };
+  const otherRuns = [
+    dashboardRun({ id: "ordinary-old", title: "Ordinary old", updatedAt: baseTime + 200 }),
+    dashboardRun({ id: "ordinary-new", title: "Ordinary new", updatedAt: baseTime + 400, applicationStatus: "applied" }),
+    dashboardRun({ id: "rejected-new", title: "Rejected new", updatedAt: baseTime + 500, applicationStatus: "rejected" }),
+    dashboardRun({ id: "rejected-old", title: "Rejected old", updatedAt: baseTime + 50, applicationStatus: "rejected" }),
+  ];
+  let listRequests = 0;
+  let pendingPoll: Route | undefined;
+  await page.route("**/api/pipeline/runs", async (route) => {
+    listRequests += 1;
+    if (listRequests === 1) {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [applyingRun, ...otherRuns] }),
+      });
+      return;
+    }
+    pendingPoll = route;
+  });
+  await page.goto("/");
+
+  const table = page.getByRole("table");
+  const roleLinks = table.locator("tbody").getByRole("link");
+  const applyingRow = table.getByRole("row").filter({ hasText: "Applying oldest" });
+  const applyingStatus = applyingRow.getByLabel(/Application state for .*: Applying/);
+  await expect(applyingStatus).toHaveText("Applying");
+  await expect(applyingRow.getByRole("combobox", { name: /Application state for/ })).toHaveCount(0);
+  await expect(roleLinks).toHaveText([
+    "Applying oldest",
+    "Ordinary new",
+    "Ordinary old",
+    "Rejected new",
+    "Rejected old",
+  ]);
+
+  await page.getByRole("button", { name: "Sort by updated date, currently newest" }).click();
+  await expect(roleLinks).toHaveText([
+    "Applying oldest",
+    "Ordinary old",
+    "Ordinary new",
+    "Rejected old",
+    "Rejected new",
+  ]);
+
+  await expect.poll(() => Boolean(pendingPoll), { timeout: 5_000 }).toBe(true);
+  await page.waitForTimeout(3_250);
+  expect(listRequests).toBe(2);
+  await pendingPoll!.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ runs: [completedApplyingRun, ...otherRuns] }),
+  });
+
+  await expect(applyingStatus).toHaveCount(0);
+  await expect(applyingRow.getByRole("combobox", { name: /Application state for/ })).toHaveValue("pending");
+  await expect(roleLinks).toHaveText([
+    "Ordinary old",
+    "Applying oldest",
+    "Ordinary new",
+    "Rejected old",
+    "Rejected new",
+  ]);
+});
+
+test("filters transient Applying rows separately from their stored lifecycle state", async ({ page }) => {
+  const runs = [
+    dashboardRun({
+      id: "filter-applying",
+      title: "Active pending application",
+      updatedAt: 1_700_000_000_300,
+      isApplying: true,
+    }),
+    dashboardRun({
+      id: "filter-pending",
+      title: "Durable pending application",
+      updatedAt: 1_700_000_000_200,
+    }),
+    dashboardRun({
+      id: "filter-applied",
+      title: "Durable applied application",
+      updatedAt: 1_700_000_000_100,
+      applicationStatus: "applied",
+    }),
+  ];
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs }),
+    });
+  });
+  await page.goto("/");
+
+  const filter = page.getByRole("combobox", { name: "Filter applications by state" });
+  const visibleRoleLinks = page.getByRole("table").locator("tbody").getByRole("link");
+  await filter.selectOption("applying");
+  await expect(visibleRoleLinks).toHaveText(["Active pending application"]);
+  await expect(page.locator(".application-status-control--applying")).toHaveText("Applying");
+
+  await filter.selectOption("pending");
+  await expect(visibleRoleLinks).toHaveText(["Durable pending application"]);
+  await expect(page.locator(".application-status-control--applying")).toHaveCount(0);
+});
+
+test("offers 10, 20, and 50 applications per page and resets every size change to page 1", async ({ page }) => {
+  const runs = Array.from({ length: 70 }, (_, index) => dashboardRun({
+    id: `page-size-${index + 1}`,
+    title: `Application ${String(index + 1).padStart(2, "0")}`,
+    updatedAt: 1_700_000_000_000 + index,
+  }));
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs }),
+    });
+  });
+  await page.goto("/");
+
+  const pageSize = page.getByRole("combobox", { name: "Applications per page" });
+  const pagination = page.getByRole("navigation", { name: "Applications pagination" });
+  await expect(pageSize.locator("option")).toHaveText(["10", "20", "50"]);
+  await expect(pageSize).toHaveValue("10");
+  await expect(pagination).toContainText("Showing 1 to 10 of 70 applications");
+
+  for (const size of [20, 50, 10]) {
+    await pagination.getByRole("button", { name: "Next page" }).click();
+    await expect(pagination.getByRole("button", { name: "Page 2" })).toHaveAttribute("aria-current", "page");
+    await pageSize.selectOption(String(size));
+    await expect(pagination.getByRole("button", { name: "Page 1" })).toHaveAttribute("aria-current", "page");
+    await expect(pagination).toContainText(`Showing 1 to ${size} of 70 applications`);
+  }
 });

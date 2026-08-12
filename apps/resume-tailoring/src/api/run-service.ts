@@ -277,7 +277,13 @@ export class RunApplicationService {
   }
 
   async listRuns(): Promise<RunDto[]> {
-    return await Promise.all(this.dependencies.repository.listRuns().map((run) => this.#toDto(run)));
+    const runs = this.dependencies.repository.listRuns();
+    const applyingRunIds = this.dependencies.repository.listApplyingRunIds(
+      runs.map(({ id }) => id),
+    );
+    return await Promise.all(
+      runs.map((run) => this.#toDto(run, applyingRunIds.has(run.id))),
+    );
   }
 
   async getRun(id: string): Promise<RunDto | undefined> {
@@ -677,8 +683,9 @@ export class RunApplicationService {
     }
   }
 
-  async #toDto(run: PublicRun): Promise<RunDto> {
+  async #toDto(run: PublicRun, isApplying?: boolean): Promise<RunDto> {
     const repository = this.dependencies.repository;
+    const projectedIsApplying = isApplying ?? repository.isRunApplying(run.id);
     const history = repository.timeline(run.id);
     const attempts: AttemptDto[] = history.attempts.map((attempt) => ({
       id: attempt.id,
@@ -712,6 +719,7 @@ export class RunApplicationService {
       opportunityKind: run.opportunityKind,
       status: run.status,
       applicationStatus: run.applicationStatus,
+      isApplying: projectedIsApplying,
       ...(run.titleOverride !== undefined ? { titleOverride: run.titleOverride } : {}),
       ...(run.organizationOverride !== undefined ? { organizationOverride: run.organizationOverride } : {}),
       generateKeywordMap: run.generateKeywordMap,

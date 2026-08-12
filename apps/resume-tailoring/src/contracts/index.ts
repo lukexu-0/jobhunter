@@ -539,6 +539,7 @@ export const RunDtoSchema = z
     opportunityKind: OpportunityKindSchema,
     status: RunStatusSchema,
     applicationStatus: ApplicationStatusSchema,
+    isApplying: z.boolean().optional(),
     titleOverride: RunIdentityTextSchema.optional(),
     organizationOverride: RunIdentityTextSchema.optional(),
     generateKeywordMap: z.boolean(),
@@ -583,6 +584,19 @@ export const ApplicationSessionBridgeStateSchema = z.enum([
 export type ApplicationSessionBridgeState = z.infer<
   typeof ApplicationSessionBridgeStateSchema
 >;
+
+export const ACTIVE_APPLICATION_SESSION_BRIDGE_STATES: Readonly<
+  Partial<Record<ApplicationSessionBridgeState, true>>
+> = Object.freeze({
+  reserved: true,
+  starting: true,
+  running: true,
+  awaiting_human_navigation: true,
+  awaiting_origin_approval: true,
+  awaiting_additional_info: true,
+  awaiting_human_review: true,
+  submitting: true,
+});
 
 export const ApplicationSubmissionPhaseSchema = z.enum([
   "not_attempted",

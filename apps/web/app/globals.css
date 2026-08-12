@@ -17,11 +17,12 @@
   --color-danger: #ef8a82;
   --color-focus: #d2f34c;
   --color-application-pending: var(--color-warning);
+  --color-application-applying: var(--color-info);
   --color-application-did_not_apply: #aeb4bf;
   --color-application-applied: #c2a7ef;
   --color-application-oa_received: #e3c66f;
   --color-application-oa_completed: #8fd4c0;
-  --color-application-rejected: #e8ad73;
+  --color-application-rejected: #ef5a5a;
   --color-application-interview: #79cae8;
   --color-application-accepted: #79cf92;
   --color-application-failed: #ef8179;
@@ -725,12 +726,23 @@ a {
   background: var(--color-surface);
   color: #fff;
   font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-base);
   font-weight: 700;
+}
+
+.application-status-control option {
+  background: var(--color-surface);
+  color: #fff;
 }
 
 .application-status-control--pending {
   --application-status-color: var(--color-application-pending);
+}
+
+.application-status-control--applying {
+  --application-status-color: var(--color-application-applying);
+  display: inline-flex;
+  align-items: center;
 }
 
 .application-status-control--did_not_apply {
@@ -762,9 +774,18 @@ a {
   --application-status-color: var(--color-application-accepted);
 }
 
+.application-status-control--oa_received,
+.application-status-control--rejected,
+.application-status-control--accepted {
+  background: var(--application-status-color);
+  color: var(--color-canvas);
+}
+
 .application-status-control--failed {
   --application-status-color: var(--color-application-failed);
 }
+
+
 
 .sort-control {
   white-space: nowrap;
@@ -841,6 +862,7 @@ a {
 
 .applications-table time {
   color: #fff;
+  font-size: var(--font-size-base);
 }
 
 .applications-table tbody tr {

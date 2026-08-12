@@ -3,7 +3,10 @@ import type { Database } from "bun:sqlite";
 import { openPipelineDatabase } from "../src/db/database.ts";
 import { ApplicationSubmissionFinalError, ClaimRejectedError, PipelineRepository, RepositoryConflictError, RunArtifactsPrunedError, SourceDriftError, type ActiveStage } from "../src/db/repository.ts";
 import { isProcessIdentityAlive, readProcessStartToken } from "../src/worker/claims.ts";
-import { ApplicationSessionSnapshotDtoSchema } from "../src/contracts/index.ts";
+import {
+  ACTIVE_APPLICATION_SESSION_BRIDGE_STATES,
+  ApplicationSessionSnapshotDtoSchema,
+} from "../src/contracts/index.ts";
 
 const databases: Database[] = [];
 const SUBMISSION_UNCERTAIN_WARNING =
@@ -155,6 +158,58 @@ describe("run listing", () => {
 
     expect(repo.listRuns(3).map(({ id }) => id)).toEqual(ids.slice(-3));
     expect(repo.listRuns().map(({ id }) => id)).toEqual(ids.slice(-100));
+  });
+
+  test("projects only the latest active application session for a requested run set", () => {
+    expect(Object.keys(ACTIVE_APPLICATION_SESSION_BRIDGE_STATES).sort()).toEqual([
+      "awaiting_additional_info",
+      "awaiting_human_navigation",
+      "awaiting_human_review",
+      "awaiting_origin_approval",
+      "reserved",
+      "running",
+      "starting",
+      "submitting",
+    ]);
+
+    const { repo } = fixture();
+    const hash = "9".repeat(64);
+    const applyingRunId = createReview(repo, hash, false, "applying-projection");
+    const ordinaryRun = repo.createRun("ordinary", "ordinary-projection");
+    const firstSessionId = "91919191-9191-4191-8191-919191919191";
+    const latestSessionId = "92929292-9292-4292-8292-929292929292";
+    repo.approve(applyingRunId, hash);
+    repo.reserveApplicationSession(applyingRunId, null, firstSessionId, hash);
+    repo.recordApplicationSnapshot(applyingRunId, {
+      slotReleased: true,
+      generation: 1,
+      sessionId: firstSessionId,
+      bridgeState: "cancelled",
+      publicSnapshot: { state: "cancelled" },
+    });
+    repo.reserveApplicationSession(
+      applyingRunId,
+      firstSessionId,
+      latestSessionId,
+      hash,
+    );
+
+    expect(repo.listApplyingRunIds([applyingRunId, ordinaryRun.id]))
+      .toEqual(new Set([applyingRunId]));
+    expect(repo.isRunApplying(applyingRunId)).toBe(true);
+    expect(repo.isRunApplying(ordinaryRun.id)).toBe(false);
+
+    repo.recordApplicationSnapshot(applyingRunId, {
+      slotReleased: true,
+      generation: 2,
+      sessionId: latestSessionId,
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+    });
+
+    expect(repo.listApplyingRunIds([applyingRunId, ordinaryRun.id]))
+      .toEqual(new Set());
+    expect(repo.isRunApplying(applyingRunId)).toBe(false);
   });
 });
 
