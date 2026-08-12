@@ -1281,7 +1281,7 @@ test("additional-information answers survive conflict reconciliation and clear o
     .toHaveValue("  Ada Public  ");
 
   const gatedGuidance = "Use only verified profile facts.";
-  await page.getByRole("textbox", { name: "Operator guidance" })
+  await page.getByRole("textbox", { name: "Steer the agent" })
     .fill(gatedGuidance);
   await page.getByRole("button", { name: "Send guidance" }).click();
   await expect.poll(() => mock.commands.length).toBe(2);
@@ -1496,7 +1496,7 @@ test("a changed question gate suppresses stale continuation after steering", asy
   );
 
   await page.goto(`/runs/${runId}`);
-  await page.getByRole("textbox", { name: "Operator guidance" })
+  await page.getByRole("textbox", { name: "Steer the agent" })
     .fill("Use the current question only.");
   await page.getByRole("group", { name: oldQuestion.question })
     .getByRole("textbox", { name: "Answer", exact: true })
@@ -1506,7 +1506,7 @@ test("a changed question gate suppresses stale continuation after steering", asy
 
   gateFrame.resolve();
   await expect(page.getByRole("group", { name: newQuestion.question })).toBeVisible();
-  const currentGuidance = page.getByRole("textbox", { name: "Operator guidance" });
+  const currentGuidance = page.getByRole("textbox", { name: "Steer the agent" });
   await currentGuidance.fill("Use the current gate.");
   await page.getByRole("button", { name: "Send guidance" }).click();
   await expect.poll(() => mock.commands.length).toBe(2);
@@ -1574,7 +1574,7 @@ test("an authoritative replacement gate clears ambiguous steering delivery", asy
   );
 
   await page.goto(`/runs/${runId}`);
-  const guidance = page.getByRole("textbox", { name: "Operator guidance" });
+  const guidance = page.getByRole("textbox", { name: "Steer the agent" });
   const send = page.getByRole("button", { name: "Send guidance" });
   await guidance.fill("Use the old gate.");
   await send.click();
@@ -2404,6 +2404,10 @@ test("navigation, human review, submit approval, and close use exact public comm
   queueSse(mock, eventFixture("closed", closed, {}), 6, closeFrame.promise);
 
   await page.goto(`/runs/${runId}`);
+  const applicationPanel = page.getByRole("region", {
+    name: "Application",
+    exact: true,
+  });
   const workflow = page.getByRole("list", { name: "Workflow progress" });
   const applyingStage = workflow.getByRole("listitem").filter({ hasText: "Applying" });
   const appliedStage = workflow.getByRole("listitem").filter({ hasText: "Applied" });
@@ -2415,7 +2419,8 @@ test("navigation, human review, submit approval, and close use exact public comm
   expect(mock.commands[0]).toEqual({ type: "continue" });
   await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
   unrelatedFrame.resolve();
-  await expect(page.getByText("Unrelated progress company", { exact: true })).toBeVisible();
+  await expect(applicationPanel.getByText("Unrelated progress company", { exact: true }))
+    .toHaveCount(0);
   await expect(page.getByRole("button", { name: "Continuing…" })).toBeDisabled();
   const continueAccepted = page.waitForResponse((response) =>
     new URL(response.url()).pathname === `${pipelineRunPath}/application/commands`
@@ -2441,16 +2446,26 @@ test("navigation, human review, submit approval, and close use exact public comm
   await expect.poll(() => mock.runGetCount).toBe(1);
   await expect(applyingStage).toHaveAttribute("aria-current", "step");
   await expect(appliedStage.locator("svg")).toHaveCount(0);
-  await expect(page.getByText("Email", { exact: true })).toBeVisible();
-  await expect(page.getByText("Salary expectation", { exact: true })).toBeVisible();
-  await expect(page.getByText("Confirm the public salary range.", { exact: true })).toBeVisible();
+  await expect(
+    applicationPanel.getByText("Public Example Company", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    applicationPanel.getByText("Public Staff Engineer", { exact: true }),
+  ).toHaveCount(0);
+  await expect(applicationPanel.getByText("Email", { exact: true })).toHaveCount(0);
+  await expect(
+    applicationPanel.getByText("Salary expectation", { exact: true }),
+  ).toHaveCount(0);
+  await expect(applicationPanel.getByText("Confirm the public salary range.", { exact: true }))
+    .toHaveCount(0);
   const requestRevisionButton = page.getByRole("button", { name: "Request application revision" });
   const submitButton = page.getByRole("button", { name: "Approve and submit" }).first();
   await expect(requestRevisionButton).toBeDisabled();
   await expect(submitButton).toBeEnabled();
   mock.application = review;
-  await page.getByLabel("Revision instructions").fill("  Correct the public salary field.  ");
-  await page.getByRole("button", { name: "Request application revision" }).click();
+  const revisionInstructions = page.getByLabel("Revision instructions");
+  await revisionInstructions.fill("  Correct the public salary field.  ");
+  await requestRevisionButton.click();
   await expect.poll(() => mock.commands.length).toBe(2);
   expect(mock.commands[1]).toEqual({
     type: "revise",
@@ -2458,8 +2473,11 @@ test("navigation, human review, submit approval, and close use exact public comm
   });
   await expect(page.getByRole("button", { name: "Requesting revision…" })).toBeDisabled();
   reviseFrame.resolve();
-  await expect(page.getByText("Application revisions", { exact: true })).toBeVisible();
-  await expect(page.getByText("1", { exact: true })).toBeVisible();
+  await expect(requestRevisionButton).toBeEnabled();
+  await expect(
+    applicationPanel.getByText("Application revisions", { exact: true }),
+  ).toHaveCount(0);
+  await expect(applicationPanel.getByText("1", { exact: true })).toHaveCount(0);
   mock.application = revised;
 
   await submitButton.click();
@@ -3128,25 +3146,38 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
   );
 
   await page.goto(`/runs/${runId}`);
-  const form = page.getByRole("form", { name: "Guide the application agent" });
-  const guidance = page.getByRole("textbox", { name: "Operator guidance" });
+  const applicationPanel = page.getByRole("region", {
+    name: "Application",
+    exact: true,
+  });
+  const form = applicationPanel.getByRole("form", { name: "Steer the agent" });
+  const guidance = form.getByRole("textbox", { name: "Steer the agent" });
   const send = page.getByRole("button", { name: "Send guidance" });
   const cancel = page.getByRole("button", { name: "Cancel application" });
+  const applicationState = applicationPanel.getByRole("status").filter({
+    hasText: /^Applying$/,
+  });
   await expect(form).toBeVisible();
-  await expect(guidance).toHaveAttribute(
-    "aria-describedby",
-    "application-steering-guidance",
-  );
-  await expect(page.getByText(
+  await expect(guidance).toBeVisible();
+  await expect(form.getByText("Steer the agent", { exact: true })).toHaveCount(1);
+  await expect(applicationState).toHaveText("Applying");
+  await expect(
+    applicationPanel.getByRole("heading", { name: "Guide the application agent" }),
+  ).toHaveCount(0);
+  await expect(applicationPanel.getByText("Operator guidance", { exact: true })).toHaveCount(0);
+  await expect(applicationPanel.getByText(
     "Delivered once before the next agent step. If an action is waiting, delivery releases it immediately. Guidance is not saved to your profile or application facts.",
     { exact: true },
-  )).toBeVisible();
+  )).toHaveCount(0);
+  const applicationStateBox = await applicationState.boundingBox();
+  expect(applicationStateBox).not.toBeNull();
   expect(await page.evaluate(
     () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
   )).toBe(true);
   const formBox = await form.boundingBox();
   expect(formBox).not.toBeNull();
   expect(formBox!.x + formBox!.width).toBeLessThanOrEqual(390);
+  expect(formBox!.y + formBox!.height).toBeLessThanOrEqual(applicationStateBox!.y);
 
   await guidance.fill("contains\u0000nul");
   await send.click();
@@ -3217,7 +3248,7 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
   expect(mock.commands[3]).toEqual({ type: "steer", message: gatedDraft });
 
   returnToRunning.resolve();
-  await expect(page.getByRole("form", { name: "Guide the application agent" })).toBeVisible();
+  await expect(page.getByRole("form", { name: "Steer the agent" })).toBeVisible();
   await expect(guidance).toHaveValue("");
   await expect(send).toBeEnabled();
 
@@ -3254,7 +3285,7 @@ test("cancelling during steering suppresses navigation continuation", async ({ p
   );
 
   await page.goto(`/runs/${runId}`);
-  await page.getByRole("textbox", { name: "Operator guidance" })
+  await page.getByRole("textbox", { name: "Steer the agent" })
     .fill("Retry the checkpoint once.");
   await page.getByRole("button", { name: "Send guidance" }).click();
   await expect.poll(() => mock.commands.length).toBe(1);
@@ -3299,7 +3330,7 @@ test("ordinary navigation continues after ambiguous steering settles", async ({ 
   );
 
   await page.goto(`/runs/${runId}`);
-  await page.getByRole("textbox", { name: "Operator guidance" })
+  await page.getByRole("textbox", { name: "Steer the agent" })
     .fill("Retry the checkpoint once.");
   await page.getByRole("button", { name: "Send guidance" }).click();
   await expect(page.getByRole("alert").filter({
@@ -3334,7 +3365,7 @@ test("retry current sends only fixed guidance at a navigation gate", async ({ pa
   });
 
   await page.goto(`/runs/${runId}`);
-  const guidance = page.getByRole("textbox", { name: "Operator guidance" });
+  const guidance = page.getByRole("textbox", { name: "Steer the agent" });
   await guidance.fill("Keep this draft for later.");
   const retryCurrent = page.getByRole("button", { name: "Retry current action" });
   await expect(retryCurrent).toHaveAttribute("title", "Retry current action");

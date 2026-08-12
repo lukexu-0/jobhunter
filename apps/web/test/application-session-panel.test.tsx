@@ -62,12 +62,26 @@ describe("ApplicationSessionPanel", () => {
     const running = renderToStaticMarkup(
       <ApplicationSessionPanel {...callbacks} snapshot={snapshot()} />,
     );
-    expect(running).toContain("Example Corp");
-    expect(running).toContain("Staff Engineer");
-    expect(running).toContain("Portfolio URL");
-    expect(running).toContain("resume.pdf");
-    expect(running).toContain("Review the highlighted field");
-    expect(running).toContain("Application revisions");
+    for (const omitted of [
+      "Company",
+      "Example Corp",
+      "Role",
+      "Staff Engineer",
+      "Created",
+      "Updated",
+      "Browser expires",
+      "Application revisions",
+      "Fields filled",
+      "Fields needing you",
+      "Portfolio URL",
+      "Needs confirmation",
+      "Files attached",
+      "resume.pdf",
+      "Warnings",
+      "Review the highlighted field",
+    ]) {
+      expect(running).not.toContain(omitted);
+    }
     expect(running).toContain("Cancel application");
     expect(running).not.toContain("Retry applying");
     expect(running).toContain('role="status"');
@@ -84,7 +98,7 @@ describe("ApplicationSessionPanel", () => {
     );
     expect(reserved).toContain("Start applying");
     expect(reserved).toContain("Cancel application");
-    expect(reserved).not.toContain("Guide the application agent");
+    expect(reserved).not.toContain("Steer the agent");
 
     const lost = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -101,7 +115,7 @@ describe("ApplicationSessionPanel", () => {
     expect(lost).toContain("Retry applying");
     expect(lost).toContain("verify whether the application was submitted");
     expect(lost).not.toContain("Cancel application");
-    expect(lost).not.toContain("Guide the application agent");
+    expect(lost).not.toContain("Steer the agent");
 
     const submitting = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -117,7 +131,7 @@ describe("ApplicationSessionPanel", () => {
     expect(submitting).not.toContain("Cancel application");
     expect(submitting).not.toContain("Retry applying");
     expect(submitting).not.toContain("Close browser");
-    expect(submitting).not.toContain("Guide the application agent");
+    expect(submitting).not.toContain("Steer the agent");
 
     const submitted = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -134,7 +148,7 @@ describe("ApplicationSessionPanel", () => {
     expect(submitted).toContain("stays open until");
     expect(submitted).not.toContain("Cancel application");
     expect(submitted).not.toContain("Retry applying");
-    expect(submitted).not.toContain("Guide the application agent");
+    expect(submitted).not.toContain("Steer the agent");
 
     const uncertain = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -153,7 +167,7 @@ describe("ApplicationSessionPanel", () => {
     expect(uncertain).toContain("Close browser");
     expect(uncertain).not.toContain("Cancel application");
     expect(uncertain).not.toContain("Retry applying");
-    expect(uncertain).not.toContain("Guide the application agent");
+    expect(uncertain).not.toContain("Steer the agent");
 
     const closedSubmitted = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -169,22 +183,30 @@ describe("ApplicationSessionPanel", () => {
     );
     expect(closedSubmitted).not.toContain("Retry applying");
     expect(closedSubmitted).not.toContain("Close browser");
-    expect(closedSubmitted).not.toContain("Guide the application agent");
+    expect(closedSubmitted).not.toContain("Steer the agent");
   });
 
   test("renders accessible steering while the application agent is running or gated", () => {
     const running = renderToStaticMarkup(
       <ApplicationSessionPanel {...callbacks} snapshot={snapshot()} />,
     );
-    expect(running).toContain('aria-labelledby="application-steering-heading"');
-    expect(running).toContain("Guide the application agent");
-    expect(running).toContain("Operator guidance");
-    expect(running).toContain("Delivered once before the next agent step.");
-    expect(running).toContain("not saved to your profile or application facts");
+    const formStart = running.indexOf("<form");
+    const formOpeningTag = running.slice(formStart, running.indexOf(">", formStart) + 1);
+    const textboxStart = running.indexOf("<textarea");
+    const textboxOpeningTag = running.slice(
+      textboxStart,
+      running.indexOf(">", textboxStart) + 1,
+    );
+    expect(formOpeningTag).toContain('aria-label="Steer the agent"');
+    expect(textboxOpeningTag).toContain('aria-label="Steer the agent"');
+    expect(running).not.toContain("Guide the application agent");
+    expect(running).not.toContain("Operator guidance");
+    expect(running).not.toContain("Delivered once before the next agent step.");
+    expect(running).not.toContain("not saved to your profile or application facts");
     expect(running).toContain("Send guidance");
     expect(running).toContain('aria-live="polite"');
-    expect(running.indexOf("Guide the application agent"))
-      .toBeGreaterThan(running.indexOf("Warnings"));
+    expect(running.indexOf("Steer the agent"))
+      .toBeLessThan(running.indexOf("Applying"));
 
     const waiting = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -199,7 +221,7 @@ describe("ApplicationSessionPanel", () => {
         })}
       />,
     );
-    expect(waiting).toContain("Operator guidance");
+    expect(waiting).toContain("Steer the agent");
     expect(waiting).toContain("Send guidance");
     expect(waiting).not.toContain("Steer and continue");
     expect(waiting).toContain('title="Retry current action"');
@@ -287,7 +309,7 @@ describe("ApplicationSessionPanel", () => {
     expect(originMarkup).toContain("https://apply.example.com");
     expect(originMarkup).toContain("Restart required");
     expect(originMarkup).not.toContain("Approve origin");
-    expect(originMarkup).not.toContain("Guide the application agent");
+    expect(originMarkup).not.toContain("Steer the agent");
   });
 
   test("builds strict credential commands with trimmed usernames and exact passwords", () => {

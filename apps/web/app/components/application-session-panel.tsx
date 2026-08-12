@@ -7,7 +7,6 @@ import {
   type ApplicationAnswerSuggestionsResponse,
   type ApplicationProfessionalizeRequest,
   type ApplicationProfessionalizeResponse,
-  type ApplicationFieldResult,
   type ApplicationPendingAction,
   type ApplicationSessionBridgeState,
   type ApplicationSessionCommand,
@@ -181,9 +180,7 @@ function ApplicationSteeringForm({
   const error = validationError
     ?? deliveryError
     ?? (steeringState === "ambiguous" ? AMBIGUOUS_STEERING_MESSAGE : null);
-  const descriptionId = "application-steering-guidance";
   const errorId = "application-steering-error";
-  const describedBy = error ? `${descriptionId} ${errorId}` : descriptionId;
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -192,23 +189,16 @@ function ApplicationSteeringForm({
 
   return (
     <form
-      aria-labelledby="application-steering-heading"
+      aria-label="Steer the agent"
       className={styles.applicationSteeringForm}
       noValidate
       onSubmit={submit}
     >
-      <div className={styles.applicationSteeringIntro}>
-        <h3 id="application-steering-heading">Guide the application agent</h3>
-        <p id={descriptionId}>
-          Delivered once before the next agent step. If an action is waiting,
-          delivery releases it immediately. Guidance is not saved to your
-          profile or application facts.
-        </p>
-      </div>
       <label className={styles.workspaceField} htmlFor="application-steering-message">
-        <span>Operator guidance</span>
+        <span>Steer the agent</span>
         <textarea
-          aria-describedby={describedBy}
+          aria-describedby={error ? errorId : undefined}
+          aria-label="Steer the agent"
           aria-invalid={error ? true : undefined}
           disabled={disabled}
           id="application-steering-message"
@@ -247,29 +237,6 @@ function ApplicationSteeringForm({
         {deliveryStatus}
       </p>
     </form>
-  );
-}
-
-function FieldList({ fields }: { readonly fields: readonly ApplicationFieldResult[] }) {
-  if (fields.length === 0) return <p>None reported.</p>;
-  return (
-    <ul className={styles.applicationList}>
-      {fields.map((field, index) => (
-        <li key={`${field.label}-${index}`}>
-          <span>{field.label}</span>
-          {field.note ? <span className={styles.applicationListNote}> — {field.note}</span> : null}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function TextList({ values }: { readonly values: readonly string[] }) {
-  if (values.length === 0) return <p>None reported.</p>;
-  return (
-    <ul className={styles.applicationList}>
-      {values.map((value, index) => <li key={`${value}-${index}`}>{value}</li>)}
-    </ul>
   );
 }
 
@@ -397,63 +364,6 @@ export function ApplicationSessionPanel({
   return (
     <section className={styles.workspaceSection} aria-label="Application">
       <p className={styles.eyebrow}>Application</p>
-      <p
-        aria-atomic="true"
-        aria-live="polite"
-        className={styles.applicationSessionState}
-        role="status"
-      >
-        {stateLabel}
-      </p>
-
-      <dl className={styles.metadataGrid}>
-        <div>
-          <dt>Company</dt>
-          <dd>{snapshot.company || "Not identified"}</dd>
-        </div>
-        <div>
-          <dt>Role</dt>
-          <dd>{snapshot.role || "Not identified"}</dd>
-        </div>
-        <div>
-          <dt>Created</dt>
-          <dd><time dateTime={new Date(snapshot.createdAt).toISOString()}>{formatTimestamp(snapshot.createdAt)}</time></dd>
-        </div>
-        <div>
-          <dt>Updated</dt>
-          <dd><time dateTime={new Date(snapshot.updatedAt).toISOString()}>{formatTimestamp(snapshot.updatedAt)}</time></dd>
-        </div>
-        {snapshot.expiresAt !== null ? (
-          <div>
-            <dt>Browser expires</dt>
-            <dd><time dateTime={new Date(snapshot.expiresAt).toISOString()}>{formatTimestamp(snapshot.expiresAt)}</time></dd>
-          </div>
-        ) : null}
-        <div>
-          <dt>Application revisions</dt>
-          <dd>{snapshot.revisionCount}</dd>
-        </div>
-      </dl>
-
-      <div className={styles.applicationSummary}>
-        <div>
-          <h3>Fields filled</h3>
-          <FieldList fields={snapshot.fieldsFilled} />
-        </div>
-        <div>
-          <h3>Fields needing you</h3>
-          <FieldList fields={snapshot.fieldsNeedingHuman} />
-        </div>
-        <div>
-          <h3>Files attached</h3>
-          <TextList values={snapshot.filesAttached} />
-        </div>
-        <div>
-          <h3>Warnings</h3>
-          <TextList values={snapshot.warnings} />
-        </div>
-      </div>
-
       {canGuideApplicationAgent(snapshot) ? (
         <ApplicationSteeringForm
           deliveryError={steeringDeliveryError}
@@ -475,6 +385,14 @@ export function ApplicationSessionPanel({
           validationError={steeringValidationError}
         />
       ) : null}
+      <p
+        aria-atomic="true"
+        aria-live="polite"
+        className={styles.applicationSessionState}
+        role="status"
+      >
+        {stateLabel}
+      </p>
 
       {pendingAction?.type === "credentials" ? (
         <ApplicationCredentialsForm
