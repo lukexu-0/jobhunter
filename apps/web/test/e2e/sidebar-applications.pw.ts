@@ -2025,15 +2025,13 @@ test("uses the dark palette and accessible lifecycle status presentation", async
     "--color-application-failed": "#ef8179",
   } as const;
   const expectedStatusText = "#ffffff";
-  const filledStatuses: Partial<Record<ApplicationStatus, true>> = {
-    oa_received: true,
-    rejected: true,
-    accepted: true,
-  };
   await page.setViewportSize({ width: 1_672, height: 941 });
-  await interceptRuns(page);
+  await interceptRuns(page, [
+    ...lifecycleRuns,
+    runFixture("lifecycle-pending", "pending", "queued"),
+  ]);
   await page.goto("/");
-  await expect(page.locator(".application-status-control")).toHaveCount(8);
+  await expect(page.locator("select.application-status-control")).toHaveCount(9);
 
   const rootStyle = await page.evaluate((tokens) => {
     const style = getComputedStyle(document.documentElement);
@@ -2055,6 +2053,7 @@ test("uses the dark palette and accessible lifecycle status presentation", async
   expect(await applicationsLink.evaluate((element) => getComputedStyle(element).outlineColor)).toBe(cssRgb(expectedColors["--color-focus"]));
 
   for (const status of [
+    "pending",
     "did_not_apply",
     "applied",
     "oa_received",
@@ -2064,16 +2063,12 @@ test("uses the dark palette and accessible lifecycle status presentation", async
     "accepted",
     "failed",
   ] as const) {
-    const token = `--color-application-${status}` as keyof typeof expectedColors;
-    const expectedStatusColor = expectedColors[token];
-    const isFilled = filledStatuses[status] === true;
-    const expectedBackground = isFilled
-      ? expectedStatusColor
-      : expectedColors["--color-surface"];
-    const expectedForeground = isFilled
-      ? expectedColors["--color-canvas"]
-      : expectedStatusText;
-    const control = page.locator(`.application-status-control--${status}`);
+    const expectedStatusColor = status === "pending"
+      ? expectedColors["--color-warning"]
+      : expectedColors[`--color-application-${status}`];
+    const expectedBackground = expectedColors["--color-surface"];
+    const expectedForeground = expectedStatusText;
+    const control = page.locator(`select.application-status-control--${status}`);
     const style = await control.evaluate((element) => {
       const computed = getComputedStyle(element);
       return {
@@ -2135,7 +2130,8 @@ test("renders Applying as a hollow info status at dashboard typography", async (
   }]);
   await page.goto("/");
 
-  const applyingControl = page.locator(".application-status-control--applying");
+  const applyingControl = page.locator("span.application-status-control--applying");
+  await expect(page.locator("select.application-status-control--applying")).toHaveCount(0);
   await expect(applyingControl).toHaveText("Applying");
   const style = await applyingControl.evaluate((element) => {
     const computed = getComputedStyle(element);

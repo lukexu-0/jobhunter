@@ -1045,7 +1045,7 @@ test("filters transient Applying rows separately from their stored lifecycle sta
   await expect(page.locator(".application-status-control--applying")).toHaveCount(0);
 });
 
-test("offers 8, 16, 32, and 64 applications per page and resets every size change to page 1", async ({ page }) => {
+test("offers 10, 20, and 50 applications per page and resets every size change to page 1", async ({ page }) => {
   const runs = Array.from({ length: 70 }, (_, index) => dashboardRun({
     id: `page-size-${index + 1}`,
     title: `Application ${String(index + 1).padStart(2, "0")}`,
@@ -1061,11 +1061,11 @@ test("offers 8, 16, 32, and 64 applications per page and resets every size chang
 
   const pageSize = page.getByRole("combobox", { name: "Applications per page" });
   const pagination = page.getByRole("navigation", { name: "Applications pagination" });
-  await expect(pageSize.locator("option")).toHaveText(["8", "16", "32", "64"]);
-  await expect(pageSize).toHaveValue("8");
-  await expect(pagination).toContainText("Showing 1 to 8 of 70 applications");
+  await expect(pageSize.locator("option")).toHaveText(["10", "20", "50"]);
+  await expect(pageSize).toHaveValue("10");
+  await expect(pagination).toContainText("Showing 1 to 10 of 70 applications");
 
-  for (const size of [16, 32, 64, 8]) {
+  for (const size of [20, 50, 10]) {
     await pagination.getByRole("button", { name: "Next page" }).click();
     await expect(pagination.getByRole("button", { name: "Page 2" })).toHaveAttribute("aria-current", "page");
     await pageSize.selectOption(String(size));

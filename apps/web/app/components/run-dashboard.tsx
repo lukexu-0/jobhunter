@@ -10,7 +10,7 @@ import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
 import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
 
-const PAGE_SIZE_OPTIONS = [8, 16, 32, 64] as const;
+const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
 const POLL_INTERVAL_MS = 3_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 const MAX_CONCURRENT_RUN_CREATIONS = 5;

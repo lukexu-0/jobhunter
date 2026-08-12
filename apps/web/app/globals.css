@@ -773,12 +773,6 @@ a {
   --application-status-color: var(--color-application-failed);
 }
 
-.application-status-control--oa_received,
-.application-status-control--rejected,
-.application-status-control--accepted {
-  background: var(--application-status-color);
-  color: var(--color-canvas);
-}
 
 
 .sort-control {
