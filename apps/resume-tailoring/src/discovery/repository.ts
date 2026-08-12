@@ -58,6 +58,7 @@ export interface DiscoverySourceReconcileInput extends DiscoverySourceDescriptor
   readonly items: readonly ClassifiedDiscoveredJobInput[];
   readonly completeSnapshot: boolean;
   readonly provenance?: string;
+  readonly failure?: unknown;
 }
 
 export interface DiscoverySourceReconcileSummary {
@@ -363,6 +364,9 @@ export class DiscoveryRepository {
 
   reconcileSource(input: DiscoverySourceReconcileInput): DiscoverySourceReconcileSummary {
     return this.#immediate(() => {
+      if (input.failure !== undefined && input.completeSnapshot) {
+        throw new Error("a failed discovery source cannot reconcile a complete snapshot");
+      }
       const now = this.#now();
       this.#upsertSource(input);
       const previouslyOpen = new Set(
@@ -510,12 +514,20 @@ export class DiscoveryRepository {
         this.database.query<{ closed: number }, [string]>(
           "SELECT closed FROM discovery_jobs WHERE id = ?",
         ).get(jobId)?.closed === 1).length;
-      this.database.query(`
-        UPDATE discovery_sources
-        SET last_sync_at = ?, last_success_at = ?, last_sync_status = 'succeeded',
-            last_error = NULL, provenance = ?
-        WHERE id = ?
-      `).run(now, now, input.provenance ?? null, input.id);
+      if (input.failure === undefined) {
+        this.database.query(`
+          UPDATE discovery_sources
+          SET last_sync_at = ?, last_success_at = ?, last_sync_status = 'succeeded',
+              last_error = NULL, provenance = ?
+          WHERE id = ?
+        `).run(now, now, input.provenance ?? null, input.id);
+      } else {
+        this.database.query(`
+          UPDATE discovery_sources
+          SET last_sync_at = ?, last_sync_status = 'failed', last_error = ?
+          WHERE id = ?
+        `).run(now, safeSourceError(input.failure), input.id);
+      }
       return { received: input.items.length, created, updated: updated.size, closed };
     });
   }

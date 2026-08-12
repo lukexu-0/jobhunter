@@ -2,6 +2,7 @@ import "./auth/service.ts";
 import { bootstrapAgentRuntime } from "./agents/runner.ts";
 import { createPipelineApplication, type PipelineApplication } from "./bootstrap.ts";
 import { APPLICATION_AGENT_PATH } from "./api/application-agent-routes.ts";
+import { DISCOVERY_SYNC_PATH } from "./api/discovery-routes.ts";
 import {
   APPLICATION_COMMAND_PATH,
   APPLICATION_EVENT_STREAM_PATH,
@@ -49,6 +50,10 @@ export function startPipelineHttpServer(
         || (
           request.method === "GET"
           && APPLICATION_EVENT_STREAM_PATH.test(url.pathname)
+        )
+        || (
+          request.method === "POST"
+          && url.pathname === DISCOVERY_SYNC_PATH
         )
       ) {
         server.timeout(request, 0);

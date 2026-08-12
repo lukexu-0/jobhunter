@@ -19,8 +19,11 @@ import {
   type DiscoverySourceDescriptor,
 } from "./repository.ts";
 import { DiscoveryHttpBudget } from "./connectors/http.ts";
+import { DISCOVERY_SYNC_DEADLINE_MS } from "./config.ts";
 import {
   classifyDiscoveryRolesWithLuna,
+  DISCOVERY_ROLE_BATCH_SIZE,
+  DISCOVERY_ROLE_MAX_CONCURRENCY,
   type DiscoveryRoleClassification,
   type DiscoveryRoleClassificationJob,
 } from "./role-classifier.ts";
@@ -74,7 +77,8 @@ const ConnectorResultSchema = z.object({
 
 
 const MAX_SYNC_CONCURRENCY = 4;
-const MAX_SYNC_DURATION_MS = 120_000;
+const MAX_CONFIGURED_SYNC_DEADLINE_MS = 60 * 60_000;
+const SYNC_TIMEOUT_MESSAGE = "Discovery synchronization timed out";
 const MAX_SYNC_REQUESTS = 2_500;
 const MAX_SYNC_BYTES = 256 * 1024 * 1024;
 type ConnectorResult = z.infer<typeof ConnectorResultSchema>;
@@ -86,6 +90,10 @@ const APPROVED_DISCOVERY_SOURCE_KINDS = {
 type ConnectorSyncOutcome =
   | { readonly connector: DiscoveryConnector; readonly result: ConnectorResult }
   | { readonly connector: DiscoveryConnector; readonly error: unknown };
+interface ClassifiedItemsResult {
+  readonly items: readonly ClassifiedDiscoveredJobInput[];
+  readonly error?: unknown;
+}
 function validatedConnectorResult(value: unknown): ConnectorResult {
   const envelope = ConnectorEnvelopeSchema.parse(value);
   const items: Array<z.infer<typeof ConnectorItemSchema>> = [];
@@ -124,17 +132,17 @@ const ABORTED = Symbol("discovery operation aborted");
 async function abortable<T>(
   operation: () => Promise<T>,
   signal: AbortSignal,
-  activeOperations: Set<Promise<unknown>>,
+  activeOperations?: Set<Promise<unknown>>,
 ): Promise<T> {
   signal.throwIfAborted();
   const operationPromise = Promise.resolve().then(() => {
     signal.throwIfAborted();
     return operation();
   });
-  activeOperations.add(operationPromise);
+  activeOperations?.add(operationPromise);
   void operationPromise.then(
-    () => activeOperations.delete(operationPromise),
-    () => activeOperations.delete(operationPromise),
+    () => activeOperations?.delete(operationPromise),
+    () => activeOperations?.delete(operationPromise),
   );
   const { promise: aborted, resolve } = Promise.withResolvers<typeof ABORTED>();
   const onAbort = (): void => resolve(ABORTED);
@@ -201,6 +209,7 @@ export interface DiscoveryServiceDependencies {
   readonly connectors: readonly DiscoveryConnector[];
   readonly now?: () => number;
   readonly classifyRoles?: ClassifyDiscoveryRoles;
+  readonly syncDeadlineMs?: number;
 }
 
 
@@ -220,6 +229,7 @@ function publicSourceError(error: unknown): string {
 export class DiscoveryService {
   readonly #now: () => number;
   readonly #classifyRoles: ClassifyDiscoveryRoles;
+  readonly #syncDeadlineMs: number;
   readonly #shutdown = new AbortController();
   readonly #activeConnectorOperations = new Set<Promise<unknown>>();
   #syncing = false;
@@ -229,6 +239,14 @@ export class DiscoveryService {
   constructor(private readonly dependencies: DiscoveryServiceDependencies) {
     this.#now = dependencies.now ?? Date.now;
     this.#classifyRoles = dependencies.classifyRoles ?? classifyDiscoveryRolesWithLuna;
+    this.#syncDeadlineMs = dependencies.syncDeadlineMs ?? DISCOVERY_SYNC_DEADLINE_MS;
+    if (
+      !Number.isSafeInteger(this.#syncDeadlineMs)
+      || this.#syncDeadlineMs < 1
+      || this.#syncDeadlineMs > MAX_CONFIGURED_SYNC_DEADLINE_MS
+    ) {
+      throw new Error("discovery synchronization deadline must be an integer from 1 to 3600000 milliseconds");
+    }
     if (dependencies.connectors.length > 100) {
       throw new Error("at most 100 discovery connectors may be configured");
     }
@@ -249,27 +267,72 @@ export class DiscoveryService {
 
   async #classifyItems(
     items: ConnectorResult["items"],
-    signal: AbortSignal,
-  ): Promise<readonly ClassifiedDiscoveredJobInput[]> {
-    if (items.length === 0) return [];
-    const classifications = await this.#classifyRoles(items.map((item) => ({
-      id: item.sourceItemId,
-      title: item.title,
-      company: item.company,
-      location: item.location ?? null,
-      description: item.description,
-    })), signal);
-    const rolesById = new Map(classifications.map(({ id, roles }) => [id, roles]));
-    if (
-      rolesById.size !== items.length
-      || items.some((item) => !rolesById.has(item.sourceItemId))
-    ) {
-      throw new Error("Discovery role classifier must return every source item exactly once");
+    workSignal: AbortSignal,
+    cancellationSignal: AbortSignal,
+    deadlineSignal: AbortSignal,
+    deadlineError: Error,
+  ): Promise<ClassifiedItemsResult> {
+    if (items.length === 0) return { items: [] };
+    const batches: Array<ConnectorResult["items"]> = [];
+    for (let offset = 0; offset < items.length; offset += DISCOVERY_ROLE_BATCH_SIZE) {
+      batches.push(items.slice(offset, offset + DISCOVERY_ROLE_BATCH_SIZE));
     }
-    return items.map((item) => ({
-      ...item,
-      roles: rolesById.get(item.sourceItemId)!,
-    }));
+    const classified = new Array<readonly ClassifiedDiscoveredJobInput[] | undefined>(batches.length);
+    const errors = new Array<unknown>(batches.length);
+    let nextBatch = 0;
+    const worker = async (): Promise<void> => {
+      while (nextBatch < batches.length) {
+        if (workSignal.aborted) {
+          cancellationSignal.throwIfAborted();
+          errors[nextBatch] = deadlineError;
+          nextBatch = batches.length;
+          return;
+        }
+        const batchIndex = nextBatch;
+        nextBatch += 1;
+        const batch = batches[batchIndex]!;
+        try {
+          const classifications = await abortable(
+            () => this.#classifyRoles(batch.map((item) => ({
+              id: item.sourceItemId,
+              title: item.title,
+              company: item.company,
+              location: item.location ?? null,
+              description: item.description,
+            })), workSignal),
+            workSignal,
+          );
+          const rolesById = new Map(classifications.map(({ id, roles }) => [id, roles]));
+          if (
+            classifications.length !== batch.length
+            || rolesById.size !== batch.length
+            || batch.some((item) => !rolesById.has(item.sourceItemId))
+          ) {
+            throw new Error("Discovery role classifier must return every source item exactly once");
+          }
+          classified[batchIndex] = batch.map((item) => ({
+            ...item,
+            roles: rolesById.get(item.sourceItemId)!,
+          }));
+        } catch (error) {
+          cancellationSignal.throwIfAborted();
+          errors[batchIndex] = deadlineSignal.aborted ? deadlineError : error;
+        }
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(DISCOVERY_ROLE_MAX_CONCURRENCY, batches.length) },
+      worker,
+    ));
+    const classifiedItems: ClassifiedDiscoveredJobInput[] = [];
+    for (const batch of classified) {
+      if (batch !== undefined) classifiedItems.push(...batch);
+    }
+    const error = errors.find((candidate) => candidate !== undefined);
+    return {
+      items: classifiedItems,
+      ...(error === undefined ? {} : { error }),
+    };
   }
 
   sync(signal: AbortSignal): Promise<DiscoverySyncResponse> {
@@ -316,11 +379,9 @@ export class DiscoveryService {
     try {
       signal.throwIfAborted();
       const cancellationSignal = AbortSignal.any([signal, this.#shutdown.signal]);
-      const connectorSignal = AbortSignal.any([
-        signal,
-        this.#shutdown.signal,
-        AbortSignal.timeout(MAX_SYNC_DURATION_MS),
-      ]);
+      const deadlineSignal = AbortSignal.timeout(this.#syncDeadlineMs);
+      const deadlineError = new Error(SYNC_TIMEOUT_MESSAGE);
+      const workSignal = AbortSignal.any([cancellationSignal, deadlineSignal]);
       const budget = new DiscoveryHttpBudget({
         maxRequests: MAX_SYNC_REQUESTS,
         maxBytes: MAX_SYNC_BYTES,
@@ -335,7 +396,7 @@ export class DiscoveryService {
           const connector = this.dependencies.connectors[index]!;
           pending[index] = await synchronizeConnector(
             connector,
-            connectorSignal,
+            workSignal,
             {
               findKnownItems: (candidates) =>
                 this.dependencies.repository.findActiveSourceItemKeys(connector.id, candidates),
@@ -366,7 +427,13 @@ export class DiscoveryService {
           kind: outcome.connector.kind,
         };
         if ("error" in outcome) {
-          this.dependencies.repository.recordSourceFailure(descriptor, outcome.error);
+          const sourceError = (
+            deadlineSignal.aborted
+            && (outcome.error === deadlineSignal.reason || outcome.error === workSignal.reason)
+          )
+            ? deadlineError
+            : outcome.error;
+          this.dependencies.repository.recordSourceFailure(descriptor, sourceError);
           sources.push({
             sourceId: outcome.connector.id,
             sourceName: outcome.connector.name,
@@ -377,48 +444,44 @@ export class DiscoveryService {
             updated: 0,
             closed: 0,
             descriptionUnavailable: 0,
-            error: publicSourceError(outcome.error),
+            error: publicSourceError(sourceError),
           });
           continue;
         }
-        try {
-          const items = await this.#classifyItems(outcome.result.items, cancellationSignal);
-          cancellationSignal.throwIfAborted();
-          const counts = this.dependencies.repository.reconcileSource({
-            ...descriptor,
-            items,
-            completeSnapshot: outcome.result.completeSnapshot,
-            ...(outcome.result.provenance === undefined
+        const classification = await this.#classifyItems(
+          outcome.result.items,
+          workSignal,
+          cancellationSignal,
+          deadlineSignal,
+          deadlineError,
+        );
+        cancellationSignal.throwIfAborted();
+        const failed = classification.error !== undefined;
+        const completeSnapshot = outcome.result.completeSnapshot && !failed;
+        const counts = this.dependencies.repository.reconcileSource({
+          ...descriptor,
+          items: classification.items,
+          completeSnapshot,
+          ...(outcome.result.provenance === undefined
+            ? {}
+            : { provenance: outcome.result.provenance }),
+          ...(failed ? { failure: classification.error } : {}),
+        });
+        sources.push({
+          sourceId: outcome.connector.id,
+          sourceName: outcome.connector.name,
+          status: failed ? "failed" : "succeeded",
+          completeSnapshot,
+          descriptionUnavailable: classification.items.filter(
+            ({ description }) => description === null,
+          ).length,
+          ...counts,
+          ...(failed
+            ? { error: publicSourceError(classification.error) }
+            : outcome.result.provenance === undefined
               ? {}
               : { provenance: outcome.result.provenance }),
-          });
-          sources.push({
-            sourceId: outcome.connector.id,
-            sourceName: outcome.connector.name,
-            status: "succeeded",
-            completeSnapshot: outcome.result.completeSnapshot,
-            descriptionUnavailable: outcome.result.descriptionUnavailable,
-            ...counts,
-            ...(outcome.result.provenance === undefined
-              ? {}
-              : { provenance: outcome.result.provenance }),
-          });
-        } catch (error) {
-          cancellationSignal.throwIfAborted();
-          this.dependencies.repository.recordSourceFailure(descriptor, error);
-          sources.push({
-            sourceId: outcome.connector.id,
-            sourceName: outcome.connector.name,
-            status: "failed",
-            completeSnapshot: false,
-            received: 0,
-            created: 0,
-            updated: 0,
-            closed: 0,
-            descriptionUnavailable: outcome.result.descriptionUnavailable,
-            error: publicSourceError(error),
-          });
-        }
+        });
       }
       const response: DiscoverySyncResponse = {
         sources,

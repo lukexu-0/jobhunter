@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { Database } from "bun:sqlite";
 import { createDiscoveryRoutes } from "../src/api/discovery-routes.ts";
 import { createApiHandler } from "../src/api/handler.ts";
@@ -240,6 +240,108 @@ describe("discovery synchronization", () => {
     });
     expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs)
       .toHaveLength(1);
+  });
+
+  test("retains successful classification batches when one batch fails", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database);
+    const classifiedBatchSizes: number[] = [];
+    const service = new DiscoveryService({
+      repository,
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      connectors: [connector("working", async () => ({
+        items: Array.from({ length: 16 }, (_, index) => input(`item-${index}`)),
+        completeSnapshot: true,
+      }))],
+      classifyRoles: async (jobs) => {
+        classifiedBatchSizes.push(jobs.length);
+        if (jobs.some(({ id }) => id === "item-15")) {
+          throw new Error("one role batch failed");
+        }
+        return jobs.map((job) => ({
+          id: job.id,
+          roles: ["software_engineering"] as const,
+        }));
+      },
+    });
+
+    const result = await service.sync(new AbortController().signal);
+
+    expect(classifiedBatchSizes.sort((left, right) => left - right)).toEqual([1, 15]);
+    expect(result.sources[0]).toMatchObject({
+      status: "failed",
+      completeSnapshot: false,
+      received: 15,
+      created: 15,
+      closed: 0,
+    });
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(15);
+  });
+
+  test("returns partial source results when the synchronization deadline expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const database = openPipelineDatabase(":memory:");
+      databases.push(database);
+      const repository = new DiscoveryRepository(database);
+      const controller = new AbortController();
+      const classificationBlocked = Promise.withResolvers<void>();
+      const classificationCompleted = Promise.withResolvers<void>();
+      const service = new DiscoveryService({
+        repository,
+        runs: {
+          createRunFromDescription: async () => run("unused"),
+          kick: () => undefined,
+        },
+        connectors: [connector("working", async () => ({
+          items: Array.from({ length: 16 }, (_, index) => input(`item-${index}`)),
+          completeSnapshot: true,
+        }))],
+        classifyRoles: async (jobs) => {
+          if (jobs.some(({ id }) => id === "item-15")) {
+            classificationBlocked.resolve();
+            return new Promise<never>(() => undefined);
+          }
+          const classifications = jobs.map((job) => ({
+            id: job.id,
+            roles: ["software_engineering"] as const,
+          }));
+          classificationCompleted.resolve();
+          return classifications;
+        },
+        syncDeadlineMs: 20,
+      });
+      const syncing = service.sync(controller.signal);
+      const missedDeadline = Symbol("missed discovery deadline");
+      const deadlineGuard = Promise.withResolvers<typeof missedDeadline>();
+      setTimeout(() => deadlineGuard.resolve(missedDeadline), 21);
+      await Promise.all([classificationBlocked.promise, classificationCompleted.promise]);
+      vi.advanceTimersByTime(21);
+      const observed = await Promise.race([syncing, deadlineGuard.promise]);
+      if (observed === missedDeadline) {
+        const cleanupReason = new Error("deadline test cleanup");
+        controller.abort(cleanupReason);
+        await expect(syncing).rejects.toBe(cleanupReason);
+      }
+
+      expect(observed).not.toBe(missedDeadline);
+      if (observed === missedDeadline) return;
+      expect(observed.sources[0]).toMatchObject({
+        status: "failed",
+        completeSnapshot: false,
+        received: 15,
+        created: 15,
+        closed: 0,
+        error: "Discovery synchronization timed out",
+      });
+      expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).total).toBe(15);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("propagates cancellation during role classification without recording a source failure", async () => {

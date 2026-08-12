@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { APPLICATION_AGENT_PATH } from "../src/api/application-agent-routes";
+import { DISCOVERY_SYNC_PATH } from "../src/api/discovery-routes";
 import { resolvePipelinePort, startPipelineHttpServer } from "../src/index";
 
 test("pipeline port accepts the isolated development port", () => {
@@ -24,9 +25,15 @@ test("only long-lived application routes disable Bun's default idle timeout", as
     { port: 0 },
   );
   try {
-    const [agentRequest, eventRequest, unrelatedRequest] = await Promise.allSettled([
+    const [
+      agentRequest,
+      eventRequest,
+      discoverySyncRequest,
+      unrelatedRequest,
+    ] = await Promise.allSettled([
       fetch(`http://127.0.0.1:${server.port}${APPLICATION_AGENT_PATH}`, { method: "POST" }),
       fetch(`http://127.0.0.1:${server.port}/v1/runs/run-1/application/events`),
+      fetch(`http://127.0.0.1:${server.port}${DISCOVERY_SYNC_PATH}`, { method: "POST" }),
       fetch(`http://127.0.0.1:${server.port}/long-running-unrelated-request`),
     ]);
 
@@ -39,6 +46,11 @@ test("only long-lived application routes disable Bun's default idle timeout", as
     if (eventRequest.status === "fulfilled") {
       expect(eventRequest.value.status).toBe(200);
       expect(await eventRequest.value.text()).toBe("completed");
+    }
+    expect(discoverySyncRequest.status).toBe("fulfilled");
+    if (discoverySyncRequest.status === "fulfilled") {
+      expect(discoverySyncRequest.value.status).toBe(200);
+      expect(await discoverySyncRequest.value.text()).toBe("completed");
     }
     expect(unrelatedRequest.status).toBe("rejected");
   } finally {
