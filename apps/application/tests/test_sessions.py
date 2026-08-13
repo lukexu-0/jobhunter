@@ -5288,8 +5288,10 @@ async def test_terminal_cleanup_cancels_active_runtime_action_before_playwright_
     assert all(event.event != "agent_step" for event in events)
 
 
+@pytest.mark.parametrize("opportunity_kind", ["hackathon", "networking_event"])
 async def test_full_application_agent_receives_one_session_scoped_run_request(
     tmp_path: Path,
+    opportunity_kind: OpportunityKind,
 ) -> None:
     cancelled = cancelled_result()
     fakes = Fakes(agent_result=cancelled)
@@ -5326,7 +5328,7 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
         ),
     )
 
-    created = await create_valid(manager, opportunity_kind="hackathon")
+    created = await create_valid(manager, opportunity_kind=opportunity_kind)
     record = manager._active
     assert record is not None
     assert record.human_gate is not None
@@ -5346,8 +5348,8 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     assert call["runtime_url"] == "http://127.0.0.1:8765"
     task = json.loads(call["task"])
     assert task["job"]["url"] == JOB_URL
-    assert call["opportunity_kind"] == "hackathon"
-    assert task["job"]["opportunity_kind"] == "hackathon"
+    assert call["opportunity_kind"] == opportunity_kind
+    assert task["job"]["opportunity_kind"] == opportunity_kind
     assert "opportunity_kind" not in manager.get_snapshot(
         created.session_id
     ).model_dump(mode="json")

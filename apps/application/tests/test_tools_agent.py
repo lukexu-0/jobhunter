@@ -1465,7 +1465,7 @@ def test_task_is_exact_compact_data_envelope_for_current_application(
 
 @pytest.mark.parametrize(
     "opportunity_kind",
-    ["job", "hackathon", "competition", "event"],
+    ["job", "hackathon", "competition", "event", "networking_event"],
 )
 def test_task_carries_every_opportunity_kind_inside_private_job_envelope(
     tmp_path: Path,

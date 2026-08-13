@@ -17,6 +17,7 @@ const EXPECTED_ICONS = {
   hackathon: Code2,
   competition: Trophy,
   event: CalendarDays,
+  networking_event: CalendarDays,
 } as const;
 
 function run(opportunityKind: RunDto["opportunityKind"]): RunDto {
@@ -63,6 +64,21 @@ describe("opportunity-kind presentation", () => {
       dashboardTitleFallback: null,
       dashboardOrganizationFallback: null,
     });
+
+    const networkingEvent = opportunityPresentation("networking_event");
+    expect(networkingEvent).toMatchObject({
+      detailKindLabel: "Networking event",
+      summaryLabel: "Networking event summary and keyword comparison",
+      titleFallback: "Networking event",
+      organizationFallback: "Organizer unavailable",
+      linkLabel: "View networking event details",
+      openNamedPrefix: "Open networking event",
+      openFallbackLabel: "Open networking event",
+      dashboardTitleFallback: "Details unavailable",
+      dashboardOrganizationFallback: "Organizer unavailable",
+    });
+    expect(networkingEvent.icon).toBe(CalendarDays);
+    expect(networkingEvent.icon).toBe(opportunityPresentation("event").icon);
 
     for (const kind of OpportunityKindSchema.options) {
       if (kind === "job") continue;
@@ -123,6 +139,31 @@ describe("opportunity-kind presentation", () => {
     expect(dashboardMarkup).not.toContain("Event · ");
     expect(dashboardMarkup).not.toContain("Event. ");
     expect(dashboardMarkup).toContain('aria-label="Open event Details unavailable event-run"');
+    expect(dashboardMarkup).not.toContain("Open application");
+  });
+
+  test("renders a networking event with kind-aware accessible identity and no visible prefix", () => {
+    const networkingEventRun = run("networking_event");
+    const detailMarkup = renderToStaticMarkup(
+      <RunIdentitySummary identity={null} run={networkingEventRun} />,
+    );
+    const dashboardMarkup = renderToStaticMarkup(
+      <RunIdentityLink identity={{}} run={networkingEventRun} />,
+    );
+
+    expect(detailMarkup).toContain("Networking event</p>");
+    expect(detailMarkup).toContain(">Networking event</h1>");
+    expect(detailMarkup).toContain("Organizer unavailable");
+    expect(detailMarkup).toContain("View networking event details");
+    expect(detailMarkup).toContain('href="https://example.test/networking_event"');
+    expect(detailMarkup).not.toContain("View event details");
+
+    expect(dashboardMarkup).toContain("Details unavailable");
+    expect(dashboardMarkup).not.toContain("Networking event · ");
+    expect(dashboardMarkup).not.toContain("Networking event. ");
+    expect(dashboardMarkup).toContain(
+      'aria-label="Open networking event Details unavailable networki…-run"',
+    );
     expect(dashboardMarkup).not.toContain("Open application");
   });
 

@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 25;
+export const PIPELINE_SCHEMA_VERSION = 26;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -959,7 +959,32 @@ CREATE INDEX discovery_jobs_recency
   ON discovery_jobs(closed, coalesce(posted_at, first_seen_at) DESC, id);
 `;
 
+const previousOpportunityKindCheck =
+  /CHECK\s*\(\s*opportunity_kind\s+IN\s*\(\s*'job'\s*,\s*'hackathon'\s*,\s*'competition'\s*,\s*'event'\s*\)\s*\)/i;
+const networkingEventOpportunityKindCheck =
+  /CHECK\s*\(\s*opportunity_kind\s+IN\s*\(\s*'job'\s*,\s*'hackathon'\s*,\s*'competition'\s*,\s*'event'\s*,\s*'networking_event'\s*\)\s*\)/i;
 
+function migrateNetworkingEventOpportunityKind(db: Database): void {
+  const runsSql = db.query<{ sql: string | null }, []>(
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+  ).get()?.sql;
+  if (runsSql && networkingEventOpportunityKindCheck.test(runsSql)) return;
+  if (
+    !runsSql
+    || !previousOpportunityKindCheck.test(runsSql)
+    || !runsTableDeclaration.test(runsSql)
+  ) {
+    throw new Error("runs opportunity_kind constraint does not match schema version 25");
+  }
+
+  const upgradedRunsSql = runsSql
+    .replace(runsTableDeclaration, "CREATE TABLE runs_pending_migration")
+    .replace(
+      previousOpportunityKindCheck,
+      "CHECK (opportunity_kind IN ('job','hackathon','competition','event','networking_event'))",
+    );
+  replaceRunsTable(db, upgradedRunsSql);
+}
 
 function hasOpportunityKindColumn(db: Database): boolean {
   return db.query<{ name: string }, []>("PRAGMA table_info(runs)")
@@ -1094,6 +1119,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 25) {
         db.exec(migration25);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(25, now);
+      }
+      if (version < 26) {
+        migrateNetworkingEventOpportunityKind(db);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(26, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

@@ -1141,7 +1141,7 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
 
 @pytest.mark.parametrize(
     "opportunity_kind",
-    ["job", "hackathon", "competition", "event"],
+    ["job", "hackathon", "competition", "event", "networking_event"],
 )
 async def test_multipart_propagates_every_valid_opportunity_kind(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],

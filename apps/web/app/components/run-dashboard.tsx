@@ -815,6 +815,7 @@ export function RunDashboard() {
             <option value="hackathon">Hackathon</option>
             <option value="competition">Competition</option>
             <option value="event">Event</option>
+            <option value="networking_event">Networking event</option>
           </select>
         </label>
 

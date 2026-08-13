@@ -33,6 +33,7 @@ import { PipelineRepository, type ActiveStage } from "../src/db/repository.ts";
 import type { LoadedContextManifest } from "../src/context/manifest.ts";
 import { ArtifactStore } from "../src/system/artifacts.ts";
 import {
+  type OpportunityKind,
   ResumeIterationDtoSchema,
   ResumeIterationListResponseSchema,
   RunDtoSchema,
@@ -304,23 +305,23 @@ describe("RunApplicationService", () => {
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
     expect(target.repository.acquire()?.runId).toBe(run.id);
   });
-  test("treats an explicit hackathon kind as authoritative over deterministic source inference", async () => {
-    const projectSubmission = [
-      "Climate resilience project submission",
-      "This prototype uses open data to help communities prepare for extreme weather events.",
+  test("persists and returns an explicit networking event kind over deterministic source inference", async () => {
+    const eventDescription = [
+      "Platform engineering networking evening",
+      "Meet infrastructure engineers and discuss reliable systems over structured small-group sessions.",
     ].join("\n");
     const target = fixture({
       loadJobSource: async () => ({
         kind: "description",
         opportunityKind: "job",
-        jobDescription: projectSubmission,
+        jobDescription: eventDescription,
       }),
     });
 
-    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "hackathon");
+    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "networking_event");
 
-    expect(run.opportunityKind).toBe("hackathon");
-    expect(target.repository.getRun(run.id)?.opportunityKind).toBe("hackathon");
+    expect(run.opportunityKind).toBe("networking_event");
+    expect(target.repository.getRun(run.id)?.opportunityKind).toBe("networking_event");
     expect(target.repository.getArtifact(run.id, "job-description")).not.toBeNull();
   });
 
@@ -559,12 +560,12 @@ describe("RunApplicationService", () => {
       loader?: {
         jobUrl: string;
         signal: AbortSignal | undefined;
-        opportunityKindHint: "job" | "hackathon" | "competition" | "event" | undefined;
+        opportunityKindHint: OpportunityKind | undefined;
       };
       extractor?: {
         lines: readonly string[];
         signal: AbortSignal | undefined;
-        opportunityKindHint: "job" | "hackathon" | "competition" | "event" | undefined;
+        opportunityKindHint: OpportunityKind | undefined;
       };
     } = {};
     const target = fixture({
@@ -597,16 +598,16 @@ describe("RunApplicationService", () => {
     expect(run.opportunityKind).toBe("competition");
   });
 
-  test("keeps an explicit hackathon kind authoritative through model-fallback extraction", async () => {
+  test("keeps an explicit networking event kind authoritative through model-fallback extraction", async () => {
     const lines = [
-      "Senior Platform Engineer",
+      "Platform Engineering Networking Evening",
       "Example Systems",
-      "Own reliable TypeScript services and production delivery.",
+      "Meet engineers working on reliable TypeScript services and production delivery.",
     ] as const;
     const selected = `${lines[0]}\n\n${lines[2]}`;
     const observed: {
-      loaderHint: "job" | "hackathon" | "competition" | "event" | undefined;
-      extractorHint: "job" | "hackathon" | "competition" | "event" | undefined;
+      loaderHint: OpportunityKind | undefined;
+      extractorHint: OpportunityKind | undefined;
     } = { loaderHint: undefined, extractorHint: undefined };
     const target = fixture({
       loadJobSource: async (_jobUrl, _signal, opportunityKindHint) => {
@@ -619,14 +620,14 @@ describe("RunApplicationService", () => {
       },
     });
 
-    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "hackathon");
+    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "networking_event");
 
     expect(observed).toEqual({
-      loaderHint: "hackathon",
-      extractorHint: "hackathon",
+      loaderHint: "networking_event",
+      extractorHint: "networking_event",
     });
-    expect(run.opportunityKind).toBe("hackathon");
-    expect(target.repository.getRun(run.id)?.opportunityKind).toBe("hackathon");
+    expect(run.opportunityKind).toBe("networking_event");
+    expect(target.repository.getRun(run.id)?.opportunityKind).toBe("networking_event");
   });
 
   test("bubbles loader failures and maps only fixed fallback failures before persistence", async () => {

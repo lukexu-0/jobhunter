@@ -445,6 +445,16 @@ describe("application agent", () => {
         autoSubmit: true,
         expectedInstructions: EXPECTED_NON_JOB_AUTO_SUBMIT_AGENT_INSTRUCTIONS,
       },
+      {
+        opportunityKind: "networking_event",
+        autoSubmit: false,
+        expectedInstructions: EXPECTED_NON_JOB_HUMAN_REVIEW_AGENT_INSTRUCTIONS,
+      },
+      {
+        opportunityKind: "networking_event",
+        autoSubmit: true,
+        expectedInstructions: EXPECTED_NON_JOB_AUTO_SUBMIT_AGENT_INSTRUCTIONS,
+      },
     ] as const;
 
     for (const { opportunityKind, autoSubmit, expectedInstructions } of cases) {
