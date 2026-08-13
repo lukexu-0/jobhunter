@@ -637,28 +637,6 @@ export function RunDashboard() {
     setCreateError(null);
     setCreateSuccess(null);
 
-    if (requests.length === 1) {
-      const request = requests[0]!;
-      try {
-        const run = await createRun(
-          request.jobUrl,
-          request.generateKeywordMap,
-          request.skipReview,
-          request.autoSubmit,
-          request.opportunityKind,
-        );
-        setJobUrl("");
-        setOpportunityKind("auto");
-        setSkipReview(false);
-        setAutoSubmit(false);
-        router.push(`/runs/${encodeURIComponent(run.id)}`);
-      } catch (error) {
-        setCreateError(publicMessage(error, "The opportunity could not be initialized. Try again."));
-        setIsCreating(false);
-      }
-      return;
-    }
-
     const results = await mapWithConcurrency(
       requests,
       MAX_CONCURRENT_RUN_CREATIONS,
@@ -698,10 +676,17 @@ export function RunDashboard() {
       setOpportunityKind("auto");
       setSkipReview(false);
       setAutoSubmit(false);
-      setCreateSuccess(`${successfulRuns.length} applications initialized.`);
+      const applicationLabel = successfulRuns.length === 1 ? "application" : "applications";
+      setCreateSuccess(`${successfulRuns.length} ${applicationLabel} initialized.`);
     } else {
-      setJobUrl(failures.map(({ request }) => request.jobUrl).join(", "));
-      setCreateError(batchFailureMessage(successfulRuns.length, results.length, failures[0]!.error));
+      if (requests.length > 1) {
+        setJobUrl(failures.map(({ request }) => request.jobUrl).join(", "));
+      }
+      setCreateError(
+        requests.length === 1
+          ? publicMessage(failures[0]!.error, "The opportunity could not be initialized. Try again.")
+          : batchFailureMessage(successfulRuns.length, results.length, failures[0]!.error),
+      );
     }
     setIsCreating(false);
   };

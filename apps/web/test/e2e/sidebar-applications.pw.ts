@@ -537,23 +537,33 @@ test("uses shared request eligibility and remains usable without overflow", asyn
 });
 
 
-test("omits the Auto-detect opportunity type, posts selected run options, and navigates on success", async ({ page }) => {
+test("omits the Auto-detect opportunity type, posts selected run options, and queues on the dashboard", async ({ page }) => {
   const initializedRun = {
-    ...runFixture("initialized-run", "applied", "failed"),
+    ...runFixture("initialized-run", "pending", "queued"),
+    jobUrl: "https://jobs.example.test/roles/123?source=ui",
     skipReview: true,
     autoSubmit: true,
   };
   let postedBody: string | null = null;
   let pendingPost: Route | undefined;
+  let pendingListRefresh: Route | undefined;
+  let listRequestCount = 0;
   const { promise: postStarted, resolve: markPostStarted } = Promise.withResolvers<void>();
+  const { promise: listRefreshStarted, resolve: markListRefreshStarted } = Promise.withResolvers<void>();
 
   await page.route("**/api/pipeline/runs", async (route) => {
     const request = route.request();
     if (request.method() === "GET") {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ runs: [] }),
-      });
+      listRequestCount += 1;
+      if (listRequestCount === 1) {
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({ runs: [] }),
+        });
+      } else {
+        pendingListRefresh = route;
+        markListRefreshStarted();
+      }
       return;
     }
 
@@ -563,7 +573,6 @@ test("omits the Auto-detect opportunity type, posts selected run options, and na
     pendingPost = route;
     markPostStarted();
   });
-  await interceptDocumentRun(page, initializedRun);
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
@@ -600,8 +609,22 @@ test("omits the Auto-detect opportunity type, posts selected run options, and na
     body: JSON.stringify(initializedRun),
   });
 
-  await expect(page).toHaveURL(/\/runs\/initialized-run$/);
-  await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
+  await listRefreshStarted;
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByRole("status")).toHaveText("1 application initialized.");
+  await expect(input).toHaveValue("");
+  await expect(opportunityType).toHaveValue("auto");
+  await expect(skipReview).not.toBeChecked();
+  await expect(autoSubmit).not.toBeChecked();
+  await expect(page.locator(`tbody a.application-link[href="/runs/${initializedRun.id}"]`)).toBeVisible();
+  await expect(page.locator(".applications-total")).toHaveText("1");
+
+  if (!pendingListRefresh) throw new Error("Application list refresh was not intercepted");
+  await pendingListRefresh.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ runs: [initializedRun] }),
+  });
+  await expect(page.locator(`tbody a.application-link[href="/runs/${initializedRun.id}"]`)).toBeVisible();
 });
 
 test("preserves both run options while confirming a duplicate canonical URL", async ({ page }) => {
@@ -611,15 +634,22 @@ test("preserves both run options while confirming a duplicate canonical URL", as
     ...runFixture("existing-duplicate-run", "applied", "failed"),
     jobUrl: canonicalJobUrl,
   };
-  const initializedRun = runFixture("duplicate-initialized-run", "applied", "failed");
+  const initializedRun: RunDto = {
+    ...runFixture("duplicate-initialized-run", "pending", "queued"),
+    jobUrl: canonicalJobUrl,
+  };
   const postedPayloads: unknown[] = [];
+  let listRequestCount = 0;
 
   await page.route("**/api/pipeline/runs", async (route) => {
     const request = route.request();
     if (request.method() === "GET") {
+      listRequestCount += 1;
       await route.fulfill({
         contentType: "application/json",
-        body: JSON.stringify({ runs: [existingRun] }),
+        body: JSON.stringify({
+          runs: listRequestCount === 1 ? [existingRun] : [initializedRun, existingRun],
+        }),
       });
       return;
     }
@@ -632,7 +662,6 @@ test("preserves both run options while confirming a duplicate canonical URL", as
       body: JSON.stringify(initializedRun),
     });
   });
-  await interceptDocumentRun(page, initializedRun);
   await page.goto("/");
 
   const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
@@ -676,8 +705,9 @@ test("preserves both run options while confirming a duplicate canonical URL", as
   await initialize.click();
   await dialog.getByRole("button", { name: "Initialize anyway" }).click();
 
-  await expect(page).toHaveURL(/\/runs\/duplicate-initialized-run$/);
-  await expect(page.getByRole("heading", { name: "Application", exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByRole("status")).toHaveText("1 application initialized.");
+  await expect(page.locator(`tbody a.application-link[href="/runs/${initializedRun.id}"]`)).toBeVisible();
   expect(postedPayloads).toEqual([{
     jobUrl: canonicalJobUrl,
     generateKeywordMap: true,
@@ -1171,6 +1201,13 @@ test("retains the URL, opportunity type, and independently selected run options 
   const alert = page.locator("#job-url-error");
   await expect(alert).toHaveAttribute("id", "job-url-error");
   await expect(alert).toHaveText("The page does not contain a usable opportunity description");
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByRole("heading", { name: "Applications", exact: true })).toBeVisible();
+  await expect(alert).toHaveCSS("color", "rgb(239, 138, 130)");
+  const initializeBox = await page.getByRole("button", { name: "Initialize" }).boundingBox();
+  const alertBox = await alert.boundingBox();
+  if (!initializeBox || !alertBox) throw new Error("Initializer feedback geometry is unavailable");
+  expect(alertBox.y).toBeGreaterThanOrEqual(initializeBox.y + initializeBox.height);
   await expect(input).toHaveValue(submittedUrl);
   await expect(input).toBeEnabled();
   await expect(opportunityType).toHaveValue("hackathon");
