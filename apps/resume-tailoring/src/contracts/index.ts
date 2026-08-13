@@ -1230,6 +1230,16 @@ export const DiscoveryStatusSchema = z.enum(["open", "queued", "closed"]);
 export type DiscoveryStatus = z.infer<typeof DiscoveryStatusSchema>;
 export const DiscoveryListStatusSchema = z.enum(["open", "queued", "closed", "all"]);
 
+export const DiscoverySeasonSchema = z.enum([
+  "spring",
+  "summer",
+  "fall",
+  "winter",
+  "off_season",
+  "unspecified",
+]);
+export type DiscoverySeason = z.infer<typeof DiscoverySeasonSchema>;
+
 const DiscoveryHttpUrlSchema = z.string().max(JOB_URL_MAX_CHARS).url().refine((value) => {
   try {
     const url = new URL(value);
@@ -1250,6 +1260,8 @@ export const DiscoveryJobSchema = z.object({
   company: DiscoveryDisplayTextSchema,
   location: z.string().trim().min(1).max(500).nullable(),
   roles: DiscoveryRolesSchema,
+  suitable: z.boolean(),
+  season: DiscoverySeasonSchema,
   canonicalUrl: DiscoveryHttpUrlSchema,
   applyUrl: DiscoveryHttpUrlSchema,
   descriptionPreview: z.string().max(500).nullable(),
@@ -1266,11 +1278,16 @@ export type DiscoveryJob = z.infer<typeof DiscoveryJobSchema>;
 
 export const DISCOVERY_LIST_MAX_OFFSET = 1_000_000;
 
+export const DiscoverySortSchema = z.enum(["recency", "source"]);
+export type DiscoverySort = z.infer<typeof DiscoverySortSchema>;
+
 export const DiscoveryListRequestSchema = z.object({
   role: DiscoveryRoleSchema.optional(),
   maxAgeDays: z.number().int().min(1).max(365).nullable().default(7),
   status: DiscoveryListStatusSchema.default("open"),
+  hideQueued: z.boolean().default(false),
   search: z.string().trim().max(200).default(""),
+  sort: DiscoverySortSchema.default("recency"),
   limit: z.number().int().min(1).max(1_000).default(100),
   offset: z.number().int().min(0).max(DISCOVERY_LIST_MAX_OFFSET).default(0),
 }).strict();

@@ -16,6 +16,8 @@ const job = {
   company: "Example",
   location: "Toronto, ON",
   roles: ["software_engineering", "machine_learning"],
+  suitable: true,
+  season: "summer",
   canonicalUrl: "https://jobs.example.test/roles/123",
   applyUrl: "https://jobs.example.test/roles/123/apply",
   descriptionPreview: "Build production software with the platform team.",
@@ -50,10 +52,18 @@ describe("discovery HTTP contracts", () => {
     }).success).toBeFalse();
   });
 
-  test("bounds list offsets with the shared exported maximum", () => {
+  test("bounds list offsets and applies shared request defaults", () => {
     expect(DiscoveryListRequestSchema.parse({
       offset: DISCOVERY_LIST_MAX_OFFSET,
-    }).offset).toBe(DISCOVERY_LIST_MAX_OFFSET);
+    })).toEqual({
+      maxAgeDays: 7,
+      status: "open",
+      hideQueued: false,
+      search: "",
+      sort: "recency",
+      limit: 100,
+      offset: DISCOVERY_LIST_MAX_OFFSET,
+    });
     expect(DiscoveryListRequestSchema.safeParse({
       offset: DISCOVERY_LIST_MAX_OFFSET + 1,
     }).success).toBeFalse();

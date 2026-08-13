@@ -53,6 +53,7 @@ export interface DiscoveryConnectorSyncContext {
 
 export interface ClassifiedDiscoveredJobInput extends DiscoveredJobInput {
   readonly roles: readonly DiscoveryRole[];
+  readonly suitable: boolean;
 }
 
 export interface DiscoverySyncResult {

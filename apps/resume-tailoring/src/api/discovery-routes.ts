@@ -25,8 +25,10 @@ const LIST_PARAMETERS: Readonly<Record<string, true>> = {
   role: true,
   maxAgeDays: true,
   status: true,
+  hideQueued: true,
   search: true,
   limit: true,
+  sort: true,
   offset: true,
 };
 
@@ -105,11 +107,17 @@ function parseListRequest(url: URL): DiscoveryListRequest | undefined {
   }
   const role = url.searchParams.get("role");
   const status = url.searchParams.get("status");
+  const hideQueued = url.searchParams.get("hideQueued");
+  const sort = url.searchParams.get("sort");
   const search = url.searchParams.get("search");
   const maxAgeDays = url.searchParams.get("maxAgeDays");
   const parsed = DiscoveryListRequestSchema.safeParse({
     ...(role === null ? {} : { role }),
     ...(status === null ? {} : { status }),
+    ...(hideQueued === null
+      ? {}
+      : { hideQueued: hideQueued === "true" ? true : hideQueued === "false" ? false : hideQueued }),
+    ...(sort === null ? {} : { sort }),
     ...(search === null ? {} : { search }),
     ...(maxAgeDays === null
       ? {}

@@ -4,6 +4,7 @@ import {
   DiscoveryRolesSchema,
   JobDescriptionSchema,
   type DiscoveryJob,
+  type DiscoverySeason,
   type DiscoveryListRequest,
 } from "../contracts/index.ts";
 import {
@@ -25,6 +26,7 @@ interface DiscoveryJobRow {
   company: string;
   location: string | null;
   roles: string;
+  suitable: 0 | 1;
   canonical_url: string;
   apply_url: string;
   description: string | null;
@@ -91,6 +93,47 @@ const DAY_MS = 86_400_000;
 const MAX_ACTIVE_SOURCE_ITEM_CANDIDATES = 10_000;
 const ACTIVE_SOURCE_ITEM_QUERY_BATCH_SIZE = 400;
 
+type NamedDiscoverySeason = Exclude<DiscoverySeason, "off_season" | "unspecified">;
+const NAMED_SEASON_PATTERNS: ReadonlyArray<
+  readonly [NamedDiscoverySeason, RegExp]
+> = [
+  ["spring", /\bspring\b/i],
+  ["summer", /\bsummer\b/i],
+  ["fall", /\bfall\b/i],
+  ["winter", /\bwinter\b/i],
+];
+const OFF_SEASON_SOURCE_PATTERN = /\boff(?:-|\s+)season\b/i;
+
+function namedSeason(text: string): NamedDiscoverySeason | undefined {
+  let matched: { readonly season: NamedDiscoverySeason; readonly index: number } | undefined;
+  for (const [season, pattern] of NAMED_SEASON_PATTERNS) {
+    const index = text.search(pattern);
+    if (index !== -1 && (matched === undefined || index < matched.index)) {
+      matched = { season, index };
+    }
+  }
+  return matched?.season;
+}
+
+function discoverySeason(
+  title: string,
+  description: string | null,
+  sourceNames: readonly string[],
+): DiscoverySeason {
+  const titleSeason = namedSeason(title);
+  if (titleSeason !== undefined) return titleSeason;
+  if (description !== null) {
+    const descriptionSeason = namedSeason(description);
+    if (descriptionSeason !== undefined) return descriptionSeason;
+  }
+  if (sourceNames.some((name) => OFF_SEASON_SOURCE_PATTERN.test(name))) return "off_season";
+  for (const sourceName of sourceNames) {
+    const sourceSeason = namedSeason(sourceName);
+    if (sourceSeason !== undefined) return sourceSeason;
+  }
+  return "unspecified";
+}
+
 function descriptionPreview(description: string | null): string | null {
   if (description === null) return null;
   const compact = description.replace(/\s+/g, " ").trim();
@@ -120,9 +163,13 @@ function publicJob(row: DiscoveryJobRow): DiscoveryJob {
     company: row.company,
     location: row.location,
     roles,
+    suitable: row.suitable === 1,
+    season: discoverySeason(row.title, row.description, sourceNames),
     canonicalUrl: row.canonical_url,
     applyUrl: row.apply_url,
-    descriptionPreview: descriptionPreview(row.description),
+    descriptionPreview: descriptionPreview(
+      row.description === null ? null : row.description.slice(0, 501),
+    ),
     queueable: status === "open" && row.description !== null,
     postedAt: row.posted_at,
     firstSeenAt: row.first_seen_at,
@@ -399,6 +446,9 @@ export class DiscoveryRepository {
         const description = JobDescriptionSchema.nullable().parse(rawItem.description);
         const location = rawItem.location?.trim() || null;
         const roles = DiscoveryRolesSchema.parse(rawItem.roles);
+        if (typeof rawItem.suitable !== "boolean") {
+          throw new Error("discovery suitability must be a boolean");
+        }
         const item = { ...rawItem, canonicalUrl, applyUrl, location };
         const keys = discoveryDedupeKeys(item);
         const candidates = this.#candidateRows(input.id, rawItem.sourceItemId, keys);
@@ -408,9 +458,9 @@ export class DiscoveryRepository {
           this.database.query(`
             INSERT INTO discovery_jobs(
               id, catalog_source_id, catalog_source_item_id,
-              title, company, location, canonical_url, apply_url,
+              title, company, location, suitable, canonical_url, apply_url,
               description, posted_at, first_seen_at, last_seen_at, closed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
           `).run(
             jobId,
             input.id,
@@ -418,6 +468,7 @@ export class DiscoveryRepository {
             rawItem.title.trim(),
             rawItem.company.trim(),
             location,
+            rawItem.suitable ? 1 : 0,
             canonicalUrl,
             applyUrl,
             description,
@@ -449,7 +500,7 @@ export class DiscoveryRepository {
           ) {
             this.database.query(`
               UPDATE discovery_jobs
-              SET title = ?, company = ?, location = ?,
+              SET title = ?, company = ?, location = ?, suitable = ?,
                   canonical_url = ?, apply_url = ?,
                   posted_at = CASE
                     WHEN posted_at IS NULL THEN ?
@@ -461,6 +512,7 @@ export class DiscoveryRepository {
               rawItem.title.trim(),
               rawItem.company.trim(),
               location,
+              rawItem.suitable ? 1 : 0,
               canonicalUrl,
               applyUrl,
               rawItem.postedAt ?? null,
@@ -547,7 +599,9 @@ export class DiscoveryRepository {
       where.push("coalesce(jobs.posted_at, jobs.first_seen_at) >= ?");
       parameters.push(this.#now() - options.maxAgeDays * DAY_MS);
     }
-    if (options.status !== "all") {
+    if (options.status === "all") {
+      if (options.hideQueued) where.push("links.run_id IS NULL");
+    } else {
       if (options.status === "queued") where.push("links.run_id IS NOT NULL");
       if (options.status === "open") where.push("links.run_id IS NULL AND jobs.closed = 0");
       if (options.status === "closed") where.push("links.run_id IS NULL AND jobs.closed = 1");
@@ -563,6 +617,10 @@ export class DiscoveryRepository {
       const pattern = `%${escaped}%`;
       parameters.push(pattern, pattern, pattern, pattern);
     }
+    const orderByClause = options.sort === "source"
+      ? `catalog_source.name COLLATE NOCASE, catalog_source.id,
+        coalesce(jobs.posted_at, jobs.first_seen_at) DESC, jobs.id`
+      : "coalesce(jobs.posted_at, jobs.first_seen_at) DESC, jobs.id";
     const clause = where.length === 0 ? "" : `WHERE ${where.join(" AND ")}`;
     const total = this.database.query<{ total: number }, Array<string | number>>(`
       SELECT count(*) AS total
@@ -572,9 +630,9 @@ export class DiscoveryRepository {
     `).get(...parameters)?.total ?? 0;
     const rows = this.database.query<DiscoveryJobRow, Array<string | number>>(`
       SELECT
-        jobs.id, jobs.title, jobs.company, jobs.location,
+        jobs.id, jobs.title, jobs.company, jobs.location, jobs.suitable,
         jobs.canonical_url, jobs.apply_url,
-        substr(jobs.description, 1, 501) AS description,
+        jobs.description,
         jobs.posted_at, jobs.first_seen_at, jobs.last_seen_at, jobs.closed,
         links.run_id,
         coalesce((
@@ -607,8 +665,9 @@ export class DiscoveryRepository {
         ), '[]') AS source_names
       FROM discovery_jobs jobs
       LEFT JOIN discovery_run_links links ON links.job_id = jobs.id
+      JOIN discovery_sources catalog_source ON catalog_source.id = jobs.catalog_source_id
       ${clause}
-      ORDER BY coalesce(jobs.posted_at, jobs.first_seen_at) DESC, jobs.id
+      ORDER BY ${orderByClause}
       LIMIT ? OFFSET ?
     `).all(...parameters, options.limit, options.offset);
     const lastSyncAt = this.database.query<{ value: number | null }, []>(

@@ -58,6 +58,7 @@ const ToolArgumentsSchema = z.object({
   classifications: z.array(z.object({
     id: z.string().trim().min(1).max(500),
     roles: RoleSetSchema,
+    suitable: z.boolean(),
   }).strict()).min(1).max(DISCOVERY_ROLE_BATCH_SIZE),
 }).strict();
 
@@ -68,6 +69,8 @@ const ROLE_TOOL: Tool = {
     "Classify every supplied internship into one or more role families and return exactly one classification for every id.",
     "Choose software_engineering for software, web, mobile, cloud, platform, infrastructure, developer, DevOps, or SRE work; machine_learning for AI, ML, NLP, computer vision, or model work; data for data science, data engineering, analytics, business intelligence, or quantitative work; security for cybersecurity, application security, threat, incident-response, or penetration-testing work; product for product management, product design, or technical program management; hardware for electrical, embedded, firmware, FPGA, ASIC, silicon, semiconductor, robotics, or mechatronics work; and other only when no listed family applies.",
     "Select every materially applicable family, not merely the first match.",
+    "Set suitable to false for roles outside software engineering, including marketing, design, business development, machine-learning research, and data science, and for roles that require a master's degree or PhD.",
+    "A role that allows a bachelor's degree in progress is suitable; AI software-engineering internships are extremely suitable; when suitability is uncertain, set suitable to true.",
   ].join(" "),
   strict: true,
   parameters: {
@@ -88,8 +91,9 @@ const ROLE_TOOL: Tool = {
               uniqueItems: true,
               items: { type: "string", enum: [...DISCOVERY_ROLES] },
             },
+            suitable: { type: "boolean" },
           },
-          required: ["id", "roles"],
+          required: ["id", "roles", "suitable"],
           additionalProperties: false,
         },
       },
@@ -110,6 +114,7 @@ export interface DiscoveryRoleClassificationJob {
 export interface DiscoveryRoleClassification {
   readonly id: string;
   readonly roles: readonly DiscoveryRole[];
+  readonly suitable: boolean;
 }
 
 export type DiscoveryRoleCompleteTransport = LunaCompleteTransport;
@@ -161,7 +166,10 @@ function parseToolCall(
     throw new Error("Luna role classification tool arguments are too large");
   }
   const parsed = ToolArgumentsSchema.parse(calls[0].arguments);
-  const byId = new Map(parsed.classifications.map((classification) => [classification.id, classification.roles]));
+  const byId = new Map(parsed.classifications.map((classification) => [
+    classification.id,
+    classification,
+  ]));
   if (
     parsed.classifications.length !== jobs.length
     || byId.size !== jobs.length
@@ -169,10 +177,14 @@ function parseToolCall(
   ) {
     throw new Error("Luna role classification must return every requested job exactly once");
   }
-  return jobs.map((job) => ({
-    id: job.id,
-    roles: [...byId.get(job.id)!].sort((left, right) => ROLE_ORDER[left] - ROLE_ORDER[right]),
-  }));
+  return jobs.map((job) => {
+    const classification = byId.get(job.id)!;
+    return {
+      id: job.id,
+      roles: [...classification.roles].sort((left, right) => ROLE_ORDER[left] - ROLE_ORDER[right]),
+      suitable: classification.suitable,
+    };
+  });
 }
 
 async function classifyDiscoveryRoleBatchWithLuna(
