@@ -275,7 +275,7 @@ describe("keyword map renderer", () => {
     }]);
   });
 
-  testWithPdftotext("does not count a keyword found only as a substring of linked edit text", async () => {
+  testWithPdftotext("counts a keyword when its linked rendered edit is the map match", async () => {
     const jobDescription = "TypeScript role requires Java.";
     const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
     const keyword = {
@@ -300,6 +300,39 @@ describe("keyword map renderer", () => {
         keywordIds: [keyword.id],
       }],
     };
+    const resume = await compiledResume("Built JavaScript services.");
+
+    const rendered = await renderKeywordMapArtifacts({
+      ...resume,
+      jobDescription,
+      atsKeywordExtraction,
+      analysis,
+    });
+    const coverage = ResumeKeywordCoverageSchema.parse(JSON.parse(
+      await Bun.file(rendered.coverage.path).text(),
+    ));
+
+    expect(coverage.keywords).toEqual([{
+      id: "keyword-java",
+      phrase: "Java",
+      found: true,
+    }]);
+  });
+
+  testWithPdftotext("does not count an unlinked keyword found only as a substring", async () => {
+    const jobDescription = "TypeScript role requires Java.";
+    const baseExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+    const keyword = {
+      id: "keyword-java",
+      phrase: "Java",
+      jdQuote: jobDescription,
+    };
+    const atsKeywordExtraction = { ...baseExtraction, keywords: [keyword] };
+    const baseAnalysis = jobAnalysisFixture({
+      jobDescriptionSha256: atsKeywordExtraction.jobDescriptionSha256,
+      jdQuote: jobDescription,
+    });
+    const analysis = { ...baseAnalysis, jdKeywords: [], exactEdits: [] };
     const resume = await compiledResume("Built JavaScript services.");
 
     const rendered = await renderKeywordMapArtifacts({
