@@ -461,7 +461,7 @@ describe("run HTTP routes", () => {
 
   test("returns stable HTTP 410 responses for pruned downloads and lifecycle commands", async () => {
     const pruned = Object.assign(
-      new Error("Run artifacts were removed by the ten-run retention policy"),
+      new Error("Historical run artifacts are unavailable"),
       { code: "RUN_ARTIFACTS_PRUNED", status: 410 },
     );
     const target = service({
@@ -483,7 +483,7 @@ describe("run HTTP routes", () => {
       expect(await response.json()).toEqual({
         error: {
           code: "RUN_ARTIFACTS_PRUNED",
-          message: "Run artifacts were removed by the ten-run retention policy",
+          message: "Historical run artifacts are unavailable",
         },
       });
     }
@@ -493,7 +493,7 @@ describe("run HTTP routes", () => {
     expect(await download.json()).toEqual({
       error: {
         code: "RUN_ARTIFACTS_PRUNED",
-        message: "Run artifacts were removed by the ten-run retention policy",
+        message: "Historical run artifacts are unavailable",
       },
     });
     const applicationStatus = await request(target, "/v1/runs/run-1", patch({ applicationStatus: "interview" }));

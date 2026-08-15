@@ -134,6 +134,14 @@ interface ArtifactRow {
   id: string; run_id: string; revision: number; attempt_id: string; stage: string; kind: string; sha256: string;
   path: string; byte_size: number; source_artifact_id: string | null; created_at: number;
 }
+interface PrunedRunArtifactManifestRow {
+  run_id: string;
+  queue_sequence: number;
+  artifact_id: string | null;
+  artifact_path: string | null;
+  artifact_sha256: string | null;
+  artifact_byte_size: number | null;
+}
 interface RevisionRow { run_id: string; revision: number; origin: RevisionOrigin; source_revision: number | null; retry_stage: ActiveStage | null; status: RunStatus; created_at: number }
 interface EventRow { sequence: number; run_id: string; revision: number | null; kind: string; payload_json: string; created_at: number }
 interface EditRequestRow { id: string; run_id: string; source_revision: number; target_revision: number; origin: "machine_regenerate" | "human_edit"; comments: string; expected_pdf_sha256: string; created_at: number }
@@ -185,6 +193,18 @@ export interface PublicAttempt {
 export interface PublicEvent { readonly sequence: number; readonly revision: number | null; readonly kind: string; readonly payload: unknown; readonly createdAt: number }
 export interface PublicTimeline { readonly events: readonly PublicEvent[]; readonly attempts: readonly PublicAttempt[] }
 export interface PublicArtifact { readonly id: string; readonly revision: number; readonly attemptId: string | null; readonly stage: string; readonly kind: string; readonly sha256: string; readonly path: string; readonly byteSize: number; readonly createdAt: number }
+export interface PrunedRunArtifact {
+  readonly id: string;
+  readonly path: string;
+  readonly sha256: string;
+  readonly byteSize: number;
+}
+
+export interface PrunedRunArtifactManifest {
+  readonly runId: string;
+  readonly queueSequence: number;
+  readonly artifacts: readonly PrunedRunArtifact[];
+}
 export interface PublicReviewableRevision {
   readonly revision: number;
   readonly status: "review" | "approved";
@@ -1403,73 +1423,72 @@ export class PipelineRepository {
     `).all(limit).map(publicRun);
   }
 
-  reserveArtifactPruneCandidates(retainCount: number): string[] {
-    if (!Number.isSafeInteger(retainCount) || retainCount < 1) throw new Error("artifact retention count must be a positive integer");
-    return this.#immediate(() => {
-      this.#db.query(`
-        INSERT INTO run_artifact_retention(run_id, state, selected_at)
-        SELECT runs.id, 'pruning', ?
-        FROM runs
-        WHERE runs.deleted_at IS NULL
-          AND runs.id NOT IN (
-            SELECT id
-            FROM runs
-            WHERE deleted_at IS NULL
-            ORDER BY queue_sequence DESC
-            LIMIT ?
-          )
-          AND runs.status IN ('review','approved','failed')
-          AND NOT EXISTS (
-            SELECT 1
-            FROM run_claim
-            WHERE run_claim.run_id = runs.id
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM attempts
-            WHERE attempts.run_id = runs.id
-              AND attempts.status IN ('running','cancel_requested')
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM run_application_sessions
-            WHERE run_application_sessions.run_id = runs.id
-              AND (
-                run_application_sessions.slot_released = 0
-                OR run_application_sessions.bridge_state IN (
-                  'reserved',
-                  'starting',
-                  'running',
-                  'awaiting_human_navigation',
-                  'awaiting_origin_approval',
-                  'awaiting_additional_info',
-                  'awaiting_human_review',
-                  'submitting',
-                  'submitted',
-                  'submission_uncertain'
-                )
-              )
-          )
-        ON CONFLICT(run_id) DO NOTHING
-      `).run(this.#now(), retainCount);
-      return this.#db.query<{ run_id: string }, []>(`
-        SELECT run_artifact_retention.run_id
-        FROM run_artifact_retention
-        JOIN runs ON runs.id = run_artifact_retention.run_id
-        WHERE run_artifact_retention.state = 'pruning'
-          AND runs.deleted_at IS NULL
-        ORDER BY runs.queue_sequence
-      `).all().map((row) => row.run_id);
-    });
+  listPrunedRunArtifactManifests(): PrunedRunArtifactManifest[] {
+    const rows = this.#db.query<PrunedRunArtifactManifestRow, []>(`
+      SELECT
+        run_artifact_retention.run_id,
+        runs.queue_sequence,
+        artifacts.id AS artifact_id,
+        artifacts.path AS artifact_path,
+        artifacts.sha256 AS artifact_sha256,
+        artifacts.byte_size AS artifact_byte_size
+      FROM run_artifact_retention
+      JOIN runs ON runs.id = run_artifact_retention.run_id
+      LEFT JOIN artifacts ON artifacts.run_id = run_artifact_retention.run_id
+      WHERE run_artifact_retention.state = 'pruned'
+      ORDER BY runs.queue_sequence, artifacts.created_at, artifacts.id
+    `).all();
+    const manifests: Array<{
+      runId: string;
+      queueSequence: number;
+      artifacts: PrunedRunArtifact[];
+    }> = [];
+    for (const row of rows) {
+      let manifest = manifests.at(-1);
+      if (manifest?.runId !== row.run_id) {
+        manifest = {
+          runId: row.run_id,
+          queueSequence: row.queue_sequence,
+          artifacts: [],
+        };
+        manifests.push(manifest);
+      }
+      if (
+        row.artifact_id !== null
+        && row.artifact_path !== null
+        && row.artifact_sha256 !== null
+        && row.artifact_byte_size !== null
+      ) {
+        manifest.artifacts.push({
+          id: row.artifact_id,
+          path: row.artifact_path,
+          sha256: row.artifact_sha256,
+          byteSize: row.artifact_byte_size,
+        });
+      }
+    }
+    return manifests;
   }
 
-  markRunArtifactsPruned(runId: string): void {
+  clearPrunedRunArtifactMarker(runId: string, queueSequence: number): void {
+    if (!Number.isSafeInteger(queueSequence) || queueSequence < 1) {
+      throw new Error("run queue sequence must be a positive safe integer");
+    }
     this.#immediate(() => {
-      this.#db.query(`
-        UPDATE run_artifact_retention
-        SET state = 'pruned', pruned_at = ?
-        WHERE run_id = ? AND state = 'pruning'
-      `).run(this.#now(), runId);
+      const result = this.#db.query(`
+        DELETE FROM run_artifact_retention
+        WHERE run_id = ?
+          AND state = 'pruned'
+          AND EXISTS (
+            SELECT 1
+            FROM runs
+            WHERE runs.id = ?
+              AND runs.queue_sequence = ?
+          )
+      `).run(runId, runId, queueSequence);
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("pruned run artifact marker changed");
+      }
     });
   }
 

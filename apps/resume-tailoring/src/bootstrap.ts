@@ -42,7 +42,6 @@ import { DiscoveryRepository } from "./discovery/repository.ts";
 import { DiscoveryService } from "./discovery/service.ts";
 import { ArtifactStore, DEFAULT_ARTIFACT_ROOT } from "./system/artifacts.ts";
 import { migrateRunOutputLayout } from "./system/run-output-migration.ts";
-import { enforceRunArtifactRetention } from "./system/run-retention.ts";
 import { ApplicationAgentService } from "./agents/application-agent-service.ts";
 import {
   createPipelineWorkerRuntime,
@@ -301,7 +300,6 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       ...schedulerOptions,
       afterDrain: async (signal) => {
         await schedulerOptions?.afterDrain?.(signal);
-        await enforceRunArtifactRetention(repository, artifacts);
         await applicationSessions.startNextAutomaticApplication(signal);
       },
     },

@@ -1661,283 +1661,94 @@ describe("application session ledger", () => {
   });
 });
 
-describe("artifact retention reservations", () => {
-  test("reserves only inactive runs outside the newest ten by queue sequence", () => {
-    const { repo } = fixture();
-    const ids = ["run-z", "run-2", "run-10", "run-a", "run-01", "run-y", "run-3", "run-b", "run-x", "run-20", "run-c", "run-1"];
-    for (const id of ids) createReview(repo, "a".repeat(64), false, id);
-    repo.setApplicationStatus(ids[0]!, "accepted");
-
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
-    expect(repo.areRunArtifactsRetained(ids[0]!)).toBeFalse();
-    expect(repo.areRunArtifactsRetained(ids[1]!)).toBeFalse();
-    expect(repo.areRunArtifactsRetained(ids[2]!)).toBeTrue();
-    expect(repo.areRunArtifactsRetained(ids[11]!)).toBeTrue();
-    expect(() => repo.reserveArtifactPruneCandidates(0)).toThrow(/positive integer/);
-    expect(() => repo.areRunArtifactsRetained("missing-run")).toThrow(RepositoryConflictError);
-  });
-
-
-  test("live states block deletion and pruning while released terminal states unblock", () => {
-    const liveStates = [
-      "reserved",
-      "starting",
-      "running",
-      "awaiting_human_navigation",
-      "awaiting_origin_approval",
-      "awaiting_additional_info",
-      "awaiting_human_review",
-      "submitting",
-      "submitted",
-      "submission_uncertain",
-    ] as const;
-    const terminalStates = ["cancelled", "failed", "closed", "lost"] as const;
-    const hash = "2".repeat(64);
-    const sessionId = (index: number) =>
-      `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
-
-    const live = fixture().repo;
-    const liveRunIds = Array.from(
-      { length: liveStates.length + 10 },
-      (_, index) => `live-application-retention-${index}`,
-    );
-    for (const id of liveRunIds) {
-      createReview(live, hash, false, id);
-      live.approve(id, hash);
-    }
-    for (const [index, bridgeState] of liveStates.entries()) {
-      const runId = liveRunIds[index]!;
-      const currentSessionId = sessionId(index);
-      live.reserveApplicationSession(runId, null, currentSessionId, hash);
-      if (bridgeState === "submitting" || bridgeState === "submitted" || bridgeState === "submission_uncertain") {
-        recordApplicationReview(live, runId, currentSessionId);
-        live.claimApplicationSubmission(currentSessionId);
-        if (bridgeState !== "submitting") {
-          live.finalizeApplicationSubmission(
-            currentSessionId,
-            bridgeState === "submitted" ? "submitted" : "uncertain",
-          );
-        }
-        live.recordApplicationSnapshot(runId, {
-          slotReleased: false,
-          generation: 1,
-          sessionId: currentSessionId,
-          bridgeState,
-          publicSnapshot: { state: bridgeState },
-        });
-      } else if (bridgeState !== "reserved") {
-        live.recordApplicationSnapshot(runId, {
-          slotReleased: false,
-          generation: 1,
-          sessionId: currentSessionId,
-          bridgeState,
-          publicSnapshot: { state: bridgeState },
-        });
-      }
-      live.releaseApplicationSessionSlot(runId, 1, currentSessionId);
-      expect(() => live.deleteRun(runId)).toThrow(/close the browser session first/);
-    }
-    expect(live.reserveArtifactPruneCandidates(10)).toEqual([]);
-
-    for (const [index, bridgeState] of terminalStates.entries()) {
-      const terminal = fixture().repo;
-      const runId = createReview(terminal, hash, false, `terminal-delete-${bridgeState}`);
-      terminal.approve(runId, hash);
-      terminal.reserveApplicationSession(runId, null, sessionId(20 + index), hash);
-      if (bridgeState === "lost") {
-        terminal.recordApplicationSnapshot(runId, {
-          slotReleased: false,
-          generation: 1,
-          sessionId: sessionId(20 + index),
-          bridgeState: "running",
-          publicSnapshot: { state: "running" },
-        });
-        terminal.markApplicationSessionLost(runId, {
-          generation: 1,
-          sessionId: sessionId(20 + index),
-          publicSnapshot: { state: bridgeState },
-        });
-      } else {
-        terminal.recordApplicationSnapshot(runId, {
-          slotReleased: bridgeState === "cancelled" || bridgeState === "failed" || bridgeState === "closed" || bridgeState === "lost",
-          generation: 1,
-          sessionId: sessionId(20 + index),
-          bridgeState,
-          publicSnapshot: { state: bridgeState },
-        });
-      }
-      terminal.deleteRun(runId);
-      expect(terminal.getRun(runId)).toBeNull();
-    }
-
-    const terminal = fixture().repo;
-    const terminalRunIds = Array.from(
-      { length: terminalStates.length + 10 },
-      (_, index) => `terminal-application-retention-${index}`,
-    );
-    for (const id of terminalRunIds) {
-      createReview(terminal, hash, false, id);
-      terminal.approve(id, hash);
-    }
-    for (const [index, bridgeState] of terminalStates.entries()) {
-      const runId = terminalRunIds[index]!;
-      terminal.reserveApplicationSession(runId, null, sessionId(30 + index), hash);
-      if (bridgeState === "lost") {
-        terminal.recordApplicationSnapshot(runId, {
-          slotReleased: false,
-          generation: 1,
-          sessionId: sessionId(30 + index),
-          bridgeState: "running",
-          publicSnapshot: { state: "running" },
-        });
-        terminal.markApplicationSessionLost(runId, {
-          generation: 1,
-          sessionId: sessionId(30 + index),
-          publicSnapshot: { state: bridgeState },
-        });
-      } else {
-        terminal.recordApplicationSnapshot(runId, {
-          slotReleased: bridgeState === "cancelled" || bridgeState === "failed" || bridgeState === "closed" || bridgeState === "lost",
-          generation: 1,
-          sessionId: sessionId(30 + index),
-          bridgeState,
-          publicSnapshot: { state: bridgeState },
-        });
-      }
-    }
-    expect(terminal.reserveArtifactPruneCandidates(10)).toEqual(
-      terminalRunIds.slice(0, terminalStates.length),
-    );
-  });
-  test("blocks deletion and pruning until a terminal session releases its slot", () => {
-    const hash = "3".repeat(64);
-    const deletion = fixture().repo;
-    const deletionRunId = createReview(deletion, hash, false, "terminal-delete-pending");
-    deletion.approve(deletionRunId, hash);
-    const deletionSessionId = "45454545-4545-4545-8545-454545454545";
-    deletion.reserveApplicationSession(deletionRunId, null, deletionSessionId, hash);
-    deletion.recordApplicationSnapshot(deletionRunId, {
-      generation: 1,
-      sessionId: deletionSessionId,
-      bridgeState: "failed",
-      publicSnapshot: { state: "failed" },
-      slotReleased: false,
-    });
-    expect(() => deletion.deleteRun(deletionRunId)).toThrow(/close the browser session first/);
-    deletion.recordApplicationSnapshot(deletionRunId, {
-      generation: 1,
-      sessionId: deletionSessionId,
-      bridgeState: "failed",
-      publicSnapshot: { state: "failed" },
-      slotReleased: true,
-    });
-    deletion.deleteRun(deletionRunId);
-    expect(deletion.getRun(deletionRunId)).toBeNull();
-
-    const retention = fixture().repo;
-    const retentionRunIds = Array.from(
-      { length: 12 },
-      (_, index) => `terminal-prune-pending-${index}`,
-    );
-    for (const runId of retentionRunIds) createReview(retention, hash, false, runId);
-    const retentionRunId = retentionRunIds[0]!;
-    retention.approve(retentionRunId, hash);
-    const retentionSessionId = "46464646-4646-4646-8646-464646464646";
-    retention.reserveApplicationSession(retentionRunId, null, retentionSessionId, hash);
-    retention.recordApplicationSnapshot(retentionRunId, {
-      generation: 1,
-      sessionId: retentionSessionId,
-      bridgeState: "failed",
-      publicSnapshot: { state: "failed" },
-      slotReleased: false,
-    });
-    expect(retention.reserveArtifactPruneCandidates(10)).toEqual([retentionRunIds[1]!]);
-    retention.recordApplicationSnapshot(retentionRunId, {
-      generation: 1,
-      sessionId: retentionSessionId,
-      bridgeState: "failed",
-      publicSnapshot: { state: "failed" },
-      slotReleased: true,
-    });
-    expect(retention.reserveArtifactPruneCandidates(10)).toEqual(retentionRunIds.slice(0, 2));
-  });
-
-  test("excludes tombstoned runs from retention selection and reservations", () => {
+describe("artifact restoration markers", () => {
+  test("enumerates complete pruned manifests and clears only the matching run and queue sequence", () => {
     const { db, repo } = fixture();
-    const ids = Array.from({ length: 13 }, (_, index) => `tombstone-retention-${index}`);
-    for (const id of ids) createReview(repo, "a".repeat(64), false, id);
-    repo.deleteRun(ids[2]!);
+    const first = createReview(repo, "a".repeat(64), false, "pruned-first");
+    const second = createReview(repo, "b".repeat(64), false, "pruning-second");
+    const firstRun = repo.getRun(first)!;
+    const secondRun = repo.getRun(second)!;
+    db.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at, pruned_at)
+      VALUES (?, 'pruned', 1000, 1000)
+    `).run(first);
+    db.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at)
+      VALUES (?, 'pruning', 1000)
+    `).run(second);
 
-    expect(repo.reserveArtifactPruneCandidates(12)).toEqual([]);
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
-    expect(db.query<{ run_id: string; state: string }, []>(
-      "SELECT run_id,state FROM run_artifact_retention ORDER BY run_id",
-    ).all()).toEqual([
-      { run_id: ids[0]!, state: "pruning" },
-      { run_id: ids[1]!, state: "pruning" },
-    ]);
-    expect(() => repo.deleteRun(ids[0]!)).toThrow(/being pruned/);
-    expect(repo.getRun(ids[0]!)).not.toBeNull();
+    expect(repo.listPrunedRunArtifactManifests()).toEqual([{
+      runId: first,
+      queueSequence: firstRun.queueSequence,
+      artifacts: [{
+        id: expect.any(String),
+        path: `/tmp/${first}.pdf`,
+        sha256: "a".repeat(64),
+        byteSize: 10,
+      }],
+    }]);
+    expect(() => repo.clearPrunedRunArtifactMarker(
+      first,
+      secondRun.queueSequence,
+    )).toThrow(RepositoryConflictError);
+    expect(repo.areRunArtifactsRetained(first)).toBe(false);
+
+    repo.clearPrunedRunArtifactMarker(first, firstRun.queueSequence);
+    expect(repo.listPrunedRunArtifactManifests()).toEqual([]);
+    expect(repo.areRunArtifactsRetained(first)).toBe(true);
+    expect(repo.areRunArtifactsRetained(second)).toBe(false);
+    expect(() => repo.clearPrunedRunArtifactMarker(
+      first,
+      firstRun.queueSequence,
+    )).toThrow(RepositoryConflictError);
   });
 
-  test("retries pruning rows and defers queued, active, claimed, and active-attempt runs", () => {
-    const { db, repo, tick } = fixture();
-    const ids = Array.from({ length: 16 }, (_, index) => `retention-${index === 0 ? "z" : index}`);
-    for (const id of ids) createReview(repo, "b".repeat(64), false, id);
-    db.query("UPDATE runs SET status='queued' WHERE id=?").run(ids[0]!);
-    db.query("UPDATE runs SET status='analyzing' WHERE id=?").run(ids[4]!);
-    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=? WHERE id=4").run(ids[1]!, "c".repeat(43), 99_999);
-    for (const [index, status] of [[2, "running"], [3, "cancel_requested"]] as const) {
-      db.query(`
-        INSERT INTO attempts(
-          id, run_id, revision, stage, attempt_no, origin, claim_token,
-          attempt_session_id, status, started_at
-        ) VALUES (?, ?, 1, 'analyzing', 1, 'initial', ?, ?, ?, 1000)
-      `).run(`active-${index}`, ids[index]!, "d".repeat(43), `session-${index}`, status);
-    }
-
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[5]!]);
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual([ids[5]!]);
-
-    db.query("UPDATE run_claim SET run_id=NULL, claim_token=NULL, expires_at=NULL WHERE id=4").run();
-    db.query("UPDATE attempts SET status='succeeded', finished_at=2000 WHERE id IN ('active-2','active-3')").run();
-    db.query("UPDATE runs SET status='review' WHERE id IN (?, ?)").run(ids[0]!, ids[4]!);
-
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 6));
-    tick(1_000);
-    repo.markRunArtifactsPruned(ids[0]!);
-    repo.markRunArtifactsPruned(ids[0]!);
-    repo.markRunArtifactsPruned("unreserved-run");
-
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(1, 6));
-    expect(db.query<{ state: string; pruned_at: number }, [string]>(
-      "SELECT state,pruned_at FROM run_artifact_retention WHERE run_id=?",
-    ).get(ids[0]!)).toEqual({ state: "pruned", pruned_at: 2_000 });
-  });
-
-  test("rejects every artifact-dependent lifecycle command after reservation", () => {
+  test("includes a pruned run whose artifact manifest is empty", () => {
     const { db, repo } = fixture();
-    const ids = Array.from({ length: 12 }, (_, index) => `command-${index === 0 ? "z" : index}`);
-    for (const id of ids) createReview(repo, "e".repeat(64), false, id);
-    db.query("UPDATE runs SET status='failed', failed_stage='compiling' WHERE id=?").run(ids[0]!);
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
+    const run = repo.createRun("JD", "empty-pruned-manifest");
+    db.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at, pruned_at)
+      VALUES (?, 'pruned', 1000, 1000)
+    `).run(run.id);
 
-    expect(() => repo.retry(ids[0]!)).toThrow(RunArtifactsPrunedError);
-    expect(() => repo.regenerate(ids[1]!, "e".repeat(64))).toThrow(RunArtifactsPrunedError);
-    expect(() => repo.editRun(ids[1]!, "change the layout", "e".repeat(64))).toThrow(RunArtifactsPrunedError);
-    expect(() => repo.approve(ids[1]!, "e".repeat(64))).toThrow(RunArtifactsPrunedError);
-    expect(repo.setApplicationStatus(ids[1]!, "rejected").applicationStatus).toBe("rejected");
+    expect(repo.listPrunedRunArtifactManifests()).toEqual([{
+      runId: run.id,
+      queueSequence: run.queueSequence,
+      artifacts: [],
+    }]);
   });
 
-  test("never reacquires a runnable run with a retention reservation", () => {
+  test("preserves public pruned behavior until restoration clears the marker", () => {
     const { db, repo } = fixture();
-    const ids = Array.from({ length: 12 }, (_, index) => `acquire-${index === 0 ? "z" : index}`);
-    for (const id of ids) createReview(repo, "f".repeat(64), false, id);
-    expect(repo.reserveArtifactPruneCandidates(10)).toEqual(ids.slice(0, 2));
-    db.query("UPDATE runs SET status='queued' WHERE id IN (?, ?)").run(ids[0]!, ids[11]!);
-    db.query("UPDATE run_claim SET run_id=?, claim_token=?, expires_at=0 WHERE id=5").run(ids[0]!, "g".repeat(43));
+    const hash = "e".repeat(64);
+    const runId = createReview(repo, hash, false, "pruned-command");
+    const queueSequence = repo.getRun(runId)!.queueSequence;
+    db.query("UPDATE runs SET status='failed', failed_stage='compiling' WHERE id=?").run(runId);
+    db.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at, pruned_at)
+      VALUES (?, 'pruned', 1000, 1000)
+    `).run(runId);
 
-    expect(repo.acquire()?.runId).toBe(ids[11]);
+    expect(() => repo.retry(runId)).toThrow(RunArtifactsPrunedError);
+    expect(() => repo.regenerate(runId, hash)).toThrow(RunArtifactsPrunedError);
+    expect(() => repo.editRun(runId, "change the layout", hash)).toThrow(RunArtifactsPrunedError);
+    expect(() => repo.approve(runId, hash)).toThrow(RunArtifactsPrunedError);
+    expect(repo.setApplicationStatus(runId, "rejected").applicationStatus).toBe("rejected");
+
+    repo.clearPrunedRunArtifactMarker(runId, queueSequence);
+    expect(repo.areRunArtifactsRetained(runId)).toBe(true);
+  });
+
+  test("never acquires a runnable run while its historical marker remains", () => {
+    const { db, repo } = fixture();
+    const pruned = repo.createRun("JD", "pruned-runnable");
+    const available = repo.createRun("JD", "available-runnable");
+    db.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at, pruned_at)
+      VALUES (?, 'pruned', 1000, 1000)
+    `).run(pruned.id);
+
+    expect(repo.acquire()?.runId).toBe(available.id);
   });
 });
 

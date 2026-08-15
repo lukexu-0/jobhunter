@@ -98,7 +98,7 @@ function blockedReasonMessage(reason: string | undefined): string | null {
     return "Approve the resume before starting the application assistant.";
   }
   if (reason === "artifacts_pruned") {
-    return "Automatic application is unavailable because the resume files were removed by retention.";
+    return "Automatic application is unavailable because historical resume files are unavailable.";
   }
   if (reason === "harness_unconfigured") {
     return "The local browser application service is not configured.";
@@ -893,7 +893,7 @@ export function RunReviewWorkspace({
         )}
         {artifactState === "pruned" && iterations.length > 0 ? (
           <p className={styles.workspaceNotice} role="status">
-            Resume files were removed by retention; iteration labels and PDF hashes remain available.
+            Historical document files are unavailable; iteration labels and PDF hashes remain available.
           </p>
         ) : null}
         {iterationError ? <p className={styles.panelError} role="alert">{iterationError}</p> : null}

@@ -118,7 +118,9 @@ describe("RunReviewWorkspace", () => {
     expect(markup).toContain('<option value="8">Iteration 3 — Latest</option>');
     expect(markup).not.toContain("View latest");
     expect(markup).not.toContain("Historical iterations are view-only");
-    expect(markup).toContain("Resume files were removed by retention");
+    expect(markup).toContain("Historical document files are unavailable");
+    expect(markup).not.toContain("removed by retention");
+    expect(markup).not.toContain("Resume files were removed by retention");
     expect(markup).not.toContain("/tmp/");
     expect(markup).not.toContain("sessionId");
     expect(markup).not.toContain("Review workspace");
