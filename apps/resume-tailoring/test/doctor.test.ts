@@ -66,6 +66,7 @@ describe("doctor public service", () => {
     expect(report.checks.map((check) => check.id)).toEqual([
       "bun", "context", "auth-openai",
       "model-openai", "model-luna",
+      "google-chrome", "systemd-run", "systemctl",
       "latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm",
     ]);
     expect(probes).toEqual([
@@ -92,6 +93,9 @@ describe("doctor public service", () => {
 
     expect(argv).toEqual([
       ["/system/bun", "--version"],
+      ["/system/google-chrome", "--version"],
+      ["/system/systemd-run", "--version"],
+      ["/system/systemctl", "--version"],
       ["/system/latexmk", "--version"],
       ["/system/pdfinfo", "-v"],
       ["/system/pdftotext", "-v"],
@@ -100,6 +104,23 @@ describe("doctor public service", () => {
     ]);
     for (const id of ["pdfinfo", "pdftotext", "pdffonts", "pdftoppm"] as const) {
       expect(byId(report.checks, id)).toMatchObject({ status: "ok", classification: "available" });
+    }
+  });
+
+  test("fails closed when any required renderer executable is missing", async () => {
+    for (const missing of ["google-chrome", "systemd-run", "systemctl"] as const) {
+      const report = await runDoctor(healthyDependencies({
+        process: {
+          findExecutable: (name) => name === missing ? undefined : `/system/${name}`,
+          version: async () => "version 1",
+        },
+      }));
+
+      expect(byId(report.checks, missing)).toMatchObject({
+        status: "error",
+        classification: "missing_system_tool",
+      });
+      expect(doctorExitCode(report)).toBe(1);
     }
   });
 
@@ -275,7 +296,7 @@ describe("doctor public service", () => {
     expect(json).not.toContain("secret");
   });
 
-  test("uses executable probes only for the six approved local programs and makes a missing tool fatal", async () => {
+  test("uses executable probes only for the nine approved local programs and makes a missing tool fatal", async () => {
     const lookedUp: string[] = [];
     const versioned: string[] = [];
     const dependencies = healthyDependencies({
@@ -292,8 +313,14 @@ describe("doctor public service", () => {
     });
     const result = await runDoctorScript(dependencies);
 
-    expect(lookedUp).toEqual(["bun", "latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm"]);
-    expect(versioned).toEqual(["bun", "latexmk", "pdfinfo", "pdftotext", "pdftoppm"]);
+    expect(lookedUp).toEqual([
+      "bun", "google-chrome", "systemd-run", "systemctl",
+      "latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm",
+    ]);
+    expect(versioned).toEqual([
+      "bun", "google-chrome", "systemd-run", "systemctl",
+      "latexmk", "pdfinfo", "pdftotext", "pdftoppm",
+    ]);
     expect(byId(result.report.checks, "pdffonts")).toMatchObject({ status: "error", classification: "missing_system_tool" });
     expect(result.exitCode).toBe(1);
     expect(result.json).not.toContain("/not-reported/");

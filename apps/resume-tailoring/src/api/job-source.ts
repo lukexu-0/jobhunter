@@ -7,10 +7,12 @@ import {
   type OpportunityKind,
 } from "../contracts";
 import { LUNA_MAX_SOURCE_BYTES, LUNA_MAX_SOURCE_LINES } from "../models/luna-job-extractor";
+import { renderJobSourceWithChrome } from "./rendered-job-source";
 
 export type ResolvedAddress = { readonly address: string; readonly family: 4 | 6 };
 export type ResolveHost = (hostname: string) => Promise<readonly ResolvedAddress[]>;
 export type JobSourceFetch = (input: string | URL, init: BunFetchRequestInit) => Promise<Response>;
+export type RenderJobSourceHtml = (url: string, signal: AbortSignal) => Promise<string | undefined>;
 export type LoadedJobSource = Readonly<
   | { kind: "description"; opportunityKind: OpportunityKind; jobDescription: string }
   | { kind: "model-fallback"; lines: readonly string[] }
@@ -29,6 +31,7 @@ export interface LoadedPublicWebSource {
 export interface JobSourceLoadOptions {
   readonly fetchImpl?: JobSourceFetch;
   readonly resolveHost?: ResolveHost;
+  readonly renderHtml?: RenderJobSourceHtml;
   readonly deadlineMs?: number;
 }
 
@@ -196,6 +199,16 @@ const IANA_IPV6_SPECIAL_PREFIXES: readonly SpecialPrefix[] = [
   { address: "ff00::", prefix: 8, globallyReachable: false },
 ];
 
+// Deprecated site-local unicast can still route inside legacy networks despite its removal from the IANA registry.
+const ADDITIONAL_BLOCKED_IPV6_PREFIXES: readonly SpecialPrefix[] = [
+  { address: "fec0::", prefix: 10, globallyReachable: false },
+];
+
+// IPv6 fails closed outside allocated global unicast and explicit globally reachable special-purpose ranges.
+const ALLOCATED_IPV6_PREFIXES: readonly SpecialPrefix[] = [
+  { address: "2000::", prefix: 3, globallyReachable: true },
+];
+
 function parseIPv4(input: string): ParsedAddress | undefined {
   if (!input || input.trim() !== input || input.includes(":")) return undefined;
   try {
@@ -278,6 +291,8 @@ function parseAddress(input: string, unwrapMapped = true): ParsedAddress | undef
 const COMPILED_SPECIAL_PREFIXES = [
   ...IANA_IPV4_SPECIAL_PREFIXES.map((row) => ({ ...row, parsed: parseIPv4(row.address)! })),
   ...IANA_IPV6_SPECIAL_PREFIXES.map((row) => ({ ...row, parsed: parseIPv6(row.address, false)! })),
+  ...ADDITIONAL_BLOCKED_IPV6_PREFIXES.map((row) => ({ ...row, parsed: parseIPv6(row.address, false)! })),
+  ...ALLOCATED_IPV6_PREFIXES.map((row) => ({ ...row, parsed: parseIPv6(row.address, false)! })),
 ];
 
 function isPublicAddress(address: ParsedAddress): boolean {
@@ -293,7 +308,7 @@ function isPublicAddress(address: ParsedAddress): boolean {
     if ((candidate.value >> shift) !== (row.parsed.value >> shift)) continue;
     if (!best || row.prefix > best.prefix) best = row;
   }
-  return best?.globallyReachable ?? true;
+  return best?.globallyReachable ?? candidate.family === 4;
 }
 
 function rawHostname(url: URL): string {
@@ -749,6 +764,21 @@ function normalizedResolvedAddresses(answers: readonly ResolvedAddress[]): Parse
   return output;
 }
 
+function validatedResolvedAddresses(answers: readonly ResolvedAddress[]): ParsedAddress[] {
+  const normalized = normalizedResolvedAddresses(answers);
+  if (normalized.length === 0) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
+  if (normalized.some((address) => !isPublicAddress(address))) throw new JobSourceError("JOB_URL_BLOCKED");
+  return normalized;
+}
+
+async function resolveValidatedHostnameAddresses(
+  hostname: string,
+  resolveHost: ResolveHost,
+  signal: AbortSignal,
+): Promise<ParsedAddress[]> {
+  return validatedResolvedAddresses(await hardRace(resolveHost(hostname), signal));
+}
+
 async function resolveValidatedAddresses(
   logicalUrl: URL,
   resolveHost: ResolveHost,
@@ -756,13 +786,11 @@ async function resolveValidatedAddresses(
 ): Promise<ParsedAddress[]> {
   const hostname = rawHostname(logicalUrl);
   const literal = parseAddress(hostname, false);
-  const answers = literal
-    ? [{ address: literal.address, family: literal.family } satisfies ResolvedAddress]
-    : await hardRace(resolveHost(hostname), signal);
-  const normalized = normalizedResolvedAddresses(answers);
-  if (normalized.length === 0) throw new JobSourceError("JOB_SOURCE_UNAVAILABLE");
-  if (normalized.some((address) => !isPublicAddress(address))) throw new JobSourceError("JOB_URL_BLOCKED");
-  return normalized;
+  return literal
+    ? validatedResolvedAddresses([
+      { address: literal.address, family: literal.family } satisfies ResolvedAddress,
+    ])
+    : resolveValidatedHostnameAddresses(hostname, resolveHost, signal);
 }
 
 export async function validatePublicHttpDestination(
@@ -939,6 +967,7 @@ async function loadJobSourceWithSignal(
   signal: AbortSignal,
   fetchImpl: JobSourceFetch,
   resolveHost: ResolveHost,
+  renderHtml: RenderJobSourceHtml,
   opportunityKindHint?: OpportunityKind,
 ): Promise<LoadedJobSource> {
   const loaded = await loadPublicWebSourceWithSignal(
@@ -980,7 +1009,28 @@ async function loadJobSourceWithSignal(
     resolveHost,
   );
   if (oracleCandidate !== undefined) return oracleCandidate;
-  return htmlFallback(loaded.body);
+  let originalError: JobSourceError;
+  try {
+    return await htmlFallback(loaded.body);
+  } catch (error) {
+    if (
+      !(error instanceof JobSourceError)
+      || error.code !== "JOB_DESCRIPTION_UNAVAILABLE"
+      || new URL(loaded.url).protocol !== "https:"
+    ) {
+      throw error;
+    }
+    originalError = error;
+  }
+
+  try {
+    const renderedHtml = await hardRace(renderHtml(loaded.url, signal), signal);
+    if (renderedHtml === undefined) throw originalError;
+    return await hardRace(htmlFallback(renderedHtml), signal);
+  } catch {
+    if (signal.aborted && !(signal.reason instanceof DeadlineExpired)) throw cancellationReason(signal);
+    throw originalError;
+  }
 }
 
 export async function loadJobSourceFromUrl(
@@ -997,12 +1047,25 @@ export async function loadJobSourceFromUrl(
   const onCallerAbort = () => controller.abort(cancellationReason(signal!));
   signal?.addEventListener("abort", onCallerAbort, { once: true });
 
+  const resolveHost = options.resolveHost ?? defaultResolveHost;
+  const renderHtml = options.renderHtml ?? (async (url, renderSignal) => renderJobSourceWithChrome(
+    url,
+    renderSignal,
+    {
+      resolveAddresses: (hostname, resolveSignal) => resolveValidatedHostnameAddresses(
+        hostname,
+        resolveHost,
+        resolveSignal,
+      ),
+    },
+  ));
   try {
     return await loadJobSourceWithSignal(
       jobUrl,
       controller.signal,
       options.fetchImpl ?? fetch,
-      options.resolveHost ?? defaultResolveHost,
+      resolveHost,
+      renderHtml,
       opportunityKindHint,
     );
   } catch (error) {

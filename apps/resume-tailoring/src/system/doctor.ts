@@ -10,8 +10,8 @@ import { MODEL_NAME, OMP_CODEX_MODEL } from "../models/oauth-codex-model.ts";
 export type DoctorCheckStatus = "ok" | "warning" | "error";
 
 export interface DoctorCheck {
-  id: "bun" | "context" | "auth-openai"
-    | "model-openai" | "model-luna"
+  id: "bun" | "google-chrome" | "systemd-run" | "systemctl"
+    | "context" | "auth-openai" | "model-openai" | "model-luna"
     | "latexmk" | "pdfinfo" | "pdftotext" | "pdffonts" | "pdftoppm";
   status: DoctorCheckStatus;
   classification: string;
@@ -66,9 +66,15 @@ export class DoctorProbeError extends Error {
   }
 }
 
-const TOOL_IDS = ["bun", "latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm"] as const;
+const TOOL_IDS = [
+  "bun", "google-chrome", "systemd-run", "systemctl",
+  "latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm",
+] as const;
 const VERSION_ARGS: Readonly<Record<(typeof TOOL_IDS)[number], readonly string[]>> = Object.freeze({
   bun: Object.freeze(["--version"]),
+  "google-chrome": Object.freeze(["--version"]),
+  "systemd-run": Object.freeze(["--version"]),
+  systemctl: Object.freeze(["--version"]),
   latexmk: Object.freeze(["--version"]),
   pdfinfo: Object.freeze(["-v"]),
   pdftotext: Object.freeze(["-v"]),

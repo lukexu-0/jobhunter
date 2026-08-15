@@ -1,9 +1,47 @@
 import { spawn } from "node:child_process";
-import { closeSync, constants, openSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, constants, lstatSync, openSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 
-export const TRUSTED_PROGRAMS = Object.freeze(["latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm"] as const);
+export const TRUSTED_PROGRAMS = Object.freeze(["latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm", "google-chrome"] as const);
 export type TrustedProgram = typeof TRUSTED_PROGRAMS[number];
+
+export const BROWSER_RESOURCE_PROFILE = Object.freeze({
+  name: "browser-renderer",
+  privateProfileDirectory: "/tmp/jobhunter-rendered-job-profile",
+  unitProperties: Object.freeze([
+    "MemoryMax=512M",
+    "MemorySwapMax=0",
+    "TasksMax=256",
+    "CPUQuota=200%",
+    "RuntimeMaxSec=10s",
+    "TimeoutStopSec=1s",
+    "KillMode=control-group",
+    "OOMPolicy=stop",
+    "LimitCORE=0",
+    "TemporaryFileSystem=/tmp:rw,size=128M,mode=0700",
+    "PrivateUsers=yes",
+    "ProtectHome=yes",
+    "ProtectSystem=strict",
+    "ProtectControlGroups=yes",
+    "ProtectKernelTunables=yes",
+    "ProtectKernelModules=yes",
+    "ProtectKernelLogs=yes",
+    "PrivateDevices=yes",
+    "PrivateIPC=yes",
+    "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=",
+    "RestrictSUIDSGID=yes",
+    "LockPersonality=yes",
+    "ProtectProc=invisible",
+    "ProcSubset=pid",
+    "IPAddressDeny=any",
+    "IPAddressAllow=localhost",
+  ] as const),
+} as const);
+export type BrowserResourceProfile = typeof BROWSER_RESOURCE_PROFILE;
+export type BrowserResourceProfileName = BrowserResourceProfile["name"];
 
 export interface SpawnContract {
   readonly command: TrustedProgram;
@@ -12,6 +50,7 @@ export interface SpawnContract {
   readonly env: Readonly<Record<string, string>>;
   readonly shell: false;
   readonly attemptRootFd?: number;
+  readonly resourceProfile?: BrowserResourceProfile;
 }
 
 export interface RunningProcess {
@@ -19,7 +58,7 @@ export interface RunningProcess {
   readonly stdout: AsyncIterable<Uint8Array>;
   readonly stderr: AsyncIterable<Uint8Array>;
   wait(): Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>;
-  kill(signal: NodeJS.Signals, target: "process-group"): Promise<void>;
+  kill(signal: NodeJS.Signals, target: "process-group" | "browser-cgroup"): Promise<void>;
 }
 
 export type ProcessBoundary = (contract: SpawnContract) => RunningProcess;
@@ -33,6 +72,7 @@ export interface TrustedProcessRequest {
   readonly stdoutLimit?: number;
   readonly stderrLimit?: number;
   readonly texmfConfigDirectory?: ".";
+  readonly resourceProfile?: BrowserResourceProfileName;
 }
 
 export interface CapturedOutput {
@@ -119,7 +159,47 @@ function openAttemptRootFd(cwd: string): number {
   }
 }
 
-function defaultBoundary(contract: SpawnContract): RunningProcess {
+const SYSTEMD_RUN = "systemd-run";
+const SYSTEMCTL = "systemctl";
+const ENV_EXECUTABLE = "/usr/bin/env";
+const SYSTEMD_CONTROL_TIMEOUT_MS = 2_000;
+const SYSTEMD_WRAPPER_WAIT_MS = 2_000;
+
+interface SystemdClientContext {
+  readonly environment: Readonly<Record<string, string>>;
+  readonly runtimeDirectory: string;
+  readonly uid: number;
+}
+
+function systemdClientContext(): SystemdClientContext {
+  if (process.platform !== "linux" || process.getuid === undefined) {
+    throw new Error("browser resource containment requires a Linux user runtime");
+  }
+  const uid = process.getuid();
+  if (!Number.isSafeInteger(uid) || uid < 0) {
+    throw new Error("browser resource containment requires a valid user id");
+  }
+  const runtimeDirectory = `/run/user/${uid}`;
+  const runtime = lstatSync(runtimeDirectory);
+  if (
+    !runtime.isDirectory()
+    || runtime.isSymbolicLink()
+    || runtime.uid !== uid
+    || (runtime.mode & 0o7777) !== 0o700
+  ) {
+    throw new Error("browser resource containment requires an owned private user runtime");
+  }
+  return {
+    environment: Object.freeze({
+      ...sanitizedEnvironment(),
+      XDG_RUNTIME_DIR: runtimeDirectory,
+    }),
+    uid,
+    runtimeDirectory,
+  };
+}
+
+function directBoundary(contract: SpawnContract): RunningProcess {
   const detached = process.platform !== "win32";
   const stdio: ["ignore", "pipe", "pipe"] = ["ignore", "pipe", "pipe"];
   const child = spawn(contract.command, [...contract.args], {
@@ -169,6 +249,172 @@ function defaultBoundary(contract: SpawnContract): RunningProcess {
   };
 }
 
+async function waitBounded<T>(promise: Promise<T>, timeoutMs: number, failure: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(failure)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runSystemctl(
+  args: readonly string[],
+  clientEnvironment: Readonly<Record<string, string>>,
+): Promise<void> {
+  const child = spawn(SYSTEMCTL, [...args], {
+    env: { ...clientEnvironment },
+    shell: false,
+    stdio: "ignore",
+  });
+  const { promise, resolve, reject } = Promise.withResolvers<number | null>();
+  child.once("error", reject);
+  child.once("close", resolve);
+  let code: number | null;
+  try {
+    code = await waitBounded(promise, SYSTEMD_CONTROL_TIMEOUT_MS, "systemd user-service control timed out");
+  } catch (error) {
+    child.kill("SIGKILL");
+    throw error;
+  }
+  if (code !== 0) throw new Error("systemd user-service control failed");
+}
+
+async function stopBrowserUnit(
+  unit: string,
+  clientEnvironment: Readonly<Record<string, string>>,
+): Promise<void> {
+  try {
+    await runSystemctl(["--user", "stop", unit], clientEnvironment);
+  } catch (stopError) {
+    try {
+      await runSystemctl(
+        ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
+        clientEnvironment,
+      );
+      await runSystemctl(["--user", "stop", unit], clientEnvironment);
+    } catch (killError) {
+      throw new AggregateError([stopError, killError], "browser cgroup cleanup failed");
+    }
+  }
+}
+
+function browserServiceBoundary(contract: SpawnContract): RunningProcess {
+  const client = systemdClientContext();
+  const hostProfile = lstatSync(contract.cwd);
+  if (
+    !hostProfile.isDirectory()
+    || hostProfile.isSymbolicLink()
+    || hostProfile.uid !== client.uid
+    || (hostProfile.mode & 0o7777) !== 0o700
+  ) {
+    throw new Error("browser resource containment requires an owned 0700 profile directory");
+  }
+  const expectedProfileArgument = `--user-data-dir=${contract.cwd}`;
+  const profileArguments = contract.args.filter((argument) => argument.startsWith("--user-data-dir="));
+  if (profileArguments.length !== 1 || profileArguments[0] !== expectedProfileArgument) {
+    throw new Error("browser resource containment requires the fixed private profile argument");
+  }
+  const chromeArgs = contract.args.map((argument) => (
+    argument === expectedProfileArgument
+      ? `--user-data-dir=${BROWSER_RESOURCE_PROFILE.privateProfileDirectory}`
+      : argument
+  ));
+  const unit = `jobhunter-rendered-job-${randomUUID()}.service`;
+  const args = [
+    "--user",
+    "--wait",
+    "--pipe",
+    "--collect",
+    "--quiet",
+    `--unit=${unit}`,
+    "--service-type=exec",
+    "--working-directory=/tmp",
+    ...BROWSER_RESOURCE_PROFILE.unitProperties.map((property) => `--property=${property}`),
+    `--property=InaccessiblePaths=${client.runtimeDirectory}`,
+    "--",
+    ENV_EXECUTABLE,
+    "-i",
+    ...Object.entries(contract.env).map(([name, value]) => `${name}=${value}`),
+    contract.command,
+    ...chromeArgs,
+  ];
+  const detached = true;
+  const stdio: ["ignore", "pipe", "pipe"] = ["ignore", "pipe", "pipe"];
+  const child = spawn(SYSTEMD_RUN, args, {
+    cwd: contract.cwd,
+    env: { ...client.environment },
+    shell: false,
+    stdio,
+    detached,
+  });
+  const signalWrapper = (): void => {
+    const pid = child.pid;
+    if (pid !== undefined && pid > 0) {
+      try {
+        process.kill(-pid, "SIGKILL");
+        return;
+      } catch {
+        // The wrapper may already have exited after collecting the service.
+      }
+    }
+    child.kill("SIGKILL");
+  };
+  const stdout = child.stdout;
+  const stderr = child.stderr;
+  if (stdout === null || stderr === null) {
+    child.once("error", () => undefined);
+    try {
+      signalWrapper();
+    } finally {
+      stdout?.destroy();
+      stderr?.destroy();
+    }
+    throw new Error("systemd browser service did not expose piped stdout and stderr");
+  }
+  const { promise: waitPromise, resolve: resolveWait, reject: rejectWait } = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  child.once("error", rejectWait);
+  child.once("close", (code, signal) => resolveWait({ code, signal }));
+  let cleanup: Promise<void> | undefined;
+  return {
+    pid: child.pid ?? -1,
+    stdout,
+    stderr,
+    wait: () => waitPromise,
+    kill: async (_signal, _target) => {
+      cleanup ??= (async () => {
+        let cleanupError: unknown;
+        try {
+          await stopBrowserUnit(unit, client.environment);
+        } catch (error) {
+          cleanupError = error;
+        }
+        signalWrapper();
+        stdout.destroy();
+        stderr.destroy();
+        try {
+          await waitBounded(waitPromise, SYSTEMD_WRAPPER_WAIT_MS, "systemd-run wrapper did not settle");
+        } catch (error) {
+          cleanupError = cleanupError === undefined
+            ? error
+            : new AggregateError([cleanupError, error], "browser containment cleanup failed");
+        }
+        if (cleanupError !== undefined) throw cleanupError;
+      })();
+      await cleanup;
+    },
+  };
+}
+
+function defaultBoundary(contract: SpawnContract): RunningProcess {
+  return contract.resourceProfile === BROWSER_RESOURCE_PROFILE
+    ? browserServiceBoundary(contract)
+    : directBoundary(contract);
+}
+
 async function capture(stream: AsyncIterable<Uint8Array>, limit: number): Promise<CapturedOutput> {
   const chunks: Buffer[] = [];
   let retained = 0;
@@ -199,6 +445,24 @@ async function processStartToken(pid: number): Promise<string | null> {
 export async function runTrustedProcess(request: TrustedProcessRequest, boundary: ProcessBoundary = defaultBoundary): Promise<TrustedProcessResult> {
   if (!TRUSTED_PROGRAMS.includes(request.command)) throw new Error(`program is not trusted: ${request.command}`);
   if (!Array.isArray(request.args) || request.args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) throw new Error("process arguments must be a NUL-free string array");
+  const browserProfile = request.resourceProfile === BROWSER_RESOURCE_PROFILE.name;
+  if (
+    (request.resourceProfile !== undefined && !browserProfile)
+    || (request.command === "google-chrome") !== browserProfile
+  ) {
+    throw new Error("the browser resource profile is required only for google-chrome");
+  }
+  if (
+    browserProfile
+    && (
+      !isAbsolute(request.cwd)
+      || request.cwd.includes("\0")
+      || request.cwd.includes(":")
+      || request.texmfConfigDirectory !== undefined
+    )
+  ) {
+    throw new Error("the browser resource profile requires an absolute private profile directory");
+  }
   if (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0) throw new Error("timeout must be positive");
   const stdoutLimit = request.stdoutLimit ?? 256 * 1024;
   const stderrLimit = request.stderrLimit ?? 256 * 1024;
@@ -212,6 +476,7 @@ export async function runTrustedProcess(request: TrustedProcessRequest, boundary
     env: sanitizedEnvironment(request.texmfConfigDirectory, attemptRootFd),
     shell: false,
     ...(attemptRootFd === undefined ? {} : { attemptRootFd }),
+    ...(browserProfile ? { resourceProfile: BROWSER_RESOURCE_PROFILE } : {}),
   };
   try {
     const running = boundary(contract);
@@ -236,7 +501,7 @@ export async function runTrustedProcess(request: TrustedProcessRequest, boundary
       if (outcome.kind === "interrupt") {
         timedOut = outcome.reason === "timeout";
         aborted = outcome.reason === "abort";
-        await running.kill("SIGKILL", "process-group");
+        await running.kill("SIGKILL", browserProfile ? "browser-cgroup" : "process-group");
         exit = await waitPromise;
         killAcknowledged = true;
       } else exit = outcome.exit;
