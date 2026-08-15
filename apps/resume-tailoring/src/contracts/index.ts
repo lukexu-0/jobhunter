@@ -1193,13 +1193,23 @@ export const JobDescriptionSchema = z
 
 
 export const RunListResponseSchema = z.object({ runs: z.array(RunDtoSchema) }).strict();
-export const CreateRunRequestSchema = z.object({
+const CreateRunFromUrlRequestSchema = z.object({
   jobUrl: JobUrlSchema,
   opportunityKind: OpportunityKindSchema.optional(),
   generateKeywordMap: z.boolean().default(true),
   skipReview: z.boolean().default(false),
   autoSubmit: z.boolean().default(false),
 }).strict();
+const CreateRunFromPastedDetailsRequestSchema = z.object({
+  jobTitle: RunIdentityTextSchema,
+  jobDescription: JobDescriptionSchema,
+  generateKeywordMap: z.boolean().default(true),
+}).strict();
+export const CreateRunRequestSchema = z.union([
+  CreateRunFromUrlRequestSchema,
+  CreateRunFromPastedDetailsRequestSchema,
+]);
+export type CreateRunRequest = z.infer<typeof CreateRunRequestSchema>;
 export const EditRunRequestSchema = z
   .object({
     comments: z.string().trim().min(1).max(8_000),

@@ -33,6 +33,7 @@ import { PipelineRepository, type ActiveStage } from "../src/db/repository.ts";
 import type { LoadedContextManifest } from "../src/context/manifest.ts";
 import { ArtifactStore } from "../src/system/artifacts.ts";
 import {
+  type CreateRunRequest,
   type OpportunityKind,
   ResumeIterationDtoSchema,
   ResumeIterationListResponseSchema,
@@ -42,6 +43,20 @@ import {
 const ORIGIN = "http://127.0.0.1:3456";
 const JOB_URL = "https://jobs.example.test/role?gh_jid=123&source=service";
 const JOB_DESCRIPTION = "A detailed role requiring TypeScript systems work, careful testing, ownership, and reliable delivery.";
+type UrlCreateRunRequest = Extract<CreateRunRequest, { readonly jobUrl: string }>;
+
+function urlRunRequest(
+  jobUrl = JOB_URL,
+  overrides: Partial<Omit<UrlCreateRunRequest, "jobUrl">> = {},
+): UrlCreateRunRequest {
+  return {
+    jobUrl,
+    generateKeywordMap: true,
+    skipReview: false,
+    autoSubmit: false,
+    ...overrides,
+  };
+}
 const fixtures: string[] = [];
 const databases: Database[] = [];
 
@@ -274,7 +289,7 @@ describe("RunApplicationService", () => {
   test("creates a runnable run with one atomic four-source snapshot and independent default-off modes", async () => {
     const target = fixture();
     const jobDescription = JOB_DESCRIPTION;
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
 
     expect(run).toMatchObject({
       id: "run-1",
@@ -287,13 +302,13 @@ describe("RunApplicationService", () => {
     expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(true);
     expect(target.repository.getRunJobUrl(run.id)).toBe(JOB_URL);
     expect(run.jobUrl).toBe(JOB_URL);
-    const skipOnly = await target.service.createRun(JOB_URL, false, true, false);
+    const skipOnly = await target.service.createRun(urlRunRequest(JOB_URL, { generateKeywordMap: false, skipReview: true }));
     expect(target.repository.getRun(skipOnly.id)).toMatchObject({
       generateKeywordMap: false,
       skipReview: true,
       autoSubmit: false,
     });
-    const submitOnly = await target.service.createRun(JOB_URL, true, false, true);
+    const submitOnly = await target.service.createRun(urlRunRequest(JOB_URL, { autoSubmit: true }));
     expect(target.repository.getRun(submitOnly.id)).toMatchObject({
       generateKeywordMap: true,
       skipReview: false,
@@ -304,6 +319,41 @@ describe("RunApplicationService", () => {
     expect(input).not.toBeNull();
     expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8")).toBe(jobDescription);
     expect(target.repository.acquire()?.runId).toBe(run.id);
+  });
+  test("creates a normal job run from pasted title and description without loading a URL", async () => {
+    let loads = 0;
+    const target = fixture({
+      loadJobSource: async () => {
+        loads += 1;
+        throw new Error("the URL loader must not run");
+      },
+    });
+    const jobTitle = "  Principal Platform Engineer  ";
+    const jobDescription = "  Build reliable TypeScript systems.\nOwn testing, delivery, and production quality.  ";
+    const trimmedDescription = jobDescription.trim();
+
+    const run = await target.service.createRun({
+      jobTitle,
+      jobDescription,
+      generateKeywordMap: false,
+    });
+
+    expect(loads).toBe(0);
+    expect(run).toMatchObject({
+      status: "queued",
+      opportunityKind: "job",
+      titleOverride: "Principal Platform Engineer",
+      generateKeywordMap: false,
+      skipReview: false,
+      autoSubmit: false,
+    });
+    expect(run).not.toHaveProperty("jobUrl");
+    expect(target.repository.getRunJobUrl(run.id)).toBeNull();
+    expect(target.repository.getRun(run.id)?.generateKeywordMap).toBe(false);
+    const input = target.repository.getArtifact(run.id, "job-description");
+    expect(input).not.toBeNull();
+    expect(Buffer.from(await target.artifacts.read(input!.path, input!.byteSize)).toString("utf8"))
+      .toBe(trimmedDescription);
   });
   test("persists and returns an explicit networking event kind over deterministic source inference", async () => {
     const eventDescription = [
@@ -318,7 +368,7 @@ describe("RunApplicationService", () => {
       }),
     });
 
-    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "networking_event");
+    const run = await target.service.createRun(urlRunRequest(JOB_URL, { opportunityKind: "networking_event" }));
 
     expect(run.opportunityKind).toBe("networking_event");
     expect(target.repository.getRun(run.id)?.opportunityKind).toBe("networking_event");
@@ -337,7 +387,7 @@ describe("RunApplicationService", () => {
     const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[0]!);
     writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nRefreshed baseline.\n`);
 
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
 
     expect(run).toMatchObject({ id: "run-1", status: "queued", revision: 1 });
     expect(target.syncs.count).toBe(1);
@@ -394,7 +444,7 @@ describe("RunApplicationService", () => {
     const changedPath = join(target.root, CONTEXT_SOURCE_ALLOWLIST[0]!);
     writeFileSync(changedPath, `${readFileSync(changedPath, "utf8")}\nStill stale baseline.\n`);
 
-    await expect(target.service.createRun(JOB_URL)).rejects.toMatchObject({
+    await expect(target.service.createRun(urlRunRequest())).rejects.toMatchObject({
       code: "CONTEXT_STALE",
       status: 409,
     });
@@ -413,14 +463,14 @@ describe("RunApplicationService", () => {
       },
     });
 
-    await expect(target.service.createRun(JOB_URL)).rejects.toBe(snapshotFailure);
+    await expect(target.service.createRun(urlRunRequest())).rejects.toBe(snapshotFailure);
     expect(target.syncs.count).toBe(0);
     expect(snapshotCalls).toBe(1);
     expectNoPersistence(target);
   });
   test("exposes durable run modes and canonical job URLs on created, listed, and retrieved DTOs", async () => {
     const target = fixture();
-    const created = await target.service.createRun(JOB_URL, false, true, true);
+    const created = await target.service.createRun(urlRunRequest(JOB_URL, { generateKeywordMap: false, skipReview: true, autoSubmit: true }));
     const listed = await target.service.listRuns();
     const retrieved = await target.service.getRun(created.id);
 
@@ -456,7 +506,7 @@ describe("RunApplicationService", () => {
 
   test("projects the latest application session without per-run list lookups", async () => {
     const target = fixture();
-    const applying = await target.service.createRun(JOB_URL);
+    const applying = await target.service.createRun(urlRunRequest());
     const pdf = await finalizeReviewPdf(target, applying.id);
     const approved = await target.service.approveRun(applying.id, pdf.sha256, false);
     expect(approved.isApplying).toBe(false);
@@ -468,7 +518,7 @@ describe("RunApplicationService", () => {
       sessionId,
       pdf.sha256,
     );
-    const ordinary = await target.service.createRun(`${JOB_URL}&ordinary=1`);
+    const ordinary = await target.service.createRun(urlRunRequest(`${JOB_URL}&ordinary=1`));
 
     await expect(target.service.getRun(applying.id)).resolves.toMatchObject({
       isApplying: true,
@@ -579,7 +629,7 @@ describe("RunApplicationService", () => {
       },
     });
 
-    const run = await target.service.createRun(JOB_URL, true, false, false, controller.signal);
+    const run = await target.service.createRun(urlRunRequest(), controller.signal);
 
     expect(observed).toEqual({
       loader: {
@@ -620,7 +670,7 @@ describe("RunApplicationService", () => {
       },
     });
 
-    const run = await target.service.createRun(JOB_URL, true, false, false, undefined, "networking_event");
+    const run = await target.service.createRun(urlRunRequest(JOB_URL, { opportunityKind: "networking_event" }));
 
     expect(observed).toEqual({
       loaderHint: "networking_event",
@@ -642,14 +692,14 @@ describe("RunApplicationService", () => {
       const sourceTarget = fixture({
         loadJobSource: async () => { throw sourceError; },
       });
-      await expect(sourceTarget.service.createRun(JOB_URL)).rejects.toBe(sourceError);
+      await expect(sourceTarget.service.createRun(urlRunRequest())).rejects.toBe(sourceError);
       expectNoPersistence(sourceTarget);
     }
     const nullTarget = fixture({
       loadJobSource: async () => ({ kind: "model-fallback", lines: ["safe source"] }),
       extractJobDescription: async () => null,
     });
-    await expect(nullTarget.service.createRun(JOB_URL)).rejects.toMatchObject({
+    await expect(nullTarget.service.createRun(urlRunRequest())).rejects.toMatchObject({
       code: "JOB_DESCRIPTION_UNAVAILABLE",
       status: 422,
       message: "The page does not contain a usable opportunity description",
@@ -686,7 +736,7 @@ describe("RunApplicationService", () => {
         loadJobSource: async () => ({ kind: "model-fallback", lines: ["safe source"] }),
         extractJobDescription: async () => { throw failure.error; },
       });
-      await expect(target.service.createRun(JOB_URL)).rejects.toMatchObject(failure.expected);
+      await expect(target.service.createRun(urlRunRequest())).rejects.toMatchObject(failure.expected);
       expectNoPersistence(target);
     }
 
@@ -695,7 +745,7 @@ describe("RunApplicationService", () => {
       loadJobSource: async () => ({ kind: "model-fallback", lines: ["safe source"] }),
       extractJobDescription: async () => { throw programmingError; },
     });
-    await expect(programmingTarget.service.createRun(JOB_URL)).rejects.toBe(programmingError);
+    await expect(programmingTarget.service.createRun(urlRunRequest())).rejects.toBe(programmingError);
     expectNoPersistence(programmingTarget);
   });
 
@@ -704,7 +754,7 @@ describe("RunApplicationService", () => {
     const validTarget = fixture({
       loadJobSource: async () => ({ kind: "description", opportunityKind: "job", jobDescription: padded }),
     });
-    const validRun = await validTarget.service.createRun(JOB_URL);
+    const validRun = await validTarget.service.createRun(urlRunRequest());
     const input = validTarget.repository.getArtifact(validRun.id, "job-description")!;
     expect(Buffer.from(
       await validTarget.artifacts.read(input.path, input.byteSize),
@@ -714,7 +764,7 @@ describe("RunApplicationService", () => {
       const invalidTarget = fixture({
         loadJobSource: async () => ({ kind: "description", opportunityKind: "job", jobDescription: invalidDescription }),
       });
-      await expect(invalidTarget.service.createRun(JOB_URL)).rejects.toMatchObject({
+      await expect(invalidTarget.service.createRun(urlRunRequest())).rejects.toMatchObject({
         name: "ZodError",
       });
       expectNoPersistence(invalidTarget);
@@ -732,13 +782,7 @@ describe("RunApplicationService", () => {
         return { kind: "description", opportunityKind: "job", jobDescription: JOB_DESCRIPTION };
       },
     });
-    await expect(beforeLoadTarget.service.createRun(
-      JOB_URL,
-      true,
-      false,
-      false,
-      beforeLoadController.signal,
-    )).rejects.toBe(beforeLoadReason);
+    await expect(beforeLoadTarget.service.createRun(urlRunRequest(), beforeLoadController.signal)).rejects.toBe(beforeLoadReason);
     expect(loadCalls).toBe(0);
     expectNoPersistence(beforeLoadTarget);
 
@@ -752,13 +796,7 @@ describe("RunApplicationService", () => {
         return loading.promise;
       },
     });
-    const loadingRun = loadingTarget.service.createRun(
-      JOB_URL,
-      true,
-      false,
-      false,
-      loadingController.signal,
-    );
+    const loadingRun = loadingTarget.service.createRun(urlRunRequest(), loadingController.signal);
     expect(loaderSignal).toBe(loadingController.signal);
     loadingController.abort(loadingReason);
     loading.resolve({ kind: "description", opportunityKind: "job", jobDescription: JOB_DESCRIPTION });
@@ -781,13 +819,7 @@ describe("RunApplicationService", () => {
         return extracting.promise;
       },
     });
-    const extractingRun = extractingTarget.service.createRun(
-      JOB_URL,
-      true,
-      false,
-      false,
-      extractingController.signal,
-    );
+    const extractingRun = extractingTarget.service.createRun(urlRunRequest(), extractingController.signal);
     await extractorStarted.promise;
     expect(extractorSignal).toBe(extractingController.signal);
     extractingController.abort(extractingReason);
@@ -807,13 +839,7 @@ describe("RunApplicationService", () => {
         return snapshot.promise;
       },
     });
-    const snapshotRun = snapshotTarget.service.createRun(
-      JOB_URL,
-      true,
-      false,
-      false,
-      snapshotController.signal,
-    );
+    const snapshotRun = snapshotTarget.service.createRun(urlRunRequest(), snapshotController.signal);
     await snapshotStarted.promise;
     snapshotController.abort(snapshotReason);
     snapshot.resolve(resolvedSnapshot!);
@@ -830,13 +856,7 @@ describe("RunApplicationService", () => {
       },
     });
     await expect(
-      afterSnapshotTarget.service.createRun(
-        JOB_URL,
-        true,
-        false,
-        false,
-        afterSnapshotController.signal,
-      ),
+      afterSnapshotTarget.service.createRun(urlRunRequest(), afterSnapshotController.signal),
     ).rejects.toBe(afterSnapshotReason);
     expectNoPersistence(afterSnapshotTarget);
   });
@@ -882,7 +902,7 @@ describe("RunApplicationService", () => {
 
   test("updates application status independently and rejects a missing run", async () => {
     const target = fixture();
-    const created = await target.service.createRun(JOB_URL);
+    const created = await target.service.createRun(urlRunRequest());
     expect(created).toMatchObject({ applicationStatus: "pending", status: "queued" });
 
     const updated = await target.service.updateApplicationStatus(created.id, "accepted");
@@ -897,7 +917,7 @@ describe("RunApplicationService", () => {
 
   test("returns durable identity overrides and maps soft deletion conflicts and visibility", async () => {
     const target = fixture();
-    const created = await target.service.createRun(JOB_URL);
+    const created = await target.service.createRun(urlRunRequest());
     expect(created).not.toHaveProperty("titleOverride");
     expect(created).not.toHaveProperty("organizationOverride");
 
@@ -935,7 +955,7 @@ describe("RunApplicationService", () => {
 
   test("maps a retry event to the compiling status that starts the new revision", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     const claim = target.repository.acquire()!;
     transition(target.repository, claim, ["analyzing", "tailoring", "compiling"]);
     target.repository.transition(claim, "failed", { failedStage: "compiling" });
@@ -951,7 +971,7 @@ describe("RunApplicationService", () => {
 
   test("maps an edit-request event to the editing status that starts the new revision", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     const pdf = await finalizeReviewPdf(target, run.id);
 
     const edited = await target.service.editRun(run.id, "Shorten the opening paragraph.", pdf.sha256);
@@ -964,7 +984,7 @@ describe("RunApplicationService", () => {
 
   test("maps attempts, retry ancestry and inherited artifacts without exposing internal tokens, paths or logs", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     const claim = target.repository.acquire()!;
     target.repository.transition(claim, "analyzing");
     const analysisAttempt = target.repository.startAttempt(claim, "analyzing");
@@ -1011,7 +1031,7 @@ describe("RunApplicationService", () => {
 
   test("exposes only the inherited current job analysis for a retained failed revision", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     const claim = target.repository.acquire()!;
     target.repository.transition(claim, "analyzing");
     const analysisAttempt = target.repository.startAttempt(claim, "analyzing");
@@ -1099,7 +1119,7 @@ describe("RunApplicationService", () => {
 
   test("enforces review/hash/source invariants and preserves exact inert edit comments", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     await expect(target.service.editRun(run.id, "not review", "a".repeat(64))).rejects.toMatchObject({ code: "RUN_CONFLICT", status: 409 });
     const pdf = await finalizeReviewPdf(target, run.id, "%PDF-1.7\nvisual", true);
     await expect(target.service.approveRun(run.id, pdf.sha256, false)).rejects.toMatchObject({ code: "VISUAL_ACKNOWLEDGEMENT_REQUIRED", status: 409 });
@@ -1134,7 +1154,7 @@ describe("RunApplicationService", () => {
     });
     const reviews: { id: string; artifactId: string; pdfSha256: string }[] = [];
     for (let index = 0; index < 12; index++) {
-      const run = await target.service.createRun(JOB_URL);
+      const run = await target.service.createRun(urlRunRequest());
       const pdf = await finalizeReviewPdf(target, run.id);
       reviews.push({ id: run.id, artifactId: pdf.id, pdfSha256: pdf.sha256 });
     }
@@ -1169,7 +1189,7 @@ describe("RunApplicationService", () => {
   });
   test("translates a download race with a new pruning reservation to HTTP 410", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     const pdf = await finalizeReviewPdf(target, run.id);
     target.artifacts.read = async () => {
       target.pipelineDatabase.query(`
@@ -1188,7 +1208,7 @@ describe("RunApplicationService", () => {
 
   test("lists retained historical iterations and authorizes exact revision artifacts", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     const first = await finalizeReviewPdf(
       target,
       run.id,
@@ -1281,7 +1301,7 @@ describe("RunApplicationService", () => {
 
   test("serves public resume and JSON artifacts with their public media metadata", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL, true);
+    const run = await target.service.createRun(urlRunRequest());
     const claim = target.repository.acquire()!;
     target.repository.transition(claim, "analyzing");
     const analysisAttempt = target.repository.startAttempt(claim, "analyzing");
@@ -1387,7 +1407,7 @@ describe("RunApplicationService", () => {
 
   test("serves the current resume diff as public JSON", async () => {
     const target = fixture();
-    const run = await target.service.createRun(JOB_URL);
+    const run = await target.service.createRun(urlRunRequest());
     const claim = target.repository.acquire()!;
     transition(target.repository, claim, ["analyzing", "tailoring"]);
     const attempt = target.repository.startAttempt(claim, "tailoring");
