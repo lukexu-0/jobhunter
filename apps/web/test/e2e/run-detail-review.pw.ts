@@ -29,6 +29,7 @@ const runId = "run-detail-review-workspace";
 const pipelineRunPath = `/api/pipeline/runs/${runId}`;
 const nativeSsePort = Number(process.env.JOBHUNTER_E2E_PIPELINE_PORT ?? "3467");
 const createdAt = 1_700_000_000_000;
+const jobUrl = "https://jobs.example.com/platform-engineer";
 const expiresAt = 1_700_086_400_000;
 const pdfHash1 = "1".repeat(64);
 const pdfHash2 = "2".repeat(64);
@@ -917,7 +918,10 @@ async function emitControlledApplicationEvent(
 }
 
 function approvedRun(): RunDto {
-  return runFixture({ status: "approved", revision: 2, origin: "human-comments", pdfSha256: pdfHash2 });
+  return RunDtoSchema.parse({
+    ...runFixture({ status: "approved", revision: 2, origin: "human-comments", pdfSha256: pdfHash2 }),
+    jobUrl,
+  });
 }
 
 function approvedIterations(): ResumeIterationListResponse {
@@ -1077,8 +1081,62 @@ test("direct edit requests retain failed input and follow the latest reviewed re
 
 });
 
+test("pasted review approves without starting an application", async ({ page }) => {
+  const approved = runFixture({
+    status: "approved",
+    revision: 2,
+    origin: "human-comments",
+    pdfSha256: pdfHash2,
+  });
+  const mock = await installPipeline(page, {
+    run: runFixture(),
+    application: notStartedBlocked("legacy_job_url_unavailable"),
+  });
+  mock.approveReply = approved;
+
+  await page.goto(`/runs/${runId}`);
+
+  const approve = page.getByRole("button", { name: "Approve", exact: true });
+  await expect(approve).toBeEnabled();
+  mock.iterations = approvedIterations();
+  await approve.click();
+
+  await expect.poll(() => mock.requests.filter((request) => request.method === "POST")).toEqual([{
+    method: "POST",
+    path: `${pipelineRunPath}/approve`,
+    body: {
+      expectedPdfSha256: pdfHash2,
+      acknowledgeVisualIssues: false,
+    },
+  }]);
+  expect(mock.startBodies).toEqual([]);
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+  await expect(page.getByText(
+    "Automatic application is unavailable for this opportunity.",
+    { exact: true },
+  )).toBeVisible();
+});
+
+test("approved pasted run without a job URL never offers standalone Apply", async ({ page }) => {
+  const mock = await installPipeline(page, {
+    run: runFixture({ status: "approved", revision: 2, origin: "human-comments", pdfSha256: pdfHash2 }),
+    iterations: approvedIterations(),
+    application: notStartedApproved(),
+  });
+
+  await page.goto(`/runs/${runId}`);
+
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThanOrEqual(1);
+  await expect(page.getByLabel("Displayed resume")).toHaveValue("2");
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+  await expect(page.getByText("Automatic application is unavailable for this opportunity.", { exact: true })).toBeVisible();
+});
+
 test("failed application start keeps approval and exposes a standalone Apply retry", async ({ page }) => {
-  const reviewRun = runFixture({ visualAcknowledgementRequired: true });
+  const reviewRun = RunDtoSchema.parse({
+    ...runFixture({ visualAcknowledgementRequired: true }),
+    jobUrl,
+  });
   const approved = approvedRun();
   const starting = snapshotFixture({ bridgeState: "starting", updatedAt: createdAt + 500 });
   const mock = await installPipeline(page, { run: reviewRun });

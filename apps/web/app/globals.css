@@ -385,6 +385,13 @@ a {
   padding: var(--space-5) 0;
   border-bottom: var(--border-width) solid var(--color-border);
 }
+.run-initializer__source {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  justify-self: start;
+}
+
+
 
 
 .run-initializer__field {
@@ -392,11 +399,27 @@ a {
   min-width: 0;
   gap: var(--space-2);
   grid-column: 1;
-  grid-row: 1;
+  grid-row: 2;
 }
 .run-initializer__kind {
   grid-column: 2;
-  grid-row: 1;
+  grid-row: 2;
+}
+
+.run-initializer__pasted-fields {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(12rem, 2fr) minmax(18rem, 3fr);
+  grid-column: 1 / 3;
+  grid-row: 2;
+  align-items: start;
+  gap: var(--space-3);
+}
+
+.run-initializer__paste-field {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
 }
 
 
@@ -413,7 +436,7 @@ a {
 .run-initializer__options {
   min-width: 0;
   grid-column: 1 / 3;
-  grid-row: 2;
+  grid-row: 3;
   margin: 0;
   border: 0;
   padding: 0;
@@ -424,6 +447,10 @@ a {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-2);
   margin-top: var(--space-2);
+}
+
+.run-initializer__options--pasted .run-initializer__option-list {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .run-initializer__mode {
@@ -520,7 +547,8 @@ a {
 }
 
 
-.run-initializer input[type="text"] {
+.run-initializer input[type="text"],
+.run-initializer textarea {
   width: 100%;
   min-width: 0;
   border: var(--border-width) solid var(--color-border-strong);
@@ -535,27 +563,43 @@ a {
     opacity var(--transition-fast);
 }
 
-.run-initializer input[type="text"] {
-  height: var(--control-height);
+.run-initializer input[type="text"],
+.run-initializer textarea {
   padding: 0 var(--space-4);
   font-family: var(--font-mono);
 }
 
+.run-initializer input[type="text"] {
+  height: var(--control-height);
+}
 
-.run-initializer input[type="text"]::placeholder {
+.run-initializer textarea {
+  min-height: calc(var(--control-height) + var(--control-height) + var(--space-3));
+  padding-top: var(--space-3);
+  padding-bottom: var(--space-3);
+  resize: vertical;
+}
+
+
+.run-initializer input[type="text"]::placeholder,
+.run-initializer textarea::placeholder {
   color: var(--color-faint);
 }
 
 .run-initializer input[type="text"]:hover:not(:disabled),
-.run-initializer input[type="text"]:focus {
+.run-initializer input[type="text"]:focus,
+.run-initializer textarea:hover:not(:disabled),
+.run-initializer textarea:focus {
   border-color: var(--color-text);
 }
 
-.run-initializer input[type="text"][aria-invalid="true"] {
+.run-initializer input[type="text"][aria-invalid="true"],
+.run-initializer textarea[aria-invalid="true"] {
   border-color: var(--color-danger);
 }
 
-.run-initializer input[type="text"]:disabled {
+.run-initializer input[type="text"]:disabled,
+.run-initializer textarea:disabled {
   border-color: var(--color-border);
   color: var(--color-faint);
   cursor: not-allowed;
@@ -564,7 +608,7 @@ a {
 
 .run-initializer .square-control {
   grid-column: 3;
-  grid-row: 1;
+  grid-row: 2;
   white-space: nowrap;
 }
 
@@ -2088,6 +2132,10 @@ a {
     justify-content: space-between;
   }
 
+  .run-initializer__pasted-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .discovery-filters {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -2225,7 +2273,6 @@ a {
     flex-direction: column;
     gap: var(--space-1);
   }
-
   .discovery-counts .discovery-counts__refresh {
     grid-column: 1 / -1;
     margin: 0;
@@ -2248,7 +2295,6 @@ a {
   .discovery-selection-bar .control {
     width: 100%;
   }
-
   .discovery-catalog-error,
   .discovery-skipped-list li {
     align-items: stretch;
@@ -2268,29 +2314,46 @@ a {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .run-initializer__source,
   .run-initializer__field,
   .run-initializer__kind,
+  .run-initializer__pasted-fields,
   .run-initializer__options,
   .run-initializer .square-control {
     grid-column: 1;
   }
 
-  .run-initializer__field {
+  .run-initializer__source {
+    width: 100%;
     grid-row: 1;
+    justify-self: stretch;
   }
 
-  .run-initializer__kind {
+  .run-initializer__field,
+  .run-initializer__pasted-fields {
     grid-row: 2;
   }
 
-  .run-initializer__options {
+  .run-initializer__kind {
     grid-row: 3;
+  }
+
+  .run-initializer__options {
+    grid-row: 4;
   }
 
   .run-initializer .square-control {
     width: 100%;
-    grid-row: 4;
+    grid-row: 5;
     justify-self: stretch;
+  }
+
+  .run-initializer--pasted .run-initializer__options {
+    grid-row: 3;
+  }
+
+  .run-initializer--pasted .square-control {
+    grid-row: 4;
   }
 
 

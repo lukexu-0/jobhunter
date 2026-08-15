@@ -478,6 +478,99 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
   await expect(page.locator(".run-composer")).toHaveCount(0);
 });
 
+test("initializes an application from pasted job details on the Applications dashboard", async ({ page }) => {
+  const jobTitle = "Senior Platform Engineer";
+  const jobDescription =
+    "Build and maintain reliable distributed systems for customer-facing products.";
+  const initializedRun = {
+    ...runFixture("pasted-job-run", "pending", "queued"),
+    generateKeywordMap: true,
+    titleOverride: jobTitle,
+  };
+  let postedBody: string | null = null;
+  let pendingPost: Route | undefined;
+  let pendingListRefresh: Route | undefined;
+  let listRequestCount = 0;
+  const { promise: postStarted, resolve: markPostStarted } = Promise.withResolvers<void>();
+  const { promise: listRefreshStarted, resolve: markListRefreshStarted } = Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      listRequestCount += 1;
+      if (listRequestCount === 1) {
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({ runs: [] }),
+        });
+      } else {
+        pendingListRefresh = route;
+        markListRefreshStarted();
+      }
+      return;
+    }
+
+    expect(request.method()).toBe("POST");
+    expect(request.headers()["content-type"]).toContain("application/json");
+    postedBody = request.postData();
+    pendingPost = route;
+    markPostStarted();
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const sourceMode = initializer.getByRole("combobox", { name: "Initialize from" });
+  await expect(sourceMode.locator("option:checked")).toHaveText("Opportunity URL(s)");
+  await sourceMode.selectOption({ label: "Paste job details" });
+
+  const title = initializer.getByRole("textbox", { name: "Job title", exact: true });
+  const description = initializer.getByRole("textbox", { name: "Job description", exact: true });
+  const generateKeywordMap = initializer.getByRole("checkbox", { name: "Generate keyword map", exact: true });
+  await expect(title).toHaveAttribute("required", "");
+  await expect(description).toHaveAttribute("required", "");
+  await expect(generateKeywordMap).toBeChecked();
+  await expect(initializer.getByRole("textbox", { name: /Opportunity URL/ })).toHaveCount(0);
+  await expect(initializer.getByRole("combobox", { name: "Opportunity type" })).toHaveCount(0);
+  await expect(initializer.getByRole("checkbox", { name: "Skip résumé review" })).toHaveCount(0);
+  await expect(initializer.getByRole("checkbox", { name: "Auto-submit application" })).toHaveCount(0);
+
+  await title.fill(`  ${jobTitle}  `);
+  await description.fill(`  ${jobDescription}  `);
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  await postStarted;
+
+  expect(postedBody).toBe(JSON.stringify({
+    jobTitle,
+    jobDescription,
+    generateKeywordMap: true,
+  }));
+
+  if (!pendingPost) throw new Error("Pasted-job initialize request was not intercepted");
+  await pendingPost.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify(initializedRun),
+  });
+
+  await listRefreshStarted;
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByRole("navigation", { name: "Primary navigation" })
+    .getByRole("link", { name: "Applications" })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("status")).toHaveText("1 application initialized.");
+  await expect(page.getByRole("link", { name: new RegExp(`^Open ${jobTitle}`) })).toHaveAttribute(
+    "href",
+    `/runs/${initializedRun.id}`,
+  );
+  await expect(page.locator(".applications-total")).toHaveText("1");
+
+  if (!pendingListRefresh) throw new Error("Application list refresh was not intercepted");
+  await pendingListRefresh.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ runs: [initializedRun] }),
+  });
+  await expect(page.getByRole("link", { name: new RegExp(`^Open ${jobTitle}`) })).toBeVisible();
+});
+
 test("uses shared request eligibility and remains usable without overflow", async ({ page }) => {
   await interceptEmptyRuns(page);
 
