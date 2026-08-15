@@ -18,6 +18,8 @@ import {
 import {
   HttpApplicationRuntimeClient,
   type ApplicationRuntimeClient,
+  type ApplicationRuntimeAttemptDiagnosticSink,
+  type ApplicationRuntimeAttemptFailureDiagnostic,
 } from "./application-runtime-client";
 import type { AgentRuntimeDependencies } from "./runner";
 import {
@@ -56,8 +58,12 @@ export interface ApplicationAgentFailureDiagnostic {
   readonly errorChain: readonly ApplicationAgentDiagnosticError[];
 }
 
+export type ApplicationAgentDiagnostic =
+  | ApplicationAgentFailureDiagnostic
+  | ApplicationRuntimeAttemptFailureDiagnostic;
+
 export type ApplicationAgentDiagnosticSink = (
-  diagnostic: ApplicationAgentFailureDiagnostic,
+  diagnostic: ApplicationAgentDiagnostic,
 ) => void | PromiseLike<void>;
 
 const MAX_DIAGNOSTIC_CAUSE_DEPTH = 4;
@@ -247,7 +253,7 @@ function diagnosticErrorChain(error: unknown): readonly ApplicationAgentDiagnost
 }
 
 function defaultApplicationAgentDiagnosticSink(
-  diagnostic: ApplicationAgentFailureDiagnostic,
+  diagnostic: ApplicationAgentDiagnostic,
 ): void {
   console.error(JSON.stringify(diagnostic));
 }
@@ -294,6 +300,7 @@ export type ApplicationRuntimeClientFactory = (
   runtimeUrl: string,
   sessionId: string,
   bearerToken: string,
+  diagnosticSink: ApplicationRuntimeAttemptDiagnosticSink,
 ) => ApplicationRuntimeClient;
 
 export type ApplicationSubmissionGuardFactory = (
@@ -367,8 +374,14 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
     this.#runNonJobApplicationAgent = options.runNonJobApplicationAgent
       ?? runNonJobApplicationAgent;
     this.#runtimeClientFactory = options.runtimeClientFactory
-      ?? ((runtimeUrl, sessionId, bearerToken) =>
-        new HttpApplicationRuntimeClient(runtimeUrl, sessionId, bearerToken));
+      ?? ((runtimeUrl, sessionId, bearerToken, diagnosticSink) =>
+        new HttpApplicationRuntimeClient(
+          runtimeUrl,
+          sessionId,
+          bearerToken,
+          fetch,
+          { diagnosticSink },
+        ));
     this.#submissionGuardFactory = options.submissionGuardFactory;
     this.#agentRuntime = options.agentRuntime ?? {};
     this.#diagnosticSink = options.diagnosticSink
@@ -449,6 +462,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
           input.runtimeUrl,
           input.sessionId,
           this.#harnessToken,
+          this.#diagnosticSink,
         );
         const submissionGuard = this.#submissionGuardFactory(input.sessionId);
         const runner = input.opportunityKind === "job"
