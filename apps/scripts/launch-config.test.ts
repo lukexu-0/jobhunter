@@ -19,9 +19,12 @@ import { dirname, join } from "node:path";
 import {
   completeLaunchStoragePreparation,
   prepareLaunchStorage,
+  prepareLaunchStorageForArtifactRecovery,
   prepareLaunchStorageForLaunch,
+  withStoppedPipeline,
 } from "./launch-storage.ts";
 import { resolveLaunchConfiguration } from "./launch-config.ts";
+import { runArtifactRestoreCommand } from "./restore-artifacts.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -378,6 +381,14 @@ describe("workspace launch configuration", () => {
     if (address === null || typeof address === "string") throw new Error("Test port is unavailable");
 
     try {
+      let callbackCalled = false;
+      await expect(withStoppedPipeline(
+        { pipelinePort: address.port },
+        () => {
+          callbackCalled = true;
+        },
+      )).rejects.toThrow(/must be stopped/);
+      expect(callbackCalled).toBe(false);
       await expect(prepareLaunchStorageForLaunch({
         ...configuration,
         pipelinePort: address.port,
@@ -388,6 +399,80 @@ describe("workspace launch configuration", () => {
         server.close((error) => error ? rejectClosed(error) : resolveClosed());
       });
     }
+  });
+
+  test("requires an existing managed pipeline database for artifact recovery", () => {
+    const { appsRoot } = primaryCheckout();
+    const configuration = resolveLaunchConfiguration(
+      "dev",
+      appsRoot,
+      configuredEnvironment(availableDataHome()),
+    );
+
+    expect(() => prepareLaunchStorageForArtifactRecovery(configuration)).toThrow(
+      /managed pipeline database does not exist/i,
+    );
+    writeDatabase(configuration.pipelineDatabase, "managed");
+    expect(() => prepareLaunchStorageForArtifactRecovery(configuration)).not.toThrow();
+  });
+
+  test("holds the stopped-pipeline exclusion until the guarded operation settles", async () => {
+    const portPicker = createServer();
+    await new Promise<void>((resolveListening, rejectListening) => {
+      portPicker.once("error", rejectListening);
+      portPicker.listen(0, "127.0.0.1", resolveListening);
+    });
+    const address = portPicker.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Test port is unavailable");
+    }
+    await new Promise<void>((resolveClosed, rejectClosed) => {
+      portPicker.close((error) => error ? rejectClosed(error) : resolveClosed());
+    });
+
+    let competingError: NodeJS.ErrnoException | undefined;
+    await withStoppedPipeline({ pipelinePort: address.port }, async () => {
+      const competingServer = createServer();
+      await new Promise<void>((resolveRejected) => {
+        competingServer.once("error", (error) => {
+          competingError = error;
+          resolveRejected();
+        });
+        competingServer.listen(address.port, "127.0.0.1");
+      });
+    });
+
+    expect(competingError?.code).toBe("EADDRINUSE");
+    const releasedServer = createServer();
+    await new Promise<void>((resolveListening, rejectListening) => {
+      releasedServer.once("error", rejectListening);
+      releasedServer.listen(address.port, "127.0.0.1", resolveListening);
+    });
+    await new Promise<void>((resolveClosed, rejectClosed) => {
+      releasedServer.close((error) => error ? rejectClosed(error) : resolveClosed());
+    });
+  });
+
+  test("rejects restore arguments with one bounded JSON summary before resolving storage", async () => {
+    const output: string[] = [];
+
+    const exitCode = await runArtifactRestoreCommand(
+      ["/caller/supplied/root", "31"],
+      (line) => output.push(line),
+    );
+
+    expect(exitCode).toBe(1);
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0]!)).toEqual({
+      markers: 0,
+      restored: 0,
+      published: 0,
+      reused: 0,
+      unrecovered: 0,
+      failures: [],
+      omittedFailures: 0,
+      fatal: "artifacts:restore does not accept arguments",
+    });
   });
 
   test("fails closed for a detached checkout", () => {

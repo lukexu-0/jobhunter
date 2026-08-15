@@ -1277,7 +1277,7 @@ export function RunDetail({ runId }: RunDetailProps) {
                     <h3>{
                       selectedIteration
                         ? iterationList?.artifactState === "pruned"
-                          ? "Resume files were removed"
+                          ? "Historical files unavailable"
                           : "No preview is available for this iteration"
                         : REVIEW_STATUSES[run.status]
                           ? "Loading reviewed resume history"
@@ -1286,7 +1286,7 @@ export function RunDetail({ runId }: RunDetailProps) {
                     <p>{
                       selectedIteration
                         ? iterationList?.artifactState === "pruned"
-                          ? "Retention preserved this iteration’s label and PDF hash, but its document files are no longer available."
+                          ? "This historical iteration keeps its label and PDF hash, but its document files are unavailable."
                           : "The pipeline did not publish a page image or PDF artifact for this iteration."
                         : REVIEW_STATUSES[run.status]
                           ? "The reviewed iteration list is still loading or unavailable."

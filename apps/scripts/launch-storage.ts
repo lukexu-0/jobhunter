@@ -732,6 +732,24 @@ export function prepareLaunchStorage(
   return artifactMigration === undefined ? {} : { artifactMigration };
 }
 
+export function prepareLaunchStorageForArtifactRecovery(
+  configuration: LaunchConfiguration,
+): void {
+  const preparation = prepareLaunchStorage(configuration);
+  if (preparation.artifactMigration !== undefined) {
+    throw new Error(
+      "Runtime artifact migration is pending; complete one stopped stable pipeline launch before recovery",
+    );
+  }
+  const pipelineMigration = databaseMigrations(configuration)[0]!;
+  if (!validateTarget(pipelineMigration)) {
+    throw new Error("Managed pipeline database does not exist");
+  }
+  if (!requirePrivateDirectoryIfPresent(configuration.artifactRoot, "Runtime artifact root")) {
+    throw new Error("Managed runtime artifact root does not exist");
+  }
+}
+
 export function completeLaunchStoragePreparation(
   preparation: LaunchStoragePreparation,
 ): void {
@@ -744,9 +762,10 @@ export function completeLaunchStoragePreparation(
   fsyncDirectory(dirname(migration.receiptPath));
 }
 
-export async function prepareLaunchStorageForLaunch(
-  configuration: LaunchConfiguration,
-): Promise<LaunchStoragePreparation> {
+export async function withStoppedPipeline<T>(
+  configuration: Pick<LaunchConfiguration, "pipelinePort">,
+  operation: () => T | Promise<T>,
+): Promise<T> {
   const reservation = createServer();
   try {
     await new Promise<void>((resolveListening, rejectListening) => {
@@ -765,10 +784,19 @@ export async function prepareLaunchStorageForLaunch(
   }
 
   try {
-    return prepareLaunchStorage(configuration);
+    return await operation();
   } finally {
     await new Promise<void>((resolveClosed, rejectClosed) => {
       reservation.close((error) => error ? rejectClosed(error) : resolveClosed());
     });
   }
+}
+
+export async function prepareLaunchStorageForLaunch(
+  configuration: LaunchConfiguration,
+): Promise<LaunchStoragePreparation> {
+  return withStoppedPipeline(
+    configuration,
+    () => prepareLaunchStorage(configuration),
+  );
 }

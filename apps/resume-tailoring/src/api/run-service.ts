@@ -545,7 +545,7 @@ export class RunApplicationService {
     if (!repository.areRunArtifactsRetained(runId)) {
       throw new RunServiceError(
         "RUN_ARTIFACTS_PRUNED",
-        "Run artifacts were removed by the ten-run retention policy",
+        "Historical run artifacts are unavailable",
         410,
       );
     }
@@ -568,7 +568,7 @@ export class RunApplicationService {
     if (!this.dependencies.repository.areRunArtifactsRetained(runId)) {
       throw new RunServiceError(
         "RUN_ARTIFACTS_PRUNED",
-        "Run artifacts were removed by the ten-run retention policy",
+        "Historical run artifacts are unavailable",
         410,
       );
     }
@@ -604,7 +604,7 @@ export class RunApplicationService {
       if (!this.dependencies.repository.areRunArtifactsRetained(runId)) {
         throw new RunServiceError(
           "RUN_ARTIFACTS_PRUNED",
-          "Run artifacts were removed by the ten-run retention policy",
+          "Historical run artifacts are unavailable",
           410,
         );
       }
@@ -665,7 +665,7 @@ export class RunApplicationService {
       if (error instanceof RunArtifactsPrunedError) {
         throw new RunServiceError(
           "RUN_ARTIFACTS_PRUNED",
-          "Run artifacts were removed by the ten-run retention policy",
+          "Historical run artifacts are unavailable",
           410,
         );
       }

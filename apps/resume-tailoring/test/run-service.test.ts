@@ -1139,7 +1139,10 @@ describe("RunApplicationService", () => {
       reviews.push({ id: run.id, artifactId: pdf.id, pdfSha256: pdf.sha256 });
     }
     target.pipelineDatabase.query("UPDATE runs SET status='failed', failed_stage='compiling' WHERE id=?").run(reviews[0]!.id);
-    expect(target.repository.reserveArtifactPruneCandidates(10)).toEqual([reviews[0]!.id, reviews[1]!.id]);
+    target.pipelineDatabase.query(`
+      INSERT INTO run_artifact_retention(run_id, state, selected_at, pruned_at)
+      VALUES (?, 'pruned', 1, 1), (?, 'pruned', 1, 1)
+    `).run(reviews[0]!.id, reviews[1]!.id);
     const prunedDto = await target.service.getRun(reviews[1]!.id);
     expect(prunedDto).toMatchObject({
       status: "review",
@@ -1157,7 +1160,7 @@ describe("RunApplicationService", () => {
     contextAvailable = false;
     const expected = {
       code: "RUN_ARTIFACTS_PRUNED",
-      message: "Run artifacts were removed by the ten-run retention policy",
+      message: "Historical run artifacts are unavailable",
       status: 410,
     };
 
@@ -1181,7 +1184,7 @@ describe("RunApplicationService", () => {
 
     await expect(target.service.getArtifact(run.id, pdf.id)).rejects.toMatchObject({
       code: "RUN_ARTIFACTS_PRUNED",
-      message: "Run artifacts were removed by the ten-run retention policy",
+      message: "Historical run artifacts are unavailable",
       status: 410,
     });
   });

@@ -76,6 +76,21 @@ export interface RunOutputMigrationResult {
   readonly rewrittenArtifacts: number;
 }
 
+export interface RunOutputBackupPublicationOptions {
+  readonly source: string;
+  readonly outputRoot: string;
+  readonly runId: string;
+  readonly queueSequence: number;
+  readonly relativeFiles: readonly string[];
+  readonly limits?: Partial<RunOutputMigrationLimits>;
+  readonly verifyTree: (candidateRunRoot: string, destinationRunRoot: string) => void;
+}
+
+export interface RunOutputBackupPublicationResult {
+  readonly destination: string;
+  readonly moved: boolean;
+}
+
 function contained(root: string, candidate: string): boolean {
   const path = relative(root, candidate);
   return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
@@ -481,6 +496,114 @@ function copyTree(
   }
 }
 
+function normalizeSelectedRelativeFiles(
+  source: string,
+  relativeFiles: readonly string[],
+  limits: RunOutputMigrationLimits,
+): string[] {
+  if (relativeFiles.length < 1) {
+    throw new Error("run output recovery requires at least one persisted artifact file");
+  }
+  if (relativeFiles.length > limits.maxArtifacts) {
+    throw new Error(`run output recovery exceeds the artifact limit of ${limits.maxArtifacts}`);
+  }
+  const normalized = relativeFiles.map((relativeFile) => {
+    const candidate = resolve(source, relativeFile);
+    if (
+      relativeFile.length < 1
+      || isAbsolute(relativeFile)
+      || relative(source, candidate) !== relativeFile
+      || !contained(source, candidate)
+      || candidate === source
+    ) {
+      throw new Error(`persisted artifact path is not a canonical relative file: ${relativeFile}`);
+    }
+    return relativeFile;
+  }).sort((left, right) => left.localeCompare(right));
+  for (let index = 1; index < normalized.length; index++) {
+    if (normalized[index] === normalized[index - 1]) {
+      throw new Error(`persisted artifact path occurs more than once: ${normalized[index]}`);
+    }
+  }
+  return normalized;
+}
+
+function copySelectedFiles(
+  source: string,
+  destination: string,
+  relativeFiles: readonly string[],
+  sourceSnapshot: TreeSnapshot,
+  limits: RunOutputMigrationLimits,
+): TreeSnapshot {
+  const destinationIdentity = identityOf(
+    requireOwnedDirectory(destination, "run output staging directory"),
+  );
+  const directories = new Set<string>();
+  for (const relativeFile of relativeFiles) {
+    let parent = dirname(relativeFile);
+    while (parent !== ".") {
+      directories.add(parent);
+      parent = dirname(parent);
+    }
+  }
+  const orderedDirectories = [...directories].sort((left, right) => {
+    const depthDifference = left.split(sep).length - right.split(sep).length;
+    return depthDifference || left.localeCompare(right);
+  });
+  const budget = newBudget(limits);
+  for (const relativeDirectory of orderedDirectories) {
+    countEntry(budget, "persisted run artifacts");
+    const sourceDirectory = resolve(source, relativeDirectory);
+    const sourceStat = requireOwnedDirectory(sourceDirectory, "run output source");
+    if ((sourceStat.mode & 0o077) !== 0) {
+      throw new Error(`persisted artifact directory must be owner-private: ${sourceDirectory}`);
+    }
+    if (
+      sourceStat.dev !== sourceSnapshot.identity.dev
+      || realpathSync(sourceDirectory) !== sourceDirectory
+    ) {
+      throw new Error(`run output source directory is unsafe: ${sourceDirectory}`);
+    }
+    const destinationDirectory = resolve(destination, relativeDirectory);
+    mkdirSync(destinationDirectory, { mode: 0o700 });
+    const destinationStat = requireOwnedDirectory(
+      destinationDirectory,
+      "run output staging directory",
+    );
+    if (destinationStat.dev !== destinationIdentity.dev) {
+      throw new Error(`run output staging directory crosses a filesystem boundary: ${destinationDirectory}`);
+    }
+  }
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  for (const relativeFile of relativeFiles) {
+    countEntry(budget, "persisted run artifacts");
+    const sourceFile = resolve(source, relativeFile);
+    if (realpathSync(sourceFile) !== sourceFile) {
+      throw new Error(`run output source file traverses a symbolic link: ${sourceFile}`);
+    }
+    const sourceStat = requireRegularFile(sourceFile, "run output source");
+    if (sourceStat.dev !== sourceSnapshot.identity.dev) {
+      throw new Error(`run output source file crosses a filesystem boundary: ${sourceFile}`);
+    }
+    copyRegularFile(
+      sourceFile,
+      resolve(destination, relativeFile),
+      sourceStat,
+      buffer,
+      budget,
+    );
+  }
+  assertDirectoryIdentity(source, sourceSnapshot.identity, "run output source", true);
+  const stagingSnapshot = secureAndSyncTree(destination, limits, destinationIdentity);
+  if (
+    budget.entries !== stagingSnapshot.entries
+    || budget.bytes !== stagingSnapshot.bytes
+  ) {
+    throw new Error("persisted run artifact staging tree changed while it was copied");
+  }
+  return stagingSnapshot;
+}
+
 function regularFilesEqual(
   left: string,
   right: string,
@@ -818,6 +941,148 @@ function publishSource(
       const remaining = lstatIfExists(staging);
       if (remaining !== undefined) {
         const remainingIdentity = identityOf(requireOwnedDirectory(staging, "run output staging directory"));
+        if (!sameIdentity(remainingIdentity, stagingIdentity)) {
+          throw new Error(`run output staging directory identity changed before cleanup: ${staging}`);
+        }
+        removeTree(staging, limits, stagingIdentity, "run output staging directory");
+        assertDirectoryIdentity(staging, stagingIdentity, "run output staging directory", true);
+        rmdirSync(staging);
+        fsyncDirectory(outputRoot, outputRootIdentity);
+      }
+    }
+  }
+}
+export function publishPrivateRunOutputBackup(
+  options: RunOutputBackupPublicationOptions,
+): RunOutputBackupPublicationResult {
+  if (
+    !isAbsolute(options.source)
+    || resolve(options.source) !== options.source
+    || !isAbsolute(options.outputRoot)
+    || resolve(options.outputRoot) !== options.outputRoot
+  ) {
+    throw new Error("run output backup and destination roots must be absolute canonical paths");
+  }
+  if (!Number.isSafeInteger(options.queueSequence) || options.queueSequence < 1) {
+    throw new Error("run output queue sequence must be a positive safe integer");
+  }
+  const limits = resolveMigrationLimits(options.limits);
+  const source = options.source;
+  const outputRoot = options.outputRoot;
+  const destination = directChild(
+    outputRoot,
+    String(options.queueSequence),
+    `run ${options.runId} destination`,
+  );
+  const sourceSnapshot = validateTree(
+    source,
+    `run ${options.runId} migrated backup`,
+    limits,
+  );
+  const sourceRootStat = requireOwnedDirectory(
+    source,
+    `run ${options.runId} migrated backup`,
+  );
+  if ((sourceRootStat.mode & 0o077) !== 0) {
+    throw new Error(`migrated run output backup must be owner-private: ${source}`);
+  }
+  const relativeFiles = normalizeSelectedRelativeFiles(
+    source,
+    options.relativeFiles,
+    limits,
+  );
+  const outputRootStat = requireCanonicalDirectory(outputRoot, "run output root", true);
+  if ((outputRootStat.mode & 0o077) !== 0) {
+    throw new Error(`run output root must be owner-private: ${outputRoot}`);
+  }
+  const outputRootIdentity = identityOf(outputRootStat);
+  requireDistinctCanonicalPaths(source, outputRoot, "migrated run output backup", "run output root");
+  requireDistinctIdentity(sourceSnapshot.identity, outputRootIdentity, source, outputRoot);
+  options.verifyTree(source, destination);
+  assertDirectoryIdentity(
+    source,
+    sourceSnapshot.identity,
+    `run ${options.runId} migrated backup`,
+    true,
+  );
+
+  const staging = join(outputRoot, `.jobhunter-restore-${options.queueSequence}-${randomUUID()}`);
+  mkdirSync(staging, { mode: 0o700 });
+  const stagingIdentity = identityOf(
+    requireOwnedDirectory(staging, "run output staging directory"),
+  );
+  let published = false;
+  try {
+    if (stagingIdentity.dev !== outputRootIdentity.dev) {
+      throw new Error(`run output staging directory is not on the target filesystem: ${staging}`);
+    }
+    const stagingSnapshot = copySelectedFiles(
+      source,
+      staging,
+      relativeFiles,
+      sourceSnapshot,
+      limits,
+    );
+    options.verifyTree(staging, destination);
+    const verifiedStaging = validateTree(
+      staging,
+      "run output staging directory",
+      limits,
+      stagingIdentity,
+    );
+    if (
+      verifiedStaging.entries !== stagingSnapshot.entries
+      || verifiedStaging.bytes !== stagingSnapshot.bytes
+    ) {
+      throw new Error(`run ${options.runId} staging tree changed during verification`);
+    }
+    assertDirectoryIdentity(
+      source,
+      sourceSnapshot.identity,
+      `run ${options.runId} migrated backup`,
+      true,
+    );
+    assertDirectoryIdentity(outputRoot, outputRootIdentity, "run output root", true);
+
+    const existingDestination = lstatIfExists(destination);
+    if (existingDestination !== undefined) {
+      const destinationStat = requireOwnedDirectory(
+        destination,
+        `run ${options.runId} output destination`,
+      );
+      const destinationIdentity = identityOf(destinationStat);
+      if (!treesEqual(
+        staging,
+        destination,
+        limits,
+        stagingIdentity,
+        destinationIdentity,
+      )) {
+        throw new Error(`run ${options.runId} output destination already exists and conflicts: ${destination}`);
+      }
+      secureAndSyncTree(destination, limits, destinationIdentity);
+      fsyncDirectory(outputRoot, outputRootIdentity);
+      return { destination, moved: false };
+    }
+
+    renameSync(staging, destination);
+    published = true;
+    const publishedStat = requireOwnedDirectory(
+      destination,
+      `run ${options.runId} output destination`,
+    );
+    if (!sameIdentity(identityOf(publishedStat), stagingIdentity)) {
+      throw new Error(`run ${options.runId} output identity changed during publication: ${destination}`);
+    }
+    fsyncDirectory(outputRoot, outputRootIdentity);
+    return { destination, moved: true };
+  } finally {
+    if (!published) {
+      const remaining = lstatIfExists(staging);
+      if (remaining !== undefined) {
+        const remainingIdentity = identityOf(
+          requireOwnedDirectory(staging, "run output staging directory"),
+        );
         if (!sameIdentity(remainingIdentity, stagingIdentity)) {
           throw new Error(`run output staging directory identity changed before cleanup: ${staging}`);
         }

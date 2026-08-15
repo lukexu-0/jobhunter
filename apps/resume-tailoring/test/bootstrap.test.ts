@@ -802,11 +802,26 @@ describe("pipeline application bootstrap", () => {
     await fixture.app.close();
   });
 
-  test("an empty startup kick runs automatic application startup after injected maintenance and retention", async () => {
+  test("an empty startup kick preserves old run artifacts and starts automatic applications after injected maintenance", async () => {
     const pipelineDatabase = openPipelineDatabase(":memory:");
     const contextDatabase = openContextDatabase(":memory:");
     const artifactRoot = join(mkdtempSync(join(tmpdir(), "pipeline-empty-startup-")), "runs");
     fixtures.push(join(artifactRoot, ".."));
+    const artifacts = new ArtifactStore(artifactRoot);
+    const seedRepository = new PipelineRepository(pipelineDatabase);
+    const artifactFiles: string[] = [];
+    for (let index = 0; index < 11; index++) {
+      const run = seedRepository.createRun(`old run ${index}`, `old-run-${index}`);
+      pipelineDatabase.query("UPDATE runs SET status='failed', failed_stage='compiling' WHERE id=?")
+        .run(run.id);
+      pipelineDatabase.query("UPDATE revisions SET status='failed' WHERE run_id=? AND revision=1")
+        .run(run.id);
+      const runRoot = join(artifactRoot, String(run.queueSequence));
+      mkdirSync(runRoot, { recursive: true });
+      const artifactFile = join(runRoot, "artifact.txt");
+      writeFileSync(artifactFile, `artifact ${index}`);
+      artifactFiles.push(artifactFile);
+    }
     let providerCalls = 0;
     const maintenanceOrder: string[] = [];
     const context = createContextApplicationService({ database: contextDatabase });
@@ -832,7 +847,7 @@ describe("pipeline application bootstrap", () => {
     const app = createPipelineApplication({
       pipelineDatabase,
       contextDatabase,
-      artifacts: new ArtifactStore(artifactRoot),
+      artifacts,
       context,
       auth,
       workerOptions: {
@@ -847,11 +862,6 @@ describe("pipeline application bootstrap", () => {
         },
       },
     });
-    const reserveCandidates = app.services.repository.reserveArtifactPruneCandidates.bind(app.services.repository);
-    app.services.repository.reserveArtifactPruneCandidates = (retainCount) => {
-      maintenanceOrder.push(`retention:${retainCount}`);
-      return reserveCandidates(retainCount);
-    };
     let signalAutomaticStart!: () => void;
     const automaticStart = new Promise<void>((resolve) => { signalAutomaticStart = resolve; });
     app.services.applicationSessions.startNextAutomaticApplication = async (signal) => {
@@ -863,14 +873,23 @@ describe("pipeline application bootstrap", () => {
 
     app.kick();
     await automaticStart;
+    const artifactContents = artifactFiles.map((artifactFile) =>
+      existsSync(artifactFile) ? readFileSync(artifactFile, "utf8") : undefined,
+    );
+    const retentionMarkerCount = pipelineDatabase.query<{ count: number }, []>(
+      "SELECT count(*) AS count FROM run_artifact_retention",
+    ).get()?.count;
     await app.close();
+
     expect(providerCalls).toBe(0);
     expect(maintenanceOrder).toEqual([
       "injected",
-      "retention:10",
       "automatic-application",
     ]);
-    expect(existsSync(artifactRoot)).toBe(false);
+    expect(artifactContents).toEqual(
+      artifactFiles.map((_, index) => `artifact ${index}`),
+    );
+    expect(retentionMarkerCount).toBe(0);
   });
 
   test("reports automatic application startup failures through the worker error handler", async () => {
