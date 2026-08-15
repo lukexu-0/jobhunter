@@ -5,6 +5,7 @@ import {
   completeLaunchStoragePreparation,
   prepareLaunchStorageForLaunch,
 } from "./launch-storage.ts";
+import { backupUserContextForLaunch } from "./user-context-backup.ts";
 
 const modeArgument = process.argv[2];
 if (modeArgument !== "dev" && modeArgument !== "start") {
@@ -21,6 +22,8 @@ function assertLaunchConfigurationUnchanged(): void {
     throw new Error("Launch checkout or storage configuration changed during preparation");
   }
 }
+assertLaunchConfigurationUnchanged();
+await backupUserContextForLaunch(mode, appsRoot);
 assertLaunchConfigurationUnchanged();
 const {
   JOBHUNTER_ARTIFACT_MIGRATION_RECEIPT: _ignoredArtifactMigrationReceipt,

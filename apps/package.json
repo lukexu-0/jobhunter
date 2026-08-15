@@ -12,7 +12,9 @@
     "start": "bun scripts/serve.ts start",
     "typecheck": "bun run --cwd resume-tailoring typecheck && bun run --cwd web typecheck",
     "build": "bun run --cwd resume-tailoring build && bun run --cwd web build",
-    "test": "bun test scripts/launch-config.test.ts && bun test --cwd resume-tailoring && bun test --cwd web",
-    "artifacts:restore": "bun scripts/restore-artifacts.ts"
+    "test": "bun test scripts/launch-config.test.ts scripts/user-context-backup.test.ts && bun test --cwd resume-tailoring && bun test --cwd web",
+    "artifacts:restore": "bun scripts/restore-artifacts.ts",
+    "user-context:backup": "bun scripts/backup-user-context.ts",
+    "user-context:restore": "bun scripts/restore-user-context.ts"
   }
 }
