@@ -1,9 +1,228 @@
 import { describe, expect, test } from "bun:test";
-import { fstatSync, realpathSync } from "node:fs";
-import { mkdtemp } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { existsSync, fstatSync, lstatSync, realpathSync } from "node:fs";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runTrustedProcess, sanitizedEnvironment, type ProcessBoundary, type SpawnContract } from "../src/system/process.ts";
+import {
+  BROWSER_RESOURCE_PROFILE,
+  TRUSTED_PROGRAMS,
+  runTrustedProcess,
+  sanitizedEnvironment,
+  type ProcessBoundary,
+  type SpawnContract,
+  type TrustedProcessRequest,
+} from "../src/system/process.ts";
+
+test("trusts only the fixed document toolchain and headless Chrome", () => {
+  expect(TRUSTED_PROGRAMS).toEqual([
+    "latexmk",
+    "pdfinfo",
+    "pdftotext",
+    "pdffonts",
+    "pdftoppm",
+    "google-chrome",
+  ]);
+});
+
+test("requires the fixed hardened browser profile only for trusted Chrome requests", async () => {
+  let launches = 0;
+  let seen: SpawnContract | undefined;
+  const boundary: ProcessBoundary = (contract) => {
+    launches++;
+    seen = contract;
+    return {
+      pid: 4099,
+      stdout: (async function* () {})(),
+      stderr: (async function* () {})(),
+      wait: async () => ({ code: 0, signal: null }),
+      kill: async () => undefined,
+    };
+  };
+  const common = { args: [], cwd: process.cwd(), timeoutMs: 1_000 } as const;
+
+  await expect(runTrustedProcess({
+    command: "google-chrome",
+    ...common,
+  } as unknown as TrustedProcessRequest, boundary)).rejects.toThrow(/resource profile/i);
+  await expect(runTrustedProcess({
+    command: "pdfinfo",
+    resourceProfile: "browser-renderer",
+    ...common,
+  } as unknown as TrustedProcessRequest, boundary)).rejects.toThrow(/resource profile/i);
+  expect(launches).toBe(0);
+
+  await runTrustedProcess({
+    command: "google-chrome",
+    resourceProfile: "browser-renderer",
+    ...common,
+  }, boundary);
+  expect(launches).toBe(1);
+  expect(seen?.env).toEqual(sanitizedEnvironment());
+  expect(seen?.env).not.toHaveProperty("XDG_RUNTIME_DIR");
+  expect(seen?.resourceProfile).toEqual({
+    name: "browser-renderer",
+    privateProfileDirectory: "/tmp/jobhunter-rendered-job-profile",
+    unitProperties: [
+      "MemoryMax=512M",
+      "MemorySwapMax=0",
+      "TasksMax=256",
+      "CPUQuota=200%",
+      "RuntimeMaxSec=10s",
+      "TimeoutStopSec=1s",
+      "KillMode=control-group",
+      "OOMPolicy=stop",
+      "LimitCORE=0",
+      "TemporaryFileSystem=/tmp:rw,size=128M,mode=0700",
+      "PrivateUsers=yes",
+      "ProtectHome=yes",
+      "ProtectSystem=strict",
+      "ProtectControlGroups=yes",
+      "ProtectKernelTunables=yes",
+      "ProtectKernelModules=yes",
+      "ProtectKernelLogs=yes",
+      "PrivateDevices=yes",
+      "PrivateIPC=yes",
+      "NoNewPrivileges=yes",
+      "CapabilityBoundingSet=",
+      "RestrictSUIDSGID=yes",
+      "LockPersonality=yes",
+      "ProtectProc=invisible",
+      "ProcSubset=pid",
+      "IPAddressDeny=any",
+      "IPAddressAllow=localhost",
+    ],
+  });
+});
+
+const chromeExecutableExists = [
+  "/usr/local/bin/google-chrome",
+  "/usr/bin/google-chrome",
+  "/bin/google-chrome",
+].some(existsSync);
+let userManagerAvailable = false;
+if (
+  process.platform === "linux"
+  && process.getuid !== undefined
+  && existsSync("/usr/bin/systemd-run")
+  && existsSync("/usr/bin/systemctl")
+) {
+  const uid = process.getuid();
+  const runtimeDirectory = `/run/user/${uid}`;
+  try {
+    const runtime = lstatSync(runtimeDirectory);
+    userManagerAvailable = runtime.isDirectory()
+      && !runtime.isSymbolicLink()
+      && runtime.uid === uid
+      && (runtime.mode & 0o7777) === 0o700
+      && spawnSync("systemctl", ["--user", "show-environment"], {
+        env: {
+          ...sanitizedEnvironment(),
+          XDG_RUNTIME_DIR: runtimeDirectory,
+        },
+        shell: false,
+        stdio: "ignore",
+        timeout: 1_000,
+      }).status === 0;
+  } catch {
+    userManagerAvailable = false;
+  }
+}
+
+describe.skipIf(!chromeExecutableExists || !userManagerAvailable)(
+  "default browser process boundary (requires Chrome and a systemd user manager)",
+  () => {
+    test("runs a headless render in the private tmpfs and collects the hardened service", async () => {
+      const cwd = await mkdtemp(join(tmpdir(), "pipeline-browser-boundary-"));
+      try {
+        const result = await runTrustedProcess({
+          command: "google-chrome",
+          args: [
+            "--headless=new",
+            "--dump-dom",
+            `--user-data-dir=${cwd}`,
+            "data:text/html,<html><body><main>contained-render</main></body></html>",
+          ],
+          cwd,
+          timeoutMs: 9_000,
+          resourceProfile: BROWSER_RESOURCE_PROFILE.name,
+        });
+
+        expect(result).toMatchObject({
+          command: "google-chrome",
+          code: 0,
+          signal: null,
+          timedOut: false,
+          aborted: false,
+        });
+        expect(Buffer.from(result.stdout.data).toString()).toContain("contained-render");
+        expect(await readdir(cwd)).toEqual([]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("honors the forced proxy for loopback URLs without a direct-network fallback", async () => {
+      let directConnections = 0;
+      let proxyConnections = 0;
+      const canary: Server = createServer((socket) => {
+        directConnections += 1;
+        socket.destroy();
+      });
+      const proxy: Server = createServer((socket) => {
+        proxyConnections += 1;
+        socket.once("data", () => {
+          socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        });
+      });
+      const listen = async (server: Server): Promise<number> => {
+        const listening = Promise.withResolvers<void>();
+        server.once("error", listening.reject);
+        server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, listening.resolve);
+        await listening.promise;
+        const address = server.address();
+        if (address === null || typeof address === "string") throw new Error("test server did not bind TCP");
+        return address.port;
+      };
+      const close = async (server: Server): Promise<void> => {
+        const closed = Promise.withResolvers<void>();
+        server.close((error) => error ? closed.reject(error) : closed.resolve());
+        await closed.promise;
+      };
+      const canaryPort = await listen(canary);
+      const proxyPort = await listen(proxy);
+      const cwd = await mkdtemp(join(tmpdir(), "pipeline-browser-egress-"));
+
+      try {
+        const result = await runTrustedProcess({
+          command: "google-chrome",
+          args: [
+            "--headless=new",
+            "--dump-dom",
+            "--virtual-time-budget=1000",
+            `--user-data-dir=${cwd}`,
+            `--proxy-server=http://127.0.0.1:${proxyPort}`,
+            "--proxy-bypass-list=<-loopback>",
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+            `http://127.0.0.1:${canaryPort}/`,
+          ],
+          cwd,
+          timeoutMs: 9_000,
+          resourceProfile: BROWSER_RESOURCE_PROFILE.name,
+        });
+
+        expect(result.timedOut).toBeFalse();
+        expect(result.aborted).toBeFalse();
+        expect(proxyConnections).toBeGreaterThan(0);
+        expect(directConnections).toBe(0);
+      } finally {
+        await Promise.all([close(canary), close(proxy)]);
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }, 15_000);
+  },
+);
 
 describe.skipIf(process.platform !== "linux")("trusted process TeX environment (requires Linux /proc parent-held cache descriptors)", () => {
   test("uses only fixed sanitized values and an opaque parent-held TeX root", async () => {
@@ -104,7 +323,7 @@ describe("trusted process lifecycle", () => {
       let parentAlive = true;
       let descendantAlive = true;
       let killSignal: NodeJS.Signals | undefined;
-      let killTarget: "process-group" | undefined;
+      let killTarget: "process-group" | "browser-cgroup" | undefined;
       let openReaders = 2;
 
       const output = (text: string): AsyncIterable<Uint8Array> => (async function* () {
@@ -177,7 +396,7 @@ describe("trusted process lifecycle", () => {
     const controller = new AbortController();
     const exit = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
     let killSignal: NodeJS.Signals | undefined;
-    let killTarget: "process-group" | undefined;
+    let killTarget: "process-group" | "browser-cgroup" | undefined;
 
     const boundary: ProcessBoundary = () => {
       const running = {
@@ -185,7 +404,7 @@ describe("trusted process lifecycle", () => {
         stdout: (async function* () {})(),
         stderr: (async function* () {})(),
         wait: () => exit.promise,
-        kill: async (signal: NodeJS.Signals, target: "process-group") => {
+        kill: async (signal: NodeJS.Signals, target: "process-group" | "browser-cgroup") => {
           killSignal = signal;
           killTarget = target;
           exit.resolve({ code: null, signal });
