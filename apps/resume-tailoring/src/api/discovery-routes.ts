@@ -23,6 +23,7 @@ export interface DiscoveryRouteService {
 
 const LIST_PARAMETERS: Readonly<Record<string, true>> = {
   role: true,
+  suitable: true,
   maxAgeDays: true,
   status: true,
   hideQueued: true,
@@ -106,6 +107,7 @@ function parseListRequest(url: URL): DiscoveryListRequest | undefined {
     if (LIST_PARAMETERS[key] !== true || url.searchParams.getAll(key).length !== 1) return undefined;
   }
   const role = url.searchParams.get("role");
+  const suitable = url.searchParams.get("suitable");
   const status = url.searchParams.get("status");
   const hideQueued = url.searchParams.get("hideQueued");
   const sort = url.searchParams.get("sort");
@@ -113,6 +115,9 @@ function parseListRequest(url: URL): DiscoveryListRequest | undefined {
   const maxAgeDays = url.searchParams.get("maxAgeDays");
   const parsed = DiscoveryListRequestSchema.safeParse({
     ...(role === null ? {} : { role }),
+    ...(suitable === null
+      ? {}
+      : { suitable: suitable === "true" ? true : suitable === "false" ? false : suitable }),
     ...(status === null ? {} : { status }),
     ...(hideQueued === null
       ? {}

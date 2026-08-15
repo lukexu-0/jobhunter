@@ -1012,6 +1012,7 @@ describe("pipeline discovery requests", () => {
       role: "machine_learning",
       maxAgeDays: 14,
       status: "queued",
+      suitable: false,
       sort: "source",
       hideQueued: true,
       search: "model evaluation",
@@ -1019,7 +1020,7 @@ describe("pipeline discovery requests", () => {
       offset: 0,
     })).resolves.toEqual(response);
     expect(requests).toEqual([{
-      input: "/api/pipeline/discovery?role=machine_learning&maxAgeDays=14&status=queued&sort=source&hideQueued=true&search=model+evaluation&limit=1000&offset=0",
+      input: "/api/pipeline/discovery?role=machine_learning&maxAgeDays=14&status=queued&suitable=false&sort=source&hideQueued=true&search=model+evaluation&limit=1000&offset=0",
       init: { cache: "no-store", method: "GET" },
     }]);
   });

@@ -595,6 +595,10 @@ export class DiscoveryRepository {
       )`);
       parameters.push(options.role);
     }
+    if (options.suitable !== undefined) {
+      where.push("jobs.suitable = ?");
+      parameters.push(options.suitable ? 1 : 0);
+    }
     if (options.maxAgeDays !== null) {
       where.push("coalesce(jobs.posted_at, jobs.first_seen_at) >= ?");
       parameters.push(this.#now() - options.maxAgeDays * DAY_MS);

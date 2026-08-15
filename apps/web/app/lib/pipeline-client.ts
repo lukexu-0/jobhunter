@@ -233,6 +233,7 @@ function discoveryQuery(request: DiscoveryListRequest): string {
   if (request.role) query.set("role", request.role);
   query.set("maxAgeDays", request.maxAgeDays === null ? "all" : String(request.maxAgeDays));
   query.set("status", request.status);
+  if (request.suitable !== undefined) query.set("suitable", String(request.suitable));
   query.set("sort", request.sort);
   query.set("hideQueued", String(request.hideQueued));
   query.set("search", request.search);

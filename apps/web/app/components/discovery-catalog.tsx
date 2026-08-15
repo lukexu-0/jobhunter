@@ -84,6 +84,7 @@ const RECENT_OPTIONS = [
 type RecentFilter = (typeof RECENT_OPTIONS)[number][0];
 type RoleFilter = DiscoveryRole | "all";
 type StatusFilter = DiscoveryJob["status"] | "all";
+type SuitabilityFilter = "all" | "true" | "false";
 type Mutation = "queue" | "sync" | null;
 
 const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
@@ -173,6 +174,7 @@ type DiscoveryViewTransition =
   | "role"
   | "recency"
   | "status"
+  | "suitability"
   | "search"
   | "sort"
   | "visibility";
@@ -445,6 +447,7 @@ export function DiscoveryCatalog() {
   const [role, setRole] = useState<RoleFilter>("all");
   const [recent, setRecent] = useState<RecentFilter>("7");
   const [status, setStatus] = useState<StatusFilter>("open");
+  const [suitability, setSuitability] = useState<SuitabilityFilter>("all");
   const [sort, setSort] = useState<DiscoverySort>("recency");
   const [hideQueuedPreference, setHideQueuedPreference] = useState(true);
   const [searchDraft, setSearchDraft] = useState("");
@@ -484,6 +487,7 @@ export function DiscoveryCatalog() {
         ...(role === "all" ? {} : { role }),
         maxAgeDays: recent === "all" ? null : Number(recent),
         status,
+        ...(suitability === "all" ? {} : { suitable: suitability === "true" }),
         search,
         sort,
         hideQueued: effectiveHideQueued,
@@ -514,6 +518,7 @@ export function DiscoveryCatalog() {
     role,
     search,
     sort,
+    suitability,
     status,
   ]);
 
@@ -728,6 +733,24 @@ export function DiscoveryCatalog() {
               <option value="queued">Queued</option>
               <option value="closed">Closed</option>
               <option value="all">All statuses</option>
+            </select>
+          </label>
+          <label className="select-control">
+            <span>Suitability</span>
+            <select
+              aria-label="Filter internships by suitability"
+              disabled={isMutating}
+              onChange={(event) => {
+                setQueueError(null);
+                beginDiscoveryViewTransition("suitability");
+                setOffset(0);
+                setSuitability(event.currentTarget.value as SuitabilityFilter);
+              }}
+              value={suitability}
+            >
+              <option value="all">All suitability</option>
+              <option value="true">Suitable</option>
+              <option value="false">Unsuitable</option>
             </select>
           </label>
           <label className="select-control">
