@@ -207,7 +207,7 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
-  test("synchronizes the Jobhunter source and exposes its three directives alongside Sample Testing", () => {
+  test("synchronizes the Jobhunter source and exposes its three directives alongside two Sample Testing directives", () => {
     const loaded = loadContextManifest();
     const database = openContextDatabase(":memory:");
     try {
@@ -232,6 +232,7 @@ describe("allowlisted context ingestion", () => {
         .filter((directive) => directive.sourceId === "automated-testing-resume-info")
         .map((directive) => directive.text)).toEqual([
         "- **Required framing:** Present Sample Testing/System A as an **agentic testing platform/workflow**, not as generic automation.",
+        "- **Required outcome directive:** Include only the synthetic fixture outcome.",
       ]);
     } finally {
       database.close();
