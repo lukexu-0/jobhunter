@@ -417,7 +417,7 @@ function findPhrase(boxes: readonly WordBox[], phrase: string): BoxRange | undef
       if (
         box.page !== page
         || indexedToken.token !== tokens[offset]
-        || (previousBox && !sameVisualTextLine(previousBox, box))
+        || (previousBox && !boxesAreContinuous(previousBox, box))
       ) {
         matches = false;
         break;
@@ -441,42 +441,6 @@ function boxesAreContinuous(left: WordBox, right: WordBox): boolean {
     && left.blockIndex === right.blockIndex
     && right.lineIndex === left.lineIndex + 1;
 }
-
-function hasPhrase(boxes: readonly WordBox[], phrase: string): boolean {
-  const tokens = canonicalTokens(phrase);
-  if (tokens.length === 0) return false;
-  const indexedTokens: Array<{ token: string | null; boxIndex: number }> = [];
-  for (const [boxIndex, box] of boxes.entries()) {
-    const boxTokens = canonicalTokens(box.text);
-    if (boxTokens.length === 0) {
-      indexedTokens.push({ token: null, boxIndex });
-      continue;
-    }
-    for (const token of boxTokens) indexedTokens.push({ token, boxIndex });
-  }
-  for (let start = 0; start + tokens.length <= indexedTokens.length; start++) {
-    let matches = true;
-    for (let offset = 0; offset < tokens.length; offset++) {
-      const indexedToken = indexedTokens[start + offset]!;
-      const previousToken = offset > 0 ? indexedTokens[start + offset - 1]! : undefined;
-      if (
-        indexedToken.token !== tokens[offset]
-        || (previousToken
-          && previousToken.boxIndex !== indexedToken.boxIndex
-          && !boxesAreContinuous(
-            boxes[previousToken.boxIndex]!,
-            boxes[indexedToken.boxIndex]!,
-          ))
-      ) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches) return true;
-  }
-  return false;
-}
-
 
 function keywordMatches(
   atsKeywordExtraction: AtsKeywordExtraction,
@@ -503,7 +467,7 @@ function keywordMatches(
     const resume = resumeCandidates
       .map((candidate) => findPhrase(resumeBoxes, candidate))
       .find(Boolean);
-    coverage.push({ id: keyword.id, phrase: keyword.phrase, found: hasPhrase(resumeBoxes, keyword.phrase) });
+    coverage.push({ id: keyword.id, phrase: keyword.phrase, found: resume !== undefined });
     const job = findPhrase(jobBoxes, keyword.phrase);
     if (!job) continue;
     if (resume) matches.push({ resume, job });
