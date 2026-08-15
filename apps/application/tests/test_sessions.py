@@ -312,6 +312,7 @@ class FakePlaywrightRuntime:
     close_cancels_active: bool = True
     close_blocker: asyncio.Event | None = None
     close_started: asyncio.Event = field(default_factory=asyncio.Event)
+    close_observer: Callable[[], None] | None = None
     runtime_started: bool = False
     closed: bool = False
     active_task: asyncio.Task[Any] | None = None
@@ -351,6 +352,7 @@ class FakePlaywrightRuntime:
             return self.result
         finally:
             self.active_task = None
+            self.order.append("runtime.execute_finished")
 
     async def get_current_page_url(self) -> str:
         return self.current_url
@@ -418,6 +420,8 @@ class FakePlaywrightRuntime:
         )
 
     async def close(self) -> None:
+        if self.close_observer is not None:
+            self.close_observer()
         self.order.append("runtime.close")
         self.close_started.set()
         if self.close_failures:
@@ -707,6 +711,20 @@ def assert_service_error(
     assert (error.status_code, error.code, error.public_message) == (status, code, message)
 
 
+async def runtime_action(
+    manager: ApplicationSessionManager,
+    session_id: UUID,
+    action: Any,
+    *,
+    action_id: UUID | None = None,
+) -> Any:
+    return await manager.runtime_action(
+        session_id,
+        action_id or uuid4(),
+        action,
+    )
+
+
 def decode_frame(frame: str) -> dict[str, Any]:
     data_line = next(line for line in frame.splitlines() if line.startswith("data: "))
     return json.loads(data_line.removeprefix("data: "))
@@ -774,7 +792,8 @@ async def test_steer_interrupts_a_pending_gate_but_rejects_inactive_generations(
     )
     guidance = "use the corrected sign-in instructions"
     navigation = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanNavigationRuntimeAction(
                 type="request_human_navigation",
@@ -964,7 +983,8 @@ async def test_gate_commands_conflict_while_steering_dispatch_is_in_flight(
     assert record is not None and record.human_gate is not None
 
     navigation = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanNavigationRuntimeAction(
                 type="request_human_navigation",
@@ -1020,7 +1040,8 @@ async def test_new_gate_can_steer_while_superseded_steer_is_unresolved(
     )
     await asyncio.wait_for(fakes.models[0].steer_started.wait(), timeout=1)
     navigation = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanNavigationRuntimeAction(
                 type="request_human_navigation",
@@ -1078,7 +1099,8 @@ async def test_final_submit_waits_for_superseded_steering_dispatch(
     )
     await asyncio.wait_for(fakes.models[0].steer_started.wait(), timeout=1)
     review = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -1536,7 +1558,8 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     with pytest.raises(HarnessServiceError) as submit:
         await manager.command(created.session_id, SubmitCommand(type="submit"))
     assert submit.value.code == "command_conflict"
-    submission_response = await manager.runtime_action(
+    submission_response = await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -1596,7 +1619,8 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
         await manager.command(created.session_id, CancelCommand(type="cancel"))
     assert submitted_command.value.code == "command_conflict"
     with pytest.raises(HarnessServiceError) as submitted_runtime:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('late')"]),
         )
@@ -2349,7 +2373,8 @@ async def test_submission_action_cannot_start_after_absolute_deadline(
 
     try:
         with pytest.raises(HarnessServiceError) as caught:
-            await manager.runtime_action(
+            await runtime_action(
+                manager,
                 created.session_id,
                 PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
             )
@@ -3580,7 +3605,8 @@ async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces
     )
     record.playwright_runtime = runtime
 
-    result = await manager.runtime_action(
+    result = await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
@@ -3610,7 +3636,8 @@ async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces
     assert record.events[-1].session.playwright_cli_diagnostics == diagnostic
 
     with pytest.raises(HarnessServiceError) as raised:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('again')"]),
         )
@@ -3660,7 +3687,8 @@ async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
     )
     record.playwright_runtime = FakePlaywrightRuntime(result=execution)
 
-    response = await manager.runtime_action(
+    response = await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -3705,7 +3733,8 @@ async def test_runtime_human_navigation_maps_guard_suspension_runtime_errors(
     events_before = tuple(record.events)
 
     with pytest.raises(HarnessServiceError) as raised:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             RequestHumanNavigationRuntimeAction(
                 type="request_human_navigation",
@@ -3723,8 +3752,8 @@ async def test_runtime_human_navigation_maps_guard_suspension_runtime_errors(
     assert record.snapshot == snapshot_before
     assert tuple(record.events) == events_before
     assert record.human_gate.pending_kind is None
-    assert record.runtime_action_pending is False
-    assert record.runtime_action_task is None
+    assert record.runtime_action_task is not None
+    assert record.runtime_action_task.done()
     await manager.delete(created.session_id)
 
 
@@ -3757,11 +3786,11 @@ async def test_runtime_playwright_cli_errors_count_toward_step_limit(
 
     for _attempt in range(2):
         with pytest.raises(HarnessServiceError) as raised:
-            await manager.runtime_action(created.session_id, action)
+            await runtime_action(manager, created.session_id, action)
         assert raised.value.code == "browser_failed"
 
     with pytest.raises(HarnessServiceError) as raised:
-        await manager.runtime_action(created.session_id, action)
+        await runtime_action(manager, created.session_id, action)
 
     assert_service_error(
         raised.value,
@@ -3798,7 +3827,8 @@ async def test_runtime_playwright_cli_action_persists_only_redacted_process_diag
         )
     )
 
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('private code')"]),
     )
@@ -3867,7 +3897,8 @@ async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagno
     record.playwright_runtime = FakePlaywrightRuntime(error=PlaywrightCliRuntimeError(error_code))
 
     with pytest.raises(HarnessServiceError) as raised:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('private code')"]),
         )
@@ -3901,14 +3932,16 @@ async def test_runtime_additional_info_continue_resumes_same_run_without_persist
     record = manager._active
     assert record is not None and record.human_gate is not None
     record.playwright_runtime = FakePlaywrightRuntime()
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
     store_path = tmp_path / "user-info.json"
     store_before = store_path.read_bytes()
     pending = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestAdditionalInfoRuntimeAction(
                 type="request_additional_info",
@@ -4023,7 +4056,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     )
 
     with pytest.raises(HarnessServiceError) as before_playwright_runtime:
-        await manager.runtime_action(created.session_id, action)
+        await runtime_action(manager, created.session_id, action)
     assert_service_error(
         before_playwright_runtime.value,
         409,
@@ -4031,12 +4064,13 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         "Inspect the application before requesting additional information",
     )
 
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
     pending = asyncio.create_task(
-        manager.runtime_action(created.session_id, action)
+        runtime_action(manager, created.session_id, action)
     )
     await wait_until(lambda: record.human_gate.pending_kind == "additional_info")
     assert manager.get_snapshot(created.session_id).state == "awaiting_additional_info"
@@ -4298,7 +4332,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
 
     record.additional_info_question_count = 99
     with pytest.raises(HarnessServiceError) as over_limit:
-        await manager.runtime_action(created.session_id, action)
+        await runtime_action(manager, created.session_id, action)
     assert_service_error(
         over_limit.value,
         409,
@@ -4335,7 +4369,8 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     runtime = FakePlaywrightRuntime(blocker=blocker)
     record.playwright_runtime = runtime
     active = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('blocked')"]),
         )
@@ -4343,7 +4378,8 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     await runtime.started.wait()
 
     with pytest.raises(HarnessServiceError) as raised:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             ReportApplicationMismatchRuntimeAction(
                 type="report_application_mismatch"
@@ -4362,6 +4398,197 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     await manager.delete(created.session_id)
 
 
+async def test_runtime_action_same_key_joins_replays_and_survives_requester_cancellation(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    blocker = asyncio.Event()
+    runtime = FakePlaywrightRuntime(blocker=blocker)
+    record.playwright_runtime = runtime
+    action_id = UUID("d037ec31-777a-487b-89c6-225981aa1b58")
+    action = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="snapshot",
+        args=[],
+    )
+
+    requester = asyncio.create_task(
+        manager.runtime_action(created.session_id, action_id, action)
+    )
+    await runtime.started.wait()
+    joined = asyncio.create_task(
+        manager.runtime_action(created.session_id, action_id, action)
+    )
+    await asyncio.sleep(0)
+    requester.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await requester
+
+    owner = record.runtime_action_task
+    assert owner is not None
+    assert owner is not requester
+    assert not owner.done()
+    assert not joined.done()
+    assert runtime.commands == [("snapshot", [])]
+
+    blocker.set()
+    joined_result = await joined
+    replayed_result = await manager.runtime_action(
+        created.session_id,
+        action_id,
+        action,
+    )
+
+    assert replayed_result is joined_result
+    assert runtime.commands == [("snapshot", [])]
+    assert record.playwright_cli_action_count == 1
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_action_idempotency_conflicts_are_distinct_and_do_not_dispatch(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    blocker = asyncio.Event()
+    runtime = FakePlaywrightRuntime(blocker=blocker)
+    record.playwright_runtime = runtime
+    first_id = UUID("82a4bfce-4bd1-4a98-bc6e-2890d5fc02f6")
+    replacement_id = UUID("cc8b251d-552d-4946-8ac9-eb82ef1370ea")
+    first_action = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="snapshot",
+        args=[],
+    )
+    different_payload = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="eval",
+        args=["() => document.title"],
+    )
+    active = asyncio.create_task(
+        manager.runtime_action(created.session_id, first_id, first_action)
+    )
+    await runtime.started.wait()
+
+    with pytest.raises(HarnessServiceError) as payload_mismatch:
+        await manager.runtime_action(
+            created.session_id,
+            first_id,
+            different_payload,
+        )
+    assert_service_error(
+        payload_mismatch.value,
+        409,
+        "command_conflict",
+        "The idempotency key was already used for a different runtime action",
+    )
+
+    with pytest.raises(HarnessServiceError) as different_active_key:
+        await manager.runtime_action(
+            created.session_id,
+            replacement_id,
+            different_payload,
+        )
+    assert_service_error(
+        different_active_key.value,
+        409,
+        "command_conflict",
+        "A runtime action is already pending",
+    )
+    assert runtime.commands == [("snapshot", [])]
+
+    blocker.set()
+    await active
+    await manager.runtime_action(
+        created.session_id,
+        replacement_id,
+        different_payload,
+    )
+
+    with pytest.raises(HarnessServiceError) as stale_key:
+        await manager.runtime_action(
+            created.session_id,
+            first_id,
+            first_action,
+        )
+    assert_service_error(
+        stale_key.value,
+        409,
+        "command_conflict",
+        "The idempotency key is no longer current",
+    )
+    assert runtime.commands == [
+        ("snapshot", []),
+        ("eval", ["() => document.title"]),
+    ]
+    await manager.delete(created.session_id)
+
+async def test_runtime_action_idempotency_key_limit_conflicts_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = make_manager(tmp_path, blocked_runner)
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    runtime = FakePlaywrightRuntime()
+    record.playwright_runtime = runtime
+    current_id = UUID("a8811440-54f0-4630-bce9-e4446ad76252")
+    fresh_id = UUID(int=4096)
+    action = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="snapshot",
+        args=[],
+    )
+
+    first_result = await manager.runtime_action(
+        created.session_id,
+        current_id,
+        action,
+    )
+    current_task = record.runtime_action_task
+    record.runtime_action_ids_seen.update(
+        UUID(int=value) for value in range(1, 4096)
+    )
+    assert len(record.runtime_action_ids_seen) == 4096
+
+    replayed_result = await manager.runtime_action(
+        created.session_id,
+        current_id,
+        action,
+    )
+    assert replayed_result is first_result
+    assert runtime.commands == [("snapshot", [])]
+
+    with pytest.raises(HarnessServiceError) as at_capacity:
+        await manager.runtime_action(
+            created.session_id,
+            fresh_id,
+            action,
+        )
+
+    assert_service_error(
+        at_capacity.value,
+        409,
+        "command_conflict",
+        "The runtime action idempotency key limit was reached",
+    )
+    assert fresh_id not in record.runtime_action_ids_seen
+    assert record.runtime_action_id == current_id
+    assert record.runtime_action_payload == action
+    assert record.runtime_action_task is current_task
+    assert runtime.commands == [("snapshot", [])]
+    assert record.playwright_cli_action_count == 1
+    await manager.delete(created.session_id)
+
+
 async def test_runtime_navigation_registers_exact_origin_automatically(
     tmp_path: Path,
 ) -> None:
@@ -4377,7 +4604,8 @@ async def test_runtime_navigation_registers_exact_origin_automatically(
     record.playwright_runtime = FakePlaywrightRuntime()
 
     navigation = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanNavigationRuntimeAction(
                 type="request_human_navigation",
@@ -4411,7 +4639,8 @@ async def test_runtime_review_rejects_a_result_for_another_job_before_gate(
     )
 
     response = await asyncio.wait_for(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -4467,7 +4696,8 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
     record.playwright_runtime = runtime
 
     approved = await asyncio.wait_for(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -4486,7 +4716,8 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
 
 
     navigation = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanNavigationRuntimeAction(
                 type="request_human_navigation",
@@ -4533,7 +4764,7 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
     )
     for forbidden in forbidden_actions:
         with pytest.raises(HarnessServiceError) as raised:
-            await manager.runtime_action(created.session_id, forbidden)
+            await runtime_action(manager, created.session_id, forbidden)
         assert_service_error(
             raised.value,
             409,
@@ -4542,7 +4773,8 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
             "submission approval",
         )
 
-    first = await manager.runtime_action(
+    first = await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["#final-submit"]),
     )
@@ -4553,7 +4785,8 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
     assert "?private=value" not in first.model_dump_json()
     assert manager.get_snapshot(created.session_id).state == "submitting"
 
-    second = await manager.runtime_action(
+    second = await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
@@ -4585,7 +4818,8 @@ async def test_manual_review_returns_exact_submit_permission(
     assert record is not None and record.human_gate is not None
 
     review = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -4612,7 +4846,8 @@ async def test_steer_rejects_after_submission_approval_before_browser_action(
     assert record is not None and record.human_gate is not None
 
     review = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -4653,7 +4888,8 @@ async def test_submission_approval_rejects_while_steering_is_in_flight(
     assert record is not None and record.human_gate is not None
 
     review = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -4716,7 +4952,8 @@ async def test_auto_submit_review_conflicts_while_steering_is_in_flight(
     )
     await asyncio.wait_for(fakes.models[0].steer_started.wait(), timeout=1)
     with pytest.raises(HarnessServiceError) as raised:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -4733,7 +4970,8 @@ async def test_auto_submit_review_conflicts_while_steering_is_in_flight(
 
     steer_blocker.set()
     await steering
-    approved = await manager.runtime_action(
+    approved = await runtime_action(
+        manager,
         created.session_id,
         RequestHumanReviewRuntimeAction(
             type="request_human_review",
@@ -4757,7 +4995,8 @@ async def test_first_approved_playwright_cli_execution_failure_parks_uncertainty
     )
     record.playwright_runtime = runtime
 
-    review = await manager.runtime_action(
+    review = await runtime_action(
+        manager,
         created.session_id,
         RequestHumanReviewRuntimeAction(
             type="request_human_review",
@@ -4768,7 +5007,8 @@ async def test_first_approved_playwright_cli_execution_failure_parks_uncertainty
     assert record.human_gate.pending_kind is None
 
     with pytest.raises(HarnessServiceError) as failed:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
@@ -4809,7 +5049,8 @@ async def test_first_approved_human_navigation_guard_failure_parks_uncertainty_w
     assert record is not None and record.human_gate is not None
     runtime = fakes.runtimes[0]
 
-    review = await manager.runtime_action(
+    review = await runtime_action(
+        manager,
         created.session_id,
         RequestHumanReviewRuntimeAction(
             type="request_human_review",
@@ -4822,7 +5063,8 @@ async def test_first_approved_human_navigation_guard_failure_parks_uncertainty_w
     )
 
     with pytest.raises(HarnessServiceError) as failed:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             RequestHumanNavigationRuntimeAction(
                 type="request_human_navigation",
@@ -4846,8 +5088,8 @@ async def test_first_approved_human_navigation_guard_failure_parks_uncertainty_w
     assert manager._active is record
     assert record.final_request is None
     assert record.finalized is False
-    assert record.runtime_action_pending is False
-    assert record.runtime_action_task is None
+    assert record.runtime_action_task is not None
+    assert record.runtime_action_task.done()
     assert runtime.closed is False
     assert fakes.models[0].closed is False
     await manager.delete(created.session_id)
@@ -4862,7 +5104,8 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     record = manager._active
     assert record is not None and record.human_gate is not None
 
-    review = await manager.runtime_action(
+    review = await runtime_action(
+        manager,
         created.session_id,
         RequestHumanReviewRuntimeAction(
             type="request_human_review",
@@ -4873,7 +5116,8 @@ async def test_submit_latch_wins_a_queued_cancel_race(
 
     await record.request_lock.acquire()
     submission = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
@@ -4915,7 +5159,8 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     record = manager._active
     assert record is not None and record.human_gate is not None
 
-    review = await manager.runtime_action(
+    review = await runtime_action(
+        manager,
         created.session_id,
         RequestHumanReviewRuntimeAction(
             type="request_human_review",
@@ -4926,7 +5171,8 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
 
     await record.request_lock.acquire()
     submission = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
@@ -4999,7 +5245,8 @@ async def test_submit_latch_wins_a_queued_model_failure(
 
     await record.request_lock.acquire()
     submission = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
         )
@@ -5058,7 +5305,8 @@ async def test_post_action_model_failures_park_uncertainty(
     record = manager._active
     assert record is not None and record.human_gate is not None
     await wait_until(lambda: record.human_gate.submission_approved)
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["button#submit"]),
     )
@@ -5127,7 +5375,8 @@ async def test_runtime_review_rejects_unresolved_fields_without_approval(
     )
 
     with pytest.raises(HarnessServiceError) as rejected:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             RequestHumanReviewRuntimeAction(
                 type="request_human_review",
@@ -5153,7 +5402,8 @@ async def test_runtime_mismatch_is_typed_and_unknown_session_is_not_found(
     assert record is not None
     record.playwright_runtime = FakePlaywrightRuntime()
 
-    mismatch = await manager.runtime_action(
+    mismatch = await runtime_action(
+        manager,
         created.session_id,
         ReportApplicationMismatchRuntimeAction(
             type="report_application_mismatch"
@@ -5162,7 +5412,8 @@ async def test_runtime_mismatch_is_typed_and_unknown_session_is_not_found(
 
     assert isinstance(mismatch, ApplicationMismatchRuntimeActionResponse)
     with pytest.raises(HarnessServiceError) as missing:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             uuid4(),
             ReportApplicationMismatchRuntimeAction(
                 type="report_application_mismatch"
@@ -5194,7 +5445,7 @@ async def test_runtime_action_rejects_starting_and_terminal_sessions(
     )
 
     with pytest.raises(HarnessServiceError) as starting:
-        await manager.runtime_action(record.session_id, action)
+        await runtime_action(manager, record.session_id, action)
     assert_service_error(
         starting.value,
         409,
@@ -5209,7 +5460,7 @@ async def test_runtime_action_rejects_starting_and_terminal_sessions(
     await manager.delete(created.session_id)
 
     with pytest.raises(HarnessServiceError) as terminal:
-        await manager.runtime_action(created.session_id, action)
+        await runtime_action(manager, created.session_id, action)
     assert_service_error(
         terminal.value,
         409,
@@ -5232,7 +5483,8 @@ async def test_create_starts_playwright_runtime_before_accepting_runtime_actions
     assert fakes.runtimes[0].runtime_started is True
     assert fakes.order.index("runtime.factory") < fakes.order.index("runtime.start")
 
-    response = await manager.runtime_action(
+    response = await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('connected')"]),
     )
@@ -5258,14 +5510,31 @@ async def test_terminal_cleanup_cancels_active_runtime_action_before_playwright_
     runtime = fakes.runtimes[0]
     runtime.blocker = asyncio.Event()
     assert record is not None
-    action = asyncio.create_task(
+    ownership_at_close: list[tuple[Any, ...]] = []
+    runtime.close_observer = lambda: ownership_at_close.append(
+        (
+            record.runtime_action_task,
+            record.runtime_action_id,
+            record.runtime_action_payload,
+            frozenset(record.runtime_action_ids_seen),
+        )
+    )
+    action_id = UUID("323e4567-e89b-42d3-a456-426614174000")
+    requester = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["new Promise(r => setTimeout(r, 30000))"]),
+            action_id,
+            PlaywrightCliRuntimeAction(
+                type="playwright_cli",
+                command="eval",
+                args=["new Promise(r => setTimeout(r, 30000))"],
+            ),
         )
     )
     await runtime.started.wait()
-    assert record.runtime_action_task is action
+    owner = record.runtime_action_task
+    assert owner is not None
+    assert owner is not requester
 
     try:
         await asyncio.wait_for(
@@ -5273,16 +5542,21 @@ async def test_terminal_cleanup_cancels_active_runtime_action_before_playwright_
             timeout=0.2,
         )
     except BaseException:
-        action.cancel()
-        await asyncio.gather(action, return_exceptions=True)
+        requester.cancel()
+        await asyncio.gather(requester, return_exceptions=True)
         await asyncio.wait_for(record.closed_event.wait(), timeout=1)
         raise
 
     with pytest.raises(asyncio.CancelledError):
-        await action
+        await requester
     assert runtime.closed
+    assert ownership_at_close == [(None, None, None, frozenset())]
+    assert owner.cancelled()
     assert record.runtime_action_task is None
-    assert record.runtime_action_pending is False
+    assert record.runtime_action_id is None
+    assert record.runtime_action_payload is None
+    assert record.runtime_action_ids_seen == set()
+    assert order.index("runtime.execute_finished") < order.index("runtime.close")
     assert order.index("runtime.close") < order.index("model.aclose")
     events = manager._tombstones[created.session_id].events
     assert all(event.event != "agent_step" for event in events)
@@ -5568,7 +5842,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
     )
 
     with pytest.raises(HarnessServiceError) as before_inspection:
-        await manager.runtime_action(created.session_id, request)
+        await runtime_action(manager, created.session_id, request)
     assert_service_error(
         before_inspection.value,
         409,
@@ -5576,7 +5850,8 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
         "Inspect the application before requesting sign-in",
     )
 
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5584,7 +5859,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
             args=[],
         ),
     )
-    first = await manager.runtime_action(created.session_id, request)
+    first = await runtime_action(manager, created.session_id, request)
     assert first == SignInRuntimeActionResponse(
         type="sign_in",
         status="attempted",
@@ -5592,7 +5867,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
     assert fakes.runtimes[0].sign_in_calls[-1]["username"] == "new@example.test"
 
     with pytest.raises(HarnessServiceError) as stale_inspection:
-        await manager.runtime_action(created.session_id, request)
+        await runtime_action(manager, created.session_id, request)
     assert_service_error(
         stale_inspection.value,
         409,
@@ -5600,7 +5875,8 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
         "Inspect the application before requesting sign-in",
     )
 
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5608,7 +5884,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
             args=[],
         ),
     )
-    second = await manager.runtime_action(created.session_id, request)
+    second = await runtime_action(manager, created.session_id, request)
     assert second == SignInRuntimeActionResponse(
         type="sign_in",
         status="attempted",
@@ -5617,7 +5893,8 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
         call["username"] for call in fakes.runtimes[0].sign_in_calls
     ] == ["new@example.test", "old@example.test"]
 
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5626,7 +5903,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
         ),
     )
     gated = asyncio.create_task(
-        manager.runtime_action(created.session_id, request)
+        runtime_action(manager, created.session_id, request)
     )
     await wait_state(
         manager,
@@ -5687,7 +5964,8 @@ async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screens
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5696,7 +5974,8 @@ async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screens
         ),
     )
     pending = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestSignInRuntimeAction(
                 type="request_sign_in",
@@ -5772,7 +6051,8 @@ async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screens
             screenshot={"data": "c2VjcmV0LXNjcmVlbnNob3Q="},
         ),
     )
-    later = await manager.runtime_action(
+    later = await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5811,7 +6091,8 @@ async def test_save_credentials_verifies_same_origin_path_without_browser_submis
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5820,7 +6101,8 @@ async def test_save_credentials_verifies_same_origin_path_without_browser_submis
         ),
     )
     pending = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestSignInRuntimeAction(
                 type="request_sign_in",
@@ -5892,7 +6174,8 @@ async def test_save_credentials_conflicts_after_navigation_to_other_approved_ori
         allow_domains=("https://account.example.test",),
     )
     await wait_state(manager, created.session_id, "running")
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5901,7 +6184,8 @@ async def test_save_credentials_conflicts_after_navigation_to_other_approved_ori
         ),
     )
     pending = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestSignInRuntimeAction(
                 type="request_sign_in",
@@ -5967,7 +6251,8 @@ async def test_saved_sign_in_preserves_private_runtime_session_timeout(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -5981,7 +6266,8 @@ async def test_saved_sign_in_preserves_private_runtime_session_timeout(
     )
 
     with pytest.raises(HarnessServiceError) as caught:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             RequestSignInRuntimeAction(
                 type="request_sign_in",
@@ -6020,7 +6306,8 @@ async def test_cancel_preempts_blocked_private_sign_in_before_submission(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -6029,7 +6316,8 @@ async def test_cancel_preempts_blocked_private_sign_in_before_submission(
         ),
     )
     gated = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestSignInRuntimeAction(
                 type="request_sign_in",
@@ -6101,7 +6389,8 @@ async def test_save_credentials_preserves_private_runtime_errors(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -6110,7 +6399,8 @@ async def test_save_credentials_preserves_private_runtime_errors(
         ),
     )
     gated = asyncio.create_task(
-        manager.runtime_action(
+        runtime_action(
+            manager,
             created.session_id,
             RequestSignInRuntimeAction(
                 type="request_sign_in",
@@ -6163,7 +6453,8 @@ async def test_capture_failure_never_opens_or_executes_the_credentials_gate(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    await manager.runtime_action(
+    await runtime_action(
+        manager,
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -6177,7 +6468,8 @@ async def test_capture_failure_never_opens_or_executes_the_credentials_gate(
     )
 
     with pytest.raises(HarnessServiceError) as caught:
-        await manager.runtime_action(
+        await runtime_action(
+            manager,
             created.session_id,
             RequestSignInRuntimeAction(
                 type="request_sign_in",

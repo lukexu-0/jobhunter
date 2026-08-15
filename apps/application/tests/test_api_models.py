@@ -70,6 +70,11 @@ from jobhunter_browser_harness.models import (
 TOKEN = "test-token-0123456789abcdef-0123456789"
 SESSION_ID = UUID("39bb70b2-5ea4-4937-8090-32d7404ad597")
 AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
+RUNTIME_ACTION_ID = UUID("6a3c94e7-2495-4d9e-88c4-3cd0a986542f")
+RUNTIME_AUTHORIZATION = {
+    **AUTHORIZATION,
+    "Idempotency-Key": str(RUNTIME_ACTION_ID),
+}
 COMMAND_ADAPTER = TypeAdapter(SessionCommand)
 RUNTIME_ACTION_ADAPTER = TypeAdapter(RuntimeActionRequest)
 RUNTIME_ACTION_RESPONSE_ADAPTER = TypeAdapter(RuntimeActionResponse)
@@ -128,7 +133,7 @@ class FakeSessionService:
     event_calls: list[tuple[UUID, int | None]] = field(default_factory=list)
     suggestion_calls: list[tuple[UUID, str]] = field(default_factory=list)
     command_calls: list[tuple[UUID, SessionCommand]] = field(default_factory=list)
-    runtime_action_calls: list[tuple[UUID, RuntimeActionRequest]] = field(
+    runtime_action_calls: list[tuple[UUID, UUID, RuntimeActionRequest]] = field(
         default_factory=list
     )
     runtime_action_response: RuntimeActionResponse = field(
@@ -232,11 +237,12 @@ class FakeSessionService:
     async def runtime_action(
         self,
         session_id: UUID,
+        action_id: UUID,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse:
         if session_id != SESSION_ID:
             raise HarnessServiceError(404, "session_not_found", "Session not found")
-        self.runtime_action_calls.append((session_id, action))
+        self.runtime_action_calls.append((session_id, action_id, action))
         return self.runtime_action_response
 
     async def delete(self, session_id: UUID) -> None:
@@ -1833,7 +1839,7 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
 
     response = await client.post(
         f"/v1/sessions/{SESSION_ID}/runtime/actions",
-        headers=AUTHORIZATION,
+        headers=RUNTIME_AUTHORIZATION,
         json=payload,
     )
 
@@ -1841,9 +1847,41 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
     assert response.json() == {"type": "continue"}
     assert response.headers["cache-control"] == "no-store"
     assert len(service.runtime_action_calls) == 1
-    dispatched_id, dispatched = service.runtime_action_calls[0]
+    dispatched_id, dispatched_action_id, dispatched = service.runtime_action_calls[0]
     assert dispatched_id == SESSION_ID
+    assert dispatched_action_id == RUNTIME_ACTION_ID
     assert isinstance(dispatched, action_type)
+
+@pytest.mark.parametrize(
+    "idempotency_key",
+    [
+        None,
+        "not-a-uuid",
+        str(RUNTIME_ACTION_ID).upper(),
+        RUNTIME_ACTION_ID.hex,
+    ],
+)
+async def test_runtime_action_endpoint_requires_canonical_uuid_idempotency_key(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    idempotency_key: str | None,
+) -> None:
+    client, service = api_client
+    headers = dict(AUTHORIZATION)
+    if idempotency_key is not None:
+        headers["Idempotency-Key"] = idempotency_key
+
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/runtime/actions",
+        headers=headers,
+        json={"type": "report_application_mismatch"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.runtime_action_calls == []
 
 async def test_request_sign_in_endpoint_returns_only_attempt_status(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
@@ -1856,7 +1894,7 @@ async def test_request_sign_in_endpoint_returns_only_attempt_status(
 
     response = await client.post(
         f"/v1/sessions/{SESSION_ID}/runtime/actions",
-        headers=AUTHORIZATION,
+        headers=RUNTIME_AUTHORIZATION,
         json={
             "type": "request_sign_in",
             "username_ref": "f2e248",
@@ -1958,7 +1996,7 @@ async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
 
     response = await client.post(
         f"/v1/sessions/{SESSION_ID}/runtime/actions",
-        headers=AUTHORIZATION,
+        headers=RUNTIME_AUTHORIZATION,
         json=payload,
     )
 

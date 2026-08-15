@@ -27,6 +27,8 @@ import {
   SignInRuntimeActionResponseSchema,
   SubmitRuntimeActionResponseSchema,
   type RuntimeActionRequest,
+  type ApplicationRuntimeAttemptFailureDiagnostic,
+  type HttpApplicationRuntimeClientOptions,
   type RuntimeActionResponse,
   type PlaywrightCliExecutionResult,
 } from "../src/agents/application-runtime-client";
@@ -136,6 +138,11 @@ test("separates review data from terminal submission outcomes", () => {
 function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
   return Response.json(value, init);
 }
+
+const SILENT_RETRY_OPTIONS: HttpApplicationRuntimeClientOptions = {
+  diagnosticSink: () => undefined,
+  wait: () => undefined,
+};
 
 const ADDITIONAL_INFO_QUESTIONS: AdditionalInfoQuestion[] = [
   {
@@ -638,6 +645,377 @@ describe("HttpApplicationRuntimeClient", () => {
     expect(requests[0]?.init.signal).toBeInstanceOf(AbortSignal);
   });
 
+  test("reuses one UUID idempotency key and succeeds on the fourth attempt after the exact delays", async () => {
+    const action: RuntimeActionRequest = {
+      type: "request_human_navigation",
+      instruction: `Secret instruction with Bearer ${TOKEN}`,
+    };
+    const idempotencyKeys: Array<string | null> = [];
+    const requestBodies: string[] = [];
+    const requestSignals: AbortSignal[] = [];
+    const waits: Array<{ delayMs: number; signal: AbortSignal }> = [];
+    const diagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
+    let attempts = 0;
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        attempts += 1;
+        idempotencyKeys.push(new Headers(init?.headers).get("Idempotency-Key"));
+        requestBodies.push(String(init?.body));
+        requestSignals.push(init?.signal as AbortSignal);
+        if (attempts <= 3) {
+          throw new Error(`transport exposed ${TOKEN} and ${String(init?.body)}`);
+        }
+        return jsonResponse({ type: "continue" });
+      },
+      {
+        diagnosticSink: (diagnostic) => {
+          diagnostics.push(diagnostic);
+        },
+        wait: (delayMs, signal) => {
+          waits.push({ delayMs, signal });
+        },
+      },
+    );
+
+    await expect(
+      client.action(action, new AbortController().signal, 10_000),
+    ).resolves.toEqual({ type: "continue" });
+
+    expect(attempts).toBe(4);
+    expect(idempotencyKeys).toHaveLength(4);
+    const actionId = idempotencyKeys[0] ?? "";
+    expect(actionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(new Set(idempotencyKeys).size).toBe(1);
+    expect(requestBodies).toHaveLength(4);
+    expect(new Set(requestBodies).size).toBe(1);
+    expect(requestBodies[0]).toBe(JSON.stringify(action));
+    expect(waits.map(({ delayMs }) => delayMs)).toEqual([250, 500, 1_000]);
+    expect(new Set([...requestSignals, ...waits.map(({ signal }) => signal)]).size).toBe(1);
+    expect(diagnostics).toEqual([1, 2, 3].map((attempt) => ({
+      event: "application_runtime_attempt_failure",
+      sessionId: SESSION_ID,
+      actionId,
+      actionType: "request_human_navigation",
+      attempt,
+      maxAttempts: 4,
+      retrying: true,
+      failureCategory: "transport_error",
+    })));
+    const serializedDiagnostics = diagnostics.map((diagnostic) => JSON.stringify(diagnostic)).join("\n");
+    expect(serializedDiagnostics).not.toContain(TOKEN);
+    expect(serializedDiagnostics).not.toContain("Secret instruction");
+    expect(serializedDiagnostics).not.toContain("transport exposed");
+    expect(serializedDiagnostics).not.toContain(RUNTIME_URL);
+  });
+
+  test("bounds stalled response cancellation by the original caller and deadline signals", async () => {
+    const caller = new AbortController();
+    const callerAbortReason = new Error("caller stopped stalled cleanup");
+    const callerCancelStarted = Promise.withResolvers<void>();
+    const callerCancelNever = Promise.withResolvers<void>();
+    const callerDiagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
+    let callerRequestSignal: AbortSignal | undefined;
+    let callerFetchCalls = 0;
+    let callerWaitCalls = 0;
+    const callerClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        callerFetchCalls += 1;
+        callerRequestSignal = init?.signal as AbortSignal;
+        return new Response(new ReadableStream<Uint8Array>({
+          cancel() {
+            callerCancelStarted.resolve();
+            return callerCancelNever.promise;
+          },
+        }), { status: 302 });
+      },
+      {
+        diagnosticSink: (diagnostic) => {
+          callerDiagnostics.push(diagnostic);
+        },
+        wait: () => {
+          callerWaitCalls += 1;
+        },
+      },
+    );
+    const callerPending = callerClient.action(
+      { type: "report_application_mismatch" },
+      caller.signal,
+      10_000,
+    );
+    await callerCancelStarted.promise;
+    caller.abort(callerAbortReason);
+
+    await expect(callerPending).rejects.toBe(callerAbortReason);
+    expect(callerFetchCalls).toBe(1);
+    expect(callerWaitCalls).toBe(0);
+    expect(callerDiagnostics).toEqual([]);
+    expect(callerRequestSignal?.reason).toBe(callerAbortReason);
+
+    const deadlineCaller = new AbortController();
+    const deadlineCancelStarted = Promise.withResolvers<void>();
+    const deadlineCancelNever = Promise.withResolvers<void>();
+    const deadlineDiagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
+    let deadlineRequestSignal: AbortSignal | undefined;
+    let deadlineFetchCalls = 0;
+    let deadlineWaitCalls = 0;
+    const deadlineClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        deadlineFetchCalls += 1;
+        deadlineRequestSignal = init?.signal as AbortSignal;
+        return new Response(new ReadableStream<Uint8Array>({
+          cancel() {
+            deadlineCancelStarted.resolve();
+            return deadlineCancelNever.promise;
+          },
+        }), {
+          headers: { "content-type": "text/plain" },
+        });
+      },
+      {
+        diagnosticSink: (diagnostic) => {
+          deadlineDiagnostics.push(diagnostic);
+        },
+        wait: () => {
+          deadlineWaitCalls += 1;
+        },
+      },
+    );
+    const deadlinePending = deadlineClient.action(
+      { type: "report_application_mismatch" },
+      deadlineCaller.signal,
+      25,
+    );
+    await deadlineCancelStarted.promise;
+    const deadlineFailure = await deadlinePending.catch((error: unknown) => error);
+
+    expect(deadlineFailure).toBeInstanceOf(DOMException);
+    expect((deadlineFailure as DOMException).name).toBe("TimeoutError");
+    expect(deadlineFetchCalls).toBe(1);
+    expect(deadlineWaitCalls).toBe(0);
+    expect(deadlineDiagnostics).toEqual([]);
+    expect(deadlineRequestSignal?.reason).toBe(deadlineFailure);
+    expect(deadlineCaller.signal.aborted).toBe(false);
+  });
+
+  test("stops after four attempts and emits exact safe diagnostics for every response failure class", async () => {
+    const followedRedirect = jsonResponse({ type: "continue" });
+    Object.defineProperty(followedRedirect, "redirected", { value: true });
+    const responses = [
+      followedRedirect,
+      new Response(`private invalid JSON ${TOKEN}`, {
+        headers: { "content-type": "application/json" },
+      }),
+      jsonResponse(
+        { code: "private_failure", message: `private ${TOKEN}` },
+        { status: 503 },
+      ),
+      jsonResponse({ type: "continue", privateValue: TOKEN }),
+    ];
+    const diagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
+    const waits: number[] = [];
+    const idempotencyKeys: Array<string | null> = [];
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        idempotencyKeys.push(new Headers(init?.headers).get("Idempotency-Key"));
+        return responses[idempotencyKeys.length - 1] as Response;
+      },
+      {
+        diagnosticSink: (diagnostic) => {
+          diagnostics.push(diagnostic);
+        },
+        wait: (delayMs) => {
+          waits.push(delayMs);
+        },
+      },
+    );
+
+    await expect(
+      client.action(
+        { type: "report_application_mismatch" },
+        new AbortController().signal,
+        10_000,
+      ),
+    ).rejects.toEqual(new ApplicationRuntimeError("model_failed"));
+
+    expect(idempotencyKeys).toHaveLength(4);
+    expect(new Set(idempotencyKeys).size).toBe(1);
+    const actionId = idempotencyKeys[0] ?? "";
+    expect(waits).toEqual([250, 500, 1_000]);
+    expect(diagnostics).toEqual([
+      {
+        event: "application_runtime_attempt_failure",
+        sessionId: SESSION_ID,
+        actionId,
+        actionType: "report_application_mismatch",
+        attempt: 1,
+        maxAttempts: 4,
+        retrying: true,
+        failureCategory: "redirect_response",
+        statusCode: 200,
+      },
+      {
+        event: "application_runtime_attempt_failure",
+        sessionId: SESSION_ID,
+        actionId,
+        actionType: "report_application_mismatch",
+        attempt: 2,
+        maxAttempts: 4,
+        retrying: true,
+        failureCategory: "response_read_error",
+        statusCode: 200,
+      },
+      {
+        event: "application_runtime_attempt_failure",
+        sessionId: SESSION_ID,
+        actionId,
+        actionType: "report_application_mismatch",
+        attempt: 3,
+        maxAttempts: 4,
+        retrying: true,
+        failureCategory: "http_error",
+        statusCode: 503,
+      },
+      {
+        event: "application_runtime_attempt_failure",
+        sessionId: SESSION_ID,
+        actionId,
+        actionType: "report_application_mismatch",
+        attempt: 4,
+        maxAttempts: 4,
+        retrying: false,
+        failureCategory: "invalid_response",
+        statusCode: 200,
+      },
+    ]);
+    const serializedDiagnostics = JSON.stringify(diagnostics);
+    expect(serializedDiagnostics).not.toContain(TOKEN);
+    expect(serializedDiagnostics).not.toContain("private");
+  });
+
+  test("uses the original caller abort and deadline across attempts and retry waits", async () => {
+    const caller = new AbortController();
+    const abortReason = new Error("stop the logical action");
+    const signals: AbortSignal[] = [];
+    let fetchCalls = 0;
+    let waitCalls = 0;
+    const waitStarted = Promise.withResolvers<void>();
+    const abortClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        fetchCalls += 1;
+        signals.push(init?.signal as AbortSignal);
+        throw new Error("retryable transport failure");
+      },
+      {
+        diagnosticSink: () => undefined,
+        wait: (_delayMs, signal) => {
+          waitCalls += 1;
+          signals.push(signal);
+          waitStarted.resolve();
+          return Promise.withResolvers<void>().promise;
+        },
+      },
+    );
+    const aborted = abortClient.action(
+      { type: "report_application_mismatch" },
+      caller.signal,
+      10_000,
+    );
+    await waitStarted.promise;
+    caller.abort(abortReason);
+
+    await expect(aborted).rejects.toBe(abortReason);
+    expect(fetchCalls).toBe(1);
+    expect(waitCalls).toBe(1);
+    expect(new Set(signals).size).toBe(1);
+    expect(signals[0]?.reason).toBe(abortReason);
+
+    let deadlineFetchCalls = 0;
+    let deadlineSignal: AbortSignal | undefined;
+    const deadlineClient = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        deadlineFetchCalls += 1;
+        deadlineSignal = init?.signal as AbortSignal;
+        throw new Error("retryable transport failure");
+      },
+      {
+        diagnosticSink: () => undefined,
+        wait: () => Promise.withResolvers<void>().promise,
+      },
+    );
+    const deadlineFailure = await deadlineClient.action(
+      { type: "report_application_mismatch" },
+      new AbortController().signal,
+      5,
+    ).catch((error: unknown) => error);
+
+    expect(deadlineFailure).toBeInstanceOf(DOMException);
+    expect((deadlineFailure as DOMException).name).toBe("TimeoutError");
+    expect(deadlineFetchCalls).toBe(1);
+    expect(deadlineSignal?.aborted).toBe(true);
+  });
+
+  test("does not retry typed non-model runtime failures", async () => {
+    const cases = [
+      { code: "step_limit", status: 409, expected: "step_limit" },
+      { code: "browser_failed", status: 502, expected: "browser_failed" },
+      { code: "session_timeout", status: 504, expected: "model_timeout" },
+    ] as const;
+
+    for (const { code, status, expected } of cases) {
+      let fetchCalls = 0;
+      let waitCalls = 0;
+      const diagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
+      const client = new HttpApplicationRuntimeClient(
+        RUNTIME_URL,
+        SESSION_ID,
+        TOKEN,
+        async () => {
+          fetchCalls += 1;
+          return jsonResponse({ code, message: `private ${TOKEN}` }, { status });
+        },
+        {
+          diagnosticSink: (diagnostic) => {
+            diagnostics.push(diagnostic);
+          },
+          wait: () => {
+            waitCalls += 1;
+          },
+        },
+      );
+
+      const failure = await client.action(
+        { type: "report_application_mismatch" },
+        new AbortController().signal,
+        10_000,
+      ).catch((error: unknown) => error);
+
+      expect(failure).toEqual(new ApplicationRuntimeError(expected));
+      expect(fetchCalls).toBe(1);
+      expect(waitCalls).toBe(0);
+      expect(diagnostics).toEqual([]);
+    }
+  });
+
   test("accepts the strict continue-without-additional-info response without answer payloads", async () => {
     const requests: unknown[] = [];
     const client = new HttpApplicationRuntimeClient(
@@ -918,6 +1296,7 @@ describe("HttpApplicationRuntimeClient", () => {
 
   test("rejects invalid and non-strict runtime action inputs before fetching", async () => {
     let fetchCalls = 0;
+    const diagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
     const client = new HttpApplicationRuntimeClient(
       RUNTIME_URL,
       SESSION_ID,
@@ -925,6 +1304,11 @@ describe("HttpApplicationRuntimeClient", () => {
       async () => {
         fetchCalls += 1;
         return jsonResponse({ type: "continue" });
+      },
+      {
+        diagnosticSink: (diagnostic) => {
+          diagnostics.push(diagnostic);
+        },
       },
     );
     const invalidInputs: unknown[] = [
@@ -990,6 +1374,7 @@ describe("HttpApplicationRuntimeClient", () => {
       ).rejects.toEqual(new ApplicationRuntimeError("model_failed"));
     }
     expect(fetchCalls).toBe(0);
+    expect(diagnostics).toEqual([]);
   });
 
   test("maps only flat step and browser errors without leaking response content", async () => {
@@ -1030,6 +1415,7 @@ describe("HttpApplicationRuntimeClient", () => {
         SESSION_ID,
         TOKEN,
         async () => response,
+        SILENT_RETRY_OPTIONS,
       );
       let failure: unknown;
       try {
@@ -1053,6 +1439,7 @@ describe("HttpApplicationRuntimeClient", () => {
       async () => {
         throw new Error(`upstream echoed Bearer ${TOKEN}`);
       },
+      SILENT_RETRY_OPTIONS,
     );
     let networkFailure: unknown;
     try {
@@ -1138,11 +1525,23 @@ describe("HttpApplicationRuntimeClient", () => {
       [RUNTIME_URL, "not-a-uuid", TOKEN],
       [RUNTIME_URL, SESSION_ID, "short-token"],
     ];
-    for (const arguments_ of invalidArguments) {
+    const configurationDiagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
+    for (const [runtimeUrl, sessionId, token] of invalidArguments) {
       expect(
-        () => new HttpApplicationRuntimeClient(...arguments_),
+        () => new HttpApplicationRuntimeClient(
+          runtimeUrl,
+          sessionId,
+          token,
+          async () => jsonResponse({ type: "continue" }),
+          {
+            diagnosticSink: (diagnostic) => {
+              configurationDiagnostics.push(diagnostic);
+            },
+          },
+        ),
       ).toThrow(new ApplicationRuntimeError("model_failed"));
     }
+    expect(configurationDiagnostics).toEqual([]);
   });
 
 
@@ -1226,6 +1625,7 @@ describe("HttpApplicationRuntimeClient", () => {
         SESSION_ID,
         TOKEN,
         async () => response,
+        SILENT_RETRY_OPTIONS,
       );
       await expect(
         client.action(
@@ -1257,6 +1657,7 @@ describe("HttpApplicationRuntimeClient", () => {
           "content-length": String(16 * 1024 * 1024 + 1),
         },
       }),
+      SILENT_RETRY_OPTIONS,
     );
     await expect(
       declaredClient.action(
@@ -1284,6 +1685,7 @@ describe("HttpApplicationRuntimeClient", () => {
       async () => new Response(streamedBody, {
         headers: { "content-type": "application/json" },
       }),
+      SILENT_RETRY_OPTIONS,
     );
     await expect(
       streamedClient.action(

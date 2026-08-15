@@ -138,7 +138,7 @@ describe("ApplicationAgentService", () => {
     expect((failure as Error).message).toBe("The model request failed");
     expect(String(failure)).not.toContain(authSecret);
   });
-  test("constructs one authenticated runtime client inside invoke and returns exact success metadata", async () => {
+  test("constructs one authenticated runtime client with the private diagnostic sink and returns exact success metadata", async () => {
     const runtimeClient = {
       action: async () => {
         throw new Error("unused");
@@ -157,6 +157,7 @@ describe("ApplicationAgentService", () => {
       finalize: async (_outcome: "submitted" | "uncertain") => undefined,
     };
     const guardFactoryCalls: string[] = [];
+    const diagnosticSink = () => undefined;
     const service = new ApplicationAgentService(TOKEN, {
       authStatusReader: connectedStatus,
       submissionGuardFactory: (sessionId) => {
@@ -172,6 +173,7 @@ describe("ApplicationAgentService", () => {
         return RESULT;
       },
       agentRuntime,
+      diagnosticSink,
     });
     const signal = new AbortController().signal;
 
@@ -183,7 +185,12 @@ describe("ApplicationAgentService", () => {
       reasoning: "high",
       result: RESULT,
     });
-    expect(runtimeFactoryCalls).toEqual([[RUNTIME_URL, SESSION_ID, TOKEN]]);
+    expect(runtimeFactoryCalls).toEqual([[
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      diagnosticSink,
+    ]]);
     expect(runCalls).toHaveLength(1);
     expect(runCalls[0]?.[0]).toEqual(INPUT);
     expect(runCalls[0]?.[1]).toBe(signal);

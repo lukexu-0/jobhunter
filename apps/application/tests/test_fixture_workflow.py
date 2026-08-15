@@ -9,7 +9,7 @@ import subprocess
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import UploadFile
@@ -211,6 +211,18 @@ async def _wait_for_state(
             await asyncio.sleep(0.02)
 
 
+async def runtime_action(
+    manager: ApplicationSessionManager,
+    session_id: UUID,
+    action: Any,
+) -> Any:
+    return await manager.runtime_action(
+        session_id,
+        uuid4(),
+        action,
+    )
+
+
 def _element_ref(dom: str, accessible_name: str) -> str:
     for line in dom.splitlines():
         if f'"{accessible_name}"' not in line:
@@ -227,7 +239,8 @@ async def _cli(
     command: PlaywrightCliCommand,
     *args: str,
 ) -> PlaywrightCliResultRuntimeActionResponse:
-    response = await manager.runtime_action(
+    response = await runtime_action(
+        manager,
         session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -557,7 +570,8 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert (await asyncio.to_thread(fixture.submit_snapshot))["submit_count"] == 0
 
             additional_info_task = asyncio.create_task(
-                manager.runtime_action(
+                runtime_action(
+                    manager,
                     created.session_id,
                     RequestAdditionalInfoRuntimeAction(
                         type="request_additional_info",
@@ -747,7 +761,8 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert await _wait_for_progress(fixture, before_human) == before_human
 
             navigation_task = asyncio.create_task(
-                manager.runtime_action(
+                runtime_action(
+                    manager,
                     created.session_id,
                     RequestHumanNavigationRuntimeAction(
                         type="request_human_navigation",
@@ -804,7 +819,8 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             )
 
             late_info_task = asyncio.create_task(
-                manager.runtime_action(
+                runtime_action(
+                    manager,
                     created.session_id,
                     RequestAdditionalInfoRuntimeAction(
                         type="request_additional_info",
@@ -858,7 +874,8 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             )["review"] == _INITIAL_REVIEW_REPLY
 
 
-            approved = await manager.runtime_action(
+            approved = await runtime_action(
+                manager,
                 created.session_id,
                 RequestHumanReviewRuntimeAction(
                     type="request_human_review",
