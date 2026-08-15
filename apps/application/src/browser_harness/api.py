@@ -61,6 +61,7 @@ class HarnessSessionService(Protocol):
     async def runtime_action(
         self,
         session_id: UUID,
+        action_id: UUID,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse: ...
 
@@ -235,8 +236,27 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
     async def runtime_action(
         session_id: UUID,
         action: Annotated[RuntimeActionRequest, Body(discriminator="type")],
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     ) -> RuntimeActionResponse:
-        return await dependencies.sessions.runtime_action(session_id, action)
+        try:
+            action_id = UUID(idempotency_key)
+        except ValueError:
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            ) from None
+        if idempotency_key != str(action_id):
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            )
+        return await dependencies.sessions.runtime_action(
+            session_id,
+            action_id,
+            action,
+        )
 
 
     @app.delete("/v1/sessions/{session_id}", status_code=204)

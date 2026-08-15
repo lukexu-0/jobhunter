@@ -114,6 +114,7 @@ _ADDITIONAL_INFO_GATE_RESPONSE_ADAPTER = TypeAdapter(
 )
 _EVENT_LIMIT = 256
 _TOMBSTONE_LIMIT = 32
+_RUNTIME_ACTION_ID_LIMIT = 4096
 _HEARTBEAT_SECONDS = 15.0
 _CLEANUP_RETRY_MAX_SECONDS = 5.0
 _SUBMISSION_UNCERTAIN_WARNING = (
@@ -199,9 +200,10 @@ class _ApplicationSession:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     closed_event: asyncio.Event = field(default_factory=asyncio.Event)
     request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    runtime_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    runtime_action_pending: bool = False
-    runtime_action_task: asyncio.Task[Any] | None = None
+    runtime_action_ids_seen: set[UUID] = field(default_factory=set)
+    runtime_action_id: UUID | None = None
+    runtime_action_payload: RuntimeActionRequest | None = None
+    runtime_action_task: asyncio.Task[RuntimeActionResponse] | None = None
     playwright_cli_action_count: int = 0
     last_successful_inspection_step: int = 0
     sign_in_inspection_step: int = 0
@@ -955,6 +957,7 @@ class ApplicationSessionManager:
     async def runtime_action(
         self,
         session_id: UUID,
+        action_id: UUID,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse:
         record = self._active
@@ -965,15 +968,43 @@ class ApplicationSessionManager:
                 )
             raise self._not_found()
 
-        owns_pending = False
-        current_task = asyncio.current_task()
-        submission_attempt_active = False
-        auto_submission_approval = False
-        try:
-            async with record.request_lock:
-                if record.finalized or record.final_request is not None:
+        async with record.request_lock:
+            if record.finalized or record.final_request is not None:
+                raise HarnessServiceError(
+                    409, "command_conflict", "The session is terminal"
+                )
+
+            task = record.runtime_action_task
+            if action_id in record.runtime_action_ids_seen:
+                if record.runtime_action_id != action_id:
                     raise HarnessServiceError(
-                        409, "command_conflict", "The session is terminal"
+                        409,
+                        "command_conflict",
+                        "The idempotency key is no longer current",
+                    )
+                if record.runtime_action_payload != action:
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "The idempotency key was already used for a different runtime action",
+                    )
+                if task is None:
+                    raise RuntimeError("Runtime action ownership is incomplete")
+            else:
+                if (
+                    len(record.runtime_action_ids_seen)
+                    >= _RUNTIME_ACTION_ID_LIMIT
+                ):
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "The runtime action idempotency key limit was reached",
+                    )
+                if task is not None and not task.done():
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "A runtime action is already pending",
                     )
                 if record.snapshot.state in {"submitted", "submission_uncertain"}:
                     raise HarnessServiceError(
@@ -1018,12 +1049,6 @@ class ApplicationSessionManager:
                         "Only browser execution and human navigation may run "
                         "after submission approval",
                     )
-                if record.runtime_action_pending:
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "A runtime action is already pending",
-                    )
                 auto_submission_approval = (
                     isinstance(action, RequestHumanReviewRuntimeAction)
                     and record.request.auto_submit
@@ -1037,10 +1062,6 @@ class ApplicationSessionManager:
                         "command_conflict",
                         _COMMAND_CONFLICT_MESSAGE,
                     )
-                record.runtime_action_pending = True
-                record.runtime_action_task = current_task
-                owns_pending = True
-                record.auto_submission_approval_pending = auto_submission_approval
                 starts_submission = isinstance(
                     action,
                     RequestHumanNavigationRuntimeAction,
@@ -1048,36 +1069,73 @@ class ApplicationSessionManager:
                     isinstance(action, PlaywrightCliRuntimeAction)
                     and action.command not in _READ_ONLY_PLAYWRIGHT_CLI_COMMANDS
                 )
-                if (
+                publish_submission_started = (
                     gate.submission_approved
                     and starts_submission
                     and not record.submission_action_started
-                ):
+                )
+                if publish_submission_started:
                     record.submission_action_started = True
-                    await self._set_state_and_event(
-                        record,
-                        "submitting",
-                        "submission_started",
-                        {},
-                    )
                 submission_attempt_active = record.submission_action_started
+                record.runtime_action_ids_seen.add(action_id)
+                record.runtime_action_id = action_id
+                record.runtime_action_payload = action
+                record.auto_submission_approval_pending = auto_submission_approval
+                task = asyncio.create_task(
+                    self._run_runtime_action(
+                        record,
+                        action,
+                        submission_attempt_active,
+                        publish_submission_started,
+                    ),
+                    name=(
+                        "browser-harness-runtime-action-"
+                        f"{record.session_id}-{action_id}"
+                    ),
+                )
+                task.add_done_callback(self._consume_runtime_action_result)
+                record.runtime_action_task = task
 
-            async with record.runtime_lock:
-                response = await self._dispatch_runtime_action(record, action)
-                if (
-                    submission_attempt_active
-                    and isinstance(action, RequestHumanNavigationRuntimeAction)
-                    and record.snapshot.state
-                    not in {"submitted", "submission_uncertain", "closed"}
-                ):
-                    await self._publish_gate(record, "submitting", None, {})
-                if (
-                    submission_attempt_active
-                    and isinstance(response, PlaywrightCliResultRuntimeActionResponse)
-                    and (response.exit_code != 0 or response.timed_out)
-                ):
-                    await self._park_submission_uncertain(record)
-                return response
+        return await asyncio.shield(task)
+
+    @staticmethod
+    def _consume_runtime_action_result(
+        task: asyncio.Task[RuntimeActionResponse],
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _run_runtime_action(
+        self,
+        record: _ApplicationSession,
+        action: RuntimeActionRequest,
+        submission_attempt_active: bool,
+        publish_submission_started: bool,
+    ) -> RuntimeActionResponse:
+        current_task = asyncio.current_task()
+        try:
+            if publish_submission_started:
+                await self._set_state_and_event(
+                    record,
+                    "submitting",
+                    "submission_started",
+                    {},
+                )
+            response = await self._dispatch_runtime_action(record, action)
+            if (
+                submission_attempt_active
+                and isinstance(action, RequestHumanNavigationRuntimeAction)
+                and record.snapshot.state
+                not in {"submitted", "submission_uncertain", "closed"}
+            ):
+                await self._publish_gate(record, "submitting", None, {})
+            if (
+                submission_attempt_active
+                and isinstance(response, PlaywrightCliResultRuntimeActionResponse)
+                and (response.exit_code != 0 or response.timed_out)
+            ):
+                await self._park_submission_uncertain(record)
+            return response
         except PlaywrightCliRuntimeError as error:
             if submission_attempt_active:
                 await self._park_submission_uncertain(record)
@@ -1096,12 +1154,9 @@ class ApplicationSessionManager:
                 await self._park_submission_uncertain(record)
             raise
         finally:
-            if owns_pending:
-                async with record.request_lock:
-                    if record.runtime_action_task is current_task:
-                        record.runtime_action_task = None
-                        record.runtime_action_pending = False
-                        record.auto_submission_approval_pending = False
+            async with record.request_lock:
+                if record.runtime_action_task is current_task:
+                    record.auto_submission_approval_pending = False
 
     async def _dispatch_runtime_action(
         self,
@@ -1863,10 +1918,13 @@ class ApplicationSessionManager:
                 await asyncio.shield(runtime_action_task)
             except (asyncio.CancelledError, Exception):
                 pass
-            async with record.request_lock:
-                if record.runtime_action_task is runtime_action_task:
-                    record.runtime_action_task = None
-                    record.runtime_action_pending = False
+        async with record.request_lock:
+            if record.runtime_action_task is runtime_action_task:
+                record.runtime_action_task = None
+                record.runtime_action_id = None
+                record.runtime_action_payload = None
+                record.runtime_action_ids_seen.clear()
+                record.auto_submission_approval_pending = False
 
         while record.playwright_runtime is not None:
             if record.runtime_close_task is None:
