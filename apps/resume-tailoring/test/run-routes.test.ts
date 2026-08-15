@@ -98,8 +98,9 @@ describe("run HTTP routes", () => {
     expect(OpportunityKindSchema.parse("networking_event")).toBe("networking_event");
     let receivedOpportunityKind: RunDto["opportunityKind"] | undefined;
     const target = service({
-      createRun: async (_jobUrl, _generateKeywordMap, _skipReview, _autoSubmit, _signal, opportunityKind) => {
-        receivedOpportunityKind = opportunityKind;
+      createRun: async (request) => {
+        if (!("jobUrl" in request)) throw new Error("Expected a URL request");
+        receivedOpportunityKind = request.opportunityKind;
         return { ...run, opportunityKind: "networking_event" };
       },
     });
@@ -115,6 +116,38 @@ describe("run HTTP routes", () => {
     expect(target.kickCount()).toBe(1);
   });
 
+  test("forwards a normalized pasted request and request signal before kicking the scheduler", async () => {
+    const queuedRun: RunDto = { ...run, applicationStatus: "pending" };
+    let received: unknown[] | undefined;
+    const target = service({
+      createRun: async (...args: unknown[]) => {
+        received = args;
+        return queuedRun;
+      },
+    });
+    const incoming = new Request("http://127.0.0.1:3457/v1/runs", post({
+      jobTitle: "  Platform Engineer  ",
+      jobDescription: "  Build reliable distributed systems and improve operational tooling.  ",
+      generateKeywordMap: false,
+    }));
+
+    const response = await createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target) })(incoming);
+
+    expect(response.status).toBe(201);
+    const responseBody = await response.json();
+    expect(responseBody).toEqual(queuedRun);
+    expect(responseBody).not.toHaveProperty("jobUrl");
+    expect(received).toEqual([
+      {
+        jobTitle: "Platform Engineer",
+        jobDescription: "Build reliable distributed systems and improve operational tooling.",
+        generateKeywordMap: false,
+      },
+      incoming.signal,
+    ]);
+    expect(target.kickCount()).toBe(1);
+  });
+
   test("canonicalizes the job URL, forwards independent run modes and request signal, and kicks only after persistence succeeds", async () => {
     let received: {
       jobUrl: string;
@@ -125,7 +158,9 @@ describe("run HTTP routes", () => {
       signal: AbortSignal | undefined;
     } | undefined;
     const target = service({
-      createRun: async (jobUrl, generateKeywordMap, skipReview, autoSubmit, signal, opportunityKind) => {
+      createRun: async (request, signal) => {
+        if (!("jobUrl" in request)) throw new Error("Expected a URL request");
+        const { jobUrl, generateKeywordMap, skipReview, autoSubmit, opportunityKind } = request;
         received = { jobUrl, generateKeywordMap, skipReview, autoSubmit, opportunityKind, signal };
         return { ...run, jobUrl, skipReview, autoSubmit };
       },
@@ -178,7 +213,9 @@ describe("run HTTP routes", () => {
       autoSubmit: boolean;
     } | undefined;
     const defaultTarget = service({
-      createRun: async (_jobUrl, generateKeywordMap, skipReview, autoSubmit) => {
+      createRun: async (request) => {
+        if (!("jobUrl" in request)) throw new Error("Expected a URL request");
+        const { generateKeywordMap, skipReview, autoSubmit } = request;
         defaulted = { generateKeywordMap, skipReview, autoSubmit };
         return run;
       },

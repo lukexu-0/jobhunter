@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent } from "react";
 import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type OpportunityKind, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
-import { PipelineClientError, createRun, deleteRun, listRuns, readJsonArtifact, updateApplicationStatus, updateRunIdentity } from "../lib/pipeline-client";
+import { PipelineClientError, createPastedRun, createRun, deleteRun, listRuns, readJsonArtifact, updateApplicationStatus, updateRunIdentity } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
 import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
@@ -57,6 +57,7 @@ type SortDirection = "newest" | "oldest";
 type StatusFilter = ApplicationStatus | "all" | "applying";
 type IdentityField = "title" | "organization";
 type OpportunityKindSelection = OpportunityKind | "auto";
+type InitializerSource = "url" | "pasted";
 
 interface EffectiveIdentity {
   readonly title?: string;
@@ -89,6 +90,12 @@ interface ValidatedCreateRunRequest {
   readonly generateKeywordMap: boolean;
   readonly skipReview: boolean;
   readonly autoSubmit: boolean;
+}
+
+interface ValidatedPastedRunRequest {
+  readonly jobTitle: string;
+  readonly jobDescription: string;
+  readonly generateKeywordMap: boolean;
 }
 
 type CreateRunResult =
@@ -127,10 +134,24 @@ function parseCreateRunRequests(
       skipReview,
       autoSubmit,
     });
-    if (!parsed.success) return null;
+    if (!parsed.success || !("jobUrl" in parsed.data)) return null;
     requests.push(parsed.data);
   }
   return requests;
+}
+
+function parsePastedRunRequest(
+  jobTitle: string,
+  jobDescription: string,
+  generateKeywordMap: boolean,
+): ValidatedPastedRunRequest | null {
+  const parsed = CreateRunRequestSchema.safeParse({
+    jobTitle,
+    jobDescription,
+    generateKeywordMap,
+  });
+  if (!parsed.success || !("jobTitle" in parsed.data)) return null;
+  return parsed.data;
 }
 
 async function mapWithConcurrency<Item, Result>(
@@ -266,10 +287,14 @@ export function RunDashboard() {
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0]);
+  const [initializerSource, setInitializerSource] = useState<InitializerSource>("url");
   const [jobUrl, setJobUrl] = useState("");
   const [opportunityKind, setOpportunityKind] = useState<OpportunityKindSelection>("auto");
   const [skipReview, setSkipReview] = useState(false);
   const [autoSubmit, setAutoSubmit] = useState(false);
+  const [jobTitle, setJobTitle] = useState("");
+  const [jobDescription, setJobDescription] = useState("");
+  const [generateKeywordMap, setGenerateKeywordMap] = useState(true);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -316,7 +341,17 @@ export function RunDashboard() {
     () => parseCreateRunRequests(jobUrl, opportunityKind, skipReview, autoSubmit),
     [autoSubmit, jobUrl, opportunityKind, skipReview],
   );
-  const isCreateRequestValid = createRunRequests !== null;
+  const pastedRunRequest = useMemo(
+    () => parsePastedRunRequest(jobTitle, jobDescription, generateKeywordMap),
+    [generateKeywordMap, jobDescription, jobTitle],
+  );
+  const isCreateRequestValid = initializerSource === "url"
+    ? createRunRequests !== null
+    : pastedRunRequest !== null;
+  const clearCreateStatus = () => {
+    setCreateError(null);
+    setCreateSuccess(null);
+  };
 
   const load = useCallback(async (showLoading = false) => {
     const requestId = ++latestListRequest.current;
@@ -691,6 +726,31 @@ export function RunDashboard() {
     setIsCreating(false);
   };
 
+  const initializePastedRun = async (request: ValidatedPastedRunRequest) => {
+    if (isCreating) return;
+    setIsCreating(true);
+    clearCreateStatus();
+    try {
+      const run = await createPastedRun(
+        request.jobTitle,
+        request.jobDescription,
+        request.generateKeywordMap,
+      );
+      latestListRequest.current += 1;
+      setIsLoading(false);
+      setRuns((current) => mergeRuns(current, [run]));
+      void load();
+      setJobTitle("");
+      setJobDescription("");
+      setGenerateKeywordMap(true);
+      setCreateSuccess("1 application initialized.");
+    } catch (error) {
+      setCreateError(publicMessage(error, "The pasted job could not be initialized. Try again."));
+    } finally {
+      setIsCreating(false);
+    }
+  };
+
   const dismissDuplicateDialog = () => {
     if (duplicateDialogRef.current?.open) duplicateDialogRef.current.close();
     setDuplicateCreateRequests(null);
@@ -699,7 +759,12 @@ export function RunDashboard() {
 
   const submitRun = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (isCreating || !createRunRequests) return;
+    if (isCreating) return;
+    if (initializerSource === "pasted") {
+      if (pastedRunRequest) void initializePastedRun(pastedRunRequest);
+      return;
+    }
+    if (!createRunRequests) return;
     const knownJobUrls = new Set(
       runs.flatMap((run) => run.jobUrl === undefined ? [] : [run.jobUrl]),
     );
@@ -755,98 +820,185 @@ export function RunDashboard() {
       </header>
 
       <form
-        className="run-initializer"
+        className={`run-initializer run-initializer--${initializerSource}`}
         aria-label="Initialize applications"
         noValidate
         onSubmit={(event) => void submitRun(event)}
       >
-        <div className="run-initializer__field">
-          <label className="run-initializer__label" htmlFor="job-url">Opportunity URLs</label>
-          <input
-            id="job-url"
-            type="text"
-            inputMode="url"
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            placeholder="https://example.com/opportunities/ship-it, https://example.com/events/demo-day"
-            value={jobUrl}
-            disabled={isCreating}
-            aria-invalid={createError ? true : undefined}
-            aria-describedby={createError ? "job-url-error" : createSuccess ? "job-url-success" : undefined}
-            aria-errormessage={createError ? "job-url-error" : undefined}
-            onChange={(event) => {
-              setJobUrl(event.target.value);
-              setCreateError(null);
-              setCreateSuccess(null);
-            }}
-          />
-        </div>
-
-        <label className="select-control run-initializer__kind">
-          <span>Opportunity type</span>
+        <label className="select-control run-initializer__source">
+          <span>Initialize from</span>
           <select
-            aria-label="Opportunity type"
-            value={opportunityKind}
+            aria-label="Initialize from"
+            value={initializerSource}
             disabled={isCreating}
             onChange={(event) => {
-              setOpportunityKind(event.currentTarget.value as OpportunityKindSelection);
-              setCreateError(null);
-              setCreateSuccess(null);
+              setInitializerSource(event.currentTarget.value as InitializerSource);
+              setDuplicateCreateRequests(null);
+              clearCreateStatus();
             }}
           >
-            <option value="auto">Auto-detect</option>
-            <option value="job">Job</option>
-            <option value="hackathon">Hackathon</option>
-            <option value="competition">Competition</option>
-            <option value="event">Event</option>
-            <option value="networking_event">Networking event</option>
+            <option value="url">Opportunity URL(s)</option>
+            <option value="pasted">Paste job details</option>
           </select>
         </label>
 
-        <fieldset className="run-initializer__options">
-          <legend className="run-initializer__label">Run options</legend>
-          <div className="run-initializer__option-list">
-            <label className="run-initializer__mode">
+        {initializerSource === "url" ? (
+          <>
+            <div className="run-initializer__field">
+              <label className="run-initializer__label" htmlFor="job-url">Opportunity URLs</label>
               <input
-                type="checkbox"
-                aria-describedby="skip-review-description"
-                aria-labelledby="skip-review-label"
-                checked={skipReview}
+                id="job-url"
+                type="text"
+                inputMode="url"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                placeholder="https://example.com/opportunities/ship-it, https://example.com/events/demo-day"
+                value={jobUrl}
                 disabled={isCreating}
+                aria-invalid={createError ? true : undefined}
+                aria-describedby={createError ? "job-url-error" : createSuccess ? "job-url-success" : undefined}
+                aria-errormessage={createError ? "job-url-error" : undefined}
                 onChange={(event) => {
-                  setSkipReview(event.currentTarget.checked);
-                  setCreateError(null);
+                  setJobUrl(event.target.value);
+                  clearCreateStatus();
                 }}
               />
-              <span className="run-initializer__mode-copy">
-                <span className="run-initializer__mode-title" id="skip-review-label">Skip résumé review</span>
-                <span className="run-initializer__mode-description" id="skip-review-description">
-                  Automatically approves only when automated résumé checks pass, then starts the application.
-                </span>
-              </span>
-            </label>
-            <label className="run-initializer__mode">
-              <input
-                type="checkbox"
-                aria-describedby="auto-submit-description"
-                aria-labelledby="auto-submit-label"
-                checked={autoSubmit}
+            </div>
+
+            <label className="select-control run-initializer__kind">
+              <span>Opportunity type</span>
+              <select
+                aria-label="Opportunity type"
+                value={opportunityKind}
                 disabled={isCreating}
                 onChange={(event) => {
-                  setAutoSubmit(event.currentTarget.checked);
-                  setCreateError(null);
+                  setOpportunityKind(event.currentTarget.value as OpportunityKindSelection);
+                  clearCreateStatus();
                 }}
-              />
-              <span className="run-initializer__mode-copy">
-                <span className="run-initializer__mode-title" id="auto-submit-label">Auto-submit application</span>
-                <span className="run-initializer__mode-description" id="auto-submit-description">
-                  Submits only when the application has no blockers.
-                </span>
-              </span>
+              >
+                <option value="auto">Auto-detect</option>
+                <option value="job">Job</option>
+                <option value="hackathon">Hackathon</option>
+                <option value="competition">Competition</option>
+                <option value="event">Event</option>
+                <option value="networking_event">Networking event</option>
+              </select>
             </label>
-          </div>
-        </fieldset>
+
+            <fieldset className="run-initializer__options">
+              <legend className="run-initializer__label">Run options</legend>
+              <div className="run-initializer__option-list">
+                <label className="run-initializer__mode">
+                  <input
+                    type="checkbox"
+                    aria-describedby="skip-review-description"
+                    aria-labelledby="skip-review-label"
+                    checked={skipReview}
+                    disabled={isCreating}
+                    onChange={(event) => {
+                      setSkipReview(event.currentTarget.checked);
+                      clearCreateStatus();
+                    }}
+                  />
+                  <span className="run-initializer__mode-copy">
+                    <span className="run-initializer__mode-title" id="skip-review-label">Skip résumé review</span>
+                    <span className="run-initializer__mode-description" id="skip-review-description">
+                      Automatically approves only when automated résumé checks pass, then starts the application.
+                    </span>
+                  </span>
+                </label>
+                <label className="run-initializer__mode">
+                  <input
+                    type="checkbox"
+                    aria-describedby="auto-submit-description"
+                    aria-labelledby="auto-submit-label"
+                    checked={autoSubmit}
+                    disabled={isCreating}
+                    onChange={(event) => {
+                      setAutoSubmit(event.currentTarget.checked);
+                      clearCreateStatus();
+                    }}
+                  />
+                  <span className="run-initializer__mode-copy">
+                    <span className="run-initializer__mode-title" id="auto-submit-label">Auto-submit application</span>
+                    <span className="run-initializer__mode-description" id="auto-submit-description">
+                      Submits only when the application has no blockers.
+                    </span>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+          </>
+        ) : (
+          <>
+            <div className="run-initializer__pasted-fields">
+              <div className="run-initializer__paste-field">
+                <label className="run-initializer__label" htmlFor="job-title">Job title</label>
+                <input
+                  id="job-title"
+                  type="text"
+                  required
+                  maxLength={200}
+                  value={jobTitle}
+                  disabled={isCreating}
+                  aria-invalid={createError ? true : undefined}
+                  aria-describedby={createError ? "pasted-job-error" : createSuccess ? "pasted-job-success" : undefined}
+                  aria-errormessage={createError ? "pasted-job-error" : undefined}
+                  onChange={(event) => {
+                    setJobTitle(event.currentTarget.value);
+                    clearCreateStatus();
+                  }}
+                />
+              </div>
+              <div className="run-initializer__paste-field">
+                <label className="run-initializer__label" htmlFor="job-description">Job description</label>
+                <textarea
+                  id="job-description"
+                  required
+                  minLength={40}
+                  maxLength={50_000}
+                  value={jobDescription}
+                  disabled={isCreating}
+                  aria-invalid={createError ? true : undefined}
+                  aria-describedby={createError ? "pasted-job-error" : createSuccess ? "pasted-job-success" : undefined}
+                  aria-errormessage={createError ? "pasted-job-error" : undefined}
+                  onChange={(event) => {
+                    setJobDescription(event.currentTarget.value);
+                    clearCreateStatus();
+                  }}
+                />
+              </div>
+            </div>
+
+            <fieldset className="run-initializer__options run-initializer__options--pasted">
+              <legend className="run-initializer__label">Run options</legend>
+              <div className="run-initializer__option-list">
+                <label className="run-initializer__mode">
+                  <input
+                    type="checkbox"
+                    aria-describedby="generate-keyword-map-description"
+                    aria-labelledby="generate-keyword-map-label"
+                    checked={generateKeywordMap}
+                    disabled={isCreating}
+                    onChange={(event) => {
+                      setGenerateKeywordMap(event.currentTarget.checked);
+                      clearCreateStatus();
+                    }}
+                  />
+                  <span className="run-initializer__mode-copy">
+                    <span className="run-initializer__mode-title" id="generate-keyword-map-label">
+                      Generate keyword map
+                    </span>
+                    <span className="run-initializer__mode-description" id="generate-keyword-map-description">
+                      Build a resume-to-job-description keyword map before tailoring.
+                    </span>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+          </>
+        )}
 
         <button
           ref={duplicateDialogOpenerRef}
@@ -856,8 +1008,24 @@ export function RunDashboard() {
         >
           {isCreating ? "Initializing…" : "Initialize"}
         </button>
-        {createError ? <p className="dashboard-alert" id="job-url-error" role="alert">{createError}</p> : null}
-        {createSuccess ? <p className="dashboard-notice dashboard-notice--success" id="job-url-success" role="status">{createSuccess}</p> : null}
+        {createError ? (
+          <p
+            className="dashboard-alert"
+            id={initializerSource === "url" ? "job-url-error" : "pasted-job-error"}
+            role="alert"
+          >
+            {createError}
+          </p>
+        ) : null}
+        {createSuccess ? (
+          <p
+            className="dashboard-notice dashboard-notice--success"
+            id={initializerSource === "url" ? "job-url-success" : "pasted-job-success"}
+            role="status"
+          >
+            {createSuccess}
+          </p>
+        ) : null}
       </form>
 
         <section className="applications-summary" aria-label="Application count">

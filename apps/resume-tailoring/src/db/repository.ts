@@ -4,6 +4,7 @@ import { CLAIM_TTL_MS, createClaimToken, isProcessIdentityAlive, type ClaimToken
 import {
   ACTIVE_APPLICATION_SESSION_BRIDGE_STATES,
   OpportunityKindSchema,
+  RunIdentityTextSchema,
   type OpportunityKind,
 } from "../contracts/index.ts";
 
@@ -510,7 +511,7 @@ export class PipelineRepository {
 
   createQueuedRun(
     jobDescription: string,
-    jobUrl: string,
+    jobUrl: string | null,
     opportunityKind: OpportunityKind,
     snapshot: RunSourceSnapshotInput,
     input: QueuedInputArtifact,
@@ -520,27 +521,33 @@ export class PipelineRepository {
     skipReview = false,
     autoSubmit = false,
     discoveryJobId?: string,
+    titleOverride?: string,
   ): PublicRun {
     if (!jobDescription.trim()) throw new Error("job description is required");
     OpportunityKindSchema.parse(opportunityKind);
-    if (jobUrl.length < 1 || jobUrl.length > 2_048 || jobUrl.trim() !== jobUrl) {
-      throw new Error("job URL is invalid");
+    if (jobUrl !== null) {
+      if (jobUrl.length < 1 || jobUrl.length > 2_048 || jobUrl.trim() !== jobUrl) {
+        throw new Error("job URL is invalid");
+      }
+      let parsedJobUrl: URL;
+      try {
+        parsedJobUrl = new URL(jobUrl);
+      } catch {
+        throw new Error("job URL is invalid");
+      }
+      if (
+        !["http:", "https:"].includes(parsedJobUrl.protocol)
+        || parsedJobUrl.username
+        || parsedJobUrl.password
+        || parsedJobUrl.hash
+        || parsedJobUrl.toString() !== jobUrl
+      ) {
+        throw new Error("job URL is invalid");
+      }
     }
-    let parsedJobUrl: URL;
-    try {
-      parsedJobUrl = new URL(jobUrl);
-    } catch {
-      throw new Error("job URL is invalid");
-    }
-    if (
-      !["http:", "https:"].includes(parsedJobUrl.protocol)
-      || parsedJobUrl.username
-      || parsedJobUrl.password
-      || parsedJobUrl.hash
-      || parsedJobUrl.toString() !== jobUrl
-    ) {
-      throw new Error("job URL is invalid");
-    }
+    const validatedTitleOverride = titleOverride === undefined
+      ? null
+      : RunIdentityTextSchema.parse(titleOverride);
     if (!/^[a-f0-9]{64}$/.test(input.sha256) || !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || !input.path) {
       throw new Error("queued input artifact metadata is invalid");
     }
@@ -573,8 +580,8 @@ export class PipelineRepository {
         }
         if (discoveryJob.closed === 1) throw new DiscoveryJobQueueConflictError("closed");
       }
-      this.#db.query("INSERT INTO runs(id, job_description, job_url, opportunity_kind, status, generate_keyword_map, skip_review, auto_submit, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 1, ?, ?, ?)")
-        .run(id, jobDescription, jobUrl, opportunityKind, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, sequence, now, now);
+      this.#db.query("INSERT INTO runs(id, job_description, job_url, opportunity_kind, status, generate_keyword_map, skip_review, auto_submit, title_override, current_revision, queue_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, 1, ?, ?, ?)")
+        .run(id, jobDescription, jobUrl, opportunityKind, generateKeywordMap ? 1 : 0, skipReview ? 1 : 0, autoSubmit ? 1 : 0, validatedTitleOverride, sequence, now, now);
       this.#db.query("INSERT INTO revisions(run_id, revision, origin, source_revision, status, created_at) VALUES (?, 1, 'initial', NULL, 'queued', ?)").run(id, now);
       this.#db.query("INSERT INTO run_source_snapshots(run_id,manifest_sha256,baseline_sha256,source_hashes_json,created_at) VALUES (?,?,?,?,?)")
         .run(id, snapshot.manifestSha256, snapshot.baselineSha256, JSON.stringify(sourceHashes), now);

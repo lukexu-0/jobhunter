@@ -377,11 +377,10 @@ export function RunReviewWorkspace({
   const canStartAfterApproval = notStarted?.canStartAfterApproval === true;
   const blockedReason = blockedReasonMessage(notStarted?.blockedReason);
   const editDisabled = !isFresh || busyAction !== null;
+  const hasApplicationUrl = run.jobUrl !== undefined;
   const approvalDisabled = editDisabled
-    || isLoadingApplication
-    || !canStartAfterApproval
-    || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues)
-    || isStartingApplication;
+    || (hasApplicationUrl && (isLoadingApplication || !canStartAfterApproval || isStartingApplication))
+    || (run.visualAcknowledgementRequired && !acknowledgeVisualIssues);
   const liveGeneration = snapshot && isStreamableApplicationSnapshot(snapshot)
     ? snapshot.generation
     : null;
@@ -856,6 +855,7 @@ export function RunReviewWorkspace({
     try {
       const approved = await onApprove(acknowledgeVisualIssues);
       if (activeRunContextRef.current !== approvalContext) return;
+      if (!hasApplicationUrl) return;
       if (!approved.currentPdfSha256) {
         setActionError("The resume was approved, but its PDF is unavailable to apply.");
         return;
@@ -955,28 +955,34 @@ export function RunReviewWorkspace({
               onClick={() => void submitApproval()}
               type="button"
             >
-              {busyAction === "approve" ? "Approving…" : "Approve and apply"}
+              {busyAction === "approve" ? "Approving…" : hasApplicationUrl ? "Approve and apply" : "Approve"}
             </button>
-            {!canStartAfterApproval && blockedReason ? (
+            {hasApplicationUrl && !canStartAfterApproval && blockedReason ? (
               <p className={styles.workspaceNotice}>{blockedReason}</p>
             ) : null}
           </>
         ) : null}
-        {run.status === "approved" && notStarted ? (
-          notStarted.canStart && run.currentPdfSha256 ? (
-            <button
-              className={styles.primaryButton}
-              disabled={isStartingApplication}
-              onClick={() => void startApplication(run.currentPdfSha256!)}
-              type="button"
-            >
-              {isStartingApplication ? "Starting…" : "Apply"}
-            </button>
-          ) : (
+        {run.status === "approved" ? (
+          !hasApplicationUrl ? (
             <p className={styles.workspaceNotice}>
-              {blockedReason ?? "Automatic application is not available for this approved run."}
+              Automatic application is unavailable for this opportunity.
             </p>
-          )
+          ) : notStarted ? (
+            notStarted.canStart && run.currentPdfSha256 ? (
+              <button
+                className={styles.primaryButton}
+                disabled={isStartingApplication}
+                onClick={() => void startApplication(run.currentPdfSha256!)}
+                type="button"
+              >
+                {isStartingApplication ? "Starting…" : "Apply"}
+              </button>
+            ) : (
+              <p className={styles.workspaceNotice}>
+                {blockedReason ?? "Automatic application is not available for this approved run."}
+              </p>
+            )
+          ) : null
         ) : null}
         {actionError ? <p className={styles.panelError} role="alert">{actionError}</p> : null}
       </section>

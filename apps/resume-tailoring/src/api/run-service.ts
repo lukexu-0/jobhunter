@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
+  CreateRunRequestSchema,
   JobDescriptionSchema,
   type ApplicationStatus,
   type ArtifactDto,
   type ArtifactKind,
   type AttemptDto,
   type AttemptStage,
+  type CreateRunRequest,
   type RevisionOrigin as PublicRevisionOrigin,
   type OpportunityKind,
   type ResumeIterationListResponse,
@@ -292,15 +294,34 @@ export class RunApplicationService {
   }
 
   async createRun(
-    jobUrl: string,
-    generateKeywordMap = true,
-    skipReview = false,
-    autoSubmit = false,
+    request: CreateRunRequest,
     requestSignal?: AbortSignal,
-    opportunityKind?: OpportunityKind,
   ): Promise<RunDto> {
     const signal = requestSignal;
     signal?.throwIfAborted();
+    const parsedRequest = CreateRunRequestSchema.parse(request);
+
+    if (!("jobUrl" in parsedRequest)) {
+      return await this.#persistRun(
+        null,
+        parsedRequest.jobDescription,
+        "job",
+        parsedRequest.generateKeywordMap,
+        false,
+        false,
+        signal,
+        undefined,
+        parsedRequest.jobTitle,
+      );
+    }
+
+    const {
+      jobUrl,
+      opportunityKind,
+      generateKeywordMap,
+      skipReview,
+      autoSubmit,
+    } = parsedRequest;
     let source: LoadedJobSource;
     try {
       source = await this.#loadJobSource(jobUrl, signal, opportunityKind);
@@ -383,7 +404,7 @@ export class RunApplicationService {
   }
 
   async #persistRun(
-    jobUrl: string,
+    jobUrl: string | null,
     jobDescription: string,
     opportunityKind: OpportunityKind,
     generateKeywordMap: boolean,
@@ -391,6 +412,7 @@ export class RunApplicationService {
     autoSubmit: boolean,
     signal?: AbortSignal,
     discoveryJobId?: string,
+    titleOverride?: string,
   ): Promise<RunDto> {
     signal?.throwIfAborted();
     let freshSnapshot: ContextSnapshot;
@@ -431,11 +453,13 @@ export class RunApplicationService {
             reservation.run,
             skipReview,
             autoSubmit,
+            undefined,
+            titleOverride,
           )
         : this.dependencies.repository.createDiscoveryQueuedRun(
             discoveryJobId,
             jobDescription,
-            jobUrl,
+            jobUrl!,
             snapshot,
             queuedInput,
             runId,

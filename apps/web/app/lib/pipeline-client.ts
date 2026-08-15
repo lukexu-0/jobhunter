@@ -344,6 +344,22 @@ export function createRun(
   return requestRun("/runs", jsonPost(parsed.data));
 }
 
+export function createPastedRun(
+  jobTitle: string,
+  jobDescription: string,
+  generateKeywordMap = true,
+): Promise<RunDto> {
+  const parsed = CreateRunRequestSchema.safeParse({
+    jobTitle,
+    jobDescription,
+    generateKeywordMap,
+  });
+  if (!parsed.success) {
+    throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
+  }
+  return requestRun("/runs", jsonPost(parsed.data));
+}
+
 export function retryRun(id: string): Promise<RunDto> {
   return requestRun(`${runPath(id)}/retry`, jsonPost({}));
 }
