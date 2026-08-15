@@ -1299,6 +1299,7 @@ export type DiscoverySort = z.infer<typeof DiscoverySortSchema>;
 
 export const DiscoveryListRequestSchema = z.object({
   role: DiscoveryRoleSchema.optional(),
+  suitable: z.boolean().optional(),
   maxAgeDays: z.number().int().min(1).max(365).nullable().default(7),
   status: DiscoveryListStatusSchema.default("open"),
   hideQueued: z.boolean().default(false),

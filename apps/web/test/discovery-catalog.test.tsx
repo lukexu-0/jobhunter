@@ -98,7 +98,14 @@ describe("DiscoveryCatalog selection", () => {
 
     expect([...discoverySelectionAfterTransition(selected, "refresh")])
       .toEqual(["swe-1", "swe-2"]);
-    for (const transition of ["page", "role", "recency", "status", "search"] as const) {
+    for (const transition of [
+      "page",
+      "role",
+      "recency",
+      "status",
+      "suitability",
+      "search",
+    ] as const) {
       expect([...discoverySelectionAfterTransition(selected, transition)]).toEqual([]);
     }
   });
@@ -171,9 +178,15 @@ describe("DiscoveryCatalog selection", () => {
     expect(markup).toContain('aria-busy="true"');
   });
 
-  test("renders sort and queued-visibility controls with their public defaults", () => {
+  test("renders suitability, sort, and queued-visibility controls with their public defaults", () => {
     const markup = renderToStaticMarkup(<DiscoveryCatalog />);
 
+    expect(markup).toContain('aria-label="Filter internships by suitability"');
+    expect(markup).toContain(
+      '<option value="all" selected="">All suitability</option>'
+      + '<option value="true">Suitable</option>'
+      + '<option value="false">Unsuitable</option>',
+    );
     expect(markup).toContain('aria-label="Sort internships"');
     expect(markup).toContain(
       '<option value="recency" selected="">Newest first</option>',

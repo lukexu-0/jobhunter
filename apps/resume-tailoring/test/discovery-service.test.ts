@@ -1003,6 +1003,67 @@ describe("discovery routes", () => {
     expect(await response.json()).toEqual({ jobs: [], total: 0, lastSyncAt: null });
   });
 
+  test("filters suitable and unsuitable jobs through the public list endpoint", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, { now: () => 1_000 });
+    repository.reconcileSource({
+      id: "mixed-suitability",
+      name: "Mixed suitability",
+      kind: "simplify",
+      items: [
+        classifiedInput("suitable-match", "Matching suitable internship"),
+        { ...classifiedInput("unsuitable-match", "Matching unsuitable internship"), suitable: false },
+        classifiedInput("suitable-other", "Other suitable internship"),
+      ],
+      completeSnapshot: true,
+    });
+    const service = new DiscoveryService({
+      repository,
+      connectors: [],
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      now: () => 1_000,
+    });
+    const fetch = createApiHandler({ webOrigin: ORIGIN, route: createDiscoveryRoutes(service) });
+
+    const request = async (suitable?: boolean) => {
+      const query = new URLSearchParams({
+        maxAgeDays: "all",
+        status: "all",
+        search: "Matching",
+      });
+      if (suitable !== undefined) query.set("suitable", String(suitable));
+      const response = await fetch(new Request(
+        `http://127.0.0.1:3457/v1/discovery?${query}`,
+      ));
+      expect(response.status).toBe(200);
+      return await response.json() as {
+        jobs: Array<{ title: string; suitable: boolean }>;
+        total: number;
+      };
+    };
+
+    const all = await request();
+    expect(all.total).toBe(2);
+    expect(all.jobs.map(({ title }) => title)).toEqual(expect.arrayContaining([
+      "Matching suitable internship",
+      "Matching unsuitable internship",
+    ]));
+    const suitable = await request(true);
+    expect(suitable.total).toBe(1);
+    expect(suitable.jobs).toEqual([
+      expect.objectContaining({ title: "Matching suitable internship", suitable: true }),
+    ]);
+    const unsuitable = await request(false);
+    expect(unsuitable.total).toBe(1);
+    expect(unsuitable.jobs).toEqual([
+      expect.objectContaining({ title: "Matching unsuitable internship", suitable: false }),
+    ]);
+  });
+
   test("strictly validates queries and mutations behind the shared origin guard", async () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);
@@ -1027,6 +1088,13 @@ describe("discovery routes", () => {
     expect((await fetch(new Request(
       "http://127.0.0.1:3457/v1/discovery?status=",
     ))).status).toBe(400);
+    const invalidSuitability = await fetch(new Request(
+      "http://127.0.0.1:3457/v1/discovery?suitable=1",
+    ));
+    expect(invalidSuitability.status).toBe(400);
+    expect(await invalidSuitability.json()).toEqual({
+      error: { code: "INVALID_REQUEST", message: "Discovery query is invalid" },
+    });
     expect((await fetch(new Request("http://127.0.0.1:3457/v1/discovery/sync", {
       method: "POST",
       headers: { "content-type": "application/json" },
