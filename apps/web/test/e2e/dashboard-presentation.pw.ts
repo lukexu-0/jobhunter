@@ -267,6 +267,12 @@ test("shows a decorative mapped kind icon beside every populated application tit
       visibleTitle: "Career Fair",
       accessibleName: "Open event Career Fair event-ki…-run",
     },
+    {
+      kind: "networking_event",
+      title: "Alumni Mixer",
+      visibleTitle: "Alumni Mixer",
+      accessibleName: "Open networking event Alumni Mixer networki…-run",
+    },
   ] as const;
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
@@ -289,7 +295,7 @@ test("shows a decorative mapped kind icon beside every populated application tit
     const icon = link.locator("svg");
     await expect(link).toHaveAttribute("aria-label", accessibleName);
     await expect(label).toHaveText(visibleTitle);
-    for (const prefix of ["Job", "Hackathon", "Competition", "Event"]) {
+    for (const prefix of ["Job", "Hackathon", "Competition", "Event", "Networking event"]) {
       await expect(label).not.toContainText(`${prefix} ·`);
       await expect(label).not.toContainText(`${prefix}. `);
     }

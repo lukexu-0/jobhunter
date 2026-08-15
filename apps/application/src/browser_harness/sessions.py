@@ -391,6 +391,7 @@ class ApplicationSessionManager:
                 "hackathon",
                 "competition",
                 "event",
+                "networking_event",
             ):
                 raise ValueError("opportunity_kind is invalid")
             origins = [_job_origin(validated_job_url)]

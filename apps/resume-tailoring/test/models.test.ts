@@ -1039,6 +1039,25 @@ describe("direct Luna job extractor", () => {
       jobDescription: "Example Labs Hackathon\nBuild a climate solution with the supplied API and submit it by Friday.",
     });
   });
+
+  test("auto-detects a networking event through the Luna response schema", async () => {
+    const sourceLines = [
+      "Example Labs Engineering Networking Night",
+      "Meet platform engineers and technical recruiters for structured conversations about distributed systems careers.",
+    ] as const;
+    const result = await extractJobDescriptionWithLuna(sourceLines, undefined, {
+      resolverFactory: () => inertResolver(),
+      transport: async () => lunaAssistant(
+        "{\"kind\":\"networking_event\",\"ranges\":[{\"startLine\":1,\"endLine\":2}]}",
+      ),
+    });
+
+    expect(result).toEqual({
+      opportunityKind: "networking_event",
+      jobDescription: sourceLines.join("\n"),
+    });
+  });
+
   test("uses an enumerated extraction hint as the authoritative opportunity kind", async () => {
     let contextSeen: Context | undefined;
     const sourceLines = [

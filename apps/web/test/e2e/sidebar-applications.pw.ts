@@ -456,6 +456,7 @@ test("shows the controlled initializer for an empty dashboard", async ({ page })
     "Hackathon",
     "Competition",
     "Event",
+    "Networking event",
   ]);
   const options = initializer.getByRole("group", { name: "Run options" });
   await expect(options.getByRole("checkbox", { name: "Skip résumé review", exact: true })).not.toBeChecked();
@@ -625,6 +626,59 @@ test("omits the Auto-detect opportunity type, posts selected run options, and qu
     body: JSON.stringify({ runs: [initializedRun] }),
   });
   await expect(page.locator(`tbody a.application-link[href="/runs/${initializedRun.id}"]`)).toBeVisible();
+});
+
+test("submits the exact Networking event opportunity type", async ({ page }) => {
+  const submittedUrl = "https://events.example.test/alumni/mixer";
+  const { promise: postReceived, resolve: markPostReceived } = Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+
+    expect(request.method()).toBe("POST");
+    expect(request.headers()["content-type"]).toContain("application/json");
+    expect(request.postDataJSON()).toEqual({
+      jobUrl: submittedUrl,
+      opportunityKind: "networking_event",
+      generateKeywordMap: true,
+      skipReview: false,
+      autoSubmit: false,
+    });
+    await route.fulfill({
+      status: 422,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_DESCRIPTION_UNAVAILABLE",
+          message: "The page does not contain a usable opportunity description",
+        },
+      }),
+    });
+    markPostReceived();
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
+  await opportunityType.selectOption({
+    label: "Networking event",
+    value: "networking_event",
+  });
+  await initializer.getByRole("textbox", { name: "Opportunity URLs" }).fill(submittedUrl);
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+
+  await postReceived;
+  await expect(opportunityType).toHaveValue("networking_event");
+  await expect(page.locator("#job-url-error")).toHaveText(
+    "The page does not contain a usable opportunity description",
+  );
 });
 
 test("preserves both run options while confirming a duplicate canonical URL", async ({ page }) => {

@@ -283,12 +283,24 @@ describe("ApplicationAgentService", () => {
     const signal = new AbortController().signal;
 
     await service.invoke(INPUT, signal);
-    for (const opportunityKind of ["hackathon", "competition", "event"] as const) {
+    for (
+      const opportunityKind of [
+        "hackathon",
+        "competition",
+        "event",
+        "networking_event",
+      ] as const
+    ) {
       await service.invoke({ ...INPUT, opportunityKind }, signal);
     }
 
     expect(jobKinds).toEqual(["job"]);
-    expect(nonJobKinds).toEqual(["hackathon", "competition", "event"]);
+    expect(nonJobKinds).toEqual([
+      "hackathon",
+      "competition",
+      "event",
+      "networking_event",
+    ]);
   });
 
   test("strictly revalidates invoke input before OAuth or runtime construction", async () => {

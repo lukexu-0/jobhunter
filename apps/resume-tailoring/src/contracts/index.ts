@@ -198,7 +198,13 @@ export const RunStatusSchema = z.enum([
   "failed",
 ]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
-export const OpportunityKindSchema = z.enum(["job", "hackathon", "competition", "event"]);
+export const OpportunityKindSchema = z.enum([
+  "job",
+  "hackathon",
+  "competition",
+  "event",
+  "networking_event",
+]);
 export type OpportunityKind = z.infer<typeof OpportunityKindSchema>;
 
 

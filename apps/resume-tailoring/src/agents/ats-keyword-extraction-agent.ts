@@ -59,6 +59,12 @@ function keywordExtractionProfile(
   };
 }
 
+const EVENT_KEYWORD_EXTRACTION_PROFILE = keywordExtractionProfile(
+  "ats-event-keyword-extraction",
+  EVENT_KEYWORD_EXTRACTION_TASK,
+  EVENT_KEYWORD_EXTRACTION_INSTRUCTIONS,
+);
+
 export const ATS_KEYWORD_EXTRACTION_PROFILES = {
   job: {
     agentName: "ats-job-keyword-extraction",
@@ -76,11 +82,8 @@ export const ATS_KEYWORD_EXTRACTION_PROFILES = {
     COMPETITION_KEYWORD_EXTRACTION_TASK,
     COMPETITION_KEYWORD_EXTRACTION_INSTRUCTIONS,
   ),
-  event: keywordExtractionProfile(
-    "ats-event-keyword-extraction",
-    EVENT_KEYWORD_EXTRACTION_TASK,
-    EVENT_KEYWORD_EXTRACTION_INSTRUCTIONS,
-  ),
+  event: EVENT_KEYWORD_EXTRACTION_PROFILE,
+  networking_event: EVENT_KEYWORD_EXTRACTION_PROFILE,
 } as const satisfies Record<OpportunityKind, AtsKeywordExtractionProfile>;
 
 export const ATS_KEYWORD_EXTRACTION_VALIDATION_FEEDBACK_MAX_CHARS = 2_048;

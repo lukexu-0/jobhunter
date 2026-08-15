@@ -74,22 +74,22 @@ describe("job source loading", () => {
       lines: ["Senior Engineer", "", "Build secure systems and collaborate across the whole team."],
     });
   });
-  test("uses an explicit hackathon kind for a deterministic project submission page", async () => {
-    const projectSubmission =
-      "Climate resilience project submission\n\nThis prototype uses open data to help communities prepare for extreme weather events.";
+  test("uses an explicit networking event kind for a deterministic event page", async () => {
+    const eventDescription =
+      "Platform engineering networking evening\n\nMeet infrastructure engineers and discuss reliable systems in structured small-group sessions.";
 
     await expect(loadJobSourceFromUrl(
-      "https://hackathons.example.test/projects/climate-resilience/submissions/1",
+      "https://events.example.test/networking/platform-engineers",
       undefined,
       {
-        fetchImpl: async () => response(projectSubmission),
+        fetchImpl: async () => response(eventDescription),
         resolveHost: resolvePublic,
       },
-      "hackathon",
+      "networking_event",
     )).resolves.toEqual({
       kind: "description",
-      opportunityKind: "hackathon",
-      jobDescription: projectSubmission,
+      opportunityKind: "networking_event",
+      jobDescription: eventDescription,
     });
   });
 

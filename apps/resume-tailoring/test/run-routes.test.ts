@@ -15,9 +15,11 @@ import type {
   ApplicationSessionSnapshotDto,
   ApplicationSessionCommand,
   ApplicationSessionView,
+  OpportunityKind,
   ResumeIterationListResponse,
   RunDto,
 } from "../src/contracts";
+import { OpportunityKindSchema } from "../src/contracts";
 
 const ORIGIN = "http://127.0.0.1:3456";
 const PDF_HASH = "a".repeat(64);
@@ -92,23 +94,24 @@ function patch(body: unknown): RequestInit {
 }
 
 describe("run HTTP routes", () => {
-  test("accepts and forwards an explicit hackathon opportunity kind", async () => {
+  test("accepts and forwards an explicit networking event opportunity kind", async () => {
+    expect(OpportunityKindSchema.parse("networking_event")).toBe("networking_event");
     let receivedOpportunityKind: RunDto["opportunityKind"] | undefined;
     const target = service({
       createRun: async (_jobUrl, _generateKeywordMap, _skipReview, _autoSubmit, _signal, opportunityKind) => {
         receivedOpportunityKind = opportunityKind;
-        return { ...run, opportunityKind: "hackathon" };
+        return { ...run, opportunityKind: "networking_event" };
       },
     });
 
     const response = await request(target, "/v1/runs", post({
-      jobUrl: "https://hackathons.example.test/projects/climate-resilience/submissions/1",
-      opportunityKind: "hackathon",
+      jobUrl: "https://events.example.test/networking/platform-engineers",
+      opportunityKind: "networking_event",
     }));
 
     expect(response.status).toBe(201);
-    expect(await response.json()).toMatchObject({ opportunityKind: "hackathon" });
-    expect(receivedOpportunityKind).toBe("hackathon");
+    expect(await response.json()).toMatchObject({ opportunityKind: "networking_event" });
+    expect(receivedOpportunityKind).toBe("networking_event");
     expect(target.kickCount()).toBe(1);
   });
 
@@ -118,7 +121,7 @@ describe("run HTTP routes", () => {
       generateKeywordMap: boolean;
       skipReview: boolean;
       autoSubmit: boolean;
-      opportunityKind: "job" | "hackathon" | "competition" | "event" | undefined;
+      opportunityKind: OpportunityKind | undefined;
       signal: AbortSignal | undefined;
     } | undefined;
     const target = service({

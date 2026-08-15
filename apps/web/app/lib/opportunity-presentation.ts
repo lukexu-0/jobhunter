@@ -69,6 +69,18 @@ export const OPPORTUNITY_PRESENTATION = {
     dashboardTitleFallback: "Details unavailable",
     dashboardOrganizationFallback: "Organizer unavailable",
   },
+  networking_event: {
+    icon: CalendarDays,
+    detailKindLabel: "Networking event",
+    summaryLabel: "Networking event summary and keyword comparison",
+    titleFallback: "Networking event",
+    organizationFallback: "Organizer unavailable",
+    linkLabel: "View networking event details",
+    openNamedPrefix: "Open networking event",
+    openFallbackLabel: "Open networking event",
+    dashboardTitleFallback: "Details unavailable",
+    dashboardOrganizationFallback: "Organizer unavailable",
+  },
 } as const satisfies Record<OpportunityKind, OpportunityPresentation>;
 
 export function opportunityPresentation(kind: OpportunityKind): OpportunityPresentation {

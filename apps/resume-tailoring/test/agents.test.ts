@@ -364,15 +364,21 @@ describe("guarded agents", () => {
     expect(providerIds).toEqual(["ats-extraction"]);
   });
 
-  test("routes non-job opportunities to distinct custom keyword extraction agents", async () => {
-    for (const opportunityKind of ["hackathon", "competition", "event"] as const) {
-      const profile = ATS_KEYWORD_EXTRACTION_PROFILES[opportunityKind];
+  test("routes non-job opportunities through their keyword extraction profiles", async () => {
+    const cases = [
+      { opportunityKind: "hackathon", profileKind: "hackathon" },
+      { opportunityKind: "competition", profileKind: "competition" },
+      { opportunityKind: "event", profileKind: "event" },
+      { opportunityKind: "networking_event", profileKind: "event" },
+    ] as const;
+    for (const { opportunityKind, profileKind } of cases) {
+      const profile = ATS_KEYWORD_EXTRACTION_PROFILES[profileKind];
       const expected = {
         ...ATS_KEYWORD_EXTRACTION,
         keywordExtractionWorkflowSha256: profile.workflowSha256,
       };
       const runtime = runtimeWith(async (agent, input) => {
-        expect(agent.name).toBe(`ats-${opportunityKind}-keyword-extraction`);
+        expect(agent.name).toBe(profile.agentName);
         expect(agent.instructions).toBe(profile.instructions);
         expect(JSON.parse(input)).toEqual({
           task: profile.task,

@@ -179,8 +179,17 @@ async def test_check_ready_uses_exact_authenticated_path_and_hardened_transport(
     assert harness.construction["trust_env"] is False
 
 
+@pytest.mark.parametrize(
+    ("opportunity_kind", "expected_kind_json"),
+    [
+        ("competition", '"opportunityKind":"competition",'),
+        ("networking_event", '"opportunityKind":"networking_event",'),
+    ],
+)
 async def test_run_posts_exact_contract_with_deadline_transport_timeout(
     build_client: Callable[..., ClientHarness],
+    opportunity_kind: str,
+    expected_kind_json: str,
 ) -> None:
     harness = build_client(
         lambda _request: httpx.Response(200, json=_success_payload())
@@ -188,7 +197,7 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
 
     result = await harness.agent.run(
         runtime_url="http://localhost:8765",
-        opportunity_kind="competition",
+        opportunity_kind=opportunity_kind,
         auto_submit=True,
         task="complete the application",
         max_turns=37,
@@ -211,10 +220,10 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
     assert request.read().decode("utf-8") == (
         '{"sessionId":"52aa48d2-c3c8-40df-80de-d213631a04aa",'
         '"runtimeUrl":"http://localhost:8765",'
-        '"opportunityKind":"competition",'
-        '"task":"complete the application",'
-        '"autoSubmit":true,'
-        '"maxTurns":37,"deadlineMs":12345}'
+        + expected_kind_json
+        + '"task":"complete the application",'
+        + '"autoSubmit":true,'
+        + '"maxTurns":37,"deadlineMs":12345}'
     )
 
 

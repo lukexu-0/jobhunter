@@ -161,6 +161,7 @@ class PipelineApplicationAgentClient:
             "hackathon",
             "competition",
             "event",
+            "networking_event",
         ):
             raise ValueError("opportunity_kind is invalid")
         if type(auto_submit) is not bool:

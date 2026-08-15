@@ -31,6 +31,7 @@ OpportunityKind: TypeAlias = Literal[
     "hackathon",
     "competition",
     "event",
+    "networking_event",
 ]
 
 
