@@ -5,6 +5,7 @@ import {
   loadJobSourceFromUrl,
   type JobSourceFetch,
   type ResolveHost,
+  type RenderJobSourceHtml,
 } from "../src/api/job-source";
 
 const PUBLIC_V4 = "93.184.216.34";
@@ -62,6 +63,7 @@ function deferred<T>() {
 
 describe("job source loading", () => {
   test("returns normalized plain text as model lines when opportunity kind is omitted", async () => {
+    let renders = 0;
     const fetchImpl: JobSourceFetch = async () => response(
       "  Senior   Engineer\r\n\r\n Build\tsecure systems and collaborate across the whole team.  ",
     );
@@ -69,10 +71,15 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl,
       resolveHost: resolvePublic,
+      renderHtml: async () => {
+        renders += 1;
+        return undefined;
+      },
     })).resolves.toEqual({
       kind: "model-fallback",
       lines: ["Senior Engineer", "", "Build secure systems and collaborate across the whole team."],
     });
+    expect(renders).toBe(0);
   });
   test("uses an explicit networking event kind for a deterministic event page", async () => {
     const eventDescription =
@@ -116,10 +123,133 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(`<main>${"界".repeat(20)}</main>`),
       resolveHost: resolvePublic,
+      renderHtml: async () => undefined,
     })).rejects.toMatchObject({ code: "JOB_DESCRIPTION_UNAVAILABLE" });
   });
 
+  test("renders an unusable IBM careers shell before returning sanitized fallback lines", async () => {
+    const terminalUrl = "https://careers.ibm.com/job/software-developer-intern/12345";
+    const shell = `<!doctype html>
+      <html lang="en">
+        <head>
+          <title>IBM Careers</title>
+          <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+        </head>
+        <body>
+          <noscript>Enable JavaScript to continue.</noscript>
+          <div id="root"></div>
+          <script src="/assets/careers.js"></script>
+        </body>
+      </html>`;
+    const renderedHtml = `<!doctype html>
+      <html lang="en">
+        <head><title>Software Developer Intern | IBM Careers</title></head>
+        <body>
+          <main>
+            <h1>Software Developer Intern</h1>
+            <section>
+              <h2>Your role and responsibilities</h2>
+              <p>Join IBM to build secure cloud software that helps clients solve complex business problems.</p>
+              <p>Collaborate with engineers, designers, and product leaders throughout the development lifecycle.</p>
+            </section>
+          </main>
+        </body>
+      </html>`;
+    const renders: Array<{ url: string; signal: AbortSignal }> = [];
+
+    const result = await loadJobSourceFromUrl(terminalUrl, undefined, {
+      fetchImpl: async () => htmlResponse(shell),
+      resolveHost: resolvePublic,
+      renderHtml: async (url: string, signal: AbortSignal) => {
+        renders.push({ url, signal });
+        expect(signal.aborted).toBe(false);
+        return renderedHtml;
+      },
+    });
+
+    expect(renders).toHaveLength(1);
+    expect(renders[0]!.url).toBe(terminalUrl);
+    expect(renders[0]!.signal.aborted).toBe(false);
+    expect(result).toEqual({
+      kind: "model-fallback",
+      lines: [
+        "Software Developer Intern",
+        "",
+        "Your role and responsibilities",
+        "",
+        "Join IBM to build secure cloud software that helps clients solve complex business problems.",
+        "",
+        "Collaborate with engineers, designers, and product leaders throughout the development lifecycle.",
+      ],
+    });
+  });
+
+  test("preserves the original fixed error when rendering cannot produce usable HTML", async () => {
+    const shell = "<html><body><div id=\"root\"></div><script src=\"/job.js\"></script></body></html>";
+    const renderers: RenderJobSourceHtml[] = [
+      async () => undefined,
+      async () => {
+        throw new Error("private renderer failure");
+      },
+      async () => `<main>${"x".repeat((512 * 1024) + 1)}</main>`,
+    ];
+
+    for (const renderHtml of renderers) {
+      await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+        fetchImpl: async () => htmlResponse(shell),
+        resolveHost: resolvePublic,
+        renderHtml,
+      })).rejects.toMatchObject({
+        code: "JOB_DESCRIPTION_UNAVAILABLE",
+        status: 422,
+        message: "The page does not contain a usable opportunity description",
+      });
+    }
+  });
+
+  test("propagates the caller's exact abort reason while rendering", async () => {
+    const controller = new AbortController();
+    const renderStarted = deferred<void>();
+    const promise = loadJobSourceFromUrl("https://jobs.example.test/role", controller.signal, {
+      fetchImpl: async () => htmlResponse("<html><body><div id=\"root\"></div></body></html>"),
+      resolveHost: resolvePublic,
+      renderHtml: async (_url, renderSignal) => {
+        renderStarted.resolve();
+        await new Promise<void>((resolve) => {
+          renderSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        renderSignal.throwIfAborted();
+        return undefined;
+      },
+    });
+
+    await renderStarted.promise;
+    const reason = new Error("stop rendered source loading");
+    controller.abort(reason);
+    await expect(promise).rejects.toBe(reason);
+  });
+
+  test("preserves the original fixed error when the shared deadline expires while rendering", async () => {
+    await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+      deadlineMs: 5,
+      fetchImpl: async () => htmlResponse("<html><body><div id=\"root\"></div></body></html>"),
+      resolveHost: resolvePublic,
+      renderHtml: async (_url, renderSignal) => {
+        await new Promise<void>((resolve) => {
+          renderSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        renderSignal.throwIfAborted();
+        return undefined;
+      },
+    })).rejects.toMatchObject({
+      code: "JOB_DESCRIPTION_UNAVAILABLE",
+      status: 422,
+      message: "The page does not contain a usable opportunity description",
+    });
+  });
+
   test("loads a JPMC Oracle Candidate Experience shell through its same-origin public requisition API", async () => {
+    let renders = 0;
     const attempts: Array<{ url: URL; init: BunFetchRequestInit }> = [];
     const shell = `<!doctype html>
       <html lang="en">
@@ -152,7 +282,14 @@ describe("job source loading", () => {
     const result = await loadJobSourceFromUrl(
       "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223",
       undefined,
-      { fetchImpl, resolveHost: resolvePublic },
+      {
+        fetchImpl,
+        resolveHost: resolvePublic,
+        renderHtml: async () => {
+          renders += 1;
+          return undefined;
+        },
+      },
     );
 
     expect(result).toEqual({
@@ -168,6 +305,7 @@ describe("job source loading", () => {
       lines: ["Build your career at JPMorganChase."],
     });
     expect(attempts).toHaveLength(2);
+    expect(renders).toBe(0);
     const apiAttempt = attempts[1]!;
     expect(apiAttempt.url.hostname).toBe(PUBLIC_V4);
     expect(apiAttempt.url.pathname).toBe("/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails");
@@ -189,14 +327,20 @@ describe("job source loading", () => {
       "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210775223/details",
     ]) {
       let fetches = 0;
+      let renders = 0;
       await expect(loadJobSourceFromUrl(sourceUrl, undefined, {
         resolveHost: resolvePublic,
+        renderHtml: async () => {
+          renders += 1;
+          return undefined;
+        },
         fetchImpl: async () => {
           fetches += 1;
           return htmlResponse("<html><body><div id=\"app\"></div></body></html>");
         },
       })).rejects.toMatchObject({ code: "JOB_DESCRIPTION_UNAVAILABLE" });
       expect(fetches).toBe(1);
+      expect(renders).toBe(sourceUrl.startsWith("https:") ? 1 : 0);
     }
   });
 
@@ -294,6 +438,7 @@ describe("job source loading", () => {
   });
 
   test("returns one exact valid JSON-LD JobPosting candidate as model lines", async () => {
+    let renders = 0;
     const body = `
       <html><body>
         <script type=" Application/LD+JSON ; charset=utf-8 ">
@@ -305,6 +450,10 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
+      renderHtml: async () => {
+        renders += 1;
+        return undefined;
+      },
     })).resolves.toEqual({
       kind: "model-fallback",
       lines: [
@@ -316,6 +465,7 @@ describe("job source loading", () => {
         "Collaborate across the product team.",
       ],
     });
+    expect(renders).toBe(0);
   });
 
   test("extracts supported non-job JSON-LD opportunities as deterministic model lines", async () => {
@@ -449,6 +599,7 @@ describe("job source loading", () => {
   });
 
   test("returns exact sanitized fallback lines using main, article, then body priority", async () => {
+    let renders = 0;
     const body = [
       "<body><header>Discard top header</header>",
       `<article><h2>Article role</h2><p>${VALID_TEXT}</p></article>`,
@@ -465,6 +616,10 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
+      renderHtml: async () => {
+        renders += 1;
+        return undefined;
+      },
     })).resolves.toEqual({
       kind: "model-fallback",
       lines: [
@@ -474,6 +629,7 @@ describe("job source loading", () => {
         "Collaborate across teams.",
       ],
     });
+    expect(renders).toBe(0);
   });
 
   test("uses article then body when higher-priority candidates are too short", async () => {
@@ -910,8 +1066,8 @@ describe("job source loading", () => {
     }
   });
 
-  test("always blocks both multicast prefixes and allows ordinary public addresses", async () => {
-    for (const cidr of ["224.0.0.0/4", "ff00::/8"]) {
+  test("blocks multicast, site-local, and unallocated ranges while allowing allocated public addresses", async () => {
+    for (const cidr of ["224.0.0.0/4", "ff00::/8", "fec0::/10", "4000::/3", "fe00::/9"]) {
       for (const address of addressEndpoints(cidr)) {
         const host = address.includes(":") ? `[${address}]` : address;
         await expect(loadJobSourceFromUrl(`http://${host}/job`, undefined, {
