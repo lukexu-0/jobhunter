@@ -408,7 +408,7 @@ describe("allowlisted context ingestion", () => {
       syncContext(database, loaded);
       const matches = searchEvidence(database, "sample reconciliation exceptions");
       expect(matches.length).toBeGreaterThan(0);
-      const claim = matches.find((block) => block.text.includes("$5,000"));
+      const claim = matches.find((block) => block.text.includes("$1,234"));
       expect(claim?.text).toContain("User-reported");
       expect(claim?.caveats.join(" ")).toMatch(/User-reported|not independently/i);
       const snapshot = createContextSnapshot(database, loaded);
