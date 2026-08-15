@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import {
   DISCOVERY_LIST_MAX_OFFSET,
   type DiscoveryJob,
@@ -30,6 +30,8 @@ function job(
     company: "Example Labs",
     location: "Remote",
     roles,
+    season: "unspecified",
+    suitable: true,
     canonicalUrl: `https://example.com/jobs/${id}`,
     applyUrl: `https://example.com/jobs/${id}/apply`,
     descriptionPreview: "Work with a small engineering team on production systems.",
@@ -111,6 +113,54 @@ describe("DiscoveryCatalog selection", () => {
       .toBe("Software engineering · Machine learning");
   });
 
+  test("renders backend season and suitability through the canonical title link without a View job action", () => {
+    const markup = renderToStaticMarkup(
+      <ul>
+        <DiscoveryJobRow
+          busy={false}
+          job={job("summer-role", ["software_engineering"], {
+            season: "summer",
+            suitable: false,
+            title: "Platform Engineering Intern",
+          })}
+          onToggle={() => undefined}
+          selected={false}
+        />
+      </ul>,
+    );
+
+    expect(markup).toContain(">Summer<");
+    expect(markup).toContain(">Unsuitable<");
+    expect(markup).toMatch(
+      /<a(?=[^>]*href="https:\/\/example\.com\/jobs\/summer-role")(?=[^>]*rel="noopener noreferrer")(?=[^>]*target="_blank")[^>]*>[\s\S]*?Platform Engineering Intern[\s\S]*?<\/a>/,
+    );
+    expect(markup).not.toContain("View job");
+  });
+
+  test("renders posted dates as whole UTC calendar-day distances with the ISO datetime preserved", () => {
+    setSystemTime(new Date("2026-08-13T00:15:00.000Z"));
+    try {
+      const markup = renderToStaticMarkup(
+        <ul>
+          <DiscoveryJobRow
+            busy={false}
+            job={job("relative-posted-date", ["software_engineering"], {
+              postedAt: Date.parse("2026-08-10T23:45:00.000Z"),
+            })}
+            onToggle={() => undefined}
+            selected={false}
+          />
+        </ul>,
+      );
+
+      expect(markup).toMatch(
+        /<time datetime="2026-08-10T23:45:00\.000Z">Posted 3 days ago<\/time>/i,
+      );
+    } finally {
+      setSystemTime();
+    }
+  });
+
   test("renders accessible loading controls with the seven-day filter selected by default", () => {
     const markup = renderToStaticMarkup(<DiscoveryCatalog />);
 
@@ -119,6 +169,35 @@ describe("DiscoveryCatalog selection", () => {
     expect(markup).toContain('<option value="7" selected="">7 days</option>');
     expect(markup).toContain('aria-live="polite"');
     expect(markup).toContain('aria-busy="true"');
+  });
+
+  test("renders sort and queued-visibility controls with their public defaults", () => {
+    const markup = renderToStaticMarkup(<DiscoveryCatalog />);
+
+    expect(markup).toContain('aria-label="Sort internships"');
+    expect(markup).toContain(
+      '<option value="recency" selected="">Newest first</option>',
+    );
+    expect(markup).toContain(
+      '<option value="source">Source A–Z</option>',
+    );
+    expect(markup).toMatch(
+      /<label[^>]*>\s*<input(?=[^>]*type="checkbox")(?=[^>]*checked="")[^>]*\/?>\s*(?:<span>)?Hide queued jobs(?:<\/span>)?\s*<\/label>/,
+    );
+  });
+
+  test("keeps the public discovery header to its title while leaving sync available outside it", () => {
+    const markup = renderToStaticMarkup(<DiscoveryCatalog />);
+    const header = markup.match(/<header class="discovery-header">[\s\S]*?<\/header>/)?.[0];
+
+    expect(header).toMatch(
+      /^<header class="discovery-header"><h1[^>]*>Discover<\/h1><\/header>$/,
+    );
+    expect(markup).not.toContain("Internship catalog");
+    expect(markup).not.toContain(
+      "Search fresh roles from trusted public sources, then send a selected set into the application pipeline.",
+    );
+    expect(markup).toMatch(/<\/header>[\s\S]*>Sync jobs<\/button>/);
   });
 
   test("renders unqueueable rows with disabled selection reasons and an honest unavailable preview", () => {

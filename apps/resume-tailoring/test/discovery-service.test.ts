@@ -37,12 +37,13 @@ function classifiedInput(
   id: string,
   title = "Software Engineering Intern",
 ): ClassifiedDiscoveredJobInput {
-  return { ...input(id, title), roles: ["software_engineering"] };
+  return { ...input(id, title), roles: ["software_engineering"], suitable: true };
 }
 
 const classifyAsSoftware: ClassifyDiscoveryRoles = async (jobs) => jobs.map((job) => ({
   id: job.id,
   roles: ["software_engineering"],
+  suitable: true,
 }));
 
 function run(id: string): RunDto {
@@ -112,7 +113,7 @@ describe("discovery synchronization", () => {
     })).toThrow("unsupported discovery connector kind");
   });
 
-  test("classifies full saved jobs before reconciliation and persists every selected role", async () => {
+  test("persists classifier suitability from synchronization to the listed job", async () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);
     const repository = new DiscoveryRepository(database, {
@@ -135,6 +136,7 @@ describe("discovery synchronization", () => {
         return jobs.map((job) => ({
           id: job.id,
           roles: ["software_engineering", "machine_learning"] as const,
+          suitable: false,
         }));
       },
     });
@@ -150,8 +152,11 @@ describe("discovery synchronization", () => {
       location: null,
       description: DESCRIPTION,
     }]);
-    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0]?.roles)
-      .toEqual(["software_engineering", "machine_learning"]);
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0])
+      .toMatchObject({
+        roles: ["software_engineering", "machine_learning"],
+        suitable: false,
+      });
   });
   test("classifies and reconciles description-unavailable jobs without making the snapshot partial", async () => {
     const database = openPipelineDatabase(":memory:");
@@ -177,6 +182,7 @@ describe("discovery synchronization", () => {
         return jobs.map((job) => ({
           id: job.id,
           roles: ["software_engineering"] as const,
+          suitable: true,
         }));
       },
     });
@@ -224,6 +230,7 @@ describe("discovery synchronization", () => {
         return jobs.map((job) => ({
           id: job.id,
           roles: ["software_engineering"] as const,
+          suitable: true,
         }));
       },
     });
@@ -265,6 +272,7 @@ describe("discovery synchronization", () => {
         return jobs.map((job) => ({
           id: job.id,
           roles: ["software_engineering"] as const,
+          suitable: true,
         }));
       },
     });
@@ -309,6 +317,7 @@ describe("discovery synchronization", () => {
           const classifications = jobs.map((job) => ({
             id: job.id,
             roles: ["software_engineering"] as const,
+            suitable: true,
           }));
           classificationCompleted.resolve();
           return classifications;
@@ -961,6 +970,39 @@ describe("discovery queueing", () => {
 });
 
 describe("discovery routes", () => {
+  test("accepts source sorting with queued jobs hidden and applies the remaining defaults", async () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    const repository = new DiscoveryRepository(database, { now: () => 1_000 });
+    const service = new DiscoveryService({
+      repository,
+      connectors: [],
+      runs: {
+        createRunFromDescription: async () => run("unused"),
+        kick: () => undefined,
+      },
+      now: () => 1_000,
+    });
+    const list = vi.spyOn(service, "list");
+    const fetch = createApiHandler({ webOrigin: ORIGIN, route: createDiscoveryRoutes(service) });
+
+    const response = await fetch(new Request(
+      "http://127.0.0.1:3457/v1/discovery?sort=source&hideQueued=true",
+    ));
+
+    expect(response.status).toBe(200);
+    expect(list).toHaveBeenCalledWith({
+      maxAgeDays: 7,
+      status: "open",
+      hideQueued: true,
+      search: "",
+      sort: "source",
+      limit: 100,
+      offset: 0,
+    });
+    expect(await response.json()).toEqual({ jobs: [], total: 0, lastSyncAt: null });
+  });
+
   test("strictly validates queries and mutations behind the shared origin guard", async () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);

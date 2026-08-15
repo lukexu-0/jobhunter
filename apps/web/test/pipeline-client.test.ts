@@ -80,6 +80,8 @@ function discoveredJob(overrides: Partial<DiscoveryJob> = {}): DiscoveryJob {
     company: "Example Labs",
     location: null,
     roles: ["machine_learning"],
+    season: "unspecified",
+    suitable: true,
     canonicalUrl: "https://example.com/jobs/ml-intern",
     applyUrl: "https://example.com/jobs/ml-intern/apply",
     descriptionPreview: "Build and evaluate production machine learning systems.",
@@ -1010,12 +1012,14 @@ describe("pipeline discovery requests", () => {
       role: "machine_learning",
       maxAgeDays: 14,
       status: "queued",
+      sort: "source",
+      hideQueued: true,
       search: "model evaluation",
       limit: 1_000,
       offset: 0,
     })).resolves.toEqual(response);
     expect(requests).toEqual([{
-      input: "/api/pipeline/discovery?role=machine_learning&maxAgeDays=14&status=queued&search=model+evaluation&limit=1000&offset=0",
+      input: "/api/pipeline/discovery?role=machine_learning&maxAgeDays=14&status=queued&sort=source&hideQueued=true&search=model+evaluation&limit=1000&offset=0",
       init: { cache: "no-store", method: "GET" },
     }]);
   });
@@ -1036,7 +1040,7 @@ describe("pipeline discovery requests", () => {
       offset: 0,
     })).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
     expect(requests[0]?.input).toBe(
-      "/api/pipeline/discovery?maxAgeDays=all&status=all&search=&limit=1000&offset=0",
+      "/api/pipeline/discovery?maxAgeDays=all&status=all&sort=recency&hideQueued=false&search=&limit=1000&offset=0",
     );
   });
 

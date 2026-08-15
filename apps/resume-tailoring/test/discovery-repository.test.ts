@@ -5,14 +5,12 @@ import { openPipelineDatabase } from "../src/db/database.ts";
 import { parsePostedAt } from "../src/discovery/connectors/normalize.ts";
 import { discoveryDedupeKeys, normalizeDiscoveryUrl } from "../src/discovery/normalize.ts";
 import { DiscoveryRepository } from "../src/discovery/repository.ts";
-import type { DiscoveredJobInput, DiscoveryRole } from "../src/discovery/types.ts";
+import type { ClassifiedDiscoveredJobInput } from "../src/discovery/types.ts";
 
 const databases: Database[] = [];
 const DESCRIPTION = "Build reliable production software with careful testing, ownership, collaboration, and measurable customer impact.";
 
-type ClassifiedItem = DiscoveredJobInput & {
-  readonly roles: readonly DiscoveryRole[];
-};
+type ClassifiedItem = ClassifiedDiscoveredJobInput;
 
 function item(overrides: Partial<ClassifiedItem> = {}): ClassifiedItem {
   return {
@@ -25,6 +23,7 @@ function item(overrides: Partial<ClassifiedItem> = {}): ClassifiedItem {
     location: "Toronto, ON",
     description: DESCRIPTION,
     roles: ["software_engineering"],
+    suitable: true,
     ...overrides,
   };
 }
@@ -120,6 +119,188 @@ describe("discovery source reconciliation", () => {
       role: "security",
     })).total).toBe(0);
   });
+
+  test("projects season by title, description, then the off-season source name", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let nextId = 0;
+    const repository = new DiscoveryRepository(database, {
+      now: () => 1_000,
+      idFactory: () => `job-${++nextId}`,
+    });
+
+    repository.reconcileSource(source(
+      "simplify-summer-2027-off-season",
+      "Simplify Summer 2027 Off-Season Internships",
+      [
+        item({
+          sourceItemId: "source-season",
+          canonicalUrl: "https://board.example.test/jobs/source-season",
+          applyUrl: "https://board.example.test/jobs/source-season/apply",
+          title: "Software Engineering Intern",
+        }),
+        item({
+          sourceItemId: "description-season",
+          canonicalUrl: "https://board.example.test/jobs/description-season",
+          applyUrl: "https://board.example.test/jobs/description-season/apply",
+          title: "Platform Engineering Intern",
+          description: "Join the fall internship cohort and build production systems.",
+        }),
+        item({
+          sourceItemId: "title-season",
+          canonicalUrl: "https://board.example.test/jobs/title-season",
+          applyUrl: "https://board.example.test/jobs/title-season/apply",
+          title: "Winter Software Engineering Intern",
+          description: "Join the summer internship cohort and build production systems.",
+        }),
+      ],
+    ));
+
+    const jobs = repository.list(
+      DiscoveryListRequestSchema.parse({ maxAgeDays: null }),
+    ).jobs;
+    expect(jobs.find((job) => job.title === "Software Engineering Intern")?.season)
+      .toBe("off_season");
+    expect(jobs.find((job) => job.title === "Platform Engineering Intern")?.season)
+      .toBe("fall");
+    expect(jobs.find((job) => job.title === "Winter Software Engineering Intern")?.season)
+      .toBe("winter");
+  });
+
+  test("publishes explicit suitability and updates it during reconciliation", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let now = 1_000;
+    const repository = new DiscoveryRepository(database, {
+      now: () => now,
+      idFactory: () => "job-1",
+    });
+
+    repository.reconcileSource(source("source-a", "Alpha", [item({ suitable: false })]));
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0]?.suitable)
+      .toBe(false);
+
+    now = 2_000;
+    repository.reconcileSource(source("source-a", "Alpha", [item()]));
+    expect(repository.list(DiscoveryListRequestSchema.parse({ maxAgeDays: null })).jobs[0]?.suitable)
+      .toBe(true);
+  });
+
+  test("sorts the public list globally by canonical source and then effective date", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let nextId = 0;
+    const foundAt = Date.parse("2026-08-11T00:00:00Z");
+    const repository = new DiscoveryRepository(database, {
+      now: () => foundAt,
+      idFactory: () => `job-${++nextId}`,
+    });
+
+    repository.reconcileSource(source("source-zulu", "Zulu Internships", [item({
+      sourceItemId: "zulu-newest",
+      canonicalUrl: "https://board.example.test/jobs/zulu-newest",
+      applyUrl: "https://board.example.test/jobs/zulu-newest/apply",
+      title: "Zulu Newest",
+      postedAt: Date.parse("2026-08-10T00:00:00Z"),
+      suitable: true,
+    })]));
+    repository.reconcileSource(source("source-alpha", "alpha Internships", [
+      item({
+        sourceItemId: "alpha-posted",
+        canonicalUrl: "https://board.example.test/jobs/alpha-posted",
+        applyUrl: "https://board.example.test/jobs/alpha-posted/apply",
+        title: "Alpha Posted",
+        postedAt: Date.parse("2026-08-08T00:00:00Z"),
+        suitable: true,
+      }),
+      item({
+        sourceItemId: "alpha-found",
+        canonicalUrl: "https://board.example.test/jobs/alpha-found",
+        applyUrl: "https://board.example.test/jobs/alpha-found/apply",
+        title: "Alpha Found",
+        postedAt: null,
+        suitable: true,
+      }),
+    ]));
+
+    const request = DiscoveryListRequestSchema.parse({
+      maxAgeDays: null,
+      sort: "source",
+    });
+    expect(repository.list(request).jobs.map((job) => job.title)).toEqual([
+      "Alpha Found",
+      "Alpha Posted",
+      "Zulu Newest",
+    ]);
+  });
+
+  test("hides queued jobs only from the unfiltered public list", () => {
+    const database = openPipelineDatabase(":memory:");
+    databases.push(database);
+    let now = 1_000;
+    let nextId = 0;
+    const repository = new DiscoveryRepository(database, {
+      now: () => now,
+      idFactory: () => `job-${++nextId}`,
+    });
+    const openJob = item({
+      sourceItemId: "open",
+      canonicalUrl: "https://board.example.test/jobs/open",
+      applyUrl: "https://board.example.test/jobs/open/apply",
+      title: "Open Intern",
+      suitable: true,
+    });
+    const closedJob = item({
+      sourceItemId: "closed",
+      canonicalUrl: "https://board.example.test/jobs/closed",
+      applyUrl: "https://board.example.test/jobs/closed/apply",
+      title: "Closed Intern",
+      suitable: true,
+    });
+    const queuedJob = item({
+      sourceItemId: "queued",
+      canonicalUrl: "https://board.example.test/jobs/queued",
+      applyUrl: "https://board.example.test/jobs/queued/apply",
+      title: "Queued Intern",
+      suitable: true,
+    });
+
+    repository.reconcileSource(source(
+      "source-a",
+      "Alpha",
+      [openJob, closedJob, queuedJob],
+    ));
+    now = 2_000;
+    repository.reconcileSource(source("source-a", "Alpha", [openJob, queuedJob]));
+    const queuedJobId = database.query<{ id: string }, [string]>(
+      "SELECT id FROM discovery_jobs WHERE title = ?",
+    ).get("Queued Intern")!.id;
+    database.query(`
+      INSERT INTO runs(id, job_description, status, queue_sequence, created_at, updated_at)
+      VALUES (?, ?, 'queued', ?, ?, ?)
+    `).run("run-queued", DESCRIPTION, 1, now, now);
+    database.query(`
+      INSERT INTO discovery_run_links(job_id, run_id, created_at) VALUES (?, ?, ?)
+    `).run(queuedJobId, "run-queued", now);
+
+    const withoutQueued = repository.list(DiscoveryListRequestSchema.parse({
+      maxAgeDays: null,
+      status: "all",
+      hideQueued: true,
+    }));
+    expect(withoutQueued.jobs.map(({ title, status }) => ({ title, status }))).toEqual([
+      { title: "Open Intern", status: "open" },
+      { title: "Closed Intern", status: "closed" },
+    ]);
+    expect(repository.list(DiscoveryListRequestSchema.parse({
+      maxAgeDays: null,
+      status: "queued",
+      hideQueued: true,
+    })).jobs.map(({ title, status }) => ({ title, status }))).toEqual([
+      { title: "Queued Intern", status: "queued" },
+    ]);
+  });
+
   test("deduplicates cross-source observations and retains every source name", () => {
     const database = openPipelineDatabase(":memory:");
     databases.push(database);

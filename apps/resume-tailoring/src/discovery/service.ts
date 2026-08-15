@@ -302,18 +302,24 @@ export class DiscoveryService {
             })), workSignal),
             workSignal,
           );
-          const rolesById = new Map(classifications.map(({ id, roles }) => [id, roles]));
+          const classificationsById = new Map(
+            classifications.map((classification) => [classification.id, classification]),
+          );
           if (
             classifications.length !== batch.length
-            || rolesById.size !== batch.length
-            || batch.some((item) => !rolesById.has(item.sourceItemId))
+            || classificationsById.size !== batch.length
+            || batch.some((item) => !classificationsById.has(item.sourceItemId))
           ) {
             throw new Error("Discovery role classifier must return every source item exactly once");
           }
-          classified[batchIndex] = batch.map((item) => ({
-            ...item,
-            roles: rolesById.get(item.sourceItemId)!,
-          }));
+          classified[batchIndex] = batch.map((item) => {
+            const classification = classificationsById.get(item.sourceItemId)!;
+            return {
+              ...item,
+              roles: classification.roles,
+              suitable: classification.suitable,
+            };
+          });
         } catch (error) {
           cancellationSignal.throwIfAborted();
           errors[batchIndex] = deadlineSignal.aborted ? deadlineError : error;

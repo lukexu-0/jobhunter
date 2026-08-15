@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { CalendarDays, ExternalLink, MapPin, RefreshCw, Search } from "lucide-react";
+import { CalendarDays, MapPin, RefreshCw, Search } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -17,6 +17,7 @@ import {
   type DiscoveryQueueResponse,
   type DiscoveryQueueSkipReason,
   type DiscoveryRole,
+  type DiscoverySort,
   type DiscoverySyncResponse,
 } from "@jobhunter/pipeline/contracts";
 import {
@@ -48,6 +49,15 @@ const ROLE_LABELS: Record<DiscoveryRole, string> = {
   product: "Product",
   hardware: "Hardware",
   other: "Other",
+};
+
+const SEASON_LABELS: Record<DiscoveryJob["season"], string> = {
+  spring: "Spring",
+  summer: "Summer",
+  fall: "Fall",
+  winter: "Winter",
+  off_season: "Off-season",
+  unspecified: "Season not stated",
 };
 
 export function discoveryRoleLabel(roles: readonly DiscoveryRole[]): string {
@@ -83,6 +93,8 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "UTC",
 });
 
+const MILLISECONDS_PER_DAY = 86_400_000;
+
 function publicMessage(error: unknown, fallback: string): string {
   if (!(error instanceof PipelineClientError)) return fallback;
   const message = error.message.trim();
@@ -94,6 +106,31 @@ function formattedDate(timestamp: number): { readonly dateTime: string; readonly
   if (!Number.isFinite(date.getTime())) return null;
 
   return { dateTime: date.toISOString(), label: DATE_FORMATTER.format(date) };
+}
+
+function relativeUtcCalendarDay(timestamp: number, now: number): string | null {
+  const date = new Date(timestamp);
+  const today = new Date(now);
+  if (!Number.isFinite(date.getTime()) || !Number.isFinite(today.getTime())) return null;
+
+  const observedUtcDay = Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate(),
+  );
+  const currentUtcDay = Date.UTC(
+    today.getUTCFullYear(),
+    today.getUTCMonth(),
+    today.getUTCDate(),
+  );
+  const daysAgo = Math.max(
+    0,
+    Math.floor((currentUtcDay - observedUtcDay) / MILLISECONDS_PER_DAY),
+  );
+
+  if (daysAgo === 0) return "today";
+  if (daysAgo === 1) return "1 day ago";
+  return `${daysAgo} days ago`;
 }
 
 export function boundedDiscoveryListOffset(offset: number): number {
@@ -130,7 +167,15 @@ export function discoveryPageWindow(
 
 
 
-type DiscoveryViewTransition = "refresh" | "page" | "role" | "recency" | "status" | "search";
+type DiscoveryViewTransition =
+  | "refresh"
+  | "page"
+  | "role"
+  | "recency"
+  | "status"
+  | "search"
+  | "sort"
+  | "visibility";
 
 export function discoverySelectionAfterTransition(
   selected: ReadonlySet<string>,
@@ -307,7 +352,9 @@ export function DiscoveryJobRow({
   const selectionReasonId = selectionUnavailableReason
     ? `discovery-selection-${job.id}-reason`
     : undefined;
-  const observedDate = formattedDate(job.postedAt ?? job.firstSeenAt);
+  const observedTimestamp = job.postedAt ?? job.firstSeenAt;
+  const observedDate = formattedDate(observedTimestamp);
+  const observedAge = relativeUtcCalendarDay(observedTimestamp, Date.now());
   return (
     <li className="discovery-row" data-status={job.status}>
       <label className="discovery-row__selector">
@@ -327,24 +374,53 @@ export function DiscoveryJobRow({
         <header className="discovery-row__heading">
           <div>
             <p className="discovery-row__role">{discoveryRoleLabel(job.roles)}</p>
-            <h3>{job.title}</h3>
+            <h3>
+              <a
+                className="discovery-row__title-link"
+                href={job.canonicalUrl}
+                rel="noopener noreferrer"
+                target="_blank"
+              >
+                {job.title}
+              </a>
+            </h3>
             <p className="discovery-row__company">{job.company}</p>
           </div>
-          <span className={`discovery-job-status discovery-job-status--${job.status}`}>{job.status}</span>
+          <div className="discovery-row__badges" aria-label="Job status">
+            <span
+              className={`discovery-job-suitability discovery-job-suitability--${
+                job.suitable ? "suitable" : "unsuitable"
+              }`}
+            >
+              {job.suitable ? "Suitable" : "Unsuitable"}
+            </span>
+            <span className={`discovery-job-status discovery-job-status--${job.status}`}>
+              {job.status}
+            </span>
+          </div>
         </header>
+        <div className="discovery-row__highlights">
+          <span className={`discovery-job-season discovery-job-season--${job.season}`}>
+            {SEASON_LABELS[job.season]}
+          </span>
+          {observedDate && observedAge ? (
+            <span
+              className="discovery-job-date"
+              title={`${job.postedAt === null ? "Found" : "Posted"} ${observedDate.label}`}
+            >
+              <CalendarDays aria-hidden="true" />
+              <time dateTime={observedDate.dateTime}>
+                {job.postedAt === null ? "Found" : "Posted"} {observedAge}
+              </time>
+              <span className="visually-hidden"> ({observedDate.label})</span>
+            </span>
+          ) : null}
+        </div>
         <ul className="discovery-row__metadata" aria-label="Job details">
           <li>
             <MapPin aria-hidden="true" />
             <span>{job.location ?? "Location not listed"}</span>
           </li>
-          {observedDate ? (
-            <li>
-              <CalendarDays aria-hidden="true" />
-              <time dateTime={observedDate.dateTime}>
-                {job.postedAt === null ? "Found" : "Posted"} {observedDate.label}
-              </time>
-            </li>
-          ) : null}
           <li className="discovery-row__sources">
             <span>Sources</span>
             <span>{job.sourceNames.join(" · ")}</span>
@@ -355,23 +431,12 @@ export function DiscoveryJobRow({
             ? "Description unavailable. Sync again later to retry job details."
             : job.descriptionPreview}
         </p>
-      </article>
-      <div className="discovery-row__actions">
-        <a
-          className="control"
-          href={job.canonicalUrl}
-          rel="noopener noreferrer"
-          target="_blank"
-        >
-          View job
-          <ExternalLink aria-hidden="true" />
-        </a>
         {job.queuedRunId ? (
           <Link className="discovery-row__run-link" href={`/runs/${encodeURIComponent(job.queuedRunId)}`}>
             Open queued run
           </Link>
         ) : null}
-      </div>
+      </article>
     </li>
   );
 }
@@ -380,6 +445,8 @@ export function DiscoveryCatalog() {
   const [role, setRole] = useState<RoleFilter>("all");
   const [recent, setRecent] = useState<RecentFilter>("7");
   const [status, setStatus] = useState<StatusFilter>("open");
+  const [sort, setSort] = useState<DiscoverySort>("recency");
+  const [hideQueuedPreference, setHideQueuedPreference] = useState(true);
   const [searchDraft, setSearchDraft] = useState("");
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
@@ -397,6 +464,7 @@ export function DiscoveryCatalog() {
   const [autoSubmit, setAutoSubmit] = useState(false);
   const requestSequence = useRef(0);
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const effectiveHideQueued = status === "queued" ? false : hideQueuedPreference;
   const beginDiscoveryViewTransition = useCallback((
     transition: Exclude<DiscoveryViewTransition, "refresh">,
   ) => {
@@ -417,6 +485,8 @@ export function DiscoveryCatalog() {
         maxAgeDays: recent === "all" ? null : Number(recent),
         status,
         search,
+        sort,
+        hideQueued: effectiveHideQueued,
         limit: MAX_DISCOVERY_RESULTS,
         offset,
       });
@@ -436,7 +506,16 @@ export function DiscoveryCatalog() {
     } finally {
       if (sequence === requestSequence.current) setIsLoading(false);
     }
-  }, [beginDiscoveryViewTransition, offset, recent, role, search, status]);
+  }, [
+    beginDiscoveryViewTransition,
+    effectiveHideQueued,
+    offset,
+    recent,
+    role,
+    search,
+    sort,
+    status,
+  ]);
 
   useEffect(() => {
     void loadCatalog();
@@ -551,32 +630,27 @@ export function DiscoveryCatalog() {
   return (
     <div className="discovery-catalog">
       <header className="discovery-header">
-        <div className="discovery-header__copy">
-          <p className="kicker">Internship catalog</p>
-          <h1 className="workspace-title">Discovery</h1>
-          <p className="workspace-summary">
-            Search fresh roles from trusted public sources, then send a selected set into the application pipeline.
-          </p>
-        </div>
-        <div className="discovery-header__sync">
-          <p className="discovery-sync-state" aria-live="polite">
-            {isLoading && catalog === null
-              ? "Checking catalog"
-              : lastSync
-                ? <>Last sync <time dateTime={lastSync.dateTime}>{lastSync.label}</time></>
-                : "Not synced yet"}
-          </p>
-          <button
-            className="control"
-            disabled={isMutating}
-            onClick={() => void syncJobs()}
-            type="button"
-          >
-            <RefreshCw aria-hidden="true" />
-            {mutation === "sync" ? "Syncing…" : "Sync jobs"}
-          </button>
-        </div>
+        <h1 className="workspace-title">Discover</h1>
       </header>
+
+      <div className="discovery-toolbar">
+        <p className="discovery-sync-state" aria-live="polite">
+          {isLoading && catalog === null
+            ? "Checking catalog"
+            : lastSync
+              ? <>Last sync <time dateTime={lastSync.dateTime}>{lastSync.label}</time></>
+              : "Not synced yet"}
+        </p>
+        <button
+          className="control"
+          disabled={isMutating}
+          onClick={() => void syncJobs()}
+          type="button"
+        >
+          <RefreshCw aria-hidden="true" />
+          {mutation === "sync" ? "Syncing…" : "Sync jobs"}
+        </button>
+      </div>
 
       <section className="discovery-notices" aria-label="Discovery updates" aria-live="polite">
         {syncError ? <p className="dashboard-alert" role="alert">{syncError}</p> : null}
@@ -655,6 +729,37 @@ export function DiscoveryCatalog() {
               <option value="closed">Closed</option>
               <option value="all">All statuses</option>
             </select>
+          </label>
+          <label className="select-control">
+            <span>Sort</span>
+            <select
+              aria-label="Sort internships"
+              disabled={isMutating}
+              onChange={(event) => {
+                setQueueError(null);
+                beginDiscoveryViewTransition("sort");
+                setOffset(0);
+                setSort(event.currentTarget.value as DiscoverySort);
+              }}
+              value={sort}
+            >
+              <option value="recency">Newest first</option>
+              <option value="source">Source A–Z</option>
+            </select>
+          </label>
+          <label className="discovery-visibility-control">
+            <input
+              checked={effectiveHideQueued}
+              disabled={isMutating || status === "queued"}
+              onChange={(event) => {
+                setQueueError(null);
+                beginDiscoveryViewTransition("visibility");
+                setOffset(0);
+                setHideQueuedPreference(event.currentTarget.checked);
+              }}
+              type="checkbox"
+            />
+            <span>Hide queued jobs</span>
           </label>
         </div>
       </section>

@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 26;
+export const PIPELINE_SCHEMA_VERSION = 27;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -958,6 +958,17 @@ ALTER TABLE discovery_jobs_v25 RENAME TO discovery_jobs;
 CREATE INDEX discovery_jobs_recency
   ON discovery_jobs(closed, coalesce(posted_at, first_seen_at) DESC, id);
 `;
+const migration27 = `
+ALTER TABLE discovery_jobs
+ADD COLUMN suitable INTEGER NOT NULL DEFAULT 1 CHECK (suitable IN (0,1));
+`;
+
+function hasDiscoveryJobSuitableColumn(db: Database): boolean {
+  return db.query<{ name: string }, []>("PRAGMA table_info(discovery_jobs)")
+    .all()
+    .some(({ name }) => name === "suitable");
+}
+
 
 const previousOpportunityKindCheck =
   /CHECK\s*\(\s*opportunity_kind\s+IN\s*\(\s*'job'\s*,\s*'hackathon'\s*,\s*'competition'\s*,\s*'event'\s*\)\s*\)/i;
@@ -1123,6 +1134,11 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
       if (version < 26) {
         migrateNetworkingEventOpportunityKind(db);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(26, now);
+      }
+      if (version < 27) {
+        if (version === 26) migrateNetworkingEventOpportunityKind(db);
+        if (!hasDiscoveryJobSuitableColumn(db)) db.exec(migration27);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(27, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");
