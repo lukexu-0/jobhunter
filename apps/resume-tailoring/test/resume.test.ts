@@ -987,10 +987,11 @@ describe("TeX repair validation", () => {
   });
 
   test("accepts safe edits within editable section bodies", () => {
+    expect(baseline).toContain("Processed over \\$123,456");
     const reordered = baseline.replace(/(\\resumeItem\{Built a full-stack[^\n]+\}\n)(\s*)(\\resumeItem\{Processed over[^\n]+\})/, "$3\n$2$1");
     expect(validateRepairCandidate(baseline, baseline).valid).toBeTrue();
     const candidates = [
-      baseline.replace("Processed over \\$300,000", "Processed over \\$654,321"),
+      baseline.replace("Processed over \\$123,456", "Processed over \\$654,321"),
       baseline.replace("\\section{Projects}", "\\section{Projects}\n% repaired body comment"),
       baseline.replace("Gmail API,", "\\textbf{Gmail API},"),
       reordered,
