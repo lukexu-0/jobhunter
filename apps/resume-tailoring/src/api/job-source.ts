@@ -587,6 +587,12 @@ async function deterministicHtmlDescription(
   }
   const candidates = new Map<string, string>();
   for (const { opportunityKind, value } of opportunities) {
+    if (typeof value.description !== "string") continue;
+    const description = JobDescriptionSchema.safeParse(
+      await normalizeHtmlFragment(value.description),
+    );
+    if (!description.success) continue;
+
     const organization = value.hiringOrganization ?? value.organizer ?? value.sponsor;
     const values = [
       typeof value.title === "string"
@@ -600,7 +606,6 @@ async function deterministicHtmlDescription(
           && typeof (organization as Record<string, unknown>).name === "string"
           ? (organization as Record<string, unknown>).name as string
           : undefined,
-      typeof value.description === "string" ? value.description : undefined,
     ];
     const normalized: string[] = [];
     for (const source of values) {
@@ -608,6 +613,7 @@ async function deterministicHtmlDescription(
       const text = await normalizeHtmlFragment(source);
       if (text) normalized.push(text);
     }
+    normalized.push(description.data);
     const candidate = JobDescriptionSchema.safeParse(normalized.join("\n\n"));
     if (candidate.success) {
       const deduplicationKind = opportunityKindHint ?? opportunityKind;
@@ -632,19 +638,31 @@ function buildFallbackCandidate(candidate: string): LoadedJobSource | "too-large
 
 async function htmlFallback(html: string): Promise<LoadedJobSource> {
   const sanitized = await sanitizeHtml(html);
-  let sawOversized = false;
-  const mainCandidates = await captureElements(sanitized, "main");
-  const articleCandidates = await captureElements(sanitized, "article");
   const bodyCandidates = await captureElements(sanitized, "body");
-  const candidateGroups = [mainCandidates, articleCandidates, bodyCandidates];
-  if (bodyCandidates.length === 0) candidateGroups.push([await captureDocument(sanitized)]);
-  for (const candidates of candidateGroups) {
+  const completeCandidate = bodyCandidates.length > 0
+    ? bodyCandidates[0]!
+    : await captureDocument(sanitized);
+  const completeResult = buildFallbackCandidate(completeCandidate);
+  if (completeResult && completeResult !== "too-large") return completeResult;
+
+  let sawOversized = completeResult === "too-large";
+  let longestCandidate: LoadedJobSource | undefined;
+  let longestLength = -1;
+  for (const candidates of [
+    await captureElements(sanitized, "main"),
+    await captureElements(sanitized, "article"),
+  ]) {
     for (const candidate of candidates) {
       const result = buildFallbackCandidate(candidate);
-      if (result === "too-large") sawOversized = true;
-      else if (result) return result;
+      if (result === "too-large") {
+        sawOversized = true;
+      } else if (result && candidate.length > longestLength) {
+        longestCandidate = result;
+        longestLength = candidate.length;
+      }
     }
   }
+  if (longestCandidate) return longestCandidate;
   throw new JobSourceError(sawOversized ? "JOB_SOURCE_TOO_LARGE" : "JOB_DESCRIPTION_UNAVAILABLE");
 }
 
