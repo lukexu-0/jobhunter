@@ -116,6 +116,42 @@ describe("run HTTP routes", () => {
     expect(target.kickCount()).toBe(1);
   });
 
+  test("extends the run-creation timeout only after accepting a valid request body", async () => {
+    const events: string[] = [];
+    const target = service({
+      createRun: async () => {
+        events.push("create");
+        return run;
+      },
+    });
+    const route = createApiHandler({ webOrigin: ORIGIN, route: createRunRoutes(target) });
+    const context = {
+      onRunCreationValidated: () => {
+        events.push("validated");
+      },
+    };
+
+    const accepted = await route(
+      new Request(
+        "http://127.0.0.1:3457/v1/runs?source=browser",
+        post({ jobUrl: "https://jobs.example.test/role" }),
+      ),
+      context,
+    );
+
+    expect(accepted.status).toBe(201);
+    expect(events).toEqual(["validated", "create"]);
+
+    events.length = 0;
+    const rejected = await route(
+      new Request("http://127.0.0.1:3457/v1/runs", post({ jobUrl: "not-a-url" })),
+      context,
+    );
+
+    expect(rejected.status).toBe(400);
+    expect(events).toEqual([]);
+  });
+
   test("forwards a normalized pasted request and request signal before kicking the scheduler", async () => {
     const queuedRun: RunDto = { ...run, applicationStatus: "pending" };
     let received: unknown[] | undefined;

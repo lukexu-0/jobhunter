@@ -22,7 +22,7 @@ import { HttpApplicationHarnessClient } from "./api/application-harness-client.t
 import { ApplicationSessionService } from "./api/application-session-service.ts";
 import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
-import { createApiHandler } from "./api/handler.ts";
+import { createApiHandler, type ApiRequestContext } from "./api/handler.ts";
 import { createRunRoutes } from "./api/run-routes.ts";
 import { createDiscoveryRoutes } from "./api/discovery-routes.ts";
 import { RunApplicationService } from "./api/run-service.ts";
@@ -111,7 +111,7 @@ export interface PipelineApplicationServices {
 }
 
 export interface PipelineApplication {
-  fetch(request: Request): Promise<Response>;
+  fetch(request: Request, context?: ApiRequestContext): Promise<Response>;
   kick(): void;
   close(): Promise<void>;
   readonly services: Readonly<PipelineApplicationServices>;
@@ -353,12 +353,12 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const fetch = createApiHandler({
     internalRoute: routeApplicationAgent,
     webOrigin,
-    route: async (request, url) =>
+    route: async (request, url, context) =>
       (await routeAuth(request, url))
       ?? (await routeContext(request, url))
       ?? (await routeApplicationSessions(request, url))
       ?? (await routeDiscovery?.(request, url))
-      ?? (await routeRuns(request, url)),
+      ?? (await routeRuns(request, url, context)),
   });
   const services = Object.freeze({
     ...(pipelineDatabase === undefined ? {} : { pipelineDatabase }),

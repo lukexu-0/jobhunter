@@ -12,7 +12,7 @@ import {
   type ResumeIterationListResponse,
   type RunDto,
 } from "../contracts";
-import { apiResponse } from "./handler";
+import { apiResponse, type ApiRequestContext } from "./handler";
 
 export interface RunRouteService {
   listRuns(): Promise<RunDto[]> | RunDto[];
@@ -80,7 +80,11 @@ function parseResumeIterationRevision(value: string | undefined): number | undef
 }
 
 export function createRunRoutes(service: RunRouteService) {
-  return async function routeRuns(request: Request, url: URL): Promise<Response | null> {
+  return async function routeRuns(
+    request: Request,
+    url: URL,
+    context: ApiRequestContext = {},
+  ): Promise<Response | null> {
     const segments = url.pathname.split("/").filter(Boolean);
     if (segments[0] !== "v1" || segments[1] !== "runs") return null;
 
@@ -93,6 +97,7 @@ export function createRunRoutes(service: RunRouteService) {
       if (request.method === "POST" && segments.length === 2) {
         const body = CreateRunRequestSchema.safeParse(await parseBody(request));
         if (!body.success) return apiResponse.error("INVALID_REQUEST", "Run request is invalid", 400);
+        context.onRunCreationValidated?.();
         const run = checkedRun(await service.createRun(body.data, request.signal));
         service.kick();
         return apiResponse.json(run, 201);

@@ -11,6 +11,7 @@ import { resolveBrowserHarnessToken } from "./system/harness-token.ts";
 
 const hostname = "127.0.0.1";
 const DEFAULT_PIPELINE_PORT = 3457;
+const RUN_CREATION_PATH = "/v1/runs";
 
 export function resolvePipelinePort(value: string | undefined): number {
   if (value === undefined) return DEFAULT_PIPELINE_PORT;
@@ -38,6 +39,9 @@ export function startPipelineHttpServer(
     port: options.port ?? DEFAULT_PIPELINE_PORT,
     fetch(request, server) {
       const url = new URL(request.url);
+      const isRunCreation =
+        request.method === "POST"
+        && url.pathname === RUN_CREATION_PATH;
       if (
         (
           request.method === "POST"
@@ -58,7 +62,16 @@ export function startPipelineHttpServer(
       ) {
         server.timeout(request, 0);
       }
-      return app.fetch(request);
+      return app.fetch(
+        request,
+        isRunCreation
+          ? {
+              onRunCreationValidated: () => {
+                server.timeout(request, 0);
+              },
+            }
+          : undefined,
+      );
     },
   });
 }

@@ -1,5 +1,13 @@
 import type { ApiError, HealthResponse } from "../contracts";
-type ApiRoute = (request: Request, url: URL) => Response | Promise<Response | null> | null;
+export interface ApiRequestContext {
+  readonly onRunCreationValidated?: () => void;
+}
+
+type ApiRoute = (
+  request: Request,
+  url: URL,
+  context: ApiRequestContext,
+) => Response | Promise<Response | null> | null;
 
 
 export interface ApiHandlerOptions {
@@ -58,9 +66,12 @@ function error(code: string, message: string, status: number): Response {
 
 export function createApiHandler(options: ApiHandlerOptions) {
   const loopbackAlias = loopbackAliasOrigin(options.webOrigin);
-  return async function handle(request: Request): Promise<Response> {
+  return async function handle(
+    request: Request,
+    context: ApiRequestContext = {},
+  ): Promise<Response> {
     const url = new URL(request.url);
-    const internalResponse = await options.internalRoute?.(request, url);
+    const internalResponse = await options.internalRoute?.(request, url, context);
     if (internalResponse) return internalResponse;
     const isMutation = MUTATION_METHODS[request.method] === true;
 
@@ -81,7 +92,7 @@ export function createApiHandler(options: ApiHandlerOptions) {
       return json({ status: "ok" } satisfies HealthResponse);
     }
 
-    const routed = await options.route?.(request, url);
+    const routed = await options.route?.(request, url, context);
     return routed ?? error("NOT_FOUND", "Route not found", 404);
   };
 }

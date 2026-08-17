@@ -97,3 +97,48 @@ test("credential command POSTs can outlive Bun's default idle timeout", async ()
     await server.stop(true);
   }
 }, 18_000);
+
+test("only exact run-creation POSTs can outlive Bun's default idle timeout", async () => {
+  const server = startPipelineHttpServer(
+    {
+      // This integration check must cross Bun's real 10-second socket idle timeout.
+      fetch: async (request, context) => {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v1/runs") {
+          await request.json();
+          context?.onRunCreationValidated?.();
+        }
+        await Bun.sleep(12_000);
+        return new Response("completed");
+      },
+    },
+    { port: 0 },
+  );
+  try {
+    const [
+      runCreationRequest,
+      runListRequest,
+      nestedRunMutationRequest,
+    ] = await Promise.allSettled([
+      fetch(`http://127.0.0.1:${server.port}/v1/runs?source=browser`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jobUrl: "https://jobs.example.test/role" }),
+      }),
+      fetch(`http://127.0.0.1:${server.port}/v1/runs`),
+      fetch(`http://127.0.0.1:${server.port}/v1/runs/run-1/retry`, {
+        method: "POST",
+      }),
+    ]);
+
+    expect(runCreationRequest.status).toBe("fulfilled");
+    if (runCreationRequest.status === "fulfilled") {
+      expect(runCreationRequest.value.status).toBe(200);
+      expect(await runCreationRequest.value.text()).toBe("completed");
+    }
+    expect(runListRequest.status).toBe("rejected");
+    expect(nestedRunMutationRequest.status).toBe("rejected");
+  } finally {
+    await server.stop(true);
+  }
+}, 18_000);
