@@ -598,7 +598,76 @@ describe("job source loading", () => {
     });
   });
 
-  test("returns exact sanitized fallback lines using main, article, then body priority", async () => {
+  test("returns the complete sanitized body when an early main contains only a valid title", async () => {
+    let renders = 0;
+    const body = [
+      "<body><header>L'Oréal careers navigation</header>",
+      "<main><h1>Senior Manager, Data Engineering and Analytics</h1></main>",
+      "<script type=\"application/ld+json\">{\"@type\":\"JobPosting\",\"title\":\"Senior Manager, Data Engineering and Analytics\"}</script>",
+      "<section><h2>About the role</h2>",
+      "<p>L'Oréal is seeking a leader to build trusted data products for teams across the business.</p>",
+      "<h2>Responsibilities</h2>",
+      "<p>Lead engineers, shape the platform roadmap, and partner with product and analytics leaders.</p>",
+      "<h2>Qualifications</h2>",
+      "<ul><li>Experience delivering reliable cloud data platforms.</li>",
+      "<li>Strong communication and people leadership skills.</li></ul></section>",
+      "<nav>Discard related job links</nav>",
+      "<form>Discard job alerts<input value=\"email\"></form>",
+      "<script>discard()</script><div hidden>Discard hidden content</div>",
+      "<footer>Discard legal links</footer></body>",
+    ].join("");
+
+    await expect(loadJobSourceFromUrl("https://careers.loreal.example/role", undefined, {
+      fetchImpl: async () => htmlResponse(body),
+      resolveHost: resolvePublic,
+      renderHtml: async () => {
+        renders += 1;
+        return undefined;
+      },
+    })).resolves.toEqual({
+      kind: "model-fallback",
+      lines: [
+        "Senior Manager, Data Engineering and Analytics",
+        "",
+        "About the role",
+        "L'Oréal is seeking a leader to build trusted data products for teams across the business.",
+        "Responsibilities",
+        "Lead engineers, shape the platform roadmap, and partner with product and analytics leaders.",
+        "Qualifications",
+        "Experience delivering reliable cloud data platforms.",
+        "Strong communication and people leadership skills.",
+      ],
+    });
+    expect(renders).toBe(0);
+  });
+
+  test("recovers the longest bounded static candidate when the complete body exceeds Luna's byte limit", async () => {
+    let renders = 0;
+    const body = [
+      "<body>",
+      `<section>${"Unrelated company culture details. ".repeat(17_000)}</section>`,
+      "<main>Platform engineer builds reliable internal services and supports delivery teams.</main>",
+      "<article>Principal platform engineer leads secure infrastructure design, mentors engineers, and partners with product teams to deliver reliable customer systems.</article>",
+      "</body>",
+    ].join("");
+
+    await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+      fetchImpl: async () => htmlResponse(body),
+      resolveHost: resolvePublic,
+      renderHtml: async () => {
+        renders += 1;
+        return undefined;
+      },
+    })).resolves.toEqual({
+      kind: "model-fallback",
+      lines: [
+        "Principal platform engineer leads secure infrastructure design, mentors engineers, and partners with product teams to deliver reliable customer systems.",
+      ],
+    });
+    expect(renders).toBe(0);
+  });
+
+  test("returns the complete sanitized body to Luna instead of prioritizing nested elements", async () => {
     let renders = 0;
     const body = [
       "<body><header>Discard top header</header>",
@@ -623,6 +692,9 @@ describe("job source loading", () => {
     })).resolves.toEqual({
       kind: "model-fallback",
       lines: [
+        "Article role",
+        VALID_TEXT,
+        "",
         "Main role",
         "Build dependable & secure systems.",
         "Qualifications",
@@ -632,13 +704,13 @@ describe("job source loading", () => {
     expect(renders).toBe(0);
   });
 
-  test("uses article then body when higher-priority candidates are too short", async () => {
+  test("keeps short nested elements in the complete sanitized body sent to Luna", async () => {
     const article = "Article candidate contains enough exact source characters for fallback selection.";
     const body = `<body><main>tiny</main><article>${article}</article><p>${VALID_TEXT}</p></body>`;
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       fetchImpl: async () => htmlResponse(body),
       resolveHost: resolvePublic,
-    })).resolves.toEqual({ kind: "model-fallback", lines: [article] });
+    })).resolves.toEqual({ kind: "model-fallback", lines: ["tiny", article, VALID_TEXT] });
   });
 
   test("enforces fallback byte and line limits independently", async () => {
