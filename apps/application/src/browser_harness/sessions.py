@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -18,6 +18,7 @@ from .credentials import CredentialStore
 from .agent import ApplicationRunRequest, build_application_task
 from .artifacts import (
     StoredCandidateArtifacts,
+    create_session_artifact_directory,
     cleanup_orphaned_session_artifacts,
     cleanup_session_artifacts,
     retry_pending_cleanup,
@@ -84,6 +85,9 @@ from .models import (
     SessionCreateRequest,
     SessionCreateResponse,
     SessionSnapshot,
+    SourceCaptureCreateRequest,
+    SourceCaptureCreateResponse,
+    SourceCaptureResult,
     SessionState,
     SESSION_ERROR_MESSAGES,
     UploadedArtifacts,
@@ -91,6 +95,7 @@ from .models import (
     validate_approved_origin,
     validate_job_url,
     sanitize_public_url,
+    https_job_origin,
 )
 from .pipeline_agent import (
     PipelineApplicationAgentClient,
@@ -127,6 +132,10 @@ _PLAYWRIGHT_CLI_TIMEOUT_MESSAGE = (
     "Playwright CLI execution timed out after 120 seconds."
 )
 _BROWSER_RUNTIME_ERROR_MESSAGE = "Browser runtime failed."
+_SOURCE_CAPTURE_ACTIVE_MESSAGE = "A source capture is already active"
+_SOURCE_CAPTURE_NOT_FOUND_MESSAGE = "Source capture was not found"
+_SOURCE_CAPTURE_NOT_READY_MESSAGE = "Source capture is not ready"
+_SOURCE_CAPTURE_UNAVAILABLE_MESSAGE = "Source capture is unavailable"
 _COMMAND_CONFLICT_MESSAGE = (
     "The application state changed; review the latest session state"
 )
@@ -239,6 +248,48 @@ class _Tombstone:
     events: tuple[HarnessEvent, ...]
 
 
+@dataclass(slots=True)
+class _SourceCapture:
+    request: SourceCaptureCreateRequest
+    response: SourceCaptureCreateResponse
+    deadline_monotonic: float
+    setup_task: asyncio.Task[Any] | None
+    session_directory: Path | None = None
+    runtime: PlaywrightCliRuntime | None = None
+    ttl_task: asyncio.Task[None] | None = None
+    completion_task: asyncio.Task[SourceCaptureResult] | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+    terminal_state: Literal[
+        "completed",
+        "cancelled",
+        "expired",
+        "failed",
+        "shutdown",
+    ] | None = None
+    closed_event: asyncio.Event = field(default_factory=asyncio.Event)
+    completed_result: SourceCaptureResult | None = None
+    result_expiry_task: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class _SourceCaptureReplay:
+    capture_id: UUID
+    result: SourceCaptureResult
+    deadline_monotonic: float
+    expiry_task: asyncio.Task[None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCaptureTombstone:
+    state: Literal[
+        "completed",
+        "cancelled",
+        "expired",
+        "failed",
+        "shutdown",
+    ]
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -313,7 +364,7 @@ def _saved_private_values(snapshot: UserInfoSnapshot) -> frozenset[str]:
 
 
 class ApplicationSessionManager:
-    """Own exactly one application session and a bounded terminal history."""
+    """Own one browser slot for either an application session or source capture."""
 
     def __init__(
         self,
@@ -343,6 +394,12 @@ class ApplicationSessionManager:
         self._startup_lock = asyncio.Lock()
         self._startup_complete = False
         self._active: _ApplicationSession | None = None
+        self._source_capture: _SourceCapture | None = None
+        self._source_capture_replay: _SourceCaptureReplay | None = None
+        self._source_capture_tombstones: OrderedDict[
+            UUID,
+            _SourceCaptureTombstone,
+        ] = OrderedDict()
         self._tombstones: OrderedDict[UUID, _Tombstone] = OrderedDict()
         self._shutting_down = False
 
@@ -443,6 +500,13 @@ class ApplicationSessionManager:
                     409,
                     "session_terminal",
                     "The application session has already ended",
+                )
+            if self._source_capture is not None:
+                raise HarnessServiceError(
+                    409,
+                    "session_active",
+                    "An application session is already active",
+                    session_id=self._source_capture.request.capture_id,
                 )
             if self._active is not None:
                 if (
@@ -693,6 +757,783 @@ class ApplicationSessionManager:
             events_url=f"{base}/events",
             commands_url=f"{base}/commands",
         )
+
+    def _clear_source_capture_replay_locked(self) -> None:
+        replay = self._source_capture_replay
+        self._source_capture_replay = None
+        if replay is None:
+            return
+        expiry_task = replay.expiry_task
+        if (
+            expiry_task is not None
+            and expiry_task is not asyncio.current_task()
+            and not expiry_task.done()
+        ):
+            expiry_task.cancel()
+
+    def _source_capture_replay_result_locked(
+        self,
+        capture_id: UUID,
+    ) -> SourceCaptureResult | None:
+        replay = self._source_capture_replay
+        if replay is None:
+            return None
+        if asyncio.get_running_loop().time() >= replay.deadline_monotonic:
+            self._clear_source_capture_replay_locked()
+            return None
+        return replay.result if replay.capture_id == capture_id else None
+
+    def _clear_source_capture_completed_result_locked(
+        self,
+        record: _SourceCapture,
+    ) -> None:
+        record.completed_result = None
+        expiry_task = record.result_expiry_task
+        record.result_expiry_task = None
+        if (
+            expiry_task is not None
+            and expiry_task is not asyncio.current_task()
+            and not expiry_task.done()
+        ):
+            expiry_task.cancel()
+
+    def _start_source_capture_result_expiry_locked(
+        self,
+        record: _SourceCapture,
+        result: SourceCaptureResult,
+    ) -> None:
+        self._clear_source_capture_completed_result_locked(record)
+        if asyncio.get_running_loop().time() >= record.deadline_monotonic:
+            return
+        record.completed_result = result
+        record.result_expiry_task = asyncio.create_task(
+            self._expire_source_capture_completed_result(record),
+            name=(
+                "browser-harness-source-capture-result-expiry-"
+                f"{record.request.capture_id}"
+            ),
+        )
+
+    async def _expire_source_capture_completed_result(
+        self,
+        record: _SourceCapture,
+    ) -> None:
+        try:
+            while True:
+                remaining = (
+                    record.deadline_monotonic
+                    - asyncio.get_running_loop().time()
+                )
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            async with self._lock:
+                if record.result_expiry_task is asyncio.current_task():
+                    self._clear_source_capture_completed_result_locked(
+                        record
+                    )
+        except asyncio.CancelledError:
+            return
+
+    def _install_source_capture_replay_locked(
+        self,
+        record: _SourceCapture,
+    ) -> None:
+        self._clear_source_capture_replay_locked()
+        result = record.completed_result
+        self._clear_source_capture_completed_result_locked(record)
+        if (
+            result is None
+            or self._shutting_down
+            or asyncio.get_running_loop().time() >= record.deadline_monotonic
+        ):
+            return
+        replay = _SourceCaptureReplay(
+            capture_id=record.request.capture_id,
+            result=result,
+            deadline_monotonic=record.deadline_monotonic,
+        )
+        self._source_capture_replay = replay
+        replay.expiry_task = asyncio.create_task(
+            self._expire_source_capture_replay(replay),
+            name=(
+                "browser-harness-source-capture-replay-expiry-"
+                f"{record.request.capture_id}"
+            ),
+        )
+
+    async def _expire_source_capture_replay(
+        self,
+        replay: _SourceCaptureReplay,
+    ) -> None:
+        try:
+            while True:
+                remaining = (
+                    replay.deadline_monotonic
+                    - asyncio.get_running_loop().time()
+                )
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            async with self._lock:
+                if self._source_capture_replay is replay:
+                    self._clear_source_capture_replay_locked()
+        except asyncio.CancelledError:
+            return
+
+    async def create_source_capture(
+        self,
+        *,
+        capture_id: UUID,
+        job_url: str,
+        approved_origins: Sequence[str],
+        timeout_seconds: int,
+    ) -> SourceCaptureCreateResponse:
+        await self.startup()
+        try:
+            request = SourceCaptureCreateRequest(
+                capture_id=capture_id,
+                job_url=job_url,
+                approved_origins=list(approved_origins),
+                timeout_seconds=timeout_seconds,
+            )
+        except (TypeError, ValueError, ValidationError):
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            ) from None
+
+        created_at = _now()
+        response = SourceCaptureCreateResponse(
+            capture_id=request.capture_id,
+            state="awaiting_human_verification",
+            expires_at=created_at + timedelta(seconds=request.timeout_seconds),
+        )
+        record = _SourceCapture(
+            request=request,
+            response=response,
+            deadline_monotonic=(
+                asyncio.get_running_loop().time() + request.timeout_seconds
+            ),
+            setup_task=None,
+        )
+        setup: asyncio.Task[Any] | None
+
+        async with self._lock:
+            if self._shutting_down:
+                raise HarnessServiceError(
+                    503,
+                    "unavailable",
+                    _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
+                )
+            if self._active is not None:
+                raise HarnessServiceError(
+                    409,
+                    "source_capture_active",
+                    _SOURCE_CAPTURE_ACTIVE_MESSAGE,
+                )
+            active_capture = self._source_capture
+            if active_capture is not None:
+                if (
+                    active_capture.request.capture_id == request.capture_id
+                    and active_capture.request == request
+                    and active_capture.terminal_state is None
+                ):
+                    record = active_capture
+                    response = active_capture.response
+                    setup = active_capture.setup_task
+                else:
+                    raise HarnessServiceError(
+                        409,
+                        "source_capture_active",
+                        _SOURCE_CAPTURE_ACTIVE_MESSAGE,
+                    )
+            else:
+                if request.capture_id in self._source_capture_tombstones:
+                    raise HarnessServiceError(
+                        409,
+                        "source_capture_not_ready",
+                        _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                    )
+                self._clear_source_capture_replay_locked()
+                self._source_capture = record
+                record.ttl_task = asyncio.create_task(
+                    self._expire_source_capture(record),
+                    name=(
+                        "browser-harness-source-capture-ttl-"
+                        f"{request.capture_id}"
+                    ),
+                )
+                record.setup_task = asyncio.create_task(
+                    self._setup_source_capture_record(record),
+                    name=(
+                        "browser-harness-source-capture-setup-"
+                        f"{request.capture_id}"
+                    ),
+                )
+                setup = record.setup_task
+
+        if setup is not None:
+            try:
+                await asyncio.shield(setup)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                if record.terminal_state == "cancelled":
+                    raise HarnessServiceError(
+                        409,
+                        "source_capture_not_ready",
+                        _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                    ) from None
+                raise HarnessServiceError(
+                    503,
+                    "unavailable",
+                    _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
+                ) from None
+        return response
+
+    async def _setup_source_capture_record(
+        self,
+        record: _SourceCapture,
+    ) -> None:
+        current_task = asyncio.current_task()
+        try:
+            record.session_directory = create_session_artifact_directory(
+                self._artifacts_root,
+                record.request.capture_id,
+            )
+            runtime = self._runtime_factory(
+                session_id=record.request.capture_id,
+                launch=self._browser_launch,
+                session_directory=record.session_directory,
+                deadline=record.deadline_monotonic,
+                node_executable=self._config.node_executable,
+                cli_script=self._config.playwright_cli_script,
+            )
+            record.runtime = runtime
+            await runtime.start(record.request.job_url)
+            await runtime.set_approved_origins(
+                record.request.approved_origins
+            )
+            await runtime.suppress_private_capture()
+            async with self._lock:
+                if record.terminal_state is not None:
+                    raise asyncio.CancelledError
+                if record.setup_task is current_task:
+                    record.setup_task = None
+            return
+        except asyncio.CancelledError:
+            async with self._lock:
+                cleanup_was_started = record.cleanup_task is not None
+                terminal_state = record.terminal_state
+                cleanup = self._schedule_source_capture_cleanup_locked(
+                    record,
+                    terminal_state or "failed",
+                )
+                if record.setup_task is current_task:
+                    record.setup_task = None
+            if not cleanup_was_started:
+                await asyncio.shield(cleanup)
+            if terminal_state == "cancelled":
+                raise HarnessServiceError(
+                    409,
+                    "source_capture_not_ready",
+                    _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                ) from None
+            raise HarnessServiceError(
+                503,
+                "unavailable",
+                _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
+            ) from None
+        except Exception:
+            async with self._lock:
+                cleanup_was_started = record.cleanup_task is not None
+                cleanup = self._schedule_source_capture_cleanup_locked(
+                    record,
+                    record.terminal_state or "failed",
+                )
+                if record.setup_task is current_task:
+                    record.setup_task = None
+            if not cleanup_was_started:
+                await asyncio.shield(cleanup)
+            raise HarnessServiceError(
+                503,
+                "unavailable",
+                _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
+            ) from None
+
+    async def complete_source_capture(
+        self,
+        capture_id: UUID,
+    ) -> SourceCaptureResult:
+        cleanup: asyncio.Task[None] | None = None
+        completion: asyncio.Task[SourceCaptureResult] | None = None
+        replay_available = False
+        replay_cleanup: asyncio.Task[None] | None = None
+        async with self._lock:
+            record = self._source_capture
+            if record is None or record.request.capture_id != capture_id:
+                replay_available = (
+                    self._source_capture_replay_result_locked(capture_id)
+                    is not None
+                )
+                if not replay_available:
+                    if capture_id in self._source_capture_tombstones:
+                        raise HarnessServiceError(
+                            409,
+                            "source_capture_not_ready",
+                            _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                        )
+                    raise HarnessServiceError(
+                        404,
+                        "source_capture_not_found",
+                        _SOURCE_CAPTURE_NOT_FOUND_MESSAGE,
+                    )
+            elif (
+                record.terminal_state == "completed"
+                and record.completed_result is not None
+            ):
+                if (
+                    asyncio.get_running_loop().time()
+                    >= record.deadline_monotonic
+                ):
+                    raise HarnessServiceError(
+                        409,
+                        "source_capture_not_ready",
+                        _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                    )
+                replay_available = True
+                replay_cleanup = record.cleanup_task
+            elif (
+                record.cleanup_task is not None
+                or record.terminal_state is not None
+                or record.setup_task is not None
+            ):
+                raise HarnessServiceError(
+                    409,
+                    "source_capture_not_ready",
+                    _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                )
+            elif (
+                asyncio.get_running_loop().time()
+                >= record.deadline_monotonic
+            ):
+                cleanup = self._schedule_source_capture_cleanup_locked(
+                    record,
+                    "expired",
+                )
+            else:
+                if record.completion_task is None:
+                    record.completion_task = asyncio.create_task(
+                        self._complete_source_capture_record(record),
+                        name=(
+                            "browser-harness-source-capture-complete-"
+                            f"{capture_id}"
+                        ),
+                    )
+                completion = record.completion_task
+        if replay_available:
+            if replay_cleanup is not None:
+                await asyncio.shield(replay_cleanup)
+            async with self._lock:
+                replay_result = self._source_capture_replay_result_locked(
+                    capture_id
+                )
+            if replay_result is None:
+                raise HarnessServiceError(
+                    409,
+                    "source_capture_not_ready",
+                    _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                )
+            return replay_result
+        if cleanup is not None:
+            await asyncio.shield(cleanup)
+            raise HarnessServiceError(
+                409,
+                "source_capture_not_ready",
+                _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+            )
+        assert completion is not None
+        try:
+            return await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            raise HarnessServiceError(
+                409,
+                "source_capture_not_ready",
+                _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+            ) from None
+
+    async def _complete_source_capture_record(
+        self,
+        record: _SourceCapture,
+    ) -> SourceCaptureResult:
+        current_task = asyncio.current_task()
+        runtime = record.runtime
+        if runtime is None:
+            cleanup, failure_won = (
+                await self._fail_source_capture_completion(
+                    record,
+                    current_task,
+                )
+            )
+            await asyncio.shield(cleanup)
+            if not failure_won:
+                raise HarnessServiceError(
+                    409,
+                    "source_capture_not_ready",
+                    _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                )
+            raise HarnessServiceError(
+                503,
+                "unavailable",
+                _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
+            )
+        try:
+            captured = await runtime.capture_source_snapshot(
+                record.request.approved_origins[0]
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            cleanup, failure_won = (
+                await self._fail_source_capture_completion(
+                    record,
+                    current_task,
+                )
+            )
+            await asyncio.shield(cleanup)
+            if not failure_won:
+                raise HarnessServiceError(
+                    409,
+                    "source_capture_not_ready",
+                    _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                )
+            raise HarnessServiceError(
+                503,
+                "unavailable",
+                _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
+            ) from None
+
+        if captured is None:
+            cleanup = await self._release_source_capture_completion(
+                record,
+                current_task,
+            )
+            if cleanup is not None:
+                await asyncio.shield(cleanup)
+            raise HarnessServiceError(
+                409,
+                "source_capture_not_ready",
+                _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+            )
+
+        try:
+            if (
+                not isinstance(captured, tuple)
+                or len(captured) != 2
+                or not all(isinstance(value, str) for value in captured)
+            ):
+                raise TypeError("invalid source capture result")
+            final_url, source = captured
+            if (
+                https_job_origin(final_url)
+                != record.request.approved_origins[0]
+            ):
+                raise ValueError("source capture left its approved origin")
+            result = SourceCaptureResult(
+                capture_id=record.request.capture_id,
+                final_url=final_url,
+                source=source,
+            )
+        except (TypeError, ValueError, ValidationError):
+            cleanup, failure_won = (
+                await self._fail_source_capture_completion(
+                    record,
+                    current_task,
+                )
+            )
+            await asyncio.shield(cleanup)
+            if not failure_won:
+                raise HarnessServiceError(
+                    409,
+                    "source_capture_not_ready",
+                    _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+                )
+            raise HarnessServiceError(
+                503,
+                "unavailable",
+                _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
+            ) from None
+
+        del captured, final_url, source
+        cleanup, completion_won = (
+            await self._finish_source_capture_completion(
+                record,
+                current_task,
+                result,
+            )
+        )
+        del result
+        await asyncio.shield(cleanup)
+        if not completion_won:
+            raise HarnessServiceError(
+                409,
+                "source_capture_not_ready",
+                _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+            )
+        async with self._lock:
+            replay_result = self._source_capture_replay_result_locked(
+                record.request.capture_id
+            )
+        if replay_result is None:
+            raise HarnessServiceError(
+                409,
+                "source_capture_not_ready",
+                _SOURCE_CAPTURE_NOT_READY_MESSAGE,
+            )
+        return replay_result
+
+    async def _finish_source_capture_completion(
+        self,
+        record: _SourceCapture,
+        task: asyncio.Task[Any] | None,
+        result: SourceCaptureResult,
+    ) -> tuple[asyncio.Task[None], bool]:
+        async with self._lock:
+            state: Literal["completed", "expired"] = (
+                "expired"
+                if asyncio.get_running_loop().time()
+                >= record.deadline_monotonic
+                else "completed"
+            )
+            cleanup = self._schedule_source_capture_cleanup_locked(
+                record,
+                state,
+            )
+            completion_won = record.terminal_state == "completed"
+            if completion_won:
+                self._start_source_capture_result_expiry_locked(
+                    record,
+                    result,
+                )
+            if record.completion_task is task:
+                record.completion_task = None
+            return cleanup, completion_won
+
+    async def _fail_source_capture_completion(
+        self,
+        record: _SourceCapture,
+        task: asyncio.Task[Any] | None,
+    ) -> tuple[asyncio.Task[None], bool]:
+        async with self._lock:
+            state: Literal["failed", "expired"] = (
+                "expired"
+                if asyncio.get_running_loop().time()
+                >= record.deadline_monotonic
+                else "failed"
+            )
+            cleanup = self._schedule_source_capture_cleanup_locked(
+                record,
+                state,
+            )
+            if record.completion_task is task:
+                record.completion_task = None
+            return cleanup, record.terminal_state == "failed"
+
+    async def _release_source_capture_completion(
+        self,
+        record: _SourceCapture,
+        task: asyncio.Task[Any] | None,
+    ) -> asyncio.Task[None] | None:
+        async with self._lock:
+            cleanup = record.cleanup_task
+            if (
+                cleanup is None
+                and asyncio.get_running_loop().time()
+                >= record.deadline_monotonic
+            ):
+                cleanup = self._schedule_source_capture_cleanup_locked(
+                    record,
+                    "expired",
+                )
+            if record.completion_task is task:
+                record.completion_task = None
+            return cleanup
+
+    async def delete_source_capture(self, capture_id: UUID) -> None:
+        async with self._lock:
+            record = self._source_capture
+            if record is None or record.request.capture_id != capture_id:
+                replay = self._source_capture_replay
+                if replay is not None and replay.capture_id == capture_id:
+                    self._clear_source_capture_replay_locked()
+                if capture_id in self._source_capture_tombstones:
+                    return
+                raise HarnessServiceError(
+                    404,
+                    "source_capture_not_found",
+                    _SOURCE_CAPTURE_NOT_FOUND_MESSAGE,
+                )
+            self._clear_source_capture_completed_result_locked(record)
+            cleanup = self._schedule_source_capture_cleanup_locked(
+                record,
+                "cancelled",
+            )
+        await asyncio.shield(cleanup)
+        async with self._lock:
+            replay = self._source_capture_replay
+            if replay is not None and replay.capture_id == capture_id:
+                self._clear_source_capture_replay_locked()
+
+    async def _expire_source_capture(self, record: _SourceCapture) -> None:
+        delay = max(
+            0.0,
+            record.deadline_monotonic - asyncio.get_running_loop().time(),
+        )
+        try:
+            await asyncio.sleep(delay)
+            cleanup = await self._begin_source_capture_cleanup(
+                record,
+                "expired",
+            )
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            return
+
+    async def _begin_source_capture_cleanup(
+        self,
+        record: _SourceCapture,
+        state: Literal[
+            "completed",
+            "cancelled",
+            "expired",
+            "failed",
+            "shutdown",
+        ],
+    ) -> asyncio.Task[None]:
+        async with self._lock:
+            return self._schedule_source_capture_cleanup_locked(record, state)
+
+    def _schedule_source_capture_cleanup_locked(
+        self,
+        record: _SourceCapture,
+        state: Literal[
+            "completed",
+            "cancelled",
+            "expired",
+            "failed",
+            "shutdown",
+        ],
+    ) -> asyncio.Task[None]:
+        if record.cleanup_task is None:
+            record.terminal_state = state
+            record.cleanup_task = asyncio.create_task(
+                self._cleanup_source_capture(record),
+                name=(
+                    "browser-harness-source-capture-cleanup-"
+                    f"{record.request.capture_id}"
+                ),
+            )
+        return record.cleanup_task
+
+    async def _cleanup_source_capture(
+        self,
+        record: _SourceCapture,
+    ) -> None:
+        ttl_task = record.ttl_task
+        if (
+            ttl_task is not None
+            and ttl_task is not asyncio.current_task()
+            and not ttl_task.done()
+        ):
+            ttl_task.cancel()
+
+        setup_task = record.setup_task
+        if (
+            setup_task is not None
+            and setup_task is not asyncio.current_task()
+            and not setup_task.done()
+        ):
+            setup_task.cancel()
+            try:
+                await asyncio.shield(setup_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        completion_task = record.completion_task
+        if (
+            completion_task is not None
+            and completion_task is not asyncio.current_task()
+        ):
+            if not completion_task.done():
+                completion_task.cancel()
+            try:
+                await asyncio.shield(completion_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if record.completion_task is completion_task:
+            record.completion_task = None
+
+        retry_delay = 0.05
+        while record.runtime is not None:
+            try:
+                await record.runtime.close()
+            except Exception:
+                logger.warning(
+                    "Source-capture runtime cleanup failed; retaining ownership "
+                    "and retrying"
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(
+                    retry_delay * 2,
+                    _CLEANUP_RETRY_MAX_SECONDS,
+                )
+            else:
+                record.runtime = None
+
+        if record.session_directory is not None:
+            cleaned = False
+            while not cleaned:
+                cleanup_result = await asyncio.to_thread(
+                    cleanup_session_artifacts,
+                    record.session_directory,
+                )
+                cleaned = cleanup_result is not False
+                if not cleaned:
+                    logger.warning(
+                        "Source-capture artifact cleanup failed; retaining "
+                        "ownership and retrying"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(
+                        retry_delay * 2,
+                        _CLEANUP_RETRY_MAX_SECONDS,
+                    )
+            record.session_directory = None
+        await self._drain_pending_cleanup()
+
+        async with self._lock:
+            if self._source_capture is record:
+                self._source_capture = None
+            state = record.terminal_state or "failed"
+            if state == "completed":
+                self._install_source_capture_replay_locked(record)
+            else:
+                self._clear_source_capture_completed_result_locked(record)
+            self._source_capture_tombstones[
+                record.request.capture_id
+            ] = _SourceCaptureTombstone(state=state)
+            self._source_capture_tombstones.move_to_end(
+                record.request.capture_id
+            )
+            while len(self._source_capture_tombstones) > _TOMBSTONE_LIMIT:
+                self._source_capture_tombstones.popitem(last=False)
+        record.closed_event.set()
 
     def get_snapshot(self, session_id: UUID) -> SessionSnapshot:
         record = self._active
@@ -1505,7 +2346,23 @@ class ApplicationSessionManager:
     async def shutdown(self) -> None:
         async with self._lock:
             self._shutting_down = True
+            self._clear_source_capture_replay_locked()
             record = self._active
+            source_capture = self._source_capture
+            if source_capture is not None:
+                self._clear_source_capture_completed_result_locked(
+                    source_capture
+                )
+            source_cleanup = (
+                self._schedule_source_capture_cleanup_locked(
+                    source_capture,
+                    "shutdown",
+                )
+                if source_capture is not None
+                else None
+            )
+        if source_cleanup is not None:
+            await asyncio.shield(source_cleanup)
         if record is not None:
             await self._request_terminal(
                 record,

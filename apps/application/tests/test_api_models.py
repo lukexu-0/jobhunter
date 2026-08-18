@@ -60,6 +60,9 @@ from jobhunter_browser_harness.models import (
     SessionCreateResponse,
     SessionError,
     SessionSnapshot,
+    SourceCaptureCreateResponse,
+    SourceCaptureCreateRequest,
+    SourceCaptureResult,
     sanitize_public_url,
     session_error,
     validate_approved_origin,
@@ -129,6 +132,9 @@ class FakeSessionService:
     snapshot_error: Exception | None = None
     suggestions_error: HarnessServiceError | None = None
     create_calls: list[dict[str, Any]] = field(default_factory=list)
+    source_capture_calls: list[dict[str, Any]] = field(default_factory=list)
+    source_capture_complete_calls: list[UUID] = field(default_factory=list)
+    source_capture_delete_calls: list[UUID] = field(default_factory=list)
     snapshot_calls: list[UUID] = field(default_factory=list)
     event_calls: list[tuple[UUID, int | None]] = field(default_factory=list)
     suggestion_calls: list[tuple[UUID, str]] = field(default_factory=list)
@@ -203,6 +209,42 @@ class FakeSessionService:
             events_url=f"http://127.0.0.1:8765/v1/sessions/{SESSION_ID}/events",
             commands_url=f"http://127.0.0.1:8765/v1/sessions/{SESSION_ID}/commands",
         )
+
+    async def create_source_capture(
+        self,
+        *,
+        capture_id: UUID,
+        job_url: str,
+        approved_origins: Sequence[str],
+        timeout_seconds: int,
+    ) -> SourceCaptureCreateResponse:
+        self.source_capture_calls.append(
+            {
+                "capture_id": capture_id,
+                "job_url": job_url,
+                "approved_origins": list(approved_origins),
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return SourceCaptureCreateResponse(
+            capture_id=capture_id,
+            state="awaiting_human_verification",
+            expires_at=NOW + timedelta(minutes=15),
+        )
+
+    async def complete_source_capture(
+        self,
+        capture_id: UUID,
+    ) -> SourceCaptureResult:
+        self.source_capture_complete_calls.append(capture_id)
+        return SourceCaptureResult(
+            capture_id=capture_id,
+            final_url="https://jobs.tal.net/application/verified",
+            source="Verified role\nEmployer details",
+        )
+
+    async def delete_source_capture(self, capture_id: UUID) -> None:
+        self.source_capture_delete_calls.append(capture_id)
 
     def get_snapshot(self, session_id: UUID) -> SessionSnapshot:
         self.snapshot_calls.append(session_id)
@@ -419,6 +461,24 @@ def test_origins_are_canonical_exact_and_do_not_admit_lookalikes() -> None:
     ):
         with pytest.raises((TypeError, ValueError)):
             validate_https_origin(invalid)
+
+
+def test_origins_canonicalize_expanded_ipv6_like_whatwg_urls() -> None:
+    expanded = "0:0:0:0:0:0:0:1"
+    capture = SourceCaptureCreateRequest(
+        capture_id=UUID("5cd2d80d-d615-4a56-a53e-01d174d6b88d"),
+        job_url=f"https://[{expanded}]/jobs/1?verified=true",
+        approved_origins=[f"https://[{expanded}]:443/"],
+        timeout_seconds=900,
+    )
+
+    assert validate_https_origin(
+        f"https://[{expanded}]:443/"
+    ) == "https://[::1]"
+    assert validate_approved_origin(
+        f"http://[{expanded}]:8080/"
+    ) == "http://[::1]:8080"
+    assert capture.approved_origins == ["https://[::1]"]
 
 
 def test_field_result_enforces_bounds_and_never_contains_a_value() -> None:
@@ -1092,6 +1152,264 @@ async def test_authenticated_response_has_no_cors_headers(
 
     assert response.status_code == 200
     assert not any(name.startswith("access-control-") for name in response.headers)
+
+
+async def test_authenticated_source_capture_creation_dispatches_validated_request_once(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    response = await client.post(
+        "/v1/source-captures",
+        headers=AUTHORIZATION,
+        json={
+            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+            "job_url": (
+                "https://jobs.tal.net/vx/lang-en-GB/mobile-0/appcentre-ext/"
+                "brand-4/candidate/so/pm/1/pl/3/opp/1234-Engineer/en-GB"
+            ),
+            "approved_origins": ["https://jobs.tal.net"],
+            "timeout_seconds": 900,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+        "state": "awaiting_human_verification",
+        "expires_at": "2026-07-13T12:15:00Z",
+    }
+    assert service.source_capture_calls == [
+        {
+            "capture_id": UUID("f4d9a10e-e63a-4ff5-9bf7-c2d054418979"),
+            "job_url": (
+                "https://jobs.tal.net/vx/lang-en-GB/mobile-0/appcentre-ext/"
+                "brand-4/candidate/so/pm/1/pl/3/opp/1234-Engineer/en-GB"
+            ),
+            "approved_origins": ["https://jobs.tal.net"],
+            "timeout_seconds": 900,
+        }
+    ]
+
+
+async def test_source_capture_completion_is_bodyless_and_returns_only_private_source_result(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    capture_id = UUID("f4d9a10e-e63a-4ff5-9bf7-c2d054418979")
+
+    response = await client.post(
+        f"/v1/source-captures/{capture_id}/complete",
+        headers=AUTHORIZATION,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "capture_id": str(capture_id),
+        "final_url": "https://jobs.tal.net/application/verified",
+        "source": "Verified role\nEmployer details",
+    }
+    assert service.source_capture_complete_calls == [capture_id]
+    assert set(response.json()) == {"capture_id", "final_url", "source"}
+
+
+async def test_source_capture_cancel_is_bodyless_and_returns_no_content(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    capture_id = UUID("f4d9a10e-e63a-4ff5-9bf7-c2d054418979")
+
+    response = await client.delete(
+        f"/v1/source-captures/{capture_id}",
+        headers=AUTHORIZATION,
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+    assert service.source_capture_delete_calls == [capture_id]
+
+
+@pytest.mark.parametrize("method,suffix", [("POST", "/complete"), ("DELETE", "")])
+@pytest.mark.parametrize(
+    "target_suffix,content",
+    [("?unexpected=true", None), ("", b"{}")],
+)
+async def test_source_capture_terminal_routes_reject_queries_and_bodies(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    method: str,
+    suffix: str,
+    target_suffix: str,
+    content: bytes | None,
+) -> None:
+    client, service = api_client
+    capture_id = UUID("f4d9a10e-e63a-4ff5-9bf7-c2d054418979")
+
+    response = await client.request(
+        method,
+        f"/v1/source-captures/{capture_id}{suffix}{target_suffix}",
+        headers=AUTHORIZATION,
+        content=content,
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.source_capture_complete_calls == []
+    assert service.source_capture_delete_calls == []
+
+@pytest.mark.parametrize("method,suffix", [("POST", "/complete"), ("DELETE", "")])
+async def test_source_capture_terminal_routes_reject_declared_oversized_bodies_without_reading(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    method: str,
+    suffix: str,
+) -> None:
+    client, service = api_client
+    capture_id = UUID("f4d9a10e-e63a-4ff5-9bf7-c2d054418979")
+
+    async def unread_body() -> AsyncIterator[bytes]:
+        raise AssertionError("declared nonempty body must not be consumed")
+        yield b"unreachable"
+
+    response = await client.request(
+        method,
+        f"/v1/source-captures/{capture_id}{suffix}",
+        headers={**AUTHORIZATION, "content-length": str(64 * 1024 * 1024)},
+        content=unread_body(),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.source_capture_complete_calls == []
+    assert service.source_capture_delete_calls == []
+
+
+@pytest.mark.parametrize("method,suffix", [("POST", "/complete"), ("DELETE", "")])
+async def test_source_capture_terminal_routes_stop_at_first_chunked_body_byte(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    method: str,
+    suffix: str,
+) -> None:
+    client, service = api_client
+    capture_id = UUID("f4d9a10e-e63a-4ff5-9bf7-c2d054418979")
+
+    async def chunked_body() -> AsyncIterator[bytes]:
+        yield b"x"
+        raise AssertionError("bodyless check must stop after the first byte")
+
+    response = await client.request(
+        method,
+        f"/v1/source-captures/{capture_id}{suffix}",
+        headers=AUTHORIZATION,
+        content=chunked_body(),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.source_capture_complete_calls == []
+    assert service.source_capture_delete_calls == []
+
+
+def test_source_capture_urls_accept_4096_characters_and_reject_4097() -> None:
+    capture_id = UUID("f4d9a10e-e63a-4ff5-9bf7-c2d054418979")
+    origin_prefix = "https://"
+    maximum_origin = origin_prefix + "a" * (4096 - len(origin_prefix))
+    maximum_job_url = "https://jobs.tal.net/" + "a" * (
+        4096 - len("https://jobs.tal.net/")
+    )
+
+    assert SourceCaptureCreateRequest(
+        capture_id=capture_id,
+        job_url=maximum_origin,
+        approved_origins=[maximum_origin],
+        timeout_seconds=900,
+    ).approved_origins == [maximum_origin]
+    assert SourceCaptureCreateRequest(
+        capture_id=capture_id,
+        job_url=maximum_job_url,
+        approved_origins=["https://jobs.tal.net"],
+        timeout_seconds=900,
+    ).job_url == maximum_job_url
+
+    with pytest.raises(ValidationError):
+        SourceCaptureCreateRequest(
+            capture_id=capture_id,
+            job_url=maximum_origin + "a",
+            approved_origins=[maximum_origin + "a"],
+            timeout_seconds=900,
+        )
+    with pytest.raises(ValidationError):
+        SourceCaptureCreateRequest(
+            capture_id=capture_id,
+            job_url=maximum_job_url + "a",
+            approved_origins=["https://jobs.tal.net"],
+            timeout_seconds=900,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+            "job_url": "http://jobs.tal.net/application",
+            "approved_origins": ["http://jobs.tal.net"],
+            "timeout_seconds": 900,
+        },
+        {
+            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+            "job_url": "https://jobs.tal.net./application",
+            "approved_origins": ["https://jobs.tal.net"],
+            "timeout_seconds": 900,
+        },
+        {
+            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+            "job_url": "https://jobs.tal.net/application",
+            "approved_origins": ["https://login.tal.net"],
+            "timeout_seconds": 900,
+        },
+        {
+            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+            "job_url": "https://jobs.tal.net/application",
+            "approved_origins": ["https://jobs.tal.net"],
+            "timeout_seconds": 901,
+        },
+        {
+            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+            "job_url": "https://jobs.tal.net/application",
+            "approved_origins": ["https://jobs.tal.net"],
+            "timeout_seconds": 900,
+            "extra": "rejected",
+        },
+    ],
+)
+async def test_source_capture_create_rejects_any_boundary_broader_than_one_exact_https_origin(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+    payload: dict[str, Any],
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        "/v1/source-captures",
+        headers=AUTHORIZATION,
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.source_capture_calls == []
 
 
 async def test_multipart_preserves_repeated_domains_files_and_bodies(

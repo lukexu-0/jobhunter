@@ -301,6 +301,8 @@ class FakePlaywrightRuntime:
     error: PlaywrightCliRuntimeError | None = None
     suspend_navigation_guard_error: PlaywrightCliRuntimeError | None = None
     start_error: PlaywrightCliRuntimeError | None = None
+    start_blocker: asyncio.Event | None = None
+    start_started: asyncio.Event = field(default_factory=asyncio.Event)
     private_sign_in_error: PlaywrightCliRuntimeError | None = None
     activate_private_values_error: PlaywrightCliRuntimeError | None = None
     capture_suppression_error: PlaywrightCliRuntimeError | None = None
@@ -323,6 +325,14 @@ class FakePlaywrightRuntime:
     activated_private_values: list[tuple[str, ...]] = field(default_factory=list)
     sign_in_calls: list[dict[str, str]] = field(default_factory=list)
     capture_suppression_calls: int = 0
+    source_snapshot_result: Any = (
+        "https://jobs.example/openings/42?verified=true",
+        "Verified role\nEmployer details",
+    )
+    source_snapshot_error: Exception | None = None
+    source_snapshot_blocker: asyncio.Event | None = None
+    source_snapshot_started: asyncio.Event = field(default_factory=asyncio.Event)
+    source_snapshot_calls: list[str] = field(default_factory=list)
     video_recording: bool = False
 
     async def start(self, job_url: str) -> None:
@@ -331,6 +341,9 @@ class FakePlaywrightRuntime:
         self.current_url = job_url
         self.runtime_started = True
         self.video_recording = True
+        self.start_started.set()
+        if self.start_blocker is not None:
+            await self.start_blocker.wait()
         if self.start_error is not None:
             raise self.start_error
 
@@ -356,6 +369,18 @@ class FakePlaywrightRuntime:
 
     async def get_current_page_url(self) -> str:
         return self.current_url
+
+    async def capture_source_snapshot(
+        self,
+        expected_origin: str,
+    ) -> tuple[str, str] | None:
+        self.source_snapshot_calls.append(expected_origin)
+        self.source_snapshot_started.set()
+        if self.source_snapshot_blocker is not None:
+            await self.source_snapshot_blocker.wait()
+        if self.source_snapshot_error is not None:
+            raise self.source_snapshot_error
+        return self.source_snapshot_result
 
     async def set_approved_origins(self, origins: Sequence[str]) -> None:
         self.approved_origins = tuple(origins)
@@ -466,6 +491,7 @@ class Fakes:
         ready_error: PipelineApplicationAgentError | None = None,
         check_blocker: asyncio.Event | None = None,
         runtime_start_error: PlaywrightCliRuntimeError | None = None,
+        runtime_start_blocker: asyncio.Event | None = None,
         runtime_close_failures: int = 0,
         runtime_close_cancels_active: bool = True,
         runtime_close_blocker: asyncio.Event | None = None,
@@ -480,6 +506,7 @@ class Fakes:
         self.ready_error = ready_error
         self.check_blocker = check_blocker
         self.runtime_start_error = runtime_start_error
+        self.runtime_start_blocker = runtime_start_blocker
         self.runtime_close_failures = runtime_close_failures
         self.runtime_close_cancels_active = runtime_close_cancels_active
         self.runtime_close_blocker = runtime_close_blocker
@@ -517,6 +544,7 @@ class Fakes:
             order=self.order,
             start_error=self.runtime_start_error,
             close_cancels_active=self.runtime_close_cancels_active,
+            start_blocker=self.runtime_start_blocker,
             close_failures=self.runtime_close_failures,
             close_blocker=self.runtime_close_blocker,
         )
@@ -685,6 +713,558 @@ async def create_valid(
         resume_source=resume_source,
         context=[],
         anecdotes=[],
+    )
+
+
+CAPTURE_ID = UUID("c7c4ee5d-c679-4548-b74c-f106227c84c8")
+
+
+async def create_source_capture(
+    manager: ApplicationSessionManager,
+    *,
+    capture_id: UUID = CAPTURE_ID,
+):
+    return await manager.create_source_capture(
+        capture_id=capture_id,
+        job_url=JOB_URL,
+        approved_origins=["https://jobs.example"],
+        timeout_seconds=900,
+    )
+
+
+async def test_source_capture_and_application_session_share_one_browser_slot(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    capture = await create_source_capture(manager)
+
+    assert capture.capture_id == CAPTURE_ID
+    assert capture.state == "awaiting_human_verification"
+    assert len(fakes.runtimes) == 1
+    runtime = fakes.runtimes[0]
+    assert runtime.job_url == JOB_URL
+    assert runtime.approved_origins == ("https://jobs.example",)
+    assert runtime.capture_suppression_calls == 1
+    with pytest.raises(HarnessServiceError) as application_conflict:
+        await create_valid(manager)
+    assert_service_error(
+        application_conflict.value,
+        409,
+        "session_active",
+        "An application session is already active",
+    )
+
+    await manager.delete_source_capture(CAPTURE_ID)
+    application = await create_valid(manager)
+    with pytest.raises(HarnessServiceError) as capture_conflict:
+        await create_source_capture(
+            manager,
+            capture_id=UUID("6439c0eb-a398-49b0-a453-b0fb030203ed"),
+        )
+    assert_service_error(
+        capture_conflict.value,
+        409,
+        "source_capture_active",
+        "A source capture is already active",
+    )
+    await manager.delete(application.session_id)
+
+
+async def test_source_capture_completion_returns_only_bounded_snapshot_and_releases_slot(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+
+    result = await manager.complete_source_capture(CAPTURE_ID)
+
+    assert result.model_dump() == {
+        "capture_id": CAPTURE_ID,
+        "final_url": "https://jobs.example/openings/42?verified=true",
+        "source": "Verified role\nEmployer details",
+    }
+    assert runtime.source_snapshot_calls == ["https://jobs.example"]
+    assert runtime.commands == []
+    assert runtime.closed is True
+    assert runtime.capture_suppression_calls == 1
+    duplicate_complete = await manager.complete_source_capture(CAPTURE_ID)
+    assert duplicate_complete == result
+    await manager.delete_source_capture(CAPTURE_ID)
+    assert manager._source_capture_replay is None
+    await manager.delete_source_capture(CAPTURE_ID)
+    with pytest.raises(HarnessServiceError) as unknown_cancel:
+        await manager.delete_source_capture(
+            UUID("bd9acf9d-2c48-46db-80dd-f1abf594ce81")
+        )
+    assert_service_error(
+        unknown_cancel.value,
+        404,
+        "source_capture_not_found",
+        "Source capture was not found",
+    )
+    replacement = await create_valid(manager)
+    await manager.delete(replacement.session_id)
+
+
+async def test_source_capture_completion_replays_after_requester_loses_response(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    release_snapshot = asyncio.Event()
+    runtime.source_snapshot_blocker = release_snapshot
+
+    request = asyncio.create_task(
+        manager.complete_source_capture(CAPTURE_ID)
+    )
+    await runtime.source_snapshot_started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    release_snapshot.set()
+    await wait_until(lambda: manager._source_capture is None)
+
+    replayed = await manager.complete_source_capture(CAPTURE_ID)
+    assert replayed.model_dump() == {
+        "capture_id": CAPTURE_ID,
+        "final_url": "https://jobs.example/openings/42?verified=true",
+        "source": "Verified role\nEmployer details",
+    }
+    await manager.delete_source_capture(CAPTURE_ID)
+
+
+async def test_source_capture_completion_replay_expires_at_original_deadline(
+    tmp_path: Path,
+) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    completed = await create_source_capture(manager)
+    result = await manager.complete_source_capture(completed.capture_id)
+
+    assert await manager.complete_source_capture(completed.capture_id) == result
+    replay = manager._source_capture_replay
+    assert replay is not None
+    replay.deadline_monotonic = asyncio.get_running_loop().time()
+
+    with pytest.raises(HarnessServiceError) as expired:
+        await manager.complete_source_capture(completed.capture_id)
+    assert_service_error(
+        expired.value,
+        409,
+        "source_capture_not_ready",
+        "Source capture is not ready",
+    )
+    assert manager._source_capture_replay is None
+
+
+async def test_source_capture_result_expires_while_cleanup_is_blocked(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    release_cleanup = asyncio.Event()
+    runtime.close_blocker = release_cleanup
+    record = manager._source_capture
+    assert record is not None
+    record.deadline_monotonic = asyncio.get_running_loop().time() + 0.2
+
+    completion = asyncio.create_task(
+        manager.complete_source_capture(CAPTURE_ID)
+    )
+    await runtime.close_started.wait()
+
+    assert record.completed_result is not None
+    await wait_until(lambda: record.completed_result is None)
+    assert manager._source_capture_replay is None
+
+    release_cleanup.set()
+    with pytest.raises(HarnessServiceError) as expired:
+        await completion
+    assert_service_error(
+        expired.value,
+        409,
+        "source_capture_not_ready",
+        "Source capture is not ready",
+    )
+    assert manager._source_capture_replay is None
+
+
+async def test_concurrent_source_capture_completion_joins_one_snapshot(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    release_snapshot = asyncio.Event()
+    runtime.source_snapshot_blocker = release_snapshot
+
+    first = asyncio.create_task(manager.complete_source_capture(CAPTURE_ID))
+    await runtime.source_snapshot_started.wait()
+    second = asyncio.create_task(manager.complete_source_capture(CAPTURE_ID))
+    await asyncio.sleep(0)
+    release_snapshot.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result == second_result
+    assert runtime.source_snapshot_calls == [
+        "https://jobs.example",
+    ]
+    assert runtime.closed is True
+    await manager.delete_source_capture(CAPTURE_ID)
+
+
+async def test_source_capture_completion_rejects_wrong_origin_without_closing_manual_browser(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    runtime.source_snapshot_result = None
+
+    with pytest.raises(HarnessServiceError) as not_ready:
+        await manager.complete_source_capture(CAPTURE_ID)
+    assert_service_error(
+        not_ready.value,
+        409,
+        "source_capture_not_ready",
+        "Source capture is not ready",
+    )
+    assert runtime.closed is False
+
+    runtime.source_snapshot_result = (
+        "https://jobs.example/openings/42?verified=true",
+        "Verified role\nEmployer details",
+    )
+    completed = await manager.complete_source_capture(CAPTURE_ID)
+    assert completed.capture_id == CAPTURE_ID
+    assert runtime.closed is True
+    await manager.delete_source_capture(CAPTURE_ID)
+
+
+async def test_source_capture_create_is_idempotent_only_for_the_same_live_request(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    first = await create_source_capture(manager)
+    replay = await create_source_capture(manager)
+
+    assert replay == first
+    assert len(fakes.runtimes) == 1
+    with pytest.raises(HarnessServiceError) as changed_payload:
+        await manager.create_source_capture(
+            capture_id=CAPTURE_ID,
+            job_url=f"{JOB_URL}&other=true",
+            approved_origins=["https://jobs.example"],
+            timeout_seconds=900,
+        )
+    assert_service_error(
+        changed_payload.value,
+        409,
+        "source_capture_active",
+        "A source capture is already active",
+    )
+    with pytest.raises(HarnessServiceError) as other_id:
+        await create_source_capture(
+            manager,
+            capture_id=UUID("4a1fb91d-1dce-4f6a-ac44-62e47d578011"),
+        )
+    assert_service_error(
+        other_id.value,
+        409,
+        "source_capture_active",
+        "A source capture is already active",
+    )
+    await manager.delete_source_capture(CAPTURE_ID)
+
+
+async def test_source_capture_start_failure_cleans_and_reclaims_browser_slot(
+    tmp_path: Path,
+) -> None:
+    fakes = Fakes(
+        runtime_start_error=PlaywrightCliRuntimeError("browser_failed"),
+    )
+    manager, _, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=fakes,
+    )
+
+    with pytest.raises(HarnessServiceError) as unavailable:
+        await create_source_capture(manager)
+    assert_service_error(
+        unavailable.value,
+        503,
+        "unavailable",
+        "Source capture is unavailable",
+    )
+    assert fakes.runtimes[0].closed is True
+
+    fakes.runtime_start_error = None
+    replacement_id = UUID("08004103-8944-44a5-931b-94251c514f54")
+    replacement = await create_source_capture(
+        manager,
+        capture_id=replacement_id,
+    )
+    assert replacement.capture_id == replacement_id
+    await manager.delete_source_capture(replacement_id)
+
+async def test_source_capture_live_replay_joins_blocked_setup_failure(
+    tmp_path: Path,
+) -> None:
+    release_start = asyncio.Event()
+    fakes = Fakes(
+        runtime_start_error=PlaywrightCliRuntimeError("browser_failed"),
+        runtime_start_blocker=release_start,
+    )
+    manager, _, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=fakes,
+    )
+    first = asyncio.create_task(create_source_capture(manager))
+    await wait_until(lambda: len(fakes.runtimes) == 1)
+    await fakes.runtimes[0].start_started.wait()
+    replay = asyncio.create_task(create_source_capture(manager))
+    await asyncio.sleep(0)
+
+    assert first.done() is False
+    assert replay.done() is False
+    assert len(fakes.runtimes) == 1
+
+    release_start.set()
+    outcomes = await asyncio.gather(first, replay, return_exceptions=True)
+    for outcome in outcomes:
+        assert isinstance(outcome, HarnessServiceError)
+        assert_service_error(
+            outcome,
+            503,
+            "unavailable",
+            "Source capture is unavailable",
+        )
+    assert fakes.runtimes[0].closed is True
+
+
+async def test_source_capture_malformed_runtime_result_fails_closed(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    runtime.source_snapshot_result = ("https://jobs.example/openings/42",)
+
+    with pytest.raises(HarnessServiceError) as unavailable:
+        await manager.complete_source_capture(CAPTURE_ID)
+
+    assert_service_error(
+        unavailable.value,
+        503,
+        "unavailable",
+        "Source capture is unavailable",
+    )
+    assert runtime.closed is True
+
+async def test_source_capture_failure_time_completion_joins_one_snapshot(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    runtime.source_snapshot_error = RuntimeError("private snapshot detail")
+    original_fail = manager._fail_source_capture_completion
+    failure_entered = asyncio.Event()
+    allow_failure = asyncio.Event()
+
+    async def blocked_failure(*args: Any, **kwargs: Any) -> Any:
+        failure_entered.set()
+        await allow_failure.wait()
+        return await original_fail(*args, **kwargs)
+
+    manager._fail_source_capture_completion = blocked_failure  # type: ignore[method-assign]
+    first = asyncio.create_task(
+        manager.complete_source_capture(CAPTURE_ID)
+    )
+    await failure_entered.wait()
+    second = asyncio.create_task(
+        manager.complete_source_capture(CAPTURE_ID)
+    )
+    await asyncio.sleep(0)
+
+    assert runtime.source_snapshot_calls == ["https://jobs.example"]
+    allow_failure.set()
+    outcomes = await asyncio.gather(first, second, return_exceptions=True)
+    for outcome in outcomes:
+        assert isinstance(outcome, HarnessServiceError)
+        assert_service_error(
+            outcome,
+            503,
+            "unavailable",
+            "Source capture is unavailable",
+        )
+    assert runtime.closed is True
+
+
+async def test_source_capture_delete_wins_post_snapshot_completion_contention(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    original_finish = manager._finish_source_capture_completion
+    finish_entered = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def blocked_finish(*args: Any, **kwargs: Any) -> Any:
+        finish_entered.set()
+        await allow_finish.wait()
+        return await original_finish(*args, **kwargs)
+
+    manager._finish_source_capture_completion = blocked_finish  # type: ignore[method-assign]
+    completion = asyncio.create_task(
+        manager.complete_source_capture(CAPTURE_ID)
+    )
+    await finish_entered.wait()
+    deletion = asyncio.create_task(manager.delete_source_capture(CAPTURE_ID))
+    await asyncio.sleep(0)
+    allow_finish.set()
+
+    with pytest.raises(HarnessServiceError) as not_ready:
+        await completion
+    assert_service_error(
+        not_ready.value,
+        409,
+        "source_capture_not_ready",
+        "Source capture is not ready",
+    )
+    await deletion
+    assert fakes.runtimes[0].closed is True
+    assert manager._source_capture_tombstones[CAPTURE_ID].state == "cancelled"
+
+
+async def test_source_capture_completion_crossing_deadline_expires(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    release_snapshot = asyncio.Event()
+    runtime.source_snapshot_blocker = release_snapshot
+    completion = asyncio.create_task(
+        manager.complete_source_capture(CAPTURE_ID)
+    )
+    await runtime.source_snapshot_started.wait()
+    record = manager._source_capture
+    assert record is not None
+    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
+    release_snapshot.set()
+
+    with pytest.raises(HarnessServiceError) as expired:
+        await completion
+    assert_service_error(
+        expired.value,
+        409,
+        "source_capture_not_ready",
+        "Source capture is not ready",
+    )
+    assert runtime.closed is True
+    assert manager._source_capture_tombstones[CAPTURE_ID].state == "expired"
+
+
+async def test_source_snapshot_failure_closes_runtime_and_returns_fixed_unavailable(
+    tmp_path: Path,
+) -> None:
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    runtime = fakes.runtimes[0]
+    runtime.source_snapshot_error = RuntimeError("private snapshot detail")
+
+    with pytest.raises(HarnessServiceError) as unavailable:
+        await manager.complete_source_capture(CAPTURE_ID)
+
+    assert_service_error(
+        unavailable.value,
+        503,
+        "unavailable",
+        "Source capture is unavailable",
+    )
+    assert runtime.closed is True
+    replacement = await create_valid(manager)
+    await manager.delete(replacement.session_id)
+
+
+async def test_source_capture_cleanup_retries_before_releasing_browser_slot(
+    tmp_path: Path,
+) -> None:
+    fakes = Fakes(runtime_close_failures=1)
+    manager, _, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=fakes,
+    )
+    await create_source_capture(manager)
+
+    await manager.delete_source_capture(CAPTURE_ID)
+
+    assert fakes.order.count("runtime.close") == 2
+    replacement = await create_valid(manager)
+    await manager.delete(replacement.session_id)
+
+
+
+
+async def test_source_capture_expiry_and_shutdown_close_runtime_before_releasing_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_sleep = asyncio.sleep
+    expiration_sleep_started = asyncio.Event()
+    release_expiration = asyncio.Event()
+
+    async def controlled_sleep(delay: float) -> None:
+        if delay > 800:
+            expiration_sleep_started.set()
+            await release_expiration.wait()
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr(sessions_module.asyncio, "sleep", controlled_sleep)
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    await create_source_capture(manager)
+    record = manager._source_capture
+    assert record is not None
+    await expiration_sleep_started.wait()
+
+    release_expiration.set()
+    await record.closed_event.wait()
+
+    assert fakes.runtimes[0].closed is True
+    with pytest.raises(HarnessServiceError) as expired:
+        await manager.complete_source_capture(CAPTURE_ID)
+    assert_service_error(
+        expired.value,
+        409,
+        "source_capture_not_ready",
+        "Source capture is not ready",
+    )
+
+    release_expiration.clear()
+    expiration_sleep_started.clear()
+
+    shutdown_id = UUID("fd399415-a97a-474c-a8ab-c5e9a4635256")
+    await create_source_capture(manager, capture_id=shutdown_id)
+    await manager.shutdown()
+    assert fakes.runtimes[-1].closed is True
+    with pytest.raises(HarnessServiceError) as shutdown_rejects_create:
+        await create_source_capture(
+            manager,
+            capture_id=UUID("44867e58-64f7-40d1-b897-ac55f5adfb7d"),
+        )
+    assert_service_error(
+        shutdown_rejects_create.value,
+        503,
+        "unavailable",
+        "Source capture is unavailable",
     )
 
 

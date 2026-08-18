@@ -24,6 +24,9 @@ from .models import (
     RuntimeActionResponse,
     SessionCreateResponse,
     SessionSnapshot,
+    SourceCaptureCreateRequest,
+    SourceCaptureCreateResponse,
+    SourceCaptureResult,
 )
 
 
@@ -45,6 +48,22 @@ class HarnessSessionService(Protocol):
         context: Sequence[UploadFile],
         anecdotes: Sequence[UploadFile],
     ) -> SessionCreateResponse: ...
+
+    async def create_source_capture(
+        self,
+        *,
+        capture_id: UUID,
+        job_url: str,
+        approved_origins: Sequence[str],
+        timeout_seconds: int,
+    ) -> SourceCaptureCreateResponse: ...
+
+    async def complete_source_capture(
+        self,
+        capture_id: UUID,
+    ) -> SourceCaptureResult: ...
+
+    async def delete_source_capture(self, capture_id: UUID) -> None: ...
 
     def get_snapshot(self, session_id: UUID) -> SessionSnapshot: ...
 
@@ -81,6 +100,27 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
         content={"code": code, "message": message},
         headers={"cache-control": "no-store"},
     )
+
+async def _require_bodyless_request(request: Request) -> None:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = -1
+        if declared_length != 0:
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            )
+    async for chunk in request.stream():
+        if chunk:
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            )
 
 
 def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> FastAPI:
@@ -172,6 +212,53 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
             context=context_files,
             anecdotes=anecdote_files,
         )
+
+    @app.post(
+        "/v1/source-captures",
+        status_code=202,
+        response_model=SourceCaptureCreateResponse,
+    )
+    async def create_source_capture(
+        body: SourceCaptureCreateRequest,
+    ) -> SourceCaptureCreateResponse:
+        return await dependencies.sessions.create_source_capture(
+            capture_id=body.capture_id,
+            job_url=body.job_url,
+            approved_origins=body.approved_origins,
+            timeout_seconds=body.timeout_seconds,
+        )
+
+    @app.post(
+        "/v1/source-captures/{capture_id}/complete",
+        response_model=SourceCaptureResult,
+    )
+    async def complete_source_capture(
+        capture_id: UUID,
+        request: Request,
+    ) -> SourceCaptureResult:
+        if request.query_params:
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            )
+        await _require_bodyless_request(request)
+        return await dependencies.sessions.complete_source_capture(capture_id)
+
+    @app.delete("/v1/source-captures/{capture_id}", status_code=204)
+    async def delete_source_capture(
+        capture_id: UUID,
+        request: Request,
+    ) -> Response:
+        if request.query_params:
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            )
+        await _require_bodyless_request(request)
+        await dependencies.sessions.delete_source_capture(capture_id)
+        return Response(status_code=204, headers={"cache-control": "no-store"})
 
     @app.get("/v1/sessions/{session_id}", response_model=SessionSnapshot)
     async def get_session(session_id: UUID) -> SessionSnapshot:

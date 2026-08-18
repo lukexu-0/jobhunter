@@ -187,6 +187,18 @@ def _create_session_directory(root: Path, session_id: UUID | str) -> tuple[int, 
         os.close(root_descriptor)
 
 
+def create_session_artifact_directory(
+    root: Path,
+    session_id: UUID | str,
+) -> Path:
+    """Create one private UUID-named browser runtime artifact directory."""
+
+    retry_pending_cleanup()
+    descriptor, path = _create_session_directory(root, session_id)
+    os.close(descriptor)
+    return path
+
+
 def _remove_contents(directory_descriptor: int) -> None:
     with os.scandir(directory_descriptor) as entries:
         names = tuple(entry.name for entry in entries)
@@ -663,6 +675,7 @@ __all__ = [
     "PersonalInformation",
     "StoredCandidateArtifacts",
     "StoredUpload",
+    "create_session_artifact_directory",
     "cleanup_orphaned_session_artifacts",
     "cleanup_session_artifacts",
     "remove_session_artifacts",
