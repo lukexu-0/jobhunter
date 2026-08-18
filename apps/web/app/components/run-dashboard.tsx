@@ -163,23 +163,11 @@ function sourceVerificationMessage(error: unknown, fallback: string): string {
     error instanceof PipelineClientError
     && error.code === "SOURCE_HANDOFF_NOT_FOUND"
   ) {
-    return "This verification session is no longer available. It may have expired. Cancel verification, then open a new browser session.";
+    return "This verification session is no longer available. Cancel verification, then open a new browser session.";
   }
   return publicMessage(error, fallback);
 }
 
-function sourceHandoffExpiry(timestamp: number): {
-  readonly dateTime: string;
-  readonly label: string;
-} | null {
-  const date = new Date(timestamp);
-  if (!Number.isFinite(date.getTime())) return null;
-  const dateTime = date.toISOString();
-  return {
-    dateTime,
-    label: dateTime.replace("T", " ").replace(/\.\d{3}Z$/u, " UTC"),
-  };
-}
 
 function parseCreateRunRequests(
   value: string,
@@ -1153,9 +1141,6 @@ export function RunDashboard() {
   const normalizedEditValue = editValue.trim();
   const isEditValueValid = normalizedEditValue.length >= 1 && normalizedEditValue.length <= 200;
   const isDialogBusy = Boolean(activeDialog && busyRunIds.has(activeDialog.runId));
-  const sourceVerificationExpiry = sourceVerification?.phase === "awaiting"
-    ? sourceHandoffExpiry(sourceVerification.handoff.expiresAt)
-    : null;
 
   return (
     <main className="workspace">
@@ -1404,15 +1389,6 @@ export function RunDashboard() {
                   A trusted local browser window is open. Complete the site&apos;s verification there,
                   then return here and confirm below.
                 </p>
-                {sourceVerificationExpiry ? (
-                  <p className="run-initializer__verification-expiry">
-                    The browser session expires at{" "}
-                    <time dateTime={sourceVerificationExpiry.dateTime}>
-                      {sourceVerificationExpiry.label}
-                    </time>
-                    . Completion is never detected automatically.
-                  </p>
-                ) : null}
                 <div className="run-initializer__verification-actions">
                   <button
                     ref={sourceVerificationCompleteRef}

@@ -1,3 +1,4 @@
+import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 import { parseBaselineResume, readBracedArgument } from "./parser.ts";
 import { RepairResultSchema, type RepairResult, type ResumeSection } from "./types.ts";
 import { ResumeValidationError } from "./render.ts";
@@ -105,7 +106,7 @@ function validateMacroArguments(body: string): void {
 }
 
 export function validateRepairCandidate(proposedTex: string, canonicalBaseline: string): RepairValidation {
-  if (Buffer.byteLength(proposedTex) > 256 * 1024) throw new ResumeValidationError("repair candidate exceeds 256 KiB");
+  if (Buffer.byteLength(proposedTex) > ARTIFACT_LIMITS.tex) throw new ResumeValidationError(`repair candidate exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
   parseBaselineResume(canonicalBaseline);
   const baseline = splitBodies(canonicalBaseline);
   const proposed = splitBodies(proposedTex);

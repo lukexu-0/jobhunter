@@ -61,9 +61,9 @@ _MAX_DOM_CAPTURE_CHARS = (
 # 101 records * (49,152 URL bytes + 7 * 8,192 title scalars) stays below
 # 16 MiB with the result envelope and two JSON serialization layers.
 _MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
-_MAX_OUTPUT_DIRECTORY_BYTES = 128 * 1024 * 1024
-_MAX_TEMPORARY_DIRECTORY_BYTES = 128 * 1024 * 1024
-_MAX_VIDEO_BYTES = 512 * 1024 * 1024
+_MAX_OUTPUT_DIRECTORY_BYTES = 1_073_741_824
+_MAX_TEMPORARY_DIRECTORY_BYTES = 1_073_741_824
+_MAX_VIDEO_BYTES = 2_147_483_648
 _MAX_SOURCE_CAPTURE_BYTES = SOURCE_CAPTURE_MAX_BYTES
 _MAX_SOURCE_CAPTURE_LINES = SOURCE_CAPTURE_MAX_LINES
 _MAX_SOURCE_CAPTURE_VISITED_NODES = 100_000
@@ -71,13 +71,10 @@ _MAX_SOURCE_CAPTURE_TRAVERSAL_BYTES = (
     _MAX_SOURCE_CAPTURE_BYTES + _MAX_PRIVATE_REDACTION_FRAGMENT_CHARS
 )
 _ARTIFACT_BUDGET_POLL_SECONDS = 0.25
-_EXECUTION_TIMEOUT_SECONDS = 120.0
-_LIFECYCLE_TIMEOUT_SECONDS = 120.0
 _BUDGET_CLEANUP_TIMEOUT_SECONDS = 1.0
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 _RECOVERY_TIMEOUT_SECONDS = 10.0
 _RECOVERY_TERMINATE_GRACE_SECONDS = 20.0
-_NATIVE_BROWSER_DISCOVERY_TIMEOUT_SECONDS = 5.0
 _PROCESS_TERMINATE_GRACE_SECONDS = 2.0
 _SAFE_INTERNAL_SCHEMES = frozenset({"about"})
 _ELEMENT_REF_PATTERN = re.compile(
@@ -286,7 +283,7 @@ class PlaywrightCliRuntimeError(RuntimeError):
 
     __slots__ = ("code",)
 
-    def __init__(self, code: Literal["browser_failed", "session_timeout"]) -> None:
+    def __init__(self, code: Literal["browser_failed"]) -> None:
         super().__init__(code)
         self.code = code
 
@@ -341,11 +338,11 @@ class _NativeBrowserOwnership:
 @dataclass(frozen=True, slots=True)
 class _InvocationResult:
     exit_code: int
-    timed_out: bool
     stdout: bytes
     stderr: bytes
     stdout_truncated: bool
     stderr_truncated: bool
+    timed_out: bool = False
 
 
 @dataclass(slots=True)
@@ -1542,19 +1539,12 @@ class PlaywrightCliRuntime:
         session_id: UUID,
         launch: ResolvedBrowserLaunch,
         session_directory: Path,
-        deadline: float,
         node_executable: Path | None = None,
         cli_script: Path | None = None,
         process_factory: ProcessFactory | None = None,
-        monotonic: Callable[[], float] = time.monotonic,
-        execution_timeout: float = _EXECUTION_TIMEOUT_SECONDS,
     ) -> None:
         if not isinstance(session_id, UUID):
             raise BrowserConfigurationError("The Playwright CLI session is invalid")
-        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
-            raise BrowserConfigurationError("The Playwright CLI deadline is invalid")
-        if execution_timeout <= 0:
-            raise BrowserConfigurationError("The Playwright CLI timeout is invalid")
 
         try:
             root = session_directory.expanduser().resolve(strict=True)
@@ -1590,9 +1580,6 @@ class PlaywrightCliRuntime:
         self._home_directory = _prepare_private_directory(self._scope_directory / "home")
         self._node_executable = _resolve_node_executable(node_executable)
         self._cli_script = _resolve_cli_script(cli_script)
-        self._deadline = float(deadline)
-        self._monotonic = monotonic
-        self._execution_timeout = float(execution_timeout)
         self._process_factory = process_factory or _default_process_factory
         self._operation_lock = asyncio.Lock()
         self._opened = False
@@ -1678,10 +1665,7 @@ class PlaywrightCliRuntime:
         self._screenshots_suppressed = True
         if self._video_started:
             try:
-                stopped = await self._invoke(
-                    "video-stop",
-                    timeout=_LIFECYCLE_TIMEOUT_SECONDS,
-                )
+                stopped = await self._invoke("video-stop")
                 self._require_success(stopped)
             except PlaywrightCliRuntimeError:
                 try:
@@ -1704,24 +1688,14 @@ class PlaywrightCliRuntime:
     ) -> None:
         async with self._operation_lock:
             await self._suppress_private_capture_unlocked()
-            remaining = self._remaining()
-            aggregate_timeout = self._execution_timeout * 5
-            session_bound = remaining <= aggregate_timeout
-            try:
-                async with asyncio.timeout(min(remaining, aggregate_timeout)):
-                    await self._sign_in_unlocked(
-                        expected_origin=expected_origin,
-                        username_ref=username_ref,
-                        password_ref=password_ref,
-                        submit_ref=submit_ref,
-                        username=username,
-                        password=password,
-                    )
-            except TimeoutError:
-                code: Literal["browser_failed", "session_timeout"] = (
-                    "session_timeout" if session_bound else "browser_failed"
-                )
-                raise PlaywrightCliRuntimeError(code) from None
+            await self._sign_in_unlocked(
+                expected_origin=expected_origin,
+                username_ref=username_ref,
+                password_ref=password_ref,
+                submit_ref=submit_ref,
+                username=username,
+                password=password,
+            )
 
     async def _sign_in_unlocked(
         self,
@@ -1780,7 +1754,6 @@ class PlaywrightCliRuntime:
         result = await self._invoke_private_script_unlocked(
             script,
             label="sign-in",
-            timeout=self._execution_timeout,
         )
         self._snapshot_from_execution(result, remove_file=True)
         self._require_success(result)
@@ -1834,7 +1807,6 @@ class PlaywrightCliRuntime:
             browser.update(
                 {
                     "cdpEndpoint": self._launch.cdp_url,
-                    "cdpTimeout": 30_000,
                 }
             )
         else:
@@ -1857,10 +1829,6 @@ class PlaywrightCliRuntime:
             "browser": browser,
             "outputDir": str(self._output_directory),
             "outputMode": "stdout",
-            "timeouts": {
-                "action": int(_EXECUTION_TIMEOUT_SECONDS * 1_000),
-                "navigation": int(_EXECUTION_TIMEOUT_SECONDS * 1_000),
-            },
             "allowUnrestrictedFileAccess": False,
             "codegen": "none",
             "snapshot": {"mode": "none"},
@@ -1917,12 +1885,6 @@ class PlaywrightCliRuntime:
             values.append(str(self._launch.user_data_dir))
         return tuple(sorted(set(values), key=len, reverse=True))
 
-    def _remaining(self) -> float:
-        return self._deadline - self._monotonic()
-
-    def _raise_if_expired(self) -> None:
-        if self._remaining() <= 0:
-            raise PlaywrightCliRuntimeError("session_timeout")
 
     def _argv(self, command: str, args: Sequence[str]) -> list[str]:
         return [
@@ -2019,15 +1981,9 @@ class PlaywrightCliRuntime:
         command: str,
         args: Sequence[str] = (),
         *,
-        timeout: float,
+        timeout: float | None = None,
         capture_limit: int = _MAX_CAPTURE_BYTES,
-        enforce_deadline: bool = True,
     ) -> _InvocationResult:
-        remaining = self._remaining()
-        if enforce_deadline and remaining <= 0:
-            raise PlaywrightCliRuntimeError("session_timeout")
-        actual_timeout = min(timeout, remaining) if enforce_deadline else timeout
-        session_bound = enforce_deadline and remaining < timeout
         process = await self._spawn(self._argv(command, args))
         self._active_process = process
         stdout_capture = _BoundedCapture(capture_limit, bytearray())
@@ -2041,10 +1997,11 @@ class PlaywrightCliRuntime:
         wait_task = asyncio.create_task(process.wait())
         timed_out = False
         try:
-            await asyncio.wait_for(
-                asyncio.gather(wait_task, stdout_task, stderr_task),
-                timeout=actual_timeout,
-            )
+            invocation = asyncio.gather(wait_task, stdout_task, stderr_task)
+            if timeout is None:
+                await invocation
+            else:
+                await asyncio.wait_for(invocation, timeout=timeout)
         except TimeoutError:
             timed_out = True
             await self._stop_failed_invocation(
@@ -2073,8 +2030,6 @@ class PlaywrightCliRuntime:
             if self._active_process is process:
                 self._active_process = None
 
-        if timed_out and session_bound:
-            raise PlaywrightCliRuntimeError("session_timeout")
         exit_code = 124 if timed_out else process.returncode
         if not isinstance(exit_code, int):
             exit_code = -1
@@ -2109,24 +2064,18 @@ class PlaywrightCliRuntime:
         )
 
     def _require_success(self, result: _InvocationResult) -> None:
-        if (
-            result.timed_out
-            or result.exit_code != 0
-            or self._reported_cli_error(result)
-        ):
+        if result.exit_code != 0 or self._reported_cli_error(result):
             raise PlaywrightCliRuntimeError("browser_failed")
 
     def _report_guard_suspension_failure(
         self,
         *,
         error_category: Literal[
-            "timeout",
             "process_exit",
             "cli_error",
             "runtime_error",
         ],
         exit_code: int | None,
-        timed_out: bool,
         reported_cli_error: bool,
         stdout_truncated: bool,
         stderr_truncated: bool,
@@ -2140,7 +2089,6 @@ class PlaywrightCliRuntime:
                         "operation": "suspend_navigation_guard",
                         "errorCategory": error_category,
                         "exitCode": exit_code,
-                        "timedOut": timed_out,
                         "reportedCliError": reported_cli_error,
                         "stdoutTruncated": stdout_truncated,
                         "stderrTruncated": stderr_truncated,
@@ -2160,7 +2108,6 @@ class PlaywrightCliRuntime:
                 origin = _origin_for_url(validated_url)
             except (TypeError, ValueError):
                 raise PlaywrightCliRuntimeError("browser_failed") from None
-            self._raise_if_expired()
 
             open_args = ["about:blank", f"--config={self._config_path}"]
             if self._launch.cdp_url is None:
@@ -2169,9 +2116,7 @@ class PlaywrightCliRuntime:
             try:
                 self._open_attempted = True
                 self._write_ownership()
-                opened = await self._invoke(
-                    "open", open_args, timeout=_LIFECYCLE_TIMEOUT_SECONDS
-                )
+                opened = await self._invoke("open", open_args)
                 self._require_success(opened)
                 self._opened = True
                 self._daemon_process_id = self._daemon_pid(opened)
@@ -2181,7 +2126,6 @@ class PlaywrightCliRuntime:
                 video = await self._invoke(
                     "video-start",
                     [str(self._video_path)],
-                    timeout=_LIFECYCLE_TIMEOUT_SECONDS,
                 )
                 self._require_success(video)
                 self._video_started = True
@@ -2189,9 +2133,7 @@ class PlaywrightCliRuntime:
                     self._monitor_artifact_budget(),
                     name=f"playwright-video-budget-{self._session_id}",
                 )
-                navigated = await self._invoke(
-                    "goto", [validated_url], timeout=_LIFECYCLE_TIMEOUT_SECONDS
-                )
+                navigated = await self._invoke("goto", [validated_url])
                 self._require_success(navigated)
                 metadata = await self._metadata()
                 if not self._url_is_allowed(metadata.url, (origin,)):
@@ -2213,9 +2155,6 @@ class PlaywrightCliRuntime:
             or self._launch.user_data_dir is None
         ):
             raise PlaywrightCliRuntimeError("browser_failed")
-        discovery_deadline = (
-            time.monotonic() + _NATIVE_BROWSER_DISCOVERY_TIMEOUT_SECONDS
-        )
         while True:
             try:
                 pid, create_time, executable = _discover_owned_native_browser(
@@ -2225,8 +2164,6 @@ class PlaywrightCliRuntime:
                 )
                 break
             except BrowserConfigurationError:
-                if time.monotonic() >= discovery_deadline:
-                    raise PlaywrightCliRuntimeError("browser_failed") from None
                 await asyncio.sleep(0.05)
         self._native_browser_process_id = pid
         self._native_browser_create_time = create_time
@@ -2339,7 +2276,6 @@ class PlaywrightCliRuntime:
         script: str,
         *,
         label: Literal["sign-in", "restore"],
-        timeout: float,
     ) -> _InvocationResult:
         descriptor, payload_path = self._create_private_script_memfd(
             script,
@@ -2349,7 +2285,6 @@ class PlaywrightCliRuntime:
             return await self._invoke(
                 "run-code",
                 [f"--filename={payload_path}"],
-                timeout=timeout,
             )
         finally:
             cleanup_failed = False
@@ -2377,20 +2312,10 @@ class PlaywrightCliRuntime:
         args: Sequence[str] | None = None,
     ) -> PlaywrightCliExecutionResult:
         async with self._operation_lock:
-            remaining = self._remaining()
-            aggregate_timeout = self._execution_timeout * 3
-            session_bound = remaining <= aggregate_timeout
-            failure: PlaywrightCliRuntimeError
             try:
-                async with asyncio.timeout(min(remaining, aggregate_timeout)):
-                    return await self._execute_unlocked(command, args)
+                return await self._execute_unlocked(command, args)
             except _ActionRuntimeFailure as caught:
                 failure = caught.error
-            except TimeoutError:
-                code: Literal["browser_failed", "session_timeout"] = (
-                    "session_timeout" if session_bound else "browser_failed"
-                )
-                failure = PlaywrightCliRuntimeError(code)
             await self._invalidate_after_action_failure_unlocked()
             raise failure from None
 
@@ -2426,11 +2351,10 @@ class PlaywrightCliRuntime:
             execution = await self._invoke(
                 command,
                 normalized,
-                timeout=self._execution_timeout,
             )
         except PlaywrightCliRuntimeError as error:
             raise _ActionRuntimeFailure(error) from None
-        if execution.timed_out or execution.exit_code == 124:
+        if execution.timed_out:
             raise _ActionRuntimeFailure(
                 PlaywrightCliRuntimeError("browser_failed")
             )
@@ -2494,19 +2418,15 @@ class PlaywrightCliRuntime:
         ):
             await self._emergency_budget_cleanup_unlocked()
             raise PlaywrightCliRuntimeError("browser_failed")
-        return PlaywrightCliExecutionResult(
-            exit_code=exit_code,
-            timed_out=execution.timed_out,
-            stdout=stdout,
-            stderr=stderr,
-            stdout_truncated=(
-                execution.stdout_truncated or stdout_text_truncated
-            ),
-            stderr_truncated=(
-                execution.stderr_truncated or stderr_text_truncated
-            ),
-            observation=observation,
-        )
+        return PlaywrightCliExecutionResult(exit_code=exit_code, stdout=stdout,
+        stderr=stderr,
+        stdout_truncated=(
+            execution.stdout_truncated or stdout_text_truncated
+        ),
+        stderr_truncated=(
+            execution.stderr_truncated or stderr_text_truncated
+        ),
+        observation=observation,)
 
     async def get_current_page_url(self) -> str:
         async with self._operation_lock:
@@ -2672,7 +2592,6 @@ class PlaywrightCliRuntime:
             captured = await self._invoke(
                 "run-code",
                 [script],
-                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
                 capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
             )
             self._require_success(captured)
@@ -2724,26 +2643,22 @@ class PlaywrightCliRuntime:
                 result = await self._invoke(
                     "run-code",
                     [self._suspend_guard_script()],
-                    timeout=_LIFECYCLE_TIMEOUT_SECONDS,
                     capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
                 )
             except asyncio.CancelledError:
                 self._report_guard_suspension_failure(
                     error_category="runtime_error",
                     exit_code=None,
-                    timed_out=False,
                     reported_cli_error=False,
                     stdout_truncated=False,
                     stderr_truncated=False,
                 )
                 await self._recover_failed_guard_suspension_unlocked()
                 raise
-            except PlaywrightCliRuntimeError as error:
-                timed_out = error.code == "session_timeout"
+            except PlaywrightCliRuntimeError:
                 self._report_guard_suspension_failure(
-                    error_category="timeout" if timed_out else "runtime_error",
+                    error_category="runtime_error",
                     exit_code=None,
-                    timed_out=timed_out,
                     reported_cli_error=False,
                     stdout_truncated=False,
                     stderr_truncated=False,
@@ -2751,18 +2666,13 @@ class PlaywrightCliRuntime:
                 await self._recover_failed_guard_suspension_unlocked()
                 raise
             reported_cli_error = self._reported_cli_error(result)
-            if result.timed_out or result.exit_code != 0 or reported_cli_error:
+            if result.exit_code != 0 or reported_cli_error:
                 error_category = (
-                    "timeout"
-                    if result.timed_out
-                    else "process_exit"
-                    if result.exit_code != 0
-                    else "cli_error"
+                    "process_exit" if result.exit_code != 0 else "cli_error"
                 )
                 self._report_guard_suspension_failure(
                     error_category=error_category,
                     exit_code=result.exit_code,
-                    timed_out=result.timed_out,
                     reported_cli_error=reported_cli_error,
                     stdout_truncated=result.stdout_truncated,
                     stderr_truncated=result.stderr_truncated,
@@ -2926,7 +2836,6 @@ class PlaywrightCliRuntime:
                 stopped = await self._invoke(
                     "video-stop",
                     timeout=_BUDGET_CLEANUP_TIMEOUT_SECONDS,
-                    enforce_deadline=False,
                 )
                 self._require_success(stopped)
             except PlaywrightCliRuntimeError:
@@ -2938,7 +2847,6 @@ class PlaywrightCliRuntime:
                 closed = await self._invoke(
                     "close",
                     timeout=_BUDGET_CLEANUP_TIMEOUT_SECONDS,
-                    enforce_deadline=False,
                 )
                 await self._require_closed_session(closed)
                 close_confirmed = True
@@ -3052,7 +2960,6 @@ class PlaywrightCliRuntime:
                 stopped = await self._invoke(
                     "video-stop",
                     timeout=_CLEANUP_TIMEOUT_SECONDS,
-                    enforce_deadline=False,
                 )
                 self._require_success(stopped)
                 self._video_started = False
@@ -3063,7 +2970,6 @@ class PlaywrightCliRuntime:
             closed = await self._invoke(
                 "close",
                 timeout=_CLEANUP_TIMEOUT_SECONDS,
-                enforce_deadline=False,
             )
             await self._require_closed_session(closed)
             self._opened = False
@@ -3094,7 +3000,6 @@ class PlaywrightCliRuntime:
         result = await self._invoke(
             "run-code",
             [self._guard_script(origins)],
-            timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
         )
         self._require_success(result)
@@ -3366,7 +3271,6 @@ class PlaywrightCliRuntime:
             selected = await self._invoke(
                 "tab-select",
                 [str(allowed_index)],
-                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             )
             self._require_success(selected)
             return
@@ -3383,7 +3287,6 @@ class PlaywrightCliRuntime:
         selected = await self._invoke(
             "tab-select",
             [str(previous.current_index)],
-            timeout=_LIFECYCLE_TIMEOUT_SECONDS,
         )
         self._require_success(selected)
         if self._screenshots_suppressed:
@@ -3396,13 +3299,11 @@ class PlaywrightCliRuntime:
             restored = await self._invoke_private_script_unlocked(
                 restore_script,
                 label="restore",
-                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             )
         else:
             restored = await self._invoke(
                 "goto",
                 [previous.url],
-                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             )
         self._require_success(restored)
 
@@ -3436,7 +3337,6 @@ class PlaywrightCliRuntime:
         result = await self._invoke(
             "run-code",
             [script],
-            timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             capture_limit=_MAX_OBSERVATION_CAPTURE_BYTES,
         )
         self._require_success(result)
@@ -3553,11 +3453,8 @@ class PlaywrightCliRuntime:
                     None if self._screenshots_suppressed else screenshot_path
                 )
             ],
-            timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             capture_limit=_MAX_OBSERVATION_CAPTURE_BYTES,
         )
-        if observation_result.timed_out or observation_result.exit_code == 124:
-            raise PlaywrightCliRuntimeError("browser_failed")
         modal_state = self._blocked_by_modal_state(observation_result)
         if modal_state:
             if execution is None or self._current_metadata is None:
@@ -3659,11 +3556,8 @@ class PlaywrightCliRuntime:
         if self._screenshots_suppressed:
             snapshot_result = await self._invoke(
                 "snapshot",
-                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
                 capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
             )
-            if snapshot_result.timed_out or snapshot_result.exit_code == 124:
-                raise PlaywrightCliRuntimeError("browser_failed")
             if (
                 snapshot_result.exit_code != 0
                 or self._reported_cli_error(snapshot_result)
@@ -3678,15 +3572,11 @@ class PlaywrightCliRuntime:
         snapshot_result = await self._invoke(
             "snapshot",
             [f"--filename={snapshot_path}"],
-            timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
         )
-        if snapshot_result.timed_out or snapshot_result.exit_code == 124:
-            raise PlaywrightCliRuntimeError("browser_failed")
         dom = ""
         if (
             snapshot_result.exit_code == 0
-            and not snapshot_result.timed_out
             and not self._reported_cli_error(snapshot_result)
         ):
             dom = self._read_text_artifact(snapshot_path, _MAX_DOM_CHARS)

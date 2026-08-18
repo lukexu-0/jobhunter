@@ -177,24 +177,15 @@ def _runtime_for_process_factory(
     session_directory: Path,
     cli_script: Path,
     process_factory: Any,
-    execution_timeout: float | None = None,
 ) -> PlaywrightCliRuntime:
-    options: dict[str, Any] = {}
-    if execution_timeout is not None:
-        options["execution_timeout"] = execution_timeout
-    return PlaywrightCliRuntime(
-        session_id=session_id,
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_directory,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-        **options,
-    )
+    return PlaywrightCliRuntime(session_id=session_id,
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_directory, process_factory=process_factory,
+    cli_script=cli_script,)
 
 
 def test_private_redaction_fragments_match_pinned_yaml_and_json_escaping() -> None:
@@ -257,30 +248,27 @@ async def test_private_observation_redacts_before_public_field_limits(
         args: Sequence[str] = (),
         *,
         capture_limit: int = playwright_cli._MAX_CAPTURE_BYTES,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> playwright_cli._InvocationResult:
+        assert "timeout" not in kwargs
+        assert "cleanup_timeout" not in kwargs
         capture_limits.append(capture_limit)
         scripts.extend(args)
         return playwright_cli._InvocationResult(
             exit_code=0,
-            timed_out=False,
             stdout=invocation_payload,
             stderr=b"",
             stdout_truncated=False,
             stderr_truncated=False,
         )
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000099"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000099"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,)
     runtime._activate_private_values_unlocked(
         (
             username,
@@ -368,7 +356,6 @@ async def test_private_observation_redacts_before_public_field_limits(
     )[: playwright_cli._MAX_DOM_CAPTURE_CHARS]
     inline = playwright_cli._InvocationResult(
         exit_code=0,
-        timed_out=False,
         stdout=json.dumps({"snapshot": serialized_dom}).encode("utf-8"),
         stderr=b"",
         stdout_truncated=False,
@@ -502,13 +489,9 @@ def test_resolve_browser_launch_missing_executable(tmp_path: Path) -> None:
 def test_runtime_init_validation(session_dir: Path, cli_script: Path) -> None:
     launch = ResolvedBrowserLaunch(cdp_url="http://127.0.0.1:9222", executable_path=None, user_data_dir=None)
     with pytest.raises(BrowserConfigurationError):
-        PlaywrightCliRuntime(
-            session_id=cast(Any, "not-a-uuid"),
-            launch=launch,
-            session_directory=session_dir,
-            deadline=time.time() + 100,
-            cli_script=cli_script,
-        )
+        PlaywrightCliRuntime(session_id=cast(Any, "not-a-uuid"),
+        launch=launch,
+        session_directory=session_dir, cli_script=cli_script,)
 
 
 
@@ -545,22 +528,16 @@ async def test_invoke_tracks_child_until_emergency_cleanup_terminates_it(
             process_finished.set()
 
     process = BlockingProcess()
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000035"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=lambda *_args, **_kwargs: process,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000035"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=lambda *_args, **_kwargs: process,
+    cli_script=cli_script,)
 
-    invocation = asyncio.create_task(
-        runtime._invoke("snapshot", timeout=10)
-    )
+    invocation = asyncio.create_task(runtime._invoke("snapshot"))
     await wait_started.wait()
 
     assert runtime._active_process is process
@@ -592,16 +569,16 @@ async def test_runtime_start_lifecycle_argv(session_dir: Path, cli_script: Path)
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
 
     await runtime.start("https://example.com/jobs/1")
+    config = json.loads(runtime._config_path.read_text(encoding="utf-8"))
+    assert "timeouts" not in config
+    assert "cdpTimeout" not in config["browser"]
+
 
     # Commands invoked: open about:blank, run-code (install guard), video-start, goto, run-code (metadata check)
     assert len(spawns) == 5
@@ -651,18 +628,14 @@ async def test_source_capture_binds_bounded_rendered_text_and_url_to_one_page(
             ).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
     await runtime.suppress_private_capture()
     invocations.clear()
@@ -727,17 +700,13 @@ async def test_source_capture_script_accepts_exact_origin_without_url_global(
     cli_script: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000047"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000047"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,)
     runtime._started = True
     runtime._guard_armed = True
     runtime._approved_origins = ("https://example.com",)
@@ -745,9 +714,11 @@ async def test_source_capture_script_accepts_exact_origin_without_url_global(
     async def invoke(
         command: str,
         args: Sequence[str] = (),
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> playwright_cli._InvocationResult:
         assert command == "run-code"
+        assert "timeout" not in kwargs
+        assert "cleanup_timeout" not in kwargs
         exercise = (
             "const frameUrl='https://example.com/jobs/1?verified=true';"
             "let frameReads=0;"
@@ -770,7 +741,6 @@ async def test_source_capture_script_accepts_exact_origin_without_url_global(
         assert result["detached"] is True
         return playwright_cli._InvocationResult(
             exit_code=0,
-            timed_out=False,
             stdout=json.dumps(
                 {"result": json.dumps(result["value"])}
             ).encode(),
@@ -826,18 +796,14 @@ async def test_source_snapshot_enforces_utf8_byte_and_line_ceilings(
             ).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000001a"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000001a"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
     captured = await runtime.capture_source_snapshot("https://example.com")
 
@@ -896,18 +862,14 @@ async def test_source_snapshot_utf8_prefix_drops_only_a_cap_split_trailing_scala
                 ).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000001b"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000001b"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     if malformed_interior:
@@ -958,18 +920,14 @@ async def test_oversized_source_snapshot_output_is_rejected_without_private_file
                 ).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000001c"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000001c"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     with pytest.raises(PlaywrightCliRuntimeError):
@@ -981,7 +939,7 @@ async def test_oversized_source_snapshot_output_is_rejected_without_private_file
 
 
 @pytest.mark.asyncio
-async def test_start_preserves_original_timeout_when_immediate_cleanup_fails(
+async def test_start_preserves_browser_failure_when_immediate_cleanup_fails(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
@@ -993,23 +951,22 @@ async def test_start_preserves_original_timeout_when_immediate_cleanup_fails(
             user_data_dir=None,
         ),
         session_directory=session_dir,
-        deadline=time.monotonic() + 100,
         cli_script=cli_script,
     )
 
-    async def timeout(*_args: Any, **_kwargs: Any) -> Any:
-        raise PlaywrightCliRuntimeError("session_timeout")
-
-    async def failed_cleanup() -> None:
+    async def failed_start(*_args: Any, **_kwargs: Any) -> Any:
         raise PlaywrightCliRuntimeError("browser_failed")
 
-    runtime._invoke = timeout  # type: ignore[method-assign]
+    async def failed_cleanup() -> None:
+        raise RuntimeError("private cleanup failure")
+
+    runtime._invoke = failed_start  # type: ignore[method-assign]
     runtime._cleanup_unlocked = failed_cleanup  # type: ignore[method-assign]
 
     with pytest.raises(PlaywrightCliRuntimeError) as caught:
         await runtime.start("https://example.com/jobs/1")
 
-    assert caught.value.code == "session_timeout"
+    assert caught.value.code == "browser_failed"
     playwright_cli._remove_owned_temporary_directory(
         runtime._temporary_directory,
         runtime._session_id,
@@ -1067,16 +1024,24 @@ async def test_runtime_execute_safe_command(session_dir: Path, cli_script: Path)
             Path(filename).write_bytes(b"\x89PNG\r\n\x1a\npngdata")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
 
     await runtime.start("https://example.com/jobs/1")
+    invocation_options: list[dict[str, Any]] = []
+    invoke = runtime._invoke
+
+    async def invoke_without_child_deadline(
+        *args: Any,
+        **kwargs: Any,
+    ) -> playwright_cli._InvocationResult:
+        invocation_options.append(kwargs.copy())
+        return await invoke(*args, **kwargs)
+
+    runtime._invoke = invoke_without_child_deadline  # type: ignore[method-assign]
+
 
     # Clear spawns log to focus on execute
     spawns.clear()
@@ -1084,7 +1049,6 @@ async def test_runtime_execute_safe_command(session_dir: Path, cli_script: Path)
     result = await runtime.execute("click", ["e3"])
 
     assert result.exit_code == 0
-    assert result.timed_out is False
     assert result.observation.url == "https://example.com/jobs/1"
     assert result.observation.title == "Software Engineer"
     assert result.observation.dom == "page-dom"
@@ -1097,6 +1061,10 @@ async def test_runtime_execute_safe_command(session_dir: Path, cli_script: Path)
     assert spawns[0][3] == "click"
     assert spawns[0][4] == "e3"
     assert spawns[1][3] == "run-code"
+    assert len(invocation_options) == 2
+    assert all("timeout" not in options for options in invocation_options)
+    assert all("cleanup_timeout" not in options for options in invocation_options)
+
 
     await runtime.close()
 
@@ -1158,18 +1126,14 @@ async def test_runtime_returns_cached_observation_while_file_chooser_is_open(
             stdout = b""
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000006"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000006"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
 
@@ -1184,20 +1148,18 @@ async def test_runtime_returns_cached_observation_while_file_chooser_is_open(
 
 
 @pytest.mark.asyncio
-async def test_timed_out_action_invalidates_and_cleans_runtime_before_release(
+async def test_action_waits_for_caller_cancellation_and_reclaims_child(
     session_dir: Path,
     cli_script: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[str] = []
-
-    timed_out_process = HangingProcess()
+    action_process = HangingProcess()
 
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
         command = argv[3]
         commands.append(command)
         if command == "click":
-            return timed_out_process
+            return action_process
         stdout = (
             _successful_metadata_result() if command == "run-code" else b""
         )
@@ -1208,38 +1170,25 @@ async def test_timed_out_action_invalidates_and_cleans_runtime_before_release(
         session_directory=session_dir,
         cli_script=cli_script,
         process_factory=factory,
-        execution_timeout=0.01,
     )
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
-    cleanup_attempts = 0
-    emergency_cleanup = runtime._emergency_budget_cleanup_unlocked
 
-    async def fail_cleanup_once() -> None:
-        nonlocal cleanup_attempts
-        cleanup_attempts += 1
-        if cleanup_attempts == 1:
-            raise PlaywrightCliRuntimeError("browser_failed")
-        await emergency_cleanup()
+    action = asyncio.create_task(runtime.execute("click", ["e3"]))
+    while runtime._active_process is not action_process:
+        await asyncio.sleep(0)
+    assert action.done() is False
 
-    monkeypatch.setattr(
-        runtime,
-        "_emergency_budget_cleanup_unlocked",
-        fail_cleanup_once,
-    )
+    action.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await action
 
-    with pytest.raises(PlaywrightCliRuntimeError) as first:
-        await runtime.execute("click", ["e3"])
+    assert action_process.terminated is True
+    assert action_process.killed is False
+    assert runtime._active_process is None
+    assert commands == ["click"]
 
-    assert first.value.code == "browser_failed"
-    assert timed_out_process.terminated is True
-    assert cleanup_attempts == 2
-    assert commands == ["click", "video-stop", "close"]
-
-    with pytest.raises(PlaywrightCliRuntimeError) as later:
-        await runtime.execute("click", ["e4"])
-
-    assert later.value.code == "browser_failed"
+    await runtime.close()
     assert commands == ["click", "video-stop", "close"]
 
 
@@ -1310,47 +1259,6 @@ async def test_permanent_cleanup_failure_returns_bounded_fixed_error(
     assert commands == ["click", "video-stop", "close"]
 
 
-@pytest.mark.asyncio
-async def test_aggregate_timeout_keeps_child_owned_until_killed(
-    session_dir: Path,
-    cli_script: Path,
-) -> None:
-    commands: list[str] = []
-
-    action_process = HangingProcess(finish_on_terminate=False)
-
-    def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
-        command = argv[3]
-        commands.append(command)
-        if command == "click":
-            return action_process
-        stdout = (
-            _successful_metadata_result() if command == "run-code" else b""
-        )
-        return DummyProcess(argv, stdout=stdout)
-
-    runtime = _runtime_for_process_factory(
-        session_id=UUID("00000000-0000-0000-0000-000000000044"),
-        session_directory=session_dir,
-        cli_script=cli_script,
-        process_factory=factory,
-        execution_timeout=0.01,
-    )
-    await runtime.start("https://example.com/jobs/1")
-    commands.clear()
-
-    with pytest.raises(PlaywrightCliRuntimeError) as raised:
-        await runtime.execute("click", ["e3"])
-
-    assert raised.value.code == "browser_failed"
-    assert action_process.terminated is True
-    assert action_process.killed is True
-    assert runtime._active_process is None
-    assert commands == ["click", "video-stop", "close"]
-
-    with pytest.raises(PlaywrightCliRuntimeError):
-        await runtime.execute("click", ["e4"])
-    assert commands == ["click", "video-stop", "close"]
 
 
 @pytest.mark.asyncio
@@ -1386,7 +1294,6 @@ async def test_ordinary_nonzero_action_exit_keeps_runtime_usable(
     later = await runtime.execute("click", ["e4"])
 
     assert first.exit_code == 9
-    assert first.timed_out is False
     assert later.exit_code == 0
     assert commands == [
         "click",
@@ -1401,7 +1308,7 @@ async def test_ordinary_nonzero_action_exit_keeps_runtime_usable(
 
 
 @pytest.mark.asyncio
-async def test_action_process_failure_preserves_error_through_cleanup_deadline(
+async def test_action_process_failure_preserves_error_while_cleanup_runs(
     session_dir: Path,
     cli_script: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1437,8 +1344,6 @@ async def test_action_process_failure_preserves_error_through_cleanup_deadline(
         "_emergency_budget_cleanup_unlocked",
         delayed_cleanup,
     )
-    runtime._deadline = time.monotonic() + 0.01
-
     with pytest.raises(PlaywrightCliRuntimeError) as first:
         await runtime.execute("click", ["e3"])
 
@@ -1501,61 +1406,6 @@ async def test_internal_observation_process_failure_invalidates_runtime(
     await runtime.close()
 
 
-@pytest.mark.asyncio
-async def test_timed_out_modal_observation_invalidates_runtime(
-    session_dir: Path,
-    cli_script: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    commands: list[str] = []
-    modal = False
-    modal_payload = json.dumps(
-        {
-            "isError": True,
-            "error": (
-                'Error: Tool "browser_run_code_unsafe" '
-                "does not handle the modal state."
-            ),
-        }
-    ).encode()
-
-    def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
-        nonlocal modal
-        command = argv[3]
-        commands.append(command)
-        if command == "click":
-            modal = True
-            return DummyProcess(
-                argv,
-                stdout=json.dumps({"snapshot": "file chooser open"}).encode(),
-            )
-        if command == "run-code" and modal:
-            return HangingProcess(stdout=modal_payload)
-        stdout = (
-            _successful_metadata_result() if command == "run-code" else b""
-        )
-        return DummyProcess(argv, stdout=stdout)
-
-    monkeypatch.setattr(playwright_cli, "_LIFECYCLE_TIMEOUT_SECONDS", 0.01)
-    runtime = _runtime_for_process_factory(
-        session_id=UUID("00000000-0000-0000-0000-000000000045"),
-        session_directory=session_dir,
-        cli_script=cli_script,
-        process_factory=factory,
-        execution_timeout=0.1,
-    )
-    await runtime.start("https://example.com/jobs/1")
-    commands.clear()
-
-    with pytest.raises(PlaywrightCliRuntimeError) as raised:
-        await runtime.execute("click", ["e3"])
-
-    assert raised.value.code == "browser_failed"
-    assert commands == ["click", "run-code", "video-stop", "close"]
-
-    with pytest.raises(PlaywrightCliRuntimeError):
-        await runtime.execute("click", ["e4"])
-    assert commands == ["click", "run-code", "video-stop", "close"]
 
 
 @pytest.mark.asyncio
@@ -1575,14 +1425,10 @@ async def test_runtime_execute_unsupported_command(session_dir: Path, cli_script
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
@@ -1610,14 +1456,10 @@ async def test_runtime_execute_session_override_rejection(session_dir: Path, cli
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
@@ -1645,14 +1487,10 @@ async def test_runtime_execute_upload_path_confinement(session_dir: Path, cli_sc
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     # Creating a file outside the session directory
@@ -1695,14 +1533,10 @@ async def test_runtime_execute_exact_origin_direct_navigation(session_dir: Path,
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     # Rejects navigation to non-approved origin
@@ -1820,18 +1654,14 @@ async def test_private_restore_keeps_secret_url_out_of_argv_and_memfd_on_disk(
             restore_scripts.append(restore_path.read_text(encoding="utf-8"))
         return DummyProcess(argv, stdout=b"{}")
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000098"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000098"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=factory,
+    cli_script=cli_script,)
     runtime._approved_origins = ("https://example.com",)
     runtime._activate_private_values_unlocked((password,))
     previous = playwright_cli._PageMetadata(
@@ -1919,18 +1749,14 @@ async def test_save_origin_verification_redacts_cached_modal_fallback_metadata(
             stdout = json.dumps({"snapshot": "modal login"}).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000097"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000097"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/login")
     await runtime.suppress_private_capture()
     metadata_title = f"{'x' * 4_080}{username}{password}"
@@ -1988,18 +1814,14 @@ async def test_runtime_rejects_tab_creation_at_observation_limit(
             ).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000008"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000008"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/0")
     commands.clear()
 
@@ -2041,18 +1863,14 @@ async def test_runtime_metadata_transport_covers_declared_tab_bounds(
             ).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000009"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000009"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
 
     await runtime.start("https://example.com/0")
 
@@ -2104,14 +1922,10 @@ async def test_runtime_execute_output_bounds(
             stderr = b"B" * 30_000
         return DummyProcess(argv=argv, stdout=stdout, stderr=stderr)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     result = await runtime.execute("click", ["e3"])
@@ -2313,14 +2127,10 @@ async def test_runtime_origin_updates(session_dir: Path, cli_script: Path) -> No
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     spawns.clear()
@@ -2361,14 +2171,10 @@ async def test_runtime_suspend_navigation_guard(session_dir: Path, cli_script: P
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     spawns.clear()
@@ -2429,18 +2235,14 @@ async def test_runtime_recovers_ambiguous_guard_suspension_before_next_action(
             }).encode("utf-8")
         return DummyProcess(argv=argv, exit_code=exit_code, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
     suspension_started = True
     calls.clear()
@@ -2462,55 +2264,36 @@ async def test_runtime_recovers_ambiguous_guard_suspension_before_next_action(
     await runtime.close()
 
 @pytest.mark.asyncio
-async def test_runtime_logs_fixed_metadata_when_guard_suspension_times_out(
+async def test_guard_suspension_cancellation_logs_runtime_failure_and_rearms(
     session_dir: Path,
     cli_script: Path,
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     suspension_started = False
+    suspension_spawned = asyncio.Event()
+    suspension_process = HangingProcess()
 
-    def mock_process_factory(*argv: str, **kwargs: Any) -> DummyProcess:
+    def mock_process_factory(
+        *argv: str,
+        **_kwargs: Any,
+    ) -> DummyProcess | HangingProcess:
         command = argv[3]
         stdout = b""
         if command == "run-code":
-            stdout = json.dumps({
-                "result": json.dumps({
-                    "url": "https://example.com/jobs/1",
-                    "title": "Software Engineer",
-                    "currentIndex": 0,
-                    "tabs": [{
-                        "url": "https://example.com/jobs/1",
-                        "title": "Software Engineer",
-                    }],
-                })
-            }).encode("utf-8")
-        return DummyProcess(
-            argv=argv,
-            stdout=stdout,
-            timed_out=(
-                suspension_started
-                and command == "run-code"
-                and "state.armed=false" in argv[4]
-            ),
-        )
+            stdout = _successful_metadata_result()
+            if suspension_started and "state.armed=false" in argv[4]:
+                suspension_spawned.set()
+                return suspension_process
+        return DummyProcess(argv=argv, stdout=stdout)
 
-    monkeypatch.setattr(
-        "jobhunter_browser_harness.playwright_cli._LIFECYCLE_TIMEOUT_SECONDS",
-        0.01,
-    )
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
     suspension_started = True
 
@@ -2518,8 +2301,12 @@ async def test_runtime_logs_fixed_metadata_when_guard_suspension_times_out(
         logging.ERROR,
         logger="jobhunter_browser_harness.playwright_cli",
     ):
-        with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
-            await runtime.suspend_navigation_guard()
+        suspension = asyncio.create_task(runtime.suspend_navigation_guard())
+        await suspension_spawned.wait()
+        assert suspension.done() is False
+        suspension.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await suspension
 
     messages = [
         json.loads(record.message)
@@ -2530,20 +2317,15 @@ async def test_runtime_logs_fixed_metadata_when_guard_suspension_times_out(
         "event": "playwright_cli_lifecycle_failure",
         "sessionId": "00000000-0000-0000-0000-000000000001",
         "operation": "suspend_navigation_guard",
-        "errorCategory": "timeout",
-        "exitCode": 124,
-        "timedOut": True,
+        "errorCategory": "runtime_error",
+        "exitCode": None,
         "reportedCliError": False,
         "stdoutTruncated": False,
         "stderrTruncated": False,
     }]
-
-    def fail_logging(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("logging failed")
-
-    monkeypatch.setattr(playwright_cli.logger, "error", fail_logging)
-    with pytest.raises(PlaywrightCliRuntimeError, match="browser_failed"):
-        await runtime.suspend_navigation_guard()
+    assert suspension_process.terminated is True
+    assert runtime._guard_armed is True
+    await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -2573,18 +2355,14 @@ async def test_runtime_logs_fixed_metadata_when_guard_invocation_fails(
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000002"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000002"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
     suspension_started = True
 
@@ -2606,7 +2384,6 @@ async def test_runtime_logs_fixed_metadata_when_guard_invocation_fails(
         "operation": "suspend_navigation_guard",
         "errorCategory": "runtime_error",
         "exitCode": None,
-        "timedOut": False,
         "reportedCliError": False,
         "stdoutTruncated": False,
         "stderrTruncated": False,
@@ -2636,14 +2413,10 @@ async def test_runtime_idempotent_cleanup(session_dir: Path, cli_script: Path) -
             }).encode("utf-8")
         return DummyProcess(argv=argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000001"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000001"),
+    launch=launch,
+    session_directory=session_dir, process_factory=mock_process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/jobs/1")
 
     spawns.clear()
@@ -2699,18 +2472,14 @@ async def test_runtime_uses_short_private_temporary_directory(
             ).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000005"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000005"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
 
     temporary_directory = Path(environments[0]["TMPDIR"])
@@ -3168,14 +2937,10 @@ async def test_native_lifecycle_journals_and_reclaims_owned_browser(
             ).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000002"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000002"),
+    launch=launch,
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
 
     open_argv = spawns[0]
@@ -3251,14 +3016,10 @@ async def test_model_paths_limits_redaction_and_unapproved_tab_are_guarded(
             stdout = f"path={session_dir}".encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000003"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000003"),
+    launch=launch,
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
 
     with pytest.raises(PlaywrightCliRuntimeError):
@@ -3339,14 +3100,10 @@ async def test_close_retries_browser_ownership_after_failed_cli_close(
             exit_code = 1 if close_calls == 1 else 0
         return DummyProcess(argv, exit_code=exit_code, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000004"),
-        launch=launch,
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000004"),
+    launch=launch,
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
 
@@ -3395,18 +3152,14 @@ async def test_close_reports_video_stop_failure_after_browser_close(
             ).encode()
         return DummyProcess(argv, exit_code=exit_code, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000007"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000007"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
 
@@ -3420,38 +3173,39 @@ async def test_close_reports_video_stop_failure_after_browser_close(
 
 
 @pytest.mark.asyncio
-async def test_open_timeout_still_closes_attempted_cli_session(
+async def test_cancelled_open_still_closes_attempted_cli_session(
     session_dir: Path,
     cli_script: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[str] = []
+    open_spawned = asyncio.Event()
+    open_process = HangingProcess()
 
-    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
         command = argv[3]
         commands.append(command)
-        return DummyProcess(argv, timed_out=command == "open")
+        if command == "open":
+            open_spawned.set()
+            return open_process
+        return DummyProcess(argv)
 
-    monkeypatch.setattr(
-        "jobhunter_browser_harness.playwright_cli._LIFECYCLE_TIMEOUT_SECONDS",
-        0.01,
-    )
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000000a"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000000a"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
 
-    with pytest.raises(PlaywrightCliRuntimeError):
-        await runtime.start("https://example.com/jobs/1")
+    start = asyncio.create_task(runtime.start("https://example.com/jobs/1"))
+    await open_spawned.wait()
+    assert start.done() is False
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
 
+    assert open_process.terminated is True
     assert commands == ["open", "close"]
 
 
@@ -3486,18 +3240,14 @@ async def test_runtime_rejects_every_cli_global_option_alias(
             ).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000000b"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000000b"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
 
@@ -3558,18 +3308,14 @@ async def test_model_outputs_do_not_share_harness_artifact_namespace(
             stdout = json.dumps({"result": json.dumps(payload)}).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000000c"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000000c"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
 
     await runtime.execute("screenshot", ["--filename=observation-1.png"])
@@ -3622,18 +3368,14 @@ async def test_unapproved_tabs_are_redacted_and_cannot_be_closed(
             stdout = b"https://private.example/mail Private inbox"
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000000d"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000000d"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
 
@@ -3650,7 +3392,7 @@ async def test_unapproved_tabs_are_redacted_and_cannot_be_closed(
 
 
 @pytest.mark.asyncio
-async def test_execute_has_one_aggregate_pipeline_deadline(
+async def test_internal_observation_waits_for_caller_cancellation(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
@@ -3658,42 +3400,23 @@ async def test_execute_has_one_aggregate_pipeline_deadline(
 
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
         commands.append(argv[3])
-        stdout = b""
-        if argv[3] == "run-code":
-            stdout = json.dumps(
-                {
-                    "result": json.dumps(
-                        {
-                            "url": "https://example.com/jobs/1",
-                            "title": "Job",
-                            "currentIndex": 0,
-                            "tabs": [
-                                {
-                                    "url": "https://example.com/jobs/1",
-                                    "title": "Job",
-                                }
-                            ],
-                        }
-                    )
-                }
-            ).encode()
+        stdout = (
+            _successful_metadata_result() if argv[3] == "run-code" else b""
+        )
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000000e"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-        execution_timeout=0.01,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000000e"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
+    runtime._remaining = lambda: 0.01  # type: ignore[method-assign]
+    observation_started = asyncio.Event()
 
     async def never_observe(
         _execution: object,
@@ -3701,23 +3424,29 @@ async def test_execute_has_one_aggregate_pipeline_deadline(
         remove_snapshot_file: bool = True,
     ) -> object:
         del remove_snapshot_file
-        await asyncio.sleep(100)
+        observation_started.set()
+        await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
     runtime._collect_observation = never_observe  # type: ignore[method-assign]
-    started = time.monotonic()
-    with pytest.raises(PlaywrightCliRuntimeError) as first:
-        await runtime.execute("click", ["e1"])
-    assert first.value.code == "browser_failed"
-    assert time.monotonic() - started < 0.2
-    assert commands == ["click", "video-stop", "close"]
+    action = asyncio.create_task(runtime.execute("click", ["e1"]))
+    await observation_started.wait()
+    await asyncio.sleep(0.02)
+    assert action.done() is False
 
-    with pytest.raises(PlaywrightCliRuntimeError) as later:
-        await runtime.execute("click", ["e2"])
-    assert later.value.code == "browser_failed"
-    assert commands == ["click", "video-stop", "close"]
+    action.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await action
 
+    assert commands == ["click"]
     await runtime.close()
+    assert commands == ["click", "video-stop", "close"]
+
+
+def test_browser_artifact_budgets_use_the_configured_capacity_limits() -> None:
+    assert playwright_cli._MAX_OUTPUT_DIRECTORY_BYTES == 1_073_741_824
+    assert playwright_cli._MAX_TEMPORARY_DIRECTORY_BYTES == 1_073_741_824
+    assert playwright_cli._MAX_VIDEO_BYTES == 2_147_483_648
 
 
 @pytest.mark.asyncio
@@ -3770,18 +3499,14 @@ async def test_live_artifact_budget_closes_the_owned_cli_session(
         "jobhunter_browser_harness.playwright_cli._ARTIFACT_BUDGET_POLL_SECONDS",
         0.001,
     )
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-00000000000f"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-00000000000f"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
     if artifact_kind in {"output", "temporary"}:
@@ -3861,18 +3586,14 @@ async def test_budget_cleanup_retains_ownership_until_temporary_removal_succeeds
         "_remove_owned_temporary_directory",
         remove_temporary_directory,
     )
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000010"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000010"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     temporary_directory = runtime._temporary_directory
     runtime._output_directory.joinpath("download.bin").write_bytes(b"xx")
@@ -3964,18 +3685,14 @@ async def test_budget_emergency_terminates_a_wedged_owned_daemon(
         "jobhunter_browser_harness.playwright_cli._terminate_owned_daemon",
         terminate,
     )
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000015"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000015"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
     commands.clear()
     (runtime._output_directory / "async-download.bin").write_bytes(b"xx")
@@ -4245,18 +3962,14 @@ async def test_not_open_close_reconciles_recorded_daemon_before_release(
         "jobhunter_browser_harness.playwright_cli._terminate_owned_daemon",
         terminate,
     )
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000013"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000013"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
 
     await runtime.close()
@@ -4317,18 +4030,14 @@ async def test_not_open_close_retains_ownership_when_daemon_survives(
         "jobhunter_browser_harness.playwright_cli._terminate_owned_daemon",
         leave_running,
     )
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000014"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        cli_script=cli_script,
-        process_factory=factory,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000014"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,
+    process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
 
     with pytest.raises(PlaywrightCliRuntimeError):
@@ -4425,19 +4134,27 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
             stderr=stderr,
         )
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000016"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000016"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/login")
+    invocation_options: list[dict[str, Any]] = []
+    invoke = runtime._invoke
+
+    async def invoke_without_child_deadline(
+        *args: Any,
+        **kwargs: Any,
+    ) -> playwright_cli._InvocationResult:
+        invocation_options.append(kwargs.copy())
+        return await invoke(*args, **kwargs)
+
+    runtime._invoke = invoke_without_child_deadline  # type: ignore[method-assign]
+
     invocations.clear()
 
     await runtime.sign_in(
@@ -4455,6 +4172,10 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
         "run-code",
         "run-code",
     ]
+    assert len(invocation_options) == 4
+    assert all("timeout" not in options for options in invocation_options)
+    assert all("cleanup_timeout" not in options for options in invocation_options)
+
     assert all(
         username not in argument and password not in argument
         for invocation in invocations
@@ -4603,6 +4324,56 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
 
 
 @pytest.mark.asyncio
+async def test_sign_in_waits_for_caller_cancellation_without_aggregate_deadline(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000017"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, cli_script=cli_script,)
+    runtime._started = True
+    sign_in_started = asyncio.Event()
+
+    async def suppress_private_capture() -> None:
+        return None
+
+    async def blocked_sign_in(**_kwargs: Any) -> None:
+        sign_in_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        runtime,
+        "_suppress_private_capture_unlocked",
+        suppress_private_capture,
+    )
+    monkeypatch.setattr(runtime, "_sign_in_unlocked", blocked_sign_in)
+
+    sign_in = asyncio.create_task(
+        runtime.sign_in(
+            expected_origin="https://example.com",
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            username="person@example.test",
+            password="private",
+        )
+    )
+    await sign_in_started.wait()
+    await asyncio.sleep(0.02)
+    assert sign_in.done() is False
+
+    sign_in.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sign_in
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_gate_capture_suppression_blocks_private_extraction_commands(
     session_dir: Path,
     cli_script: Path,
@@ -4632,18 +4403,14 @@ async def test_gate_capture_suppression_blocks_private_extraction_commands(
             ).encode()
         return DummyProcess(argv, stdout=stdout)
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000017"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000017"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/login")
     invocations.clear()
 
@@ -4705,18 +4472,14 @@ async def test_failed_video_stop_closes_runtime_before_private_fill(
             stdout=stdout,
         )
 
-    runtime = PlaywrightCliRuntime(
-        session_id=UUID("00000000-0000-0000-0000-000000000018"),
-        launch=ResolvedBrowserLaunch(
-            cdp_url="http://127.0.0.1:9222",
-            executable_path=None,
-            user_data_dir=None,
-        ),
-        session_directory=session_dir,
-        deadline=time.monotonic() + 100,
-        process_factory=process_factory,
-        cli_script=cli_script,
-    )
+    runtime = PlaywrightCliRuntime(session_id=UUID("00000000-0000-0000-0000-000000000018"),
+    launch=ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    ),
+    session_directory=session_dir, process_factory=process_factory,
+    cli_script=cli_script,)
     await runtime.start("https://example.com/login")
     commands.clear()
 

@@ -27,6 +27,15 @@ MODEL_NAME = "gpt-5.6-sol"
 MODEL_REASONING = "high"
 SOURCE_CAPTURE_MAX_BYTES = 512 * 1024
 SOURCE_CAPTURE_MAX_LINES = 20_000
+APPLICATION_PROFILE_MAX_BYTES = 5_242_880
+APPLICATION_RESUME_MAX_BYTES = 52_428_800
+APPLICATION_RESUME_SOURCE_MAX_BYTES = 1_310_720
+APPLICATION_CONTEXT_MAX_COUNT = 50
+APPLICATION_CONTEXT_MAX_BYTES = 5_242_880
+APPLICATION_CONTEXT_TOTAL_MAX_BYTES = 26_214_400
+APPLICATION_ANECDOTE_MAX_COUNT = 100
+APPLICATION_ANECDOTE_MAX_BYTES = 1_310_720
+APPLICATION_ANECDOTE_TOTAL_MAX_BYTES = 10_485_760
 
 OpportunityKind: TypeAlias = Literal[
     "job",
@@ -590,8 +599,12 @@ class UploadedArtifacts(FrozenPrivateModel):
     personal_information: Path
     resume: Path
     resume_source: Path
-    context: tuple[Path, ...] = Field(default=(), max_length=10)
-    anecdotes: tuple[Path, ...] = Field(default=(), max_length=20)
+    context: tuple[Path, ...] = Field(
+        default=(), max_length=APPLICATION_CONTEXT_MAX_COUNT
+    )
+    anecdotes: tuple[Path, ...] = Field(
+        default=(), max_length=APPLICATION_ANECDOTE_MAX_COUNT
+    )
 
 
 class SessionCreateRequest(FrozenPrivateModel):
@@ -639,7 +652,6 @@ class SourceCaptureCreateRequest(FrozenPrivateModel):
     capture_id: Annotated[UUID, Field(strict=False)]
     job_url: SourceCaptureUrl
     approved_origins: list[SourceCaptureUrl] = Field(min_length=1, max_length=1)
-    timeout_seconds: Literal[900]
 
     @model_validator(mode="after")
     def _validate_capture_boundary(self) -> SourceCaptureCreateRequest:
@@ -658,7 +670,6 @@ class SourceCaptureCreateRequest(FrozenPrivateModel):
 class SourceCaptureCreateResponse(FrozenPrivateModel):
     capture_id: UUID
     state: Literal["awaiting_human_verification"]
-    expires_at: datetime
 
 
 class SourceCaptureResult(FrozenPrivateModel):
@@ -705,49 +716,32 @@ class SessionError(PublicModel):
 
 class PlaywrightCliDiagnostic(PublicModel):
     step: int = Field(ge=1)
-    status: Literal["succeeded", "failed", "timed_out"]
+    status: Literal["succeeded", "failed"]
     exit_code: int
-    timed_out: bool
     error_category: Literal[
         "process_exit",
-        "execution_timeout",
         "browser_runtime",
-        "session_timeout",
     ] | None
     stderr_excerpt: Literal[
         "[redacted]",
-        "Playwright CLI execution timed out after 120 seconds.",
         "Browser runtime failed.",
-        "Application session expired.",
     ] | None
     stderr_truncated: bool
 
     @model_validator(mode="after")
     def _validate_outcome(self) -> PlaywrightCliDiagnostic:
-        expected_status = (
-            "timed_out"
-            if self.timed_out
-            else "succeeded"
-            if self.exit_code == 0
-            else "failed"
-        )
+        expected_status = "succeeded" if self.exit_code == 0 else "failed"
         if self.status != expected_status:
             raise ValueError("status does not match the browser outcome")
-        if self.error_category == "execution_timeout":
-            expected_excerpt = "Playwright CLI execution timed out after 120 seconds."
-            valid_category = self.timed_out
-        elif self.error_category == "session_timeout":
-            expected_excerpt = "Application session expired."
-            valid_category = self.timed_out and self.exit_code == -1
-        elif self.error_category == "browser_runtime":
+        if self.error_category == "browser_runtime":
             expected_excerpt = "Browser runtime failed."
-            valid_category = not self.timed_out and self.exit_code == -1
+            valid_category = self.exit_code == -1
         elif self.error_category == "process_exit":
             expected_excerpt = None
-            valid_category = not self.timed_out and self.exit_code != 0
+            valid_category = self.exit_code != 0
         else:
             expected_excerpt = None
-            valid_category = not self.timed_out and self.exit_code == 0
+            valid_category = self.exit_code == 0
         if not valid_category:
             raise ValueError("error_category does not match the browser outcome")
         if (
@@ -1143,7 +1137,6 @@ class BrowserObservation(PublicModel):
 
 class PlaywrightCliExecutionResult(PublicModel):
     exit_code: int
-    timed_out: bool
     stdout: Annotated[str, StringConstraints(strict=True, max_length=20_000)]
     stderr: Annotated[str, StringConstraints(strict=True, max_length=20_000)]
     stdout_truncated: bool

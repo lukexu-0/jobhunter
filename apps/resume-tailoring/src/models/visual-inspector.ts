@@ -10,8 +10,8 @@ import type { Effort } from "@oh-my-pi/pi-catalog";
 import { z } from "zod";
 import { createOAuthOnlyApiKeyResolver } from "../auth/oauth-only-resolver";
 import { MODEL_NAME, OMP_CODEX_MODEL } from "./oauth-codex-model";
+import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 
-export const MAX_VISUAL_INSPECTION_PNG_BYTES = 25 * 1024 * 1024;
 // pi-catalog publishes Effort as an ambient const enum; this is its exact medium wire value.
 const MEDIUM_EFFORT = "medium" as Effort;
 
@@ -51,8 +51,8 @@ export async function inspectResumePng(
   signal?: AbortSignal,
   inspectorOptions: VisualInspectorOptions = {},
 ): Promise<VisualInspection> {
-  if (!(png instanceof Uint8Array) || png.byteLength === 0 || png.byteLength > MAX_VISUAL_INSPECTION_PNG_BYTES) {
-    throw new Error(`PNG must contain 1-${MAX_VISUAL_INSPECTION_PNG_BYTES} bytes`);
+  if (!(png instanceof Uint8Array) || png.byteLength === 0 || png.byteLength > ARTIFACT_LIMITS.png) {
+    throw new Error(`PNG must contain 1-${ARTIFACT_LIMITS.png} bytes`);
   }
   if (png.byteLength < 8 || png[0] !== 0x89 || png[1] !== 0x50 || png[2] !== 0x4e || png[3] !== 0x47 || png[4] !== 0x0d || png[5] !== 0x0a || png[6] !== 0x1a || png[7] !== 0x0a) {
     throw new Error("Visual inspection accepts PNG only");

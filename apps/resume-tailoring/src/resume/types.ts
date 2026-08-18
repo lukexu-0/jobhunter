@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 
 const Id = z.string().trim().min(1).max(200);
 const Sha256 = z.string().regex(/^[a-f0-9]{64}$/);
@@ -231,7 +232,7 @@ export const RepairChangeSchema = z.object({
 
 export const RepairResultSchema = z.object({
   status: z.enum(["repaired", "unrepaired"]),
-  tailoredTex: z.string().max(256 * 1024).nullable(),
+  tailoredTex: z.string().max(ARTIFACT_LIMITS.tex).nullable(),
   changes: z.array(RepairChangeSchema).max(100).readonly(),
   remainingDiagnostics: z.array(z.string().max(2_000)).max(100).readonly(),
 }).strict().superRefine((value, ctx) => {

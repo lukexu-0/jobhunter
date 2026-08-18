@@ -34,25 +34,24 @@ import {
   type ReviewApplicationResult,
   type RuntimeActionResponse,
 } from "./application-runtime-client.ts";
-import { projectApplicationHistory } from "./application-history.ts";
+import {
+  MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
+  projectApplicationHistory,
+} from "./application-history.ts";
 import {
   APPLICATION_AGENT_STEERING_PREFIX,
   type ApplicationAgentSteeringInbox,
 } from "./application-agent-steering.ts";
 import {
-  AgentDeadlineError,
   assertBoundedTranscript,
   boundedJson,
-  MAX_AGENT_TRANSCRIPT_BYTES,
   createAttemptRunner,
-  runWithDeadline,
   type AgentRuntimeDependencies,
 } from "./runner.ts";
 import { createTerminalSubmission } from "./tools.ts";
 
-const MAX_APPLICATION_TASK_BYTES = 1024 * 1024;
+export const MAX_APPLICATION_TASK_BYTES = 5_242_880;
 const MAX_BROWSER_TOOL_OUTPUT_BYTES = 512 * 1024;
-const PLAYWRIGHT_CLI_RUNTIME_TIMEOUT_MS = 370_000;
 
 function isLoopbackHttpOrigin(value: string): boolean {
   try {
@@ -106,7 +105,6 @@ export type { ApplicationRunResult };
 export type ApplicationAgentFailureCode =
   | "INVALID_REQUEST"
   | "OAUTH_REQUIRED"
-  | "MODEL_TIMEOUT"
   | "INVALID_MODEL_OUTPUT"
   | "MODEL_PROVIDER_FAILED"
   | "APPLICATION_MISMATCH"
@@ -115,7 +113,6 @@ export type ApplicationAgentFailureCode =
 const APPLICATION_AGENT_FAILURE_MESSAGES: Readonly<Record<ApplicationAgentFailureCode, string>> = {
   INVALID_REQUEST: "Request is invalid",
   OAUTH_REQUIRED: "Connect OpenAI Codex in Provider access",
-  MODEL_TIMEOUT: "The model request timed out",
   INVALID_MODEL_OUTPUT: "The model returned invalid output",
   MODEL_PROVIDER_FAILED: "The model request failed",
   APPLICATION_MISMATCH: "The open page does not match the requested job",
@@ -146,7 +143,6 @@ export interface BrowserApplicationContext {
   readonly runtimeClient: ApplicationRuntimeClient;
   readonly submissionGuard: ApplicationSubmissionGuard;
   readonly signal: AbortSignal;
-  readonly deadlineAtMs: number;
   readonly steeringInbox?: ApplicationAgentSteeringInbox;
   latestScreenshotDataUrl?: string;
   submissionApproved: boolean;
@@ -356,18 +352,14 @@ function rejectMissingPostNavigationInspection(
   }
 }
 
-function remainingDeadlineMs(context: BrowserApplicationContext): number {
-  return Math.max(1, Math.ceil(context.deadlineAtMs - Date.now()));
-}
 
 async function runtimeAction(
   context: BrowserApplicationContext,
   action: Parameters<ApplicationRuntimeClient["action"]>[0],
-  timeoutMs: number,
   signal: AbortSignal,
 ): Promise<RuntimeActionResponse> {
   try {
-    const response = await context.runtimeClient.action(action, signal, timeoutMs);
+    const response = await context.runtimeClient.action(action, signal);
     signal.throwIfAborted();
     const parsed = RuntimeActionResponseSchema.safeParse(response);
     if (!parsed.success) throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
@@ -377,21 +369,6 @@ async function runtimeAction(
       throw context.signal.reason ?? new DOMException("Aborted", "AbortError");
     }
     const toolAbortReason = signal.aborted ? signal.reason : undefined;
-    if (
-      (
-        error instanceof DOMException
-        && error.name === "TimeoutError"
-      )
-      || (
-        toolAbortReason instanceof DOMException
-        && toolAbortReason.name === "TimeoutError"
-      )
-    ) {
-      const cause = error instanceof DOMException && error.name === "TimeoutError"
-        ? error
-        : toolAbortReason;
-      throw new ApplicationAgentFailure("MODEL_TIMEOUT", { cause });
-    }
     if (signal.aborted) {
       throw toolAbortReason ?? new DOMException("Aborted", "AbortError");
     }
@@ -399,11 +376,9 @@ async function runtimeAction(
     if (error instanceof ApplicationRuntimeError) {
       const code = error.code === "invalid_request"
         ? "INVALID_REQUEST"
-        : error.code === "model_timeout"
-          ? "MODEL_TIMEOUT"
-          : error.code === "browser_failed"
-            ? "BROWSER_FAILED"
-            : "MODEL_PROVIDER_FAILED";
+        : error.code === "browser_failed"
+          ? "BROWSER_FAILED"
+          : "MODEL_PROVIDER_FAILED";
       throw new ApplicationAgentFailure(code, { cause: error });
     }
     throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED", { cause: error });
@@ -417,7 +392,6 @@ function runtimeTool<Schema extends z.ZodObject>(
     name: string;
     description: string;
     parameters: Schema;
-    timeoutMs: number;
     allowAfterApproval?: boolean;
     isEnabled?: (context: BrowserApplicationContext) => boolean;
     execute: (
@@ -433,8 +407,6 @@ function runtimeTool<Schema extends z.ZodObject>(
     parameters: options.parameters,
     strict: true,
     errorFunction: null,
-    timeoutMs: options.timeoutMs,
-    timeoutBehavior: "raise_exception",
     isEnabled: ({ runContext }) =>
       (!runContext.context.submissionApproved || options.allowAfterApproval === true)
       && (options.isEnabled?.(runContext.context) ?? true),
@@ -524,7 +496,6 @@ function hasTrustedSubmissionEvidence(
   if (result.status === "submission_uncertain") return true;
   const confirmation = result.submission_confirmation.text;
   return preSubmissionDom !== undefined
-    && !execution.timed_out
     && execution.exit_code === 0
     && !preSubmissionDom.includes(confirmation)
     && execution.observation.dom.includes(confirmation);
@@ -537,7 +508,7 @@ function applicationTranscriptAssertion(result: unknown): void {
     throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
   }
   try {
-    assertBoundedTranscript(result);
+    assertBoundedTranscript(result, MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES);
   } catch {
     throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
   }
@@ -577,7 +548,6 @@ async function runApplicationAgentWithProfile(
     runtimeClient: dependencies.runtimeClient,
     submissionGuard: dependencies.submissionGuard,
     signal,
-    deadlineAtMs: Date.now() + input.deadlineMs,
     ...(dependencies.steeringInbox === undefined
       ? {}
       : { steeringInbox: dependencies.steeringInbox }),
@@ -625,7 +595,6 @@ async function runApplicationAgentWithProfile(
     name: "playwright_cli",
     description: PLAYWRIGHT_CLI_DESCRIPTION,
     parameters: PlaywrightCliToolParametersSchema,
-    timeoutMs: PLAYWRIGHT_CLI_RUNTIME_TIMEOUT_MS,
     allowAfterApproval: true,
     execute: async ({ command, args }, runtimeContext, actionSignal) => {
       const isSubmissionAction = !isPlaywrightCliReadOnlyCommand(command)
@@ -634,7 +603,6 @@ async function runApplicationAgentWithProfile(
       const response = await runtimeAction(
         runtimeContext,
         { type: "playwright_cli", command, args },
-        Math.min(PLAYWRIGHT_CLI_RUNTIME_TIMEOUT_MS, remainingDeadlineMs(runtimeContext)),
         actionSignal,
       );
       if (response.type !== "playwright_cli_result") {
@@ -655,7 +623,7 @@ async function runApplicationAgentWithProfile(
           "Playwright CLI result",
           MAX_BROWSER_TOOL_OUTPUT_BYTES,
         );
-        if (response.exit_code === 0 && !response.timed_out) {
+        if (response.exit_code === 0) {
           runtimeContext.playwrightCliCompleted = true;
           runtimeContext.postNavigationInspectionRequired = false;
           if (!runtimeContext.submissionClaimed) {
@@ -675,7 +643,6 @@ async function runApplicationAgentWithProfile(
     name: "request_sign_in",
     description: "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login form. Pass only the inspected refs for the username/email input, password input, and submit control; main-frame eN refs, frame-scoped fNeN refs, and exact snapshot ref=eN or ref=fNeN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
     parameters: SignInToolParameters,
-    timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) => runtimeContext.playwrightCliCompleted,
     execute: async (
       { username_ref, password_ref, submit_ref },
@@ -695,7 +662,6 @@ async function runApplicationAgentWithProfile(
           password_ref: canonicalPlaywrightElementRef(password_ref),
           submit_ref: canonicalPlaywrightElementRef(submit_ref),
         },
-        remainingDeadlineMs(runtimeContext),
         actionSignal,
       );
       if (response.type === "cancel") throw new ApplicationAgentCancelled(response.result);
@@ -711,7 +677,6 @@ async function runApplicationAgentWithProfile(
     name: "request_human_navigation",
     description: "Pause for browser interaction reserved for the human: 2FA, CAPTCHA, an inaccessible or explicitly manual control, or a required transition to a new origin. Use request_sign_in for ordinary username/password login.",
     parameters: HumanNavigationToolParameters,
-    timeoutMs: input.deadlineMs,
     allowAfterApproval: true,
     isEnabled: (runtimeContext) => runtimeContext.playwrightCliCompleted,
     execute: async ({ instruction }, runtimeContext, actionSignal) => {
@@ -720,7 +685,6 @@ async function runApplicationAgentWithProfile(
       const response = await runtimeAction(
         runtimeContext,
         { type: "request_human_navigation", instruction },
-        remainingDeadlineMs(runtimeContext),
         actionSignal,
       );
       if (response.type === "cancel") throw new ApplicationAgentCancelled(response.result);
@@ -739,14 +703,12 @@ async function runApplicationAgentWithProfile(
     name: "request_additional_info",
     description: "After a successful browser inspection, fill every visible field supported by current facts except the job narrative fields defined below, and upload the supplied resume when visible. Then ask one bounded batch for remaining visible fields whose facts are unavailable. Supply a stable key and the correct scope for every question; the runtime automatically saves each accepted answer in private user context under that key and scope, so do not separately persist, log, or copy it. For job applications, every application-specific open-ended narrative/free-text prompt—including any short answer, textarea, or why/how/describe prompt—must be included with answer_type \"text\" and scope \"application\" before any fill or type, even when profile context or a saved answer seems usable; batch all currently visible prompts that lack accepted current-session answers. After an accepted current-session answer for the exact question, enter it exactly and do not ask again. A continue or decline without an answer never permits manufactured text. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction. Treat a deterministic question as already answered by current facts unless the page conflicts; treat a job narrative question as answered only after its accepted current-session response.",
     parameters: AdditionalInfoToolParameters,
-    timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) => runtimeContext.playwrightCliCompleted,
     execute: async ({ questions }, runtimeContext, actionSignal) => {
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
         { type: "request_additional_info", questions },
-        remainingDeadlineMs(runtimeContext),
         actionSignal,
       );
       if (response.type === "cancel") throw new ApplicationAgentCancelled(response.result);
@@ -768,7 +730,6 @@ async function runApplicationAgentWithProfile(
     name: "request_human_review",
     description: input.autoSubmit ? AUTO_SUBMIT_REVIEW_DESCRIPTION : HUMAN_REVIEW_DESCRIPTION,
     parameters: HumanReviewToolParameters,
-    timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) =>
       runtimeContext.playwrightCliCompleted
       && !runtimeContext.postNavigationInspectionRequired,
@@ -781,7 +742,6 @@ async function runApplicationAgentWithProfile(
       const response = await runtimeAction(
         runtimeContext,
         { type: "request_human_review", result },
-        remainingDeadlineMs(runtimeContext),
         actionSignal,
       );
       if (response.type === "interrupted") return INTERRUPTED_ACTION_RESULT;
@@ -815,14 +775,12 @@ async function runApplicationAgentWithProfile(
     name: "report_application_mismatch",
     description: "Report that the requested posting is unavailable or the visible application materially mismatches it.",
     parameters: ApplicationMismatchToolParameters,
-    timeoutMs: input.deadlineMs,
     isEnabled: (runtimeContext) => runtimeContext.playwrightCliCompleted,
     execute: async (_input, runtimeContext, actionSignal) => {
       rejectMissingBrowserInspection(runtimeContext);
       const response = await runtimeAction(
         runtimeContext,
         { type: "report_application_mismatch" },
-        remainingDeadlineMs(runtimeContext),
         actionSignal,
       );
       if (response.type !== "application_mismatch") {
@@ -837,7 +795,7 @@ async function runApplicationAgentWithProfile(
     name: "submit_application_result",
     description: "Record the final result using only the latest post-approval browser observation.",
     schema: TerminalApplicationResultParameters,
-    timeoutMs: input.deadlineMs,
+    timeoutMs: null,
     assertActive: () => {
       signal.throwIfAborted();
       if (
@@ -925,7 +883,7 @@ async function runApplicationAgentWithProfile(
         boundedJson(
           candidateInput,
           "application agent model input",
-          MAX_AGENT_TRANSCRIPT_BYTES,
+          MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
         );
       } catch {
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
@@ -938,7 +896,7 @@ async function runApplicationAgentWithProfile(
     const screenshot = filterContext?.latestScreenshotDataUrl;
     if (
       screenshot === undefined
-      || Buffer.byteLength(screenshot, "utf8") > MAX_AGENT_TRANSCRIPT_BYTES
+      || Buffer.byteLength(screenshot, "utf8") > MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES
     ) {
       return { ...modelData, input: transientInput };
     }
@@ -949,11 +907,15 @@ async function runApplicationAgentWithProfile(
     const candidateInput = [...transientInput, transientImage];
     const transcriptLabel = "application agent model input";
     try {
-      boundedJson(candidateInput, transcriptLabel, MAX_AGENT_TRANSCRIPT_BYTES);
+      boundedJson(
+        candidateInput,
+        transcriptLabel,
+        MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
+      );
     } catch (error) {
       if (
         error instanceof Error
-        && error.message === `${transcriptLabel} exceeds ${MAX_AGENT_TRANSCRIPT_BYTES} bytes`
+        && error.message === `${transcriptLabel} exceeds ${MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES} bytes`
       ) {
         return { ...modelData, input: transientInput };
       }
@@ -999,19 +961,14 @@ async function runApplicationAgentWithProfile(
 
   try {
     try {
-      await runWithDeadline(
-        runner,
-        agent,
-        input.task,
-        null,
+      const result = await runner.run(agent, input.task, {
+        maxTurns: null,
         signal,
-        input.deadlineMs,
-        {
-          context,
-          callModelInputFilter: filter,
-          assertTranscript: applicationTranscriptAssertion,
-        },
-      );
+        context,
+        callModelInputFilter: filter,
+        assertTranscript: applicationTranscriptAssertion,
+      });
+      applicationTranscriptAssertion(result);
     } catch (error) {
       let targetError = error;
       if (error !== null && typeof error === "object" && "error" in error) {
@@ -1028,9 +985,6 @@ async function runApplicationAgentWithProfile(
           throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
         }
         return ApplicationRunResultSchema.parse(targetError.result);
-      }
-      if (targetError instanceof AgentDeadlineError) {
-        throw new ApplicationAgentFailure("MODEL_TIMEOUT");
       }
       throw targetError;
     }

@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test";
 import type { AgentInputItem } from "@openai/agents-core";
 import {
   APPLICATION_HISTORY_PRUNED_NOTICE,
+  MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
   ApplicationHistoryProjectionError,
   projectApplicationHistory,
 } from "../src/agents/application-history.ts";
-import { MAX_AGENT_TRANSCRIPT_BYTES } from "../src/agents/runner.ts";
 type FunctionCallItem = Extract<AgentInputItem, { type: "function_call" }>;
 type FunctionCallResultItem = Extract<AgentInputItem, { type: "function_call_result" }>;
 
@@ -212,7 +212,7 @@ describe("projectApplicationHistory", () => {
   });
 
   test("prunes oldest Playwright CLI pairs atomically to the byte limit with one notice", () => {
-    const largeOutput = "ø".repeat(275_000);
+    const largeOutput = "ø".repeat(1_375_000);
     const oldestCall = playwrightCliCall("oldest", largeOutput);
     const oldestResult = playwrightCliResult("oldest", largeOutput);
     const newestCall = playwrightCliCall("newest", largeOutput);
@@ -225,7 +225,9 @@ describe("projectApplicationHistory", () => {
       newestCall,
       newestResult,
     ] satisfies readonly AgentInputItem[];
-    expect(Buffer.byteLength(JSON.stringify(history))).toBeGreaterThan(MAX_AGENT_TRANSCRIPT_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(history))).toBeGreaterThan(
+      MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
+    );
 
     const projected = projectApplicationHistory(history);
 
@@ -238,11 +240,13 @@ describe("projectApplicationHistory", () => {
     expect(projected.includes(oldestCall)).toBe(false);
     expect(projected.includes(oldestResult)).toBe(false);
     expect(projected.filter((item) => item === APPLICATION_HISTORY_PRUNED_NOTICE)).toHaveLength(1);
-    expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThanOrEqual(MAX_AGENT_TRANSCRIPT_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThanOrEqual(
+      MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
+    );
   });
 
   test("treats the latest non-delta native Codex history as a replacement window", () => {
-    const obsoletePrefix = user("x".repeat(MAX_AGENT_TRANSCRIPT_BYTES));
+    const obsoletePrefix = user("x".repeat(MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES));
     const [anchor, coveredCall, matchingResult] = nativePlaywrightCliGroup(
       "native-replacement",
       false,
@@ -255,7 +259,9 @@ describe("projectApplicationHistory", () => {
       matchingResult,
       suffix,
     ] satisfies readonly AgentInputItem[];
-    expect(Buffer.byteLength(JSON.stringify(history))).toBeGreaterThan(MAX_AGENT_TRANSCRIPT_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(history))).toBeGreaterThan(
+      MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
+    );
 
     const projected = projectApplicationHistory(history);
 
@@ -265,12 +271,12 @@ describe("projectApplicationHistory", () => {
     expect(projected.includes(obsoletePrefix)).toBe(false);
     expect(projected.includes(APPLICATION_HISTORY_PRUNED_NOTICE)).toBe(false);
     expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThanOrEqual(
-      MAX_AGENT_TRANSCRIPT_BYTES,
+      MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
     );
   });
 
   test("fails with the dedicated provider error when preserved non-browser history overflows", () => {
-    const oversized = user("x".repeat(MAX_AGENT_TRANSCRIPT_BYTES));
+    const oversized = user("x".repeat(MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES));
 
     expect(() => projectApplicationHistory([oversized])).toThrow(ApplicationHistoryProjectionError);
     try {

@@ -1,14 +1,45 @@
 import { describe, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ArtifactStore } from "../src/system/artifacts.ts";
+import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
 
 async function artifactRoot(): Promise<string> {
   return await mkdtemp(join(tmpdir(), "pipeline-run-input-"));
 }
 
 const address = { run: 123 } as const;
+
+const expectedArtifactLimits = {
+  tex: 524_288,
+  stdout: 524_288,
+  stderr: 524_288,
+  log: 2_097_152,
+  pdf: 20_971_520,
+  png: 52_428_800,
+} as const;
+
+describe("pipeline artifact bounds", () => {
+  test("publishes the canonical byte limit for every artifact type", () => {
+    expect(ARTIFACT_LIMITS).toEqual(expectedArtifactLimits);
+  });
+
+  for (const [kind, limit] of Object.entries(expectedArtifactLimits)) {
+    test(`${kind} accepts its canonical limit and rejects one byte over`, async () => {
+      const store = new ArtifactStore(join(await artifactRoot(), "data", "runs"));
+      const input = await store.createRunInput(address);
+      const path = join(input, `${kind}.artifact`);
+      await writeFile(path, "");
+      await truncate(path, limit);
+      await expect(store.read(path, limit)).resolves.toHaveLength(limit);
+
+      await truncate(path, limit + 1);
+      await expect(store.read(path, limit)).rejects.toThrow(
+        `artifact exceeds ${limit} byte limit`,
+      );
+    });
+  }
+});
 
 describe("run input artifacts", () => {
   test("uses exactly data/runs/{queue-sequence}/input and rejects invalid run sequences", async () => {

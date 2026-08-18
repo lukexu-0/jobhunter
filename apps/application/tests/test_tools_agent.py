@@ -194,7 +194,6 @@ def make_gate(
     *,
     publisher: EventPublisher | None = None,
     approved_origins: list[str] | None = None,
-    action_timeout: float = 1,
     review_snapshot: Any = None,
     user_info_store: Any = None,
     auto_submit: bool = False,
@@ -209,7 +208,6 @@ def make_gate(
         publish=publisher,
         review_snapshot=review_snapshot,
         auto_submit=auto_submit,
-        action_timeout=action_timeout,
     )
     return gate, publisher
 
@@ -219,7 +217,7 @@ async def test_sign_in_requester_cancellation_after_browser_mutation_resolves_ga
     tmp_path: Path,
 ) -> None:
     tmp_path.chmod(0o700)
-    gate, publisher = make_gate(action_timeout=5)
+    gate, publisher = make_gate()
     runtime = CredentialRuntime()
     credential_store = CredentialStore(tmp_path / "credentials.json")
     username = "person@example.test"
@@ -274,7 +272,7 @@ async def test_interrupt_does_not_release_running_sign_in_mutation(
     tmp_path: Path,
 ) -> None:
     tmp_path.chmod(0o700)
-    gate, publisher = make_gate(action_timeout=5)
+    gate, publisher = make_gate()
     runtime = CredentialRuntime()
     credential_store = CredentialStore(tmp_path / "credentials.json")
     username = "person@example.test"
@@ -320,7 +318,7 @@ async def test_failed_sign_in_does_not_replace_saved_credentials(
             raise RuntimeError("private browser failure")
 
     tmp_path.chmod(0o700)
-    gate, _publisher = make_gate(action_timeout=5)
+    gate, _publisher = make_gate()
     runtime = FailingCredentialRuntime()
     runtime.mutation_release.set()
     credential_store = CredentialStore(tmp_path / "credentials.json")
@@ -347,7 +345,7 @@ async def test_save_credentials_requester_cancellation_after_upsert_resolves_gat
     tmp_path: Path,
 ) -> None:
     tmp_path.chmod(0o700)
-    gate, publisher = make_gate(action_timeout=5)
+    gate, publisher = make_gate()
     runtime = CredentialRuntime()
     runtime.mutation_release.set()
     credential_store = PublicationBlockingCredentialStore(
@@ -523,7 +521,7 @@ async def test_interrupt_releases_every_pending_human_tool_gate(
         assert publisher.events[-1] == ("running", None, {})
         assert await gate.interrupt() is False
 
-    navigation_gate, navigation_publisher = make_gate(action_timeout=5)
+    navigation_gate, navigation_publisher = make_gate()
     navigation_task = asyncio.create_task(
         navigation_gate.request_human_navigation(
             "Complete the public checkpoint.",
@@ -537,7 +535,7 @@ async def test_interrupt_releases_every_pending_human_tool_gate(
         "navigation",
     )
 
-    credentials_gate, credentials_publisher = make_gate(action_timeout=5)
+    credentials_gate, credentials_publisher = make_gate()
     credentials_task = asyncio.create_task(
         credentials_gate.request_sign_in(
             username_ref="e1",
@@ -563,7 +561,7 @@ async def test_interrupt_releases_every_pending_human_tool_gate(
             "answer_type": "text",
         }
     )
-    additional_gate, additional_publisher = make_gate(action_timeout=5)
+    additional_gate, additional_publisher = make_gate()
     additional_task = asyncio.create_task(
         additional_gate.request_additional_info([question], FakeRuntime())
     )
@@ -574,7 +572,7 @@ async def test_interrupt_releases_every_pending_human_tool_gate(
         "additional_info",
     )
 
-    review_gate, review_publisher = make_gate(action_timeout=5)
+    review_gate, review_publisher = make_gate()
     review_task = asyncio.create_task(
         review_gate.request_human_review(make_result(), FakeRuntime())
     )
@@ -657,7 +655,7 @@ async def test_navigation_suspends_guard_before_gate_and_reinstalls_it_afterward
 
 
 @pytest.mark.asyncio
-async def test_navigation_cancel_and_timeout_return_structured_cancellation() -> None:
+async def test_navigation_waits_until_explicit_cancellation() -> None:
     private_values = tuple(make_candidate().direct_fields.values())
     publisher = EventPublisher()
     gate = HumanGate(
@@ -676,6 +674,9 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
     )
     pending = asyncio.create_task(gate.request_human_navigation("Log in.", runtime))
     await publisher.next_event()
+    await asyncio.sleep(0.01)
+    assert pending.done() is False
+
     await gate.cancel()
     cancelled = await pending
     payload = CancelledApplicationResult.model_validate_json(cancelled.extracted_content)
@@ -687,21 +688,8 @@ async def test_navigation_cancel_and_timeout_return_structured_cancellation() ->
     assert payload.final_url == "https://jobs.example/apply/[redacted]"
     assert all(value not in cancelled.extracted_content for value in private_values)
     assert payload.submit_attempted is False
-
-    runtime.current_url = "https://jobs.example:99999/private"
-
-    timeout_gate, timeout_publisher = make_gate(action_timeout=0.001)
-    timed_out = await timeout_gate.request_human_navigation("Wait for human.", runtime)
-    timeout_payload = CancelledApplicationResult.model_validate_json(
-        timed_out.extracted_content
-    )
-    assert timeout_publisher.events[0][0] == "awaiting_human_navigation"
-    assert timed_out.is_done is True
-    assert timed_out.success is False
-    assert timeout_payload.status == "cancelled"
-    assert timeout_payload.final_url == "https://jobs.example/openings/42"
     with pytest.raises(HarnessServiceError) as error:
-        await timeout_gate.continue_navigation()
+        await gate.continue_navigation()
     assert_conflict(error.value)
 
 

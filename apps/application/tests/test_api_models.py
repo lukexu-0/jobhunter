@@ -14,6 +14,8 @@ from pydantic import TypeAdapter, ValidationError
 
 from jobhunter_browser_harness.api import HarnessDependencies, create_app
 from jobhunter_browser_harness.models import (
+    APPLICATION_ANECDOTE_MAX_COUNT,
+    APPLICATION_CONTEXT_MAX_COUNT,
     SESSION_ERROR_MESSAGES,
     AdditionalInfoRuntimeActionResponse,
     ApplicationAnswerSuggestion,
@@ -73,11 +75,6 @@ from jobhunter_browser_harness.models import (
 TOKEN = "test-token-0123456789abcdef-0123456789"
 SESSION_ID = UUID("39bb70b2-5ea4-4937-8090-32d7404ad597")
 AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
-RUNTIME_ACTION_ID = UUID("6a3c94e7-2495-4d9e-88c4-3cd0a986542f")
-RUNTIME_AUTHORIZATION = {
-    **AUTHORIZATION,
-    "Idempotency-Key": str(RUNTIME_ACTION_ID),
-}
 COMMAND_ADAPTER = TypeAdapter(SessionCommand)
 RUNTIME_ACTION_ADAPTER = TypeAdapter(RuntimeActionRequest)
 RUNTIME_ACTION_RESPONSE_ADAPTER = TypeAdapter(RuntimeActionResponse)
@@ -109,7 +106,6 @@ def make_snapshot(**overrides: Any) -> SessionSnapshot:
                 "step": 1,
                 "status": "failed",
                 "exit_code": 7,
-                "timed_out": False,
                 "error_category": "process_exit",
                 "stderr_excerpt": "[redacted]",
                 "stderr_truncated": True,
@@ -139,7 +135,7 @@ class FakeSessionService:
     event_calls: list[tuple[UUID, int | None]] = field(default_factory=list)
     suggestion_calls: list[tuple[UUID, str]] = field(default_factory=list)
     command_calls: list[tuple[UUID, SessionCommand]] = field(default_factory=list)
-    runtime_action_calls: list[tuple[UUID, UUID, RuntimeActionRequest]] = field(
+    runtime_action_calls: list[tuple[UUID, RuntimeActionRequest]] = field(
         default_factory=list
     )
     runtime_action_response: RuntimeActionResponse = field(
@@ -214,20 +210,17 @@ class FakeSessionService:
         capture_id: UUID,
         job_url: str,
         approved_origins: Sequence[str],
-        timeout_seconds: int,
     ) -> SourceCaptureCreateResponse:
         self.source_capture_calls.append(
             {
                 "capture_id": capture_id,
                 "job_url": job_url,
                 "approved_origins": list(approved_origins),
-                "timeout_seconds": timeout_seconds,
             }
         )
         return SourceCaptureCreateResponse(
             capture_id=capture_id,
             state="awaiting_human_verification",
-            expires_at=NOW + timedelta(minutes=15),
         )
 
     async def complete_source_capture(
@@ -277,12 +270,11 @@ class FakeSessionService:
     async def runtime_action(
         self,
         session_id: UUID,
-        action_id: UUID,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse:
         if session_id != SESSION_ID:
             raise HarnessServiceError(404, "session_not_found", "Session not found")
-        self.runtime_action_calls.append((session_id, action_id, action))
+        self.runtime_action_calls.append((session_id, action))
         return self.runtime_action_response
 
     async def delete(self, session_id: UUID) -> None:
@@ -465,7 +457,6 @@ def test_origins_canonicalize_expanded_ipv6_like_whatwg_urls() -> None:
         capture_id=UUID("5cd2d80d-d615-4a56-a53e-01d174d6b88d"),
         job_url=f"https://[{expanded}]/jobs/1?verified=true",
         approved_origins=[f"https://[{expanded}]:443/"],
-        timeout_seconds=900,
     )
 
     assert validate_https_origin(
@@ -1163,7 +1154,6 @@ async def test_authenticated_source_capture_creation_dispatches_validated_reques
                 "brand-4/candidate/so/pm/1/pl/3/opp/1234-Engineer/en-GB"
             ),
             "approved_origins": ["https://jobs.tal.net"],
-            "timeout_seconds": 900,
         },
     )
 
@@ -1172,7 +1162,6 @@ async def test_authenticated_source_capture_creation_dispatches_validated_reques
     assert response.json() == {
         "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
         "state": "awaiting_human_verification",
-        "expires_at": "2026-07-13T12:15:00Z",
     }
     assert service.source_capture_calls == [
         {
@@ -1182,7 +1171,6 @@ async def test_authenticated_source_capture_creation_dispatches_validated_reques
                 "brand-4/candidate/so/pm/1/pl/3/opp/1234-Engineer/en-GB"
             ),
             "approved_origins": ["https://jobs.tal.net"],
-            "timeout_seconds": 900,
         }
     ]
 
@@ -1326,13 +1314,11 @@ def test_source_capture_urls_accept_4096_characters_and_reject_4097() -> None:
         capture_id=capture_id,
         job_url=maximum_origin,
         approved_origins=[maximum_origin],
-        timeout_seconds=900,
     ).approved_origins == [maximum_origin]
     assert SourceCaptureCreateRequest(
         capture_id=capture_id,
         job_url=maximum_job_url,
         approved_origins=["https://jobs.tal.net"],
-        timeout_seconds=900,
     ).job_url == maximum_job_url
 
     with pytest.raises(ValidationError):
@@ -1340,14 +1326,12 @@ def test_source_capture_urls_accept_4096_characters_and_reject_4097() -> None:
             capture_id=capture_id,
             job_url=maximum_origin + "a",
             approved_origins=[maximum_origin + "a"],
-            timeout_seconds=900,
         )
     with pytest.raises(ValidationError):
         SourceCaptureCreateRequest(
             capture_id=capture_id,
             job_url=maximum_job_url + "a",
             approved_origins=["https://jobs.tal.net"],
-            timeout_seconds=900,
         )
 
 
@@ -1358,31 +1342,27 @@ def test_source_capture_urls_accept_4096_characters_and_reject_4097() -> None:
             "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
             "job_url": "http://jobs.tal.net/application",
             "approved_origins": ["http://jobs.tal.net"],
-            "timeout_seconds": 900,
         },
         {
             "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
             "job_url": "https://jobs.tal.net./application",
             "approved_origins": ["https://jobs.tal.net"],
-            "timeout_seconds": 900,
         },
         {
             "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
             "job_url": "https://jobs.tal.net/application",
             "approved_origins": ["https://login.tal.net"],
-            "timeout_seconds": 900,
-        },
-        {
-            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
-            "job_url": "https://jobs.tal.net/application",
-            "approved_origins": ["https://jobs.tal.net"],
-            "timeout_seconds": 901,
         },
         {
             "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
             "job_url": "https://jobs.tal.net/application",
             "approved_origins": ["https://jobs.tal.net"],
             "timeout_seconds": 900,
+        },
+        {
+            "capture_id": "f4d9a10e-e63a-4ff5-9bf7-c2d054418979",
+            "job_url": "https://jobs.tal.net/application",
+            "approved_origins": ["https://jobs.tal.net"],
             "extra": "rejected",
         },
     ],
@@ -1578,8 +1558,10 @@ async def test_multipart_rejects_non_boolean_auto_submit_before_dispatch(
     ("parts", "expected_status"),
     [
         (multipart_parts(domains=[f"https://d{index}.example" for index in range(21)]), 422),
-        (multipart_parts(contexts=11), 422),
-        (multipart_parts(anecdotes=21), 422),
+        (multipart_parts(contexts=APPLICATION_CONTEXT_MAX_COUNT), 202),
+        (multipart_parts(contexts=APPLICATION_CONTEXT_MAX_COUNT + 1), 422),
+        (multipart_parts(anecdotes=APPLICATION_ANECDOTE_MAX_COUNT), 202),
+        (multipart_parts(anecdotes=APPLICATION_ANECDOTE_MAX_COUNT + 1), 422),
     ],
 )
 async def test_multipart_count_validation(
@@ -1644,7 +1626,6 @@ async def test_snapshot_get_returns_sanitized_public_model(
             "step": 1,
             "status": "failed",
             "exit_code": 7,
-            "timed_out": False,
             "error_category": "process_exit",
             "stderr_excerpt": "[redacted]",
             "stderr_truncated": True,
@@ -1655,6 +1636,31 @@ async def test_snapshot_get_returns_sanitized_public_model(
         PlaywrightCliDiagnostic,
     )
     assert service.snapshot_calls == [SESSION_ID]
+
+
+@pytest.mark.parametrize(
+    "removed_field",
+    [
+        {"timed_out": False},
+        {"status": "timed_out"},
+        {"error_category": "execution_timeout"},
+        {"error_category": "session_timeout"},
+    ],
+)
+def test_playwright_diagnostic_rejects_removed_timeout_contract(
+    removed_field: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "step": 1,
+        "status": "succeeded",
+        "exit_code": 0,
+        "error_category": None,
+        "stderr_excerpt": None,
+        "stderr_truncated": False,
+    }
+    payload.update(removed_field)
+    with pytest.raises(ValidationError):
+        PlaywrightCliDiagnostic.model_validate(payload)
 
 
 async def test_private_suggestions_get_is_authenticated_strict_and_public_safe(
@@ -2137,7 +2143,7 @@ def test_playwright_cli_runtime_action_rejects_prohibited_commands(
         ),
     ],
 )
-async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
+async def test_runtime_action_endpoint_dispatches_strict_typed_actions_without_extra_headers(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
     payload: dict[str, Any],
     action_type: type[RuntimeActionRequest],
@@ -2146,7 +2152,7 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
 
     response = await client.post(
         f"/v1/sessions/{SESSION_ID}/runtime/actions",
-        headers=RUNTIME_AUTHORIZATION,
+        headers=AUTHORIZATION,
         json=payload,
     )
 
@@ -2154,41 +2160,10 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions(
     assert response.json() == {"type": "continue"}
     assert response.headers["cache-control"] == "no-store"
     assert len(service.runtime_action_calls) == 1
-    dispatched_id, dispatched_action_id, dispatched = service.runtime_action_calls[0]
+    dispatched_id, dispatched = service.runtime_action_calls[0]
     assert dispatched_id == SESSION_ID
-    assert dispatched_action_id == RUNTIME_ACTION_ID
     assert isinstance(dispatched, action_type)
 
-@pytest.mark.parametrize(
-    "idempotency_key",
-    [
-        None,
-        "not-a-uuid",
-        str(RUNTIME_ACTION_ID).upper(),
-        RUNTIME_ACTION_ID.hex,
-    ],
-)
-async def test_runtime_action_endpoint_requires_canonical_uuid_idempotency_key(
-    api_client: tuple[httpx.AsyncClient, FakeSessionService],
-    idempotency_key: str | None,
-) -> None:
-    client, service = api_client
-    headers = dict(AUTHORIZATION)
-    if idempotency_key is not None:
-        headers["Idempotency-Key"] = idempotency_key
-
-    response = await client.post(
-        f"/v1/sessions/{SESSION_ID}/runtime/actions",
-        headers=headers,
-        json={"type": "report_application_mismatch"},
-    )
-
-    assert response.status_code == 422
-    assert response.json() == {
-        "code": "invalid_request",
-        "message": "Request is invalid",
-    }
-    assert service.runtime_action_calls == []
 
 async def test_request_sign_in_endpoint_returns_only_attempt_status(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
@@ -2201,7 +2176,7 @@ async def test_request_sign_in_endpoint_returns_only_attempt_status(
 
     response = await client.post(
         f"/v1/sessions/{SESSION_ID}/runtime/actions",
-        headers=RUNTIME_AUTHORIZATION,
+        headers=AUTHORIZATION,
         json={
             "type": "request_sign_in",
             "username_ref": "f2e248",
@@ -2303,7 +2278,7 @@ async def test_runtime_action_endpoint_rejects_invalid_union_without_dispatch(
 
     response = await client.post(
         f"/v1/sessions/{SESSION_ID}/runtime/actions",
-        headers=RUNTIME_AUTHORIZATION,
+        headers=AUTHORIZATION,
         json=payload,
     )
 
@@ -2347,7 +2322,6 @@ def test_sign_in_runtime_response_projects_only_status() -> None:
                 "type": "submit_application_result",
                 "pre_click_dom": "button Final submit",
                 "exit_code": 0,
-                "timed_out": False,
                 "stdout": "",
                 "stderr": "",
                 "stdout_truncated": False,
@@ -2404,7 +2378,6 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
         PlaywrightCliExecutionResult.model_validate(
             {
                 "exit_code": 0,
-                "timed_out": False,
                 "stdout": "",
                 "stderr": "",
                 "stdout_truncated": False,
@@ -2435,7 +2408,6 @@ def test_rejects_removed_candidate_question_preflight_contract() -> None:
         {
             "type": "playwright_cli_result",
             "exit_code": 0,
-            "timed_out": False,
             "stdout": "ok",
             "stderr": "",
             "stdout_truncated": False,

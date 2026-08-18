@@ -13,10 +13,7 @@ import {
   type SourceCaptureHarnessClient,
 } from "./application-harness-client.ts";
 
-export const SOURCE_HANDOFF_TIMEOUT_SECONDS = 900 as const;
-const SOURCE_HANDOFF_TIMEOUT_MS = SOURCE_HANDOFF_TIMEOUT_SECONDS * 1_000;
 const CAPTURE_CLEANUP_TIMEOUT_MS = 10_000;
-const CAPTURE_CLEANUP_RETRY_MS = 1_000;
 
 export type SourceHandoffErrorCode =
   | "SOURCE_HANDOFF_INVALID_URL"
@@ -71,7 +68,6 @@ export interface SourceHandoffServiceDependencies {
   readonly runs: SourceHandoffRunService;
   readonly harness?: SourceCaptureHarnessClient;
   readonly idFactory?: () => string;
-  readonly now?: () => number;
 }
 
 type ActiveSourceHandoffPhase =
@@ -79,35 +75,27 @@ type ActiveSourceHandoffPhase =
   | "awaiting"
   | "completing"
   | "cancelling"
-  | "expiring"
   | "closing";
 
 interface ActiveSourceHandoff {
   readonly id: string;
   readonly request: CreateSourceHandoffRequest;
   readonly approvedOrigins: readonly [string];
-  expiresAt: number;
   phase: ActiveSourceHandoffPhase;
-  timer?: NodeJS.Timeout;
   readonly controller: AbortController;
   captureClosed: boolean;
   captureCleanup?: Promise<void>;
   creation?: Promise<SourceHandoffDto>;
   completion?: Promise<RunDto>;
-  expiryCleanup?: Promise<void>;
-  cleanupRetryTimer?: NodeJS.Timeout;
 }
 
 interface CompletedSourceHandoff {
   readonly id: string;
   readonly run: RunDto;
-  readonly expiresAt: number;
-  timer?: NodeJS.Timeout;
 }
 
 export class SourceHandoffService {
   readonly #idFactory: () => string;
-  readonly #now: () => number;
   #active: ActiveSourceHandoff | undefined;
   #completed: CompletedSourceHandoff | undefined;
   #closed = false;
@@ -115,7 +103,6 @@ export class SourceHandoffService {
 
   constructor(private readonly dependencies: SourceHandoffServiceDependencies) {
     this.#idFactory = dependencies.idFactory ?? randomUUID;
-    this.#now = dependencies.now ?? Date.now;
   }
 
   async create(
@@ -128,7 +115,6 @@ export class SourceHandoffService {
       throw new SourceHandoffError("SOURCE_HANDOFF_INVALID_URL");
     }
 
-    this.#expireIfNeeded();
     if (this.#closed || this.dependencies.harness === undefined) {
       throw new SourceHandoffError("SOURCE_HANDOFF_UNAVAILABLE");
     }
@@ -144,7 +130,6 @@ export class SourceHandoffService {
       throw new SourceHandoffError("SOURCE_HANDOFF_INVALID_URL");
     }
 
-    this.#expireIfNeeded();
     if (this.#closed || this.dependencies.harness === undefined) {
       throw new SourceHandoffError("SOURCE_HANDOFF_UNAVAILABLE");
     }
@@ -158,13 +143,11 @@ export class SourceHandoffService {
       id,
       request: validatedRequest,
       approvedOrigins: [new URL(validatedRequest.jobUrl).origin],
-      expiresAt: this.#now() + SOURCE_HANDOFF_TIMEOUT_MS,
       phase: "opening",
       controller: new AbortController(),
       captureClosed: false,
     };
     this.#active = active;
-    this.#armExpiry(active);
     return await this.#startCreation(active);
   }
 
@@ -172,11 +155,7 @@ export class SourceHandoffService {
     active: ActiveSourceHandoff,
     request: CreateSourceHandoffRequest,
   ): Promise<SourceHandoffDto> {
-    if (
-      active.phase === "expiring"
-      || active.phase === "cancelling"
-      || active.phase === "closing"
-    ) {
+    if (active.phase === "cancelling" || active.phase === "closing") {
       throw new SourceHandoffError("SOURCE_HANDOFF_CONFLICT");
     }
     const identical = active.request.jobUrl === request.jobUrl
@@ -204,11 +183,10 @@ export class SourceHandoffService {
 
   async #open(active: ActiveSourceHandoff): Promise<SourceHandoffDto> {
     try {
-      const created = await this.dependencies.harness!.createSourceCapture({
+      await this.dependencies.harness!.createSourceCapture({
         captureId: active.id,
         jobUrl: active.request.jobUrl,
         approvedOrigins: active.approvedOrigins,
-        timeoutSeconds: SOURCE_HANDOFF_TIMEOUT_SECONDS,
       }, active.controller.signal);
       if (
         this.#closed
@@ -217,15 +195,7 @@ export class SourceHandoffService {
       ) {
         throw new SourceCaptureHarnessError("unavailable");
       }
-      active.expiresAt = Math.min(active.expiresAt, created.expiresAt);
-      if (
-        !Number.isSafeInteger(active.expiresAt)
-        || active.expiresAt <= this.#now()
-      ) {
-        throw new SourceCaptureHarnessError("invalid_response");
-      }
       active.phase = "awaiting";
-      this.#armExpiry(active);
       return this.#dto(active);
     } catch (error) {
       if (
@@ -250,7 +220,6 @@ export class SourceHandoffService {
   }
 
   async get(id: string): Promise<SourceHandoffDto> {
-    this.#expireIfNeeded();
     return this.#dto(this.#requireVisible(id));
   }
 
@@ -258,7 +227,6 @@ export class SourceHandoffService {
     const completed = this.#completedResult(id);
     if (completed !== undefined) return completed;
     signal?.throwIfAborted();
-    this.#expireIfNeeded();
     const active = this.#requireVisible(id);
     if (active.phase === "completing" && active.completion !== undefined) {
       return await this.#awaitCompletion(active.completion, signal);
@@ -307,10 +275,6 @@ export class SourceHandoffService {
       if (active.phase === "cancelling" || active.phase === "closing") {
         throw active.controller.signal.reason
           ?? new DOMException("Source handoff completion was aborted", "AbortError");
-      }
-      if (active.phase === "expiring") {
-        await active.expiryCleanup?.catch(() => undefined);
-        throw new SourceHandoffError("SOURCE_HANDOFF_NOT_FOUND");
       }
       if (
         error instanceof SourceCaptureHarnessError
@@ -373,17 +337,13 @@ export class SourceHandoffService {
         operationSignal,
       );
     } catch (error) {
-      if (active.phase === "expiring") {
-        await active.expiryCleanup?.catch(() => undefined);
-        throw new SourceHandoffError("SOURCE_HANDOFF_NOT_FOUND");
-      }
       this.#resumeAwaiting(active, "completing");
       throw error;
     }
 
     try {
       if (!this.#closed) {
-        this.#cacheCompleted(active.id, run, active.expiresAt);
+        this.#cacheCompleted(active.id, run);
         this.dependencies.runs.kick();
       }
       return run;
@@ -394,7 +354,6 @@ export class SourceHandoffService {
   }
 
   async delete(id: string): Promise<void> {
-    this.#expireIfNeeded();
     const active = this.#requireVisible(id);
     if (active.phase === "completing") {
       active.phase = "cancelling";
@@ -431,7 +390,7 @@ export class SourceHandoffService {
     const active = this.#active;
     if (active === undefined) return;
 
-    if (active.phase !== "expiring") active.phase = "closing";
+    active.phase = "closing";
     active.controller.abort(
       new DOMException("Source handoff service is closing", "AbortError"),
     );
@@ -457,7 +416,6 @@ export class SourceHandoffService {
       active === undefined
       || active.id !== id
       || active.phase === "opening"
-      || active.phase === "expiring"
       || active.phase === "cancelling"
       || active.phase === "closing"
     ) {
@@ -471,17 +429,7 @@ export class SourceHandoffService {
       id: active.id,
       state: "awaiting_human_verification",
       jobUrl: active.request.jobUrl,
-      expiresAt: active.expiresAt,
     });
-  }
-
-  #armExpiry(active: ActiveSourceHandoff): void {
-    clearTimeout(active.timer);
-    const delay = Math.max(0, active.expiresAt - this.#now());
-    active.timer = setTimeout(() => {
-      this.#beginExpiry(active);
-    }, delay);
-    active.timer.unref?.();
   }
 
   #resumeAwaiting(
@@ -490,75 +438,6 @@ export class SourceHandoffService {
   ): void {
     if (this.#active !== active || active.phase !== from) return;
     active.phase = "awaiting";
-    if (active.expiresAt <= this.#now()) {
-      this.#beginExpiry(active);
-    } else {
-      this.#armExpiry(active);
-    }
-  }
-
-  #expireIfNeeded(): void {
-    const active = this.#active;
-    if (
-      active !== undefined
-      && active.expiresAt <= this.#now()
-    ) {
-      this.#beginExpiry(active);
-    }
-  }
-
-  #beginExpiry(active: ActiveSourceHandoff): void {
-    if (
-      this.#active !== active
-      || (
-        active.phase !== "opening"
-        && active.phase !== "awaiting"
-        && active.phase !== "completing"
-      )
-    ) {
-      return;
-    }
-    active.phase = "expiring";
-    if (active.timer !== undefined) {
-      clearTimeout(active.timer);
-      delete active.timer;
-    }
-    active.controller.abort(
-      new DOMException("Source handoff expired", "TimeoutError"),
-    );
-    this.#runExpiryCleanup(active);
-  }
-
-  #runExpiryCleanup(active: ActiveSourceHandoff): void {
-    if (this.#active !== active || active.phase !== "expiring") return;
-    const cleanup = this.#ensureCaptureClosed(active);
-    active.expiryCleanup = cleanup;
-    void cleanup.then(
-      () => {
-        this.#clear(active);
-      },
-      () => {
-        this.#scheduleExpiryCleanupRetry(active);
-      },
-    ).finally(() => {
-      if (active.expiryCleanup === cleanup) delete active.expiryCleanup;
-    });
-  }
-
-  #scheduleExpiryCleanupRetry(active: ActiveSourceHandoff): void {
-    if (
-      this.#closed
-      || this.#active !== active
-      || active.phase !== "expiring"
-      || active.cleanupRetryTimer !== undefined
-    ) {
-      return;
-    }
-    active.cleanupRetryTimer = setTimeout(() => {
-      delete active.cleanupRetryTimer;
-      this.#runExpiryCleanup(active);
-    }, CAPTURE_CLEANUP_RETRY_MS);
-    active.cleanupRetryTimer.unref?.();
   }
 
   async #ensureCaptureClosed(active: ActiveSourceHandoff): Promise<void> {
@@ -596,42 +475,20 @@ export class SourceHandoffService {
     }
   }
 
-  #cacheCompleted(id: string, run: RunDto, expiresAt: number): void {
-    this.#clearCompleted();
-    const delay = expiresAt - this.#now();
-    if (delay <= 0) return;
-    const completed: CompletedSourceHandoff = { id, run, expiresAt };
-    completed.timer = setTimeout(() => {
-      if (this.#completed === completed) this.#clearCompleted();
-    }, delay);
-    completed.timer.unref?.();
-    this.#completed = completed;
+  #cacheCompleted(id: string, run: RunDto): void {
+    this.#completed = { id, run };
   }
 
   #completedResult(id: string): RunDto | undefined {
     const completed = this.#completed;
-    if (completed === undefined) return undefined;
-    if (completed.expiresAt <= this.#now()) {
-      this.#clearCompleted();
-      return undefined;
-    }
-    return completed.id === id ? completed.run : undefined;
+    return completed?.id === id ? completed.run : undefined;
   }
 
   #clearCompleted(): void {
-    clearTimeout(this.#completed?.timer);
     this.#completed = undefined;
   }
 
   #clear(active: ActiveSourceHandoff): void {
-    if (active.timer !== undefined) {
-      clearTimeout(active.timer);
-      delete active.timer;
-    }
-    if (active.cleanupRetryTimer !== undefined) {
-      clearTimeout(active.cleanupRetryTimer);
-      delete active.cleanupRetryTimer;
-    }
     if (this.#active === active) this.#active = undefined;
   }
 

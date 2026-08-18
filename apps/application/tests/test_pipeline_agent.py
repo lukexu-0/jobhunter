@@ -176,6 +176,7 @@ async def test_check_ready_uses_exact_authenticated_path_and_hardened_transport(
     assert request.content == b""
     assert harness.construction["headers"] == {"Authorization": f"Bearer {_TOKEN}"}
     assert harness.construction["trust_env"] is False
+    assert harness.construction["timeout"] is None
 
 
 @pytest.mark.parametrize(
@@ -185,7 +186,7 @@ async def test_check_ready_uses_exact_authenticated_path_and_hardened_transport(
         ("networking_event", '"opportunityKind":"networking_event",'),
     ],
 )
-async def test_run_posts_exact_contract_with_deadline_transport_timeout(
+async def test_run_posts_exact_contract_without_transport_deadline(
     build_client: Callable[..., ClientHarness],
     opportunity_kind: str,
     expected_kind_json: str,
@@ -210,10 +211,10 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
     assert request.headers["Authorization"] == f"Bearer {_TOKEN}"
     assert request.headers["Content-Type"] == "application/json"
     assert request.extensions["timeout"] == {
-        "connect": 72.345,
-        "read": 72.345,
-        "write": 72.345,
-        "pool": 72.345,
+        "connect": None,
+        "read": None,
+        "write": None,
+        "pool": None,
     }
     assert request.read().decode("utf-8") == (
         '{"sessionId":"52aa48d2-c3c8-40df-80de-d213631a04aa",'
@@ -245,10 +246,10 @@ async def test_steer_posts_exact_authenticated_path_body_and_requires_empty_202(
     assert request.headers["Content-Type"] == "application/json"
     assert request.read() == b'{"message":"Prefer the operator-updated location."}'
     assert request.extensions["timeout"] == {
-        "connect": 5.0,
-        "read": 5.0,
-        "write": 5.0,
-        "pool": 5.0,
+        "connect": None,
+        "read": None,
+        "write": None,
+        "pool": None,
     }
 
 
@@ -604,7 +605,6 @@ async def test_malformed_success_or_status_json_is_fixed_and_sanitized(
             "oauth_required",
             "Connect OpenAI Codex in Provider access",
         ),
-        (504, "MODEL_TIMEOUT", "model_timeout", "The model request timed out"),
         (
             502,
             "INVALID_MODEL_OUTPUT",
@@ -734,7 +734,7 @@ async def test_unauthorized_run_is_pipeline_unavailable_without_body_leakage(
     )
 
 
-async def test_run_transport_timeout_is_fixed_and_sanitized(
+async def test_run_transport_timeout_is_pipeline_unavailable_and_sanitized(
     build_client: Callable[..., ClientHarness],
 ) -> None:
     secret = "private-timeout-detail"
@@ -747,8 +747,8 @@ async def test_run_transport_timeout_is_fixed_and_sanitized(
         await _run(harness.agent)
     _assert_public_error(
         raised.value,
-        "model_timeout",
-        "The model request timed out",
+        "pipeline_unavailable",
+        "The local pipeline model service is unavailable",
         secret,
     )
 
@@ -889,7 +889,10 @@ async def test_run_rejects_non_loopback_runtime_origin_before_request(
     [
         ({"opportunity_kind": "internship"}, "opportunity_kind is invalid"),
         ({"auto_submit": 1}, "auto_submit is invalid"),
-        ({"task": "a" * (1_048_576 + 1)}, "task is invalid"),
+        (
+            {"task": "a" * (pipeline_agent_module._MAX_APPLICATION_TASK_BYTES + 1)},
+            "task is invalid",
+        ),
         ({"task": b"not text"}, "task is invalid"),
         ({"deadline_ms": 999}, "deadline_ms is invalid"),
         ({"deadline_ms": 86_400_001}, "deadline_ms is invalid"),

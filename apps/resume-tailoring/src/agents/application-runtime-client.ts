@@ -345,7 +345,6 @@ export type BrowserObservation = z.infer<typeof BrowserObservationSchema>;
 
 export const PlaywrightCliExecutionResultSchema = z.object({
   exit_code: z.number().int(),
-  timed_out: z.boolean(),
   stdout: z.string().refine((value) => hasCodePointLength(value, 0, 20_000)),
   stderr: z.string().refine((value) => hasCodePointLength(value, 0, 20_000)),
   stdout_truncated: z.boolean(),
@@ -503,7 +502,6 @@ export type RuntimeActionResponse = z.infer<typeof RuntimeActionResponseSchema>;
 
 export type ApplicationRuntimeErrorCode =
   | "browser_failed"
-  | "model_timeout"
   | "model_failed"
   | "invalid_request";
 
@@ -534,13 +532,11 @@ function isSanitizedBasename(value: string): boolean {
 
 const ERROR_MESSAGES: Readonly<Record<ApplicationRuntimeErrorCode, string>> = {
   browser_failed: "The browser session failed",
-  model_timeout: "The model request timed out",
   model_failed: "The model request failed",
   invalid_request: "Request is invalid",
 };
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
-const MAX_TIMEOUT_MS = 86_400_000;
 const RuntimeErrorEnvelopeSchema = z.object({
   code: z.string(),
   message: z.string(),
@@ -557,7 +553,7 @@ export class ApplicationRuntimeError extends Error {
 }
 
 export interface ApplicationRuntimeClient {
-  action(input: RuntimeActionRequest, signal: AbortSignal, timeoutMs: number): Promise<RuntimeActionResponse>;
+  action(input: RuntimeActionRequest, signal: AbortSignal): Promise<RuntimeActionResponse>;
 }
 
 export type ApplicationRuntimeFetch = (
@@ -565,39 +561,6 @@ export type ApplicationRuntimeFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-export type ApplicationRuntimeAttemptFailureCategory =
-  | "transport_error"
-  | "redirect_response"
-  | "response_read_error"
-  | "http_error"
-  | "invalid_request"
-  | "invalid_response";
-
-export interface ApplicationRuntimeAttemptFailureDiagnostic {
-  readonly event: "application_runtime_attempt_failure";
-  readonly sessionId: string;
-  readonly actionId: string;
-  readonly actionType: RuntimeActionRequest["type"];
-  readonly attempt: number;
-  readonly maxAttempts: 4;
-  readonly retrying: boolean;
-  readonly failureCategory: ApplicationRuntimeAttemptFailureCategory;
-  readonly statusCode?: number;
-}
-
-export type ApplicationRuntimeAttemptDiagnosticSink = (
-  diagnostic: ApplicationRuntimeAttemptFailureDiagnostic,
-) => void | PromiseLike<void>;
-
-export type ApplicationRuntimeRetryWait = (
-  delayMs: number,
-  signal: AbortSignal,
-) => void | PromiseLike<void>;
-
-export interface HttpApplicationRuntimeClientOptions {
-  readonly diagnosticSink?: ApplicationRuntimeAttemptDiagnosticSink;
-  readonly wait?: ApplicationRuntimeRetryWait;
-}
 
 function normalizeRuntimeOrigin(value: string): string {
   let url: URL;
@@ -636,69 +599,6 @@ async function abortable<T>(work: PromiseLike<T> | T, signal: AbortSignal): Prom
   }
 }
 
-function defaultApplicationRuntimeAttemptDiagnosticSink(
-  diagnostic: ApplicationRuntimeAttemptFailureDiagnostic,
-): void {
-  console.error(JSON.stringify(diagnostic));
-}
-
-function reportApplicationRuntimeAttemptFailure(
-  sink: ApplicationRuntimeAttemptDiagnosticSink,
-  diagnostic: ApplicationRuntimeAttemptFailureDiagnostic,
-): void {
-  try {
-    const result = sink(diagnostic);
-    if (result !== undefined) {
-      void Promise.resolve(result).catch(() => undefined);
-    }
-  } catch {
-    // Diagnostics must never alter the fixed application runtime failure.
-  }
-}
-
-function waitForApplicationRuntimeRetry(
-  delayMs: number,
-  signal: AbortSignal,
-): Promise<void> {
-  signal.throwIfAborted();
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
-  const onAbort = () => {
-    clearTimeout(timeout);
-    signal.removeEventListener("abort", onAbort);
-    reject(signal.reason);
-  };
-  const timeout = setTimeout(() => {
-    signal.removeEventListener("abort", onAbort);
-    resolve();
-  }, delayMs);
-  signal.addEventListener("abort", onAbort, { once: true });
-  return promise;
-}
-
-class RetryableApplicationRuntimeFailure extends Error {
-  readonly category: ApplicationRuntimeAttemptFailureCategory;
-  readonly statusCode: number | undefined;
-
-  constructor(
-    category: ApplicationRuntimeAttemptFailureCategory,
-    statusCode?: number,
-  ) {
-    super(category);
-    this.name = "RetryableApplicationRuntimeFailure";
-    this.category = category;
-    this.statusCode = statusCode;
-  }
-}
-
-class ApplicationRuntimeInvalidRequestFailure extends Error {
-  readonly category = "invalid_request" as const;
-  readonly statusCode = 422 as const;
-
-  constructor() {
-    super("invalid_request");
-    this.name = "ApplicationRuntimeInvalidRequestFailure";
-  }
-}
 
 async function cancelResponseBody(
   response: Response,
@@ -756,23 +656,17 @@ async function readBoundedJson(response: Response, signal: AbortSignal): Promise
   }
 }
 
-const MAX_RUNTIME_ACTION_ATTEMPTS = 4 as const;
-const RUNTIME_ACTION_RETRY_DELAYS_MS = [250, 500, 1_000] as const;
 
 export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
   readonly #endpoint: string;
-  readonly #sessionId: string;
   readonly #bearerToken: string;
   readonly #fetch: ApplicationRuntimeFetch;
-  readonly #diagnosticSink: ApplicationRuntimeAttemptDiagnosticSink;
-  readonly #wait: ApplicationRuntimeRetryWait;
 
   constructor(
     runtimeUrl: string,
     sessionId: string,
     bearerToken: string,
     fetchImpl: ApplicationRuntimeFetch = fetch,
-    options: HttpApplicationRuntimeClientOptions = {},
   ) {
     const runtimeOrigin = normalizeRuntimeOrigin(runtimeUrl);
     if (
@@ -780,100 +674,24 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
       || typeof bearerToken !== "string"
       || bearerToken.length < 32
       || typeof fetchImpl !== "function"
-      || (
-        options.diagnosticSink !== undefined
-        && typeof options.diagnosticSink !== "function"
-      )
-      || (options.wait !== undefined && typeof options.wait !== "function")
     ) {
       throw new ApplicationRuntimeError("model_failed");
     }
     this.#endpoint = `${runtimeOrigin}/v1/sessions/${sessionId}/runtime/actions`;
-    this.#sessionId = sessionId;
     this.#bearerToken = bearerToken;
     this.#fetch = fetchImpl;
-    this.#diagnosticSink = options.diagnosticSink
-      ?? defaultApplicationRuntimeAttemptDiagnosticSink;
-    this.#wait = options.wait ?? waitForApplicationRuntimeRetry;
   }
 
   async action(
     input: RuntimeActionRequest,
-    callerSignal: AbortSignal,
-    timeoutMs: number,
+    signal: AbortSignal,
   ): Promise<RuntimeActionResponse> {
     const parsedInput = RuntimeActionRequestSchema.safeParse(input);
-    if (
-      !parsedInput.success
-      || !Number.isSafeInteger(timeoutMs)
-      || timeoutMs < 1
-      || timeoutMs > MAX_TIMEOUT_MS
-    ) {
+    if (!parsedInput.success) {
       throw new ApplicationRuntimeError("model_failed");
     }
-    callerSignal.throwIfAborted();
-    const signal = AbortSignal.any([callerSignal, AbortSignal.timeout(timeoutMs)]);
-    const actionId = crypto.randomUUID();
+    signal.throwIfAborted();
     const requestBody = JSON.stringify(parsedInput.data);
-
-    for (let attempt = 1; attempt <= MAX_RUNTIME_ACTION_ATTEMPTS; attempt += 1) {
-      try {
-        return await this.#performAttempt(requestBody, signal, actionId);
-      } catch (error) {
-        if (signal.aborted) throw signal.reason;
-        if (error instanceof ApplicationRuntimeInvalidRequestFailure) {
-          reportApplicationRuntimeAttemptFailure(
-            this.#diagnosticSink,
-            {
-              event: "application_runtime_attempt_failure",
-              sessionId: this.#sessionId,
-              actionId,
-              actionType: parsedInput.data.type,
-              attempt,
-              maxAttempts: MAX_RUNTIME_ACTION_ATTEMPTS,
-              retrying: false,
-              failureCategory: error.category,
-              statusCode: error.statusCode,
-            },
-          );
-          throw new ApplicationRuntimeError("invalid_request");
-        }
-        if (!(error instanceof RetryableApplicationRuntimeFailure)) throw error;
-
-        const retrying = attempt < MAX_RUNTIME_ACTION_ATTEMPTS;
-        const baseDiagnostic = {
-          event: "application_runtime_attempt_failure",
-          sessionId: this.#sessionId,
-          actionId,
-          actionType: parsedInput.data.type,
-          attempt,
-          maxAttempts: MAX_RUNTIME_ACTION_ATTEMPTS,
-          retrying,
-          failureCategory: error.category,
-        } as const;
-        reportApplicationRuntimeAttemptFailure(
-          this.#diagnosticSink,
-          error.statusCode === undefined
-            ? baseDiagnostic
-            : { ...baseDiagnostic, statusCode: error.statusCode },
-        );
-        if (!retrying) {
-          throw new ApplicationRuntimeError("model_failed");
-        }
-        await abortable(
-          this.#wait(RUNTIME_ACTION_RETRY_DELAYS_MS[attempt - 1]!, signal),
-          signal,
-        );
-      }
-    }
-    throw new ApplicationRuntimeError("model_failed");
-  }
-
-  async #performAttempt(
-    requestBody: string,
-    signal: AbortSignal,
-    actionId: string,
-  ): Promise<RuntimeActionResponse> {
     let response: Response;
     try {
       response = await abortable(this.#fetch(this.#endpoint, {
@@ -883,7 +701,6 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
           accept: "application/json",
           authorization: `Bearer ${this.#bearerToken}`,
           "content-type": "application/json",
-          "Idempotency-Key": actionId,
         },
         body: requestBody,
         signal,
@@ -892,27 +709,21 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
       } as RequestInit & { timeout: false }), signal);
     } catch {
       if (signal.aborted) throw signal.reason;
-      throw new RetryableApplicationRuntimeFailure("transport_error");
+      throw new ApplicationRuntimeError("model_failed");
     }
     if (!(response instanceof Response)) {
-      throw new RetryableApplicationRuntimeFailure("invalid_response");
+      throw new ApplicationRuntimeError("model_failed");
     }
     if (response.redirected || (response.status >= 300 && response.status < 400)) {
       await cancelResponseBody(response, signal);
-      throw new RetryableApplicationRuntimeFailure(
-        "redirect_response",
-        response.status,
-      );
+      throw new ApplicationRuntimeError("model_failed");
     }
     let body: unknown;
     try {
       body = await readBoundedJson(response, signal);
     } catch {
       if (signal.aborted) throw signal.reason;
-      throw new RetryableApplicationRuntimeFailure(
-        "response_read_error",
-        response.status,
-      );
+      throw new ApplicationRuntimeError("model_failed");
     }
     if (!response.ok) {
       const parsedError = RuntimeErrorEnvelopeSchema.safeParse(body);
@@ -921,22 +732,19 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
         && parsedError.success
         && parsedError.data.code === "invalid_request"
       ) {
-        throw new ApplicationRuntimeInvalidRequestFailure();
+        throw new ApplicationRuntimeError("invalid_request");
       }
       if (parsedError.success && parsedError.data.code === "browser_failed") {
         throw new ApplicationRuntimeError("browser_failed");
       }
       if (parsedError.success && parsedError.data.code === "session_timeout") {
-        throw new ApplicationRuntimeError("model_timeout");
+        throw new ApplicationRuntimeError("model_failed");
       }
-      throw new RetryableApplicationRuntimeFailure("http_error", response.status);
+      throw new ApplicationRuntimeError("model_failed");
     }
     const parsedResponse = RuntimeActionResponseSchema.safeParse(body);
     if (!parsedResponse.success) {
-      throw new RetryableApplicationRuntimeFailure(
-        "invalid_response",
-        response.status,
-      );
+      throw new ApplicationRuntimeError("model_failed");
     }
     return parsedResponse.data;
   }

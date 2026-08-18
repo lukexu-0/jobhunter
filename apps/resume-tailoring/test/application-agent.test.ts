@@ -14,6 +14,7 @@ import {
 import {
   ApplicationAgentFailure,
   ApplicationAgentRunInputSchema,
+  MAX_APPLICATION_TASK_BYTES,
   ApplicationRunResultSchema,
   runApplicationAgent,
   runNonJobApplicationAgent,
@@ -21,6 +22,9 @@ import {
   type ApplicationAgentDependencies,
   type BrowserApplicationContext,
 } from "../src/agents/application-agent.ts";
+import {
+  MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
+} from "../src/agents/application-history.ts";
 import {
   APPLICATION_AGENT_STEERING_PREFIX,
   ApplicationAgentSteeringInbox,
@@ -36,8 +40,6 @@ import {
   createApplicationAgentRoutes,
 } from "../src/api/application-agent-routes.ts";
 import {
-  AgentDeadlineError,
-  MAX_AGENT_TRANSCRIPT_BYTES,
   type AgentRunner,
   type AgentRunOptions,
 } from "../src/agents/runner.ts";
@@ -70,7 +72,6 @@ const CANCELLED_RESULT = {
 const PRE_SUBMISSION_EXECUTION_RESULT = {
   type: "playwright_cli_result" as const,
   exit_code: 0,
-  timed_out: false,
   stdout: "form inspected",
   stderr: "",
   stdout_truncated: false,
@@ -89,7 +90,6 @@ const PRE_SUBMISSION_EXECUTION_RESULT = {
 const SUBMIT_EXECUTION_RESULT = {
   type: "playwright_cli_result" as const,
   exit_code: 0,
-  timed_out: false,
   stdout: "clicked submit",
   stderr: "",
   stdout_truncated: false,
@@ -342,10 +342,17 @@ describe("application agent", () => {
     const { autoSubmit: _autoSubmit, ...missingMode } = input;
     expect(() => ApplicationAgentRunInputSchema.parse(missingMode)).toThrow();
     expect(() => ApplicationAgentRunInputSchema.parse({ ...input, runtimeUrl: "https://example.com" })).toThrow();
-    expect(() => ApplicationAgentRunInputSchema.parse({ ...input, task: "x".repeat(1024 * 1024 + 1) })).toThrow();
+    expect(ApplicationAgentRunInputSchema.parse({
+      ...input,
+      task: "x".repeat(MAX_APPLICATION_TASK_BYTES),
+    }).task).toHaveLength(MAX_APPLICATION_TASK_BYTES);
     expect(() => ApplicationAgentRunInputSchema.parse({
       ...input,
-      task: "é".repeat(512 * 1024 + 1),
+      task: "x".repeat(MAX_APPLICATION_TASK_BYTES + 1),
+    })).toThrow();
+    expect(() => ApplicationAgentRunInputSchema.parse({
+      ...input,
+      task: "é".repeat(MAX_APPLICATION_TASK_BYTES / 2 + 1),
     })).toThrow();
     expect(() => ApplicationRunResultSchema.parse(VALID_RESULT)).toThrow();
     expect(() => ApplicationRunResultSchema.parse({
@@ -496,7 +503,7 @@ describe("application agent", () => {
   });
 
   test("AGENT-TRANSCRIPT-001 rejects an oversized non-history transcript field", async () => {
-    const transcriptByteCap = 2 * 1024 * 1024;
+    const transcriptByteCap = MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES;
     const dependencies = dependenciesWith(
       async () => {
         throw new Error("runtime actions must not run");
@@ -539,7 +546,7 @@ describe("application agent", () => {
           throw new Error("application input filter is required");
         }
         context.latestScreenshotDataUrl =
-          `data:image/png;base64,${"A".repeat(MAX_AGENT_TRANSCRIPT_BYTES)}`;
+          `data:image/png;base64,${"A".repeat(MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES)}`;
         const oversizedFiltered = await callModelInputFilter({
           agent: agent as unknown as Parameters<typeof callModelInputFilter>[0]["agent"],
           context,
@@ -551,7 +558,7 @@ describe("application agent", () => {
           content: [expect.objectContaining({ type: "input_image" })],
         });
         expect(Buffer.byteLength(JSON.stringify(oversizedFiltered.input))).toBeLessThanOrEqual(
-          MAX_AGENT_TRANSCRIPT_BYTES,
+          MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES,
         );
 
         context.latestScreenshotDataUrl = smallScreenshotDataUrl;
@@ -679,11 +686,11 @@ describe("application agent", () => {
       role: "user",
       content: [{
         type: "input_text",
-        text: "x".repeat(MAX_AGENT_TRANSCRIPT_BYTES - fixedBytes),
+        text: "x".repeat(MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES - fixedBytes),
       }],
     }] satisfies AgentInputItem[];
     expect(Buffer.byteLength(JSON.stringify(projectedInput), "utf8"))
-      .toBe(MAX_AGENT_TRANSCRIPT_BYTES);
+      .toBe(MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES);
     const dependencies = dependenciesWith(
       async () => {
         throw new Error("runtime actions must not run");
@@ -848,7 +855,6 @@ describe("application agent", () => {
           return {
             type: "playwright_cli_result",
             exit_code: 0,
-            timed_out: false,
             stdout: "",
             stderr: "",
             stdout_truncated: false,
@@ -1235,7 +1241,7 @@ describe("application agent", () => {
       ],
       [
         new DOMException("runtime request timed out", "TimeoutError"),
-        new ApplicationAgentFailure("MODEL_TIMEOUT"),
+        new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"),
       ],
     ] as const) {
       const dependencies = dependenciesWith(
@@ -1290,7 +1296,6 @@ describe("application agent", () => {
     const browserResult = {
       type: "playwright_cli_result" as const,
       exit_code: 0,
-      timed_out: false,
       stdout: "",
       stderr: "",
       stdout_truncated: false,
@@ -1376,7 +1381,6 @@ describe("application agent", () => {
           return {
             type: "playwright_cli_result",
             exit_code: 0,
-            timed_out: false,
             stdout: "",
             stderr: "",
             stdout_truncated: false,
@@ -1465,7 +1469,6 @@ describe("application agent", () => {
         return {
           type: "playwright_cli_result",
           exit_code: 124,
-          timed_out: true,
           stdout: "",
           stderr: "Playwright CLI execution timed out after 120 seconds.",
           stdout_truncated: false,
@@ -1555,19 +1558,20 @@ describe("application agent", () => {
   });
 
   test("runs one fixed serial agent and returns the runtime cancellation result", async () => {
+    const controller = new AbortController();
     let runnerCalls = 0;
     const runtimeRequests: unknown[] = [];
     const dependencies = dependenciesWith(
-      async (request, signal, timeoutMs) => {
+      async (request, signal) => {
         runtimeRequests.push(request);
-        expect(signal).toBeInstanceOf(AbortSignal);
-        expect(timeoutMs).toBeGreaterThan(0);
+        expect(signal).toBe(controller.signal);
         return { type: "cancel", result: CANCELLED_RESULT };
       },
       async (agent, input, options) => {
         runnerCalls++;
         expect(input).toBe(RUN_INPUT.task);
         expect(options.maxTurns).toBeNull();
+        expect(options.signal).toBe(controller.signal);
         expect(options.context).toMatchObject({
           submissionApproved: false,
           submissionActionStarted: false,
@@ -1617,7 +1621,7 @@ describe("application agent", () => {
         ]);
         const playwrightCliTool = functionTool(agent, "playwright_cli");
         const playwrightCliDescription = playwrightCliTool.description;
-        expect(playwrightCliTool.timeoutMs).toBe(370_000);
+        expect(playwrightCliTool.timeoutMs).toBeUndefined();
         expect(PLAYWRIGHT_CLI_COMMANDS).toEqual(EXPECTED_PLAYWRIGHT_CLI_COMMANDS);
         const referenceStats = lstatSync(PLAYWRIGHT_CLI_AGENT_REFERENCE_PATH);
         expect(referenceStats.isFile()).toBe(true);
@@ -1638,7 +1642,7 @@ describe("application agent", () => {
         for (const item of agent.tools) {
           if (item.type !== "function") throw new Error("all application tools must be function tools");
           expect(item.strict).toBe(true);
-          expect(item.timeoutBehavior).toBe("raise_exception");
+          expect(item.timeoutMs).toBeUndefined();
         }
         if (typeof agent.instructions !== "string") {
           throw new Error("application agent instructions must be static");
@@ -1664,40 +1668,43 @@ describe("application agent", () => {
       },
     );
 
-    const result = await runApplicationAgent(RUN_INPUT, new AbortController().signal, dependencies);
+    const result = await runApplicationAgent(RUN_INPUT, controller.signal, dependencies);
     expect(result).toEqual(CANCELLED_RESULT);
     expect(runnerCalls).toBe(1);
     expect(runtimeRequests).toEqual([{ type: "request_human_review", result: VALID_RESULT }]);
   });
 
-  test("caps a Playwright CLI runtime action at the aggregate execution budget plus margin", async () => {
-    let runtimeTimeoutMs: number | undefined;
+  test("passes only the authoritative application signal to Playwright runtime actions", async () => {
+    const controller = new AbortController();
+    let runtimeArguments: unknown[] = [];
     const dependencies = dependenciesWith(
-      async (request, _signal, timeoutMs) => {
-        expect(request).toEqual({ type: "playwright_cli", command: "snapshot", args: [] });
-        runtimeTimeoutMs = timeoutMs;
-        return PRE_SUBMISSION_EXECUTION_RESULT;
+      (...args) => {
+        runtimeArguments = args;
+        expect(args[0]).toEqual({ type: "playwright_cli", command: "snapshot", args: [] });
+        return Promise.resolve(PRE_SUBMISSION_EXECUTION_RESULT);
       },
       async (agent, _input, options) => {
         await functionTool(agent, "playwright_cli").invoke(
           new RunContext(options.context),
           JSON.stringify({ command: "snapshot", args: [] }),
         );
-        throw new Error("stop after observing the runtime timeout");
+        throw new Error("stop after observing the runtime signal");
       },
     );
 
     await expect(runApplicationAgent(
       { ...RUN_INPUT, deadlineMs: 500_000 },
-      new AbortController().signal,
+      controller.signal,
       dependencies,
-    )).rejects.toThrow("stop after observing the runtime timeout");
-    expect(runtimeTimeoutMs).toBe(370_000);
+    )).rejects.toThrow("stop after observing the runtime signal");
+    expect(runtimeArguments).toEqual([
+      { type: "playwright_cli", command: "snapshot", args: [] },
+      controller.signal,
+    ]);
   });
 
   test("skips approved read-only claims and records the latest successful post-approval observation after one mutation claim", async () => {
     const runtimeRequests: RuntimeActionRequest[] = [];
-    const runtimeTimeouts: number[] = [];
     const guardOperations: string[] = [];
     const reviewResult = VALID_RESULT;
     const unresolvedResult = {
@@ -1735,9 +1742,8 @@ describe("application agent", () => {
       fields_filled: [],
     };
     const dependencies = dependenciesWith(
-      async (request, _signal, timeoutMs) => {
+      async (request) => {
         runtimeRequests.push(request);
-        runtimeTimeouts.push(timeoutMs);
         if (request.type === "playwright_cli") {
           guardOperations.push(`runtime:${request.command}:${request.args.join("|")}`);
           if (request.command === "fill") {
@@ -1907,9 +1913,6 @@ describe("application agent", () => {
       { type: "playwright_cli", command: "click", args: ["#submit"] },
       { type: "playwright_cli", command: "snapshot", args: [] },
     ]);
-    expect(runtimeTimeouts.every(
-      (timeout) => timeout > 0 && timeout <= AUTO_SUBMIT_RUN_INPUT.deadlineMs,
-    )).toBe(true);
   });
 
   test("uses the newest failed or timed-out post-approval observation as terminal evidence after one mutation claim", async () => {
@@ -1917,7 +1920,6 @@ describe("application agent", () => {
     const failedObservation = {
       ...SUBMIT_EXECUTION_RESULT,
       exit_code: 2,
-      timed_out: false,
       stderr: "snapshot failed",
       observation: {
         ...SUBMIT_EXECUTION_RESULT.observation,
@@ -1930,7 +1932,6 @@ describe("application agent", () => {
     const timedOutObservation = {
       ...failedObservation,
       exit_code: 124,
-      timed_out: true,
       stderr: "snapshot timed out",
       observation: {
         ...failedObservation.observation,
@@ -2736,7 +2737,7 @@ describe("application agent", () => {
   test("maps a runtime model timeout through the public error boundary", async () => {
     const token = "test-token-0123456789abcdef-0123456789";
     const privateProviderBody = "private provider timeout response";
-    const runtimeError = Object.assign(new ApplicationRuntimeError("model_timeout"), {
+    const runtimeError = Object.assign(new ApplicationRuntimeError("model_failed"), {
       privateProviderBody,
     });
     let runtimeCalls = 0;
@@ -2785,62 +2786,16 @@ describe("application agent", () => {
     const response = await route(request, new URL(request.url));
 
     expect(runtimeCalls).toBe(1);
-    expect(response?.status).toBe(504);
+    expect(response?.status).toBe(502);
     const serialized = await response?.text() ?? "";
     expect(JSON.parse(serialized)).toEqual({
       error: {
-        code: "MODEL_TIMEOUT",
-        message: "The model request timed out",
+        code: "MODEL_PROVIDER_FAILED",
+        message: "The model request failed",
       },
     });
     expect(serialized).not.toContain(privateProviderBody);
   });
-
-  test("maps the application run deadline to the fixed model timeout", async () => {
-    const dependencies = dependenciesWith(
-      async () => {
-        throw new Error("runtime must not be called");
-      },
-      async () => {
-        throw new AgentDeadlineError(RUN_INPUT.deadlineMs);
-      },
-    );
-    await expect(runApplicationAgent(
-      RUN_INPUT,
-      new AbortController().signal,
-      dependencies,
-    )).rejects.toEqual(new ApplicationAgentFailure("MODEL_TIMEOUT"));
-  });
-
-  test("maps the gate HTTP deadline to the fixed model timeout", async () => {
-    const deadlineInput = { ...RUN_INPUT, deadlineMs: 1_000 };
-    const now = spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(1_000);
-    const dependencies = dependenciesWith(
-      async () => {
-        throw new DOMException("runtime request timed out", "TimeoutError");
-      },
-      async (agent, _input, options) => {
-        await functionTool(agent, "request_human_navigation").invoke(
-          inspectedRunContext(options.context),
-          JSON.stringify({ instruction: "Complete login" }),
-        );
-        throw new Error("runtime deadline must terminate the run");
-      },
-    );
-    try {
-      await expect(runApplicationAgent(
-        deadlineInput,
-        new AbortController().signal,
-        dependencies,
-      )).rejects.toMatchObject({
-        code: "MODEL_TIMEOUT",
-        message: "The model request timed out",
-      });
-    } finally {
-      now.mockRestore();
-    }
-  });
-
 
   test("returns cancellation from navigation and maps review mismatch", async () => {
     const navigationDependencies = dependenciesWith(
@@ -2888,7 +2843,6 @@ describe("application agent", () => {
       async () => ({
         type: "playwright_cli_result",
         exit_code: 0,
-        timed_out: false,
         stdout: "",
         stderr: "",
         stdout_truncated: false,
@@ -2916,14 +2870,14 @@ describe("application agent", () => {
       dependencies,
     )).rejects.toEqual(new ApplicationAgentFailure("MODEL_PROVIDER_FAILED"));
   });
-  test("maps an active tool-call timeout to the fixed model timeout", async () => {
+  test("preserves an active tool-call cancellation reason without deadline mapping", async () => {
     const toolController = new AbortController();
-    const timeoutReason = new DOMException("tool deadline", "TimeoutError");
+    const cancellationReason = new DOMException("tool cancelled", "TimeoutError");
     const dependencies = dependenciesWith(
       async (_request, signal) => {
-        toolController.abort(timeoutReason);
+        toolController.abort(cancellationReason);
         signal.throwIfAborted();
-        throw new Error("runtime client did not receive the tool timeout");
+        throw new Error("runtime client did not receive the tool cancellation");
       },
       async (agent, _input, options) => {
         await functionTool(agent, "playwright_cli").invoke(
@@ -2931,7 +2885,7 @@ describe("application agent", () => {
           JSON.stringify({ command: "snapshot", args: [] }),
           { signal: toolController.signal },
         );
-        throw new Error("tool timeout must terminate the run");
+        throw new Error("tool cancellation must terminate the run");
       },
     );
 
@@ -2939,10 +2893,7 @@ describe("application agent", () => {
       RUN_INPUT,
       new AbortController().signal,
       dependencies,
-    )).rejects.toMatchObject({
-      code: "MODEL_TIMEOUT",
-      message: "The model request timed out",
-    });
+    )).rejects.toBe(cancellationReason);
   });
   test("propagates the active tool-call abort signal to runtime HTTP", async () => {
     const outerController = new AbortController();

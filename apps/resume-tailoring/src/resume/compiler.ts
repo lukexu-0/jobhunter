@@ -64,7 +64,7 @@ const TRUSTED_BASELINE_SHA256 = "abe8b2120bd736a860e47919dbfb1673a7e5166c2a03d97
 function validateTex(tex: string): void {
   const bytes = Buffer.byteLength(tex, "utf8");
   if (bytes === 0) throw new Error("TeX source is empty");
-  if (bytes > ARTIFACT_LIMITS.tex) throw new Error("TeX source exceeds 256 KiB");
+  if (bytes > ARTIFACT_LIMITS.tex) throw new Error(`TeX source exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
   if (tex.includes("\0")) throw new Error("TeX source contains NUL");
   if (SHELL_ESCAPE.test(tex)) throw new Error("TeX shell escape is forbidden");
   if (tex.includes("^^")) throw new Error("forbidden TeX character translation");

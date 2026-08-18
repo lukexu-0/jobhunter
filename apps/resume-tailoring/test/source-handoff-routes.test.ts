@@ -20,7 +20,6 @@ const HANDOFF: SourceHandoffDto = {
   id: HANDOFF_ID,
   state: "awaiting_human_verification",
   jobUrl: JOB_URL,
-  expiresAt: 1_800_000,
 };
 
 function runDto(): RunDto {
@@ -118,10 +117,11 @@ describe("source handoff contracts", () => {
       id: "123e4567-e89b-42d3-a456-426614174000",
       state: "awaiting_human_verification",
       jobUrl: JOB_URL,
-      expiresAt: 1_800_000,
     };
     expect(SourceHandoffDtoSchema.parse(publicDto)).toEqual(publicDto);
     expect(SourceHandoffDtoSchema.safeParse({ ...publicDto, source: "private browser source" }).success)
+      .toBe(false);
+    expect(SourceHandoffDtoSchema.safeParse({ ...publicDto, expiresAt: 1_800_000 }).success)
       .toBe(false);
   });
 });

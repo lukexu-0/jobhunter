@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ProcessBoundary, SpawnContract } from "../src/system/process.ts";
 import { rasterizePdfPage, runDeterministicPdfQa } from "../src/resume/index.ts";
+import { ARTIFACT_LIMITS } from "../src/system/artifacts.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -253,7 +254,7 @@ describe("deterministic PDF QA", () => {
 
   test("fails malformed and capped command output without hiding other command results", async () => {
     const { root, pdf } = await fixture();
-    const oversized = Buffer.alloc(256 * 1024 + 1, 0x78);
+    const oversized = Buffer.alloc(ARTIFACT_LIMITS.stdout + 1, 0x78);
     const report = await runDeterministicPdfQa({
       pdfPath: pdf,
       cwd: root,
@@ -270,7 +271,7 @@ describe("deterministic PDF QA", () => {
       "embedded-fonts": "fail",
       "word-bounds": "fail",
     });
-    expect(report.checks.find(({ id }) => id === "text-output")?.detail).toContain("exceeded 262144 bytes");
+    expect(report.checks.find(({ id }) => id === "text-output")?.detail).toContain(`exceeded ${ARTIFACT_LIMITS.stdout} bytes`);
     expect(report.checks.every(({ detail }) => !detail.includes(root) && detail.length <= 240)).toBe(true);
   });
 
@@ -338,7 +339,7 @@ describe("deterministic PDF QA", () => {
   test("bounds warning count, length, and inspected LaTeX log bytes", async () => {
     const { root, pdf } = await fixture();
     const warning = `LaTeX Warning: ${"x".repeat(900)}`;
-    const latexLog = `${Array.from({ length: 120 }, () => warning).join("\\n")}\\n${"z".repeat(1024 * 1024)}`;
+    const latexLog = `${Array.from({ length: 120 }, () => warning).join("\\n")}\\n${"z".repeat(ARTIFACT_LIMITS.log)}`;
     const report = await runDeterministicPdfQa({
       pdfPath: pdf,
       cwd: root,
@@ -414,7 +415,7 @@ describe("PDF page rasterization", () => {
     await expect(readFile(`${contracts[0]?.args.at(-1)}.png`)).rejects.toThrow();
   });
 
-  test("accepts a PNG at the 25 MiB cap and rejects one byte above it", async () => {
+  test("accepts a PNG at the canonical cap and rejects one byte above it", async () => {
     const atLimitFixture = await fixture();
     const atLimit = await rasterizePdfPage({
       pdfPath: atLimitFixture.pdf,
@@ -422,13 +423,13 @@ describe("PDF page rasterization", () => {
       cwd: atLimitFixture.root,
       boundary: fakeBoundary([{
         onSpawn: async (contract) => {
-          const png = Buffer.alloc(25 * 1024 * 1024);
+          const png = Buffer.alloc(ARTIFACT_LIMITS.png);
           Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png);
           await writeFile(`${contract.args.at(-1)}.png`, png);
         },
       }]),
     });
-    expect(atLimit.byteSize).toBe(25 * 1024 * 1024);
+    expect(atLimit.byteSize).toBe(ARTIFACT_LIMITS.png);
 
     const oversizedFixture = await fixture();
     await expect(rasterizePdfPage({
@@ -437,12 +438,12 @@ describe("PDF page rasterization", () => {
       cwd: oversizedFixture.root,
       boundary: fakeBoundary([{
         onSpawn: async (contract) => {
-          const png = Buffer.alloc(25 * 1024 * 1024 + 1);
+          const png = Buffer.alloc(ARTIFACT_LIMITS.png + 1);
           Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png);
           await writeFile(`${contract.args.at(-1)}.png`, png);
         },
       }]),
-    })).rejects.toThrow("26214400 byte limit");
+    })).rejects.toThrow(`${ARTIFACT_LIMITS.png} byte limit`);
   });
 
   test("rejects extra page or side artifacts from pdftoppm", async () => {

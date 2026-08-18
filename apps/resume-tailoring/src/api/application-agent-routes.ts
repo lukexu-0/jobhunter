@@ -17,11 +17,10 @@ import {
 } from "../agents/application-agent-steering.ts";
 
 export const APPLICATION_AGENT_PATH = "/v1/internal/application-agent";
-const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+export const MAX_APPLICATION_AGENT_REQUEST_BYTES = 20_971_520;
 const MAX_STEER_REQUEST_BYTES = 128 * 1024;
 const APPLICATION_AGENT_STEER_PATH =
   /^\/v1\/internal\/application-agent\/([^/]+)\/steer$/;
-const DEFAULT_BODY_TIMEOUT_MS = 300_000;
 
 class RequestTooLargeError extends Error {}
 async function runAbortable<T>(
@@ -43,7 +42,6 @@ async function runAbortable<T>(
 const APPLICATION_AGENT_ERROR_RESPONSES: Readonly<Record<ApplicationAgentFailureCode, readonly [status: number, message: string]>> = {
   INVALID_REQUEST: [422, "Request is invalid"],
   OAUTH_REQUIRED: [409, "Connect OpenAI Codex in Provider access"],
-  MODEL_TIMEOUT: [504, "The model request timed out"],
   INVALID_MODEL_OUTPUT: [502, "The model returned invalid output"],
   MODEL_PROVIDER_FAILED: [502, "The model request failed"],
   APPLICATION_MISMATCH: [409, "The open page does not match the requested job"],
@@ -61,7 +59,7 @@ function serviceErrorResponse(error: unknown): Response {
 async function readJsonBody(
   request: Request,
   signal: AbortSignal,
-  maxBytes = MAX_REQUEST_BYTES,
+  maxBytes = MAX_APPLICATION_AGENT_REQUEST_BYTES,
 ): Promise<unknown> {
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
@@ -122,14 +120,10 @@ export interface ApplicationAgentRouteService {
   ): Promise<void> | void;
 }
 
-export interface ApplicationAgentRouteOptions {
-  readonly bodyTimeoutMs?: number;
-}
 
 export function createApplicationAgentRoutes(
   service: ApplicationAgentRouteService | undefined,
   token: string | undefined,
-  options: ApplicationAgentRouteOptions = {},
 ) {
   return async function routeApplicationAgent(request: Request, url: URL): Promise<Response | null> {
     const steerPath = APPLICATION_AGENT_STEER_PATH.exec(url.pathname);
@@ -171,10 +165,6 @@ export function createApplicationAgentRoutes(
       );
     }
     if (steerPath !== null) {
-      const bodyTimeoutSignal = AbortSignal.timeout(
-        Math.min(options.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS, 5_000),
-      );
-      const bodySignal = AbortSignal.any([request.signal, bodyTimeoutSignal]);
       let sessionId: string;
       let input: ApplicationAgentSteerRequest;
       try {
@@ -182,13 +172,10 @@ export function createApplicationAgentRoutes(
           steerPath[1],
         );
         input = ApplicationAgentSteerRequestSchema.parse(
-          await readJsonBody(request, bodySignal, MAX_STEER_REQUEST_BYTES),
+          await readJsonBody(request, request.signal, MAX_STEER_REQUEST_BYTES),
         );
       } catch (error) {
         if (request.signal.aborted) throw request.signal.reason;
-        if (bodyTimeoutSignal.aborted) {
-          return apiResponse.error("MODEL_TIMEOUT", "The model request timed out", 504);
-        }
         if (error instanceof RequestTooLargeError) {
           return apiResponse.error(
             "REQUEST_TOO_LARGE",
@@ -220,35 +207,25 @@ export function createApplicationAgentRoutes(
         return serviceErrorResponse(error);
       }
     }
-    const bodyTimeoutSignal = AbortSignal.timeout(options.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS);
-    const bodySignal = AbortSignal.any([request.signal, bodyTimeoutSignal]);
     let input: ApplicationAgentRunInput;
     try {
-      input = ApplicationAgentRunInputSchema.parse(await readJsonBody(request, bodySignal));
+      input = ApplicationAgentRunInputSchema.parse(await readJsonBody(request, request.signal));
     } catch (error) {
       if (request.signal.aborted) throw request.signal.reason;
-      if (bodyTimeoutSignal.aborted) {
-        return apiResponse.error("MODEL_TIMEOUT", "The model request timed out", 504);
-      }
       if (error instanceof RequestTooLargeError) {
         return apiResponse.error("REQUEST_TOO_LARGE", "The model request is too large", 413);
       }
       return apiResponse.error("INVALID_REQUEST", "Request is invalid", 422);
     }
-    const deadlineSignal = AbortSignal.timeout(input.deadlineMs);
-    const invokeSignal = AbortSignal.any([request.signal, deadlineSignal]);
     try {
-      const success = await runAbortable(() => service.invoke(input, invokeSignal), invokeSignal);
+      const success = await runAbortable(
+        () => service.invoke(input, request.signal),
+        request.signal,
+      );
       request.signal.throwIfAborted();
-      if (deadlineSignal.aborted) {
-        return apiResponse.error("MODEL_TIMEOUT", "The model request timed out", 504);
-      }
       return apiResponse.json(success);
     } catch (error) {
       if (request.signal.aborted) throw request.signal.reason;
-      if (deadlineSignal.aborted) {
-        return apiResponse.error("MODEL_TIMEOUT", "The model request timed out", 504);
-      }
       return serviceErrorResponse(error);
     }
   };

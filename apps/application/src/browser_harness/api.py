@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
 from .models import (
+    APPLICATION_ANECDOTE_MAX_COUNT,
+    APPLICATION_CONTEXT_MAX_COUNT,
     AdditionalInfoQuestionId,
     ApplicationAnswerSuggestionsResponse,
     HarnessConfig,
@@ -54,7 +56,6 @@ class HarnessSessionService(Protocol):
         capture_id: UUID,
         job_url: str,
         approved_origins: Sequence[str],
-        timeout_seconds: int,
     ) -> SourceCaptureCreateResponse: ...
 
     async def complete_source_capture(
@@ -79,7 +80,6 @@ class HarnessSessionService(Protocol):
     async def runtime_action(
         self,
         session_id: UUID,
-        action_id: UUID,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse: ...
 
@@ -195,7 +195,11 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         allow_domains = allow_domain or []
         context_files = context or []
         anecdote_files = anecdote or []
-        if len(allow_domains) > 20 or len(context_files) > 10 or len(anecdote_files) > 20:
+        if (
+            len(allow_domains) > 20
+            or len(context_files) > APPLICATION_CONTEXT_MAX_COUNT
+            or len(anecdote_files) > APPLICATION_ANECDOTE_MAX_COUNT
+        ):
             raise HarnessServiceError(422, "invalid_request", "Request is invalid")
         return await dependencies.sessions.create_session(
             session_id=session_id,
@@ -222,7 +226,6 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
             capture_id=body.capture_id,
             job_url=body.job_url,
             approved_origins=body.approved_origins,
-            timeout_seconds=body.timeout_seconds,
         )
 
     @app.post(
@@ -320,27 +323,8 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
     async def runtime_action(
         session_id: UUID,
         action: Annotated[RuntimeActionRequest, Body(discriminator="type")],
-        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     ) -> RuntimeActionResponse:
-        try:
-            action_id = UUID(idempotency_key)
-        except ValueError:
-            raise HarnessServiceError(
-                422,
-                "invalid_request",
-                "Request is invalid",
-            ) from None
-        if idempotency_key != str(action_id):
-            raise HarnessServiceError(
-                422,
-                "invalid_request",
-                "Request is invalid",
-            )
-        return await dependencies.sessions.runtime_action(
-            session_id,
-            action_id,
-            action,
-        )
+        return await dependencies.sessions.runtime_action(session_id, action)
 
 
     @app.delete("/v1/sessions/{session_id}", status_code=204)

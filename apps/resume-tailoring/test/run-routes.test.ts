@@ -507,11 +507,6 @@ describe("run HTTP routes", () => {
         status: 502,
         message: "Opportunity description extraction failed",
       },
-      {
-        code: "JOB_EXTRACTION_TIMEOUT",
-        status: 504,
-        message: "Opportunity description extraction timed out",
-      },
     ]) {
       const response = await request(service({
         createRun: async () => {

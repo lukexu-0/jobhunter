@@ -31,7 +31,7 @@ import {
 import { openPipelineDatabase } from "../src/db/database.ts";
 import { PipelineRepository, type ActiveStage } from "../src/db/repository.ts";
 import type { LoadedContextManifest } from "../src/context/manifest.ts";
-import { ArtifactStore } from "../src/system/artifacts.ts";
+import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
 import {
   type CreateRunRequest,
   type OpportunityKind,
@@ -192,7 +192,7 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
   else if (status === "compiling") transition(target.repository, claim, ["deterministic_qa", "visual_qa"]);
   const attempt = target.repository.startAttempt(claim, "visual_qa");
   const root = await target.artifacts.createAttempt({ run: run.queueSequence, revision: String(run.currentRevision), stage: "visual_qa", attempt: attempt.attemptNo });
-  const stored = await target.artifacts.write(join(root, "resume.pdf"), bytes, 10 * 1024 * 1024);
+  const stored = await target.artifacts.write(join(root, "resume.pdf"), bytes, ARTIFACT_LIMITS.pdf);
   const artifact = target.repository.finalizeArtifact(claim, {
     attemptId: attempt.id,
     stage: "visual_qa",
@@ -203,7 +203,7 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
   });
   let tailoredTexId: string | undefined;
   if (tailoredTexBytes !== undefined) {
-    const tex = await target.artifacts.write(join(root, "resume.tex"), tailoredTexBytes, 256 * 1024);
+    const tex = await target.artifacts.write(join(root, "resume.tex"), tailoredTexBytes, ARTIFACT_LIMITS.tex);
     tailoredTexId = target.repository.finalizeArtifact(claim, {
       attemptId: attempt.id,
       stage: "visual_qa",
@@ -216,7 +216,7 @@ async function finalizeReviewPdf(target: Fixture, runId: string, bytes = "%PDF-1
   let keywordCoverageId: string | undefined;
   let keywordMapId: string | undefined;
   if (keywordMapBytes !== undefined) {
-    const map = await target.artifacts.write(join(root, "keyword-map.pdf"), keywordMapBytes, 10 * 1024 * 1024);
+    const map = await target.artifacts.write(join(root, "keyword-map.pdf"), keywordMapBytes, ARTIFACT_LIMITS.pdf);
     keywordMapId = target.repository.finalizeArtifact(claim, {
       attemptId: attempt.id,
       stage: "visual_qa",
@@ -785,15 +785,7 @@ describe("RunApplicationService", () => {
         },
       },
       {
-        error: new LunaJobExtractionError("timeout", "private timeout detail"),
-        expected: {
-          code: "JOB_EXTRACTION_TIMEOUT",
-          status: 504,
-          message: "Opportunity description extraction timed out",
-        },
-      },
-      {
-        error: new LunaJobExtractionError("unavailable", "private model detail"),
+        error: new LunaJobExtractionError("private model detail"),
         expected: {
           code: "JOB_EXTRACTION_UNAVAILABLE",
           status: 502,

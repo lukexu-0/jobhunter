@@ -578,7 +578,7 @@ async function extractBbox(request: KeywordMapRequest): Promise<ParsedBboxPage> 
     timeoutMs: BBOX_TIMEOUT_MS,
     ...(request.signal ? { signal: request.signal } : {}),
     stdoutLimit: BBOX_OUTPUT_LIMIT,
-    stderrLimit: 256 * 1024,
+    stderrLimit: ARTIFACT_LIMITS.stderr,
   }, request.processBoundary);
   if (result.aborted) request.signal?.throwIfAborted();
   if (result.timedOut) throw new Error("pdftotext bbox extraction timed out");

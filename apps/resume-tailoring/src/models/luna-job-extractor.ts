@@ -19,7 +19,6 @@ import {
 } from "../contracts";
 
 export const LUNA_MODEL_NAME = "gpt-5.6-luna" as const;
-export const LUNA_EXTRACTION_DEADLINE_MS = 120_000;
 export const LUNA_MAX_SOURCE_BYTES = 512 * 1_024;
 export const LUNA_MAX_SOURCE_LINES = 20_000;
 export const LUNA_MAX_RESPONSE_BYTES = 64 * 1_024;
@@ -65,17 +64,15 @@ export interface LunaJobExtractorOptions {
   readonly transport?: LunaCompleteTransport;
   readonly resolverFactory?: CodexLunaResolverFactory;
   readonly sessionIdFactory?: () => string;
-  readonly deadlineMs?: number;
   readonly opportunityKindHint?: OpportunityKind;
 }
 
 export class LunaJobExtractionError extends Error {
-  readonly kind: "timeout" | "unavailable";
+  readonly kind = "unavailable" as const;
 
-  constructor(kind: "timeout" | "unavailable", message: string, options?: ErrorOptions) {
+  constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "LunaJobExtractionError";
-    this.kind = kind;
   }
 }
 
@@ -145,18 +142,18 @@ const textEncoder = new TextEncoder();
 
 function assertBoundedSource(lines: readonly string[]): void {
   if (!Array.isArray(lines) || lines.length === 0 || lines.length > LUNA_MAX_SOURCE_LINES) {
-    throw new LunaJobExtractionError("unavailable", "Luna source is outside the supported line bounds");
+    throw new LunaJobExtractionError("Luna source is outside the supported line bounds");
   }
   let sourceBytes = 0;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     if (typeof line !== "string") {
-      throw new LunaJobExtractionError("unavailable", "Luna source contains an invalid line");
+      throw new LunaJobExtractionError("Luna source contains an invalid line");
     }
     sourceBytes += textEncoder.encode(line).byteLength;
     if (index > 0) sourceBytes += 1;
     if (sourceBytes > LUNA_MAX_SOURCE_BYTES) {
-      throw new LunaJobExtractionError("unavailable", "Luna source is outside the supported byte bounds");
+      throw new LunaJobExtractionError("Luna source is outside the supported byte bounds");
     }
   }
 }
@@ -238,35 +235,21 @@ export async function extractJobDescriptionWithLuna(
     : OpportunityKindSchema.parse(options.opportunityKindHint);
   signal?.throwIfAborted();
 
-  const combinedController = new AbortController();
-  let timedOut = false;
   let rejectCallerAbort: ((reason?: unknown) => void) | undefined;
   const callerAbortPromise = signal
     ? new Promise<never>((_resolve, reject) => { rejectCallerAbort = reject; })
     : undefined;
   const onCallerAbort = (): void => {
-    const reason = signal?.reason;
-    combinedController.abort(reason);
-    rejectCallerAbort?.(reason);
+    rejectCallerAbort?.(signal?.reason);
   };
   signal?.addEventListener("abort", onCallerAbort, { once: true });
-
-  let rejectDeadline: ((reason?: unknown) => void) | undefined;
-  const deadlinePromise = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
-  const deadlineMs = options.deadlineMs ?? LUNA_EXTRACTION_DEADLINE_MS;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    const error = new LunaJobExtractionError("timeout", "Luna extraction timed out");
-    combinedController.abort(error);
-    rejectDeadline?.(error);
-  }, deadlineMs);
 
   try {
     const sessionId = (options.sessionIdFactory ?? (() => `job-ingestion-${randomUUID()}`))();
     const resolverFactory = options.resolverFactory ?? createOAuthOnlyApiKeyResolver;
     const transport = options.transport ?? completeSimple;
-    const apiKey = resolverFactory("openai-codex", sessionId, LUNA_MODEL_NAME, combinedController.signal);
-    if (combinedController.signal.aborted) throw combinedController.signal.reason;
+    const apiKey = resolverFactory("openai-codex", sessionId, LUNA_MODEL_NAME, signal);
+    signal?.throwIfAborted();
 
     const context: Context = {
       systemPrompt: SYSTEM_PROMPT,
@@ -281,27 +264,24 @@ export async function extractJobDescriptionWithLuna(
     };
     const transportPromise = Promise.resolve(transport(LUNA_DESCRIPTOR, context, {
       apiKey,
-      signal: combinedController.signal,
+      ...(signal === undefined ? {} : { signal }),
       reasoning: HIGH_EFFORT,
       sessionId,
       preferWebsockets: false,
       loopGuard: { enabled: false },
     }));
     void transportPromise.catch(() => undefined);
-    const raceCandidates: Promise<AssistantMessage>[] = [transportPromise, deadlinePromise];
-    if (callerAbortPromise) raceCandidates.push(callerAbortPromise);
-    const message = await Promise.race(raceCandidates);
+    const message = callerAbortPromise === undefined
+      ? await transportPromise
+      : await Promise.race([transportPromise, callerAbortPromise]);
     return parseSelection(message, lines, opportunityKindHint);
   } catch (error) {
     if (signal?.aborted) signal.throwIfAborted();
-    if (timedOut) throw new LunaJobExtractionError("timeout", "Luna extraction timed out", { cause: error });
     const oauthError = recoverOAuthRequiredError(error);
     if (oauthError) throw oauthError;
-    throw new LunaJobExtractionError("unavailable", "Luna extraction failed", { cause: error });
+    throw new LunaJobExtractionError("Luna extraction failed", { cause: error });
   } finally {
-    clearTimeout(timer);
     signal?.removeEventListener("abort", onCallerAbort);
     rejectCallerAbort = undefined;
-    rejectDeadline = undefined;
   }
 }

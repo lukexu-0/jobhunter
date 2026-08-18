@@ -18,7 +18,7 @@ MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
 REASONING = "high"
 _AGENT_PATH = "/v1/internal/application-agent"
-_STEER_TIMEOUT_SECONDS = 5.0
+_MAX_APPLICATION_TASK_BYTES = 5_242_880
 _COMMAND_CONFLICT_MESSAGE = (
     "The application state changed; review the latest session state"
 )
@@ -43,7 +43,6 @@ _ERROR_RESPONSES: Final[dict[tuple[int, str], tuple[str, str]]] = {
         "oauth_required",
         "Connect OpenAI Codex in Provider access",
     ),
-    (504, "MODEL_TIMEOUT"): ("model_timeout", "The model request timed out"),
     (502, "INVALID_MODEL_OUTPUT"): (
         "invalid_model_output",
         "The model returned invalid output",
@@ -123,14 +122,14 @@ class PipelineApplicationAgentClient:
         self._client = httpx.AsyncClient(
             base_url=_normalize_loopback_origin(pipeline_url, name="pipeline_url"),
             headers={"Authorization": f"Bearer {bearer_token}"},
-            timeout=httpx.Timeout(300.0),
+            timeout=None,
             trust_env=False,
         )
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
     async def check_ready(self) -> None:
-        response = await self._send("GET", timeout_is_model_error=False)
+        response = await self._send("GET")
         try:
             _AgentStatus.model_validate(response.json())
         except (ValueError, ValidationError):
@@ -161,7 +160,11 @@ class PipelineApplicationAgentClient:
             raise ValueError("opportunity_kind is invalid")
         if type(auto_submit) is not bool:
             raise ValueError("auto_submit is invalid")
-        _validate_utf8_text(task, name="task", max_bytes=1_048_576)
+        _validate_utf8_text(
+            task,
+            name="task",
+            max_bytes=_MAX_APPLICATION_TASK_BYTES,
+        )
         if (
             type(deadline_ms) is not int
             or not 1_000 <= deadline_ms <= 86_400_000
@@ -177,8 +180,7 @@ class PipelineApplicationAgentClient:
                 "autoSubmit": auto_submit,
                 "deadlineMs": deadline_ms,
             },
-            timeout=deadline_ms / 1_000 + 60,
-            timeout_is_model_error=True,
+            allow_agent_errors=True,
         )
         try:
             success = _AgentRunSuccess.model_validate(response.json())
@@ -194,8 +196,6 @@ class PipelineApplicationAgentClient:
             "POST",
             path=f"{_AGENT_PATH}/{self._session_id}/steer",
             json={"message": normalized},
-            timeout=_STEER_TIMEOUT_SECONDS,
-            timeout_is_model_error=False,
             allow_command_conflict=True,
             expected_status=202,
         )
@@ -223,8 +223,7 @@ class PipelineApplicationAgentClient:
         *,
         path: str = _AGENT_PATH,
         json: dict[str, Any] | None = None,
-        timeout: float | None = None,
-        timeout_is_model_error: bool,
+        allow_agent_errors: bool = False,
         allow_command_conflict: bool = False,
         expected_status: int = 200,
     ) -> httpx.Response:
@@ -234,23 +233,7 @@ class PipelineApplicationAgentClient:
                 "The local pipeline model service is unavailable",
             )
         try:
-            if timeout is None:
-                response = await self._client.request(
-                    method, path, json=json
-                )
-            else:
-                response = await self._client.request(
-                    method, path, json=json, timeout=timeout
-                )
-        except httpx.TimeoutException as error:
-            if timeout_is_model_error:
-                raise PipelineApplicationAgentError(
-                    "model_timeout", "The model request timed out"
-                ) from error
-            raise PipelineApplicationAgentError(
-                "pipeline_unavailable",
-                "The local pipeline model service is unavailable",
-            ) from error
+            response = await self._client.request(method, path, json=json)
         except httpx.RequestError as error:
             raise PipelineApplicationAgentError(
                 "pipeline_unavailable",
@@ -277,7 +260,7 @@ class PipelineApplicationAgentClient:
                 (response.status_code, gateway_code or "")
             )
             if mapped is not None and (
-                timeout_is_model_error
+                allow_agent_errors
                 or gateway_code == "OAUTH_REQUIRED"
                 or (
                     allow_command_conflict
@@ -290,7 +273,7 @@ class PipelineApplicationAgentClient:
                     "pipeline_unavailable",
                     "The local pipeline model service is unavailable",
                 )
-            if timeout_is_model_error:
+            if allow_agent_errors:
                 raise PipelineApplicationAgentError(
                     "model_failed", "The model request failed"
                 )

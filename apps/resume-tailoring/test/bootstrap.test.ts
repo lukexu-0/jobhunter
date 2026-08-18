@@ -629,7 +629,6 @@ describe("pipeline application bootstrap", () => {
       id: handoffId,
       state: "awaiting_human_verification" as const,
       jobUrl: JOB_URL,
-      expiresAt: 1_900_000,
     };
     const queued = {
       id: "run-source-handoff",

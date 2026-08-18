@@ -49,11 +49,10 @@ import {
   type LoadedJobSource,
   type LoadJobSource,
 } from "./job-source.ts";
-import { ArtifactStore } from "../system/artifacts.ts";
+import { ARTIFACT_LIMITS, ArtifactStore } from "../system/artifacts.ts";
 
 const MAX_JOB_DESCRIPTION_BYTES = 200_000;
 const MAX_PUBLIC_METADATA_BYTES = 1024 * 1024;
-export const MAX_COMPILED_PDF_BYTES = 10 * 1024 * 1024;
 const PUBLIC_ARTIFACT_KINDS: Readonly<Record<string, ArtifactKind>> = Object.freeze({
   "job-analysis": "job-analysis",
   "ats-keyword-extraction": "ats-keyword-extraction",
@@ -180,9 +179,9 @@ function publicFilename(kind: ArtifactKind): string {
 }
 
 function publicArtifactLimit(kind: ArtifactKind): number {
-  if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return MAX_COMPILED_PDF_BYTES;
-  if (kind === "page-image") return 25 * 1024 * 1024;
-  if (kind === "tailored-tex") return 256 * 1024;
+  if (kind === "compiled-pdf" || kind === "keyword-map-pdf") return ARTIFACT_LIMITS.pdf;
+  if (kind === "page-image") return ARTIFACT_LIMITS.png;
+  if (kind === "tailored-tex") return ARTIFACT_LIMITS.tex;
   return MAX_PUBLIC_METADATA_BYTES;
 }
 
@@ -441,13 +440,6 @@ export class RunApplicationService {
         );
       }
       if (error instanceof LunaJobExtractionError) {
-        if (error.kind === "timeout") {
-          throw new RunServiceError(
-            "JOB_EXTRACTION_TIMEOUT",
-            "Opportunity description extraction timed out",
-            504,
-          );
-        }
         throw new RunServiceError(
           "JOB_EXTRACTION_UNAVAILABLE",
           "Opportunity description extraction failed",

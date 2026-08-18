@@ -28,7 +28,7 @@ export function createTerminalSubmission<S extends z.ZodObject>(options: {
   description: string;
   schema: S;
   sharedSubmitted?: { value: boolean };
-  timeoutMs?: number;
+  timeoutMs?: number | null;
   maxBytes?: number;
   assertActive?: () => void;
   validate?: (value: z.output<S>) => void | Promise<void>;
@@ -55,8 +55,12 @@ export function createTerminalSubmission<S extends z.ZodObject>(options: {
         if (!(error instanceof TerminalSubmissionValidationError) && !sdkInputValidationError) throw error;
         return formatValidationError(error);
       },
-    timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
-    timeoutBehavior: "raise_exception",
+    ...(options.timeoutMs === null
+      ? {}
+      : {
+        timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
+        timeoutBehavior: "raise_exception" as const,
+      }),
     execute: async (input: unknown): Promise<z.output<S>> => {
       options.assertActive?.();
       if (shared.value || calls !== 0 || validationInFlight) {
