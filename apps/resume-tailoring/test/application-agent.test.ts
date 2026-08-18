@@ -2669,7 +2669,6 @@ describe("application agent", () => {
     )).rejects.toEqual(new ApplicationAgentFailure("APPLICATION_MISMATCH"));
 
     for (const [runtimeError, expectedCode] of [
-      [new ApplicationRuntimeError("step_limit"), "STEP_LIMIT"],
       [new ApplicationRuntimeError("browser_failed"), "BROWSER_FAILED"],
       [new ApplicationRuntimeError("invalid_request"), "INVALID_REQUEST"],
       [new ApplicationRuntimeError("model_failed"), "MODEL_PROVIDER_FAILED"],

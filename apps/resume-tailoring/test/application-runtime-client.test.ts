@@ -1044,7 +1044,6 @@ describe("HttpApplicationRuntimeClient", () => {
 
   test("does not retry typed non-model runtime failures", async () => {
     const cases = [
-      { code: "step_limit", status: 409, expected: "step_limit" },
       { code: "browser_failed", status: 502, expected: "browser_failed" },
       { code: "session_timeout", status: 504, expected: "model_timeout" },
     ] as const;
@@ -1445,15 +1444,8 @@ describe("HttpApplicationRuntimeClient", () => {
     expect(diagnostics).toEqual([]);
   });
 
-  test("maps only flat step and browser errors without leaking response content", async () => {
+  test("maps only flat browser errors without leaking response content", async () => {
     const cases = [
-      {
-        response: jsonResponse(
-          { code: "step_limit", message: "private server detail" },
-          { status: 409 },
-        ),
-        expected: new ApplicationRuntimeError("step_limit"),
-      },
       {
         response: jsonResponse(
           { code: "browser_failed", message: "private browser detail" },
@@ -1470,7 +1462,7 @@ describe("HttpApplicationRuntimeClient", () => {
       },
       {
         response: jsonResponse(
-          { error: { code: "step_limit", message: "nested secret" } },
+          { error: { code: "retired_error", message: "nested secret" } },
           { status: 409 },
         ),
         expected: new ApplicationRuntimeError("model_failed"),

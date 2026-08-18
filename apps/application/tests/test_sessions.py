@@ -138,7 +138,6 @@ def multipart_parts() -> list[tuple[str, tuple[None, str] | tuple[str, bytes, st
     return [
         ("opportunity_kind", (None, "job")),
         ("job_url", (None, JOB_URL)),
-        ("max_steps", (None, "100")),
         (
             "personal_information",
             (
@@ -707,7 +706,6 @@ async def create_valid(
         opportunity_kind=opportunity_kind,
         allow_domains=list(allow_domains),
         auto_submit=auto_submit,
-        max_steps=100,
         personal_information=personal,
         resume=resume,
         resume_source=resume_source,
@@ -1715,22 +1713,18 @@ async def test_final_submit_waits_for_superseded_steering_dispatch(
     await manager.delete(created.session_id)
 
 @pytest.mark.parametrize(
-    ("job_url", "opportunity_kind", "origins", "max_steps"),
+    ("job_url", "opportunity_kind", "origins"),
     [
-        ("not-a-url", "job", [], 100),
-        (JOB_URL, "internship", [], 100),
-        (JOB_URL, "job", ["https://ats.example/path"], 100),
-        (JOB_URL, "job", ["https://jobs.example"], 100),
-        (JOB_URL, "job", [], 0),
-        (JOB_URL, "job", [], 501),
+        ("not-a-url", "job", []),
+        (JOB_URL, "internship", []),
+        (JOB_URL, "job", ["https://ats.example/path"]),
+        (JOB_URL, "job", ["https://jobs.example"]),
     ],
     ids=[
         "job-url",
         "opportunity-kind",
         "origin",
         "duplicate-origin",
-        "min-steps",
-        "max-steps",
     ],
 )
 async def test_invalid_create_values_fail_before_storage(
@@ -1739,7 +1733,6 @@ async def test_invalid_create_values_fail_before_storage(
     job_url: str,
     opportunity_kind: Any,
     origins: list[str],
-    max_steps: int,
 ) -> None:
     storage_called = False
 
@@ -1757,7 +1750,6 @@ async def test_invalid_create_values_fail_before_storage(
             job_url=job_url,
             opportunity_kind=opportunity_kind,
             allow_domains=origins,
-            max_steps=max_steps,
             personal_information=personal,
             resume=resume,
             resume_source=resume_source,
@@ -2448,13 +2440,6 @@ async def test_suggestions_cannot_read_saved_answers_after_finalization_starts(
         ),
         (
             PipelineApplicationAgentError(
-                "step_limit",
-                SESSION_ERROR_MESSAGES["step_limit"],
-            ),
-            "step_limit",
-        ),
-        (
-            PipelineApplicationAgentError(
                 "oauth_required", SESSION_ERROR_MESSAGES["oauth_required"]
             ),
             "oauth_required",
@@ -2481,7 +2466,6 @@ async def test_suggestions_cannot_read_saved_answers_after_finalization_starts(
     ],
     ids=[
         "mismatch",
-        "step-limit",
         "oauth",
         "model-timeout",
         "invalid-model-output",
@@ -2993,7 +2977,6 @@ async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_pa
             job_url=JOB_URL,
             opportunity_kind="job",
             allow_domains=[],
-            max_steps=100,
             personal_information=personal,
             resume=resume,
             resume_source=resume_source,
@@ -3477,7 +3460,6 @@ async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
         job_url=private_job_url,
         opportunity_kind="job",
         allow_domains=[],
-        max_steps=100,
         personal_information=personal,
         resume=resume,
         resume_source=resume_source,
@@ -3836,7 +3818,6 @@ async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
         job_url=job_url,
         opportunity_kind="job",
         allow_domains=[],
-        max_steps=100,
         personal_information=personal,
         resume=resume,
         resume_source=resume_source,
@@ -3933,7 +3914,6 @@ async def test_encoded_gate_result_and_file_values_project_actionable_warnings(
         opportunity_kind="job",
         allow_domains=[],
         auto_submit=True,
-        max_steps=100,
         personal_information=personal,
         resume=upload("resume.pdf", pdf_bytes()),
         resume_source=upload("resume.tex", b"Resume evidence"),
@@ -4159,7 +4139,7 @@ async def test_shutdown_upgrades_active_to_terminal_race_tombstone_to_closed(
     assert [event.event for event in tombstone.events][-2:] == ["cancelled", "closed"]
 
 
-async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces_step_limit(
+async def test_runtime_playwright_cli_actions_have_no_count_limit(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -4168,7 +4148,6 @@ async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces
         job_url=JOB_URL,
         opportunity_kind="job",
         allow_domains=[],
-        max_steps=1,
         personal_information=personal,
         resume=resume,
         resume_source=resume_source,
@@ -4178,57 +4157,28 @@ async def test_runtime_playwright_cli_action_counts_completed_calls_and_enforces
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None
-    runtime = FakePlaywrightRuntime(
-        result=playwright_execution_result().model_copy(
-            update={"exit_code": 124, "timed_out": True}
-        )
-    )
+    runtime = FakePlaywrightRuntime()
     record.playwright_runtime = runtime
-
-    result = await runtime_action(
-        manager,
-        created.session_id,
-        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
+    action = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="snapshot",
+        args=[],
     )
 
-    assert isinstance(result, PlaywrightCliResultRuntimeActionResponse)
-    assert result.stdout == "completed"
-    assert result.exit_code == 124
-    assert result.timed_out is True
-    assert record.playwright_cli_action_count == 1
-    assert runtime.commands == [('snapshot', [])]
+    for _attempt in range(501):
+        result = await runtime_action(manager, created.session_id, action)
+        assert isinstance(result, PlaywrightCliResultRuntimeActionResponse)
+
+    assert record.playwright_cli_action_count == 501
+    assert runtime.commands == [("snapshot", [])] * 501
+    assert runtime.closed is False
     step = record.events[-1]
     assert step.event == "agent_step"
-    assert step.detail.step_number == 1
-    assert step.detail.current_url == "https://jobs.example/openings/42"
-    diagnostic = manager.get_snapshot(created.session_id).playwright_cli_diagnostics
-    assert [item.model_dump() for item in diagnostic] == [
-        {
-            "step": 1,
-            "status": "timed_out",
-            "exit_code": 124,
-            "timed_out": True,
-            "error_category": "execution_timeout",
-            "stderr_excerpt": "Playwright CLI execution timed out after 120 seconds.",
-            "stderr_truncated": False,
-        }
-    ]
-    assert record.events[-1].session.playwright_cli_diagnostics == diagnostic
-
-    with pytest.raises(HarnessServiceError) as raised:
-        await runtime_action(
-            manager,
-            created.session_id,
-            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('again')"]),
-        )
-
-    assert_service_error(
-        raised.value,
-        409,
-        "step_limit",
-        SESSION_ERROR_MESSAGES["step_limit"],
-    )
-    assert record.playwright_cli_action_count == 1
+    assert step.detail.step_number == 501
+    diagnostics = manager.get_snapshot(
+        created.session_id
+    ).playwright_cli_diagnostics
+    assert [diagnostic.step for diagnostic in diagnostics] == list(range(402, 502))
     await manager.delete(created.session_id)
 
 
@@ -4337,7 +4287,7 @@ async def test_runtime_human_navigation_maps_guard_suspension_runtime_errors(
     await manager.delete(created.session_id)
 
 
-async def test_runtime_playwright_cli_errors_count_toward_step_limit(
+async def test_runtime_playwright_cli_errors_keep_monotonic_steps(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -4346,7 +4296,6 @@ async def test_runtime_playwright_cli_errors_count_toward_step_limit(
         job_url=JOB_URL,
         opportunity_kind="job",
         allow_domains=[],
-        max_steps=2,
         personal_information=personal,
         resume=resume,
         resume_source=resume_source,
@@ -4364,28 +4313,20 @@ async def test_runtime_playwright_cli_errors_count_toward_step_limit(
         args=[],
     )
 
-    for _attempt in range(2):
+    for _attempt in range(3):
         with pytest.raises(HarnessServiceError) as raised:
             await runtime_action(manager, created.session_id, action)
         assert raised.value.code == "browser_failed"
 
-    with pytest.raises(HarnessServiceError) as raised:
-        await runtime_action(manager, created.session_id, action)
-
-    assert_service_error(
-        raised.value,
-        409,
-        "step_limit",
-        SESSION_ERROR_MESSAGES["step_limit"],
-    )
-    assert record.playwright_cli_action_count == 2
-    assert runtime.commands == [("snapshot", []), ("snapshot", [])]
+    assert record.playwright_cli_action_count == 3
+    assert runtime.commands == [("snapshot", [])] * 3
     assert [
         diagnostic.step
         for diagnostic in manager.get_snapshot(
             created.session_id
         ).playwright_cli_diagnostics
-    ] == [1, 2]
+    ] == [1, 2, 3]
+    assert runtime.closed is False
     await manager.delete(created.session_id)
 
 
@@ -6307,7 +6248,6 @@ async def test_full_agent_result_requires_matching_job_and_accepted_review(
         "invalid_model_output",
         "model_failed",
         "application_mismatch",
-        "step_limit",
         "browser_failed",
     ],
 )

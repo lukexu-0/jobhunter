@@ -210,7 +210,7 @@ const SLOT_RELEASED_STATES: Partial<Record<HarnessSessionState, true>> = {
 
 
 const RawPlaywrightCliDiagnosticSchema = z.object({
-  step: z.number().int().min(1).max(500),
+  step: z.number().int().min(1),
   status: z.enum(["succeeded", "failed", "timed_out"]),
   exit_code: z.number().int(),
   timed_out: z.boolean(),
@@ -316,7 +316,7 @@ const RawEventSchema = z.discriminatedUnion("event", [
     ...RawEventBaseShape,
     event: z.literal("agent_step"),
     detail: z.object({
-      step_number: z.number().int().min(1).max(500),
+      step_number: z.number().int().min(1),
       current_url: z.string().max(4_096).refine(isSanitizedHttpUrl),
     }).strict(),
   }).strict(),
@@ -1158,7 +1158,6 @@ export class HttpApplicationHarnessClient implements
         { type: "text/x-tex" },
       ),
     );
-    form.set("max_steps", "100");
     const response = await this.#request(
       "/v1/sessions",
       {

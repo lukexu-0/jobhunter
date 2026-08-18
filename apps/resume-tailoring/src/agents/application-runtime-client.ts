@@ -502,7 +502,6 @@ export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
 export type RuntimeActionResponse = z.infer<typeof RuntimeActionResponseSchema>;
 
 export type ApplicationRuntimeErrorCode =
-  | "step_limit"
   | "browser_failed"
   | "model_timeout"
   | "model_failed"
@@ -534,7 +533,6 @@ function isSanitizedBasename(value: string): boolean {
 }
 
 const ERROR_MESSAGES: Readonly<Record<ApplicationRuntimeErrorCode, string>> = {
-  step_limit: "The application step limit was reached",
   browser_failed: "The browser session failed",
   model_timeout: "The model request timed out",
   model_failed: "The model request failed",
@@ -924,9 +922,6 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
         && parsedError.data.code === "invalid_request"
       ) {
         throw new ApplicationRuntimeInvalidRequestFailure();
-      }
-      if (parsedError.success && parsedError.data.code === "step_limit") {
-        throw new ApplicationRuntimeError("step_limit");
       }
       if (parsedError.success && parsedError.data.code === "browser_failed") {
         throw new ApplicationRuntimeError("browser_failed");

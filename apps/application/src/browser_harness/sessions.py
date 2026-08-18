@@ -435,7 +435,6 @@ class ApplicationSessionManager:
         opportunity_kind: OpportunityKind,
         allow_domains: Sequence[str],
         auto_submit: bool = False,
-        max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
         resume_source: UploadFile,
@@ -459,8 +458,6 @@ class ApplicationSessionManager:
                 raise ValueError("approved origins are invalid")
             if type(auto_submit) is not bool:
                 raise ValueError("auto_submit is invalid")
-            if not 1 <= max_steps <= 500:
-                raise ValueError("max_steps is invalid")
         except (TypeError, ValueError):
             raise HarnessServiceError(
                 422, "invalid_request", "Request is invalid"
@@ -579,7 +576,6 @@ class ApplicationSessionManager:
                 opportunity_kind=opportunity_kind,
                 approved_origins=tuple(origins),
                 auto_submit=auto_submit,
-                max_steps=max_steps,
                 artifacts=uploaded,
                 direct_fields=tuple(candidate.direct_fields.items()),
             )
@@ -692,7 +688,6 @@ class ApplicationSessionManager:
                 "invalid_model_output": 502,
                 "model_failed": 502,
                 "application_mismatch": 409,
-                "step_limit": 409,
                 "browser_failed": 502,
             }.get(error.code, 502)
             raise HarnessServiceError(
@@ -2006,21 +2001,13 @@ class ApplicationSessionManager:
     ) -> RuntimeActionResponse:
         runtime = record.playwright_runtime
         gate = record.human_gate
-        request = record.request
-        if runtime is None or gate is None or request is None:
+        if runtime is None or gate is None or record.request is None:
             raise HarnessServiceError(
                 409, "command_conflict", "The session is still starting"
             )
 
         if isinstance(action, PlaywrightCliRuntimeAction):
             async with record.request_lock:
-                if record.playwright_cli_action_count >= request.max_steps:
-                    error = session_error("step_limit")
-                    raise HarnessServiceError(
-                        409,
-                        error.code,
-                        error.message,
-                    )
                 record.playwright_cli_action_count += 1
                 step = record.playwright_cli_action_count
             try:
@@ -2146,13 +2133,6 @@ class ApplicationSessionManager:
 
         if isinstance(action, RequestSignInRuntimeAction):
             async with record.request_lock:
-                if record.playwright_cli_action_count >= request.max_steps:
-                    error = session_error("step_limit")
-                    raise HarnessServiceError(
-                        409,
-                        error.code,
-                        error.message,
-                    )
                 record.playwright_cli_action_count += 1
                 if (
                     record.last_successful_inspection_step

@@ -703,7 +703,6 @@ const APPLICATION_SESSION_ERROR_MESSAGES = {
   model_failed: "The model request failed",
   browser_failed: "The browser session failed",
   application_mismatch: "The open page does not match the requested job",
-  step_limit: "The application step limit was reached",
   session_timeout: "The application session expired",
 } as const;
 
@@ -737,10 +736,6 @@ export const ApplicationSessionErrorSchema = z.discriminatedUnion("code", [
     message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.application_mismatch),
   }).strict(),
   z.object({
-    code: z.literal("step_limit"),
-    message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.step_limit),
-  }).strict(),
-  z.object({
     code: z.literal("session_timeout"),
     message: z.literal(APPLICATION_SESSION_ERROR_MESSAGES.session_timeout),
   }).strict(),
@@ -767,7 +762,7 @@ const PENDING_ACTIONS_BY_STATE: Readonly<
   awaiting_human_review: { human_review: true },
 };
 export const ApplicationPlaywrightCliDiagnosticSchema = z.object({
-  step: z.number().int().min(1).max(500),
+  step: z.number().int().min(1),
   status: z.enum(["succeeded", "failed", "timed_out"]),
   exitCode: z.number().int(),
   timedOut: z.boolean(),
@@ -967,7 +962,7 @@ export const ApplicationSessionEventDtoSchema = z.discriminatedUnion("event", [
   z.object({
     ...ApplicationEventBaseShape,
     event: z.literal("agent_step"),
-    detail: z.object({ stepNumber: z.number().int().min(1).max(500) }).strict(),
+    detail: z.object({ stepNumber: z.number().int().min(1) }).strict(),
   }).strict(),
   z.object({
     ...ApplicationEventBaseShape,

@@ -624,12 +624,6 @@ async def test_malformed_success_or_status_json_is_fixed_and_sanitized(
             "The open page does not match the requested job",
         ),
         (
-            409,
-            "STEP_LIMIT",
-            "step_limit",
-            "The application step limit was reached",
-        ),
-        (
             502,
             "BROWSER_FAILED",
             "browser_failed",

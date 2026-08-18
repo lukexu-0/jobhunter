@@ -641,7 +641,7 @@ describe("ApplicationAgentService", () => {
   });
 
   test("preserves typed application-agent failures by identity", async () => {
-    const typedFailure = new ApplicationAgentFailure("STEP_LIMIT");
+    const typedFailure = new ApplicationAgentFailure("BROWSER_FAILED");
     const service = new ApplicationAgentService(TOKEN, {
       submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
       authStatusReader: connectedStatus,
@@ -659,7 +659,7 @@ describe("ApplicationAgentService", () => {
     ).catch((error: unknown) => error);
 
     expect(failure).toBe(typedFailure);
-    expect((failure as ApplicationAgentFailure).code).toBe("STEP_LIMIT");
+    expect((failure as ApplicationAgentFailure).code).toBe("BROWSER_FAILED");
   });
 
   test("propagates the exact in-flight abort reason without an OAuth reread", async () => {

@@ -56,10 +56,6 @@ _ERROR_RESPONSES: Final[dict[tuple[int, str], tuple[str, str]]] = {
         "application_mismatch",
         "The open page does not match the requested job",
     ),
-    (409, "STEP_LIMIT"): (
-        "step_limit",
-        "The application step limit was reached",
-    ),
     (502, "BROWSER_FAILED"): (
         "browser_failed",
         "The browser session failed",

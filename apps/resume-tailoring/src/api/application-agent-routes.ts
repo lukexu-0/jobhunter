@@ -47,7 +47,6 @@ const APPLICATION_AGENT_ERROR_RESPONSES: Readonly<Record<ApplicationAgentFailure
   INVALID_MODEL_OUTPUT: [502, "The model returned invalid output"],
   MODEL_PROVIDER_FAILED: [502, "The model request failed"],
   APPLICATION_MISMATCH: [409, "The open page does not match the requested job"],
-  STEP_LIMIT: [409, "The application step limit was reached"],
   BROWSER_FAILED: [502, "The browser session failed"],
 };
 

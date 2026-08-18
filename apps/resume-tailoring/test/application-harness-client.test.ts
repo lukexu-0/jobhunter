@@ -38,7 +38,7 @@ function rawSnapshot(overrides: Record<string, unknown> = {}): Record<string, un
     warnings: ["Review before submitting."],
     revision_count: 1,
     playwright_cli_diagnostics: [{
-      step: 1,
+      step: 501,
       status: "failed",
       exit_code: 1,
       timed_out: false,
@@ -94,7 +94,7 @@ describe("HttpApplicationHarnessClient", () => {
       warnings: ["Review before submitting."],
       revisionCount: 1,
       playwrightCliDiagnostics: [{
-        step: 1,
+        step: 501,
         status: "failed",
         exitCode: 1,
         timedOut: false,
@@ -283,13 +283,11 @@ describe("HttpApplicationHarnessClient", () => {
       "personal_information",
       "resume",
       "resume_source",
-      "max_steps",
     ]);
     expect(form.get("session_id")).toBe(SESSION_ID);
     expect(form.get("job_url")).toBe("https://jobs.private.example/roles/123?source=local");
     expect(form.get("opportunity_kind")).toBe("hackathon");
     expect(form.get("auto_submit")).toBe("true");
-    expect(form.get("max_steps")).toBe("100");
     const profile = form.get("personal_information");
     const resumeSourcePart = form.get("resume_source");
     const resume = form.get("resume");
@@ -720,7 +718,7 @@ describe("HttpApplicationHarnessClient", () => {
       { event: "session_started", detail: {}, session: baseSession },
       {
         event: "agent_step",
-        detail: { step_number: 2, current_url: "https://private.example/form" },
+        detail: { step_number: 501, current_url: "https://private.example/form" },
         session: baseSession,
       },
       { event: "snapshot", detail: {}, session: baseSession },
@@ -849,7 +847,7 @@ describe("HttpApplicationHarnessClient", () => {
     });
     expect(events.map(({ event, detail }) => ({ event, detail }))).toEqual([
       { event: "session_started", detail: {} },
-      { event: "agent_step", detail: { stepNumber: 2 } },
+      { event: "agent_step", detail: { stepNumber: 501 } },
       { event: "snapshot", detail: {} },
       { event: "human_navigation_required", detail: { instruction: "Complete the CAPTCHA." } },
       { event: "credentials_required", detail: {} },
