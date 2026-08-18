@@ -774,6 +774,659 @@ test("submits the exact Networking event opportunity type", async ({ page }) => 
   );
 });
 
+test("retains source-handoff options and resets a BFCache-restored session", async ({ page }) => {
+  const jobUrl = "https://nomuracampus.tal.net/vx/lang-en-GB/mobile-0/appcentre-1/opp/1525/en-GB";
+  const expiresAt = 1_800_000_000_000;
+  let runPostCount = 0;
+  let handoffPostCount = 0;
+  let pendingHandoffPost: Route | undefined;
+  let popupCount = 0;
+  let deleteCount = 0;
+  const { promise: handoffPostStarted, resolve: markHandoffPostStarted } =
+    Promise.withResolvers<void>();
+  page.on("popup", () => {
+    popupCount += 1;
+  });
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+    runPostCount += 1;
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+          message: "Complete this site's human verification in the local browser",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs", async (route) => {
+    handoffPostCount += 1;
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({
+      jobUrl,
+      opportunityKind: "networking_event",
+      generateKeywordMap: true,
+      skipReview: true,
+      autoSubmit: true,
+    });
+    pendingHandoffPost = route;
+    markHandoffPostStarted();
+  });
+  await page.route(
+    "**/api/pipeline/source-handoffs/44444444-4444-4444-8444-444444444444",
+    async (route) => {
+      deleteCount += 1;
+      expect(route.request().method()).toBe("DELETE");
+      await route.fulfill({ status: 204 });
+    },
+  );
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await input.fill(jobUrl);
+  await opportunityType.selectOption("networking_event");
+  await skipReview.check();
+  await autoSubmit.check();
+  await initializer.getByRole("button", { name: "Initialize" }).evaluate(
+    (button: HTMLButtonElement) => {
+      button.click();
+      button.click();
+    },
+  );
+
+  const verification = initializer.getByRole("region", { name: "Human verification required" });
+  await expect(verification).toBeVisible();
+  await expect(verification.getByText(
+    "This site requires a verification step that Jobhunter will not attempt. Open the trusted local browser and complete the verification manually.",
+    { exact: true },
+  )).toBeVisible();
+  const open = verification.getByRole("button", { name: "Open verification browser" });
+  await expect(open).toBeFocused();
+  await expect(input).toHaveValue(jobUrl);
+  await expect(opportunityType).toHaveValue("networking_event");
+  await expect(skipReview).toBeChecked();
+  await expect(input).toHaveAttribute("aria-describedby", "source-verification-description");
+  await expect(autoSubmit).toBeChecked();
+  await expect(input).toBeDisabled();
+  expect(runPostCount).toBe(1);
+  expect(handoffPostCount).toBe(0);
+
+  await open.evaluate((button: HTMLButtonElement) => {
+    button.click();
+    button.click();
+  });
+  await handoffPostStarted;
+  await expect(verification.getByRole("button", { name: "Opening verification browser…" })).toBeDisabled();
+  expect(handoffPostCount).toBe(1);
+  expect(popupCount).toBe(0);
+
+  if (!pendingHandoffPost) throw new Error("Source-handoff request was not intercepted");
+  await pendingHandoffPost.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify({
+      id: "44444444-4444-4444-8444-444444444444",
+      state: "awaiting_human_verification",
+      jobUrl,
+      expiresAt,
+    }),
+  });
+
+  await expect(verification.getByRole("heading", {
+    name: "Complete verification in the local browser",
+  })).toBeVisible();
+  await expect(verification.getByText(
+    "A trusted local browser window is open. Complete the site's verification there, then return here and confirm below.",
+    { exact: true },
+  )).toBeVisible();
+  await expect(verification.getByRole("button", {
+    name: "I've completed verification",
+  })).toBeFocused();
+  await expect(verification.getByRole("button", { name: "Cancel verification" })).toBeEnabled();
+  await expect(input).toHaveValue(jobUrl);
+  await expect(opportunityType).toHaveValue("networking_event");
+  await expect(skipReview).toBeChecked();
+  await expect(autoSubmit).toBeChecked();
+  expect(popupCount).toBe(0);
+  await page.setViewportSize({ width: 320, height: 900 });
+  await expectNoDocumentOverflow(page);
+  await page.evaluate(() => {
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+  });
+  await expect(verification.getByRole("alert")).toHaveText(
+    "Verification session ended. Open a new verification browser session.",
+  );
+  await expect(verification.getByRole("button", {
+    name: "Open verification browser",
+  })).toBeEnabled();
+  await expect(verification.getByRole("button", {
+    name: "I've completed verification",
+  })).toHaveCount(0);
+  await expect(input).toHaveValue(jobUrl);
+  await expect(opportunityType).toHaveValue("networking_event");
+  await expect(skipReview).toBeChecked();
+  await expect(autoSubmit).toBeChecked();
+  expect(deleteCount).toBe(1);
+});
+
+test("releases a late-created source handoff once after pagehide without changing visible state", async ({ page }) => {
+  const jobUrl = "https://jobs.example.test/challenged/page-exit";
+  const handoffId = "88888888-8888-4888-8888-888888888888";
+  let pendingHandoffPost: Route | undefined;
+  let deleteCount = 0;
+  const { promise: handoffPostStarted, resolve: markHandoffPostStarted } =
+    Promise.withResolvers<void>();
+  const { promise: deleteReceived, resolve: markDeleteReceived } =
+    Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+          message: "Complete this site's human verification in the local browser",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs", async (route) => {
+    pendingHandoffPost = route;
+    markHandoffPostStarted();
+  });
+  await page.route(`**/api/pipeline/source-handoffs/${handoffId}`, async (route) => {
+    deleteCount += 1;
+    expect(route.request().method()).toBe("DELETE");
+    expect(route.request().postData()).toBeNull();
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "SOURCE_HANDOFF_UNAVAILABLE",
+          message: "private upstream details",
+        },
+      }),
+    });
+    markDeleteReceived();
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  await initializer.getByRole("textbox", { name: "Opportunity URLs" }).fill(jobUrl);
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  await initializer.getByRole("button", { name: "Open verification browser" }).click();
+  await handoffPostStarted;
+
+  await page.evaluate(async () => {
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+  });
+  expect(deleteCount).toBe(0);
+
+  if (!pendingHandoffPost) throw new Error("Source-handoff request was not intercepted");
+  await pendingHandoffPost.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify({
+      id: handoffId,
+      state: "awaiting_human_verification",
+      jobUrl,
+      expiresAt: 1_800_000_000_000,
+    }),
+  });
+
+  await deleteReceived;
+  const verification = initializer.getByRole("region", { name: "Human verification required" });
+  const open = verification.getByRole("button", { name: "Open verification browser" });
+  await expect(open).toBeEnabled();
+  await page.evaluate(() => {
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+  });
+  await page.evaluate(
+    () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())),
+  );
+
+  await expect(verification).toBeVisible();
+  await expect(open).toBeEnabled();
+  await expect(verification.getByRole("alert")).toHaveCount(0);
+  expect(deleteCount).toBe(1);
+});
+
+test("releases an awaiting source handoff once when the dashboard unmounts", async ({ page }) => {
+  const jobUrl = "https://jobs.example.test/challenged/navigation";
+  const handoffId = "99999999-9999-4999-8999-999999999999";
+  let deleteCount = 0;
+  const { promise: deleteReceived, resolve: markDeleteReceived } =
+    Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+          message: "Complete this site's human verification in the local browser",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: handoffId,
+        state: "awaiting_human_verification",
+        jobUrl,
+        expiresAt: 1_800_000_000_000,
+      }),
+    });
+  });
+  await page.route(`**/api/pipeline/source-handoffs/${handoffId}`, async (route) => {
+    deleteCount += 1;
+    expect(route.request().method()).toBe("DELETE");
+    await route.fulfill({ status: 204 });
+    markDeleteReceived();
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  await initializer.getByRole("textbox", { name: "Opportunity URLs" }).fill(jobUrl);
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  await initializer.getByRole("button", { name: "Open verification browser" }).click();
+  await expect(initializer.getByRole("button", {
+    name: "I've completed verification",
+  })).toBeEnabled();
+
+  await page.getByRole("link", { name: "Discovery", exact: true }).click();
+  await expect(page).toHaveURL(/\/discovery$/);
+  await deleteReceived;
+  expect(deleteCount).toBe(1);
+});
+
+test("completes a source handoff once and merges the created run", async ({ page }) => {
+  const jobUrl = "https://jobs.example.test/challenged/role";
+  const completedRun: RunDto = {
+    ...runFixture("handoff-completed-run", "pending", "queued"),
+    opportunityKind: "hackathon",
+    jobUrl,
+    skipReview: true,
+    autoSubmit: true,
+  };
+  let completed = false;
+  let completePostCount = 0;
+  let pendingComplete: Route | undefined;
+  const { promise: completeStarted, resolve: markCompleteStarted } =
+    Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    const request = route.request();
+    if (request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: completed ? [completedRun] : [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+          message: "Complete this site's human verification in the local browser",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "55555555-5555-4555-8555-555555555555",
+        state: "awaiting_human_verification",
+        jobUrl,
+        expiresAt: 1_800_000_000_000,
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs/55555555-5555-4555-8555-555555555555/complete", async (route) => {
+    completePostCount += 1;
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postData()).toBeNull();
+    pendingComplete = route;
+    markCompleteStarted();
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await input.fill(jobUrl);
+  await opportunityType.selectOption("hackathon");
+  await skipReview.check();
+  await autoSubmit.check();
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  await initializer.getByRole("button", { name: "Open verification browser" }).click();
+
+  const complete = initializer.getByRole("button", { name: "I've completed verification" });
+  await expect(complete).toBeEnabled();
+  await complete.evaluate((button: HTMLButtonElement) => {
+    button.click();
+    button.click();
+  });
+  await completeStarted;
+  await expect(initializer.getByRole("button", { name: "Completing verification…" })).toBeDisabled();
+  expect(completePostCount).toBe(1);
+
+  if (!pendingComplete) throw new Error("Source-handoff completion was not intercepted");
+  completed = true;
+  await pendingComplete.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify(completedRun),
+  });
+
+  await expect(page).toHaveURL(/\/$/);
+  await expect(initializer.getByRole("region", { name: "Human verification required" })).toHaveCount(0);
+  await expect(initializer.getByRole("status")).toHaveText("1 application initialized.");
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue("");
+  await expect(opportunityType).toHaveValue("auto");
+  await expect(skipReview).not.toBeChecked();
+  await expect(autoSubmit).not.toBeChecked();
+  await expect(page.locator(`tbody a.application-link[href="/runs/${completedRun.id}"]`)).toBeVisible();
+  await expect(page.locator(".applications-total")).toHaveText("1");
+  expect(completePostCount).toBe(1);
+});
+
+test("cancels a source handoff once and keeps the initializer choices", async ({ page }) => {
+  const jobUrl = "https://jobs.example.test/challenged/cancel";
+  let deleteCount = 0;
+  let pendingDelete: Route | undefined;
+  const { promise: deleteStarted, resolve: markDeleteStarted } =
+    Promise.withResolvers<void>();
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+          message: "Complete this site's human verification in the local browser",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "66666666-6666-4666-8666-666666666666",
+        state: "awaiting_human_verification",
+        jobUrl,
+        expiresAt: 1_800_000_000_000,
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs/66666666-6666-4666-8666-666666666666", async (route) => {
+    deleteCount += 1;
+    expect(route.request().method()).toBe("DELETE");
+    expect(route.request().postData()).toBeNull();
+    pendingDelete = route;
+    markDeleteStarted();
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  await input.fill(jobUrl);
+  await opportunityType.selectOption("event");
+  await skipReview.check();
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  await initializer.getByRole("button", { name: "Open verification browser" }).click();
+
+  const cancel = initializer.getByRole("button", { name: "Cancel verification" });
+  await cancel.evaluate((button: HTMLButtonElement) => {
+    button.click();
+    button.click();
+  });
+  await deleteStarted;
+  await page.evaluate(() => {
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+  });
+  await expect(initializer.getByRole("button", { name: "Cancelling verification…" })).toBeDisabled();
+  await expect(initializer.getByRole("button", {
+    name: "I've completed verification",
+  })).toBeDisabled();
+  expect(deleteCount).toBe(1);
+
+  if (!pendingDelete) throw new Error("Source-handoff cancellation was not intercepted");
+  await pendingDelete.fulfill({ status: 204 });
+
+  await expect(initializer.getByRole("region", { name: "Human verification required" })).toHaveCount(0);
+  await expect(initializer.getByRole("status")).toHaveText(
+    "Verification cancelled. The URL and options were kept.",
+  );
+  await expect(input).toHaveValue(jobUrl);
+  await expect(opportunityType).toHaveValue("event");
+  await expect(skipReview).toBeChecked();
+  await expect(input).toBeEnabled();
+  await expect(initializer.getByRole("button", { name: "Initialize" })).toBeFocused();
+  expect(deleteCount).toBe(1);
+});
+
+test("surfaces source-handoff conflicts and outages without an automatic retry", async ({ page }) => {
+  const jobUrl = "https://jobs.example.test/challenged/unavailable";
+  let handoffPostCount = 0;
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+          message: "Complete this site's human verification in the local browser",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs", async (route) => {
+    handoffPostCount += 1;
+    const unavailable = handoffPostCount === 2;
+    await route.fulfill({
+      status: unavailable ? 503 : 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: unavailable
+          ? {
+              code: "SOURCE_HANDOFF_UNAVAILABLE",
+              message: "private upstream details",
+            }
+          : {
+              code: "SOURCE_HANDOFF_CONFLICT",
+              message: "A source handoff is already active",
+            },
+      }),
+    });
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  await initializer.getByRole("textbox", { name: "Opportunity URLs" }).fill(jobUrl);
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  const open = initializer.getByRole("button", { name: "Open verification browser" });
+
+  await open.click();
+  await expect(initializer.getByRole("alert")).toHaveText(
+    "A source handoff is already active",
+  );
+  await expect(open).toBeEnabled();
+  expect(handoffPostCount).toBe(1);
+
+  await open.click();
+  await expect(initializer.getByRole("alert")).toHaveText(
+    "Source handoff is unavailable",
+  );
+  await expect(open).toBeEnabled();
+  expect(handoffPostCount).toBe(2);
+  await initializer.getByRole("button", { name: "Cancel verification" }).click();
+  await expect(initializer.getByRole("button", { name: "Initialize" })).toBeFocused();
+  expect(handoffPostCount).toBe(2);
+});
+
+test("returns an expired source handoff to the open-browser step without cleanup or completion retry", async ({ page }) => {
+  const jobUrl = "https://jobs.example.test/challenged/expired";
+  let completePostCount = 0;
+  let deleteCount = 0;
+
+  await page.route("**/api/pipeline/runs", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ runs: [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+          message: "Complete this site's human verification in the local browser",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "77777777-7777-4777-8777-777777777777",
+        state: "awaiting_human_verification",
+        jobUrl,
+        expiresAt: 1_700_000_000_000,
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs/77777777-7777-4777-8777-777777777777/complete", async (route) => {
+    completePostCount += 1;
+    await route.fulfill({
+      status: 404,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "SOURCE_HANDOFF_NOT_FOUND",
+          message: "Source handoff not found",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/pipeline/source-handoffs/77777777-7777-4777-8777-777777777777", async (route) => {
+    deleteCount += 1;
+    await route.fulfill({
+      status: 404,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: {
+          code: "SOURCE_HANDOFF_NOT_FOUND",
+          message: "Source handoff not found",
+        },
+      }),
+    });
+  });
+  await page.goto("/");
+
+  const initializer = page.getByRole("form", { name: "Initialize applications", exact: true });
+  const input = initializer.getByRole("textbox", { name: "Opportunity URLs" });
+  const opportunityType = initializer.getByRole("combobox", { name: "Opportunity type" });
+  const skipReview = initializer.getByRole("checkbox", { name: "Skip résumé review" });
+  const autoSubmit = initializer.getByRole("checkbox", { name: "Auto-submit application" });
+  await input.fill(jobUrl);
+  await opportunityType.selectOption("event");
+  await skipReview.check();
+  await autoSubmit.check();
+  await initializer.getByRole("button", { name: "Initialize" }).click();
+  await initializer.getByRole("button", { name: "Open verification browser" }).click();
+  const complete = initializer.getByRole("button", { name: "I've completed verification" });
+  await complete.click();
+
+  await expect(initializer.getByRole("alert")).toHaveText(
+    "Verification session ended. Open a new verification browser session.",
+  );
+  const open = initializer.getByRole("button", { name: "Open verification browser" });
+  await expect(open).toBeEnabled();
+  await expect(open).toBeFocused();
+  await expect(initializer.getByRole("button", {
+    name: "I've completed verification",
+  })).toHaveCount(0);
+  await expect(initializer.getByRole("button", { name: "Cancel verification" })).toHaveCount(0);
+  await expect(input).toHaveValue(jobUrl);
+  await expect(input).toBeDisabled();
+  await expect(opportunityType).toHaveValue("event");
+  await expect(skipReview).toBeChecked();
+  await expect(autoSubmit).toBeChecked();
+  expect(completePostCount).toBe(1);
+  expect(deleteCount).toBe(0);
+});
+
 test("preserves both run options while confirming a duplicate canonical URL", async ({ page }) => {
   const canonicalJobUrl = "https://jobs.example.test/roles/123?source=ui";
   const enteredJobUrl = "HTTPS://Jobs.Example.Test:443/roles/123?source=ui#description";

@@ -14,13 +14,17 @@ import {
   approveRun,
   artifactHref,
   closeApplicationSession,
+  completeSourceHandoff,
   createRun,
+  createSourceHandoff,
   deleteRun,
+  deleteSourceHandoff,
   listDiscoveryJobs,
   editRun,
   getApplicationAnswerSuggestions,
   getApplicationSession,
   getRun,
+  getSourceHandoff,
   listRuns,
   listResumeIterations,
   readJsonArtifact,
@@ -334,6 +338,184 @@ describe("pipeline run requests", () => {
         init: { body: JSON.stringify({ expectedPdfSha256: sha256, acknowledgeVisualIssues: true }), cache: "no-store", headers: { "content-type": "application/json" }, method: "POST" },
       },
     ]);
+  });
+
+  test("creates a source handoff for a URL run awaiting human verification", async () => {
+    const jobUrl = "https://nomuracampus.tal.net/vx/lang-en-GB/mobile-0/appcentre-1/brand-4/xf-2fa21512c600/candidate/so/pm/1/pl/1/opp/1525-2027-Technology-Summer-Analyst-Program-Global-Execution-Services-Technology/en-GB";
+    const handoff = {
+      id: "11111111-1111-4111-8111-111111111111",
+      state: "awaiting_human_verification",
+      jobUrl,
+      expiresAt: 1_775_174_700_000,
+    };
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(json(handoff, { status: 201 }), requests);
+
+    await expect(createSourceHandoff({
+      jobUrl,
+      generateKeywordMap: true,
+      skipReview: false,
+      autoSubmit: false,
+    })).resolves.toEqual({
+      id: "11111111-1111-4111-8111-111111111111",
+      state: "awaiting_human_verification",
+      jobUrl,
+      expiresAt: 1_775_174_700_000,
+    });
+    expect(requests).toEqual([{
+      input: "/api/pipeline/source-handoffs",
+      init: {
+        body: JSON.stringify({
+          jobUrl,
+          generateKeywordMap: true,
+          skipReview: false,
+          autoSubmit: false,
+        }),
+        cache: "no-store",
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      },
+    }]);
+  });
+
+  test("rejects invalid source-handoff requests locally", () => {
+    let fetchCalls = 0;
+    setFetchMock(async () => {
+      fetchCalls += 1;
+      return json({});
+    });
+    const invalidRequests: unknown[] = [
+      { jobUrl: "ftp://jobs.example.test/roles/platform" },
+      {
+        jobUrl: "https://jobs.example.test/roles/platform",
+        source: "captured text is never accepted",
+      },
+    ];
+
+    for (const request of invalidRequests) {
+      expect(() => createSourceHandoff(
+        request as Parameters<typeof createSourceHandoff>[0],
+      )).toThrow(PipelineClientError);
+    }
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("gets, completes, and deletes a source handoff with exact bodyless operations", async () => {
+    const jobUrl = "https://jobs.example.test/roles/platform";
+    const handoff = {
+      id: "22222222-2222-4222-8222-222222222222",
+      state: "awaiting_human_verification",
+      jobUrl,
+      expiresAt: 1_775_174_700_000,
+    } as const;
+    const completedRun = { ...run(), id: "captured-run", jobUrl };
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    setFetchMock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init });
+      if (init?.method === "GET") return json(handoff);
+      if (init?.method === "POST") return json(completedRun, { status: 201 });
+      return new Response(null, { status: 204 });
+    });
+
+    await expect(getSourceHandoff("handoff /1")).resolves.toEqual(handoff);
+    await expect(completeSourceHandoff("handoff /1")).resolves.toEqual(completedRun);
+    await expect(deleteSourceHandoff("handoff /1")).resolves.toBeUndefined();
+    expect(requests).toEqual([
+      {
+        input: "/api/pipeline/source-handoffs/handoff%20%2F1",
+        init: { cache: "no-store", method: "GET" },
+      },
+      {
+        input: "/api/pipeline/source-handoffs/handoff%20%2F1/complete",
+        init: { cache: "no-store", method: "POST" },
+      },
+      {
+        input: "/api/pipeline/source-handoffs/handoff%20%2F1",
+        init: { cache: "no-store", method: "DELETE" },
+      },
+    ]);
+  });
+
+  test("opts a source-handoff cleanup delete into fetch keepalive", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(new Response(null, { status: 204 }), requests);
+
+    await expect(deleteSourceHandoff("handoff /cleanup", true)).resolves.toBeUndefined();
+    expect(requests).toEqual([{
+      input: "/api/pipeline/source-handoffs/handoff%20%2Fcleanup",
+      init: { cache: "no-store", keepalive: true, method: "DELETE" },
+    }]);
+  });
+
+  test("rejects private browser data in every public source-handoff response", async () => {
+    const jobUrl = "https://jobs.example.test/roles/private-boundary";
+    const handoff = {
+      id: "33333333-3333-4333-8333-333333333333",
+      state: "awaiting_human_verification",
+      jobUrl,
+      expiresAt: 1_800_000_000_000,
+    };
+
+    for (const privateField of [
+      { source: "captured visible text" },
+      { cookies: [{ name: "session", value: "secret" }] },
+    ]) {
+      setFetchMock(async () => json({ ...handoff, ...privateField }, { status: 201 }));
+      await expect(createSourceHandoff({ jobUrl })).rejects.toMatchObject({
+        code: "INVALID_RESPONSE",
+      });
+    }
+
+    setFetchMock(async () => json({
+      ...run(),
+      id: "private-completion",
+      jobUrl,
+      source: "captured visible text",
+    }, { status: 201 }));
+    await expect(completeSourceHandoff(handoff.id)).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
+  test("uses fixed source-handoff errors for unavailable, conflicting, and missing sessions", async () => {
+    const jobUrl = "https://jobs.example.test/roles/error-boundary";
+    const cases = [
+      {
+        status: 503,
+        code: "SOURCE_HANDOFF_UNAVAILABLE",
+        serverMessage: "private upstream details",
+        expectedMessage: "Source handoff is unavailable",
+        request: () => createSourceHandoff({ jobUrl }),
+      },
+      {
+        status: 409,
+        code: "SOURCE_HANDOFF_CONFLICT",
+        serverMessage: "A source handoff is already active",
+        expectedMessage: "A source handoff is already active",
+        request: () => createSourceHandoff({ jobUrl }),
+      },
+      {
+        status: 404,
+        code: "SOURCE_HANDOFF_NOT_FOUND",
+        serverMessage: "Source handoff not found",
+        expectedMessage: "Source handoff not found",
+        request: () => getSourceHandoff("missing"),
+      },
+    ] as const;
+
+    for (const errorCase of cases) {
+      setFetchMock(async () => json({
+        error: {
+          code: errorCase.code,
+          message: errorCase.serverMessage,
+        },
+      }, { status: errorCase.status }));
+      await expect(errorCase.request()).rejects.toMatchObject({
+        code: errorCase.code,
+        message: errorCase.expectedMessage,
+        status: errorCase.status,
+      });
+    }
   });
 
   test("forwards an explicit keyword-map opt out", async () => {

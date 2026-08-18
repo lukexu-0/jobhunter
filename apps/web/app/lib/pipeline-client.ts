@@ -10,6 +10,7 @@ import {
   ApproveRunRequestSchema,
   ArtifactDtoSchema,
   CreateRunRequestSchema,
+  CreateSourceHandoffRequestSchema,
   EditRunRequestSchema,
   DiscoveryListRequestSchema,
   DiscoveryListResponseSchema,
@@ -20,6 +21,7 @@ import {
   RegenerateRunRequestSchema,
   ResumeIterationListResponseSchema,
   RunDtoSchema,
+  SourceHandoffDtoSchema,
   RunListResponseSchema,
   StartApplicationSessionRequestSchema,
   UpdateApplicationStatusRequestSchema,
@@ -35,6 +37,7 @@ import {
   type DiscoveryQueueResponse,
   type DiscoverySyncResponse,
   type OpportunityKind,
+  type SourceHandoffDto,
   type RunDto,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
@@ -52,6 +55,7 @@ const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   APPLICATION_HARNESS_UNAVAILABLE: "The local application service is unavailable",
   INVALID_MODEL_OUTPUT: "The model returned invalid output",
   MODEL_PROVIDER_FAILED: "The model request failed",
+  SOURCE_HANDOFF_UNAVAILABLE: "Source handoff is unavailable",
   MODEL_TIMEOUT: "The model request timed out",
   JOB_EXTRACTION_UNAVAILABLE: "Opportunity description extraction failed",
   JOB_EXTRACTION_TIMEOUT: "Opportunity description extraction timed out",
@@ -169,6 +173,10 @@ function runPath(id: string): string {
 
 function applicationPath(id: string): string {
   return `${runPath(id)}/application`;
+}
+
+function sourceHandoffPath(id: string): string {
+  return `/source-handoffs/${encodeURIComponent(id)}`;
 }
 function ensureValidRequest(valid: boolean): asserts valid {
   if (!valid) {
@@ -343,6 +351,48 @@ export function createRun(
     throw new PipelineClientError("The request is invalid.", "INVALID_REQUEST");
   }
   return requestRun("/runs", jsonPost(parsed.data));
+}
+
+export function createSourceHandoff(
+  request: z.input<typeof CreateSourceHandoffRequestSchema>,
+): Promise<SourceHandoffDto> {
+  const parsed = CreateSourceHandoffRequestSchema.safeParse(request);
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    "/source-handoffs",
+    jsonPost(parsed.data),
+    201,
+    SourceHandoffDtoSchema,
+  );
+}
+
+export function getSourceHandoff(id: string): Promise<SourceHandoffDto> {
+  return requestApplicationResponse(
+    sourceHandoffPath(id),
+    { method: "GET" },
+    200,
+    SourceHandoffDtoSchema,
+  );
+}
+
+export function completeSourceHandoff(id: string): Promise<RunDto> {
+  return requestApplicationResponse(
+    `${sourceHandoffPath(id)}/complete`,
+    { method: "POST" },
+    201,
+    RunDtoSchema,
+  );
+}
+
+export function deleteSourceHandoff(id: string, keepalive = false): Promise<void> {
+  return requestEmptyApplicationResponse(
+    sourceHandoffPath(id),
+    {
+      method: "DELETE",
+      ...(keepalive ? { keepalive: true } : {}),
+    },
+    204,
+  );
 }
 
 export function createPastedRun(
