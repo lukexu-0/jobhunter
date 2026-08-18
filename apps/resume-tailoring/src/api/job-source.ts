@@ -50,7 +50,8 @@ export type JobSourceErrorCode =
   | "JOB_SOURCE_UNAVAILABLE"
   | "JOB_SOURCE_UNSUPPORTED"
   | "JOB_SOURCE_TOO_LARGE"
-  | "JOB_DESCRIPTION_UNAVAILABLE";
+  | "JOB_DESCRIPTION_UNAVAILABLE"
+  | "JOB_HUMAN_VERIFICATION_REQUIRED";
 
 const ERROR_DETAILS = {
   JOB_URL_BLOCKED: [400, "Opportunity URL must resolve to a public HTTP(S) address"],
@@ -58,11 +59,15 @@ const ERROR_DETAILS = {
   JOB_SOURCE_UNSUPPORTED: [422, "The opportunity page response is not HTML or plain text"],
   JOB_SOURCE_TOO_LARGE: [413, "The opportunity page is too large to import"],
   JOB_DESCRIPTION_UNAVAILABLE: [422, "The page does not contain a usable opportunity description"],
-} as const satisfies Record<JobSourceErrorCode, readonly [400 | 413 | 422, string]>;
+  JOB_HUMAN_VERIFICATION_REQUIRED: [
+    409,
+    "Complete this site's human verification in the local browser",
+  ],
+} as const satisfies Record<JobSourceErrorCode, readonly [400 | 409 | 413 | 422, string]>;
 
 export class JobSourceError extends Error {
   readonly code: JobSourceErrorCode;
-  readonly status: 400 | 413 | 422;
+  readonly status: 400 | 409 | 413 | 422;
 
   constructor(code: JobSourceErrorCode, options?: ErrorOptions) {
     const [status, message] = ERROR_DETAILS[code];
@@ -470,7 +475,7 @@ export function decodeHtmlEntities(value: string): string {
   });
 }
 
-function normalizeText(value: string): string {
+export function normalizeJobSourceText(value: string): string {
   return value
     .replace(/\r\n?/g, "\n")
     .split("\n")
@@ -513,7 +518,7 @@ async function captureElements(html: string, selector: string): Promise<string[]
     },
     text(text) { current?.push(text.text); },
   }).transform(new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })).text();
-  return output.map((value) => normalizeText(decodeHtmlEntities(value)));
+  return output.map((value) => normalizeJobSourceText(decodeHtmlEntities(value)));
 }
 
 async function captureDocument(html: string): Promise<string> {
@@ -521,12 +526,18 @@ async function captureDocument(html: string): Promise<string> {
   await new HTMLRewriter().onDocument({
     text(text) { chunks.push(text.text); },
   }).transform(new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })).text();
-  return normalizeText(decodeHtmlEntities(chunks.join("")));
+  return normalizeJobSourceText(decodeHtmlEntities(chunks.join("")));
 }
 
 async function normalizeHtmlFragment(fragment: string): Promise<string> {
   const sanitized = await sanitizeHtml(fragment);
   return captureDocument(sanitized);
+}
+
+async function isTalHumanVerificationPage(html: string): Promise<boolean> {
+  const visibleText = await normalizeHtmlFragment(html);
+  return visibleText.includes("Quick Check Needed")
+    && visibleText.includes("We just need to confirm you're a real person.");
 }
 
 function jsonLdOpportunityKind(value: unknown): OpportunityKind | undefined {
@@ -988,14 +999,19 @@ async function loadJobSourceWithSignal(
   renderHtml: RenderJobSourceHtml,
   opportunityKindHint?: OpportunityKind,
 ): Promise<LoadedJobSource> {
+  const submittedInputUrl = new URL(jobUrl);
   const loaded = await loadPublicWebSourceWithSignal(
     jobUrl,
     signal,
     fetchImpl,
     resolveHost,
   );
+  const submittedUrl = canonicalizeLogicalUrl(jobUrl);
+  const humanVerificationEligible = submittedInputUrl.protocol === "https:"
+    && !submittedInputUrl.hostname.endsWith(".")
+    && new URL(loaded.url).origin === submittedUrl.origin;
   if (loaded.mediaType === "plain") {
-    const jobDescription = normalizeText(loaded.body);
+    const jobDescription = normalizeJobSourceText(loaded.body);
     if (opportunityKindHint !== undefined) {
       const parsed = JobDescriptionSchema.safeParse(jobDescription);
       if (parsed.success) {
@@ -1027,6 +1043,12 @@ async function loadJobSourceWithSignal(
     resolveHost,
   );
   if (oracleCandidate !== undefined) return oracleCandidate;
+  if (
+    humanVerificationEligible
+    && await isTalHumanVerificationPage(loaded.body)
+  ) {
+    throw new JobSourceError("JOB_HUMAN_VERIFICATION_REQUIRED");
+  }
   let originalError: JobSourceError;
   try {
     return await htmlFallback(loaded.body);
@@ -1045,8 +1067,14 @@ async function loadJobSourceWithSignal(
     const renderedHtml = await hardRace(renderHtml(loaded.url, signal), signal);
     if (renderedHtml === undefined) throw originalError;
     return await hardRace(htmlFallback(renderedHtml), signal);
-  } catch {
+  } catch (error) {
     if (signal.aborted && !(signal.reason instanceof DeadlineExpired)) throw cancellationReason(signal);
+    if (
+      error instanceof JobSourceError
+      && error.code === "JOB_HUMAN_VERIFICATION_REQUIRED"
+    ) {
+      throw error;
+    }
     throw originalError;
   }
 }

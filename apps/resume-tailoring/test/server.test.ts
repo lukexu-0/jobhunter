@@ -98,7 +98,7 @@ test("credential command POSTs can outlive Bun's default idle timeout", async ()
   }
 }, 18_000);
 
-test("only exact run-creation POSTs can outlive Bun's default idle timeout", async () => {
+test("only validated run creation and source handoff POSTs can outlive Bun's idle timeout", async () => {
   const server = startPipelineHttpServer(
     {
       // This integration check must cross Bun's real 10-second socket idle timeout.
@@ -108,6 +108,20 @@ test("only exact run-creation POSTs can outlive Bun's default idle timeout", asy
           await request.json();
           context?.onRunCreationValidated?.();
         }
+        if (
+          request.method === "POST"
+          && url.pathname === "/v1/source-handoffs"
+        ) {
+          await request.json();
+          context?.onSourceHandoffCreationValidated?.();
+        }
+        if (
+          request.method === "POST"
+          && /^\/v1\/source-handoffs\/[^/]+\/complete$/.test(url.pathname)
+          && request.body === null
+        ) {
+          context?.onSourceHandoffCompletionValidated?.();
+        }
         await Bun.sleep(12_000);
         return new Response("completed");
       },
@@ -116,15 +130,26 @@ test("only exact run-creation POSTs can outlive Bun's default idle timeout", asy
   );
   try {
     const [
+      sourceCreationRequest,
       runCreationRequest,
+      sourceCompletionRequest,
       runListRequest,
       nestedRunMutationRequest,
     ] = await Promise.allSettled([
+      fetch(`http://127.0.0.1:${server.port}/v1/source-handoffs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jobUrl: "https://jobs.example.test/role" }),
+      }),
       fetch(`http://127.0.0.1:${server.port}/v1/runs?source=browser`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jobUrl: "https://jobs.example.test/role" }),
       }),
+      fetch(
+        `http://127.0.0.1:${server.port}/v1/source-handoffs/123e4567-e89b-42d3-a456-426614174000/complete`,
+        { method: "POST" },
+      ),
       fetch(`http://127.0.0.1:${server.port}/v1/runs`),
       fetch(`http://127.0.0.1:${server.port}/v1/runs/run-1/retry`, {
         method: "POST",
@@ -136,7 +161,17 @@ test("only exact run-creation POSTs can outlive Bun's default idle timeout", asy
       expect(runCreationRequest.value.status).toBe(200);
       expect(await runCreationRequest.value.text()).toBe("completed");
     }
+    expect(sourceCompletionRequest.status).toBe("fulfilled");
+    if (sourceCompletionRequest.status === "fulfilled") {
+      expect(sourceCompletionRequest.value.status).toBe(200);
+      expect(await sourceCompletionRequest.value.text()).toBe("completed");
+    }
     expect(runListRequest.status).toBe("rejected");
+    expect(sourceCreationRequest.status).toBe("fulfilled");
+    if (sourceCreationRequest.status === "fulfilled") {
+      expect(sourceCreationRequest.value.status).toBe(200);
+      expect(await sourceCreationRequest.value.text()).toBe("completed");
+    }
     expect(nestedRunMutationRequest.status).toBe("rejected");
   } finally {
     await server.stop(true);

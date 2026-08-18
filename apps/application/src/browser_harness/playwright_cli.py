@@ -30,9 +30,12 @@ from .models import (
     BrowserScreenshot,
     BrowserTab,
     PlaywrightCliExecutionResult,
+    SOURCE_CAPTURE_MAX_BYTES,
+    SOURCE_CAPTURE_MAX_LINES,
     validate_approved_origin,
     validate_job_url,
     validate_loopback_http_url,
+    validate_https_origin,
 )
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,12 @@ _MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
 _MAX_OUTPUT_DIRECTORY_BYTES = 128 * 1024 * 1024
 _MAX_TEMPORARY_DIRECTORY_BYTES = 128 * 1024 * 1024
 _MAX_VIDEO_BYTES = 512 * 1024 * 1024
+_MAX_SOURCE_CAPTURE_BYTES = SOURCE_CAPTURE_MAX_BYTES
+_MAX_SOURCE_CAPTURE_LINES = SOURCE_CAPTURE_MAX_LINES
+_MAX_SOURCE_CAPTURE_VISITED_NODES = 100_000
+_MAX_SOURCE_CAPTURE_TRAVERSAL_BYTES = (
+    _MAX_SOURCE_CAPTURE_BYTES + _MAX_PRIVATE_REDACTION_FRAGMENT_CHARS
+)
 _ARTIFACT_BUDGET_POLL_SECONDS = 0.25
 _EXECUTION_TIMEOUT_SECONDS = 120.0
 _LIFECYCLE_TIMEOUT_SECONDS = 120.0
@@ -148,6 +157,25 @@ def _private_redaction_fragments(values: Iterable[str]) -> tuple[str, ...]:
             )
         )
     return tuple(sorted(fragments, key=len, reverse=True))
+
+
+def _bounded_source_snapshot(value: str) -> str:
+    lines = value.splitlines(keepends=True)
+    if len(lines) > _MAX_SOURCE_CAPTURE_LINES:
+        value = "".join(lines[:_MAX_SOURCE_CAPTURE_LINES])
+    encoded = value.encode("utf-8")
+    if len(encoded) <= _MAX_SOURCE_CAPTURE_BYTES:
+        return value
+    prefix = encoded[:_MAX_SOURCE_CAPTURE_BYTES]
+    try:
+        return prefix.decode("utf-8")
+    except UnicodeDecodeError as error:
+        if (
+            error.reason != "unexpected end of data"
+            or error.end != len(prefix)
+        ):
+            raise
+        return prefix[: error.start].decode("utf-8")
 
 
 _APPROVED_COMMANDS = frozenset(
@@ -1956,6 +1984,7 @@ class PlaywrightCliRuntime:
         actual_timeout = min(timeout, remaining) if enforce_deadline else timeout
         session_bound = enforce_deadline and remaining < timeout
         process = await self._spawn(self._argv(command, args))
+        self._active_process = process
         stdout_capture = _BoundedCapture(capture_limit, bytearray())
         stderr_capture = _BoundedCapture(capture_limit, bytearray())
         stdout_task = asyncio.create_task(
@@ -2177,9 +2206,9 @@ class PlaywrightCliRuntime:
             f"const expectedOrigin={json.dumps(expected_origin)};"
             f"const username={json.dumps(username)};"
             f"const password={json.dumps(password)};"
-            "const hasExpectedUrl=(url)=>url===expectedOrigin||"
-            "url.startsWith(expectedOrigin+'/');"
-            "if(!hasExpectedUrl(page.url()))"
+            "const hasExpectedOrigin=(url)=>{try{return "
+            "new URL(url).origin===expectedOrigin;}catch{return false;}};"
+            "if(!hasExpectedOrigin(page.url()))"
             "throw new Error('Unexpected sign-in origin');"
             f"const usernameElement=await page.locator('aria-ref={username_ref}').elementHandle();"
             f"const passwordElement=await page.locator('aria-ref={password_ref}').elementHandle();"
@@ -2426,6 +2455,193 @@ class PlaywrightCliRuntime:
             )
             self._current_metadata = metadata
             return metadata.url
+
+    async def capture_source_snapshot(
+        self,
+        expected_origin: str,
+    ) -> tuple[str, str] | None:
+        """Read bounded rendered semantic text without page mutation."""
+
+        async with self._operation_lock:
+            if not self._started or self._closed or not self._guard_armed:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            try:
+                canonical_origin = validate_https_origin(expected_origin)
+            except (TypeError, ValueError):
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+            if (
+                canonical_origin != expected_origin
+                or self._approved_origins != (canonical_origin,)
+            ):
+                raise PlaywrightCliRuntimeError("browser_failed")
+
+            traversal_function = (
+                "function(){"
+                f"const maxVisitedNodes={_MAX_SOURCE_CAPTURE_VISITED_NODES};"
+                f"const maxBytes={_MAX_SOURCE_CAPTURE_TRAVERSAL_BYTES};"
+                f"const maxLines={_MAX_SOURCE_CAPTURE_LINES};"
+                'const excludedTags=new Set(["input","textarea","select"]);'
+                'const nonContentTags=new Set(["script","style","template","noscript"]);'
+                "const semanticAttributes=['aria-label','alt','title'];"
+                "const encoder=new TextEncoder();"
+                "const lines=[];"
+                "let usedBytes=0;"
+                "let visitedNodes=0;"
+                "let stopped=false;"
+                "const appendLine=raw=>{"
+                "if(stopped||typeof raw!=='string')return;"
+                "if(lines.length>=maxLines){stopped=true;return;}"
+                "const separatorBytes=lines.length?1:0;"
+                "const remaining=maxBytes-usedBytes-separatorBytes;"
+                "if(remaining<=0){stopped=true;return;}"
+                "const normalized=raw.slice(0,remaining+1)"
+                ".replace(/\\s+/gu,' ').trim();"
+                "if(!normalized)return;"
+                "let line=normalized;"
+                "if(encoder.encode(line).length>remaining){"
+                "let low=0;"
+                "let high=Math.min(line.length,remaining);"
+                "while(low<high){"
+                "const middle=Math.ceil((low+high)/2);"
+                "if(encoder.encode(line.slice(0,middle)).length<=remaining)"
+                "low=middle;else high=middle-1;"
+                "}"
+                "if(low>0){const last=line.charCodeAt(low-1);"
+                "if(last>=0xD800&&last<=0xDBFF)low-=1;}"
+                "line=line.slice(0,low).trimEnd();"
+                "stopped=true;"
+                "}"
+                "if(!line)return;"
+                "usedBytes+=separatorBytes+encoder.encode(line).length;"
+                "lines.push(line);"
+                "if(usedBytes>=maxBytes||lines.length>=maxLines)stopped=true;"
+                "};"
+                "const root=document.body;"
+                "let node=root;"
+                "while(node&&visitedNodes<maxVisitedNodes&&!stopped){"
+                "visitedNodes+=1;"
+                "let descend=true;"
+                "if(node.nodeType===Node.ELEMENT_NODE){"
+                "const element=node;"
+                "if(excludedTags.has(element.localName)"
+                "||element.isContentEditable"
+                "||element.hasAttribute('contenteditable')"
+                "||nonContentTags.has(element.localName)){"
+                "descend=false;"
+                "}else{"
+                "let style=null;"
+                "try{style=getComputedStyle(element);}catch{descend=false;}"
+                "if(descend&&(element.hidden"
+                "||(element.getAttribute('aria-hidden')||'').toLowerCase()==='true'"
+                "||style.display==='none'"
+                "||style.visibility==='hidden'"
+                "||style.visibility==='collapse'"
+                "||style.contentVisibility==='hidden'"
+                "||style.opacity==='0'))descend=false;"
+                "if(descend){"
+                "for(const attribute of semanticAttributes)"
+                "appendLine(element.getAttribute(attribute));"
+                "}"
+                "}"
+                "}else if(node.nodeType===Node.TEXT_NODE){"
+                "appendLine(node.nodeValue);"
+                "}"
+                "let next=null;"
+                "if(descend&&node.firstChild){"
+                "next=node.firstChild;"
+                "}else{"
+                "let cursor=node;"
+                "while(cursor&&cursor!==root&&!cursor.nextSibling)"
+                "cursor=cursor.parentNode;"
+                "if(cursor&&cursor!==root)next=cursor.nextSibling;"
+                "}"
+                "node=next;"
+                "}"
+                "return lines.join('\\n');"
+                "}"
+            )
+            script = (
+                "async (page) => {"
+                f"const expectedOrigin={json.dumps(canonical_origin)};"
+                "const cdp=await page.context().newCDPSession(page);"
+                "try{"
+                "const beforeTree=(await cdp.send('Page.getFrameTree')).frameTree;"
+                "if(!beforeTree||!beforeTree.frame"
+                "||typeof beforeTree.frame.id!=='string'"
+                "||typeof beforeTree.frame.url!=='string')"
+                "throw new Error('Source frame unavailable');"
+                "const beforeUrl=beforeTree.frame.url;"
+                "const beforeOrigin=(()=>{try{return new URL(beforeUrl).origin;}"
+                "catch{return '';}})();"
+                "if(beforeOrigin!==expectedOrigin)"
+                "return {url:beforeUrl,source:null};"
+                "const isolated=await cdp.send('Page.createIsolatedWorld',{"
+                "frameId:beforeTree.frame.id,"
+                "worldName:'jobhunter.sourceCapture.'+Date.now()+'.'+Math.random(),"
+                "grantUniveralAccess:false});"
+                "const executionContextId=isolated&&isolated.executionContextId;"
+                "if(!Number.isSafeInteger(executionContextId)"
+                "||executionContextId<=0)"
+                "throw new Error('Source context unavailable');"
+                "const evaluated=await cdp.send('Runtime.callFunctionOn',{"
+                f"functionDeclaration:{json.dumps(traversal_function)},"
+                "executionContextId,"
+                "returnByValue:true,"
+                "awaitPromise:false,"
+                "userGesture:false});"
+                "if(!evaluated||evaluated.exceptionDetails"
+                "||!evaluated.result"
+                "||evaluated.result.type!=='string'"
+                "||typeof evaluated.result.value!=='string'"
+                "||evaluated.result.objectId!==undefined)"
+                "throw new Error('Source result unavailable');"
+                "const source=evaluated.result.value;"
+                "const afterTree=(await cdp.send('Page.getFrameTree')).frameTree;"
+                "if(!afterTree||!afterTree.frame"
+                "||afterTree.frame.id!==beforeTree.frame.id"
+                "||typeof afterTree.frame.url!=='string')"
+                "return {url:'',source:null};"
+                "const afterUrl=afterTree.frame.url;"
+                "const afterOrigin=(()=>{try{return new URL(afterUrl).origin;}"
+                "catch{return '';}})();"
+                "if(afterOrigin!==expectedOrigin)"
+                "return {url:afterUrl,source:null};"
+                "return {url:afterUrl,source};"
+                "}finally{await cdp.detach();}"
+                "}"
+            )
+            captured = await self._invoke(
+                "run-code",
+                [script],
+                timeout=_LIFECYCLE_TIMEOUT_SECONDS,
+                capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+            )
+            self._require_success(captured)
+            if captured.stdout_truncated:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            payload = self._decode_run_code_result(captured)
+            final_url = payload.get("url")
+            snapshot = payload.get("source")
+            if not isinstance(final_url, str):
+                raise PlaywrightCliRuntimeError("browser_failed")
+            try:
+                if _origin_for_url(final_url) != canonical_origin:
+                    return None
+            except (TypeError, ValueError):
+                return None
+            if snapshot is None:
+                return None
+            if not isinstance(snapshot, str):
+                raise PlaywrightCliRuntimeError("browser_failed")
+            try:
+                source = _bounded_source_snapshot(
+                    self._redact_bounded_text(snapshot, len(snapshot))
+                )
+            except UnicodeError:
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+            if not source:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            return final_url, source
 
     async def set_approved_origins(self, origins: Iterable[str]) -> None:
         async with self._operation_lock:
@@ -2824,7 +3040,8 @@ class PlaywrightCliRuntime:
             "return route.continue();}"
             "const url=request.url();"
             "if(url==='about:blank')return route.continue();"
-            "if(state.allowed.some(origin=>url===origin||url.startsWith(origin+'/')))return route.continue();"
+            "const requestOrigin=(()=>{try{return new URL(url).origin;}catch{return null;}})();"
+            "if(requestOrigin!==null&&state.allowed.includes(requestOrigin))return route.continue();"
             "return route.abort('blockedbyclient');};"
             "state.handler=handler;"
             "await context.route('**/*',handler);"

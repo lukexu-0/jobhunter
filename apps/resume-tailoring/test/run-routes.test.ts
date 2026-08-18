@@ -10,6 +10,7 @@ import {
 import { createApiHandler } from "../src/api/handler";
 import { createRunRoutes, type RunRouteService } from "../src/api/run-routes";
 import { RunServiceError } from "../src/api/run-service";
+import { JobSourceError } from "../src/api/job-source";
 import type {
   ApplicationSessionEventDto,
   ApplicationSessionSnapshotDto,
@@ -150,6 +151,27 @@ describe("run HTTP routes", () => {
 
     expect(rejected.status).toBe(400);
     expect(events).toEqual([]);
+  });
+
+  test("returns the fixed verification challenge without kicking a run", async () => {
+    const target = service({
+      createRun: async () => {
+        throw new JobSourceError("JOB_HUMAN_VERIFICATION_REQUIRED");
+      },
+    });
+
+    const response = await request(target, "/v1/runs", post({
+      jobUrl: "https://jobs.example.test/role",
+    }));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+        message: "Complete this site's human verification in the local browser",
+      },
+    });
+    expect(target.kickCount()).toBe(0);
   });
 
   test("forwards a normalized pasted request and request signal before kicking the scheduler", async () => {

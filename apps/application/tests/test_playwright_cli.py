@@ -415,6 +415,66 @@ def test_runtime_init_validation(session_dir: Path, cli_script: Path) -> None:
         )
 
 
+
+@pytest.mark.asyncio
+async def test_invoke_tracks_child_until_emergency_cleanup_terminates_it(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    wait_started = asyncio.Event()
+    process_finished = asyncio.Event()
+
+    class BlockingProcess:
+        def __init__(self) -> None:
+            self.stdout = DummyStream(b"")
+            self.stderr = DummyStream(b"")
+            self.returncode: int | None = None
+            self.terminated = False
+            self.killed = False
+
+        async def wait(self) -> int:
+            wait_started.set()
+            await process_finished.wait()
+            assert self.returncode is not None
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+            process_finished.set()
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            process_finished.set()
+
+    process = BlockingProcess()
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000035"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=lambda *_args, **_kwargs: process,
+        cli_script=cli_script,
+    )
+
+    invocation = asyncio.create_task(
+        runtime._invoke("snapshot", timeout=10)
+    )
+    await wait_started.wait()
+
+    assert runtime._active_process is process
+    await runtime._emergency_budget_cleanup_unlocked()
+    await invocation
+
+    assert process.terminated is True
+    assert process.killed is False
+    assert runtime._active_process is None
+
 @pytest.mark.asyncio
 async def test_runtime_start_lifecycle_argv(session_dir: Path, cli_script: Path) -> None:
     launch = ResolvedBrowserLaunch(cdp_url="http://127.0.0.1:9222", executable_path=None, user_data_dir=None)
@@ -457,6 +517,303 @@ async def test_runtime_start_lifecycle_argv(session_dir: Path, cli_script: Path)
     assert spawns[3][4] == "https://example.com/jobs/1"
     assert spawns[4][3] == "run-code"  # metadata
 
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_source_capture_binds_bounded_rendered_text_and_url_to_one_page(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    invocations: list[list[str]] = []
+    source = "Verified role\nEmployer details"
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        invocations.append(list(argv))
+        command = argv[3]
+        stdout = b""
+        if command == "run-code":
+            if "const maxVisitedNodes=" in argv[4]:
+                result = {
+                    "url": "https://example.com/jobs/1?verified=true",
+                    "source": source,
+                }
+            else:
+                result = {
+                    "url": "https://example.com/jobs/1?verified=true",
+                    "title": "Verified role",
+                    "currentIndex": 0,
+                    "tabs": [
+                        {
+                            "url": "https://example.com/jobs/1?verified=true",
+                            "title": "Verified role",
+                        }
+                    ],
+                }
+            stdout = json.dumps(
+                {"result": json.dumps(result)}
+            ).encode("utf-8")
+        return DummyProcess(argv=argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000001"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    await runtime.suppress_private_capture()
+    invocations.clear()
+
+    captured = await runtime.capture_source_snapshot("https://example.com")
+
+    assert captured == (
+        "https://example.com/jobs/1?verified=true",
+        source,
+    )
+    assert [invocation[3] for invocation in invocations] == ["run-code"]
+    capture_script = invocations[0][4]
+    assert "page.evaluate" not in capture_script
+    assert "page.context().newCDPSession(page)" in capture_script
+    assert capture_script.count("Page.getFrameTree") == 2
+    assert "Page.createIsolatedWorld" in capture_script
+    assert "Runtime.callFunctionOn" in capture_script
+    assert "executionContextId" in capture_script
+    assert "exceptionDetails" in capture_script
+    assert "finally{await cdp.detach();}" in capture_script
+    assert "ariaSnapshot" not in capture_script
+    assert "querySelectorAll" not in capture_script
+    assert ".innerText" not in capture_script
+    assert ".textContent" not in capture_script
+    assert "element.value" not in capture_script
+    assert "node.firstChild" in capture_script
+    assert "nextSibling" in capture_script
+    assert (
+        f"const maxVisitedNodes={playwright_cli._MAX_SOURCE_CAPTURE_VISITED_NODES};"
+        in capture_script
+    )
+    assert (
+        f"const maxBytes={playwright_cli._MAX_SOURCE_CAPTURE_TRAVERSAL_BYTES};"
+        in capture_script
+    )
+    assert (
+        f"const maxLines={playwright_cli._MAX_SOURCE_CAPTURE_LINES};"
+        in capture_script
+    )
+    assert "new URL(beforeUrl).origin" in capture_script
+    assert "new URL(afterUrl).origin" in capture_script
+    assert r'new Set([\"input\",\"textarea\",\"select\"])' in capture_script
+    assert "element.isContentEditable" in capture_script
+    assert "element.hasAttribute('contenteditable')" in capture_script
+    assert "element.hidden" in capture_script
+    assert "(element.getAttribute('aria-hidden')||'').toLowerCase()==='true'" in capture_script
+    assert "style.display==='none'" in capture_script
+    assert "style.visibility==='hidden'" in capture_script
+    assert "style.contentVisibility==='hidden'" in capture_script
+    assert not {
+        "click",
+        "type",
+        "fill",
+        "eval",
+        "screenshot",
+    }.intersection(invocation[3] for invocation in invocations)
+    assert list(runtime._internal_directory.glob("source-capture-*.yml")) == []
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_source_snapshot_enforces_utf8_byte_and_line_ceilings(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    raw_source = "".join(
+        f"- text \"{'x' * 40}-{index}\"\n" for index in range(20_001)
+    )
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        stdout = b""
+        if command == "run-code":
+            result = (
+                {
+                    "url": "https://example.com/jobs/1",
+                    "source": raw_source,
+                }
+                if "const maxVisitedNodes=" in argv[4]
+                else {
+                    "url": "https://example.com/jobs/1",
+                    "title": "Role",
+                    "currentIndex": 0,
+                    "tabs": [
+                        {
+                            "url": "https://example.com/jobs/1",
+                            "title": "Role",
+                        }
+                    ],
+                }
+            )
+            stdout = json.dumps(
+                {"result": json.dumps(result)}
+            ).encode("utf-8")
+        return DummyProcess(argv=argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-00000000001a"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    captured = await runtime.capture_source_snapshot("https://example.com")
+
+    assert captured is not None
+    _final_url, bounded_source = captured
+    assert len(bounded_source.encode("utf-8")) <= 512 * 1024
+    assert len(bounded_source.splitlines()) <= 20_000
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_interior", [False, True])
+async def test_source_snapshot_utf8_prefix_drops_only_a_cap_split_trailing_scalar(
+    session_dir: Path,
+    cli_script: Path,
+    malformed_interior: bool,
+) -> None:
+    source = "x" * (512 * 1024 - 1) + "€"
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        stdout = b""
+        if command == "run-code":
+            if "const maxVisitedNodes=" in argv[4]:
+                stdout = (
+                    b'{"result":"valid\xffinvalid"}'
+                    if malformed_interior
+                    else json.dumps(
+                        {
+                            "result": json.dumps(
+                                {
+                                    "url": "https://example.com/jobs/1",
+                                    "source": source,
+                                }
+                            )
+                        }
+                    ).encode("utf-8")
+                )
+            else:
+                stdout = json.dumps(
+                    {
+                        "result": json.dumps(
+                            {
+                                "url": "https://example.com/jobs/1",
+                                "title": "Role",
+                                "currentIndex": 0,
+                                "tabs": [
+                                    {
+                                        "url": "https://example.com/jobs/1",
+                                        "title": "Role",
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                ).encode("utf-8")
+        return DummyProcess(argv=argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-00000000001b"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/jobs/1")
+
+    if malformed_interior:
+        with pytest.raises(PlaywrightCliRuntimeError):
+            await runtime.capture_source_snapshot("https://example.com")
+    else:
+        captured = await runtime.capture_source_snapshot("https://example.com")
+        assert captured is not None
+        assert captured[1] == "x" * (512 * 1024 - 1)
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_source_snapshot_output_is_rejected_without_private_file(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    capture_invocations: list[list[str]] = []
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        stdout = b""
+        if command == "run-code":
+            if "const maxVisitedNodes=" in argv[4]:
+                capture_invocations.append(list(argv))
+                stdout = (
+                    b'{"result":"'
+                    + b"x" * (9 * 1024 * 1024)
+                    + b'"}'
+                )
+            else:
+                stdout = json.dumps(
+                    {
+                        "result": json.dumps(
+                            {
+                                "url": "https://example.com/jobs/1",
+                                "title": "Role",
+                                "currentIndex": 0,
+                                "tabs": [
+                                    {
+                                        "url": "https://example.com/jobs/1",
+                                        "title": "Role",
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                ).encode("utf-8")
+        return DummyProcess(argv=argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-00000000001c"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    await runtime.start("https://example.com/jobs/1")
+
+    with pytest.raises(PlaywrightCliRuntimeError):
+        await runtime.capture_source_snapshot("https://example.com")
+
+    assert len(capture_invocations) == 1
+    assert list(runtime._internal_directory.glob("source-capture-*.yml")) == []
     await runtime.close()
 
 
@@ -1251,11 +1608,21 @@ def test_navigation_guard_rearm_reuses_persistent_state_and_handler() -> None:
         "handoffPending:false,handoffChanged:false};"
     ) in script
     assert "state.handler=handler;" in script
-    assert "state.allowed.some(" in script
+    assert "state.allowed.includes(requestOrigin)" in script
     assert script.index(rearm) < script.index("context.route('**/*',handler)")
     assert script.count("context.route('**/*',handler)") == 1
     assert script.count("const handler=async route=>{") == 1
     assert "unroute" not in script
+
+
+def test_navigation_guard_uses_exact_parsed_origin_for_root_query_urls() -> None:
+    script = PlaywrightCliRuntime._guard_script(("https://example.com",))
+
+    assert "new URL(url).origin" in script
+    assert "state.allowed.includes(requestOrigin)" in script
+    assert "requestOrigin!==null" in script
+    assert "url.startsWith(origin+'/')" not in script
+    assert "return route.abort('blockedbyclient');" in script
 
 
 def test_navigation_guard_handler_bypasses_routes_while_disarmed() -> None:
@@ -3324,6 +3691,24 @@ async def test_not_open_close_retains_ownership_when_daemon_survives(
     assert runtime._ownership_path.exists()
 
 
+def test_private_sign_in_origin_guard_accepts_same_origin_root_query_urls() -> None:
+    script = PlaywrightCliRuntime._private_sign_in_script(
+        expected_origin="https://example.com",
+        username_ref="e1",
+        password_ref="e2",
+        submit_ref="e3",
+        username="operator",
+        password="private",
+    )
+
+    assert (
+        "const hasExpectedOrigin=(url)=>{try{return "
+        "new URL(url).origin===expectedOrigin;}catch{return false;}};"
+        "if(!hasExpectedOrigin(page.url()))"
+    ) in script
+    assert "url.startsWith(expectedOrigin+'/')" not in script
+
+
 @pytest.mark.asyncio
 async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshots(
     session_dir: Path,
@@ -3460,12 +3845,13 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     assert json.dumps(password) in payload_scripts[0]
     assert "const expectedOrigin=\"https://example.com\"" in payload_scripts[0]
     expected_url_check = (
-        "const hasExpectedUrl=(url)=>url===expectedOrigin||"
-        "url.startsWith(expectedOrigin+'/');"
-        "if(!hasExpectedUrl(page.url()))"
+        "const hasExpectedOrigin=(url)=>{try{return "
+        "new URL(url).origin===expectedOrigin;}catch{return false;}};"
+        "if(!hasExpectedOrigin(page.url()))"
         "throw new Error('Unexpected sign-in origin');"
     )
     assert expected_url_check in payload_scripts[0]
+    assert "url.startsWith(expectedOrigin+'/')" not in payload_scripts[0]
     assert payload_scripts[0].count(".elementHandle()") == 3
     cdp_origin_check = (
         "const cdp=await page.context().newCDPSession(page);"
@@ -3497,7 +3883,6 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
         "throw new Error('Unexpected sign-in control origin');"
     )
     assert rejected_control_origin in payload_scripts[0]
-    assert "new URL(" not in payload_scripts[0]
     assert "page.evaluate(()=>location.origin)" not in payload_scripts[0]
     assert "ownerDocument.location.origin" not in payload_scripts[0]
     assert payload_scripts[0].index(

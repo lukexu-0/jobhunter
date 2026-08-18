@@ -680,6 +680,74 @@ describe("RunApplicationService", () => {
     expect(target.repository.getRun(run.id)?.opportunityKind).toBe("networking_event");
   });
 
+  test("normalizes a bounded captured source through Luna and persists one complete run", async () => {
+    const observed: {
+      calls: number;
+      lines?: readonly string[];
+      hint: OpportunityKind | undefined;
+    } = { calls: 0, hint: undefined };
+    const target = fixture({
+      extractJobDescription: async (lines, _signal, hint) => {
+        observed.calls += 1;
+        observed.lines = lines;
+        observed.hint = hint;
+        return { opportunityKind: "job", jobDescription: JOB_DESCRIPTION };
+      },
+    });
+
+    const run = await target.service.createRunFromCapturedSource(
+      urlRunRequest(JOB_URL, { opportunityKind: "job" }),
+      " Senior Engineer \r\n\r\n Build\treliable TypeScript systems with careful testing and ownership. ",
+    );
+
+    expect(observed).toEqual({
+      calls: 1,
+      lines: [
+        "Senior Engineer",
+        "",
+        "Build reliable TypeScript systems with careful testing and ownership.",
+      ],
+      hint: "job",
+    });
+    expect(run).toMatchObject({
+      id: "run-1",
+      jobUrl: JOB_URL,
+      opportunityKind: "job",
+      status: "queued",
+    });
+    expect(persistenceCounts(target.pipelineDatabase)).toEqual({
+      runs: 1,
+      revisions: 1,
+      snapshots: 1,
+      artifacts: 1,
+      events: 3,
+    });
+  });
+
+  test("rejects unusable captured source before any partial run is persisted", async () => {
+    const oversizedTarget = fixture();
+    await expect(oversizedTarget.service.createRunFromCapturedSource(
+      urlRunRequest(),
+      "x".repeat(512 * 1_024 + 1),
+    )).rejects.toMatchObject({
+      code: "JOB_SOURCE_TOO_LARGE",
+      status: 413,
+    });
+    expectNoPersistence(oversizedTarget);
+
+    const nullTarget = fixture({
+      extractJobDescription: async () => null,
+    });
+    await expect(nullTarget.service.createRunFromCapturedSource(
+      urlRunRequest(),
+      "Senior Engineer\nBuild reliable TypeScript systems with careful testing and ownership.",
+    )).rejects.toMatchObject({
+      code: "JOB_DESCRIPTION_UNAVAILABLE",
+      status: 422,
+    });
+    expectNoPersistence(nullTarget);
+  });
+
   test("bubbles loader failures and maps only fixed fallback failures before persistence", async () => {
     for (const code of [
       "JOB_URL_BLOCKED",
@@ -687,6 +755,7 @@ describe("RunApplicationService", () => {
       "JOB_SOURCE_UNSUPPORTED",
       "JOB_SOURCE_TOO_LARGE",
       "JOB_DESCRIPTION_UNAVAILABLE",
+      "JOB_HUMAN_VERIFICATION_REQUIRED",
     ] satisfies readonly JobSourceErrorCode[]) {
       const sourceError = new JobSourceError(code);
       const sourceTarget = fixture({

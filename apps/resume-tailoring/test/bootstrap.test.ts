@@ -57,6 +57,7 @@ interface IngestionOverrides {
   readonly useDefaultWorker?: boolean;
   readonly workerOptions?: PipelineApplicationOptions["workerOptions"];
   readonly discovery?: PipelineApplicationOptions["discovery"];
+  readonly sourceHandoffs?: PipelineApplicationOptions["sourceHandoffs"];
 }
 
 function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {}) {
@@ -150,6 +151,9 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
       : {}),
     ...(ingestion.applicationSessions
       ? { applicationSessions: ingestion.applicationSessions }
+      : {}),
+    ...(ingestion.sourceHandoffs
+      ? { sourceHandoffs: ingestion.sourceHandoffs }
       : {}),
     loadJobSource: ingestion.loadJobSource ?? (async (jobUrl, signal): Promise<LoadedJobSource> => {
       calls.loadedUrls.push(jobUrl);
@@ -615,7 +619,68 @@ describe("pipeline application bootstrap", () => {
     const input = fixture.app.services.repository.getArtifact(created.id, "job-description")!;
     expect(Buffer.from(
       await fixture.app.services.artifacts.read(input.path, input.byteSize),
+
     ).toString("utf8")).toBe(JOB_DESCRIPTION);
+    await fixture.app.close();
+  });
+  test("composes source handoff creation and bodyless completion through the public handler", async () => {
+    const handoffId = "123e4567-e89b-42d3-a456-426614174000";
+    const handoff = {
+      id: handoffId,
+      state: "awaiting_human_verification" as const,
+      jobUrl: JOB_URL,
+      expiresAt: 1_900_000,
+    };
+    const queued = {
+      id: "run-source-handoff",
+      jobUrl: JOB_URL,
+      opportunityKind: "job" as const,
+      status: "queued" as const,
+      applicationStatus: "pending" as const,
+      isApplying: false,
+      generateKeywordMap: true,
+      skipReview: false,
+      autoSubmit: false,
+      queueSequence: 1,
+      revision: 1,
+      origin: "initial" as const,
+      createdAt: 1_000_000,
+      updatedAt: 1_000_000,
+      visualAcknowledgementRequired: false,
+      attempts: [],
+      artifacts: [],
+      timeline: [],
+    };
+    const calls: string[] = [];
+    const sourceHandoffs: NonNullable<PipelineApplicationOptions["sourceHandoffs"]> = {
+      create: async () => {
+        calls.push("create");
+        return handoff;
+      },
+      get: async () => handoff,
+      complete: async () => {
+        calls.push("complete");
+        return queued;
+      },
+      delete: async () => { calls.push("delete"); },
+      close: async () => { calls.push("close"); },
+    };
+    const fixture = createFixture(false, { sourceHandoffs });
+
+    const created = await fixture.app.fetch(mutation(
+      "/v1/source-handoffs",
+      { jobUrl: JOB_URL },
+    ));
+    expect(created.status).toBe(201);
+    expect(await created.json()).toEqual(handoff);
+
+    const completed = await fixture.app.fetch(new Request(
+      `http://127.0.0.1:3457/v1/source-handoffs/${handoffId}/complete`,
+      { method: "POST", headers: { origin: WEB_ORIGIN } },
+    ));
+    expect(completed.status).toBe(201);
+    expect(await completed.json()).toEqual(queued);
+    expect(calls).toEqual(["create", "complete"]);
     await fixture.app.close();
   });
 
@@ -956,6 +1021,30 @@ describe("pipeline application bootstrap", () => {
     expect(() => fixture.pipelineDatabase.query("SELECT 1").get()).toThrow();
     expect(fixture.app.close()).toBe(firstClose);
     expect(discoveryCloseCalls).toBe(1);
+  });
+
+  test("closes an active source-handoff boundary before closing databases", async () => {
+    let pipelineDatabase: Database | undefined;
+    let closeCalls: string[] | undefined;
+    const sourceHandoffs = {
+      create: async () => { throw new Error("not used"); },
+      get: async () => { throw new Error("not used"); },
+      complete: async () => { throw new Error("not used"); },
+      delete: async () => { throw new Error("not used"); },
+      close: async () => {
+        closeCalls!.push("source-handoffs");
+        expect(pipelineDatabase!.query("SELECT 1").get()).toBeDefined();
+      },
+    } as NonNullable<PipelineApplicationOptions["sourceHandoffs"]>;
+    const fixture = createFixture(false, { sourceHandoffs });
+    pipelineDatabase = fixture.pipelineDatabase;
+    closeCalls = fixture.calls.close;
+
+    await fixture.app.close();
+
+    expect(fixture.calls.close.indexOf("source-handoffs")).toBeLessThan(
+      fixture.calls.close.indexOf("pipeline-database"),
+    );
   });
 
   test("closes worker, auth, context, and owned databases in order exactly once", async () => {

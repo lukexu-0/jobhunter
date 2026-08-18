@@ -25,6 +25,8 @@ from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
 MODEL_REASONING = "high"
+SOURCE_CAPTURE_MAX_BYTES = 512 * 1024
+SOURCE_CAPTURE_MAX_LINES = 20_000
 
 OpportunityKind: TypeAlias = Literal[
     "job",
@@ -108,6 +110,10 @@ _SESSION_ERROR_MESSAGES: dict[str, str] = {
 SESSION_ERROR_MESSAGES: Mapping[str, str] = MappingProxyType(_SESSION_ERROR_MESSAGES)
 
 StrictText = Annotated[str, StringConstraints(strict=True)]
+SourceCaptureUrl = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1, max_length=4_096),
+]
 ShortLabel = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=500),
@@ -218,11 +224,19 @@ def _is_loopback_host(hostname: str) -> bool:
 
 def _netloc_without_userinfo(parsed: SplitResult) -> str:
     assert parsed.hostname is not None
-    host = parsed.hostname.lower().rstrip(".")
-    if ":" in host:
-        host = f"[{host}]"
+    raw_host = parsed.hostname.rstrip(".")
+    try:
+        address = ipaddress.ip_address(raw_host)
+    except ValueError:
+        host = raw_host.lower()
+    else:
+        host = address.compressed
+        if address.version == 6:
+            host = f"[{host}]"
     port = parsed.port
-    if (parsed.scheme.lower() == "https" and port == 443) or (parsed.scheme.lower() == "http" and port == 80):
+    if (parsed.scheme.lower() == "https" and port == 443) or (
+        parsed.scheme.lower() == "http" and port == 80
+    ):
         port = None
     return f"{host}:{port}" if port is not None else host
 
@@ -266,6 +280,18 @@ def validate_https_origin(value: str) -> str:
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError("origin must not contain a path, query, or fragment")
     return f"https://{_netloc_without_userinfo(parsed)}"
+
+
+def https_job_origin(value: str) -> str:
+    """Return the canonical exact HTTPS origin for a private job URL."""
+
+    validated = validate_job_url(value)
+    parsed = urlsplit(validated)
+    if (parsed.hostname or "").endswith("."):
+        raise ValueError("job_url hostname must not end with a dot")
+    if parsed.scheme.lower() != "https":
+        raise ValueError("job_url must use HTTPS")
+    return validate_https_origin(f"https://{_netloc_without_userinfo(parsed)}")
 
 
 def validate_approved_origin(value: str) -> str:
@@ -610,6 +636,56 @@ class SessionCreateRequest(FrozenPrivateModel):
     @property
     def direct_field_map(self) -> Mapping[str, str]:
         return MappingProxyType(dict(self.direct_fields))
+
+
+class SourceCaptureCreateRequest(FrozenPrivateModel):
+    capture_id: Annotated[UUID, Field(strict=False)]
+    job_url: SourceCaptureUrl
+    approved_origins: list[SourceCaptureUrl] = Field(min_length=1, max_length=1)
+    timeout_seconds: Literal[900]
+
+    @model_validator(mode="after")
+    def _validate_capture_boundary(self) -> SourceCaptureCreateRequest:
+        job_origin = https_job_origin(self.job_url)
+        canonical_origins = [
+            validate_https_origin(origin) for origin in self.approved_origins
+        ]
+        if canonical_origins != [job_origin]:
+            raise ValueError(
+                "approved_origins must contain only the job URL's exact HTTPS origin"
+            )
+        object.__setattr__(self, "approved_origins", canonical_origins)
+        return self
+
+
+class SourceCaptureCreateResponse(FrozenPrivateModel):
+    capture_id: UUID
+    state: Literal["awaiting_human_verification"]
+    expires_at: datetime
+
+
+class SourceCaptureResult(FrozenPrivateModel):
+    capture_id: UUID
+    final_url: SourceCaptureUrl
+    source: Annotated[
+        str,
+        StringConstraints(strict=True, min_length=1),
+    ]
+
+    @field_validator("final_url")
+    @classmethod
+    def _validate_final_url(cls, value: str) -> str:
+        validate_job_url(value)
+        return value
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source_bounds(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > SOURCE_CAPTURE_MAX_BYTES:
+            raise ValueError("source exceeds the byte limit")
+        if len(value.splitlines()) > SOURCE_CAPTURE_MAX_LINES:
+            raise ValueError("source exceeds the line limit")
+        return value
 
 
 class FieldResult(PublicModel):

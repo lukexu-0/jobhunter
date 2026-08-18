@@ -41,7 +41,7 @@ export interface RunRouteService {
 }
 
 
-function mappedError(error: unknown): Response {
+export function mapRunRouteError(error: unknown): Response {
   let status = 500;
   let code = "INTERNAL_ERROR";
   let message = "Request failed";
@@ -215,7 +215,7 @@ export function createRunRoutes(service: RunRouteService) {
       service.kick();
       return apiResponse.json(checkedRun(run));
     } catch (error) {
-      return mappedError(error);
+      return mapRunRouteError(error);
     }
   };
 }

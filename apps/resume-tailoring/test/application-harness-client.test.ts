@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   ApplicationHarnessError,
   HttpApplicationHarnessClient,
+  SourceCaptureHarnessError,
   type ApplicationHarnessFetch,
   type ApplicationHarnessCreateInput,
 } from "../src/api/application-harness-client";
@@ -1196,5 +1197,184 @@ describe("HttpApplicationHarnessClient", () => {
       .catch((reason: unknown) => reason);
     expect(timeoutError).toBeInstanceOf(DOMException);
     expect((timeoutError as DOMException).name).toBe("TimeoutError");
+  });
+  test("uses the authenticated strict private source-capture create, complete, and delete contract", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const responses = [
+      Response.json({
+        capture_id: SESSION_ID,
+        state: "awaiting_human_verification",
+        expires_at: "2026-08-17T12:15:00Z",
+      }, { status: 202 }),
+      Response.json({
+        capture_id: SESSION_ID,
+        final_url: "https://jobs.example.test/role",
+        source: "Senior Engineer\nBuild reliable TypeScript services with careful testing and ownership.",
+      }),
+      new Response(null, { status: 204 }),
+    ];
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async (input, init) => {
+        calls.push({ url: String(input), init });
+        return responses.shift()!;
+      },
+    });
+    const signal = new AbortController().signal;
+
+    await expect(client.createSourceCapture({
+      captureId: SESSION_ID,
+      jobUrl: "https://jobs.example.test/role",
+      approvedOrigins: ["https://jobs.example.test"],
+      timeoutSeconds: 900,
+    }, signal)).resolves.toEqual({
+      expiresAt: Date.parse("2026-08-17T12:15:00Z"),
+    });
+    await expect(client.completeSourceCapture(SESSION_ID, signal)).resolves.toEqual({
+      finalUrl: "https://jobs.example.test/role",
+      source: "Senior Engineer\nBuild reliable TypeScript services with careful testing and ownership.",
+    });
+    await expect(client.deleteSourceCapture(SESSION_ID, signal)).resolves.toBeUndefined();
+
+    expect(calls.map(({ url }) => url)).toEqual([
+      `${ORIGIN}/v1/source-captures`,
+      `${ORIGIN}/v1/source-captures/${SESSION_ID}/complete`,
+      `${ORIGIN}/v1/source-captures/${SESSION_ID}`,
+    ]);
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      capture_id: SESSION_ID,
+      job_url: "https://jobs.example.test/role",
+      approved_origins: ["https://jobs.example.test"],
+      timeout_seconds: 900,
+    });
+    expect(calls[0]!.init?.headers).toEqual({
+      accept: "application/json",
+      "content-type": "application/json",
+      authorization: `Bearer ${TOKEN}`,
+    });
+    expect(calls[1]!.init?.body).toBeUndefined();
+    expect(calls[2]!.init?.body).toBeUndefined();
+  });
+  test("marks a source-capture POST result ambiguous when transport loses the response", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => {
+        throw new TypeError("connection reset after request");
+      },
+    });
+
+    await expect(client.completeSourceCapture(
+      SESSION_ID,
+      new AbortController().signal,
+    )).rejects.toEqual(new SourceCaptureHarnessError("ambiguous_result"));
+  });
+  test("marks a successful source-capture response ambiguous when its body is unreadable", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => new Response("{", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    });
+
+    await expect(client.completeSourceCapture(
+      SESSION_ID,
+      new AbortController().signal,
+    )).rejects.toEqual(new SourceCaptureHarnessError("ambiguous_result"));
+  });
+  test("marks an unrecognized source-capture error response ambiguous", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json({
+        code: "unexpected_private_failure",
+        message: "private detail",
+      }, { status: 502 }),
+    });
+
+    await expect(client.completeSourceCapture(
+      SESSION_ID,
+      new AbortController().signal,
+    )).rejects.toEqual(new SourceCaptureHarnessError("ambiguous_result"));
+  });
+
+
+
+
+  test("accepts a canonical private final URL through the 4096-character capture bound", async () => {
+    const prefix = "https://jobs.example.test/role?state=";
+    const finalUrl = `${prefix}${"a".repeat(4_096 - prefix.length)}`;
+    expect(finalUrl.length).toBe(4_096);
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json({
+        capture_id: SESSION_ID,
+        final_url: finalUrl,
+        source: "Senior Engineer\nBuild reliable TypeScript services with careful testing and ownership.",
+      }),
+    });
+
+    await expect(client.completeSourceCapture(
+      SESSION_ID,
+      new AbortController().signal,
+    )).resolves.toEqual({
+      finalUrl,
+      source: "Senior Engineer\nBuild reliable TypeScript services with careful testing and ownership.",
+    });
+  });
+
+  test("treats invalid successful capture bodies as ambiguous and maps only fixed HTTP failures", async () => {
+    const oversized = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json({
+        capture_id: SESSION_ID,
+        final_url: "https://jobs.example.test/role",
+        source: "x".repeat(512 * 1_024 + 1),
+      }),
+    });
+    await expect(oversized.completeSourceCapture(
+      SESSION_ID,
+      new AbortController().signal,
+    )).rejects.toEqual(new SourceCaptureHarnessError("ambiguous_result"));
+    for (const finalUrl of [
+      "https://user:secret@jobs.example.test/role",
+      "https://jobs.example.test/role#application",
+      "https://jobs.example.test:443/role",
+      `https://jobs.example.test/${"a".repeat(4_097)}`,
+    ]) {
+      const invalidUrl = new HttpApplicationHarnessClient({
+        origin: ORIGIN,
+        token: TOKEN,
+        fetchImpl: async () => Response.json({
+          capture_id: SESSION_ID,
+          final_url: finalUrl,
+          source: "Senior Engineer\nBuild reliable TypeScript services with careful testing and ownership.",
+        }),
+      });
+      await expect(invalidUrl.completeSourceCapture(
+        SESSION_ID,
+        new AbortController().signal,
+      )).rejects.toEqual(new SourceCaptureHarnessError("ambiguous_result"));
+    }
+
+    const notReady = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json({
+        code: "source_capture_not_ready",
+        message: "private challenge detail",
+      }, { status: 409 }),
+    });
+    const error = await notReady.completeSourceCapture(
+      SESSION_ID,
+      new AbortController().signal,
+    ).catch((reason: unknown) => reason);
+    expect(error).toEqual(new SourceCaptureHarnessError("capture_not_ready"));
+    expect(JSON.stringify(error)).not.toContain("private challenge detail");
   });
 });

@@ -11,6 +11,7 @@ import {
   ApplicationSessionErrorSchema,
   FieldResultSchema,
   HarnessSessionStateSchema,
+  JobUrlSchema,
   OpportunityKindSchema,
   type ApplicationAdditionalInfoQuestion,
   type ApplicationAnswerSuggestionsResponse,
@@ -22,6 +23,10 @@ import {
   type OpportunityKind,
   type HarnessSessionState,
 } from "../contracts";
+import {
+  LUNA_MAX_SOURCE_BYTES,
+  LUNA_MAX_SOURCE_LINES,
+} from "../models/luna-job-extractor.ts";
 import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 
 const DEFAULT_HARNESS_ORIGIN = "http://127.0.0.1:8765";
@@ -29,6 +34,7 @@ const MAX_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES = 64 * 1024;
 const MAX_SSE_FRAME_BYTES = 8 * 1024 * 1024;
 const UUIDSchema = z.string().uuid();
+const MAX_SOURCE_CAPTURE_RESPONSE_BYTES = LUNA_MAX_SOURCE_BYTES * 6 + 64 * 1_024;
 const TimestampSchema = z.string().datetime({ offset: true });
 
 export type ApplicationHarnessErrorCode =
@@ -64,6 +70,36 @@ export class ApplicationHarnessError extends Error {
   }
 }
 
+export type SourceCaptureHarnessErrorCode =
+  | "capture_not_found"
+  | "capture_active"
+  | "capture_not_ready"
+  | "invalid_request"
+  | "unauthorized"
+  | "unavailable"
+  | "invalid_response"
+  | "ambiguous_result";
+
+const SOURCE_CAPTURE_ERROR_MESSAGES: Readonly<
+  Record<SourceCaptureHarnessErrorCode, string>
+> = {
+  capture_not_found: "The source capture was not found",
+  capture_active: "Another source capture is active",
+  capture_not_ready: "Human verification is not complete",
+  invalid_request: "The browser harness rejected the source capture request",
+  unauthorized: "The browser harness rejected authentication",
+  unavailable: "The local verification browser is unavailable",
+  invalid_response: "The local verification browser returned an invalid response",
+  ambiguous_result: "The local verification browser did not confirm the result",
+};
+
+export class SourceCaptureHarnessError extends Error {
+  constructor(readonly code: SourceCaptureHarnessErrorCode) {
+    super(SOURCE_CAPTURE_ERROR_MESSAGES[code]);
+    this.name = "SourceCaptureHarnessError";
+  }
+}
+
 export type ApplicationHarnessFetch = (
   input: string | URL | Request,
   init?: RequestInit,
@@ -83,6 +119,34 @@ export interface ApplicationHarnessCreateInput {
   readonly personalInformationMarkdown: string;
   readonly resumePdf: Uint8Array;
   readonly resumeSource: Uint8Array;
+}
+
+export interface SourceCaptureCreateInput {
+  readonly captureId: string;
+  readonly jobUrl: string;
+  readonly approvedOrigins: readonly string[];
+  readonly timeoutSeconds: 900;
+}
+
+export interface SourceCaptureCreateResult {
+  readonly expiresAt: number;
+}
+
+export interface SourceCaptureCompleteResult {
+  readonly finalUrl: string;
+  readonly source: string;
+}
+
+export interface SourceCaptureHarnessClient {
+  createSourceCapture(
+    input: SourceCaptureCreateInput,
+    signal: AbortSignal,
+  ): Promise<SourceCaptureCreateResult>;
+  completeSourceCapture(
+    captureId: string,
+    signal: AbortSignal,
+  ): Promise<SourceCaptureCompleteResult>;
+  deleteSourceCapture(captureId: string, signal: AbortSignal): Promise<void>;
 }
 
 export interface ApplicationHarnessSnapshot {
@@ -422,6 +486,56 @@ const CreateResponseSchema = z.object({
   events_url: z.string().url().max(4_096),
   commands_url: z.string().url().max(4_096),
 }).strict();
+const SourceCaptureErrorEnvelopeSchema = z.object({
+  code: z.enum([
+    "source_capture_not_found",
+    "source_capture_active",
+    "source_capture_not_ready",
+    "invalid_request",
+    "unauthorized",
+    "unavailable",
+  ]),
+  message: z.string().max(2_000),
+}).strict();
+const SourceCaptureCreateResponseSchema = z.object({
+  capture_id: UUIDSchema,
+  state: z.literal("awaiting_human_verification"),
+  expires_at: TimestampSchema,
+}).strict();
+const SourceCaptureCompleteResponseSchema = z.object({
+  capture_id: UUIDSchema,
+  final_url: z.string().max(4_096),
+  source: z.string().min(1),
+}).strict().superRefine((value, context) => {
+  if (!isCanonicalSourceCaptureFinalUrl(value.final_url)) {
+    context.addIssue({
+      code: "custom",
+      path: ["final_url"],
+      message: "final_url must be canonical",
+    });
+  }
+  if (Buffer.byteLength(value.source, "utf8") > LUNA_MAX_SOURCE_BYTES) {
+    context.addIssue({
+      code: "custom",
+      path: ["source"],
+      message: "source exceeds the byte limit",
+    });
+  }
+  let lines = 1;
+  for (let index = 0; index < value.source.length; index += 1) {
+    if (
+      value.source.charCodeAt(index) === 10
+      && ++lines > LUNA_MAX_SOURCE_LINES
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["source"],
+        message: "source exceeds the line limit",
+      });
+      break;
+    }
+  }
+});
 
 function codePointLength(value: string, minimum: number, maximum: number): boolean {
   const length = [...value].length;
@@ -899,7 +1013,94 @@ async function mapErrorResponse(
   throw new ApplicationHarnessError("invalid_response");
 }
 
-export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
+function isCanonicalSourceCaptureOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:")
+      && url.username === ""
+      && url.password === ""
+      && url.pathname === "/"
+      && url.search === ""
+      && url.hash === ""
+      && url.origin === value;
+  } catch {
+    return false;
+  }
+}
+
+function isCanonicalSourceCaptureFinalUrl(value: string): boolean {
+  if (value.length < 1 || value.length > 4_096) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:")
+      && url.username === ""
+      && url.password === ""
+      && url.hash === ""
+      && url.href === value;
+  } catch {
+    return false;
+  }
+}
+
+async function readSourceCaptureJson(
+  response: Response,
+  signal: AbortSignal,
+  maximumBytes: number,
+  errorCode: "invalid_response" | "ambiguous_result" = "invalid_response",
+): Promise<unknown> {
+  try {
+    return await readBoundedJson(response, signal, maximumBytes);
+  } catch {
+    if (signal.aborted) throw abortReason(signal);
+    throw new SourceCaptureHarnessError(errorCode);
+  }
+}
+
+async function mapSourceCaptureErrorResponse(
+  response: Response,
+  signal: AbortSignal,
+): Promise<never> {
+  const body = await readSourceCaptureJson(
+    response,
+    signal,
+    MAX_ERROR_BYTES,
+    "ambiguous_result",
+  );
+  const envelope = SourceCaptureErrorEnvelopeSchema.safeParse(body);
+  if (!envelope.success) throw new SourceCaptureHarnessError("ambiguous_result");
+  if (
+    response.status === 404
+    && envelope.data.code === "source_capture_not_found"
+  ) {
+    throw new SourceCaptureHarnessError("capture_not_found");
+  }
+  if (
+    response.status === 409
+    && envelope.data.code === "source_capture_active"
+  ) {
+    throw new SourceCaptureHarnessError("capture_active");
+  }
+  if (
+    response.status === 409
+    && envelope.data.code === "source_capture_not_ready"
+  ) {
+    throw new SourceCaptureHarnessError("capture_not_ready");
+  }
+  if (response.status === 422 && envelope.data.code === "invalid_request") {
+    throw new SourceCaptureHarnessError("invalid_request");
+  }
+  if (response.status === 401 && envelope.data.code === "unauthorized") {
+    throw new SourceCaptureHarnessError("unauthorized");
+  }
+  if (response.status === 503 && envelope.data.code === "unavailable") {
+    throw new SourceCaptureHarnessError("unavailable");
+  }
+  throw new SourceCaptureHarnessError("ambiguous_result");
+}
+
+export class HttpApplicationHarnessClient implements
+  ApplicationHarnessClient,
+  SourceCaptureHarnessClient {
   readonly #origin: string;
   readonly #token: string;
   readonly #fetch: ApplicationHarnessFetch;
@@ -1128,6 +1329,136 @@ export class HttpApplicationHarnessClient implements ApplicationHarnessClient {
     if (!response.ok) await mapErrorResponse(response, parsedSessionId.data, signal);
     await cancelResponse(response);
     if (response.status !== 204) throw new ApplicationHarnessError("invalid_response");
+  }
+
+  async createSourceCapture(
+    input: SourceCaptureCreateInput,
+    signal: AbortSignal,
+  ): Promise<SourceCaptureCreateResult> {
+    const captureId = UUIDSchema.safeParse(input.captureId);
+    const jobUrl = JobUrlSchema.safeParse(input.jobUrl);
+    if (
+      !captureId.success
+      || !jobUrl.success
+      || jobUrl.data !== input.jobUrl
+      || input.timeoutSeconds !== 900
+      || !Array.isArray(input.approvedOrigins)
+      || input.approvedOrigins.length < 1
+      || input.approvedOrigins.length > 20
+      || new Set(input.approvedOrigins).size !== input.approvedOrigins.length
+      || input.approvedOrigins.some((origin) => !isCanonicalSourceCaptureOrigin(origin))
+    ) {
+      throw new SourceCaptureHarnessError("invalid_request");
+    }
+    const response = await this.#sourceCaptureRequest(
+      "/v1/source-captures",
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          capture_id: captureId.data,
+          job_url: jobUrl.data,
+          approved_origins: input.approvedOrigins,
+          timeout_seconds: input.timeoutSeconds,
+        }),
+      },
+      signal,
+    );
+    if (!response.ok) await mapSourceCaptureErrorResponse(response, signal);
+    if (response.status !== 202) {
+      await cancelResponse(response);
+      throw new SourceCaptureHarnessError("ambiguous_result");
+    }
+    const body = await readSourceCaptureJson(
+      response,
+      signal,
+      MAX_ERROR_BYTES,
+      "ambiguous_result",
+    );
+    const created = SourceCaptureCreateResponseSchema.safeParse(body);
+    if (!created.success || created.data.capture_id !== captureId.data) {
+      throw new SourceCaptureHarnessError("ambiguous_result");
+    }
+    return { expiresAt: Date.parse(created.data.expires_at) };
+  }
+
+  async completeSourceCapture(
+    captureId: string,
+    signal: AbortSignal,
+  ): Promise<SourceCaptureCompleteResult> {
+    const parsedCaptureId = UUIDSchema.safeParse(captureId);
+    if (!parsedCaptureId.success) {
+      throw new SourceCaptureHarnessError("invalid_request");
+    }
+    const response = await this.#sourceCaptureRequest(
+      `/v1/source-captures/${parsedCaptureId.data}/complete`,
+      { method: "POST", headers: { accept: "application/json" } },
+      signal,
+    );
+    if (!response.ok) await mapSourceCaptureErrorResponse(response, signal);
+    if (response.status !== 200) {
+      await cancelResponse(response);
+      throw new SourceCaptureHarnessError("ambiguous_result");
+    }
+    const body = await readSourceCaptureJson(
+      response,
+      signal,
+      MAX_SOURCE_CAPTURE_RESPONSE_BYTES,
+      "ambiguous_result",
+    );
+    const completed = SourceCaptureCompleteResponseSchema.safeParse(body);
+    if (
+      !completed.success
+      || completed.data.capture_id !== parsedCaptureId.data
+    ) {
+      throw new SourceCaptureHarnessError("ambiguous_result");
+    }
+    return {
+      finalUrl: completed.data.final_url,
+      source: completed.data.source,
+    };
+  }
+
+  async deleteSourceCapture(
+    captureId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const parsedCaptureId = UUIDSchema.safeParse(captureId);
+    if (!parsedCaptureId.success) {
+      throw new SourceCaptureHarnessError("invalid_request");
+    }
+    const response = await this.#sourceCaptureRequest(
+      `/v1/source-captures/${parsedCaptureId.data}`,
+      { method: "DELETE" },
+      signal,
+    );
+    if (!response.ok) await mapSourceCaptureErrorResponse(response, signal);
+    await cancelResponse(response);
+    if (response.status !== 204) {
+      throw new SourceCaptureHarnessError("invalid_response");
+    }
+  }
+
+  async #sourceCaptureRequest(
+    path: string,
+    init: RequestInit,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    try {
+      return await this.#request(path, init, signal);
+    } catch (error) {
+      if (signal.aborted) throw abortReason(signal);
+      if (
+        error instanceof ApplicationHarnessError
+        && (error.code === "unavailable" || error.code === "invalid_response")
+      ) {
+        throw new SourceCaptureHarnessError("ambiguous_result");
+      }
+      throw new SourceCaptureHarnessError("invalid_response");
+    }
   }
 
   async #request(path: string, init: RequestInit, signal: AbortSignal): Promise<Response> {

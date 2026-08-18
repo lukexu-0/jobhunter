@@ -17,13 +17,21 @@ import {
   createApplicationSessionRoutes,
   type ApplicationSessionRouteService,
 } from "./api/application-session-routes.ts";
-import type { ApplicationHarnessClient } from "./api/application-harness-client.ts";
-import { HttpApplicationHarnessClient } from "./api/application-harness-client.ts";
+import {
+  HttpApplicationHarnessClient,
+  type ApplicationHarnessClient,
+  type SourceCaptureHarnessClient,
+} from "./api/application-harness-client.ts";
 import { ApplicationSessionService } from "./api/application-session-service.ts";
 import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
 import { createApiHandler, type ApiRequestContext } from "./api/handler.ts";
 import { createRunRoutes } from "./api/run-routes.ts";
+import {
+  createSourceHandoffRoutes,
+  type SourceHandoffRouteService,
+} from "./api/source-handoff-routes.ts";
+import { SourceHandoffService } from "./api/source-handoff-service.ts";
 import { createDiscoveryRoutes } from "./api/discovery-routes.ts";
 import { RunApplicationService } from "./api/run-service.ts";
 import type { LoadJobSource } from "./api/job-source.ts";
@@ -70,6 +78,10 @@ export interface PipelineApplicationSessionService extends ApplicationSessionRou
   dispose?(): void | Promise<void>;
 }
 
+export interface PipelineSourceHandoffService extends SourceHandoffRouteService {
+  close(): void | Promise<void>;
+}
+
 
 export interface PipelineApplicationOptions {
   readonly webOrigin?: string;
@@ -93,6 +105,8 @@ export interface PipelineApplicationOptions {
   readonly applicationHarness?: ApplicationHarnessClient;
   readonly applicationSessions?: PipelineApplicationSessionService;
   readonly professionalizeAnswer?: ProfessionalizeApplicationAnswer;
+  readonly sourceCaptureHarness?: SourceCaptureHarnessClient;
+  readonly sourceHandoffs?: PipelineSourceHandoffService;
 }
 
 /** Internal handles are exposed for typed integration tests, not serialized by any route. */
@@ -108,6 +122,7 @@ export interface PipelineApplicationServices {
   readonly discovery?: DiscoveryService;
   readonly auth: ClosableAuthRouteService;
   readonly applicationSessions: PipelineApplicationSessionService;
+  readonly sourceHandoffs: PipelineSourceHandoffService;
 }
 
 export interface PipelineApplication {
@@ -238,13 +253,24 @@ async function closeAll(operations: readonly (() => void | Promise<void>)[]): Pr
   const errors: unknown[] = [];
   for (const operation of operations) {
     try {
-      await operation();
+      const pending = operation();
+      if (pending !== undefined) await pending;
     } catch (error) {
       errors.push(error);
     }
   }
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, "Pipeline application close failed");
+}
+
+function isSourceCaptureHarnessClient(
+  client: ApplicationHarnessClient | undefined,
+): client is ApplicationHarnessClient & SourceCaptureHarnessClient {
+  if (client === undefined) return false;
+  const candidate = client as Partial<SourceCaptureHarnessClient>;
+  return typeof candidate.createSourceCapture === "function"
+    && typeof candidate.completeSourceCapture === "function"
+    && typeof candidate.deleteSourceCapture === "function";
 }
 
 export function createPipelineApplication(options: PipelineApplicationOptions = {}): PipelineApplication {
@@ -270,6 +296,17 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const contextDatabase = options.contextDatabase ?? (options.context ? undefined : openContextDatabase());
   const context = options.context ?? createContextApplicationService({ database: contextDatabase! });
   const applicationHarnessOrigin = options.applicationHarnessOrigin ?? process.env.JOBHUNTER_HARNESS_URL;
+  const defaultHarness = browserHarnessToken === undefined
+    ? undefined
+    : new HttpApplicationHarnessClient({
+        token: browserHarnessToken,
+        ...(applicationHarnessOrigin ? { origin: applicationHarnessOrigin } : {}),
+      });
+  const applicationHarness = options.applicationHarness ?? defaultHarness;
+  const sourceCaptureHarness = options.sourceCaptureHarness
+    ?? (isSourceCaptureHarnessClient(applicationHarness)
+      ? applicationHarness
+      : undefined);
   let worker = options.worker;
   const applicationSessions = options.applicationSessions ?? new ApplicationSessionService({
     repository,
@@ -277,18 +314,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     onApplicationSessionReleased: () => worker?.kick(),
     professionalizeAnswer:
       options.professionalizeAnswer ?? professionalizeApplicationAnswer,
-    ...(
-      options.applicationHarness
-        ? { harness: options.applicationHarness }
-        : browserHarnessToken === undefined
-          ? {}
-          : {
-              harness: new HttpApplicationHarnessClient({
-                token: browserHarnessToken,
-                ...(applicationHarnessOrigin ? { origin: applicationHarnessOrigin } : {}),
-              }),
-            }
-    ),
+    ...(applicationHarness ? { harness: applicationHarness } : {}),
   });
   const schedulerOptions = options.workerOptions?.scheduler;
   worker ??= createPipelineWorkerRuntime({
@@ -311,6 +337,10 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     scheduler: worker,
     ...(options.loadJobSource ? { loadJobSource: options.loadJobSource } : {}),
     ...(options.extractJobDescription ? { extractJobDescription: options.extractJobDescription } : {}),
+  });
+  const sourceHandoffs = options.sourceHandoffs ?? new SourceHandoffService({
+    runs,
+    ...(sourceCaptureHarness ? { harness: sourceCaptureHarness } : {}),
   });
   const discoveryRepository = options.discoveryRepository
     ?? (pipelineDatabase === undefined ? undefined : new DiscoveryRepository(pipelineDatabase));
@@ -348,6 +378,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const routeAuth = createAuthRoutes(auth);
   const routeContext = createContextRoutes(context);
   const routeRuns = createRunRoutes(runs);
+  const routeSourceHandoffs = createSourceHandoffRoutes(sourceHandoffs);
   const routeDiscovery = discovery === undefined ? undefined : createDiscoveryRoutes(discovery);
   const routeApplicationSessions = createApplicationSessionRoutes(applicationSessions);
   const fetch = createApiHandler({
@@ -358,6 +389,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       ?? (await routeContext(request, url))
       ?? (await routeApplicationSessions(request, url))
       ?? (await routeDiscovery?.(request, url))
+      ?? (await routeSourceHandoffs(request, url, context))
       ?? (await routeRuns(request, url, context)),
   });
   const services = Object.freeze({
@@ -372,6 +404,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     ...(discovery === undefined ? {} : { discovery }),
     auth,
     applicationSessions,
+    sourceHandoffs,
   });
   let closePromise: Promise<void> | undefined;
 
@@ -380,6 +413,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     kick: () => worker.kick(),
     close: () => {
       closePromise ??= closeAll([
+        () => sourceHandoffs.close(),
         ...(discovery ? [() => discovery.close()] : []),
         () => worker.close(),
         () => applicationSessions.dispose?.(),

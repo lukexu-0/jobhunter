@@ -3,9 +3,39 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent } from "react";
-import { APPLICATION_STATUSES, CreateRunRequestSchema, type ApplicationStatus, type ArtifactDto, type OpportunityKind, type RunDto, type RunStatus } from "@jobhunter/pipeline/contracts";
-import { PipelineClientError, createPastedRun, createRun, deleteRun, listRuns, readJsonArtifact, updateApplicationStatus, updateRunIdentity } from "../lib/pipeline-client";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+  type KeyboardEvent,
+} from "react";
+import {
+  APPLICATION_STATUSES,
+  CreateRunRequestSchema,
+  type ApplicationStatus,
+  type ArtifactDto,
+  type OpportunityKind,
+  type RunDto,
+  type RunStatus,
+  type SourceHandoffDto,
+} from "@jobhunter/pipeline/contracts";
+import {
+  PipelineClientError,
+  completeSourceHandoff,
+  createPastedRun,
+  createRun,
+  createSourceHandoff,
+  deleteRun,
+  deleteSourceHandoff,
+  listRuns,
+  readJsonArtifact,
+  updateApplicationStatus,
+  updateRunIdentity,
+} from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
 import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
@@ -98,6 +128,18 @@ interface ValidatedPastedRunRequest {
   readonly generateKeywordMap: boolean;
 }
 
+type SourceVerificationFlow =
+  | {
+      readonly phase: "required";
+      readonly request: ValidatedCreateRunRequest;
+      readonly sessionEnded: boolean;
+    }
+  | {
+      readonly phase: "awaiting";
+      readonly request: ValidatedCreateRunRequest;
+      readonly handoff: SourceHandoffDto;
+    };
+
 type CreateRunResult =
   | {
     readonly success: true;
@@ -114,6 +156,29 @@ function publicMessage(error: unknown, fallback: string): string {
   const message = error.message.trim();
   if (!message) return fallback;
   return message.slice(0, MAX_PUBLIC_MESSAGE_LENGTH);
+}
+
+function sourceVerificationMessage(error: unknown, fallback: string): string {
+  if (
+    error instanceof PipelineClientError
+    && error.code === "SOURCE_HANDOFF_NOT_FOUND"
+  ) {
+    return "This verification session is no longer available. It may have expired. Cancel verification, then open a new browser session.";
+  }
+  return publicMessage(error, fallback);
+}
+
+function sourceHandoffExpiry(timestamp: number): {
+  readonly dateTime: string;
+  readonly label: string;
+} | null {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return null;
+  const dateTime = date.toISOString();
+  return {
+    dateTime,
+    label: dateTime.replace("T", " ").replace(/\.\d{3}Z$/u, " UTC"),
+  };
 }
 
 function parseCreateRunRequests(
@@ -300,6 +365,12 @@ export function RunDashboard() {
   const [isCreating, setIsCreating] = useState(false);
   const [duplicateCreateRequests, setDuplicateCreateRequests] =
     useState<readonly ValidatedCreateRunRequest[] | null>(null);
+  const [sourceVerification, setSourceVerification] =
+    useState<SourceVerificationFlow | null>(null);
+  const [sourceVerificationAction, setSourceVerificationAction] =
+    useState<"open" | "complete" | "cancel" | null>(null);
+  const [sourceVerificationError, setSourceVerificationError] =
+    useState<string | null>(null);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
   const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
   const [actionMenu, setActionMenu] = useState<ActionMenuState | null>(null);
@@ -310,6 +381,31 @@ export function RunDashboard() {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const duplicateDialogRef = useRef<HTMLDialogElement>(null);
   const duplicateDialogOpenerRef = useRef<HTMLButtonElement>(null);
+  const sourceVerificationOpenRef = useRef<HTMLButtonElement>(null);
+  const jobUrlInputRef = useRef<HTMLInputElement>(null);
+  const sourceVerificationCompleteRef = useRef<HTMLButtonElement>(null);
+  const restoreInitializerFocusRef = useRef(false);
+  const initializerPendingRef = useRef(false);
+  const sourceVerificationActionRef = useRef<"open" | "complete" | "cancel" | null>(null);
+  const sourceVerificationRef = useRef<SourceVerificationFlow | null>(null);
+  const awaitingSourceHandoffIdRef = useRef<string | null>(null);
+  const releasedSourceHandoffIdRef = useRef<string | null>(null);
+  const sourceHandoffReleaseRequestedRef = useRef(false);
+  const sourceHandoffCleanupMountedRef = useRef(false);
+  awaitingSourceHandoffIdRef.current = sourceVerification?.phase === "awaiting"
+    ? sourceVerification.handoff.id
+    : null;
+  sourceVerificationRef.current = sourceVerification;
+  const commitSourceVerification = useCallback(
+    (next: SourceVerificationFlow | null) => {
+      sourceVerificationRef.current = next;
+      awaitingSourceHandoffIdRef.current = next?.phase === "awaiting"
+        ? next.handoff.id
+        : null;
+      setSourceVerification(next);
+    },
+    [],
+  );
   const editInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const actionTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -335,6 +431,36 @@ export function RunDashboard() {
   const restoreActionTriggerFocus = useCallback((runId: string) => {
     scheduleFocusRestoration(runId);
   }, [scheduleFocusRestoration]);
+  const releaseAwaitingSourceHandoff = useCallback(() => {
+    sourceHandoffReleaseRequestedRef.current = true;
+    const handoffId = awaitingSourceHandoffIdRef.current;
+    if (!handoffId || releasedSourceHandoffIdRef.current === handoffId) return;
+    releasedSourceHandoffIdRef.current = handoffId;
+    void deleteSourceHandoff(handoffId, true).catch(() => undefined);
+  }, []);
+  const markReleasedSourceHandoffEnded = useCallback(() => {
+    if (sourceVerificationActionRef.current === "cancel") return;
+    const verification = sourceVerificationRef.current;
+    if (verification?.phase !== "awaiting") return;
+    const ended: SourceVerificationFlow = {
+      phase: "required",
+      request: verification.request,
+      sessionEnded: true,
+    };
+    commitSourceVerification(ended);
+    setSourceVerificationError(
+      "Verification session ended. Open a new verification browser session.",
+    );
+  }, [commitSourceVerification]);
+  const handleSourceHandoffPageHide = useCallback(() => {
+    releaseAwaitingSourceHandoff();
+    markReleasedSourceHandoffEnded();
+  }, [markReleasedSourceHandoffEnded, releaseAwaitingSourceHandoff]);
+  const handleSourceHandoffPageShow = useCallback((event: PageTransitionEvent) => {
+    if (event.persisted && sourceHandoffReleaseRequestedRef.current) {
+      markReleasedSourceHandoffEnded();
+    }
+  }, [markReleasedSourceHandoffEnded]);
   const requestedArtifacts = useRef(new Set<string>());
   const latestListRequest = useRef(0);
   const createRunRequests = useMemo(
@@ -348,10 +474,56 @@ export function RunDashboard() {
   const isCreateRequestValid = initializerSource === "url"
     ? createRunRequests !== null
     : pastedRunRequest !== null;
+  const isInitializerBusy = isCreating || sourceVerification !== null;
   const clearCreateStatus = () => {
     setCreateError(null);
     setCreateSuccess(null);
+    setSourceVerificationError(null);
   };
+  useEffect(() => {
+    sourceHandoffCleanupMountedRef.current = true;
+    window.addEventListener("pagehide", handleSourceHandoffPageHide);
+    window.addEventListener("pageshow", handleSourceHandoffPageShow);
+    return () => {
+      window.removeEventListener("pagehide", handleSourceHandoffPageHide);
+      window.removeEventListener("pageshow", handleSourceHandoffPageShow);
+      sourceHandoffCleanupMountedRef.current = false;
+      queueMicrotask(() => {
+        if (!sourceHandoffCleanupMountedRef.current) releaseAwaitingSourceHandoff();
+      });
+    };
+  }, [
+    handleSourceHandoffPageHide,
+    handleSourceHandoffPageShow,
+    releaseAwaitingSourceHandoff,
+  ]);
+
+  useEffect(() => {
+    const verification = sourceVerification;
+    if (!verification || sourceVerificationAction !== null) return;
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (verification.phase === "required") {
+        sourceVerificationOpenRef.current?.focus();
+      } else {
+        sourceVerificationCompleteRef.current?.focus();
+      }
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [sourceVerification, sourceVerificationAction]);
+
+  useEffect(() => {
+    if (sourceVerification !== null || !restoreInitializerFocusRef.current) return;
+    restoreInitializerFocusRef.current = false;
+    const focusFrame = window.requestAnimationFrame(() => {
+      const initializeButton = duplicateDialogOpenerRef.current;
+      if (initializeButton && !initializeButton.disabled) {
+        initializeButton.focus();
+      } else {
+        jobUrlInputRef.current?.focus();
+      }
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [sourceVerification]);
 
   const load = useCallback(async (showLoading = false) => {
     const requestId = ++latestListRequest.current;
@@ -667,67 +839,235 @@ export function RunDashboard() {
   };
 
   const initializeRuns = async (requests: readonly ValidatedCreateRunRequest[]) => {
-    if (isCreating) return;
+    if (isInitializerBusy || initializerPendingRef.current) return;
+    initializerPendingRef.current = true;
     setIsCreating(true);
     setCreateError(null);
     setCreateSuccess(null);
+    setSourceVerificationError(null);
 
-    const results = await mapWithConcurrency(
-      requests,
-      MAX_CONCURRENT_RUN_CREATIONS,
-      async (request): Promise<CreateRunResult> => {
-        try {
-          return {
-            success: true,
-            run: await createRun(
-              request.jobUrl,
-              request.generateKeywordMap,
-              request.skipReview,
-              request.autoSubmit,
-              request.opportunityKind,
-            ),
-          };
-        } catch (error) {
-          return { success: false, request, error };
-        }
-      },
-    );
-    const successfulRuns: RunDto[] = [];
-    const failures: Extract<CreateRunResult, { success: false }>[] = [];
-    for (const result of results) {
-      if (result.success) successfulRuns.push(result.run);
-      else failures.push(result);
-    }
+    try {
+      const results = await mapWithConcurrency(
+        requests,
+        MAX_CONCURRENT_RUN_CREATIONS,
+        async (request): Promise<CreateRunResult> => {
+          try {
+            return {
+              success: true,
+              run: await createRun(
+                request.jobUrl,
+                request.generateKeywordMap,
+                request.skipReview,
+                request.autoSubmit,
+                request.opportunityKind,
+              ),
+            };
+          } catch (error) {
+            return { success: false, request, error };
+          }
+        },
+      );
+      const successfulRuns: RunDto[] = [];
+      const failures: Extract<CreateRunResult, { success: false }>[] = [];
+      for (const result of results) {
+        if (result.success) successfulRuns.push(result.run);
+        else failures.push(result);
+      }
 
-    if (successfulRuns.length > 0) {
-      latestListRequest.current += 1;
-      setIsLoading(false);
-      setRuns((current) => mergeRuns(current, successfulRuns));
-      void load();
-    }
+      if (successfulRuns.length > 0) {
+        latestListRequest.current += 1;
+        setIsLoading(false);
+        setRuns((current) => mergeRuns(current, successfulRuns));
+        void load();
+      }
 
-    if (failures.length === 0) {
-      setJobUrl("");
-      setOpportunityKind("auto");
-      setSkipReview(false);
-      setAutoSubmit(false);
-      const applicationLabel = successfulRuns.length === 1 ? "application" : "applications";
-      setCreateSuccess(`${successfulRuns.length} ${applicationLabel} initialized.`);
-    } else {
+      if (failures.length === 0) {
+        setJobUrl("");
+        setOpportunityKind("auto");
+        setSkipReview(false);
+        setAutoSubmit(false);
+        const applicationLabel = successfulRuns.length === 1 ? "application" : "applications";
+        setCreateSuccess(`${successfulRuns.length} ${applicationLabel} initialized.`);
+        return;
+      }
+
       if (requests.length > 1) {
         setJobUrl(failures.map(({ request }) => request.jobUrl).join(", "));
       }
+      const verificationFailure = requests.length === 1
+        && failures.length === 1
+        && failures[0]!.error instanceof PipelineClientError
+        && failures[0]!.error.code === "JOB_HUMAN_VERIFICATION_REQUIRED"
+        ? failures[0]!
+        : null;
+      if (verificationFailure) {
+        commitSourceVerification({
+          phase: "required",
+          sessionEnded: false,
+          request: verificationFailure.request,
+        });
+        return;
+      }
+
       setCreateError(
         requests.length === 1
           ? publicMessage(failures[0]!.error, "The opportunity could not be initialized. Try again.")
           : batchFailureMessage(successfulRuns.length, results.length, failures[0]!.error),
       );
+    } finally {
+      initializerPendingRef.current = false;
+      setIsCreating(false);
     }
-    setIsCreating(false);
+  };
+
+  const openSourceVerification = async () => {
+    const verification = sourceVerification;
+    if (
+      verification?.phase !== "required"
+      || sourceVerificationActionRef.current !== null
+    ) return;
+
+    sourceHandoffReleaseRequestedRef.current = false;
+    releasedSourceHandoffIdRef.current = null;
+    sourceVerificationActionRef.current = "open";
+    setSourceVerificationAction("open");
+    setSourceVerificationError(null);
+    try {
+      const handoff = await createSourceHandoff(verification.request);
+      if (sourceHandoffReleaseRequestedRef.current) {
+        awaitingSourceHandoffIdRef.current = handoff.id;
+        releaseAwaitingSourceHandoff();
+        return;
+      }
+      commitSourceVerification({
+        phase: "awaiting",
+        request: verification.request,
+        handoff,
+      });
+    } catch (error) {
+      if (sourceHandoffReleaseRequestedRef.current) return;
+      setSourceVerificationError(
+        sourceVerificationMessage(error, "The verification browser could not be opened. Try again."),
+      );
+    } finally {
+      sourceVerificationActionRef.current = null;
+      setSourceVerificationAction(null);
+    }
+  };
+
+  const completeSourceVerification = async () => {
+    const verification = sourceVerification;
+    if (
+      verification?.phase !== "awaiting"
+      || sourceVerificationActionRef.current !== null
+    ) return;
+
+    sourceVerificationActionRef.current = "complete";
+    setSourceVerificationAction("complete");
+    setSourceVerificationError(null);
+    try {
+      const run = await completeSourceHandoff(verification.handoff.id);
+      const currentVerification = sourceVerificationRef.current;
+      if (
+        currentVerification?.phase !== "awaiting"
+        || currentVerification.handoff.id !== verification.handoff.id
+      ) {
+        void load();
+        return;
+      }
+      latestListRequest.current += 1;
+      setIsLoading(false);
+      setRuns((current) => mergeRuns(current, [run]));
+      void load();
+      setJobUrl("");
+      setOpportunityKind("auto");
+      setSkipReview(false);
+      setAutoSubmit(false);
+      restoreInitializerFocusRef.current = true;
+      commitSourceVerification(null);
+      setCreateSuccess("1 application initialized.");
+    } catch (error) {
+      if (sourceHandoffReleaseRequestedRef.current) return;
+      if (
+        error instanceof PipelineClientError
+        && error.code === "SOURCE_HANDOFF_NOT_FOUND"
+      ) {
+        releasedSourceHandoffIdRef.current = verification.handoff.id;
+        commitSourceVerification({
+          phase: "required",
+          request: verification.request,
+          sessionEnded: true,
+        });
+        setSourceVerificationError(
+          "Verification session ended. Open a new verification browser session.",
+        );
+      } else {
+        setSourceVerificationError(
+          sourceVerificationMessage(error, "Verification could not be completed. Try again."),
+        );
+      }
+    } finally {
+      sourceVerificationActionRef.current = null;
+      setSourceVerificationAction(null);
+    }
+  };
+
+  const cancelSourceVerification = async () => {
+    const verification = sourceVerification;
+    if (!verification || sourceVerificationActionRef.current !== null) return;
+
+    if (verification.phase === "required") {
+      restoreInitializerFocusRef.current = true;
+      commitSourceVerification(null);
+      setSourceVerificationError(null);
+      setCreateSuccess("Verification cancelled. The URL and options were kept.");
+      return;
+    }
+
+    sourceVerificationActionRef.current = "cancel";
+    setSourceVerificationAction("cancel");
+    setSourceVerificationError(null);
+    releasedSourceHandoffIdRef.current = verification.handoff.id;
+    try {
+      await deleteSourceHandoff(verification.handoff.id);
+      restoreInitializerFocusRef.current = true;
+      commitSourceVerification(null);
+      setCreateSuccess("Verification cancelled. The URL and options were kept.");
+    } catch (error) {
+      if (
+        error instanceof PipelineClientError
+        && error.code === "SOURCE_HANDOFF_NOT_FOUND"
+      ) {
+        restoreInitializerFocusRef.current = true;
+        commitSourceVerification(null);
+        setSourceVerificationError(null);
+        setCreateSuccess("Verification session ended. The URL and options were kept.");
+      } else if (sourceHandoffReleaseRequestedRef.current) {
+        commitSourceVerification({
+          phase: "required",
+          request: verification.request,
+          sessionEnded: true,
+        });
+        setSourceVerificationError(
+          "Verification session ended. Open a new verification browser session.",
+        );
+      } else {
+        setSourceVerificationError(
+          sourceVerificationMessage(error, "Verification could not be cancelled. Try again."),
+        );
+        if (releasedSourceHandoffIdRef.current === verification.handoff.id) {
+          releasedSourceHandoffIdRef.current = null;
+        }
+      }
+    } finally {
+      sourceVerificationActionRef.current = null;
+      setSourceVerificationAction(null);
+    }
   };
 
   const initializePastedRun = async (request: ValidatedPastedRunRequest) => {
-    if (isCreating) return;
+    if (isInitializerBusy || initializerPendingRef.current) return;
+    initializerPendingRef.current = true;
     setIsCreating(true);
     clearCreateStatus();
     try {
@@ -747,6 +1087,7 @@ export function RunDashboard() {
     } catch (error) {
       setCreateError(publicMessage(error, "The pasted job could not be initialized. Try again."));
     } finally {
+      initializerPendingRef.current = false;
       setIsCreating(false);
     }
   };
@@ -759,7 +1100,7 @@ export function RunDashboard() {
 
   const submitRun = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (isCreating) return;
+    if (isInitializerBusy || initializerPendingRef.current) return;
     if (initializerSource === "pasted") {
       if (pastedRunRequest) void initializePastedRun(pastedRunRequest);
       return;
@@ -783,7 +1124,7 @@ export function RunDashboard() {
 
   const confirmDuplicateRun = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (isCreating || !duplicateCreateRequests) return;
+    if (isInitializerBusy || initializerPendingRef.current || !duplicateCreateRequests) return;
     const requests = duplicateCreateRequests;
     if (duplicateDialogRef.current?.open) duplicateDialogRef.current.close();
     setDuplicateCreateRequests(null);
@@ -812,6 +1153,9 @@ export function RunDashboard() {
   const normalizedEditValue = editValue.trim();
   const isEditValueValid = normalizedEditValue.length >= 1 && normalizedEditValue.length <= 200;
   const isDialogBusy = Boolean(activeDialog && busyRunIds.has(activeDialog.runId));
+  const sourceVerificationExpiry = sourceVerification?.phase === "awaiting"
+    ? sourceHandoffExpiry(sourceVerification.handoff.expiresAt)
+    : null;
 
   return (
     <main className="workspace">
@@ -830,7 +1174,7 @@ export function RunDashboard() {
           <select
             aria-label="Initialize from"
             value={initializerSource}
-            disabled={isCreating}
+            disabled={isInitializerBusy}
             onChange={(event) => {
               setInitializerSource(event.currentTarget.value as InitializerSource);
               setDuplicateCreateRequests(null);
@@ -847,6 +1191,7 @@ export function RunDashboard() {
             <div className="run-initializer__field">
               <label className="run-initializer__label" htmlFor="job-url">Opportunity URLs</label>
               <input
+                ref={jobUrlInputRef}
                 id="job-url"
                 type="text"
                 inputMode="url"
@@ -855,9 +1200,17 @@ export function RunDashboard() {
                 spellCheck={false}
                 placeholder="https://example.com/opportunities/ship-it, https://example.com/events/demo-day"
                 value={jobUrl}
-                disabled={isCreating}
+                disabled={isInitializerBusy}
                 aria-invalid={createError ? true : undefined}
-                aria-describedby={createError ? "job-url-error" : createSuccess ? "job-url-success" : undefined}
+                aria-describedby={
+                  createError
+                    ? "job-url-error"
+                    : sourceVerification
+                      ? "source-verification-description"
+                      : createSuccess
+                        ? "job-url-success"
+                        : undefined
+                }
                 aria-errormessage={createError ? "job-url-error" : undefined}
                 onChange={(event) => {
                   setJobUrl(event.target.value);
@@ -871,7 +1224,7 @@ export function RunDashboard() {
               <select
                 aria-label="Opportunity type"
                 value={opportunityKind}
-                disabled={isCreating}
+                disabled={isInitializerBusy}
                 onChange={(event) => {
                   setOpportunityKind(event.currentTarget.value as OpportunityKindSelection);
                   clearCreateStatus();
@@ -895,7 +1248,7 @@ export function RunDashboard() {
                     aria-describedby="skip-review-description"
                     aria-labelledby="skip-review-label"
                     checked={skipReview}
-                    disabled={isCreating}
+                    disabled={isInitializerBusy}
                     onChange={(event) => {
                       setSkipReview(event.currentTarget.checked);
                       clearCreateStatus();
@@ -914,7 +1267,7 @@ export function RunDashboard() {
                     aria-describedby="auto-submit-description"
                     aria-labelledby="auto-submit-label"
                     checked={autoSubmit}
-                    disabled={isCreating}
+                    disabled={isInitializerBusy}
                     onChange={(event) => {
                       setAutoSubmit(event.currentTarget.checked);
                       clearCreateStatus();
@@ -941,7 +1294,7 @@ export function RunDashboard() {
                   required
                   maxLength={200}
                   value={jobTitle}
-                  disabled={isCreating}
+                  disabled={isInitializerBusy}
                   aria-invalid={createError ? true : undefined}
                   aria-describedby={createError ? "pasted-job-error" : createSuccess ? "pasted-job-success" : undefined}
                   aria-errormessage={createError ? "pasted-job-error" : undefined}
@@ -959,7 +1312,7 @@ export function RunDashboard() {
                   minLength={40}
                   maxLength={50_000}
                   value={jobDescription}
-                  disabled={isCreating}
+                  disabled={isInitializerBusy}
                   aria-invalid={createError ? true : undefined}
                   aria-describedby={createError ? "pasted-job-error" : createSuccess ? "pasted-job-success" : undefined}
                   aria-errormessage={createError ? "pasted-job-error" : undefined}
@@ -980,7 +1333,7 @@ export function RunDashboard() {
                     aria-describedby="generate-keyword-map-description"
                     aria-labelledby="generate-keyword-map-label"
                     checked={generateKeywordMap}
-                    disabled={isCreating}
+                    disabled={isInitializerBusy}
                     onChange={(event) => {
                       setGenerateKeywordMap(event.currentTarget.checked);
                       clearCreateStatus();
@@ -1004,10 +1357,94 @@ export function RunDashboard() {
           ref={duplicateDialogOpenerRef}
           className="square-control square-control--primary"
           type="submit"
-          disabled={isCreating || !isCreateRequestValid}
+          disabled={isInitializerBusy || !isCreateRequestValid}
         >
-          {isCreating ? "Initializing…" : "Initialize"}
+          {isCreating ? "Initializing…" : sourceVerification ? "Verification required" : "Initialize"}
         </button>
+        {sourceVerification ? (
+          <section
+            aria-labelledby="source-verification-heading"
+            className="run-initializer__verification"
+          >
+            <h2 id="source-verification-heading">Human verification required</h2>
+            {sourceVerification.phase === "required" ? (
+              <>
+                <p id="source-verification-description" role="status">
+                  This site requires a verification step that Jobhunter will not attempt. Open the trusted
+                  local browser and complete the verification manually.
+                </p>
+                <div className="run-initializer__verification-actions">
+                  <button
+                    ref={sourceVerificationOpenRef}
+                    className="square-control square-control--primary"
+                    disabled={sourceVerificationAction !== null}
+                    onClick={() => void openSourceVerification()}
+                    type="button"
+                  >
+                    {sourceVerificationAction === "open"
+                      ? "Opening verification browser…"
+                      : "Open verification browser"}
+                  </button>
+                  {sourceVerification.sessionEnded ? null : (
+                    <button
+                      className="square-control"
+                      disabled={sourceVerificationAction !== null}
+                      onClick={() => void cancelSourceVerification()}
+                      type="button"
+                    >
+                      Cancel verification
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                <h3>Complete verification in the local browser</h3>
+                <p id="source-verification-description" role="status">
+                  A trusted local browser window is open. Complete the site&apos;s verification there,
+                  then return here and confirm below.
+                </p>
+                {sourceVerificationExpiry ? (
+                  <p className="run-initializer__verification-expiry">
+                    The browser session expires at{" "}
+                    <time dateTime={sourceVerificationExpiry.dateTime}>
+                      {sourceVerificationExpiry.label}
+                    </time>
+                    . Completion is never detected automatically.
+                  </p>
+                ) : null}
+                <div className="run-initializer__verification-actions">
+                  <button
+                    ref={sourceVerificationCompleteRef}
+                    className="square-control square-control--primary"
+                    disabled={sourceVerificationAction !== null}
+                    onClick={() => void completeSourceVerification()}
+                    type="button"
+                  >
+                    {sourceVerificationAction === "complete"
+                      ? "Completing verification…"
+                      : "I've completed verification"}
+                  </button>
+                  <button
+                    className="square-control"
+                    disabled={sourceVerificationAction !== null}
+                    onClick={() => void cancelSourceVerification()}
+                    type="button"
+                  >
+                    {sourceVerificationAction === "cancel"
+                      ? "Cancelling verification…"
+                      : "Cancel verification"}
+                  </button>
+                </div>
+              </>
+            )}
+            {sourceVerificationError ? (
+              <p className="dashboard-alert" role="alert">
+                {sourceVerificationError}
+              </p>
+            ) : null}
+          </section>
+        ) : null}
         {createError ? (
           <p
             className="dashboard-alert"
