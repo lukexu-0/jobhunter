@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import stat
+import subprocess
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -85,6 +86,38 @@ class DummyProcess:
         self.returncode = 137
 
 
+class HangingProcess:
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        finish_on_terminate: bool = True,
+    ) -> None:
+        self.stdout = DummyStream(stdout)
+        self.stderr = DummyStream(b"")
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+        self._finish_on_terminate = finish_on_terminate
+        self._finished = asyncio.Event()
+
+    async def wait(self) -> int:
+        await self._finished.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if self._finish_on_terminate:
+            self.returncode = 124
+            self._finished.set()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = 137
+        self._finished.set()
+
+
 @pytest.fixture
 def cli_script(tmp_path: Path) -> Path:
     script = tmp_path / "playwright-cli.js"
@@ -99,6 +132,69 @@ def session_dir(tmp_path: Path) -> Path:
     return d
 
 
+def run_url_less_generated_script(script: str, exercise: str) -> Any:
+    program = (
+        "const vm=require('node:vm');"
+        "const context=vm.createContext({});"
+        "for(const name of ['URL','require','process']){"
+        "if(vm.runInContext('typeof '+name,context)!=='undefined')"
+        "throw new Error(name+' unexpectedly available');}"
+        f"const generated=vm.runInContext({json.dumps(f'({script})')},context);"
+        "(async()=>{"
+        f"{exercise}"
+        "})().then((value)=>process.stdout.write(JSON.stringify(value)))"
+        ".catch((error)=>{process.stderr.write(String(error&&error.stack||error));"
+        "process.exitCode=1;});"
+    )
+    completed = subprocess.run(
+        [str(playwright_cli._resolve_node_executable(None)), "-e", program],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+def _successful_metadata_result() -> bytes:
+    metadata = {
+        "url": "https://example.com/jobs/1",
+        "title": "Software Engineer",
+        "currentIndex": 0,
+        "tabs": [
+            {
+                "url": "https://example.com/jobs/1",
+                "title": "Software Engineer",
+            }
+        ],
+    }
+    return json.dumps({"result": json.dumps(metadata)}).encode()
+
+
+def _runtime_for_process_factory(
+    *,
+    session_id: UUID,
+    session_directory: Path,
+    cli_script: Path,
+    process_factory: Any,
+    execution_timeout: float | None = None,
+) -> PlaywrightCliRuntime:
+    options: dict[str, Any] = {}
+    if execution_timeout is not None:
+        options["execution_timeout"] = execution_timeout
+    return PlaywrightCliRuntime(
+        session_id=session_id,
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_directory,
+        deadline=time.monotonic() + 100,
+        process_factory=process_factory,
+        cli_script=cli_script,
+        **options,
+    )
 
 
 def test_private_redaction_fragments_match_pinned_yaml_and_json_escaping() -> None:
@@ -606,8 +702,6 @@ async def test_source_capture_binds_bounded_rendered_text_and_url_to_one_page(
         f"const maxLines={playwright_cli._MAX_SOURCE_CAPTURE_LINES};"
         in capture_script
     )
-    assert "new URL(beforeUrl).origin" in capture_script
-    assert "new URL(afterUrl).origin" in capture_script
     assert r'new Set([\"input\",\"textarea\",\"select\"])' in capture_script
     assert "element.isContentEditable" in capture_script
     assert "element.hasAttribute('contenteditable')" in capture_script
@@ -624,6 +718,75 @@ async def test_source_capture_binds_bounded_rendered_text_and_url_to_one_page(
         "screenshot",
     }.intersection(invocation[3] for invocation in invocations)
     assert list(runtime._internal_directory.glob("source-capture-*.yml")) == []
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_source_capture_script_accepts_exact_origin_without_url_global(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000047"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        deadline=time.monotonic() + 100,
+        cli_script=cli_script,
+    )
+    runtime._started = True
+    runtime._guard_armed = True
+    runtime._approved_origins = ("https://example.com",)
+
+    async def invoke(
+        command: str,
+        args: Sequence[str] = (),
+        **_kwargs: Any,
+    ) -> playwright_cli._InvocationResult:
+        assert command == "run-code"
+        exercise = (
+            "const frameUrl='https://example.com/jobs/1?verified=true';"
+            "let frameReads=0;"
+            "let detached=false;"
+            "const cdp={send:async(command)=>{"
+            "if(command==='Page.getFrameTree'){frameReads+=1;"
+            "return {frameTree:{frame:{id:'main',url:frameUrl}}};}"
+            "if(command==='Page.createIsolatedWorld')"
+            "return {executionContextId:7};"
+            "if(command==='Runtime.callFunctionOn')"
+            "return {result:{type:'string',value:'Verified role'}};"
+            "throw new Error(command);},"
+            "detach:async()=>{detached=true;}};"
+            "const page={context:()=>({newCDPSession:async()=>cdp})};"
+            "const value=await generated(page);"
+            "return {value,frameReads,detached};"
+        )
+        result = run_url_less_generated_script(args[0], exercise)
+        assert result["frameReads"] == 2
+        assert result["detached"] is True
+        return playwright_cli._InvocationResult(
+            exit_code=0,
+            timed_out=False,
+            stdout=json.dumps(
+                {"result": json.dumps(result["value"])}
+            ).encode(),
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+
+    monkeypatch.setattr(runtime, "_invoke", invoke)
+
+    captured = await runtime.capture_source_snapshot("https://example.com")
+
+    assert captured == (
+        "https://example.com/jobs/1?verified=true",
+        "Verified role",
+    )
     await runtime.close()
 
 
@@ -1018,6 +1181,382 @@ async def test_runtime_returns_cached_observation_while_file_chooser_is_open(
     assert commands == ["click", "run-code"]
 
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_action_invalidates_and_cleans_runtime_before_release(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[str] = []
+
+    timed_out_process = HangingProcess()
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
+        command = argv[3]
+        commands.append(command)
+        if command == "click":
+            return timed_out_process
+        stdout = (
+            _successful_metadata_result() if command == "run-code" else b""
+        )
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000040"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=factory,
+        execution_timeout=0.01,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    commands.clear()
+    cleanup_attempts = 0
+    emergency_cleanup = runtime._emergency_budget_cleanup_unlocked
+
+    async def fail_cleanup_once() -> None:
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        await emergency_cleanup()
+
+    monkeypatch.setattr(
+        runtime,
+        "_emergency_budget_cleanup_unlocked",
+        fail_cleanup_once,
+    )
+
+    with pytest.raises(PlaywrightCliRuntimeError) as first:
+        await runtime.execute("click", ["e3"])
+
+    assert first.value.code == "browser_failed"
+    assert timed_out_process.terminated is True
+    assert cleanup_attempts == 2
+    assert commands == ["click", "video-stop", "close"]
+
+    with pytest.raises(PlaywrightCliRuntimeError) as later:
+        await runtime.execute("click", ["e4"])
+
+    assert later.value.code == "browser_failed"
+    assert commands == ["click", "video-stop", "close"]
+
+
+@pytest.mark.asyncio
+async def test_permanent_cleanup_failure_returns_bounded_fixed_error(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[str] = []
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        commands.append(command)
+        if command == "click":
+            raise OSError("private process failure")
+        stdout = (
+            _successful_metadata_result() if command == "run-code" else b""
+        )
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000046"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=factory,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    commands.clear()
+
+    cleanup_attempts = 0
+    emergency_cleanup = runtime._emergency_budget_cleanup_unlocked
+
+    async def unavailable_cleanup() -> None:
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts <= 10:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        await emergency_cleanup()
+
+    monkeypatch.setattr(playwright_cli, "_CLEANUP_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(
+        runtime,
+        "_emergency_budget_cleanup_unlocked",
+        unavailable_cleanup,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(PlaywrightCliRuntimeError) as first:
+        await runtime.execute("click", ["e3"])
+
+    assert first.value.code == "browser_failed"
+    assert time.monotonic() - started < 0.2
+    assert cleanup_attempts < 10
+    assert commands == ["click"]
+
+    with pytest.raises(PlaywrightCliRuntimeError) as later:
+        await runtime.execute("click", ["e4"])
+    assert later.value.code == "browser_failed"
+    assert commands == ["click"]
+
+    monkeypatch.setattr(
+        runtime,
+        "_emergency_budget_cleanup_unlocked",
+        emergency_cleanup,
+    )
+    await runtime.close()
+    assert commands == ["click", "video-stop", "close"]
+
+
+@pytest.mark.asyncio
+async def test_aggregate_timeout_keeps_child_owned_until_killed(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    commands: list[str] = []
+
+    action_process = HangingProcess(finish_on_terminate=False)
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
+        command = argv[3]
+        commands.append(command)
+        if command == "click":
+            return action_process
+        stdout = (
+            _successful_metadata_result() if command == "run-code" else b""
+        )
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000044"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=factory,
+        execution_timeout=0.01,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    commands.clear()
+
+    with pytest.raises(PlaywrightCliRuntimeError) as raised:
+        await runtime.execute("click", ["e3"])
+
+    assert raised.value.code == "browser_failed"
+    assert action_process.terminated is True
+    assert action_process.killed is True
+    assert runtime._active_process is None
+    assert commands == ["click", "video-stop", "close"]
+
+    with pytest.raises(PlaywrightCliRuntimeError):
+        await runtime.execute("click", ["e4"])
+    assert commands == ["click", "video-stop", "close"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_nonzero_action_exit_keeps_runtime_usable(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    commands: list[str] = []
+    click_count = 0
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        nonlocal click_count
+        command = argv[3]
+        commands.append(command)
+        if command == "click":
+            click_count += 1
+            return DummyProcess(argv, exit_code=9 if click_count == 1 else 0)
+        stdout = (
+            _successful_metadata_result() if command == "run-code" else b""
+        )
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000041"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=factory,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    commands.clear()
+
+    first = await runtime.execute("click", ["e3"])
+    later = await runtime.execute("click", ["e4"])
+
+    assert first.exit_code == 9
+    assert first.timed_out is False
+    assert later.exit_code == 0
+    assert commands == [
+        "click",
+        "run-code",
+        "snapshot",
+        "click",
+        "run-code",
+        "snapshot",
+    ]
+
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_action_process_failure_preserves_error_through_cleanup_deadline(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[str] = []
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        commands.append(command)
+        if command == "click":
+            raise OSError("private process failure")
+        stdout = (
+            _successful_metadata_result() if command == "run-code" else b""
+        )
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000042"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=factory,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    commands.clear()
+    emergency_cleanup = runtime._emergency_budget_cleanup_unlocked
+
+    async def delayed_cleanup() -> None:
+        await asyncio.sleep(0.05)
+        await emergency_cleanup()
+
+    monkeypatch.setattr(
+        runtime,
+        "_emergency_budget_cleanup_unlocked",
+        delayed_cleanup,
+    )
+    runtime._deadline = time.monotonic() + 0.01
+
+    with pytest.raises(PlaywrightCliRuntimeError) as first:
+        await runtime.execute("click", ["e3"])
+
+    assert first.value.code == "browser_failed"
+    assert "private process failure" not in str(first.value)
+    assert commands == ["click", "video-stop", "close"]
+
+    with pytest.raises(PlaywrightCliRuntimeError) as later:
+        await runtime.execute("click", ["e4"])
+
+    assert later.value.code == "browser_failed"
+    assert commands == ["click", "video-stop", "close"]
+
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_internal_observation_process_failure_invalidates_runtime(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    commands: list[str] = []
+    action_ran = False
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        nonlocal action_ran
+        command = argv[3]
+        commands.append(command)
+        if command == "click":
+            action_ran = True
+            return DummyProcess(argv)
+        if command == "run-code" and action_ran:
+            return DummyProcess(argv, exit_code=9)
+        stdout = (
+            _successful_metadata_result() if command == "run-code" else b""
+        )
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000043"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=factory,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    commands.clear()
+
+    with pytest.raises(PlaywrightCliRuntimeError) as first:
+        await runtime.execute("click", ["e3"])
+
+    assert first.value.code == "browser_failed"
+    assert commands == ["click", "run-code", "video-stop", "close"]
+
+    with pytest.raises(PlaywrightCliRuntimeError) as later:
+        await runtime.execute("click", ["e4"])
+
+    assert later.value.code == "browser_failed"
+    assert commands == ["click", "run-code", "video-stop", "close"]
+
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_modal_observation_invalidates_runtime(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[str] = []
+    modal = False
+    modal_payload = json.dumps(
+        {
+            "isError": True,
+            "error": (
+                'Error: Tool "browser_run_code_unsafe" '
+                "does not handle the modal state."
+            ),
+        }
+    ).encode()
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
+        nonlocal modal
+        command = argv[3]
+        commands.append(command)
+        if command == "click":
+            modal = True
+            return DummyProcess(
+                argv,
+                stdout=json.dumps({"snapshot": "file chooser open"}).encode(),
+            )
+        if command == "run-code" and modal:
+            return HangingProcess(stdout=modal_payload)
+        stdout = (
+            _successful_metadata_result() if command == "run-code" else b""
+        )
+        return DummyProcess(argv, stdout=stdout)
+
+    monkeypatch.setattr(playwright_cli, "_LIFECYCLE_TIMEOUT_SECONDS", 0.01)
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000045"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=factory,
+        execution_timeout=0.1,
+    )
+    await runtime.start("https://example.com/jobs/1")
+    commands.clear()
+
+    with pytest.raises(PlaywrightCliRuntimeError) as raised:
+        await runtime.execute("click", ["e3"])
+
+    assert raised.value.code == "browser_failed"
+    assert commands == ["click", "run-code", "video-stop", "close"]
+
+    with pytest.raises(PlaywrightCliRuntimeError):
+        await runtime.execute("click", ["e4"])
+    assert commands == ["click", "run-code", "video-stop", "close"]
+
 
 @pytest.mark.asyncio
 async def test_runtime_execute_unsupported_command(session_dir: Path, cli_script: Path) -> None:
@@ -1528,68 +2067,59 @@ async def test_runtime_metadata_transport_covers_declared_tab_bounds(
     await runtime.close()
 
 @pytest.mark.asyncio
-async def test_runtime_execute_timeout_and_output_bounds(session_dir: Path, cli_script: Path) -> None:
-    launch = ResolvedBrowserLaunch(cdp_url="http://127.0.0.1:9222", executable_path=None, user_data_dir=None)
+async def test_runtime_execute_output_bounds(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    launch = ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    )
 
-    def mock_process_factory(*argv: str, **kwargs: Any) -> DummyProcess:
-        cmd = argv[3]
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
         stdout = b""
-        if cmd == "run-code":
-            stdout = json.dumps({
-                "result": json.dumps({
-                    "url": "https://example.com/jobs/1",
-                    "title": "Software Engineer",
-                    "currentIndex": 0,
-                    "tabs": [{"url": "https://example.com/jobs/1", "title": "Software Engineer"}],
-                })
-            }).encode("utf-8")
-            return DummyProcess(argv=argv, stdout=stdout)
-        elif cmd == "click":
-            # Simulate a long execution that times out
-            return DummyProcess(argv=argv, timed_out=True)
-        return DummyProcess(argv=argv, stdout=stdout)
+        stderr = b""
+        if command == "run-code":
+            stdout = json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "url": "https://example.com/jobs/1",
+                            "title": "Software Engineer",
+                            "currentIndex": 0,
+                            "tabs": [
+                                {
+                                    "url": "https://example.com/jobs/1",
+                                    "title": "Software Engineer",
+                                }
+                            ],
+                        }
+                    )
+                }
+            ).encode()
+        elif command == "click":
+            stdout = b"A" * 30_000
+            stderr = b"B" * 30_000
+        return DummyProcess(argv=argv, stdout=stdout, stderr=stderr)
 
     runtime = PlaywrightCliRuntime(
         session_id=UUID("00000000-0000-0000-0000-000000000001"),
         launch=launch,
         session_directory=session_dir,
         deadline=time.monotonic() + 100,
-        process_factory=mock_process_factory,
+        process_factory=process_factory,
         cli_script=cli_script,
-        execution_timeout=0.1,  # Short timeout for testing
     )
     await runtime.start("https://example.com/jobs/1")
 
-    res = await runtime.execute("click", ["e3"])
-    assert res.timed_out
-    assert res.exit_code == 124
+    result = await runtime.execute("click", ["e3"])
 
-    # Test output truncation
-    def mock_process_factory_truncated(*argv: str, **kwargs: Any) -> DummyProcess:
-        cmd = argv[3]
-        stdout = b""
-        if cmd == "run-code":
-            stdout = json.dumps({
-                "result": json.dumps({
-                    "url": "https://example.com/jobs/1",
-                    "title": "Software Engineer",
-                    "currentIndex": 0,
-                    "tabs": [{"url": "https://example.com/jobs/1", "title": "Software Engineer"}],
-                })
-            }).encode("utf-8")
-            return DummyProcess(argv=argv, stdout=stdout)
-        elif cmd == "click":
-            # Output excessive stdout
-            return DummyProcess(argv=argv, stdout=b"A" * 30_000, stderr=b"B" * 30_000)
-        return DummyProcess(argv=argv, stdout=stdout)
-
-    runtime._process_factory = mock_process_factory_truncated
-    runtime._execution_timeout = 5.0
-    res_trunc = await runtime.execute("click", ["e3"])
-    assert len(res_trunc.stdout) == 20_000
-    assert len(res_trunc.stderr) == 20_000
-    assert res_trunc.stdout_truncated
-    assert res_trunc.stderr_truncated
+    assert len(result.stdout) == 20_000
+    assert len(result.stderr) == 20_000
+    assert result.stdout_truncated
+    assert result.stderr_truncated
 
     await runtime.close()
 
@@ -1608,21 +2138,127 @@ def test_navigation_guard_rearm_reuses_persistent_state_and_handler() -> None:
         "handoffPending:false,handoffChanged:false};"
     ) in script
     assert "state.handler=handler;" in script
-    assert "state.allowed.includes(requestOrigin)" in script
+    assert "state.allowed.some((origin)=>hasExactOrigin(url,origin))" in script
     assert script.index(rearm) < script.index("context.route('**/*',handler)")
     assert script.count("context.route('**/*',handler)") == 1
     assert script.count("const handler=async route=>{") == 1
     assert "unroute" not in script
 
 
-def test_navigation_guard_uses_exact_parsed_origin_for_root_query_urls() -> None:
-    script = PlaywrightCliRuntime._guard_script(("https://example.com",))
+def test_navigation_guard_matches_exact_origins_without_url_global() -> None:
+    cases = [
+        {"url": "https://example.com", "expected": "continue"},
+        {"url": "https://example.com/", "expected": "continue"},
+        {"url": "https://example.com?job=1", "expected": "continue"},
+        {"url": "https://example.com/#details", "expected": "continue"},
+        {"url": "http://127.0.0.1:8080/jobs", "expected": "continue"},
+        {
+            "url": "https://[2001:db8::1]:8443/jobs",
+            "expected": "continue",
+        },
+        {"url": "about:blank", "expected": "continue"},
+        {"url": "https://example.com.evil.test/", "expected": "abort"},
+        {"url": "https://example.com@evil.test/", "expected": "abort"},
+        {"url": "https://example.com:444/", "expected": "abort"},
+        {"url": "https://example.com\\evil", "expected": "abort"},
+        {"url": "ftp://example.com/", "expected": "abort"},
+        {"url": "not a URL", "expected": "abort"},
+        {
+            "url": "https://evil.test/",
+            "navigation": False,
+            "expected": "continue",
+        },
+        {
+            "url": "https://evil.test/",
+            "topLevel": False,
+            "expected": "continue",
+        },
+        {
+            "url": "https://evil.test/",
+            "disarmed": True,
+            "expected": "continue",
+        },
+    ]
+    exercise = (
+        f"const cases={json.dumps(cases, separators=(',', ':'))};"
+        "const context={handler:null,"
+        "route:async(_pattern,handler)=>{context.handler=handler;}};"
+        "const page={context:()=>context};"
+        "await generated(page);"
+        "const state=context[Object.getOwnPropertySymbols(context)[0]];"
+        "const decisions=[];"
+        "for(const item of cases){"
+        "state.armed=!item.disarmed;"
+        "let decision='none';"
+        "const request={"
+        "isNavigationRequest:()=>item.navigation!==false,"
+        "frame:()=>({parentFrame:()=>item.topLevel===false?{}:null}),"
+        "url:()=>item.url};"
+        "const route={request:()=>request,"
+        "continue:()=>{decision='continue';},"
+        "abort:()=>{decision='abort';}};"
+        "await context.handler(route);"
+        "decisions.push(decision);}"
+        "return decisions;"
+    )
 
-    assert "new URL(url).origin" in script
-    assert "state.allowed.includes(requestOrigin)" in script
-    assert "requestOrigin!==null" in script
-    assert "url.startsWith(origin+'/')" not in script
-    assert "return route.abort('blockedbyclient');" in script
+    decisions = run_url_less_generated_script(
+        PlaywrightCliRuntime._guard_script(
+            (
+                "https://example.com",
+                "http://127.0.0.1:8080",
+                "https://[2001:db8::1]:8443",
+            )
+        ),
+        exercise,
+    )
+
+    assert decisions == [case["expected"] for case in cases]
+
+
+def test_sign_in_script_accepts_exact_origin_without_url_global() -> None:
+    page_url = "https://example.com/sign-in?next=%2Fjobs"
+    exercise = (
+        f"const pageUrl={json.dumps(page_url)};"
+        "const events=[];"
+        "const frame={url:()=>pageUrl,name:()=>''};"
+        "const elements={"
+        "'aria-ref=e1':{ownerFrame:async()=>frame,"
+        "fill:async(value)=>events.push(['username',value])},"
+        "'aria-ref=e2':{ownerFrame:async()=>frame,"
+        "fill:async(value)=>events.push(['password',value])},"
+        "'aria-ref=e3':{ownerFrame:async()=>frame,"
+        "click:async()=>events.push(['submit'])}};"
+        "const cdp={"
+        "send:async(command)=>{"
+        "if(command!=='Page.getFrameTree')throw new Error(command);"
+        "return {frameTree:{frame:{id:'main',url:pageUrl,name:'',"
+        "securityOrigin:'https://example.com'},childFrames:[]}};},"
+        "detach:async()=>{}};"
+        "const context={newCDPSession:async()=>cdp};"
+        "const page={url:()=>pageUrl,context:()=>context,"
+        "locator:(selector)=>({elementHandle:async()=>elements[selector]})};"
+        "await generated(page);"
+        "return events;"
+    )
+
+    events = run_url_less_generated_script(
+        PlaywrightCliRuntime._private_sign_in_script(
+            expected_origin="https://example.com",
+            username_ref="e1",
+            password_ref="e2",
+            submit_ref="e3",
+            username="candidate@example.com",
+            password="private-test-password",
+        ),
+        exercise,
+    )
+
+    assert events == [
+        ["username", "candidate@example.com"],
+        ["password", "private-test-password"],
+        ["submit"],
+    ]
 
 
 def test_navigation_guard_handler_bypasses_routes_while_disarmed() -> None:
@@ -3018,7 +3654,10 @@ async def test_execute_has_one_aggregate_pipeline_deadline(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
+    commands: list[str] = []
+
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        commands.append(argv[3])
         stdout = b""
         if argv[3] == "run-code":
             stdout = json.dumps(
@@ -3054,6 +3693,7 @@ async def test_execute_has_one_aggregate_pipeline_deadline(
         execution_timeout=0.01,
     )
     await runtime.start("https://example.com/jobs/1")
+    commands.clear()
 
     async def never_observe(
         _execution: object,
@@ -3066,9 +3706,16 @@ async def test_execute_has_one_aggregate_pipeline_deadline(
 
     runtime._collect_observation = never_observe  # type: ignore[method-assign]
     started = time.monotonic()
-    with pytest.raises(PlaywrightCliRuntimeError):
+    with pytest.raises(PlaywrightCliRuntimeError) as first:
         await runtime.execute("click", ["e1"])
+    assert first.value.code == "browser_failed"
     assert time.monotonic() - started < 0.2
+    assert commands == ["click", "video-stop", "close"]
+
+    with pytest.raises(PlaywrightCliRuntimeError) as later:
+        await runtime.execute("click", ["e2"])
+    assert later.value.code == "browser_failed"
+    assert commands == ["click", "video-stop", "close"]
 
     await runtime.close()
 
@@ -3691,24 +4338,6 @@ async def test_not_open_close_retains_ownership_when_daemon_survives(
     assert runtime._ownership_path.exists()
 
 
-def test_private_sign_in_origin_guard_accepts_same_origin_root_query_urls() -> None:
-    script = PlaywrightCliRuntime._private_sign_in_script(
-        expected_origin="https://example.com",
-        username_ref="e1",
-        password_ref="e2",
-        submit_ref="e3",
-        username="operator",
-        password="private",
-    )
-
-    assert (
-        "const hasExpectedOrigin=(url)=>{try{return "
-        "new URL(url).origin===expectedOrigin;}catch{return false;}};"
-        "if(!hasExpectedOrigin(page.url()))"
-    ) in script
-    assert "url.startsWith(expectedOrigin+'/')" not in script
-
-
 @pytest.mark.asyncio
 async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshots(
     session_dir: Path,
@@ -3845,13 +4474,10 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     assert json.dumps(password) in payload_scripts[0]
     assert "const expectedOrigin=\"https://example.com\"" in payload_scripts[0]
     expected_url_check = (
-        "const hasExpectedOrigin=(url)=>{try{return "
-        "new URL(url).origin===expectedOrigin;}catch{return false;}};"
-        "if(!hasExpectedOrigin(page.url()))"
+        "if(!hasExactOrigin(page.url(),expectedOrigin))"
         "throw new Error('Unexpected sign-in origin');"
     )
     assert expected_url_check in payload_scripts[0]
-    assert "url.startsWith(expectedOrigin+'/')" not in payload_scripts[0]
     assert payload_scripts[0].count(".elementHandle()") == 3
     cdp_origin_check = (
         "const cdp=await page.context().newCDPSession(page);"

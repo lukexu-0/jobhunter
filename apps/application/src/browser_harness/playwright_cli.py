@@ -264,6 +264,17 @@ _FOCUS_SUPPRESSION_ARGS = (
     "--disable-window-activation",
     "--disable-focus-on-load",
 )
+_EXACT_ORIGIN_MATCHER_SCRIPT = (
+    "const hasExactOrigin=(url,origin)=>{"
+    "if(typeof url!=='string'||typeof origin!=='string'||origin.length===0)"
+    "return false;"
+    "for(let index=0;index<url.length;index+=1){"
+    "const code=url.charCodeAt(index);"
+    "if(code<=0x20||code===0x5c||code===0x7f)return false;}"
+    "if(!url.startsWith(origin))return false;"
+    "const boundary=url.charAt(origin.length);"
+    "return boundary===''||boundary==='/'||boundary==='?'||boundary==='#';};"
+)
 
 
 class BrowserConfigurationError(ValueError):
@@ -278,6 +289,14 @@ class PlaywrightCliRuntimeError(RuntimeError):
     def __init__(self, code: Literal["browser_failed", "session_timeout"]) -> None:
         super().__init__(code)
         self.code = code
+
+
+class _ActionRuntimeFailure(Exception):
+    __slots__ = ("error",)
+
+    def __init__(self, error: PlaywrightCliRuntimeError) -> None:
+        super().__init__()
+        self.error = error
 
 
 @dataclass(frozen=True, slots=True)
@@ -1969,6 +1988,32 @@ class PlaywrightCliRuntime:
         except (TimeoutError, ProcessLookupError, OSError):
             pass
 
+    async def _stop_failed_invocation(
+        self,
+        process: _Process,
+        wait_task: asyncio.Task[int],
+        stdout_task: asyncio.Task[None],
+        stderr_task: asyncio.Task[None],
+    ) -> None:
+        async def stop() -> None:
+            await self._terminate_process(process)
+            for task in (wait_task, stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                wait_task,
+                stdout_task,
+                stderr_task,
+                return_exceptions=True,
+            )
+
+        stop_task = asyncio.create_task(stop())
+        try:
+            await asyncio.shield(stop_task)
+        except asyncio.CancelledError:
+            await stop_task
+            raise
+
     async def _invoke(
         self,
         command: str,
@@ -2002,30 +2047,27 @@ class PlaywrightCliRuntime:
             )
         except TimeoutError:
             timed_out = True
-            await self._terminate_process(process)
-            for task in (wait_task, stdout_task, stderr_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(
+            await self._stop_failed_invocation(
+                process,
                 wait_task,
                 stdout_task,
                 stderr_task,
-                return_exceptions=True,
             )
         except asyncio.CancelledError:
-            await self._terminate_process(process)
-            for task in (wait_task, stdout_task, stderr_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(
+            await self._stop_failed_invocation(
+                process,
                 wait_task,
                 stdout_task,
                 stderr_task,
-                return_exceptions=True,
             )
             raise
         except (OSError, ValueError, TypeError):
-            await self._terminate_process(process)
+            await self._stop_failed_invocation(
+                process,
+                wait_task,
+                stdout_task,
+                stderr_task,
+            )
             raise PlaywrightCliRuntimeError("browser_failed") from None
         finally:
             if self._active_process is process:
@@ -2206,9 +2248,8 @@ class PlaywrightCliRuntime:
             f"const expectedOrigin={json.dumps(expected_origin)};"
             f"const username={json.dumps(username)};"
             f"const password={json.dumps(password)};"
-            "const hasExpectedOrigin=(url)=>{try{return "
-            "new URL(url).origin===expectedOrigin;}catch{return false;}};"
-            "if(!hasExpectedOrigin(page.url()))"
+            f"{_EXACT_ORIGIN_MATCHER_SCRIPT}"
+            "if(!hasExactOrigin(page.url(),expectedOrigin))"
             "throw new Error('Unexpected sign-in origin');"
             f"const usernameElement=await page.locator('aria-ref={username_ref}').elementHandle();"
             f"const passwordElement=await page.locator('aria-ref={password_ref}').elementHandle();"
@@ -2339,14 +2380,19 @@ class PlaywrightCliRuntime:
             remaining = self._remaining()
             aggregate_timeout = self._execution_timeout * 3
             session_bound = remaining <= aggregate_timeout
+            failure: PlaywrightCliRuntimeError
             try:
                 async with asyncio.timeout(min(remaining, aggregate_timeout)):
                     return await self._execute_unlocked(command, args)
+            except _ActionRuntimeFailure as caught:
+                failure = caught.error
             except TimeoutError:
                 code: Literal["browser_failed", "session_timeout"] = (
                     "session_timeout" if session_bound else "browser_failed"
                 )
-                raise PlaywrightCliRuntimeError(code) from None
+                failure = PlaywrightCliRuntimeError(code)
+            await self._invalidate_after_action_failure_unlocked()
+            raise failure from None
 
     async def _execute_unlocked(
         self,
@@ -2369,15 +2415,25 @@ class PlaywrightCliRuntime:
             raise PlaywrightCliRuntimeError("browser_failed")
         pre_metadata = self._current_metadata
         if pre_metadata is None:
-            pre_metadata = await self._metadata()
+            try:
+                pre_metadata = await self._metadata()
+            except PlaywrightCliRuntimeError as error:
+                raise _ActionRuntimeFailure(error) from None
         if not self._url_is_allowed(pre_metadata.url, self._approved_origins):
             raise PlaywrightCliRuntimeError("browser_failed")
         self._validate_tab_command(command, normalized, pre_metadata)
-        execution = await self._invoke(
-            command,
-            normalized,
-            timeout=self._execution_timeout,
-        )
+        try:
+            execution = await self._invoke(
+                command,
+                normalized,
+                timeout=self._execution_timeout,
+            )
+        except PlaywrightCliRuntimeError as error:
+            raise _ActionRuntimeFailure(error) from None
+        if execution.timed_out or execution.exit_code == 124:
+            raise _ActionRuntimeFailure(
+                PlaywrightCliRuntimeError("browser_failed")
+            )
         preserve_snapshot_file = (
             not self._screenshots_suppressed
             and command == "snapshot"
@@ -2386,23 +2442,29 @@ class PlaywrightCliRuntime:
                 for value in normalized
             )
         )
-        post_metadata, observation = await self._collect_observation(
-            execution,
-            remove_snapshot_file=not preserve_snapshot_file,
-        )
+        try:
+            post_metadata, observation = await self._collect_observation(
+                execution,
+                remove_snapshot_file=not preserve_snapshot_file,
+            )
+        except PlaywrightCliRuntimeError as error:
+            raise _ActionRuntimeFailure(error) from None
         escaped_origin = not self._url_is_allowed(
             post_metadata.url, self._approved_origins
         )
         if escaped_origin:
-            await self._restore_allowed_page(
-                pre_metadata,
-                post_metadata,
-            )
-            post_metadata, observation = await self._collect_observation(None)
-            if not self._url_is_allowed(
-                post_metadata.url, self._approved_origins
-            ):
-                raise PlaywrightCliRuntimeError("browser_failed")
+            try:
+                await self._restore_allowed_page(
+                    pre_metadata,
+                    post_metadata,
+                )
+                post_metadata, observation = await self._collect_observation(None)
+                if not self._url_is_allowed(
+                    post_metadata.url, self._approved_origins
+                ):
+                    raise PlaywrightCliRuntimeError("browser_failed")
+            except PlaywrightCliRuntimeError as error:
+                raise _ActionRuntimeFailure(error) from None
         self._current_metadata = post_metadata
         if self._screenshots_suppressed:
             stdout = "[redacted]"
@@ -2563,6 +2625,7 @@ class PlaywrightCliRuntime:
             script = (
                 "async (page) => {"
                 f"const expectedOrigin={json.dumps(canonical_origin)};"
+                f"{_EXACT_ORIGIN_MATCHER_SCRIPT}"
                 "const cdp=await page.context().newCDPSession(page);"
                 "try{"
                 "const beforeTree=(await cdp.send('Page.getFrameTree')).frameTree;"
@@ -2571,9 +2634,7 @@ class PlaywrightCliRuntime:
                 "||typeof beforeTree.frame.url!=='string')"
                 "throw new Error('Source frame unavailable');"
                 "const beforeUrl=beforeTree.frame.url;"
-                "const beforeOrigin=(()=>{try{return new URL(beforeUrl).origin;}"
-                "catch{return '';}})();"
-                "if(beforeOrigin!==expectedOrigin)"
+                "if(!hasExactOrigin(beforeUrl,expectedOrigin))"
                 "return {url:beforeUrl,source:null};"
                 "const isolated=await cdp.send('Page.createIsolatedWorld',{"
                 "frameId:beforeTree.frame.id,"
@@ -2602,9 +2663,7 @@ class PlaywrightCliRuntime:
                 "||typeof afterTree.frame.url!=='string')"
                 "return {url:'',source:null};"
                 "const afterUrl=afterTree.frame.url;"
-                "const afterOrigin=(()=>{try{return new URL(afterUrl).origin;}"
-                "catch{return '';}})();"
-                "if(afterOrigin!==expectedOrigin)"
+                "if(!hasExactOrigin(afterUrl,expectedOrigin))"
                 "return {url:afterUrl,source:null};"
                 "return {url:afterUrl,source};"
                 "}finally{await cdp.detach();}"
@@ -2826,6 +2885,36 @@ class PlaywrightCliRuntime:
         except BrowserConfigurationError:
             raise PlaywrightCliRuntimeError("browser_failed") from None
 
+    async def _invalidate_after_action_failure_unlocked(self) -> None:
+        self._started = False
+        self._guard_armed = False
+        self._current_metadata = None
+        if self._closed:
+            return
+
+        async def cleanup() -> None:
+            try:
+                async with asyncio.timeout(_CLEANUP_TIMEOUT_SECONDS):
+                    while True:
+                        try:
+                            await self._emergency_budget_cleanup_unlocked()
+                        except PlaywrightCliRuntimeError:
+                            await asyncio.sleep(0.1)
+                        else:
+                            return
+            except TimeoutError:
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+
+        cleanup_task = asyncio.create_task(
+            cleanup(),
+            name=f"playwright-action-failure-cleanup-{self._session_id}",
+        )
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
+
     async def _emergency_budget_cleanup_unlocked(self) -> None:
         active = self._active_process
         if active is not None:
@@ -3020,6 +3109,7 @@ class PlaywrightCliRuntime:
             "const context=page.context();"
             "const key=Symbol.for('jobhunter.playwrightCli.navigationGuard');"
             f"const allowed={encoded};"
+            f"{_EXACT_ORIGIN_MATCHER_SCRIPT}"
             "let state=context[key];"
             "if(state){"
             "const handoffChanged=state.handoffPending&&state.handoffChanged;"
@@ -3040,8 +3130,8 @@ class PlaywrightCliRuntime:
             "return route.continue();}"
             "const url=request.url();"
             "if(url==='about:blank')return route.continue();"
-            "const requestOrigin=(()=>{try{return new URL(url).origin;}catch{return null;}})();"
-            "if(requestOrigin!==null&&state.allowed.includes(requestOrigin))return route.continue();"
+            "if(state.allowed.some((origin)=>hasExactOrigin(url,origin)))"
+            "return route.continue();"
             "return route.abort('blockedbyclient');};"
             "state.handler=handler;"
             "await context.route('**/*',handler);"
@@ -3466,6 +3556,8 @@ class PlaywrightCliRuntime:
             timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             capture_limit=_MAX_OBSERVATION_CAPTURE_BYTES,
         )
+        if observation_result.timed_out or observation_result.exit_code == 124:
+            raise PlaywrightCliRuntimeError("browser_failed")
         modal_state = self._blocked_by_modal_state(observation_result)
         if modal_state:
             if execution is None or self._current_metadata is None:
@@ -3570,9 +3662,10 @@ class PlaywrightCliRuntime:
                 timeout=_LIFECYCLE_TIMEOUT_SECONDS,
                 capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
             )
+            if snapshot_result.timed_out or snapshot_result.exit_code == 124:
+                raise PlaywrightCliRuntimeError("browser_failed")
             if (
                 snapshot_result.exit_code != 0
-                or snapshot_result.timed_out
                 or self._reported_cli_error(snapshot_result)
                 or snapshot_result.stdout_truncated
             ):
@@ -3588,6 +3681,8 @@ class PlaywrightCliRuntime:
             timeout=_LIFECYCLE_TIMEOUT_SECONDS,
             capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
         )
+        if snapshot_result.timed_out or snapshot_result.exit_code == 124:
+            raise PlaywrightCliRuntimeError("browser_failed")
         dom = ""
         if (
             snapshot_result.exit_code == 0
