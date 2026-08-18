@@ -623,6 +623,38 @@ describe("SourceHandoffService", () => {
     });
     await target.service.close();
   });
+  test("retries failed expiry cleanup until private slot release is confirmed", async () => {
+    let now = 1_000_000;
+    const behavior: {
+      deleteError?: unknown;
+      expiresAt: number;
+      now: () => number;
+    } = {
+      deleteError: new SourceCaptureHarnessError("ambiguous_result"),
+      expiresAt: EXPIRES_AT + 900_000,
+      now: () => now,
+    };
+    const target = fixture(behavior);
+    await target.service.create(REQUEST);
+
+    now = EXPIRES_AT;
+    await expect(target.service.get(HANDOFF_ID)).rejects.toMatchObject({
+      code: "SOURCE_HANDOFF_NOT_FOUND",
+    });
+    await flushMicrotasks();
+    expect(target.calls.captureDeletes).toEqual([HANDOFF_ID]);
+
+    delete behavior.deleteError;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await flushMicrotasks();
+    expect(target.calls.captureDeletes).toEqual([HANDOFF_ID, HANDOFF_ID]);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await expect(target.service.create(REQUEST)).resolves.toMatchObject({
+      id: HANDOFF_ID,
+    });
+    await target.service.close();
+  });
+
 
   test("maps private capture failures without persistence or private detail", async () => {
     const unavailable = fixture({

@@ -16,6 +16,7 @@ import {
 export const SOURCE_HANDOFF_TIMEOUT_SECONDS = 900 as const;
 const SOURCE_HANDOFF_TIMEOUT_MS = SOURCE_HANDOFF_TIMEOUT_SECONDS * 1_000;
 const CAPTURE_CLEANUP_TIMEOUT_MS = 10_000;
+const CAPTURE_CLEANUP_RETRY_MS = 1_000;
 
 export type SourceHandoffErrorCode =
   | "SOURCE_HANDOFF_INVALID_URL"
@@ -94,6 +95,7 @@ interface ActiveSourceHandoff {
   creation?: Promise<SourceHandoffDto>;
   completion?: Promise<RunDto>;
   expiryCleanup?: Promise<void>;
+  cleanupRetryTimer?: NodeJS.Timeout;
 }
 
 interface CompletedSourceHandoff {
@@ -524,6 +526,11 @@ export class SourceHandoffService {
     active.controller.abort(
       new DOMException("Source handoff expired", "TimeoutError"),
     );
+    this.#runExpiryCleanup(active);
+  }
+
+  #runExpiryCleanup(active: ActiveSourceHandoff): void {
+    if (this.#active !== active || active.phase !== "expiring") return;
     const cleanup = this.#ensureCaptureClosed(active);
     active.expiryCleanup = cleanup;
     void cleanup.then(
@@ -531,11 +538,27 @@ export class SourceHandoffService {
         this.#clear(active);
       },
       () => {
-        // Keep the explicit expiring state so another create cannot race cleanup.
+        this.#scheduleExpiryCleanupRetry(active);
       },
     ).finally(() => {
       if (active.expiryCleanup === cleanup) delete active.expiryCleanup;
     });
+  }
+
+  #scheduleExpiryCleanupRetry(active: ActiveSourceHandoff): void {
+    if (
+      this.#closed
+      || this.#active !== active
+      || active.phase !== "expiring"
+      || active.cleanupRetryTimer !== undefined
+    ) {
+      return;
+    }
+    active.cleanupRetryTimer = setTimeout(() => {
+      delete active.cleanupRetryTimer;
+      this.#runExpiryCleanup(active);
+    }, CAPTURE_CLEANUP_RETRY_MS);
+    active.cleanupRetryTimer.unref?.();
   }
 
   async #ensureCaptureClosed(active: ActiveSourceHandoff): Promise<void> {
@@ -604,6 +627,10 @@ export class SourceHandoffService {
     if (active.timer !== undefined) {
       clearTimeout(active.timer);
       delete active.timer;
+    }
+    if (active.cleanupRetryTimer !== undefined) {
+      clearTimeout(active.cleanupRetryTimer);
+      delete active.cleanupRetryTimer;
     }
     if (this.#active === active) this.#active = undefined;
   }
