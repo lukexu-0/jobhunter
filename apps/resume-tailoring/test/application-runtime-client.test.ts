@@ -608,7 +608,7 @@ test("exports the exact Playwright CLI commands that are read-only for submissio
 });
 
 describe("HttpApplicationRuntimeClient", () => {
-  test("posts an authenticated action to the exact session runtime endpoint", async () => {
+  test("serializes a strict Playwright CLI action with one canonical UUID idempotency key", async () => {
     const requests: Array<{ url: string; init: RequestInit }> = [];
     const client = new HttpApplicationRuntimeClient(
       RUNTIME_URL,
@@ -616,33 +616,101 @@ describe("HttpApplicationRuntimeClient", () => {
       TOKEN,
       async (input, init) => {
         requests.push({ url: String(input), init: init ?? {} });
-        return jsonResponse({ type: "continue" });
+        return jsonResponse({
+          type: "playwright_cli_result",
+          ...SUBMIT_EXECUTION_RESULT,
+        });
       },
     );
     const action: RuntimeActionRequest = {
-      type: "request_human_navigation",
-      instruction: "Complete the CAPTCHA",
+      type: "playwright_cli",
+      command: "snapshot",
+      args: [],
     };
 
     await expect(client.action(action, new AbortController().signal, 1_000)).resolves.toEqual({
-      type: "continue",
+      type: "playwright_cli_result",
+      ...SUBMIT_EXECUTION_RESULT,
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]?.url).toBe(
       "http://127.0.0.1:8765/v1/sessions/123e4567-e89b-42d3-a456-426614174000/runtime/actions",
     );
-    expect(requests[0]?.init).toMatchObject({
+    const request = requests[0]?.init;
+    expect(request).toMatchObject({
       method: "POST",
       redirect: "manual",
-      headers: {
-        accept: "application/json",
-        authorization: `Bearer ${TOKEN}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(action),
+      body: "{\"type\":\"playwright_cli\",\"command\":\"snapshot\",\"args\":[]}",
     });
-    expect((requests[0]?.init as RequestInit & { timeout?: boolean }).timeout).toBe(false);
-    expect(requests[0]?.init.signal).toBeInstanceOf(AbortSignal);
+    const requestHeaders = new Headers(request?.headers);
+    expect(requestHeaders.get("accept")).toBe("application/json");
+    expect(requestHeaders.get("authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(requestHeaders.get("content-type")).toBe("application/json");
+    expect(requestHeaders.get("Idempotency-Key")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect((request as RequestInit & { timeout?: boolean }).timeout).toBe(false);
+    expect(request?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  test("treats a harness 422 invalid_request as one sanitized non-retryable runtime contract failure", async () => {
+    const privateArgument = `https://private.example.test/apply?token=${TOKEN}`;
+    const privateHarnessMessage = `invalid argument ${privateArgument}`;
+    const diagnostics: ApplicationRuntimeAttemptFailureDiagnostic[] = [];
+    let fetchCalls = 0;
+    let waitCalls = 0;
+    let actionId = "";
+    const client = new HttpApplicationRuntimeClient(
+      RUNTIME_URL,
+      SESSION_ID,
+      TOKEN,
+      async (_input, init) => {
+        fetchCalls += 1;
+        actionId = new Headers(init?.headers).get("Idempotency-Key") ?? "";
+        return jsonResponse(
+          { code: "invalid_request", message: privateHarnessMessage },
+          { status: 422 },
+        );
+      },
+      {
+        diagnosticSink: (diagnostic) => {
+          diagnostics.push(diagnostic);
+        },
+        wait: () => {
+          waitCalls += 1;
+        },
+      },
+    );
+
+    const failure = await client.action(
+      {
+        type: "playwright_cli",
+        command: "goto",
+        args: [privateArgument],
+      },
+      new AbortController().signal,
+      1_000,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toEqual(new ApplicationRuntimeError("invalid_request"));
+    expect(fetchCalls).toBe(1);
+    expect(waitCalls).toBe(0);
+    expect(diagnostics).toEqual([{
+      event: "application_runtime_attempt_failure",
+      sessionId: SESSION_ID,
+      actionId,
+      actionType: "playwright_cli",
+      attempt: 1,
+      maxAttempts: 4,
+      retrying: false,
+      failureCategory: "invalid_request",
+      statusCode: 422,
+    }]);
+    const serializedDiagnostics = JSON.stringify(diagnostics);
+    expect(serializedDiagnostics).not.toContain(privateArgument);
+    expect(serializedDiagnostics).not.toContain(privateHarnessMessage);
+    expect(serializedDiagnostics).not.toContain(TOKEN);
+    expect(serializedDiagnostics).not.toContain(RUNTIME_URL);
   });
 
   test("reuses one UUID idempotency key and succeeds on the fourth attempt after the exact delays", async () => {
