@@ -465,7 +465,7 @@ async def create_session(
     response = await client.post(
         f"{harness_url}/v1/sessions",
         headers=headers,
-        data={"job_url": fixture.posting_url, "opportunity_kind": "job", "max_steps": "100"},
+        data={"job_url": fixture.posting_url, "opportunity_kind": "job"},
         files=multipart(inputs),
     )
     payload = response_json_object(capture, response, "Harness session create response was not JSON")

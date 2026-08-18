@@ -170,7 +170,6 @@ class FakeSessionService:
         opportunity_kind: OpportunityKind,
         allow_domains: Sequence[str],
         auto_submit: bool,
-        max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
         resume_source: UploadFile,
@@ -186,7 +185,6 @@ class FakeSessionService:
                 "opportunity_kind": opportunity_kind,
                 "allow_domains": list(allow_domains),
                 "auto_submit": auto_submit,
-                "max_steps": max_steps,
                 "personal_information": (
                     personal_information.filename,
                     await personal_information.read(),
@@ -314,14 +312,12 @@ def multipart_parts(
     domains: Sequence[str] = (),
     contexts: int = 0,
     anecdotes: int = 0,
-    max_steps: int | str = 100,
     session_id: UUID | str | None = None,
     opportunity_kind: str | None = "job",
     auto_submit: bool | str | None = None,
 ) -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
     parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]] = [
         ("job_url", (None, "https://jobs.example/openings/42?source=board")),
-        ("max_steps", (None, str(max_steps))),
         (
             "personal_information",
             ("profile.md", b"---\nfull_name: Test Person\n---\nProfile", "text/markdown"),
@@ -712,7 +708,6 @@ def test_session_errors_are_limited_to_the_fixed_catalog() -> None:
         "model_failed": "The model request failed",
         "browser_failed": "The browser session failed",
         "application_mismatch": "The open page does not match the requested job",
-        "step_limit": "The application step limit was reached",
         "session_timeout": "The application session expired",
     }
     assert dict(SESSION_ERROR_MESSAGES) == expected
@@ -1425,7 +1420,6 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
             domains=("https://jobs.example", "https://ats.example"),
             contexts=2,
             anecdotes=2,
-            max_steps=321,
         ),
     )
 
@@ -1443,7 +1437,6 @@ async def test_multipart_preserves_repeated_domains_files_and_bodies(
     assert call["job_url"] == "https://jobs.example/openings/42?source=board"
     assert call["allow_domains"] == ["https://jobs.example", "https://ats.example"]
     assert call["auto_submit"] is True
-    assert call["max_steps"] == 321
     assert call["personal_information"] == (
         "profile.md",
         b"---\nfull_name: Test Person\n---\nProfile",
@@ -1584,16 +1577,12 @@ async def test_multipart_rejects_non_boolean_auto_submit_before_dispatch(
 @pytest.mark.parametrize(
     ("parts", "expected_status"),
     [
-        (multipart_parts(max_steps=1), 202),
-        (multipart_parts(max_steps=500), 202),
-        (multipart_parts(max_steps=0), 422),
-        (multipart_parts(max_steps=501), 422),
         (multipart_parts(domains=[f"https://d{index}.example" for index in range(21)]), 422),
         (multipart_parts(contexts=11), 422),
         (multipart_parts(anecdotes=21), 422),
     ],
 )
-async def test_multipart_count_and_max_steps_validation(
+async def test_multipart_count_validation(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
     parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]],
     expected_status: int,

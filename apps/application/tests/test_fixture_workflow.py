@@ -411,7 +411,6 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             opportunity_kind="job",
             allow_domains=[fixture.form_origin],
             auto_submit=True,
-            max_steps=20,
             personal_information=personal,
             resume=resume,
             resume_source=resume_source,

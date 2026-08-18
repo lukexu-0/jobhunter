@@ -110,7 +110,6 @@ export type ApplicationAgentFailureCode =
   | "INVALID_MODEL_OUTPUT"
   | "MODEL_PROVIDER_FAILED"
   | "APPLICATION_MISMATCH"
-  | "STEP_LIMIT"
   | "BROWSER_FAILED";
 
 const APPLICATION_AGENT_FAILURE_MESSAGES: Readonly<Record<ApplicationAgentFailureCode, string>> = {
@@ -120,7 +119,6 @@ const APPLICATION_AGENT_FAILURE_MESSAGES: Readonly<Record<ApplicationAgentFailur
   INVALID_MODEL_OUTPUT: "The model returned invalid output",
   MODEL_PROVIDER_FAILED: "The model request failed",
   APPLICATION_MISMATCH: "The open page does not match the requested job",
-  STEP_LIMIT: "The application step limit was reached",
   BROWSER_FAILED: "The browser session failed",
 };
 
@@ -403,11 +401,9 @@ async function runtimeAction(
         ? "INVALID_REQUEST"
         : error.code === "model_timeout"
           ? "MODEL_TIMEOUT"
-          : error.code === "step_limit"
-            ? "STEP_LIMIT"
-            : error.code === "browser_failed"
-              ? "BROWSER_FAILED"
-              : "MODEL_PROVIDER_FAILED";
+          : error.code === "browser_failed"
+            ? "BROWSER_FAILED"
+            : "MODEL_PROVIDER_FAILED";
       throw new ApplicationAgentFailure(code, { cause: error });
     }
     throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED", { cause: error });

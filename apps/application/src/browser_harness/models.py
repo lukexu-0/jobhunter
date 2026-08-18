@@ -70,7 +70,6 @@ ErrorCode: TypeAlias = Literal[
     "model_failed",
     "browser_failed",
     "application_mismatch",
-    "step_limit",
     "session_timeout",
 ]
 DIRECT_FIELD_NAMES = frozenset(
@@ -104,7 +103,6 @@ _SESSION_ERROR_MESSAGES: dict[str, str] = {
     "model_failed": "The model request failed",
     "browser_failed": "The browser session failed",
     "application_mismatch": "The open page does not match the requested job",
-    "step_limit": "The application step limit was reached",
     "session_timeout": "The application session expired",
 }
 SESSION_ERROR_MESSAGES: Mapping[str, str] = MappingProxyType(_SESSION_ERROR_MESSAGES)
@@ -602,7 +600,6 @@ class SessionCreateRequest(FrozenPrivateModel):
     opportunity_kind: OpportunityKind
     approved_origins: tuple[StrictText, ...] = Field(min_length=1, max_length=20)
     auto_submit: bool
-    max_steps: int = Field(default=100, ge=1, le=500)
     artifacts: UploadedArtifacts
     direct_fields: tuple[tuple[StrictText, StrictText], ...] = ()
 
@@ -707,7 +704,7 @@ class SessionError(PublicModel):
 
 
 class PlaywrightCliDiagnostic(PublicModel):
-    step: int = Field(ge=1, le=500)
+    step: int = Field(ge=1)
     status: Literal["succeeded", "failed", "timed_out"]
     exit_code: int
     timed_out: bool
@@ -889,7 +886,7 @@ class EmptyEventDetail(PublicModel):
 
 
 class AgentStepDetail(PublicModel):
-    step_number: int = Field(ge=1, le=500)
+    step_number: int = Field(ge=1)
     current_url: StrictText
 
     @field_validator("current_url")

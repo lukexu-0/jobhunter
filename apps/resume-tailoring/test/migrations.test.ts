@@ -901,7 +901,7 @@ test("migration twelve preserves the live claim and adds four unique empty claim
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
   expect(db.query<{
     id: number;
     run_id: string | null;
@@ -1068,6 +1068,48 @@ test("migration eleven rewrites every legacy application snapshot into a strict 
   expect(projections[1]?.warnings.slice(0, 99)).toEqual(warningInputs.slice(0, 99));
   expect(projections[1]?.warnings.at(-1)).toBe(SUBMISSION_UNCERTAIN_WARNING);
   expect(projections[1]?.warnings.filter((warning) => warning === SUBMISSION_UNCERTAIN_WARNING)).toHaveLength(1);
+});
+
+test("migration twenty eight normalizes retired step-limit session snapshots", () => {
+  const db = versionTenDatabase();
+  migratePipelineDatabase(db, 5_000);
+  const legacy = legacySnapshot(1, "failed", {
+    submissionPhase: "not_attempted",
+    error: {
+      code: "step_limit",
+      message: "The application step limit was reached",
+    },
+  });
+  db.query(`
+    INSERT INTO run_application_sessions(
+      run_id, generation, session_id, resume_revision, pdf_sha256, bridge_state,
+      submission_phase, slot_released, public_snapshot_json, last_upstream_event_id,
+      created_at, updated_at, terminal_at
+    ) VALUES (
+      'existing-run', 1, '88888888-8888-4888-8888-888888888888', 2, ?,
+      'failed', 'not_attempted', 1, ?, 1, 1000, 1500, 1500
+    )
+  `).run("a".repeat(64), JSON.stringify(legacy));
+  db.query("DELETE FROM schema_migrations WHERE version = 28").run();
+  db.exec("PRAGMA user_version = 27");
+
+  migratePipelineDatabase(db, 6_000);
+
+  const stored = db.query<{ public_snapshot_json: string }, []>(`
+    SELECT public_snapshot_json
+    FROM run_application_sessions
+    WHERE run_id = 'existing-run' AND generation = 1
+  `).get();
+  const snapshot = ApplicationSessionSnapshotDtoSchema.parse(
+    JSON.parse(stored?.public_snapshot_json ?? "null"),
+  );
+  expect(snapshot.error).toEqual({
+    code: "browser_failed",
+    message: "The browser session failed",
+  });
+  expect(db.query<{ user_version: number }, []>(
+    "PRAGMA user_version",
+  ).get()?.user_version).toBe(28);
 });
 
 test("migration eleven enforces phase timestamps and recreates ledger schema objects", () => {
@@ -1263,6 +1305,7 @@ test("fresh databases default to pending while accepting lifecycle statuses", ()
     { version: 25, applied_at: 2_000 },
     { version: 26, applied_at: 2_000 },
     { version: 27, applied_at: 2_000 },
+    { version: 28, applied_at: 2_000 },
   ]);
   expect(db.query<{ count: number }, []>(`
     SELECT count(*) AS count
@@ -1408,6 +1451,7 @@ test("migration twenty-three removes retired version seventeen discovery sources
     { version: 25, applied_at: 2_000 },
     { version: 26, applied_at: 2_000 },
     { version: 27, applied_at: 2_000 },
+    { version: 28, applied_at: 2_000 },
   ]);
   expect(db.query<{ id: string }, []>("SELECT id FROM discovery_sources").all()).toEqual([]);
   expect(db.query<{ job_id: string }, []>("SELECT job_id FROM discovery_observations").all())
@@ -1446,6 +1490,7 @@ test("migration twenty-two deletes recruiting-event storage from a populated ver
     { version: 25, applied_at: 2_000 },
     { version: 26, applied_at: 2_000 },
     { version: 27, applied_at: 2_000 },
+    { version: 28, applied_at: 2_000 },
   ]);
   expect(db.query<{ name: string }, []>(`
     SELECT name
@@ -1531,6 +1576,7 @@ test("migration twenty-three keeps only approved discovery source families", () 
     { version: 25, applied_at: 2_000 },
     { version: 26, applied_at: 2_000 },
     { version: 27, applied_at: 2_000 },
+    { version: 28, applied_at: 2_000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1670,6 +1716,7 @@ test("migration twenty-five makes discovery descriptions nullable without losing
     { version: 25, applied_at: 2_500 },
     { version: 26, applied_at: 2_500 },
     { version: 27, applied_at: 2_500 },
+    { version: 28, applied_at: 2_500 },
   ]);
   expect(db.query<{ required: number }, []>(`
     SELECT "notnull" AS required
@@ -1731,19 +1778,20 @@ test("migration twenty-five makes discovery descriptions nullable without losing
 
 
 test("migration twenty-six admits networking events without weakening the opportunity-kind constraint", () => {
-  expect(PIPELINE_SCHEMA_VERSION).toBe(27);
+  expect(PIPELINE_SCHEMA_VERSION).toBe(28);
   const db = versionTwentyFiveDiscoveryDatabase();
 
   migratePipelineDatabase(db, 2_600);
 
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version)
-    .toBe(27);
+    .toBe(28);
   expect(db.query<{ version: number; applied_at: number }, []>(
     "SELECT version, applied_at FROM schema_migrations ORDER BY version",
   ).all()).toEqual([
     { version: 25, applied_at: 2_500 },
     { version: 26, applied_at: 2_600 },
     { version: 27, applied_at: 2_600 },
+    { version: 28, applied_at: 2_600 },
   ]);
   expect(db.query<{ id: string; opportunity_kind: string }, []>(
     "SELECT id, opportunity_kind FROM runs ORDER BY id",
@@ -1774,6 +1822,7 @@ test("re-running current migrations preserves nullable discovery descriptions", 
     { version: 25, applied_at: 2_500 },
     { version: 26, applied_at: 2_500 },
     { version: 27, applied_at: 2_500 },
+    { version: 28, applied_at: 2_500 },
   ]);
   expect(db.query<{ description: string | null }, []>(
     "SELECT description FROM discovery_jobs WHERE id = 'job-open'",
@@ -1787,13 +1836,14 @@ test("migration twenty-seven defaults existing discovery jobs to suitable and en
   migratePipelineDatabase(db, 2_700);
 
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version)
-    .toBe(27);
+    .toBe(28);
   expect(db.query<{ version: number; applied_at: number }, []>(
     "SELECT version, applied_at FROM schema_migrations ORDER BY version",
   ).all()).toEqual([
     { version: 25, applied_at: 2_500 },
     { version: 26, applied_at: 2_600 },
     { version: 27, applied_at: 2_700 },
+    { version: 28, applied_at: 2_700 },
   ]);
   expect(db.query<{ id: string; suitable: number }, []>(
     "SELECT id, suitable FROM discovery_jobs",
@@ -1823,6 +1873,7 @@ test("migration twenty-seven reconciles a suitability-first version twenty-six d
     { version: 25, applied_at: 2_500 },
     { version: 26, applied_at: 2_600 },
     { version: 27, applied_at: 2_700 },
+    { version: 28, applied_at: 2_700 },
   ]);
   expect(db.query<{ suitable: number }, []>(
     "SELECT suitable FROM discovery_jobs WHERE id = 'legacy-job'",
@@ -1883,6 +1934,7 @@ test("combined migrations preserve a version seventeen opportunity database", ()
     { version: 25, applied_at: 2_000 },
     { version: 26, applied_at: 2_000 },
     { version: 27, applied_at: 2_000 },
+    { version: 28, applied_at: 2_000 },
   ]);
 });
 
@@ -1895,7 +1947,7 @@ test("migrates version seven defaults without changing existing statuses", () =>
   expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
   expect(db.query<{ version: number }, []>(
     "SELECT version FROM schema_migrations ORDER BY version",
-  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+  ).all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
   expect(db.query<{ id: string; application_status: string }, []>(
     "SELECT id, application_status FROM runs ORDER BY id",
   ).all()).toEqual([
@@ -1938,6 +1990,7 @@ test("migrates version six runs without breaking data, foreign keys, indexes, or
     { version: 25, applied_at: 2000 },
     { version: 26, applied_at: 2000 },
     { version: 27, applied_at: 2000 },
+    { version: 28, applied_at: 2000 },
   ]);
   expect(db.query<{
     id: string;
@@ -1979,7 +2032,7 @@ test("migrates existing runs to application status applied atomically", () => {
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
   expect(migrated.query<{
     application_status: string;
     generate_keyword_map: number;
@@ -2013,7 +2066,7 @@ test("migrates version two retention state atomically without changing history",
   migratePipelineDatabase(migrated, 2_000);
 
   expect(migrated.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(PIPELINE_SCHEMA_VERSION);
-  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+  expect(migrated.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map(({ version }) => version)).toEqual([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_artifact_retention'").get()?.name).toBe("run_artifact_retention");
   expect(migrated.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'run_artifact_retention_state'").get()?.name).toBe("run_artifact_retention_state");
   expect(migrated.query<{ id: string }, []>("SELECT id FROM runs").all()).toEqual([{ id: "run-1" }]);

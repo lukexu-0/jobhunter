@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { RUN_CLAIM_CAPACITY } from "../worker/claims.ts";
 
-export const PIPELINE_SCHEMA_VERSION = 27;
+export const PIPELINE_SCHEMA_VERSION = 28;
 
 const migration1 = `
 CREATE TABLE schema_migrations (
@@ -963,6 +963,22 @@ ALTER TABLE discovery_jobs
 ADD COLUMN suitable INTEGER NOT NULL DEFAULT 1 CHECK (suitable IN (0,1));
 `;
 
+const migration28 = `
+UPDATE run_application_sessions
+SET public_snapshot_json = json_set(
+  public_snapshot_json,
+  '$.error.code', 'browser_failed',
+  '$.error.message', 'The browser session failed'
+)
+WHERE json_extract(public_snapshot_json, '$.error.code') = 'step_limit';
+`;
+
+function hasApplicationSessionSnapshotColumn(db: Database): boolean {
+  return db.query<{ name: string }, []>(
+    "PRAGMA table_info(run_application_sessions)",
+  ).all().some(({ name }) => name === "public_snapshot_json");
+}
+
 function hasDiscoveryJobSuitableColumn(db: Database): boolean {
   return db.query<{ name: string }, []>("PRAGMA table_info(discovery_jobs)")
     .all()
@@ -1139,6 +1155,10 @@ export function migratePipelineDatabase(db: Database, now = Date.now()): void {
         if (version === 26) migrateNetworkingEventOpportunityKind(db);
         if (!hasDiscoveryJobSuitableColumn(db)) db.exec(migration27);
         db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(27, now);
+      }
+      if (version < 28) {
+        if (hasApplicationSessionSnapshotColumn(db)) db.exec(migration28);
+        db.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(28, now);
       }
       db.exec(`PRAGMA user_version = ${PIPELINE_SCHEMA_VERSION}`);
       db.exec("COMMIT");

@@ -41,7 +41,6 @@ class HarnessSessionService(Protocol):
         opportunity_kind: OpportunityKind,
         allow_domains: Sequence[str],
         auto_submit: bool,
-        max_steps: int,
         personal_information: UploadFile,
         resume: UploadFile,
         resume_source: UploadFile,
@@ -190,7 +189,6 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         session_id: Annotated[UUID | None, Form()] = None,
         allow_domain: Annotated[list[str] | None, Form()] = None,
         auto_submit: Annotated[Literal["false", "true"], Form()] = "false",
-        max_steps: Annotated[int, Form(ge=1, le=500)] = 100,
         context: Annotated[list[UploadFile] | None, File()] = None,
         anecdote: Annotated[list[UploadFile] | None, File()] = None,
     ) -> SessionCreateResponse:
@@ -205,7 +203,6 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
             opportunity_kind=opportunity_kind,
             allow_domains=allow_domains,
             auto_submit=auto_submit == "true",
-            max_steps=max_steps,
             personal_information=personal_information,
             resume=resume,
             resume_source=resume_source,

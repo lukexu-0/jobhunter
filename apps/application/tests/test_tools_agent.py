@@ -589,7 +589,6 @@ async def test_interrupt_releases_every_pending_human_tool_gate(
 def make_request(
     tmp_path: Path,
     *,
-    max_steps: int = 3,
     opportunity_kind: OpportunityKind = "job",
 ) -> ApplicationRunRequest:
     session_directory = tmp_path / "session"
@@ -610,7 +609,6 @@ def make_request(
         opportunity_kind=opportunity_kind,
         approved_origins=(JOB_ORIGIN,),
         auto_submit=False,
-        max_steps=max_steps,
         artifacts=artifacts,
     )
     return ApplicationRunRequest(
