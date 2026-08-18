@@ -183,7 +183,7 @@ function runtimeWith(run: AgentRunner["run"], providerIds: string[] = []): Agent
   };
 }
 
-function runOptionsAreFresh(options: { maxTurns: number; signal: AbortSignal }, maxTurns: number): void {
+function runOptionsAreFresh(options: { maxTurns: number | null; signal: AbortSignal }, maxTurns: number): void {
   expect(options.maxTurns).toBe(maxTurns);
   expect(options.signal).toBeInstanceOf(AbortSignal);
   expect(Object.keys(options).sort()).toEqual(["maxTurns", "signal"]);

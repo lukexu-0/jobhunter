@@ -85,7 +85,6 @@ async def _run(agent: PipelineApplicationAgentClient):
         opportunity_kind="job",
         auto_submit=False,
         task="private task",
-        max_turns=25,
         deadline_ms=30_000,
     )
 
@@ -200,7 +199,6 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
         opportunity_kind=opportunity_kind,
         auto_submit=True,
         task="complete the application",
-        max_turns=37,
         deadline_ms=12_345,
     )
 
@@ -222,8 +220,7 @@ async def test_run_posts_exact_contract_with_deadline_transport_timeout(
         '"runtimeUrl":"http://localhost:8765",'
         + expected_kind_json
         + '"task":"complete the application",'
-        + '"autoSubmit":true,'
-        + '"maxTurns":37,"deadlineMs":12345}'
+        + '"autoSubmit":true,"deadlineMs":12345}'
     )
 
 
@@ -888,7 +885,6 @@ async def test_run_rejects_non_loopback_runtime_origin_before_request(
             opportunity_kind="job",
             auto_submit=False,
             task="task",
-            max_turns=10,
             deadline_ms=30_000,
         )
     assert harness.requests == []
@@ -901,9 +897,6 @@ async def test_run_rejects_non_loopback_runtime_origin_before_request(
         ({"auto_submit": 1}, "auto_submit is invalid"),
         ({"task": "a" * (1_048_576 + 1)}, "task is invalid"),
         ({"task": b"not text"}, "task is invalid"),
-        ({"max_turns": 0}, "max_turns is invalid"),
-        ({"max_turns": 501}, "max_turns is invalid"),
-        ({"max_turns": True}, "max_turns is invalid"),
         ({"deadline_ms": 999}, "deadline_ms is invalid"),
         ({"deadline_ms": 86_400_001}, "deadline_ms is invalid"),
         ({"deadline_ms": 1_000.0}, "deadline_ms is invalid"),
@@ -922,7 +915,6 @@ async def test_run_rejects_values_outside_the_strict_post_contract(
         "auto_submit": False,
         "runtime_url": "http://127.0.0.1:8765",
         "task": "task",
-        "max_turns": 10,
         "deadline_ms": 30_000,
     }
     arguments.update(override)

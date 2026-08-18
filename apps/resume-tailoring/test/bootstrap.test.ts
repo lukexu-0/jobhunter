@@ -747,7 +747,6 @@ describe("pipeline application bootstrap", () => {
           opportunityKind: "job",
           runtimeUrl: "http://127.0.0.1:8765",
           task: "Complete the application",
-          maxTurns: 25,
           deadlineMs: 30_000,
           autoSubmit: false,
         }),

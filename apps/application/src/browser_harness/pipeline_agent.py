@@ -150,7 +150,6 @@ class PipelineApplicationAgentClient:
         opportunity_kind: OpportunityKind,
         auto_submit: bool,
         task: str,
-        max_turns: int,
         deadline_ms: int,
     ) -> ApplicationRunResult:
         runtime_origin = _normalize_loopback_origin(
@@ -167,8 +166,6 @@ class PipelineApplicationAgentClient:
         if type(auto_submit) is not bool:
             raise ValueError("auto_submit is invalid")
         _validate_utf8_text(task, name="task", max_bytes=1_048_576)
-        if type(max_turns) is not int or not 1 <= max_turns <= 500:
-            raise ValueError("max_turns is invalid")
         if (
             type(deadline_ms) is not int
             or not 1_000 <= deadline_ms <= 86_400_000
@@ -182,7 +179,6 @@ class PipelineApplicationAgentClient:
                 "opportunityKind": opportunity_kind,
                 "task": task,
                 "autoSubmit": auto_submit,
-                "maxTurns": max_turns,
                 "deadlineMs": deadline_ms,
             },
             timeout=deadline_ms / 1_000 + 60,

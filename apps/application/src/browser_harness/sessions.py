@@ -2445,7 +2445,6 @@ class ApplicationSessionManager:
                     opportunity_kind=request.opportunity_kind,
                     auto_submit=request.auto_submit,
                     task=record.application_task,
-                    max_turns=request.max_steps,
                     deadline_ms=min(remaining_ms, 86_400_000),
                 )
             else:

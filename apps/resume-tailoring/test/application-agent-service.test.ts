@@ -25,7 +25,6 @@ const INPUT: ApplicationAgentRunInput = {
   sessionId: SESSION_ID,
   runtimeUrl: RUNTIME_URL,
   task: `Apply using ${DIRECT_VALUE}`,
-  maxTurns: 42,
   deadlineMs: 60_000,
   autoSubmit: false,
 };
