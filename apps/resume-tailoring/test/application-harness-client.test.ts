@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  APPLICATION_SESSION_UPLOAD_LIMITS,
   ApplicationHarnessError,
   HttpApplicationHarnessClient,
   SourceCaptureHarnessError,
@@ -7,11 +8,15 @@ import {
   type ApplicationHarnessCreateInput,
 } from "../src/api/application-harness-client";
 import type { ApplicationSessionCommand } from "../src/contracts";
-import { ARTIFACT_LIMITS } from "../src/system/artifacts.ts";
 
 const ORIGIN = "http://127.0.0.1:8765";
 const TOKEN = "test-token-0123456789abcdef-0123456789";
 const SESSION_ID = "123e4567-e89b-42d3-a456-426614174000";
+
+function withReportedByteLength(bytes: Uint8Array, byteLength: number): Uint8Array {
+  Object.defineProperty(bytes, "byteLength", { value: byteLength });
+  return bytes;
+}
 
 function rawSnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -41,7 +46,6 @@ function rawSnapshot(overrides: Record<string, unknown> = {}): Record<string, un
       step: 501,
       status: "failed",
       exit_code: 1,
-      timed_out: false,
       error_category: "process_exit",
       stderr_excerpt: "[redacted]",
       stderr_truncated: false,
@@ -67,6 +71,19 @@ function rawSnapshot(overrides: Record<string, unknown> = {}): Record<string, un
 }
 
 describe("HttpApplicationHarnessClient", () => {
+  test("publishes the exact application-session upload limits", () => {
+    expect(APPLICATION_SESSION_UPLOAD_LIMITS).toEqual({
+      profileBytes: 5_242_880,
+      resumePdfBytes: 52_428_800,
+      resumeSourceBytes: 1_310_720,
+      contextFileCount: 50,
+      contextFileBytes: 5_242_880,
+      contextTotalBytes: 26_214_400,
+      anecdoteFileCount: 100,
+      anecdoteFileBytes: 1_310_720,
+      anecdoteTotalBytes: 10_485_760,
+    });
+  });
   test("gets and strictly reprojects a complete harness snapshot without private fields", async () => {
     const calls: Array<{
       input: string | URL | Request;
@@ -97,7 +114,6 @@ describe("HttpApplicationHarnessClient", () => {
         step: 501,
         status: "failed",
         exitCode: 1,
-        timedOut: false,
         errorCategory: "process_exit",
         stderrExcerpt: "[redacted]",
         stderrTruncated: false,
@@ -347,7 +363,10 @@ describe("HttpApplicationHarnessClient", () => {
       undefined,
       new Uint8Array(),
       Uint8Array.of(0xc3, 0x28),
-      new Uint8Array(ARTIFACT_LIMITS.tex + 1),
+      withReportedByteLength(
+        new TextEncoder().encode("\\documentclass{article}"),
+        APPLICATION_SESSION_UPLOAD_LIMITS.resumeSourceBytes + 1,
+      ),
     ];
 
     for (const resumeSource of invalidSources) {
@@ -355,6 +374,95 @@ describe("HttpApplicationHarnessClient", () => {
         { ...baseInput, resumeSource } as ApplicationHarnessCreateInput,
         new AbortController().signal,
       )).rejects.toEqual(new ApplicationHarnessError("invalid_request"));
+    }
+    expect(fetchCalls).toBe(0);
+  });
+  test("accepts application uploads at each exact byte limit without payload-sized fixtures", async () => {
+    let fetchCalls = 0;
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        return Response.json({
+          session_id: SESSION_ID,
+          state: "starting",
+          events_url: `${ORIGIN}/v1/sessions/${SESSION_ID}/events`,
+          commands_url: `${ORIGIN}/v1/sessions/${SESSION_ID}/commands`,
+        }, { status: 202 });
+      },
+    });
+    const profilePrefix = "# Applicant\n";
+    const personalInformationMarkdown = profilePrefix
+      + " ".repeat(
+        APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes
+          - Buffer.byteLength(profilePrefix, "utf8"),
+      );
+    const resumePdf = withReportedByteLength(
+      new TextEncoder().encode("%PDF-"),
+      APPLICATION_SESSION_UPLOAD_LIMITS.resumePdfBytes,
+    );
+    const resumeSource = withReportedByteLength(
+      new TextEncoder().encode("\\documentclass{article}"),
+      APPLICATION_SESSION_UPLOAD_LIMITS.resumeSourceBytes,
+    );
+
+    await expect(client.create({
+      sessionId: SESSION_ID,
+      jobUrl: "https://jobs.private.example/roles/123",
+      opportunityKind: "job",
+      autoSubmit: false,
+      personalInformationMarkdown,
+      resumePdf,
+      resumeSource,
+    }, new AbortController().signal)).resolves.toBeUndefined();
+    expect(fetchCalls).toBe(1);
+  });
+  test("rejects each application upload one byte above its limit before network I/O", async () => {
+    let fetchCalls = 0;
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        throw new Error("network must not be called");
+      },
+    });
+    const baseInput: ApplicationHarnessCreateInput = {
+      sessionId: SESSION_ID,
+      jobUrl: "https://jobs.private.example/roles/123",
+      opportunityKind: "job",
+      autoSubmit: false,
+      personalInformationMarkdown: "# Applicant",
+      resumePdf: new TextEncoder().encode("%PDF-private"),
+      resumeSource: new TextEncoder().encode("\\documentclass{article}"),
+    };
+    const invalidInputs: ApplicationHarnessCreateInput[] = [
+      {
+        ...baseInput,
+        personalInformationMarkdown: "x".repeat(
+          APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes + 1,
+        ),
+      },
+      {
+        ...baseInput,
+        resumePdf: withReportedByteLength(
+          new TextEncoder().encode("%PDF-"),
+          APPLICATION_SESSION_UPLOAD_LIMITS.resumePdfBytes + 1,
+        ),
+      },
+      {
+        ...baseInput,
+        resumeSource: withReportedByteLength(
+          new TextEncoder().encode("\\documentclass{article}"),
+          APPLICATION_SESSION_UPLOAD_LIMITS.resumeSourceBytes + 1,
+        ),
+      },
+    ];
+
+    for (const input of invalidInputs) {
+      await expect(client.create(input, new AbortController().signal))
+        .rejects.toEqual(new ApplicationHarnessError("invalid_request"));
     }
     expect(fetchCalls).toBe(0);
   });
@@ -1202,7 +1310,6 @@ describe("HttpApplicationHarnessClient", () => {
       Response.json({
         capture_id: SESSION_ID,
         state: "awaiting_human_verification",
-        expires_at: "2026-08-17T12:15:00Z",
       }, { status: 202 }),
       Response.json({
         capture_id: SESSION_ID,
@@ -1225,10 +1332,7 @@ describe("HttpApplicationHarnessClient", () => {
       captureId: SESSION_ID,
       jobUrl: "https://jobs.example.test/role",
       approvedOrigins: ["https://jobs.example.test"],
-      timeoutSeconds: 900,
-    }, signal)).resolves.toEqual({
-      expiresAt: Date.parse("2026-08-17T12:15:00Z"),
-    });
+    }, signal)).resolves.toBeUndefined();
     await expect(client.completeSourceCapture(SESSION_ID, signal)).resolves.toEqual({
       finalUrl: "https://jobs.example.test/role",
       source: "Senior Engineer\nBuild reliable TypeScript services with careful testing and ownership.",
@@ -1244,7 +1348,6 @@ describe("HttpApplicationHarnessClient", () => {
       capture_id: SESSION_ID,
       job_url: "https://jobs.example.test/role",
       approved_origins: ["https://jobs.example.test"],
-      timeout_seconds: 900,
     });
     expect(calls[0]!.init?.headers).toEqual({
       accept: "application/json",

@@ -14,6 +14,7 @@ import {
   type TailoringPlan,
   type TailoringResult,
 } from "../resume/types.ts";
+import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 import {
   TAILORING_DEADLINE_MS,
   boundedJson,
@@ -272,7 +273,7 @@ function assertActive(signal: AbortSignal): void {
 }
 
 export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise<TailoringResult> {
-  if (Buffer.byteLength(attempt.input.baseline) > 256 * 1024) throw new Error("baseline exceeds 256 KiB");
+  if (Buffer.byteLength(attempt.input.baseline) > ARTIFACT_LIMITS.tex) throw new Error(`baseline exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
   const analysisSha256 = hashJobAnalysis(attempt.input.analysis);
   const input = boundedJson({
     task: TAILORING_TASK,
@@ -339,7 +340,7 @@ export async function runTailoringAgent(attempt: TailoringAgentAttempt): Promise
       const toolSignal = AbortSignal.any([attempt.signal, AbortSignal.timeout(DEFAULT_TOOL_TIMEOUT_MS)]);
       const preview = await attempt.input.operations.renderPlan(plan, toolSignal);
       assertActive(toolSignal);
-      if (Buffer.byteLength(preview) > 256 * 1024) throw new Error("tailored TeX exceeds 256 KiB");
+      if (Buffer.byteLength(preview) > ARTIFACT_LIMITS.tex) throw new Error(`tailored TeX exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
       const result = {
         ok: true as const,
         bytes: Buffer.byteLength(preview),

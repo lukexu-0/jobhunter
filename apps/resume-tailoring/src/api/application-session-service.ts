@@ -33,6 +33,7 @@ import {
 } from "../db/repository.ts";
 import { ARTIFACT_LIMITS, type ArtifactStore } from "../system/artifacts.ts";
 import {
+  APPLICATION_SESSION_UPLOAD_LIMITS,
   ApplicationHarnessError,
   type ApplicationHarnessClient,
   type ApplicationHarnessEvent,
@@ -43,13 +44,11 @@ import {
   type ProfessionalizeApplicationAnswer,
 } from "../models/application-answer-professionalizer.ts";
 import {
-  MAX_COMPILED_PDF_BYTES,
   readVerifiedArtifactBytes,
   RunServiceError,
 } from "./run-service.ts";
 import { canonicalizePublicHttpUrl } from "./job-source.ts";
 
-const MAX_PROFILE_BYTES = 1024 * 1024;
 const PROFILE_RELATIVE_PATH = "apps/user-info/current-context/personal/applicant-profile.md";
 const LOST_WARNING = "Verify whether the application was submitted before retrying.";
 const SLOT_RELEASE_RETRY_DELAY_MS = 250;
@@ -184,7 +183,10 @@ function isContained(root: string, candidate: string): boolean {
 function validateProfileText(value: unknown): string {
   if (typeof value !== "string") throw new Error("applicant profile is not text");
   const bytes = Buffer.byteLength(value, "utf8");
-  if (bytes < 1 || bytes > MAX_PROFILE_BYTES) throw new Error("applicant profile size is invalid");
+  if (
+    bytes < 1
+    || bytes > APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes
+  ) throw new Error("applicant profile size is invalid");
   return value;
 }
 
@@ -205,24 +207,36 @@ export async function readApplicantProfileMarkdown(
   if (!pathStat.isFile() || pathStat.isSymbolicLink()) {
     throw new Error("applicant profile must be a regular file");
   }
-  if (pathStat.size < 1 || pathStat.size > MAX_PROFILE_BYTES) {
+  if (
+    pathStat.size < 1
+    || pathStat.size > APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes
+  ) {
     throw new Error("applicant profile size is invalid");
   }
 
   const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size < 1 || stat.size > MAX_PROFILE_BYTES) {
+    if (
+      !stat.isFile()
+      || stat.size < 1
+      || stat.size > APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes
+    ) {
       throw new Error("applicant profile must be a bounded regular file");
     }
-    const buffer = new Uint8Array(MAX_PROFILE_BYTES + 1);
+    const buffer = new Uint8Array(
+      APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes + 1,
+    );
     let offset = 0;
     while (offset < buffer.byteLength) {
       const item = await handle.read(buffer, offset, buffer.byteLength - offset, null);
       if (item.bytesRead === 0) break;
       offset += item.bytesRead;
     }
-    if (offset < 1 || offset > MAX_PROFILE_BYTES) {
+    if (
+      offset < 1
+      || offset > APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes
+    ) {
       throw new Error("applicant profile size is invalid");
     }
     const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -1383,7 +1397,7 @@ export class ApplicationSessionService {
       const verifiedPdf = await readVerifiedArtifactBytes(
         this.dependencies.artifacts,
         currentPdf,
-        MAX_COMPILED_PDF_BYTES,
+        ARTIFACT_LIMITS.pdf,
       );
       signal.throwIfAborted();
       if (

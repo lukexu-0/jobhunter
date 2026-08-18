@@ -88,17 +88,20 @@ export function boundedJson(value: unknown, label: string, maxBytes = MAX_AGENT_
   return serialized;
 }
 
-export function assertBoundedTranscript(result: unknown): void {
+export function assertBoundedTranscript(
+  result: unknown,
+  maxBytes = MAX_AGENT_TRANSCRIPT_BYTES,
+): void {
   if (result !== null && typeof result === "object") {
     const transcript = {
       rawResponses: "rawResponses" in result ? result.rawResponses : undefined,
       newItems: "newItems" in result ? result.newItems : undefined,
       finalOutput: "finalOutput" in result ? result.finalOutput : undefined,
     };
-    boundedJson(transcript, "agent transcript", MAX_AGENT_TRANSCRIPT_BYTES);
+    boundedJson(transcript, "agent transcript", maxBytes);
     return;
   }
-  boundedJson(result, "agent transcript", MAX_AGENT_TRANSCRIPT_BYTES);
+  boundedJson(result, "agent transcript", maxBytes);
 }
 
 export class AgentDeadlineError extends Error {

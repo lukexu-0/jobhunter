@@ -776,7 +776,6 @@ test("submits the exact Networking event opportunity type", async ({ page }) => 
 
 test("retains source-handoff options and resets a BFCache-restored session", async ({ page }) => {
   const jobUrl = "https://nomuracampus.tal.net/vx/lang-en-GB/mobile-0/appcentre-1/opp/1525/en-GB";
-  const expiresAt = 1_800_000_000_000;
   let runPostCount = 0;
   let handoffPostCount = 0;
   let pendingHandoffPost: Route | undefined;
@@ -882,7 +881,6 @@ test("retains source-handoff options and resets a BFCache-restored session", asy
       id: "44444444-4444-4444-8444-444444444444",
       state: "awaiting_human_verification",
       jobUrl,
-      expiresAt,
     }),
   });
 
@@ -995,7 +993,6 @@ test("releases a late-created source handoff once after pagehide without changin
       id: handoffId,
       state: "awaiting_human_verification",
       jobUrl,
-      expiresAt: 1_800_000_000_000,
     }),
   });
 
@@ -1051,7 +1048,6 @@ test("releases an awaiting source handoff once when the dashboard unmounts", asy
         id: handoffId,
         state: "awaiting_human_verification",
         jobUrl,
-        expiresAt: 1_800_000_000_000,
       }),
     });
   });
@@ -1120,7 +1116,6 @@ test("completes a source handoff once and merges the created run", async ({ page
         id: "55555555-5555-4555-8555-555555555555",
         state: "awaiting_human_verification",
         jobUrl,
-        expiresAt: 1_800_000_000_000,
       }),
     });
   });
@@ -1210,7 +1205,6 @@ test("cancels a source handoff once and keeps the initializer choices", async ({
         id: "66666666-6666-4666-8666-666666666666",
         state: "awaiting_human_verification",
         jobUrl,
-        expiresAt: 1_800_000_000_000,
       }),
     });
   });
@@ -1330,8 +1324,8 @@ test("surfaces source-handoff conflicts and outages without an automatic retry",
   expect(handoffPostCount).toBe(2);
 });
 
-test("returns an expired source handoff to the open-browser step without cleanup or completion retry", async ({ page }) => {
-  const jobUrl = "https://jobs.example.test/challenged/expired";
+test("returns an unavailable source handoff to the open-browser step without cleanup or completion retry", async ({ page }) => {
+  const jobUrl = "https://jobs.example.test/challenged/unavailable";
   let completePostCount = 0;
   let deleteCount = 0;
 
@@ -1362,7 +1356,6 @@ test("returns an expired source handoff to the open-browser step without cleanup
         id: "77777777-7777-4777-8777-777777777777",
         state: "awaiting_human_verification",
         jobUrl,
-        expiresAt: 1_700_000_000_000,
       }),
     });
   });

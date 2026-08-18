@@ -665,10 +665,6 @@ a {
   white-space: normal;
 }
 
-.run-initializer__verification .run-initializer__verification-expiry {
-  color: var(--color-text);
-  font-size: var(--font-size-xs);
-}
 
 .run-initializer__verification .dashboard-alert {
   margin: 0;

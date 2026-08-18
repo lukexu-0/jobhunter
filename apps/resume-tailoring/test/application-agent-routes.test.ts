@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import {
   APPLICATION_AGENT_PATH,
+  MAX_APPLICATION_AGENT_REQUEST_BYTES,
   createApplicationAgentRoutes,
   type ApplicationAgentRouteService,
 } from "../src/api/application-agent-routes.ts";
@@ -10,7 +11,6 @@ import { ApplicationAgentSteeringConflict } from "../src/agents/application-agen
 
 const API_ORIGIN = "http://127.0.0.1:3457";
 const TOKEN = "test-token-0123456789abcdef-0123456789";
-const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const INPUT = {
   opportunityKind: "job" as const,
   sessionId: "123e4567-e89b-42d3-a456-426614174000",
@@ -302,7 +302,7 @@ describe("application agent HTTP boundary", () => {
     }
     expect(invokes).toBe(0);
   });
-  test("enforces both declared and streamed 4 MiB request limits", async () => {
+  test("enforces both declared and streamed 20 MiB request limits", async () => {
     let invokes = 0;
     const route = createApplicationAgentRoutes(fakeService({
       invoke: async () => {
@@ -315,7 +315,7 @@ describe("application agent HTTP boundary", () => {
       headers: {
         authorization: `Bearer ${TOKEN}`,
         "content-type": "application/json",
-        "content-length": String(MAX_REQUEST_BYTES + 1),
+        "content-length": String(MAX_APPLICATION_AGENT_REQUEST_BYTES + 1),
       },
       body: "{}",
     }), new URL(`${API_ORIGIN}${APPLICATION_AGENT_PATH}`));
@@ -325,10 +325,17 @@ describe("application agent HTTP boundary", () => {
     });
 
     let cancelled = false;
+    const chunk = new Uint8Array(1_048_576);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(new Uint8Array(MAX_REQUEST_BYTES));
-        controller.enqueue(new Uint8Array([1]));
+        for (
+          let bytes = 0;
+          bytes < MAX_APPLICATION_AGENT_REQUEST_BYTES;
+          bytes += chunk.byteLength
+        ) {
+          controller.enqueue(chunk);
+        }
+        controller.enqueue(Uint8Array.of(1));
       },
       cancel() {
         cancelled = true;
@@ -350,12 +357,16 @@ describe("application agent HTTP boundary", () => {
   test("gives request cancellation precedence over a concurrent streamed size failure", async () => {
     const controller = new AbortController();
     const abortReason = new Error("caller stopped oversized body");
+    const oversizedChunk = Uint8Array.of(1);
+    Object.defineProperty(oversizedChunk, "byteLength", {
+      value: MAX_APPLICATION_AGENT_REQUEST_BYTES + 1,
+    });
     const reader = {
       read: () => {
         controller.abort(abortReason);
         return Promise.resolve({
           done: false as const,
-          value: new Uint8Array(MAX_REQUEST_BYTES + 1),
+          value: oversizedChunk,
         });
       },
       cancel: () => Promise.resolve(),
@@ -442,41 +453,6 @@ describe("application agent HTTP boundary", () => {
     expect(seenInput).toEqual(INPUT);
     expect(seenSignal?.aborted).toBe(false);
   });
-  test("bounds only the streamed body read with the injectable body timeout", async () => {
-    let cancelled = false;
-    let invokes = 0;
-    const timeoutController = new AbortController();
-    const timeoutSpy = spyOn(AbortSignal, "timeout").mockReturnValue(timeoutController.signal);
-    try {
-      const stream = new ReadableStream<Uint8Array>({
-        pull() {
-          timeoutController.abort(new DOMException("Body timed out", "TimeoutError"));
-        },
-        cancel() {
-          cancelled = true;
-        },
-      });
-      const route = createApplicationAgentRoutes(fakeService({
-        invoke: async () => {
-          invokes += 1;
-          return SUCCESS;
-        },
-      }), TOKEN, { bodyTimeoutMs: 5 });
-      const response = await route(request(APPLICATION_AGENT_PATH, {
-        method: "POST",
-        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
-        body: stream,
-      }), new URL(`${API_ORIGIN}${APPLICATION_AGENT_PATH}`));
-      expect(response?.status).toBe(504);
-      expect(await response?.json()).toEqual({
-        error: { code: "MODEL_TIMEOUT", message: "The model request timed out" },
-      });
-      expect(cancelled).toBe(true);
-      expect(invokes).toBe(0);
-    } finally {
-      timeoutSpy.mockRestore();
-    }
-  });
   test("settles on request abort when a streamed read and cancellation both stall", async () => {
     const controller = new AbortController();
     const abortReason = new Error("caller stopped stalled body read");
@@ -523,105 +499,28 @@ describe("application agent HTTP boundary", () => {
     expect(cancelCalled).toBe(true);
   });
 
-  test("uses the per-input deadline without capping runs at the body-read timeout", async () => {
-    const timeoutCalls: number[] = [];
-    const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
-      timeoutCalls.push(milliseconds);
-      return new AbortController().signal;
-    });
+  test("uses only the request cancellation signal for body reading and invocation", async () => {
+    const controller = new AbortController();
+    const timeoutSpy = spyOn(AbortSignal, "timeout");
+    let seenSignal: AbortSignal | undefined;
     try {
-      const longInput = { ...INPUT, deadlineMs: 400_001 };
       const route = createApplicationAgentRoutes(fakeService({
         invoke: async (_input, signal) => {
-          expect(signal.aborted).toBe(false);
+          seenSignal = signal;
           return SUCCESS;
         },
-      }), TOKEN, { bodyTimeoutMs: 5 });
+      }), TOKEN);
       const response = await route(request(APPLICATION_AGENT_PATH, {
         method: "POST",
         headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
-        body: JSON.stringify(longInput),
+        body: JSON.stringify({ ...INPUT, deadlineMs: 400_001 }),
+        signal: controller.signal,
       }), new URL(`${API_ORIGIN}${APPLICATION_AGENT_PATH}`));
+
       expect(response?.status).toBe(200);
-      expect(timeoutCalls).toEqual([5, 400_001]);
+      expect(seenSignal).toBe(controller.signal);
+      expect(timeoutSpy).not.toHaveBeenCalled();
     } finally {
-      timeoutSpy.mockRestore();
-    }
-
-    let seenSignal: AbortSignal | undefined;
-    const bodyController = new AbortController();
-    const deadlineController = new AbortController();
-    let timeoutIndex = 0;
-    const deadlineTimeoutCalls: number[] = [];
-    const deadlineSpy = spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
-      deadlineTimeoutCalls.push(milliseconds);
-      return timeoutIndex++ === 0 ? bodyController.signal : deadlineController.signal;
-    });
-    try {
-      const deadlineRoute = createApplicationAgentRoutes(fakeService({
-        invoke: async (_input, signal) => {
-          seenSignal = signal;
-          const privateError = new Error("private provider timeout body");
-          deadlineController.abort(privateError);
-          throw privateError;
-        },
-      }), TOKEN);
-      const timedOut = await deadlineRoute(request(APPLICATION_AGENT_PATH, {
-        method: "POST",
-        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
-        body: JSON.stringify({ ...INPUT, deadlineMs: 1_000 }),
-      }), new URL(`${API_ORIGIN}${APPLICATION_AGENT_PATH}`));
-      expect(seenSignal?.aborted).toBe(true);
-      expect(deadlineTimeoutCalls).toEqual([300_000, 1_000]);
-      expect(timedOut?.status).toBe(504);
-      expect(await timedOut?.json()).toEqual({
-        error: { code: "MODEL_TIMEOUT", message: "The model request timed out" },
-      });
-    } finally {
-      deadlineSpy.mockRestore();
-    }
-  });
-  test("returns MODEL_TIMEOUT when invocation ignores the expired deadline signal", async () => {
-    const bodyController = new AbortController();
-    const deadlineController = new AbortController();
-    const invocation = Promise.withResolvers<typeof SUCCESS>();
-    const invocationStarted = Promise.withResolvers<void>();
-    let seenSignal: AbortSignal | undefined;
-    let timeoutIndex = 0;
-    const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation(() => (
-      timeoutIndex++ === 0 ? bodyController.signal : deadlineController.signal
-    ));
-    let responsePromise: Promise<Response | null> | undefined;
-    try {
-      const route = createApplicationAgentRoutes(fakeService({
-        invoke: (_input, signal) => {
-          seenSignal = signal;
-          invocationStarted.resolve();
-          return invocation.promise;
-        },
-      }), TOKEN);
-      responsePromise = route(request(APPLICATION_AGENT_PATH, {
-        method: "POST",
-        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
-        body: JSON.stringify({ ...INPUT, deadlineMs: 1_000 }),
-      }), new URL(`${API_ORIGIN}${APPLICATION_AGENT_PATH}`));
-      await invocationStarted.promise;
-
-      deadlineController.abort(new DOMException("Deadline expired", "TimeoutError"));
-      expect(seenSignal?.aborted).toBe(true);
-      const settledPromptly = (async (): Promise<never> => {
-        for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
-        throw new Error("application-agent POST did not settle after its deadline");
-      })();
-      const response = await Promise.race([responsePromise, settledPromptly]);
-
-      expect(response?.status).toBe(504);
-      expect(await response?.json()).toEqual({
-        error: { code: "MODEL_TIMEOUT", message: "The model request timed out" },
-      });
-    } finally {
-      invocation.resolve(SUCCESS);
-      await responsePromise?.catch(() => undefined);
       timeoutSpy.mockRestore();
     }
   });
@@ -652,7 +551,6 @@ describe("application agent HTTP boundary", () => {
     const cases = [
       ["INVALID_REQUEST", 422, "Request is invalid"],
       ["OAUTH_REQUIRED", 409, "Connect OpenAI Codex in Provider access"],
-      ["MODEL_TIMEOUT", 504, "The model request timed out"],
       ["INVALID_MODEL_OUTPUT", 502, "The model returned invalid output"],
       ["MODEL_PROVIDER_FAILED", 502, "The model request failed"],
       ["APPLICATION_MISMATCH", 409, "The open page does not match the requested job"],

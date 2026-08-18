@@ -34,6 +34,7 @@ from jobhunter_browser_harness.playwright_cli import (
     ResolvedBrowserLaunch,
 )
 from jobhunter_browser_harness.models import (
+    APPLICATION_RESUME_SOURCE_MAX_BYTES,
     AdditionalInfoBooleanCommandAnswer,
     AdditionalInfoBooleanQuestion,
     AdditionalInfoOption,
@@ -464,22 +465,18 @@ class FakePlaywrightRuntime:
 def playwright_execution_result(
     url: str = "https://jobs.example/openings/42?private=value",
 ) -> PlaywrightCliExecutionResult:
-    return PlaywrightCliExecutionResult(
-        exit_code=0,
-        timed_out=False,
-        stdout="completed",
-        stderr="",
-        stdout_truncated=False,
-        stderr_truncated=False,
-        observation=BrowserObservation(
-            url=url,
-            title="Application",
-            tabs=[],
-            dom="Application form",
-            page_info={"url": url},
-            screenshot=None,
-        ),
-    )
+    return PlaywrightCliExecutionResult(exit_code=0, stdout="completed",
+    stderr="",
+    stdout_truncated=False,
+    stderr_truncated=False,
+    observation=BrowserObservation(
+        url=url,
+        title="Application",
+        tabs=[],
+        dom="Application form",
+        page_info={"url": url},
+        screenshot=None,
+    ),)
 
 
 class Fakes:
@@ -671,7 +668,6 @@ async def test_manager_passes_resolved_cli_config_to_one_runtime(
         "session_id",
         "launch",
         "session_directory",
-        "deadline",
         "node_executable",
         "cli_script",
     }
@@ -684,7 +680,7 @@ async def test_manager_passes_resolved_cli_config_to_one_runtime(
     assert call["session_directory"].parent == root
     assert call["node_executable"] == tmp_path / "node"
     assert call["cli_script"] == tmp_path / "playwright-cli.js"
-    assert isinstance(call["deadline"], float)
+    assert "deadline" not in call
     record = manager._active
     assert record is not None and record.playwright_runtime is runtime
 
@@ -726,7 +722,6 @@ async def create_source_capture(
         capture_id=capture_id,
         job_url=JOB_URL,
         approved_origins=["https://jobs.example"],
-        timeout_seconds=900,
     )
 
 
@@ -834,30 +829,9 @@ async def test_source_capture_completion_replays_after_requester_loses_response(
     await manager.delete_source_capture(CAPTURE_ID)
 
 
-async def test_source_capture_completion_replay_expires_at_original_deadline(
-    tmp_path: Path,
-) -> None:
-    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
-    completed = await create_source_capture(manager)
-    result = await manager.complete_source_capture(completed.capture_id)
-
-    assert await manager.complete_source_capture(completed.capture_id) == result
-    replay = manager._source_capture_replay
-    assert replay is not None
-    replay.deadline_monotonic = asyncio.get_running_loop().time()
-
-    with pytest.raises(HarnessServiceError) as expired:
-        await manager.complete_source_capture(completed.capture_id)
-    assert_service_error(
-        expired.value,
-        409,
-        "source_capture_not_ready",
-        "Source capture is not ready",
-    )
-    assert manager._source_capture_replay is None
 
 
-async def test_source_capture_result_expires_while_cleanup_is_blocked(
+async def test_source_capture_result_remains_available_while_cleanup_is_blocked(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
@@ -867,7 +841,6 @@ async def test_source_capture_result_expires_while_cleanup_is_blocked(
     runtime.close_blocker = release_cleanup
     record = manager._source_capture
     assert record is not None
-    record.deadline_monotonic = asyncio.get_running_loop().time() + 0.2
 
     completion = asyncio.create_task(
         manager.complete_source_capture(CAPTURE_ID)
@@ -875,20 +848,13 @@ async def test_source_capture_result_expires_while_cleanup_is_blocked(
     await runtime.close_started.wait()
 
     assert record.completed_result is not None
-    await wait_until(lambda: record.completed_result is None)
-    assert manager._source_capture_replay is None
+    await asyncio.sleep(0.01)
+    assert record.completed_result is not None
 
     release_cleanup.set()
-    with pytest.raises(HarnessServiceError) as expired:
-        await completion
-    assert_service_error(
-        expired.value,
-        409,
-        "source_capture_not_ready",
-        "Source capture is not ready",
-    )
-    assert manager._source_capture_replay is None
-
+    result = await completion
+    assert await manager.complete_source_capture(CAPTURE_ID) == result
+    await manager.delete_source_capture(CAPTURE_ID)
 
 async def test_concurrent_source_capture_completion_joins_one_snapshot(
     tmp_path: Path,
@@ -956,7 +922,6 @@ async def test_source_capture_create_is_idempotent_only_for_the_same_live_reques
             capture_id=CAPTURE_ID,
             job_url=f"{JOB_URL}&other=true",
             approved_origins=["https://jobs.example"],
-            timeout_seconds=900,
         )
     assert_service_error(
         changed_payload.value,
@@ -1140,33 +1105,6 @@ async def test_source_capture_delete_wins_post_snapshot_completion_contention(
     assert manager._source_capture_tombstones[CAPTURE_ID].state == "cancelled"
 
 
-async def test_source_capture_completion_crossing_deadline_expires(
-    tmp_path: Path,
-) -> None:
-    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
-    await create_source_capture(manager)
-    runtime = fakes.runtimes[0]
-    release_snapshot = asyncio.Event()
-    runtime.source_snapshot_blocker = release_snapshot
-    completion = asyncio.create_task(
-        manager.complete_source_capture(CAPTURE_ID)
-    )
-    await runtime.source_snapshot_started.wait()
-    record = manager._source_capture
-    assert record is not None
-    record.deadline_monotonic = asyncio.get_running_loop().time() - 1
-    release_snapshot.set()
-
-    with pytest.raises(HarnessServiceError) as expired:
-        await completion
-    assert_service_error(
-        expired.value,
-        409,
-        "source_capture_not_ready",
-        "Source capture is not ready",
-    )
-    assert runtime.closed is True
-    assert manager._source_capture_tombstones[CAPTURE_ID].state == "expired"
 
 
 async def test_source_snapshot_failure_closes_runtime_and_returns_fixed_unavailable(
@@ -1211,48 +1149,20 @@ async def test_source_capture_cleanup_retries_before_releasing_browser_slot(
 
 
 
-async def test_source_capture_expiry_and_shutdown_close_runtime_before_releasing_slot(
+async def test_source_capture_has_no_lease_and_shutdown_releases_slot(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_sleep = asyncio.sleep
-    expiration_sleep_started = asyncio.Event()
-    release_expiration = asyncio.Event()
-
-    async def controlled_sleep(delay: float) -> None:
-        if delay > 800:
-            expiration_sleep_started.set()
-            await release_expiration.wait()
-            return
-        await real_sleep(delay)
-
-    monkeypatch.setattr(sessions_module.asyncio, "sleep", controlled_sleep)
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
     await create_source_capture(manager)
     record = manager._source_capture
     assert record is not None
-    await expiration_sleep_started.wait()
 
-    release_expiration.set()
-    await record.closed_event.wait()
+    await asyncio.sleep(0.01)
+    assert manager._source_capture is record
+    assert fakes.runtimes[0].closed is False
 
-    assert fakes.runtimes[0].closed is True
-    with pytest.raises(HarnessServiceError) as expired:
-        await manager.complete_source_capture(CAPTURE_ID)
-    assert_service_error(
-        expired.value,
-        409,
-        "source_capture_not_ready",
-        "Source capture is not ready",
-    )
-
-    release_expiration.clear()
-    expiration_sleep_started.clear()
-
-    shutdown_id = UUID("fd399415-a97a-474c-a8ab-c5e9a4635256")
-    await create_source_capture(manager, capture_id=shutdown_id)
     await manager.shutdown()
-    assert fakes.runtimes[-1].closed is True
+    assert fakes.runtimes[0].closed is True
     with pytest.raises(HarnessServiceError) as shutdown_rejects_create:
         await create_source_capture(
             manager,
@@ -1293,14 +1203,8 @@ async def runtime_action(
     manager: ApplicationSessionManager,
     session_id: UUID,
     action: Any,
-    *,
-    action_id: UUID | None = None,
 ) -> Any:
-    return await manager.runtime_action(
-        session_id,
-        action_id or uuid4(),
-        action,
-    )
+    return await manager.runtime_action(session_id, action)
 
 
 def decode_frame(frame: str) -> dict[str, Any]:
@@ -3719,7 +3623,7 @@ async def test_create_session_uses_latex_source_as_resume_evidence_and_pdf_for_u
         ("resume.txt", b"not latex"),
         ("resume.tex", b""),
         ("resume.tex", b"\xff"),
-        ("resume.tex", b"x" * (256 * 1024 + 1)),
+        ("resume.tex", b"x" * (APPLICATION_RESUME_SOURCE_MAX_BYTES + 1)),
     ],
     ids=["wrong-extension", "empty", "invalid-utf8", "over-byte-limit"],
 )
@@ -4282,8 +4186,7 @@ async def test_runtime_human_navigation_maps_guard_suspension_runtime_errors(
     assert record.snapshot == snapshot_before
     assert tuple(record.events) == events_before
     assert record.human_gate.pending_kind is None
-    assert record.runtime_action_task is not None
-    assert record.runtime_action_task.done()
+    assert record.runtime_action_task is None
     await manager.delete(created.session_id)
 
 
@@ -4360,7 +4263,6 @@ async def test_runtime_playwright_cli_action_persists_only_redacted_process_diag
             "step": 1,
             "status": "failed",
             "exit_code": 7,
-            "timed_out": False,
             "error_category": "process_exit",
             "stderr_excerpt": "[redacted]",
             "stderr_truncated": True,
@@ -4377,63 +4279,40 @@ async def test_runtime_playwright_cli_action_persists_only_redacted_process_diag
     )
 
 
-@pytest.mark.parametrize(
-    (
-        "error_code",
-        "expected_status",
-        "expected_timed_out",
-        "expected_category",
-        "expected_excerpt",
-    ),
-    [
-        (
-            "browser_failed",
-            "failed",
-            False,
-            "browser_runtime",
-            "Browser runtime failed.",
-        ),
-        (
-            "session_timeout",
-            "timed_out",
-            True,
-            "session_timeout",
-            "Application session expired.",
-        ),
-    ],
-)
-async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagnostics(
+async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagnostic(
     tmp_path: Path,
-    error_code: Literal["browser_failed", "session_timeout"],
-    expected_status: Literal["failed", "timed_out"],
-    expected_timed_out: bool,
-    expected_category: Literal["browser_runtime", "session_timeout"],
-    expected_excerpt: str,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
     assert record is not None
-    record.playwright_runtime = FakePlaywrightRuntime(error=PlaywrightCliRuntimeError(error_code))
+    record.playwright_runtime = FakePlaywrightRuntime(
+        error=PlaywrightCliRuntimeError("browser_failed")
+    )
 
     with pytest.raises(HarnessServiceError) as raised:
         await runtime_action(
             manager,
             created.session_id,
-            PlaywrightCliRuntimeAction(type="playwright_cli", command="eval", args=["console.log('private code')"]),
+            PlaywrightCliRuntimeAction(
+                type="playwright_cli",
+                command="eval",
+                args=["console.log('private code')"],
+            ),
         )
 
-    assert raised.value.code == error_code
-    diagnostics = manager.get_snapshot(created.session_id).playwright_cli_diagnostics
+    assert raised.value.code == "browser_failed"
+    diagnostics = manager.get_snapshot(
+        created.session_id
+    ).playwright_cli_diagnostics
     assert [item.model_dump() for item in diagnostics] == [
         {
             "step": 1,
-            "status": expected_status,
+            "status": "failed",
             "exit_code": -1,
-            "timed_out": expected_timed_out,
-            "error_category": expected_category,
-            "stderr_excerpt": expected_excerpt,
+            "error_category": "browser_runtime",
+            "stderr_excerpt": "Browser runtime failed.",
             "stderr_truncated": False,
         }
     ]
@@ -4919,7 +4798,7 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     await manager.delete(created.session_id)
 
 
-async def test_runtime_action_same_key_joins_replays_and_survives_requester_cancellation(
+async def test_runtime_action_continues_once_after_requester_cancellation_and_releases_ownership(
     tmp_path: Path,
 ) -> None:
     manager, _, _ = make_manager(tmp_path, blocked_runner)
@@ -4930,7 +4809,6 @@ async def test_runtime_action_same_key_joins_replays_and_survives_requester_canc
     blocker = asyncio.Event()
     runtime = FakePlaywrightRuntime(blocker=blocker)
     record.playwright_runtime = runtime
-    action_id = UUID("d037ec31-777a-487b-89c6-225981aa1b58")
     action = PlaywrightCliRuntimeAction(
         type="playwright_cli",
         command="snapshot",
@@ -4938,176 +4816,42 @@ async def test_runtime_action_same_key_joins_replays_and_survives_requester_canc
     )
 
     requester = asyncio.create_task(
-        manager.runtime_action(created.session_id, action_id, action)
+        manager.runtime_action(created.session_id, action)
     )
     await runtime.started.wait()
-    joined = asyncio.create_task(
-        manager.runtime_action(created.session_id, action_id, action)
-    )
-    await asyncio.sleep(0)
-    requester.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await requester
-
     owner = record.runtime_action_task
     assert owner is not None
     assert owner is not requester
     assert not owner.done()
-    assert not joined.done()
     assert runtime.commands == [("snapshot", [])]
 
-    blocker.set()
-    joined_result = await joined
-    replayed_result = await manager.runtime_action(
-        created.session_id,
-        action_id,
-        action,
-    )
+    requester.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await requester
+    assert not owner.done()
 
-    assert replayed_result is joined_result
+    blocker.set()
+    await wait_until(lambda: record.runtime_action_task is None)
     assert runtime.commands == [("snapshot", [])]
     assert record.playwright_cli_action_count == 1
-    await manager.delete(created.session_id)
 
-
-async def test_runtime_action_idempotency_conflicts_are_distinct_and_do_not_dispatch(
-    tmp_path: Path,
-) -> None:
-    manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
-    record = manager._active
-    assert record is not None
-    blocker = asyncio.Event()
-    runtime = FakePlaywrightRuntime(blocker=blocker)
-    record.playwright_runtime = runtime
-    first_id = UUID("82a4bfce-4bd1-4a98-bc6e-2890d5fc02f6")
-    replacement_id = UUID("cc8b251d-552d-4946-8ac9-eb82ef1370ea")
-    first_action = PlaywrightCliRuntimeAction(
-        type="playwright_cli",
-        command="snapshot",
-        args=[],
-    )
-    different_payload = PlaywrightCliRuntimeAction(
-        type="playwright_cli",
-        command="eval",
-        args=["() => document.title"],
-    )
-    active = asyncio.create_task(
-        manager.runtime_action(created.session_id, first_id, first_action)
-    )
-    await runtime.started.wait()
-
-    with pytest.raises(HarnessServiceError) as payload_mismatch:
-        await manager.runtime_action(
-            created.session_id,
-            first_id,
-            different_payload,
-        )
-    assert_service_error(
-        payload_mismatch.value,
-        409,
-        "command_conflict",
-        "The idempotency key was already used for a different runtime action",
-    )
-
-    with pytest.raises(HarnessServiceError) as different_active_key:
-        await manager.runtime_action(
-            created.session_id,
-            replacement_id,
-            different_payload,
-        )
-    assert_service_error(
-        different_active_key.value,
-        409,
-        "command_conflict",
-        "A runtime action is already pending",
-    )
-    assert runtime.commands == [("snapshot", [])]
-
-    blocker.set()
-    await active
-    await manager.runtime_action(
+    next_result = await manager.runtime_action(
         created.session_id,
-        replacement_id,
-        different_payload,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="eval",
+            args=["() => document.title"],
+        ),
     )
-
-    with pytest.raises(HarnessServiceError) as stale_key:
-        await manager.runtime_action(
-            created.session_id,
-            first_id,
-            first_action,
-        )
-    assert_service_error(
-        stale_key.value,
-        409,
-        "command_conflict",
-        "The idempotency key is no longer current",
-    )
+    assert isinstance(next_result, PlaywrightCliResultRuntimeActionResponse)
     assert runtime.commands == [
         ("snapshot", []),
         ("eval", ["() => document.title"]),
     ]
+    assert record.playwright_cli_action_count == 2
     await manager.delete(created.session_id)
 
-async def test_runtime_action_idempotency_key_limit_conflicts_without_dispatch(
-    tmp_path: Path,
-) -> None:
-    manager, _, _ = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
-    record = manager._active
-    assert record is not None
-    runtime = FakePlaywrightRuntime()
-    record.playwright_runtime = runtime
-    current_id = UUID("a8811440-54f0-4630-bce9-e4446ad76252")
-    fresh_id = UUID(int=4096)
-    action = PlaywrightCliRuntimeAction(
-        type="playwright_cli",
-        command="snapshot",
-        args=[],
-    )
 
-    first_result = await manager.runtime_action(
-        created.session_id,
-        current_id,
-        action,
-    )
-    current_task = record.runtime_action_task
-    record.runtime_action_ids_seen.update(
-        UUID(int=value) for value in range(1, 4096)
-    )
-    assert len(record.runtime_action_ids_seen) == 4096
-
-    replayed_result = await manager.runtime_action(
-        created.session_id,
-        current_id,
-        action,
-    )
-    assert replayed_result is first_result
-    assert runtime.commands == [("snapshot", [])]
-
-    with pytest.raises(HarnessServiceError) as at_capacity:
-        await manager.runtime_action(
-            created.session_id,
-            fresh_id,
-            action,
-        )
-
-    assert_service_error(
-        at_capacity.value,
-        409,
-        "command_conflict",
-        "The runtime action idempotency key limit was reached",
-    )
-    assert fresh_id not in record.runtime_action_ids_seen
-    assert record.runtime_action_id == current_id
-    assert record.runtime_action_payload == action
-    assert record.runtime_action_task is current_task
-    assert runtime.commands == [("snapshot", [])]
-    assert record.playwright_cli_action_count == 1
-    await manager.delete(created.session_id)
 
 
 async def test_runtime_navigation_registers_exact_origin_automatically(
@@ -5609,8 +5353,7 @@ async def test_first_approved_human_navigation_guard_failure_parks_uncertainty_w
     assert manager._active is record
     assert record.final_request is None
     assert record.finalized is False
-    assert record.runtime_action_task is not None
-    assert record.runtime_action_task.done()
+    assert record.runtime_action_task is None
     assert runtime.closed is False
     assert fakes.models[0].closed is False
     await manager.delete(created.session_id)
@@ -6031,20 +5774,13 @@ async def test_terminal_cleanup_cancels_active_runtime_action_before_playwright_
     runtime = fakes.runtimes[0]
     runtime.blocker = asyncio.Event()
     assert record is not None
-    ownership_at_close: list[tuple[Any, ...]] = []
+    ownership_at_close: list[Any] = []
     runtime.close_observer = lambda: ownership_at_close.append(
-        (
-            record.runtime_action_task,
-            record.runtime_action_id,
-            record.runtime_action_payload,
-            frozenset(record.runtime_action_ids_seen),
-        )
+        record.runtime_action_task
     )
-    action_id = UUID("323e4567-e89b-42d3-a456-426614174000")
     requester = asyncio.create_task(
         manager.runtime_action(
             created.session_id,
-            action_id,
             PlaywrightCliRuntimeAction(
                 type="playwright_cli",
                 command="eval",
@@ -6071,12 +5807,9 @@ async def test_terminal_cleanup_cancels_active_runtime_action_before_playwright_
     with pytest.raises(asyncio.CancelledError):
         await requester
     assert runtime.closed
-    assert ownership_at_close == [(None, None, None, frozenset())]
+    assert ownership_at_close == [None]
     assert owner.cancelled()
     assert record.runtime_action_task is None
-    assert record.runtime_action_id is None
-    assert record.runtime_action_payload is None
-    assert record.runtime_action_ids_seen == set()
     assert order.index("runtime.execute_finished") < order.index("runtime.close")
     assert order.index("runtime.close") < order.index("model.aclose")
     events = manager._tombstones[created.session_id].events
@@ -6184,7 +5917,7 @@ async def test_oversized_data_task_fails_before_preflight_and_playwright_runtime
     monkeypatch.setattr(
         sessions_module,
         "build_application_task",
-        lambda _request: "x" * (1024 * 1024 + 1),
+        lambda _request: "x" * (sessions_module._MAX_APPLICATION_TASK_BYTES + 1),
     )
     manager, fakes, root = make_manager(tmp_path, None)
 
@@ -6547,28 +6280,24 @@ async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screens
         }
     ]
 
-    runtime.result = PlaywrightCliExecutionResult(
-        exit_code=0,
-        timed_out=False,
-        stdout=f"result for {username} using {password}",
-        stderr=f"stderr {password}",
-        stdout_truncated=False,
-        stderr_truncated=False,
-        observation=BrowserObservation(
-            url=f"https://jobs.example/account/{username}",
-            title=f"Welcome {username}",
-            tabs=[
-                BrowserTab(
-                    url=f"https://jobs.example/account/{username}",
-                    title=f"Account {password}",
-                    tab_id="0",
-                )
-            ],
-            dom=f"Signed in as {username} with {password}",
-            page_info={"username": username},
-            screenshot={"data": "c2VjcmV0LXNjcmVlbnNob3Q="},
-        ),
-    )
+    runtime.result = PlaywrightCliExecutionResult(exit_code=0, stdout=f"result for {username} using {password}",
+    stderr=f"stderr {password}",
+    stdout_truncated=False,
+    stderr_truncated=False,
+    observation=BrowserObservation(
+        url=f"https://jobs.example/account/{username}",
+        title=f"Welcome {username}",
+        tabs=[
+            BrowserTab(
+                url=f"https://jobs.example/account/{username}",
+                title=f"Account {password}",
+                tab_id="0",
+            )
+        ],
+        dom=f"Signed in as {username} with {password}",
+        page_info={"username": username},
+        screenshot={"data": "c2VjcmV0LXNjcmVlbnNob3Q="},
+    ),)
     later = await runtime_action(
         manager,
         created.session_id,

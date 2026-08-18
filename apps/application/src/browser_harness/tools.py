@@ -5,7 +5,6 @@ from typing import Literal, Protocol, TypeAlias
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 
-from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 from .playwright_cli import PlaywrightCliRuntimeError
 from .credentials import CredentialStore
 from .models import (
@@ -348,15 +347,12 @@ class HumanGate:
         publish: GateEventPublisher,
         review_snapshot: ReviewSnapshotSink | None = None,
         auto_submit: bool = False,
-        action_timeout: float = DEFAULT_SESSION_TIMEOUT_SECONDS,
     ) -> None:
         canonical_origins = [validate_approved_origin(origin) for origin in approved_origins]
         if not canonical_origins or len(canonical_origins) > MAX_APPROVED_ORIGINS:
             raise ValueError("approved origins must contain 1 to 20 entries")
         if len(set(canonical_origins)) != len(canonical_origins):
             raise ValueError("approved origins must be unique")
-        if action_timeout <= 0:
-            raise ValueError("action_timeout must be positive")
         if type(auto_submit) is not bool:
             raise ValueError("auto_submit must be a boolean")
         self._job_url = validate_job_url(job_url)
@@ -370,7 +366,6 @@ class HumanGate:
         self._publish = publish
         self._review_snapshot = review_snapshot
         self._auto_submit = auto_submit
-        self._action_timeout = action_timeout
         self._lock = asyncio.Lock()
         self._pending: _PendingGate | None = None
         self._cancelled = False
@@ -1003,16 +998,7 @@ class HumanGate:
             self._pending = pending
             await self._publish(state, event, detail)
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(future),
-                timeout=self._action_timeout,
-            )
-        except TimeoutError:
-            async with self._lock:
-                self._cancelled = True
-                if not future.done():
-                    future.set_result(("cancel", None))
-            return "cancel", None
+            return await asyncio.shield(future)
         finally:
             async with self._lock:
                 if self._pending is pending:

@@ -52,8 +52,6 @@ export function mapRunRouteError(error: unknown): Response {
       message = error.message;
     } else if (code === "JOB_EXTRACTION_UNAVAILABLE") {
       message = "Opportunity description extraction failed";
-    } else if (code === "JOB_EXTRACTION_TIMEOUT") {
-      message = "Opportunity description extraction timed out";
     } else if (code === "CONTEXT_SYNC_FAILED") {
       message = "Context synchronization failed";
     }

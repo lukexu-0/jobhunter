@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ResumeSection } from "./types.ts";
+import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 
 export const EDITABLE_SECTIONS = ["experience", "projects", "competitions-other", "technical-skills"] as const;
 export const KNOWN_BODY_MACROS: Readonly<Record<string, true>> = {
@@ -141,7 +142,7 @@ function parseSkills(region: ResumeRegion): BaselineSkill[] {
 }
 
 export function parseBaselineResume(source: string): ParsedBaselineResume {
-  if (Buffer.byteLength(source) > 256 * 1024) throw new Error("baseline exceeds 256 KiB");
+  if (Buffer.byteLength(source) > ARTIFACT_LIMITS.tex) throw new Error(`baseline exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
   if ((source.match(/\\begin\{document\}/g) ?? []).length !== 1 || (source.match(/\\end\{document\}/g) ?? []).length !== 1) throw new Error("baseline must contain exactly one document wrapper");
   const experience = locateSection(source, "Experience", "experience");
   const projects = locateSection(source, "Projects", "projects");

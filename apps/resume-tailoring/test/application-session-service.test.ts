@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  APPLICATION_SESSION_UPLOAD_LIMITS,
   ApplicationHarnessError,
   type ApplicationHarnessClient,
   type ApplicationHarnessCreateInput,
@@ -249,7 +250,7 @@ async function createApprovedRun(
   const pdf = await artifacts.write(
     join(attemptRoot, "resume.pdf"),
     PDF_BYTES,
-    10 * 1024 * 1024,
+    ARTIFACT_LIMITS.pdf,
   );
   repository.finalizeArtifact(claim, {
     attemptId: attempt.id,
@@ -549,6 +550,24 @@ describe("application session service", () => {
     expect(serialized).not.toContain(PROFILE);
   });
 
+  test("rejects approved PDF and source files one byte over their pipeline artifact caps", async () => {
+    for (const kind of ["pdf", "tex"] as const) {
+      const target = await createTarget();
+      const artifact = kind === "pdf" ? target.pdf : target.tex;
+      if (!artifact) throw new Error("approved resume artifact fixture missing");
+      await truncate(artifact.path, ARTIFACT_LIMITS[kind] + 1);
+
+      await expect(
+        target.service.start(target.runId, target.pdf.sha256, signal()),
+      ).rejects.toMatchObject({
+        code: "APPLICATION_SOURCE_UNAVAILABLE",
+        status: 409,
+        message: "Application source files are unavailable",
+      });
+      expect(target.harness!.createCalls).toHaveLength(0);
+    }
+  });
+
   test("rejects application start when the current tailored source is missing", async () => {
     const target = await createTarget({ tailoredTexBytes: null });
     expect(await target.service.get(target.runId)).toEqual({
@@ -724,8 +743,23 @@ describe("application session service", () => {
     await writeFile(empty.profilePath, "");
     await expect(readApplicantProfileMarkdown(empty.root)).rejects.toThrow(/size/);
 
+    const maximum = await createProfileRoot();
+    await writeFile(maximum.profilePath, "");
+    await truncate(
+      maximum.profilePath,
+      APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes,
+    );
+    expect(Buffer.byteLength(
+      await readApplicantProfileMarkdown(maximum.root),
+      "utf8",
+    )).toBe(APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes);
+
     const oversized = await createProfileRoot();
-    await writeFile(oversized.profilePath, new Uint8Array(1024 * 1024 + 1));
+    await writeFile(oversized.profilePath, "");
+    await truncate(
+      oversized.profilePath,
+      APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes + 1,
+    );
     await expect(readApplicantProfileMarkdown(oversized.root)).rejects.toThrow(/size/);
 
     const linked = await createProfileRoot();
@@ -1475,7 +1509,7 @@ describe("application session service", () => {
     const editedPdf = await target.artifacts.write(
       join(attemptRoot, "resume.pdf"),
       editedPdfBytes,
-      10 * 1024 * 1024,
+      ARTIFACT_LIMITS.pdf,
     );
     target.repository.finalizeArtifact(claim, {
       attemptId: attempt.id,
@@ -1550,7 +1584,6 @@ describe("application session service", () => {
           step: 3,
           status: "failed",
           exitCode: 1,
-          timedOut: false,
           errorCategory: "process_exit",
           stderrExcerpt: "[redacted]",
           stderrTruncated: true,
@@ -1594,7 +1627,6 @@ describe("application session service", () => {
             step: 3,
             status: "failed",
             exitCode: 1,
-            timedOut: false,
             errorCategory: "process_exit",
             stderrExcerpt: "[redacted]",
             stderrTruncated: true,
@@ -1615,7 +1647,6 @@ describe("application session service", () => {
           step: 3,
           status: "failed",
           exitCode: 1,
-          timedOut: false,
           errorCategory: "process_exit",
           stderrExcerpt: "[redacted]",
           stderrTruncated: true,

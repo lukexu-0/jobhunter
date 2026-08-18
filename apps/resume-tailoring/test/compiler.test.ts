@@ -3,7 +3,7 @@ import { fstatSync, lstatSync, realpathSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ArtifactStore } from "../src/system/artifacts.ts";
+import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
 import { runTrustedProcess, sanitizedEnvironment, type ProcessBoundary, type RunningProcess, type SpawnContract } from "../src/system/process.ts";
 import { COMPILE_TIMEOUTS, compileResume } from "../src/resume/compiler.ts";
 
@@ -229,8 +229,8 @@ describe("trusted resume compiler", () => {
       if (result.ok) throw new Error("expected terminal validation failure");
       expect(result.classification).toBe("terminal");
       expect(result.process).toBeUndefined();
-      expect(result.log.bytes).toBeLessThanOrEqual(1024 * 1024);
-      expect(Buffer.from(await artifacts.read(result.log.path, 1024 * 1024)).toString()).toMatch(/forbidden/i);
+      expect(result.log.bytes).toBeLessThanOrEqual(ARTIFACT_LIMITS.log);
+      expect(Buffer.from(await artifacts.read(result.log.path, ARTIFACT_LIMITS.log)).toString()).toMatch(/forbidden/i);
       expect(spawned).toBeFalse();
     }
 
@@ -256,7 +256,7 @@ describe("trusted resume compiler", () => {
       expect(result.ok).toBeFalse();
       if (!result.ok) {
         expect(result.reason).toMatch(/forbidden|file access/i);
-        expect(result.log.bytes).toBeLessThanOrEqual(1024 * 1024);
+        expect(result.log.bytes).toBeLessThanOrEqual(ARTIFACT_LIMITS.log);
       }
       expect(spawned).toBeFalse();
     }
@@ -320,9 +320,9 @@ describe("trusted resume compiler", () => {
     const result = await compileResume({ artifacts, address, tex: safeTex, mode: "full", processBoundary: () => exited(104, huge, huge, 1) });
     expect(result.ok).toBeFalse();
     if (result.ok) throw new Error("expected failure");
-    expect(result.log.bytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(result.log.bytes).toBeLessThanOrEqual(ARTIFACT_LIMITS.log);
     expect(result.classification).toBe("terminal");
-    await expect(artifacts.read(join(result.attemptRoot, "resume.pdf"), 10 * 1024 * 1024)).rejects.toThrow();
+    await expect(artifacts.read(join(result.attemptRoot, "resume.pdf"), ARTIFACT_LIMITS.pdf)).rejects.toThrow();
   });
 
   testWithLinuxTexCache("distinguishes repairable TeX diagnostics from terminal compiler failures", async () => {
@@ -353,7 +353,7 @@ describe("trusted resume compiler", () => {
     expect(result.ok).toBeTrue();
     if (!result.ok) throw new Error("expected success");
     expect(result.pdf.bytes).toBe(pdfBytes.byteLength);
-    expect(Buffer.from(await artifacts.read(result.pdf.path, 10 * 1024 * 1024))).toEqual(pdfBytes);
+    expect(Buffer.from(await artifacts.read(result.pdf.path, ARTIFACT_LIMITS.pdf))).toEqual(pdfBytes);
     await expect(artifacts.write(result.pdf.path, "replacement", 100)).rejects.toThrow(/already exists/i);
   });
 
@@ -364,13 +364,13 @@ describe("trusted resume compiler", () => {
       address,
       tex: safeTex,
       mode: "full",
-      processBoundary: (contract) => { writeFileSync(join(contract.cwd, "compile.pdf"), Buffer.alloc(10 * 1024 * 1024 + 1)); return exited(107); },
+      processBoundary: (contract) => { writeFileSync(join(contract.cwd, "compile.pdf"), Buffer.alloc(ARTIFACT_LIMITS.pdf + 1)); return exited(107); },
     });
     expect(result.ok).toBeFalse();
     if (!result.ok) {
       expect(result.classification).toBe("terminal");
       expect(result.reason).toMatch(/acceptable PDF|byte limit/i);
-      expect(result.log.bytes).toBeLessThanOrEqual(1024 * 1024);
+      expect(result.log.bytes).toBeLessThanOrEqual(ARTIFACT_LIMITS.log);
     }
   });
 });

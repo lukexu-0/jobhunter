@@ -346,7 +346,6 @@ describe("pipeline run requests", () => {
       id: "11111111-1111-4111-8111-111111111111",
       state: "awaiting_human_verification",
       jobUrl,
-      expiresAt: 1_775_174_700_000,
     };
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     capture(json(handoff, { status: 201 }), requests);
@@ -360,7 +359,6 @@ describe("pipeline run requests", () => {
       id: "11111111-1111-4111-8111-111111111111",
       state: "awaiting_human_verification",
       jobUrl,
-      expiresAt: 1_775_174_700_000,
     });
     expect(requests).toEqual([{
       input: "/api/pipeline/source-handoffs",
@@ -406,7 +404,6 @@ describe("pipeline run requests", () => {
       id: "22222222-2222-4222-8222-222222222222",
       state: "awaiting_human_verification",
       jobUrl,
-      expiresAt: 1_775_174_700_000,
     } as const;
     const completedRun = { ...run(), id: "captured-run", jobUrl };
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
@@ -453,12 +450,12 @@ describe("pipeline run requests", () => {
       id: "33333333-3333-4333-8333-333333333333",
       state: "awaiting_human_verification",
       jobUrl,
-      expiresAt: 1_800_000_000_000,
     };
 
     for (const privateField of [
       { source: "captured visible text" },
       { cookies: [{ name: "session", value: "secret" }] },
+      { expiresAt: 1_800_000_000_000 },
     ]) {
       setFetchMock(async () => json({ ...handoff, ...privateField }, { status: 201 }));
       await expect(createSourceHandoff({ jobUrl })).rejects.toMatchObject({
@@ -697,7 +694,6 @@ describe("pipeline run requests", () => {
   test("exposes only fixed actionable extraction 5xx messages", async () => {
     for (const [code, status, message] of [
       ["JOB_EXTRACTION_UNAVAILABLE", 502, "Opportunity description extraction failed"],
-      ["JOB_EXTRACTION_TIMEOUT", 504, "Opportunity description extraction timed out"],
     ] as const) {
       setFetchMock(async () => json({
         error: {

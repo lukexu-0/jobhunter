@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants, lstatSync, openSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { ARTIFACT_LIMITS } from "./artifacts.ts";
 
 export const TRUSTED_PROGRAMS = Object.freeze(["latexmk", "pdfinfo", "pdftotext", "pdffonts", "pdftoppm", "google-chrome"] as const);
 export type TrustedProgram = typeof TRUSTED_PROGRAMS[number];
@@ -464,8 +465,8 @@ export async function runTrustedProcess(request: TrustedProcessRequest, boundary
     throw new Error("the browser resource profile requires an absolute private profile directory");
   }
   if (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0) throw new Error("timeout must be positive");
-  const stdoutLimit = request.stdoutLimit ?? 256 * 1024;
-  const stderrLimit = request.stderrLimit ?? 256 * 1024;
+  const stdoutLimit = request.stdoutLimit ?? ARTIFACT_LIMITS.stdout;
+  const stderrLimit = request.stderrLimit ?? ARTIFACT_LIMITS.stderr;
   if (!Number.isSafeInteger(stdoutLimit) || stdoutLimit < 0 || !Number.isSafeInteger(stderrLimit) || stderrLimit < 0) throw new Error("output limits must be non-negative integers");
   if (request.signal?.aborted) throw request.signal.reason ?? new DOMException("Aborted", "AbortError");
   const attemptRootFd = request.texmfConfigDirectory === "." ? openAttemptRootFd(request.cwd) : undefined;

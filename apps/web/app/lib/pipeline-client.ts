@@ -58,7 +58,6 @@ const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   SOURCE_HANDOFF_UNAVAILABLE: "Source handoff is unavailable",
   MODEL_TIMEOUT: "The model request timed out",
   JOB_EXTRACTION_UNAVAILABLE: "Opportunity description extraction failed",
-  JOB_EXTRACTION_TIMEOUT: "Opportunity description extraction timed out",
 });
 const JsonValueSchema = z.json();
 

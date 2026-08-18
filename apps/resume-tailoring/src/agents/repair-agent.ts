@@ -3,6 +3,7 @@ import { z } from "zod";
 import { MODEL_NAME } from "../models/oauth-codex-model.ts";
 import { validateRepairResult } from "../resume/repair.ts";
 import { RepairResultSchema, type RepairResult } from "../resume/types.ts";
+import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 import {
   REPAIR_DEADLINE_MS,
   boundedJson,
@@ -16,7 +17,7 @@ export const MAX_REPAIR_TOOL_CALLS = 8;
 export const MAX_REPAIR_TOOL_BYTES = 2 * 1024 * 1024;
 
 const ArtifactRequestSchema = z.object({ artifactId: z.string().min(1).max(200) }).strict();
-const CandidateSchema = z.object({ tailoredTex: z.string().max(256 * 1024) }).strict();
+const CandidateSchema = z.object({ tailoredTex: z.string().max(ARTIFACT_LIMITS.tex) }).strict();
 
 export interface RepairToolResult {
   readonly ok: boolean;
@@ -50,8 +51,8 @@ function assertActive(signal: AbortSignal): void {
 }
 
 export async function runRepairAgent(attempt: RepairAgentAttempt): Promise<RepairResult> {
-  if (Buffer.byteLength(attempt.input.failedTex) > 256 * 1024) throw new Error("failed TeX artifact exceeds 256 KiB");
-  if (Buffer.byteLength(attempt.input.latexLog) > 1024 * 1024) throw new Error("LaTeX log artifact exceeds 1 MiB");
+  if (Buffer.byteLength(attempt.input.failedTex) > ARTIFACT_LIMITS.tex) throw new Error(`failed TeX artifact exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
+  if (Buffer.byteLength(attempt.input.latexLog) > ARTIFACT_LIMITS.log) throw new Error(`LaTeX log artifact exceeds ${ARTIFACT_LIMITS.log} byte limit`);
   const modelInput = boundedJson({
     task: "Repair the supplied TeX using the fixed failed artifact and LaTeX log.",
     failedTexArtifactId: attempt.input.failedTexArtifactId,
@@ -112,7 +113,7 @@ export async function runRepairAgent(attempt: RepairAgentAttempt): Promise<Repai
     timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
     timeoutBehavior: "raise_exception",
     execute: async ({ tailoredTex }): Promise<RepairToolResult> => {
-      if (Buffer.byteLength(tailoredTex) > 256 * 1024) throw new Error("repair candidate exceeds 256 KiB");
+      if (Buffer.byteLength(tailoredTex) > ARTIFACT_LIMITS.tex) throw new Error(`repair candidate exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
       budget.begin("validate_candidate", { tailoredTex });
       const toolSignal = AbortSignal.any([attempt.signal, AbortSignal.timeout(DEFAULT_TOOL_TIMEOUT_MS)]);
       assertActive(toolSignal);
@@ -132,7 +133,7 @@ export async function runRepairAgent(attempt: RepairAgentAttempt): Promise<Repai
     timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
     timeoutBehavior: "raise_exception",
     execute: async ({ tailoredTex }): Promise<RepairToolResult> => {
-      if (Buffer.byteLength(tailoredTex) > 256 * 1024) throw new Error("repair candidate exceeds 256 KiB");
+      if (Buffer.byteLength(tailoredTex) > ARTIFACT_LIMITS.tex) throw new Error(`repair candidate exceeds ${ARTIFACT_LIMITS.tex} byte limit`);
       budget.begin("compile_candidate", { tailoredTex });
       if (!validatedCandidates.has(tailoredTex)) throw new Error("compile_candidate requires successful validation of the exact candidate");
       const toolSignal = AbortSignal.any([attempt.signal, AbortSignal.timeout(DEFAULT_TOOL_TIMEOUT_MS)]);

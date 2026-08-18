@@ -6,6 +6,7 @@ import stat
 from dataclasses import FrozenInstanceError
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryFile
 from uuid import UUID
 
 import pytest
@@ -29,7 +30,20 @@ from jobhunter_browser_harness.context import (
     load_candidate_context,
     render_candidate_evidence,
 )
-from jobhunter_browser_harness.models import DIRECT_FIELD_NAMES, HarnessServiceError
+from jobhunter_browser_harness.models import (
+    APPLICATION_ANECDOTE_MAX_BYTES,
+    APPLICATION_ANECDOTE_MAX_COUNT,
+    APPLICATION_ANECDOTE_TOTAL_MAX_BYTES,
+    APPLICATION_CONTEXT_MAX_BYTES,
+    APPLICATION_CONTEXT_MAX_COUNT,
+    APPLICATION_CONTEXT_TOTAL_MAX_BYTES,
+    APPLICATION_PROFILE_MAX_BYTES,
+    APPLICATION_RESUME_MAX_BYTES,
+    APPLICATION_RESUME_SOURCE_MAX_BYTES,
+    DIRECT_FIELD_NAMES,
+    HarnessServiceError,
+    UploadedArtifacts,
+)
 
 
 SESSION_ID = UUID("913830a4-b8dc-46c4-8791-d80c79db250a")
@@ -58,6 +72,30 @@ EXPECTED_DIRECT_FIELDS = {
 
 def upload(filename: str, content: bytes) -> UploadFile:
     return UploadFile(file=BytesIO(content), filename=filename)
+
+
+def sized_upload(
+    filename: str,
+    size: int,
+    *,
+    prefix: bytes = b"",
+    fill: bytes | None = None,
+) -> UploadFile:
+    source = TemporaryFile()
+    source.write(prefix)
+    remaining = size - len(prefix)
+    if remaining < 0:
+        raise ValueError("prefix exceeds requested upload size")
+    if fill is None:
+        source.truncate(size)
+    else:
+        chunk = fill * (64 * 1024 // len(fill))
+        while remaining:
+            written = min(remaining, len(chunk))
+            source.write(chunk[:written])
+            remaining -= written
+    source.seek(0)
+    return UploadFile(file=source, filename=filename, size=size)
 
 
 def pdf_bytes(text: str | None = "Resume evidence", *, encrypted: bool = False) -> bytes:
@@ -277,8 +315,29 @@ async def test_store_uploads_rejects_a_symlink_in_the_artifact_root_chain(
     assert not (outside / str(SESSION_ID)).exists()
 
 
+def test_application_upload_and_evidence_limits_are_exact() -> None:
+    assert APPLICATION_PROFILE_MAX_BYTES == 5_242_880
+    assert APPLICATION_RESUME_MAX_BYTES == 52_428_800
+    assert APPLICATION_RESUME_SOURCE_MAX_BYTES == 1_310_720
+    assert APPLICATION_CONTEXT_MAX_COUNT == 50
+    assert APPLICATION_CONTEXT_MAX_BYTES == 5_242_880
+    assert APPLICATION_CONTEXT_TOTAL_MAX_BYTES == 26_214_400
+    assert APPLICATION_ANECDOTE_MAX_COUNT == 100
+    assert APPLICATION_ANECDOTE_MAX_BYTES == 1_310_720
+    assert APPLICATION_ANECDOTE_TOTAL_MAX_BYTES == 10_485_760
+    assert MAX_SOURCE_CHARACTERS == 500_000
+    assert MAX_RESUME_SOURCE_CHARACTERS == 1_310_720
+    assert MAX_COMBINED_NARRATIVE_CHARACTERS == 2_060_720
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("context_count", "anecdote_count"), [(11, 0), (0, 21)])
+@pytest.mark.parametrize(
+    ("context_count", "anecdote_count"),
+    [
+        (APPLICATION_CONTEXT_MAX_COUNT + 1, 0),
+        (0, APPLICATION_ANECDOTE_MAX_COUNT + 1),
+    ],
+)
 async def test_store_uploads_enforces_upload_count_limits_before_creating_a_session(
     tmp_path: Path, context_count: int, anecdote_count: int
 ) -> None:
@@ -290,25 +349,21 @@ async def test_store_uploads_enforces_upload_count_limits_before_creating_a_sess
 
 
 @pytest.mark.asyncio
-async def test_store_uploads_accepts_exact_per_file_and_combined_byte_limits(
+async def test_store_uploads_accepts_exact_upload_count_limits(
     tmp_path: Path,
 ) -> None:
-    personal = upload("profile.md", b"p" * (1024 * 1024))
-    resume = upload(
-        "resume.pdf",
-        b"%PDF-" + b"r" * (10 * 1024 * 1024 - len(b"%PDF-")),
-    )
-    resume_source = upload("resume.tex", b"t" * (256 * 1024))
+    personal, resume = default_uploads()
+    resume_source = upload("resume.tex", b"Resume evidence")
     contexts = [
-        upload(f"context-{index}.txt", b"c" * (1024 * 1024))
-        for index in range(5)
+        upload(f"context-{index}.txt", b"c")
+        for index in range(APPLICATION_CONTEXT_MAX_COUNT)
     ]
     anecdotes = [
-        upload(f"anecdote-{index}.txt", b"a" * (256 * 1024))
-        for index in range(8)
+        upload(f"anecdote-{index}.txt", b"a")
+        for index in range(APPLICATION_ANECDOTE_MAX_COUNT)
     ]
 
-    artifacts = await store_uploads(
+    stored = await store_uploads(
         tmp_path,
         SESSION_ID,
         personal,
@@ -318,31 +373,111 @@ async def test_store_uploads_accepts_exact_per_file_and_combined_byte_limits(
         anecdotes,
     )
 
-    assert artifacts.personal_upload.path.stat().st_size == 1024 * 1024
-    assert artifacts.resume.path.stat().st_size == 10 * 1024 * 1024
-    assert artifacts.resume_source.path.stat().st_size == 256 * 1024
+    assert len(stored.contexts) == APPLICATION_CONTEXT_MAX_COUNT
+    assert len(stored.anecdotes) == APPLICATION_ANECDOTE_MAX_COUNT
+    UploadedArtifacts(
+        session_directory=stored.session_directory,
+        personal_information=stored.personal_upload.path,
+        resume=stored.resume.path,
+        resume_source=stored.resume_source.path,
+        context=tuple(item.path for item in stored.contexts),
+        anecdotes=tuple(item.path for item in stored.anecdotes),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "count"),
+    [
+        ("context", APPLICATION_CONTEXT_MAX_COUNT + 1),
+        ("anecdotes", APPLICATION_ANECDOTE_MAX_COUNT + 1),
+    ],
+)
+def test_uploaded_artifacts_models_reject_counts_above_the_upload_limits(
+    tmp_path: Path,
+    field: str,
+    count: int,
+) -> None:
+    values = {
+        "session_directory": tmp_path,
+        "personal_information": tmp_path / "profile.md",
+        "resume": tmp_path / "resume.pdf",
+        "resume_source": tmp_path / "resume.tex",
+        field: tuple(tmp_path / f"{field}-{index}.txt" for index in range(count)),
+    }
+    with pytest.raises(ValueError):
+        UploadedArtifacts(**values)
+
+
+@pytest.mark.asyncio
+async def test_store_uploads_accepts_exact_per_file_and_combined_byte_limits(
+    tmp_path: Path,
+) -> None:
+    personal = sized_upload(
+        "profile.md",
+        APPLICATION_PROFILE_MAX_BYTES,
+        fill=b" ",
+    )
+    resume = sized_upload(
+        "resume.pdf",
+        APPLICATION_RESUME_MAX_BYTES,
+        prefix=b"%PDF-",
+    )
+    resume_source = sized_upload(
+        "resume.tex",
+        APPLICATION_RESUME_SOURCE_MAX_BYTES,
+    )
+    contexts = [
+        sized_upload(f"context-{index}.txt", APPLICATION_CONTEXT_MAX_BYTES)
+        for index in range(
+            APPLICATION_CONTEXT_TOTAL_MAX_BYTES // APPLICATION_CONTEXT_MAX_BYTES
+        )
+    ]
+    anecdotes = [
+        sized_upload(f"anecdote-{index}.txt", APPLICATION_ANECDOTE_MAX_BYTES)
+        for index in range(
+            APPLICATION_ANECDOTE_TOTAL_MAX_BYTES // APPLICATION_ANECDOTE_MAX_BYTES
+        )
+    ]
+
+    stored = await store_uploads(
+        tmp_path,
+        SESSION_ID,
+        personal,
+        resume,
+        resume_source,
+        contexts,
+        anecdotes,
+    )
+
+    assert stored.personal_upload.path.stat().st_size == APPLICATION_PROFILE_MAX_BYTES
+    assert stored.resume.path.stat().st_size == APPLICATION_RESUME_MAX_BYTES
     assert (
-        sum(item.path.stat().st_size for item in artifacts.contexts)
-        == 5 * 1024 * 1024
+        stored.resume_source.path.stat().st_size
+        == APPLICATION_RESUME_SOURCE_MAX_BYTES
     )
     assert (
-        sum(item.path.stat().st_size for item in artifacts.anecdotes)
-        == 2 * 1024 * 1024
+        sum(item.path.stat().st_size for item in stored.contexts)
+        == APPLICATION_CONTEXT_TOTAL_MAX_BYTES
+    )
+    assert (
+        sum(item.path.stat().st_size for item in stored.anecdotes)
+        == APPLICATION_ANECDOTE_TOTAL_MAX_BYTES
     )
     assert all(
         item.file.closed
         for item in (personal, resume, resume_source, *contexts, *anecdotes)
     )
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("kind", "size"),
     [
-        ("personal", 1024 * 1024 + 1),
-        ("resume", 10 * 1024 * 1024 + 1),
-        ("resume_source", 256 * 1024 + 1),
-        ("context", 1024 * 1024 + 1),
-        ("anecdote", 256 * 1024 + 1),
+        ("personal", APPLICATION_PROFILE_MAX_BYTES + 1),
+        ("resume", APPLICATION_RESUME_MAX_BYTES + 1),
+        ("resume_source", APPLICATION_RESUME_SOURCE_MAX_BYTES + 1),
+        ("context", APPLICATION_CONTEXT_MAX_BYTES + 1),
+        ("anecdote", APPLICATION_ANECDOTE_MAX_BYTES + 1),
     ],
 )
 async def test_store_uploads_enforces_each_per_file_byte_limit(
@@ -353,15 +488,15 @@ async def test_store_uploads_enforces_each_per_file_byte_limit(
     contexts: list[UploadFile] = []
     anecdotes: list[UploadFile] = []
     if kind == "personal":
-        personal = upload("profile.md", b"p" * size)
+        personal = sized_upload("profile.md", size, fill=b" ")
     elif kind == "resume":
-        resume = upload("resume.pdf", b"%PDF-" + b"p" * (size - 5))
+        resume = sized_upload("resume.pdf", size, prefix=b"%PDF-")
     elif kind == "resume_source":
-        resume_source = upload("resume.tex", b"t" * size)
+        resume_source = sized_upload("resume.tex", size)
     elif kind == "context":
-        contexts.append(upload("context.md", b"c" * size))
+        contexts.append(sized_upload("context.md", size))
     else:
-        anecdotes.append(upload("anecdote.txt", b"a" * size))
+        anecdotes.append(sized_upload("anecdote.txt", size))
 
     await expect_invalid_artifacts(
         tmp_path,
@@ -381,15 +516,19 @@ async def test_store_uploads_enforces_combined_byte_limits_without_leaving_parti
     personal, resume = default_uploads()
     if kind == "context":
         contexts = [
-            upload(f"context-{index}.txt", b"c" * (1024 * 1024))
-            for index in range(5)
+            sized_upload(f"context-{index}.txt", APPLICATION_CONTEXT_MAX_BYTES)
+            for index in range(
+                APPLICATION_CONTEXT_TOTAL_MAX_BYTES // APPLICATION_CONTEXT_MAX_BYTES
+            )
         ] + [upload("context-over.txt", b"x")]
         anecdotes: list[UploadFile] = []
     else:
         contexts = []
         anecdotes = [
-            upload(f"anecdote-{index}.txt", b"a" * (256 * 1024))
-            for index in range(8)
+            sized_upload(f"anecdote-{index}.txt", APPLICATION_ANECDOTE_MAX_BYTES)
+            for index in range(
+                APPLICATION_ANECDOTE_TOTAL_MAX_BYTES // APPLICATION_ANECDOTE_MAX_BYTES
+            )
         ] + [upload("anecdote-over.txt", b"x")]
 
     await expect_invalid_artifacts(tmp_path, personal, resume, contexts, anecdotes)

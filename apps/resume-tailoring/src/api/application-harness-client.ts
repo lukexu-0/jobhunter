@@ -27,7 +27,6 @@ import {
   LUNA_MAX_SOURCE_BYTES,
   LUNA_MAX_SOURCE_LINES,
 } from "../models/luna-job-extractor.ts";
-import { ARTIFACT_LIMITS } from "../system/artifacts.ts";
 
 const DEFAULT_HARNESS_ORIGIN = "http://127.0.0.1:8765";
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
@@ -36,6 +35,18 @@ const MAX_SSE_FRAME_BYTES = 8 * 1024 * 1024;
 const UUIDSchema = z.string().uuid();
 const MAX_SOURCE_CAPTURE_RESPONSE_BYTES = LUNA_MAX_SOURCE_BYTES * 6 + 64 * 1_024;
 const TimestampSchema = z.string().datetime({ offset: true });
+
+export const APPLICATION_SESSION_UPLOAD_LIMITS = Object.freeze({
+  profileBytes: 5_242_880,
+  resumePdfBytes: 52_428_800,
+  resumeSourceBytes: 1_310_720,
+  contextFileCount: 50,
+  contextFileBytes: 5_242_880,
+  contextTotalBytes: 26_214_400,
+  anecdoteFileCount: 100,
+  anecdoteFileBytes: 1_310_720,
+  anecdoteTotalBytes: 10_485_760,
+});
 
 export type ApplicationHarnessErrorCode =
   | "session_not_found"
@@ -125,12 +136,9 @@ export interface SourceCaptureCreateInput {
   readonly captureId: string;
   readonly jobUrl: string;
   readonly approvedOrigins: readonly string[];
-  readonly timeoutSeconds: 900;
 }
 
-export interface SourceCaptureCreateResult {
-  readonly expiresAt: number;
-}
+export type SourceCaptureCreateResult = void;
 
 export interface SourceCaptureCompleteResult {
   readonly finalUrl: string;
@@ -211,20 +219,15 @@ const SLOT_RELEASED_STATES: Partial<Record<HarnessSessionState, true>> = {
 
 const RawPlaywrightCliDiagnosticSchema = z.object({
   step: z.number().int().min(1),
-  status: z.enum(["succeeded", "failed", "timed_out"]),
+  status: z.enum(["succeeded", "failed"]),
   exit_code: z.number().int(),
-  timed_out: z.boolean(),
   error_category: z.enum([
     "process_exit",
-    "execution_timeout",
     "browser_runtime",
-    "session_timeout",
   ]).nullable(),
   stderr_excerpt: z.union([
     z.literal("[redacted]"),
-    z.literal("Playwright CLI execution timed out after 120 seconds."),
     z.literal("Browser runtime failed."),
-    z.literal("Application session expired."),
   ]).nullable(),
   stderr_truncated: z.boolean(),
 }).strict();
@@ -500,7 +503,6 @@ const SourceCaptureErrorEnvelopeSchema = z.object({
 const SourceCaptureCreateResponseSchema = z.object({
   capture_id: UUIDSchema,
   state: z.literal("awaiting_human_verification"),
-  expires_at: TimestampSchema,
 }).strict();
 const SourceCaptureCompleteResponseSchema = z.object({
   capture_id: UUIDSchema,
@@ -607,7 +609,7 @@ function isValidResumeSource(value: unknown): value is Uint8Array {
   if (
     !(value instanceof Uint8Array)
     || value.byteLength < 1
-    || value.byteLength > ARTIFACT_LIMITS.tex
+    || value.byteLength > APPLICATION_SESSION_UPLOAD_LIMITS.resumeSourceBytes
   ) return false;
   try {
     new TextDecoder("utf-8", { fatal: true }).decode(value);
@@ -776,7 +778,6 @@ function projectPlaywrightCliDiagnostic(
     step: diagnostic.step,
     status: diagnostic.status,
     exitCode: diagnostic.exit_code,
-    timedOut: diagnostic.timed_out,
     errorCategory: diagnostic.error_category,
     stderrExcerpt: diagnostic.stderr_excerpt,
     stderrTruncated: diagnostic.stderr_truncated,
@@ -1126,10 +1127,10 @@ export class HttpApplicationHarnessClient implements
       || !isHarnessJobUrl(input.jobUrl)
       || typeof input.autoSubmit !== "boolean"
       || profileBytes < 1
-      || profileBytes > 1024 * 1024
+      || profileBytes > APPLICATION_SESSION_UPLOAD_LIMITS.profileBytes
       || !(input.resumePdf instanceof Uint8Array)
       || input.resumePdf.byteLength < 5
-      || input.resumePdf.byteLength > 10 * 1024 * 1024
+      || input.resumePdf.byteLength > APPLICATION_SESSION_UPLOAD_LIMITS.resumePdfBytes
       || String.fromCharCode(...input.resumePdf.subarray(0, 5)) !== "%PDF-"
       || !isValidResumeSource(input.resumeSource)
     ) {
@@ -1340,7 +1341,6 @@ export class HttpApplicationHarnessClient implements
       !captureId.success
       || !jobUrl.success
       || jobUrl.data !== input.jobUrl
-      || input.timeoutSeconds !== 900
       || !Array.isArray(input.approvedOrigins)
       || input.approvedOrigins.length < 1
       || input.approvedOrigins.length > 20
@@ -1361,7 +1361,6 @@ export class HttpApplicationHarnessClient implements
           capture_id: captureId.data,
           job_url: jobUrl.data,
           approved_origins: input.approvedOrigins,
-          timeout_seconds: input.timeoutSeconds,
         }),
       },
       signal,
@@ -1381,7 +1380,7 @@ export class HttpApplicationHarnessClient implements
     if (!created.success || created.data.capture_id !== captureId.data) {
       throw new SourceCaptureHarnessError("ambiguous_result");
     }
-    return { expiresAt: Date.parse(created.data.expires_at) };
+    return;
   }
 
   async completeSourceCapture(

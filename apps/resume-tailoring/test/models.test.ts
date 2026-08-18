@@ -17,13 +17,13 @@ import { inspectResumePng } from "../src/models/visual-inspector";
 import { mapAgentsRequest } from "../src/models/agents-mapping";
 import { MODEL_NAME, OAuthCodexModel, type CodexTransport } from "../src/models/oauth-codex-model";
 import { OAuthCodexModelProvider } from "../src/models/oauth-codex-provider";
+import { ARTIFACT_LIMITS } from "../src/system/artifacts.ts";
 import {
   extractJobDescriptionWithLuna,
   LUNA_MAX_RESPONSE_BYTES,
   LUNA_MAX_SOURCE_BYTES,
   LUNA_MAX_SOURCE_LINES,
   LUNA_MODEL_NAME,
-  LunaJobExtractionError,
   type LunaCompleteTransport,
 } from "../src/models";
 
@@ -898,6 +898,12 @@ describe("direct visual inspector", () => {
   test("rejects non-PNG and non-strict visual inspection results", async () => {
     const neverTransport = async (): Promise<AssistantMessage> => { throw new Error("transport must not run"); };
     await expect(inspectResumePng(new Uint8Array([0xff, 0xd8, 0xff]), "visual", undefined, { transport: neverTransport })).rejects.toThrow("PNG only");
+    await expect(inspectResumePng(
+      new Uint8Array(ARTIFACT_LIMITS.png + 1),
+      "visual",
+      undefined,
+      { transport: neverTransport },
+    )).rejects.toThrow(`PNG must contain 1-${ARTIFACT_LIMITS.png} bytes`);
     await expect(inspectResumePng(png, "visual", undefined, {
       resolverFactory: () => inertResolver(),
       transport: async () => ({
@@ -988,23 +994,19 @@ describe("direct Luna job extractor", () => {
       sessionIdFactory: () => "job-ingestion-fixed",
     });
 
-    const combinedSignal = resolverSignal;
-    if (!combinedSignal) throw new Error("Expected the resolver to receive a combined signal");
+    expect(resolverSignal).toBeUndefined();
     expect(result).toEqual({
       opportunityKind: "job",
       jobDescription: "Senior Engineer at Acme Corporation\nBuild reliable distributed systems with a collaborative product team.",
     });
     expect(optionsSeen).toEqual({
       apiKey: resolver,
-      signal: combinedSignal,
       reasoning: "high" as Effort,
       sessionId: "job-ingestion-fixed",
       preferWebsockets: false,
       loopGuard: { enabled: false },
     });
-    const transportSignal = optionsSeen?.signal;
-    if (!transportSignal) throw new Error("Expected the transport to receive a combined signal");
-    expect(combinedSignal).toBe(transportSignal);
+    expect(optionsSeen?.signal).toBeUndefined();
     expect(contextSeen?.tools).toBeUndefined();
     expect(contextSeen?.systemPrompt).toHaveLength(1);
     expect(contextSeen?.messages).toHaveLength(1);
@@ -1323,7 +1325,6 @@ describe("direct Luna job extractor", () => {
           started.resolve();
           return pending.promise;
         },
-        deadlineMs: 10_000,
       },
     );
     await started.promise;
@@ -1335,44 +1336,36 @@ describe("direct Luna job extractor", () => {
     pending.resolve(lunaAssistant("{\"ranges\":null}"));
   });
 
-  test("hard-deadlines an ignoring transport and sinks its late rejection", async () => {
+  test("does not impose an elapsed deadline on an ignoring transport", async () => {
     const pending = deferred<AssistantMessage>();
-    const unhandled: unknown[] = [];
-    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
-    let resolverSignal: AbortSignal | undefined;
-    let transportSignal: AbortSignal | undefined;
-    process.on("unhandledRejection", onUnhandled);
+    const started = deferred<void>();
+    let settled = false;
     vi.useFakeTimers();
     try {
       const extraction = extractJobDescriptionWithLuna(
-        ["A sufficiently detailed job description source line for timeout."],
+        ["A sufficiently detailed job description source line without an extraction deadline."],
         undefined,
         {
-          resolverFactory: (_provider, _sessionId, _modelId, signal) => {
-            resolverSignal = signal;
-            return inertResolver();
-          },
-          transport: (_model, _context, options) => {
-            transportSignal = options.signal;
+          resolverFactory: () => inertResolver(),
+          transport: () => {
+            started.resolve();
             return pending.promise;
           },
-          deadlineMs: 5,
         },
       );
-      vi.advanceTimersByTime(5);
-      await expect(extraction).rejects.toBeInstanceOf(LunaJobExtractionError);
-      await expect(extraction).rejects.toEqual(expect.objectContaining({
-        kind: "timeout",
-        message: "Luna extraction timed out",
-      }));
-      expect(transportSignal).toBe(resolverSignal);
-      expect(transportSignal?.aborted).toBe(true);
-      pending.reject(new Error("late ignored transport rejection"));
+      void extraction.then(
+        () => { settled = true; },
+        () => { settled = true; },
+      );
+      await started.promise;
+
+      vi.advanceTimersByTime(24 * 60 * 60 * 1_000);
       await Promise.resolve();
-      await Promise.resolve();
-      expect(unhandled).toEqual([]);
+      expect(settled).toBe(false);
+
+      pending.resolve(lunaAssistant("{\"ranges\":null}"));
+      await expect(extraction).resolves.toBeNull();
     } finally {
-      process.off("unhandledRejection", onUnhandled);
       vi.useRealTimers();
     }
   });

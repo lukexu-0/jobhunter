@@ -575,7 +575,6 @@ export const SourceHandoffDtoSchema = z.object({
   id: SourceHandoffIdSchema,
   state: SourceHandoffStateSchema,
   jobUrl: JobUrlSchema,
-  expiresAt: z.number().int().nonnegative().safe(),
 }).strict();
 export type SourceHandoffDto = z.infer<typeof SourceHandoffDtoSchema>;
 
@@ -763,50 +762,35 @@ const PENDING_ACTIONS_BY_STATE: Readonly<
 };
 export const ApplicationPlaywrightCliDiagnosticSchema = z.object({
   step: z.number().int().min(1),
-  status: z.enum(["succeeded", "failed", "timed_out"]),
+  status: z.enum(["succeeded", "failed"]),
   exitCode: z.number().int(),
-  timedOut: z.boolean(),
   errorCategory: z.enum([
     "process_exit",
-    "execution_timeout",
     "browser_runtime",
-    "session_timeout",
   ]).nullable(),
   stderrExcerpt: z.union([
     z.literal("[redacted]"),
-    z.literal("Playwright CLI execution timed out after 120 seconds."),
     z.literal("Browser runtime failed."),
-    z.literal("Application session expired."),
   ]).nullable(),
   stderrTruncated: z.boolean(),
 }).strict().superRefine((diagnostic, context) => {
-  const expectedStatus = diagnostic.timedOut
-    ? "timed_out"
-    : diagnostic.exitCode === 0
-      ? "succeeded"
-      : "failed";
+  const expectedStatus = diagnostic.exitCode === 0 ? "succeeded" : "failed";
   if (diagnostic.status !== expectedStatus) {
     context.addIssue({
       code: "custom",
       path: ["status"],
-      message: "status must match exitCode and timedOut",
+      message: "status must match exitCode",
     });
   }
   let expectedExcerpt: typeof diagnostic.stderrExcerpt = null;
   let validCategory = false;
-  if (diagnostic.errorCategory === "execution_timeout") {
-    expectedExcerpt = "Playwright CLI execution timed out after 120 seconds.";
-    validCategory = diagnostic.timedOut;
-  } else if (diagnostic.errorCategory === "session_timeout") {
-    expectedExcerpt = "Application session expired.";
-    validCategory = diagnostic.timedOut && diagnostic.exitCode === -1;
-  } else if (diagnostic.errorCategory === "browser_runtime") {
+  if (diagnostic.errorCategory === "browser_runtime") {
     expectedExcerpt = "Browser runtime failed.";
-    validCategory = !diagnostic.timedOut && diagnostic.exitCode === -1;
+    validCategory = diagnostic.exitCode === -1;
   } else if (diagnostic.errorCategory === "process_exit") {
-    validCategory = !diagnostic.timedOut && diagnostic.exitCode !== 0;
+    validCategory = diagnostic.exitCode !== 0;
   } else {
-    validCategory = !diagnostic.timedOut && diagnostic.exitCode === 0;
+    validCategory = diagnostic.exitCode === 0;
   }
   if (!validCategory) {
     context.addIssue({

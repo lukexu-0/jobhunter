@@ -7,7 +7,6 @@ import {
   type SourceCaptureHarnessClient,
 } from "../src/api/application-harness-client";
 import {
-  SourceHandoffError,
   SourceHandoffService,
   type SourceHandoffRunService,
 } from "../src/api/source-handoff-service";
@@ -18,7 +17,6 @@ import type {
 
 const HANDOFF_ID = "123e4567-e89b-42d3-a456-426614174000";
 const JOB_URL = "https://jobs.example.test/role";
-const EXPIRES_AT = 1_900_000;
 const REQUEST: CreateSourceHandoffRequest = {
   jobUrl: JOB_URL,
   generateKeywordMap: true,
@@ -49,16 +47,9 @@ function runDto(): RunDto {
   };
 }
 
-async function flushMicrotasks(): Promise<void> {
-  for (let index = 0; index < 8; index += 1) {
-    await Promise.resolve();
-  }
-}
 
 function fixture(overrides: {
   completeResult?: SourceCaptureCompleteResult;
-  expiresAt?: number;
-  now?: () => number;
   createError?: unknown;
   createResult?: Promise<SourceCaptureCreateResult>;
   onCaptureCreate?: () => void;
@@ -104,7 +95,7 @@ function fixture(overrides: {
       overrides.onCaptureCreate?.();
       if (overrides.createError !== undefined) throw overrides.createError;
       if (overrides.createResult !== undefined) return await overrides.createResult;
-      return { expiresAt: overrides.expiresAt ?? EXPIRES_AT };
+      return;
     },
     completeSourceCapture: async (captureId) => {
       calls.events.push("capture-complete");
@@ -128,7 +119,6 @@ function fixture(overrides: {
       runs,
       harness,
       idFactory: () => HANDOFF_ID,
-      now: overrides.now ?? (() => 1_000_000),
     }),
   };
 }
@@ -143,7 +133,6 @@ describe("SourceHandoffService", () => {
       id: HANDOFF_ID,
       state: "awaiting_human_verification",
       jobUrl: JOB_URL,
-      expiresAt: EXPIRES_AT,
     });
     await expect(target.service.get(HANDOFF_ID)).resolves.toEqual(created);
     expect(target.calls).toMatchObject({
@@ -154,7 +143,6 @@ describe("SourceHandoffService", () => {
         captureId: HANDOFF_ID,
         jobUrl: JOB_URL,
         approvedOrigins: ["https://jobs.example.test"],
-        timeoutSeconds: 900,
       }],
       captureCompletes: [],
       capturedSources: [],
@@ -178,7 +166,7 @@ describe("SourceHandoffService", () => {
     disconnected.abort(new DOMException("Response connection was lost", "AbortError"));
     const retryDuringOpen = target.service.create(REQUEST);
 
-    opening.resolve({ expiresAt: EXPIRES_AT });
+    opening.resolve();
     const [created, recovered] = await Promise.all([first, retryDuringOpen]);
     expect(recovered).toEqual(created);
     await expect(target.service.create(REQUEST)).resolves.toEqual(created);
@@ -299,12 +287,10 @@ describe("SourceHandoffService", () => {
     await target.service.delete(HANDOFF_ID);
   });
 
-  test("shares in-flight completion and replays one committed result only through the handoff deadline", async () => {
-    let now = 1_000_000;
+  test("shares in-flight completion and retains one committed result without a lease", async () => {
     const committed = Promise.withResolvers<RunDto>();
     const runStarted = Promise.withResolvers<void>();
     const target = fixture({
-      now: () => now,
       runCreate: async () => {
         runStarted.resolve();
         return await committed.promise;
@@ -327,11 +313,8 @@ describe("SourceHandoffService", () => {
       captureDeletes: [HANDOFF_ID],
     });
 
-    now = EXPIRES_AT;
-    await expect(target.service.complete(HANDOFF_ID)).rejects.toMatchObject({
-      code: "SOURCE_HANDOFF_NOT_FOUND",
-      status: 404,
-    });
+    await Promise.resolve();
+    await expect(target.service.complete(HANDOFF_ID)).resolves.toEqual(runDto());
   });
   test("keeps shared completion alive when one caller disconnects", async () => {
     const firstRequest = new AbortController();
@@ -526,134 +509,8 @@ describe("SourceHandoffService", () => {
     await target.service.close();
   });
 
-  test("expires and cancels the capture before admitting a replacement", async () => {
-    let now = 1_000_000;
-    const target = fixture({
-      expiresAt: 9_000_000,
-      now: () => now,
-    });
-    await target.service.create(REQUEST);
-
-    now = EXPIRES_AT;
-    await expect(target.service.get(HANDOFF_ID)).rejects.toMatchObject({
-      code: "SOURCE_HANDOFF_NOT_FOUND",
-      status: 404,
-    });
-    expect(target.calls.captureDeletes).toEqual([HANDOFF_ID]);
-    await flushMicrotasks();
-    await expect(target.service.create(REQUEST)).resolves.toMatchObject({
-      expiresAt: EXPIRES_AT + 900_000,
-    });
-    await target.service.close();
-  });
-  test("makes expiry authoritative during pre-persistence completion", async () => {
-    let now = 1_000_000;
-    const runStarted = Promise.withResolvers<void>();
-    const target = fixture({
-      now: () => now,
-      runCreate: async (_request, _source, signal) => {
-        if (signal === undefined) throw new Error("missing completion signal");
-        runStarted.resolve();
-        signal.throwIfAborted();
-        return await new Promise<never>((_resolve, reject) => {
-          signal.addEventListener("abort", () => reject(signal.reason), {
-            once: true,
-          });
-        });
-      },
-    });
-    await target.service.create(REQUEST);
-    const completionError = target.service.complete(HANDOFF_ID)
-      .catch((error: unknown) => error);
-    await runStarted.promise;
-
-    now = EXPIRES_AT;
-    await expect(target.service.get(HANDOFF_ID)).rejects.toMatchObject({
-      code: "SOURCE_HANDOFF_NOT_FOUND",
-      status: 404,
-    });
-    await expect(completionError).resolves.toMatchObject({
-      code: "SOURCE_HANDOFF_NOT_FOUND",
-      status: 404,
-    });
-    expect(target.calls.captureDeletes).toEqual([HANDOFF_ID]);
-    expect(target.calls.creates).toBe(1);
-    expect(target.calls.kicks).toBe(0);
-  });
 
 
-  test("makes expiry authoritative while delayed private cleanup still owns the slot", async () => {
-    let now = 1_000_000;
-    const cleanup = Promise.withResolvers<void>();
-    const target = fixture({
-      now: () => now,
-      expiresAt: 9_000_000,
-      deleteResult: cleanup.promise,
-    });
-    await target.service.create(REQUEST);
-    now = EXPIRES_AT;
-
-    let observed: string | undefined;
-    void target.service.get(HANDOFF_ID).then(
-      () => {
-        observed = "resolved";
-      },
-      (error: unknown) => {
-        observed = error instanceof SourceHandoffError ? error.code : "unexpected";
-      },
-    );
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(observed).toBe("SOURCE_HANDOFF_NOT_FOUND");
-    await expect(target.service.complete(HANDOFF_ID)).rejects.toMatchObject({
-      code: "SOURCE_HANDOFF_NOT_FOUND",
-    });
-    await expect(target.service.delete(HANDOFF_ID)).rejects.toMatchObject({
-      code: "SOURCE_HANDOFF_NOT_FOUND",
-    });
-    await expect(target.service.create(REQUEST)).rejects.toMatchObject({
-      code: "SOURCE_HANDOFF_CONFLICT",
-    });
-
-    cleanup.resolve();
-    await cleanup.promise;
-    await flushMicrotasks();
-    await expect(target.service.create(REQUEST)).resolves.toMatchObject({
-      id: HANDOFF_ID,
-    });
-    await target.service.close();
-  });
-  test("retries failed expiry cleanup until private slot release is confirmed", async () => {
-    let now = 1_000_000;
-    const behavior: {
-      deleteError?: unknown;
-      expiresAt: number;
-      now: () => number;
-    } = {
-      deleteError: new SourceCaptureHarnessError("ambiguous_result"),
-      expiresAt: EXPIRES_AT + 900_000,
-      now: () => now,
-    };
-    const target = fixture(behavior);
-    await target.service.create(REQUEST);
-
-    now = EXPIRES_AT;
-    await expect(target.service.get(HANDOFF_ID)).rejects.toMatchObject({
-      code: "SOURCE_HANDOFF_NOT_FOUND",
-    });
-    await flushMicrotasks();
-    expect(target.calls.captureDeletes).toEqual([HANDOFF_ID]);
-
-    delete behavior.deleteError;
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    await flushMicrotasks();
-    expect(target.calls.captureDeletes).toEqual([HANDOFF_ID, HANDOFF_ID]);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    await expect(target.service.create(REQUEST)).resolves.toMatchObject({
-      id: HANDOFF_ID,
-    });
-    await target.service.close();
-  });
 
 
   test("maps private capture failures without persistence or private detail", async () => {
@@ -787,7 +644,7 @@ describe("SourceHandoffService", () => {
     await Promise.resolve();
     expect(closeSettled).toBe(false);
 
-    opening.resolve({ expiresAt: EXPIRES_AT });
+    opening.resolve();
     await expect(creating).rejects.toMatchObject({
       code: "SOURCE_HANDOFF_UNAVAILABLE",
       status: 503,

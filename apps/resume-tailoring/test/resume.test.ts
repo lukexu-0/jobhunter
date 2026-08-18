@@ -31,6 +31,7 @@ import {
   type JobAnalysis,
   type TailoringPlan,
 } from "../src/resume/index.ts";
+import { ARTIFACT_LIMITS } from "../src/system/artifacts.ts";
 import { atsKeywordExtractionFixture, jobAnalysisFixture } from "./job-analysis.fixture.ts";
 
 const baseline = readFileSync(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex"), "utf8");
@@ -1010,6 +1011,6 @@ describe("TeX repair validation", () => {
     expect(() => validateRepairCandidate(malformedMacro, baseline)).toThrow();
     expect(() => validateRepairCandidate(baseline.replace("Alex Example", "Mallory"), baseline)).toThrow(/immutable resume region/i);
     expect(() => validateRepairCandidate(baseline.replace("\\resumeItem{Built a full-stack", "}\\resumeItem{Built a full-stack"), baseline)).toThrow(/unmatched closing brace/i);
-    expect(() => validateRepairCandidate("x".repeat(256 * 1024 + 1), baseline)).toThrow(/256 KiB/i);
+    expect(() => validateRepairCandidate("x".repeat(ARTIFACT_LIMITS.tex + 1), baseline)).toThrow(/524288 byte limit/i);
   });
 });

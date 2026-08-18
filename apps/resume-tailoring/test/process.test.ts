@@ -14,6 +14,7 @@ import {
   type SpawnContract,
   type TrustedProcessRequest,
 } from "../src/system/process.ts";
+import { ARTIFACT_LIMITS } from "../src/system/artifacts.ts";
 
 test("trusts only the fixed document toolchain and headless Chrome", () => {
   expect(TRUSTED_PROGRAMS).toEqual([
@@ -313,6 +314,34 @@ describe.skipIf(process.platform !== "linux")("trusted process TeX environment (
 });
 
 describe("trusted process lifecycle", () => {
+  test("applies the canonical stdout and stderr caps by default", async () => {
+    const output = (size: number): AsyncIterable<Uint8Array> => (async function* () {
+      yield Buffer.alloc(size, 0x78);
+    })();
+    const result = await runTrustedProcess({
+      command: "pdfinfo",
+      args: [],
+      cwd: process.cwd(),
+      timeoutMs: 1_000,
+    }, () => ({
+      pid: 4100,
+      stdout: output(ARTIFACT_LIMITS.stdout + 1),
+      stderr: output(ARTIFACT_LIMITS.stderr + 1),
+      wait: async () => ({ code: 0, signal: null }),
+      kill: async () => undefined,
+    }));
+
+    expect(result.stdout).toMatchObject({
+      bytes: ARTIFACT_LIMITS.stdout + 1,
+      truncated: true,
+    });
+    expect(result.stderr).toMatchObject({
+      bytes: ARTIFACT_LIMITS.stderr + 1,
+      truncated: true,
+    });
+    expect(result.stdout.data.byteLength).toBe(ARTIFACT_LIMITS.stdout);
+    expect(result.stderr.data.byteLength).toBe(ARTIFACT_LIMITS.stderr);
+  });
   test("timeout and abort await process-group death and captured-pipe closure", async () => {
     for (const interrupt of ["timeout", "abort"] as const) {
       const exit = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();

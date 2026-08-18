@@ -119,18 +119,14 @@ _ADDITIONAL_INFO_GATE_RESPONSE_ADAPTER = TypeAdapter(
 )
 _EVENT_LIMIT = 256
 _TOMBSTONE_LIMIT = 32
-_RUNTIME_ACTION_ID_LIMIT = 4096
 _HEARTBEAT_SECONDS = 15.0
 _CLEANUP_RETRY_MAX_SECONDS = 5.0
 _SUBMISSION_UNCERTAIN_WARNING = (
     "The application submission could not be verified. Check the headed browser "
     "if it is still available, then close this session."
 )
-_MAX_APPLICATION_TASK_BYTES = 1024 * 1024
+_MAX_APPLICATION_TASK_BYTES = 5_242_880
 _PLAYWRIGHT_CLI_DIAGNOSTIC_LIMIT = 100
-_PLAYWRIGHT_CLI_TIMEOUT_MESSAGE = (
-    "Playwright CLI execution timed out after 120 seconds."
-)
 _BROWSER_RUNTIME_ERROR_MESSAGE = "Browser runtime failed."
 _SOURCE_CAPTURE_ACTIVE_MESSAGE = "A source capture is already active"
 _SOURCE_CAPTURE_NOT_FOUND_MESSAGE = "Source capture was not found"
@@ -147,7 +143,6 @@ _STEERABLE_SESSION_STATES = frozenset(
         "awaiting_human_review",
     }
 )
-_SESSION_TIMEOUT_DIAGNOSTIC_MESSAGE = "Application session expired."
 _REDACTED_STDERR_EXCERPT = "[redacted]"
 _READ_ONLY_PLAYWRIGHT_CLI_COMMANDS = frozenset(
     {
@@ -209,9 +204,6 @@ class _ApplicationSession:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     closed_event: asyncio.Event = field(default_factory=asyncio.Event)
     request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    runtime_action_ids_seen: set[UUID] = field(default_factory=set)
-    runtime_action_id: UUID | None = None
-    runtime_action_payload: RuntimeActionRequest | None = None
     runtime_action_task: asyncio.Task[RuntimeActionResponse] | None = None
     playwright_cli_action_count: int = 0
     last_successful_inspection_step: int = 0
@@ -252,31 +244,25 @@ class _Tombstone:
 class _SourceCapture:
     request: SourceCaptureCreateRequest
     response: SourceCaptureCreateResponse
-    deadline_monotonic: float
     setup_task: asyncio.Task[Any] | None
     session_directory: Path | None = None
     runtime: PlaywrightCliRuntime | None = None
-    ttl_task: asyncio.Task[None] | None = None
     completion_task: asyncio.Task[SourceCaptureResult] | None = None
     cleanup_task: asyncio.Task[None] | None = None
     terminal_state: Literal[
         "completed",
         "cancelled",
-        "expired",
         "failed",
         "shutdown",
     ] | None = None
     closed_event: asyncio.Event = field(default_factory=asyncio.Event)
     completed_result: SourceCaptureResult | None = None
-    result_expiry_task: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True)
 class _SourceCaptureReplay:
     capture_id: UUID
     result: SourceCaptureResult
-    deadline_monotonic: float
-    expiry_task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,7 +270,6 @@ class _SourceCaptureTombstone:
     state: Literal[
         "completed",
         "cancelled",
-        "expired",
         "failed",
         "shutdown",
     ]
@@ -612,7 +597,6 @@ class ApplicationSessionManager:
                 session_id=session_id,
                 launch=self._browser_launch,
                 session_directory=stored.session_directory,
-                deadline=record.deadline_monotonic,
                 node_executable=self._config.node_executable,
                 cli_script=self._config.playwright_cli_script,
             )
@@ -641,7 +625,6 @@ class ApplicationSessionManager:
                 approved_origins=origins,
                 publish=publish_gate,
                 review_snapshot=review_snapshot,
-                action_timeout=float(self._config.session_timeout),
             )
             if record.final_request is not None:
                 raise asyncio.CancelledError
@@ -754,17 +737,7 @@ class ApplicationSessionManager:
         )
 
     def _clear_source_capture_replay_locked(self) -> None:
-        replay = self._source_capture_replay
         self._source_capture_replay = None
-        if replay is None:
-            return
-        expiry_task = replay.expiry_task
-        if (
-            expiry_task is not None
-            and expiry_task is not asyncio.current_task()
-            and not expiry_task.done()
-        ):
-            expiry_task.cancel()
 
     def _source_capture_replay_result_locked(
         self,
@@ -773,9 +746,6 @@ class ApplicationSessionManager:
         replay = self._source_capture_replay
         if replay is None:
             return None
-        if asyncio.get_running_loop().time() >= replay.deadline_monotonic:
-            self._clear_source_capture_replay_locked()
-            return None
         return replay.result if replay.capture_id == capture_id else None
 
     def _clear_source_capture_completed_result_locked(
@@ -783,52 +753,6 @@ class ApplicationSessionManager:
         record: _SourceCapture,
     ) -> None:
         record.completed_result = None
-        expiry_task = record.result_expiry_task
-        record.result_expiry_task = None
-        if (
-            expiry_task is not None
-            and expiry_task is not asyncio.current_task()
-            and not expiry_task.done()
-        ):
-            expiry_task.cancel()
-
-    def _start_source_capture_result_expiry_locked(
-        self,
-        record: _SourceCapture,
-        result: SourceCaptureResult,
-    ) -> None:
-        self._clear_source_capture_completed_result_locked(record)
-        if asyncio.get_running_loop().time() >= record.deadline_monotonic:
-            return
-        record.completed_result = result
-        record.result_expiry_task = asyncio.create_task(
-            self._expire_source_capture_completed_result(record),
-            name=(
-                "browser-harness-source-capture-result-expiry-"
-                f"{record.request.capture_id}"
-            ),
-        )
-
-    async def _expire_source_capture_completed_result(
-        self,
-        record: _SourceCapture,
-    ) -> None:
-        try:
-            while True:
-                remaining = (
-                    record.deadline_monotonic
-                    - asyncio.get_running_loop().time()
-                )
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(remaining)
-            async with self._lock:
-                if record.result_expiry_task is asyncio.current_task():
-                    self._clear_source_capture_completed_result_locked(
-                        record
-                    )
-        except asyncio.CancelledError:
-            return
 
     def _install_source_capture_replay_locked(
         self,
@@ -837,44 +761,12 @@ class ApplicationSessionManager:
         self._clear_source_capture_replay_locked()
         result = record.completed_result
         self._clear_source_capture_completed_result_locked(record)
-        if (
-            result is None
-            or self._shutting_down
-            or asyncio.get_running_loop().time() >= record.deadline_monotonic
-        ):
+        if result is None or self._shutting_down:
             return
-        replay = _SourceCaptureReplay(
+        self._source_capture_replay = _SourceCaptureReplay(
             capture_id=record.request.capture_id,
             result=result,
-            deadline_monotonic=record.deadline_monotonic,
         )
-        self._source_capture_replay = replay
-        replay.expiry_task = asyncio.create_task(
-            self._expire_source_capture_replay(replay),
-            name=(
-                "browser-harness-source-capture-replay-expiry-"
-                f"{record.request.capture_id}"
-            ),
-        )
-
-    async def _expire_source_capture_replay(
-        self,
-        replay: _SourceCaptureReplay,
-    ) -> None:
-        try:
-            while True:
-                remaining = (
-                    replay.deadline_monotonic
-                    - asyncio.get_running_loop().time()
-                )
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(remaining)
-            async with self._lock:
-                if self._source_capture_replay is replay:
-                    self._clear_source_capture_replay_locked()
-        except asyncio.CancelledError:
-            return
 
     async def create_source_capture(
         self,
@@ -882,7 +774,6 @@ class ApplicationSessionManager:
         capture_id: UUID,
         job_url: str,
         approved_origins: Sequence[str],
-        timeout_seconds: int,
     ) -> SourceCaptureCreateResponse:
         await self.startup()
         try:
@@ -890,7 +781,6 @@ class ApplicationSessionManager:
                 capture_id=capture_id,
                 job_url=job_url,
                 approved_origins=list(approved_origins),
-                timeout_seconds=timeout_seconds,
             )
         except (TypeError, ValueError, ValidationError):
             raise HarnessServiceError(
@@ -899,18 +789,13 @@ class ApplicationSessionManager:
                 "Request is invalid",
             ) from None
 
-        created_at = _now()
         response = SourceCaptureCreateResponse(
             capture_id=request.capture_id,
             state="awaiting_human_verification",
-            expires_at=created_at + timedelta(seconds=request.timeout_seconds),
         )
         record = _SourceCapture(
             request=request,
             response=response,
-            deadline_monotonic=(
-                asyncio.get_running_loop().time() + request.timeout_seconds
-            ),
             setup_task=None,
         )
         setup: asyncio.Task[Any] | None
@@ -953,13 +838,6 @@ class ApplicationSessionManager:
                     )
                 self._clear_source_capture_replay_locked()
                 self._source_capture = record
-                record.ttl_task = asyncio.create_task(
-                    self._expire_source_capture(record),
-                    name=(
-                        "browser-harness-source-capture-ttl-"
-                        f"{request.capture_id}"
-                    ),
-                )
                 record.setup_task = asyncio.create_task(
                     self._setup_source_capture_record(record),
                     name=(
@@ -1003,7 +881,6 @@ class ApplicationSessionManager:
                 session_id=record.request.capture_id,
                 launch=self._browser_launch,
                 session_directory=record.session_directory,
-                deadline=record.deadline_monotonic,
                 node_executable=self._config.node_executable,
                 cli_script=self._config.playwright_cli_script,
             )
@@ -1063,7 +940,6 @@ class ApplicationSessionManager:
         self,
         capture_id: UUID,
     ) -> SourceCaptureResult:
-        cleanup: asyncio.Task[None] | None = None
         completion: asyncio.Task[SourceCaptureResult] | None = None
         replay_available = False
         replay_cleanup: asyncio.Task[None] | None = None
@@ -1090,15 +966,6 @@ class ApplicationSessionManager:
                 record.terminal_state == "completed"
                 and record.completed_result is not None
             ):
-                if (
-                    asyncio.get_running_loop().time()
-                    >= record.deadline_monotonic
-                ):
-                    raise HarnessServiceError(
-                        409,
-                        "source_capture_not_ready",
-                        _SOURCE_CAPTURE_NOT_READY_MESSAGE,
-                    )
                 replay_available = True
                 replay_cleanup = record.cleanup_task
             elif (
@@ -1110,14 +977,6 @@ class ApplicationSessionManager:
                     409,
                     "source_capture_not_ready",
                     _SOURCE_CAPTURE_NOT_READY_MESSAGE,
-                )
-            elif (
-                asyncio.get_running_loop().time()
-                >= record.deadline_monotonic
-            ):
-                cleanup = self._schedule_source_capture_cleanup_locked(
-                    record,
-                    "expired",
                 )
             else:
                 if record.completion_task is None:
@@ -1143,13 +1002,6 @@ class ApplicationSessionManager:
                     _SOURCE_CAPTURE_NOT_READY_MESSAGE,
                 )
             return replay_result
-        if cleanup is not None:
-            await asyncio.shield(cleanup)
-            raise HarnessServiceError(
-                409,
-                "source_capture_not_ready",
-                _SOURCE_CAPTURE_NOT_READY_MESSAGE,
-            )
         assert completion is not None
         try:
             return await asyncio.shield(completion)
@@ -1300,22 +1152,14 @@ class ApplicationSessionManager:
         result: SourceCaptureResult,
     ) -> tuple[asyncio.Task[None], bool]:
         async with self._lock:
-            state: Literal["completed", "expired"] = (
-                "expired"
-                if asyncio.get_running_loop().time()
-                >= record.deadline_monotonic
-                else "completed"
-            )
             cleanup = self._schedule_source_capture_cleanup_locked(
                 record,
-                state,
+                "completed",
             )
             completion_won = record.terminal_state == "completed"
             if completion_won:
-                self._start_source_capture_result_expiry_locked(
-                    record,
-                    result,
-                )
+                self._clear_source_capture_completed_result_locked(record)
+                record.completed_result = result
             if record.completion_task is task:
                 record.completion_task = None
             return cleanup, completion_won
@@ -1326,15 +1170,9 @@ class ApplicationSessionManager:
         task: asyncio.Task[Any] | None,
     ) -> tuple[asyncio.Task[None], bool]:
         async with self._lock:
-            state: Literal["failed", "expired"] = (
-                "expired"
-                if asyncio.get_running_loop().time()
-                >= record.deadline_monotonic
-                else "failed"
-            )
             cleanup = self._schedule_source_capture_cleanup_locked(
                 record,
-                state,
+                "failed",
             )
             if record.completion_task is task:
                 record.completion_task = None
@@ -1347,15 +1185,6 @@ class ApplicationSessionManager:
     ) -> asyncio.Task[None] | None:
         async with self._lock:
             cleanup = record.cleanup_task
-            if (
-                cleanup is None
-                and asyncio.get_running_loop().time()
-                >= record.deadline_monotonic
-            ):
-                cleanup = self._schedule_source_capture_cleanup_locked(
-                    record,
-                    "expired",
-                )
             if record.completion_task is task:
                 record.completion_task = None
             return cleanup
@@ -1385,20 +1214,6 @@ class ApplicationSessionManager:
             if replay is not None and replay.capture_id == capture_id:
                 self._clear_source_capture_replay_locked()
 
-    async def _expire_source_capture(self, record: _SourceCapture) -> None:
-        delay = max(
-            0.0,
-            record.deadline_monotonic - asyncio.get_running_loop().time(),
-        )
-        try:
-            await asyncio.sleep(delay)
-            cleanup = await self._begin_source_capture_cleanup(
-                record,
-                "expired",
-            )
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            return
 
     async def _begin_source_capture_cleanup(
         self,
@@ -1406,7 +1221,6 @@ class ApplicationSessionManager:
         state: Literal[
             "completed",
             "cancelled",
-            "expired",
             "failed",
             "shutdown",
         ],
@@ -1420,7 +1234,6 @@ class ApplicationSessionManager:
         state: Literal[
             "completed",
             "cancelled",
-            "expired",
             "failed",
             "shutdown",
         ],
@@ -1440,13 +1253,6 @@ class ApplicationSessionManager:
         self,
         record: _SourceCapture,
     ) -> None:
-        ttl_task = record.ttl_task
-        if (
-            ttl_task is not None
-            and ttl_task is not asyncio.current_task()
-            and not ttl_task.done()
-        ):
-            ttl_task.cancel()
 
         setup_task = record.setup_task
         if (
@@ -1793,7 +1599,6 @@ class ApplicationSessionManager:
     async def runtime_action(
         self,
         session_id: UUID,
-        action_id: UUID,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse:
         record = self._active
@@ -1810,127 +1615,95 @@ class ApplicationSessionManager:
                     409, "command_conflict", "The session is terminal"
                 )
 
-            task = record.runtime_action_task
-            if action_id in record.runtime_action_ids_seen:
-                if record.runtime_action_id != action_id:
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "The idempotency key is no longer current",
-                    )
-                if record.runtime_action_payload != action:
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "The idempotency key was already used for a different runtime action",
-                    )
-                if task is None:
-                    raise RuntimeError("Runtime action ownership is incomplete")
-            else:
-                if (
-                    len(record.runtime_action_ids_seen)
-                    >= _RUNTIME_ACTION_ID_LIMIT
-                ):
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "The runtime action idempotency key limit was reached",
-                    )
-                if task is not None and not task.done():
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "A runtime action is already pending",
-                    )
-                if record.snapshot.state in {"submitted", "submission_uncertain"}:
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "Only closing the browser is allowed after a submission outcome",
-                    )
-                if (
-                    asyncio.get_running_loop().time()
-                    >= record.deadline_monotonic
-                ):
-                    await self._begin_finalization_locked(
-                        record,
-                        _TerminalRequest("failed", "failed", "session_timeout"),
-                        duplicate_ok=True,
-                    )
-                    raise HarnessServiceError(
-                        504,
-                        "session_timeout",
-                        "The application session expired",
-                    )
-                if (
-                    record.snapshot.state == "starting"
-                    or record.playwright_runtime is None
-                    or record.human_gate is None
-                    or record.request is None
-                ):
-                    raise HarnessServiceError(
-                        409, "command_conflict", "The session is still starting"
-                    )
-                gate = record.human_gate
-                if gate.submission_approved and not isinstance(
-                    action,
-                    (
-                        PlaywrightCliRuntimeAction,
-                        RequestHumanNavigationRuntimeAction,
-                    ),
-                ):
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "Only browser execution and human navigation may run "
-                        "after submission approval",
-                    )
-                auto_submission_approval = (
-                    isinstance(action, RequestHumanReviewRuntimeAction)
-                    and record.request.auto_submit
+            if record.runtime_action_task is not None:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "A runtime action is already pending",
                 )
-                if (
-                    auto_submission_approval
-                    and record.steering_command_pending_epochs
-                ):
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        _COMMAND_CONFLICT_MESSAGE,
-                    )
-                starts_submission = isinstance(
-                    action,
+            if record.snapshot.state in {"submitted", "submission_uncertain"}:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "Only closing the browser is allowed after a submission outcome",
+                )
+            if (
+                asyncio.get_running_loop().time()
+                >= record.deadline_monotonic
+            ):
+                await self._begin_finalization_locked(
+                    record,
+                    _TerminalRequest("failed", "failed", "session_timeout"),
+                    duplicate_ok=True,
+                )
+                raise HarnessServiceError(
+                    504,
+                    "session_timeout",
+                    "The application session expired",
+                )
+            if (
+                record.snapshot.state == "starting"
+                or record.playwright_runtime is None
+                or record.human_gate is None
+                or record.request is None
+            ):
+                raise HarnessServiceError(
+                    409, "command_conflict", "The session is still starting"
+                )
+            gate = record.human_gate
+            if gate.submission_approved and not isinstance(
+                action,
+                (
+                    PlaywrightCliRuntimeAction,
                     RequestHumanNavigationRuntimeAction,
-                ) or (
-                    isinstance(action, PlaywrightCliRuntimeAction)
-                    and action.command not in _READ_ONLY_PLAYWRIGHT_CLI_COMMANDS
+                ),
+            ):
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "Only browser execution and human navigation may run "
+                    "after submission approval",
                 )
-                publish_submission_started = (
-                    gate.submission_approved
-                    and starts_submission
-                    and not record.submission_action_started
+            auto_submission_approval = (
+                isinstance(action, RequestHumanReviewRuntimeAction)
+                and record.request.auto_submit
+            )
+            if (
+                auto_submission_approval
+                and record.steering_command_pending_epochs
+            ):
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    _COMMAND_CONFLICT_MESSAGE,
                 )
-                if publish_submission_started:
-                    record.submission_action_started = True
-                submission_attempt_active = record.submission_action_started
-                record.runtime_action_ids_seen.add(action_id)
-                record.runtime_action_id = action_id
-                record.runtime_action_payload = action
-                record.auto_submission_approval_pending = auto_submission_approval
-                task = asyncio.create_task(
-                    self._run_runtime_action(
-                        record,
-                        action,
-                        submission_attempt_active,
-                        publish_submission_started,
-                    ),
-                    name=(
-                        "browser-harness-runtime-action-"
-                        f"{record.session_id}-{action_id}"
-                    ),
-                )
-                task.add_done_callback(self._consume_runtime_action_result)
-                record.runtime_action_task = task
+            starts_submission = isinstance(
+                action,
+                RequestHumanNavigationRuntimeAction,
+            ) or (
+                isinstance(action, PlaywrightCliRuntimeAction)
+                and action.command not in _READ_ONLY_PLAYWRIGHT_CLI_COMMANDS
+            )
+            publish_submission_started = (
+                gate.submission_approved
+                and starts_submission
+                and not record.submission_action_started
+            )
+            if publish_submission_started:
+                record.submission_action_started = True
+            submission_attempt_active = record.submission_action_started
+            record.auto_submission_approval_pending = auto_submission_approval
+            task = asyncio.create_task(
+                self._run_runtime_action(
+                    record,
+                    action,
+                    submission_attempt_active,
+                    publish_submission_started,
+                ),
+                name=f"browser-harness-runtime-action-{record.session_id}",
+            )
+            task.add_done_callback(self._consume_runtime_action_result)
+            record.runtime_action_task = task
 
         return await asyncio.shield(task)
 
@@ -1968,7 +1741,7 @@ class ApplicationSessionManager:
             if (
                 submission_attempt_active
                 and isinstance(response, PlaywrightCliResultRuntimeActionResponse)
-                and (response.exit_code != 0 or response.timed_out)
+                and response.exit_code != 0
             ):
                 await self._park_submission_uncertain(record)
             return response
@@ -1992,6 +1765,7 @@ class ApplicationSessionManager:
         finally:
             async with record.request_lock:
                 if record.runtime_action_task is current_task:
+                    record.runtime_action_task = None
                     record.auto_submission_approval_pending = False
 
     async def _dispatch_runtime_action(
@@ -2005,6 +1779,7 @@ class ApplicationSessionManager:
             raise HarnessServiceError(
                 409, "command_conflict", "The session is still starting"
             )
+        request = record.request
 
         if isinstance(action, PlaywrightCliRuntimeAction):
             async with record.request_lock:
@@ -2021,7 +1796,7 @@ class ApplicationSessionManager:
                     )
                 public = session_error(error.code)
                 raise HarnessServiceError(
-                    504 if error.code == "session_timeout" else 502,
+                    502,
                     public.code,
                     public.message,
                 ) from None
@@ -2051,7 +1826,7 @@ class ApplicationSessionManager:
                             "submitting" if gate.submission_approved else "running"
                         ),
                     )
-                if result.exit_code == 0 and not result.timed_out:
+                if result.exit_code == 0:
                     record.last_successful_inspection_step = step
                 private_values = gate.redaction_values
                 public_tabs = [
@@ -2757,9 +2532,6 @@ class ApplicationSessionManager:
         async with record.request_lock:
             if record.runtime_action_task is runtime_action_task:
                 record.runtime_action_task = None
-                record.runtime_action_id = None
-                record.runtime_action_payload = None
-                record.runtime_action_ids_seen.clear()
                 record.auto_submission_approval_pending = False
 
         while record.playwright_runtime is not None:
@@ -2917,28 +2689,16 @@ class ApplicationSessionManager:
         outcome: PlaywrightCliExecutionResult | PlaywrightCliRuntimeError,
     ) -> None:
         if isinstance(outcome, PlaywrightCliRuntimeError):
-            session_timed_out = outcome.code == "session_timeout"
             diagnostic = PlaywrightCliDiagnostic(
                 step=step,
-                status="timed_out" if session_timed_out else "failed",
+                status="failed",
                 exit_code=-1,
-                timed_out=session_timed_out,
-                error_category=(
-                    "session_timeout" if session_timed_out else "browser_runtime"
-                ),
-                stderr_excerpt=(
-                    _SESSION_TIMEOUT_DIAGNOSTIC_MESSAGE
-                    if session_timed_out
-                    else _BROWSER_RUNTIME_ERROR_MESSAGE
-                ),
+                error_category="browser_runtime",
+                stderr_excerpt=_BROWSER_RUNTIME_ERROR_MESSAGE,
                 stderr_truncated=False,
             )
         else:
-            if outcome.timed_out:
-                status = "timed_out"
-                error_category = "execution_timeout"
-                stderr_excerpt = _PLAYWRIGHT_CLI_TIMEOUT_MESSAGE
-            elif outcome.exit_code != 0:
+            if outcome.exit_code != 0:
                 status = "failed"
                 error_category = "process_exit"
                 stderr_excerpt = (
@@ -2954,7 +2714,6 @@ class ApplicationSessionManager:
                 step=step,
                 status=status,
                 exit_code=outcome.exit_code,
-                timed_out=outcome.timed_out,
                 error_category=error_category,
                 stderr_excerpt=stderr_excerpt,
                 stderr_truncated=outcome.stderr_truncated,

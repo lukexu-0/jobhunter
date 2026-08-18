@@ -19,17 +19,22 @@ from fastapi import UploadFile
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode, ScalarNode
 
-from .models import DIRECT_FIELD_NAMES, HarnessServiceError
+from .models import (
+    APPLICATION_ANECDOTE_MAX_BYTES,
+    APPLICATION_ANECDOTE_MAX_COUNT,
+    APPLICATION_ANECDOTE_TOTAL_MAX_BYTES,
+    APPLICATION_CONTEXT_MAX_BYTES,
+    APPLICATION_CONTEXT_MAX_COUNT,
+    APPLICATION_CONTEXT_TOTAL_MAX_BYTES,
+    APPLICATION_PROFILE_MAX_BYTES,
+    APPLICATION_RESUME_MAX_BYTES,
+    APPLICATION_RESUME_SOURCE_MAX_BYTES,
+    DIRECT_FIELD_NAMES,
+    HarnessServiceError,
+)
 
 
 _CHUNK_SIZE: Final = 64 * 1024
-_PERSONAL_LIMIT: Final = 1024 * 1024
-_RESUME_LIMIT: Final = 10 * 1024 * 1024
-_RESUME_SOURCE_LIMIT: Final = 256 * 1024
-_CONTEXT_FILE_LIMIT: Final = 1024 * 1024
-_CONTEXT_TOTAL_LIMIT: Final = 5 * 1024 * 1024
-_ANECDOTE_FILE_LIMIT: Final = 256 * 1024
-_ANECDOTE_TOTAL_LIMIT: Final = 2 * 1024 * 1024
 _INVALID_REQUEST_MESSAGE: Final = "Request is invalid"
 _DIRECTORY_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _FILE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -559,7 +564,10 @@ async def store_uploads(
 
     try:
         try:
-            if len(context_uploads) > 10 or len(anecdote_uploads) > 20:
+            if (
+                len(context_uploads) > APPLICATION_CONTEXT_MAX_COUNT
+                or len(anecdote_uploads) > APPLICATION_ANECDOTE_MAX_COUNT
+            ):
                 raise ValueError("too many uploads")
 
             session_descriptor, session_directory = _create_session_directory(
@@ -571,7 +579,7 @@ async def store_uploads(
                 directory_descriptor=session_descriptor,
                 session_directory=session_directory,
                 allowed_suffixes=frozenset({".md"}),
-                maximum_bytes=_PERSONAL_LIMIT,
+                maximum_bytes=APPLICATION_PROFILE_MAX_BYTES,
                 decode_utf8=True,
                 retain_text=True,
             )
@@ -584,7 +592,7 @@ async def store_uploads(
                 directory_descriptor=session_descriptor,
                 session_directory=session_directory,
                 allowed_suffixes=frozenset({".pdf"}),
-                maximum_bytes=_RESUME_LIMIT,
+                maximum_bytes=APPLICATION_RESUME_MAX_BYTES,
                 decode_utf8=False,
                 require_pdf_magic=True,
             )
@@ -593,7 +601,7 @@ async def store_uploads(
                 directory_descriptor=session_descriptor,
                 session_directory=session_directory,
                 allowed_suffixes=frozenset({".tex"}),
-                maximum_bytes=_RESUME_SOURCE_LIMIT,
+                maximum_bytes=APPLICATION_RESUME_SOURCE_MAX_BYTES,
                 decode_utf8=True,
             )
             if resume_source_size < 1:
@@ -608,7 +616,8 @@ async def store_uploads(
                     session_directory=session_directory,
                     allowed_suffixes=frozenset({".md", ".txt"}),
                     maximum_bytes=min(
-                        _CONTEXT_FILE_LIMIT, _CONTEXT_TOTAL_LIMIT - context_total
+                        APPLICATION_CONTEXT_MAX_BYTES,
+                        APPLICATION_CONTEXT_TOTAL_MAX_BYTES - context_total,
                     ),
                     decode_utf8=True,
                 )
@@ -624,7 +633,8 @@ async def store_uploads(
                     session_directory=session_directory,
                     allowed_suffixes=frozenset({".md", ".txt"}),
                     maximum_bytes=min(
-                        _ANECDOTE_FILE_LIMIT, _ANECDOTE_TOTAL_LIMIT - anecdote_total
+                        APPLICATION_ANECDOTE_MAX_BYTES,
+                        APPLICATION_ANECDOTE_TOTAL_MAX_BYTES - anecdote_total,
                     ),
                     decode_utf8=True,
                 )

@@ -1,7 +1,7 @@
 import type { AgentInputItem } from "@openai/agents-core";
 import { parseCodexBridge, type CodexBridge } from "../models/agents-mapping.ts";
-import { MAX_AGENT_TRANSCRIPT_BYTES } from "./runner.ts";
 
+export const MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES = 10_485_760;
 export const APPLICATION_HISTORY_PRUNED_NOTICE: AgentInputItem = Object.freeze({
   role: "user",
   content: [{
@@ -189,7 +189,7 @@ export function projectApplicationHistory(history: readonly AgentInputItem[]): A
     + (pruned ? noticeBytes + (includedIndexes.size === 0 ? 0 : 1) : 0);
 
   for (const [callIndex, resultIndex] of retainedPairs) {
-    if (projectedBytes <= MAX_AGENT_TRANSCRIPT_BYTES) break;
+    if (projectedBytes <= MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES) break;
     if (!pruned) {
       pruned = true;
       projectedBytes += noticeBytes + (includedIndexes.size === 0 ? 0 : 1);
@@ -208,7 +208,7 @@ export function projectApplicationHistory(history: readonly AgentInputItem[]): A
       + (includedIndexes.size === 0 ? 0 : 1);
   }
 
-  if (projectedBytes > MAX_AGENT_TRANSCRIPT_BYTES) {
+  if (projectedBytes > MAX_APPLICATION_AGENT_TRANSCRIPT_BYTES) {
     throw new ApplicationHistoryProjectionError();
   }
 

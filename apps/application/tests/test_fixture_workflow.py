@@ -9,7 +9,7 @@ import subprocess
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 from fastapi import UploadFile
@@ -216,11 +216,7 @@ async def runtime_action(
     session_id: UUID,
     action: Any,
 ) -> Any:
-    return await manager.runtime_action(
-        session_id,
-        uuid4(),
-        action,
-    )
+    return await manager.runtime_action(session_id, action)
 
 
 def _element_ref(dom: str, accessible_name: str) -> str:
@@ -250,14 +246,12 @@ async def _cli(
     )
     assert isinstance(response, PlaywrightCliResultRuntimeActionResponse)
     assert response.exit_code == 0, response.stderr
-    assert response.timed_out is False
     return response
 
 
 async def _human_click(runtime: PlaywrightCliRuntime, element_ref: str) -> None:
-    result = await runtime._invoke("click", [element_ref], timeout=120)
+    result = await runtime._invoke("click", [element_ref])
     assert result.exit_code == 0, result.stderr
-    assert result.timed_out is False
     assert runtime._reported_cli_error(result) is False
 
 

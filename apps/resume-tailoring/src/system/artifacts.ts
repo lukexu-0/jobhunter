@@ -3,7 +3,14 @@ import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-export const ARTIFACT_LIMITS = Object.freeze({ tex: 256 * 1024, stdout: 256 * 1024, stderr: 256 * 1024, log: 1024 * 1024, pdf: 10 * 1024 * 1024, png: 25 * 1024 * 1024 });
+export const ARTIFACT_LIMITS = Object.freeze({
+  tex: 524_288,
+  stdout: 524_288,
+  stderr: 524_288,
+  log: 2_097_152,
+  pdf: 20_971_520,
+  png: 52_428_800,
+});
 
 export interface ArtifactMetadata {
   readonly path: string;
