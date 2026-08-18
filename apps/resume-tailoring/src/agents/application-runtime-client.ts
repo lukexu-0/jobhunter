@@ -501,7 +501,12 @@ export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
 });
 export type RuntimeActionResponse = z.infer<typeof RuntimeActionResponseSchema>;
 
-export type ApplicationRuntimeErrorCode = "step_limit" | "browser_failed" | "model_timeout" | "model_failed";
+export type ApplicationRuntimeErrorCode =
+  | "step_limit"
+  | "browser_failed"
+  | "model_timeout"
+  | "model_failed"
+  | "invalid_request";
 
 function parsedHttpUrl(value: string): URL | undefined {
   try {
@@ -533,6 +538,7 @@ const ERROR_MESSAGES: Readonly<Record<ApplicationRuntimeErrorCode, string>> = {
   browser_failed: "The browser session failed",
   model_timeout: "The model request timed out",
   model_failed: "The model request failed",
+  invalid_request: "Request is invalid",
 };
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -566,6 +572,7 @@ export type ApplicationRuntimeAttemptFailureCategory =
   | "redirect_response"
   | "response_read_error"
   | "http_error"
+  | "invalid_request"
   | "invalid_response";
 
 export interface ApplicationRuntimeAttemptFailureDiagnostic {
@@ -682,6 +689,16 @@ class RetryableApplicationRuntimeFailure extends Error {
     this.name = "RetryableApplicationRuntimeFailure";
     this.category = category;
     this.statusCode = statusCode;
+  }
+}
+
+class ApplicationRuntimeInvalidRequestFailure extends Error {
+  readonly category = "invalid_request" as const;
+  readonly statusCode = 422 as const;
+
+  constructor() {
+    super("invalid_request");
+    this.name = "ApplicationRuntimeInvalidRequestFailure";
   }
 }
 
@@ -806,6 +823,23 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
         return await this.#performAttempt(requestBody, signal, actionId);
       } catch (error) {
         if (signal.aborted) throw signal.reason;
+        if (error instanceof ApplicationRuntimeInvalidRequestFailure) {
+          reportApplicationRuntimeAttemptFailure(
+            this.#diagnosticSink,
+            {
+              event: "application_runtime_attempt_failure",
+              sessionId: this.#sessionId,
+              actionId,
+              actionType: parsedInput.data.type,
+              attempt,
+              maxAttempts: MAX_RUNTIME_ACTION_ATTEMPTS,
+              retrying: false,
+              failureCategory: error.category,
+              statusCode: error.statusCode,
+            },
+          );
+          throw new ApplicationRuntimeError("invalid_request");
+        }
         if (!(error instanceof RetryableApplicationRuntimeFailure)) throw error;
 
         const retrying = attempt < MAX_RUNTIME_ACTION_ATTEMPTS;
@@ -884,6 +918,13 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
     }
     if (!response.ok) {
       const parsedError = RuntimeErrorEnvelopeSchema.safeParse(body);
+      if (
+        response.status === 422
+        && parsedError.success
+        && parsedError.data.code === "invalid_request"
+      ) {
+        throw new ApplicationRuntimeInvalidRequestFailure();
+      }
       if (parsedError.success && parsedError.data.code === "step_limit") {
         throw new ApplicationRuntimeError("step_limit");
       }

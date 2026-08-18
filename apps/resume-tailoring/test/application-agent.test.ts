@@ -2673,6 +2673,7 @@ describe("application agent", () => {
     for (const [runtimeError, expectedCode] of [
       [new ApplicationRuntimeError("step_limit"), "STEP_LIMIT"],
       [new ApplicationRuntimeError("browser_failed"), "BROWSER_FAILED"],
+      [new ApplicationRuntimeError("invalid_request"), "INVALID_REQUEST"],
       [new ApplicationRuntimeError("model_failed"), "MODEL_PROVIDER_FAILED"],
       [new Error("private provider response"), "MODEL_PROVIDER_FAILED"],
     ] as const) {
