@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   CreateRunRequestSchema,
+  CreateSourceHandoffRequestSchema,
+  JOB_DESCRIPTION_MIN_CHARS,
   JobDescriptionSchema,
   type ApplicationStatus,
   type ArtifactDto,
@@ -9,6 +11,7 @@ import {
   type AttemptDto,
   type AttemptStage,
   type CreateRunRequest,
+  type CreateSourceHandoffRequest,
   type RevisionOrigin as PublicRevisionOrigin,
   type OpportunityKind,
   type ResumeIterationListResponse,
@@ -32,12 +35,16 @@ import {
 import { OAuthRequiredError } from "../auth/oauth-only-resolver.ts";
 import {
   extractJobDescriptionWithLuna,
+  LUNA_MAX_SOURCE_BYTES,
+  LUNA_MAX_SOURCE_LINES,
   LunaJobExtractionError,
+  type ExtractedOpportunityDescription,
   type ExtractJobDescription,
 } from "../models/luna-job-extractor.ts";
 import {
   JobSourceError,
   loadJobSourceFromUrl,
+  normalizeJobSourceText,
   validatePublicHttpDestination,
   type LoadedJobSource,
   type LoadJobSource,
@@ -115,6 +122,33 @@ export class RunServiceError extends Error {
     super(message);
     this.name = "RunServiceError";
   }
+}
+
+function normalizeCapturedSource(source: string): readonly string[] {
+  if (
+    typeof source !== "string"
+    || Buffer.byteLength(source, "utf8") > LUNA_MAX_SOURCE_BYTES
+  ) {
+    throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+  }
+  let lineCount = 1;
+  for (let index = 0; index < source.length; index += 1) {
+    const codeUnit = source.charCodeAt(index);
+    if (
+      codeUnit === 10
+      || (codeUnit === 13 && source.charCodeAt(index + 1) !== 10)
+    ) {
+      lineCount += 1;
+      if (lineCount > LUNA_MAX_SOURCE_LINES) {
+        throw new JobSourceError("JOB_SOURCE_TOO_LARGE");
+      }
+    }
+  }
+  const normalized = normalizeJobSourceText(source);
+  if (normalized.length < JOB_DESCRIPTION_MIN_CHARS) {
+    throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+  }
+  return normalized.split("\n");
 }
 
 function sourceSnapshot(snapshot: ContextSnapshot): RunSourceSnapshotInput {
@@ -331,40 +365,9 @@ export class RunApplicationService {
     }
     signal?.throwIfAborted();
 
-    let extracted: { readonly opportunityKind: OpportunityKind; readonly jobDescription: string } | null;
-    if (source.kind === "description") {
-      extracted = source;
-    } else {
-      try {
-        extracted = await this.#extractJobDescription(source.lines, signal, opportunityKind);
-      } catch (error) {
-        if (signal?.aborted) signal.throwIfAborted();
-        if (error instanceof OAuthRequiredError) {
-          throw new RunServiceError(
-            "JOB_EXTRACTION_AUTH_REQUIRED",
-            "Connect OpenAI Codex OAuth before importing this opportunity page",
-            409,
-          );
-        }
-        if (error instanceof LunaJobExtractionError) {
-          if (error.kind === "timeout") {
-            throw new RunServiceError(
-              "JOB_EXTRACTION_TIMEOUT",
-              "Opportunity description extraction timed out",
-              504,
-            );
-          }
-          throw new RunServiceError(
-            "JOB_EXTRACTION_UNAVAILABLE",
-            "Opportunity description extraction failed",
-            502,
-          );
-        }
-        throw error;
-      }
-      signal?.throwIfAborted();
-    }
-    if (extracted === null) throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+    const extracted = source.kind === "description"
+      ? source
+      : await this.#extractSource(source.lines, signal, opportunityKind);
     const validated = JobDescriptionSchema.parse(extracted.jobDescription);
 
     return await this.#persistRun(
@@ -376,6 +379,88 @@ export class RunApplicationService {
       autoSubmit,
       signal,
     );
+  }
+
+  async validateSourceHandoffRequest(
+    request: CreateSourceHandoffRequest,
+    requestSignal?: AbortSignal,
+  ): Promise<CreateSourceHandoffRequest> {
+    requestSignal?.throwIfAborted();
+    const parsedRequest = CreateSourceHandoffRequestSchema.parse(request);
+    await this.#validatePublicJobUrl(parsedRequest.jobUrl, requestSignal);
+    requestSignal?.throwIfAborted();
+    return parsedRequest;
+  }
+
+  async createRunFromCapturedSource(
+    request: CreateSourceHandoffRequest,
+    capturedSource: string,
+    requestSignal?: AbortSignal,
+  ): Promise<RunDto> {
+    requestSignal?.throwIfAborted();
+    const parsedRequest = CreateSourceHandoffRequestSchema.parse(request);
+    await this.#validatePublicJobUrl(parsedRequest.jobUrl, requestSignal);
+    requestSignal?.throwIfAborted();
+    const lines = normalizeCapturedSource(capturedSource);
+    const extracted = await this.#extractSource(
+      lines,
+      requestSignal,
+      parsedRequest.opportunityKind,
+    );
+    requestSignal?.throwIfAborted();
+    return await this.#persistRun(
+      parsedRequest.jobUrl,
+      JobDescriptionSchema.parse(extracted.jobDescription),
+      parsedRequest.opportunityKind ?? extracted.opportunityKind,
+      parsedRequest.generateKeywordMap,
+      parsedRequest.skipReview,
+      parsedRequest.autoSubmit,
+      requestSignal,
+    );
+  }
+
+  async #extractSource(
+    lines: readonly string[],
+    signal: AbortSignal | undefined,
+    opportunityKindHint: OpportunityKind | undefined,
+  ): Promise<ExtractedOpportunityDescription> {
+    let extracted: ExtractedOpportunityDescription | null;
+    try {
+      extracted = await this.#extractJobDescription(
+        lines,
+        signal,
+        opportunityKindHint,
+      );
+    } catch (error) {
+      if (signal?.aborted) signal.throwIfAborted();
+      if (error instanceof OAuthRequiredError) {
+        throw new RunServiceError(
+          "JOB_EXTRACTION_AUTH_REQUIRED",
+          "Connect OpenAI Codex OAuth before importing this opportunity page",
+          409,
+        );
+      }
+      if (error instanceof LunaJobExtractionError) {
+        if (error.kind === "timeout") {
+          throw new RunServiceError(
+            "JOB_EXTRACTION_TIMEOUT",
+            "Opportunity description extraction timed out",
+            504,
+          );
+        }
+        throw new RunServiceError(
+          "JOB_EXTRACTION_UNAVAILABLE",
+          "Opportunity description extraction failed",
+          502,
+        );
+      }
+      throw error;
+    }
+    signal?.throwIfAborted();
+    if (extracted === null) {
+      throw new JobSourceError("JOB_DESCRIPTION_UNAVAILABLE");
+    }
+    return extracted;
   }
 
   async createRunFromDescription(

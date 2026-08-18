@@ -566,6 +566,19 @@ export const RunDtoSchema = z
   .strict();
 export type RunDto = z.infer<typeof RunDtoSchema>;
 
+export const SourceHandoffIdSchema = z.string().uuid();
+
+export const SourceHandoffStateSchema = z.literal("awaiting_human_verification");
+export type SourceHandoffState = z.infer<typeof SourceHandoffStateSchema>;
+
+export const SourceHandoffDtoSchema = z.object({
+  id: SourceHandoffIdSchema,
+  state: SourceHandoffStateSchema,
+  jobUrl: JobUrlSchema,
+  expiresAt: z.number().int().nonnegative().safe(),
+}).strict();
+export type SourceHandoffDto = z.infer<typeof SourceHandoffDtoSchema>;
+
 export const HarnessSessionStateSchema = z.enum([
   "starting",
   "running",
@@ -1193,20 +1206,23 @@ export const JobDescriptionSchema = z
 
 
 export const RunListResponseSchema = z.object({ runs: z.array(RunDtoSchema) }).strict();
-const CreateRunFromUrlRequestSchema = z.object({
+export const CreateSourceHandoffRequestSchema = z.object({
   jobUrl: JobUrlSchema,
   opportunityKind: OpportunityKindSchema.optional(),
   generateKeywordMap: z.boolean().default(true),
   skipReview: z.boolean().default(false),
   autoSubmit: z.boolean().default(false),
 }).strict();
+export type CreateSourceHandoffRequest = z.infer<
+  typeof CreateSourceHandoffRequestSchema
+>;
 const CreateRunFromPastedDetailsRequestSchema = z.object({
   jobTitle: RunIdentityTextSchema,
   jobDescription: JobDescriptionSchema,
   generateKeywordMap: z.boolean().default(true),
 }).strict();
 export const CreateRunRequestSchema = z.union([
-  CreateRunFromUrlRequestSchema,
+  CreateSourceHandoffRequestSchema,
   CreateRunFromPastedDetailsRequestSchema,
 ]);
 export type CreateRunRequest = z.infer<typeof CreateRunRequestSchema>;

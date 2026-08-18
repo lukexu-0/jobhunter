@@ -1,6 +1,8 @@
 import type { ApiError, HealthResponse } from "../contracts";
 export interface ApiRequestContext {
   readonly onRunCreationValidated?: () => void;
+  readonly onSourceHandoffCreationValidated?: () => void;
+  readonly onSourceHandoffCompletionValidated?: () => void;
 }
 
 type ApiRoute = (

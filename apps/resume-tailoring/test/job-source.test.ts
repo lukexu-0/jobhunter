@@ -127,6 +127,88 @@ describe("job source loading", () => {
     })).rejects.toMatchObject({ code: "JOB_DESCRIPTION_UNAVAILABLE" });
   });
 
+  test("rejects a TAL human-verification page instead of returning model fallback", async () => {
+    const body = `<!doctype html>
+      <html lang="en">
+        <head><title>Quick Check Needed</title></head>
+        <body>
+          <main>
+            <h1>Quick Check Needed</h1>
+            <p>We just need to confirm you're a real person. Please check the box below and then click Continue.</p>
+            <p>This quick check helps keep this service secure and ensures visitors can continue to the requested page.</p>
+            <label><input type="checkbox" name="human-verification"> I'm a real person</label>
+            <button type="button">Continue</button>
+          </main>
+        </body>
+      </html>`;
+
+    await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+      fetchImpl: async () => htmlResponse(body),
+      resolveHost: resolvePublic,
+    })).rejects.toMatchObject({
+      code: "JOB_HUMAN_VERIFICATION_REQUIRED",
+      status: 409,
+      message: "Complete this site's human verification in the local browser",
+    });
+  });
+  test("does not classify rendered markers when Chrome's final origin is unavailable", async () => {
+    const shell = "<!doctype html><html><body><div id=\"root\"></div></body></html>";
+    const challenge = `<!doctype html><html><body><main>
+      <h1>Quick Check Needed</h1>
+      <p>We just need to confirm you're a real person. Please check the box below.</p>
+    </main></body></html>`;
+
+    await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+      fetchImpl: async () => htmlResponse(shell),
+      resolveHost: resolvePublic,
+      renderHtml: async () => challenge,
+    })).resolves.toMatchObject({ kind: "model-fallback" });
+  });
+
+  test("does not advertise handoff for HTTP, trailing-dot, or cross-origin submissions", async () => {
+    const challenge = `<!doctype html><html><body><main>
+      <h1>Quick Check Needed</h1>
+      <p>We just need to confirm you're a real person. Please check the box below and continue to the requested opportunity page.</p>
+    </main></body></html>`;
+
+    await expect(loadJobSourceFromUrl("http://jobs.example.test/role", undefined, {
+      fetchImpl: async () => htmlResponse(challenge),
+      resolveHost: resolvePublic,
+    })).resolves.toMatchObject({ kind: "model-fallback" });
+    await expect(loadJobSourceFromUrl("https://jobs.example.test./role", undefined, {
+      fetchImpl: async () => htmlResponse(challenge),
+      resolveHost: resolvePublic,
+    })).resolves.toMatchObject({ kind: "model-fallback" });
+
+
+    let requestCount = 0;
+    await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+      fetchImpl: async () => {
+        requestCount += 1;
+        return requestCount === 1
+          ? new Response(null, {
+              status: 302,
+              headers: { location: "https://careers.example.test/role" },
+            })
+          : htmlResponse(challenge);
+      },
+      resolveHost: resolvePublic,
+    })).resolves.toMatchObject({ kind: "model-fallback" });
+    expect(requestCount).toBe(2);
+  });
+
+  test("requires both TAL markers before changing ordinary fallback classification", async () => {
+    for (const body of [
+      "<main><h1>Quick Check Needed</h1><p>Build reliable systems with a collaborative engineering team.</p></main>",
+      "<main><p>We just need to confirm you're a real person.</p><p>Build reliable systems with a collaborative engineering team.</p></main>",
+    ]) {
+      await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
+        fetchImpl: async () => htmlResponse(body),
+        resolveHost: resolvePublic,
+      })).resolves.toMatchObject({ kind: "model-fallback" });
+    }
+  });
+
   test("renders an unusable IBM careers shell before returning sanitized fallback lines", async () => {
     const terminalUrl = "https://careers.ibm.com/job/software-developer-intern/12345";
     const shell = `<!doctype html>

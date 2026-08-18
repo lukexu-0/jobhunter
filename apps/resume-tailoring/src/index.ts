@@ -12,6 +12,9 @@ import { resolveBrowserHarnessToken } from "./system/harness-token.ts";
 const hostname = "127.0.0.1";
 const DEFAULT_PIPELINE_PORT = 3457;
 const RUN_CREATION_PATH = "/v1/runs";
+const SOURCE_HANDOFF_CREATION_PATH = "/v1/source-handoffs";
+const SOURCE_HANDOFF_COMPLETION_PATH =
+  /^\/v1\/source-handoffs\/[^/]+\/complete$/;
 
 export function resolvePipelinePort(value: string | undefined): number {
   if (value === undefined) return DEFAULT_PIPELINE_PORT;
@@ -42,6 +45,12 @@ export function startPipelineHttpServer(
       const isRunCreation =
         request.method === "POST"
         && url.pathname === RUN_CREATION_PATH;
+      const isSourceHandoffCreation =
+        request.method === "POST"
+        && url.pathname === SOURCE_HANDOFF_CREATION_PATH;
+      const isSourceHandoffCompletion =
+        request.method === "POST"
+        && SOURCE_HANDOFF_COMPLETION_PATH.test(url.pathname);
       if (
         (
           request.method === "POST"
@@ -64,11 +73,29 @@ export function startPipelineHttpServer(
       }
       return app.fetch(
         request,
-        isRunCreation
+        isRunCreation || isSourceHandoffCreation || isSourceHandoffCompletion
           ? {
-              onRunCreationValidated: () => {
-                server.timeout(request, 0);
-              },
+              ...(isRunCreation
+                ? {
+                    onRunCreationValidated: () => {
+                      server.timeout(request, 0);
+                    },
+                  }
+                : {}),
+              ...(isSourceHandoffCreation
+                ? {
+                    onSourceHandoffCreationValidated: () => {
+                      server.timeout(request, 0);
+                    },
+                  }
+                : {}),
+              ...(isSourceHandoffCompletion
+                ? {
+                    onSourceHandoffCompletionValidated: () => {
+                      server.timeout(request, 0);
+                    },
+                  }
+                : {}),
             }
           : undefined,
       );
