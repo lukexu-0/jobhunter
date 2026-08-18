@@ -252,7 +252,6 @@ const RUN_INPUT: ApplicationAgentRunInput = {
   sessionId: "123e4567-e89b-42d3-a456-426614174000",
   runtimeUrl: "http://127.0.0.1:8765",
   task: "Fill the supplied application with direct candidate data.",
-  maxTurns: 40,
   deadlineMs: 60_000,
   autoSubmit: false,
 };
@@ -334,7 +333,6 @@ describe("application agent", () => {
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
       runtimeUrl: "http://127.0.0.1:8765",
       task: "Fill the supplied application.",
-      maxTurns: 40,
       deadlineMs: 60_000,
       autoSubmit: false,
     };
@@ -1569,7 +1567,7 @@ describe("application agent", () => {
       async (agent, input, options) => {
         runnerCalls++;
         expect(input).toBe(RUN_INPUT.task);
-        expect(options.maxTurns).toBe(RUN_INPUT.maxTurns);
+        expect(options.maxTurns).toBeNull();
         expect(options.context).toMatchObject({
           submissionApproved: false,
           submissionActionStarted: false,

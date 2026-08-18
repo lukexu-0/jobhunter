@@ -94,7 +94,6 @@ export const ApplicationAgentRunInputSchema = z.object({
   sessionId: z.string().uuid(),
   runtimeUrl: z.string().refine(isLoopbackHttpOrigin, "must be a loopback HTTP origin"),
   task: utf8Bounded(MAX_APPLICATION_TASK_BYTES),
-  maxTurns: z.number().int().min(1).max(500),
   autoSubmit: z.boolean(),
   deadlineMs: z.number().int().min(1_000).max(86_400_000),
 }).strict();
@@ -1008,7 +1007,7 @@ async function runApplicationAgentWithProfile(
         runner,
         agent,
         input.task,
-        input.maxTurns,
+        null,
         signal,
         input.deadlineMs,
         {

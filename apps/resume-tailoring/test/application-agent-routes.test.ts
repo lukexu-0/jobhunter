@@ -16,7 +16,6 @@ const INPUT = {
   sessionId: "123e4567-e89b-42d3-a456-426614174000",
   runtimeUrl: "http://127.0.0.1:8765",
   task: "Fill the application.",
-  maxTurns: 40,
   deadlineMs: 60_000,
   autoSubmit: false,
 };
@@ -397,6 +396,7 @@ describe("application agent HTTP boundary", () => {
       "{",
       "{\"private\":\"private-invalid-request-body\"",
       JSON.stringify({ ...INPUT, extra: true }),
+      JSON.stringify({ ...INPUT, maxTurns: 40 }),
       JSON.stringify({ ...INPUT, runtimeUrl: "https://example.com" }),
       JSON.stringify({ ...INPUT, deadlineMs: 999 }),
     ];

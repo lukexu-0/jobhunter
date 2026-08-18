@@ -24,7 +24,7 @@ export function bootstrapAgentRuntime(): void {
 }
 
 export interface AgentRunOptions<TContext> {
-  maxTurns: number;
+  maxTurns: number | null;
   signal: AbortSignal;
   context?: TContext;
   callModelInputFilter?: CallModelInputFilter<TContext>;
@@ -112,7 +112,7 @@ export async function runWithDeadline<TContext>(
   runner: AgentRunner,
   agent: Agent<TContext, "text">,
   input: string,
-  maxTurns: number,
+  maxTurns: number | null,
   outerSignal: AbortSignal,
   deadlineMs: number,
   additionalOptions: Pick<

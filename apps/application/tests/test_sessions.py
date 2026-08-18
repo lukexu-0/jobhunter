@@ -6195,7 +6195,6 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
         "opportunity_kind",
         "auto_submit",
         "task",
-        "max_turns",
         "deadline_ms",
     }
     assert call["auto_submit"] is False
@@ -6230,7 +6229,6 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     assert "updated_at" not in call["task"]
     assert task["evidence"][0]["category"] == "resume"
     assert "workflow" not in call["task"].lower()
-    assert call["max_turns"] == 100
     assert 1_000 <= call["deadline_ms"] <= 14_400_000
     assert fakes.order.index("model.check_ready") < fakes.order.index(
         "runtime.factory"
