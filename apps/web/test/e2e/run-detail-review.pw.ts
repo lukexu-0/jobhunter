@@ -1238,6 +1238,163 @@ test("an accepted live projection clears a stale application load failure", asyn
   mock.application = failed;
 });
 
+test("sounds once for each newly actionable application gate after user audio priming", async ({ page }) => {
+  await page.addInitScript(() => {
+    const calls = {
+      audioContextsConstructed: 0,
+      oscillatorStarts: 0,
+    };
+    const audioWindow = window as typeof window & {
+      __webAudioCalls: typeof calls;
+      webkitAudioContext?: typeof AudioContext;
+    };
+    Object.defineProperty(audioWindow, "__webAudioCalls", {
+      configurable: true,
+      value: calls,
+    });
+
+    const nativeOscillatorStart = OscillatorNode.prototype.start;
+    OscillatorNode.prototype.start = function (when?: number): void {
+      calls.oscillatorStarts += 1;
+      nativeOscillatorStart.call(this, when);
+    };
+
+    const NativeAudioContext = window.AudioContext;
+    class ObservableAudioContext extends NativeAudioContext {
+      constructor(options?: AudioContextOptions) {
+        super(options);
+        calls.audioContextsConstructed += 1;
+      }
+    }
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: ObservableAudioContext,
+    });
+    if (audioWindow.webkitAudioContext === NativeAudioContext) {
+      Object.defineProperty(audioWindow, "webkitAudioContext", {
+        configurable: true,
+        value: ObservableAudioContext,
+      });
+    }
+  });
+  await installControlledEventSource(page);
+
+  const running = snapshotFixture({
+    bridgeState: "running",
+    generation: 4,
+    updatedAt: createdAt + 100,
+  });
+  const navigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 4,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public identity check.",
+    },
+    updatedAt: createdAt + 200,
+  });
+  const newerSameNavigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 4,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public identity check.",
+    },
+    updatedAt: createdAt + 300,
+    warnings: ["Newer navigation projection accepted."],
+  });
+  const reconnectReplay = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 4,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public identity check.",
+    },
+    updatedAt: createdAt + 400,
+    warnings: ["Authoritative reconnect replay accepted."],
+  });
+  const review = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    generation: 4,
+    pendingAction: { type: "human_review" },
+    updatedAt: createdAt + 500,
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: running,
+  });
+  const audioCalls = () => page.evaluate(() => (
+    window as typeof window & {
+      __webAudioCalls: {
+        audioContextsConstructed: number;
+        oscillatorStarts: number;
+      };
+    }
+  ).__webAudioCalls);
+  const settleClientEffects = () => page.evaluate(() => new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+  }));
+  const applicationPanel = page.getByRole("region", {
+    name: "Application",
+    exact: true,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(0);
+  await settleClientEffects();
+  expect((await audioCalls()).oscillatorStarts).toBe(0);
+
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  await settleClientEffects();
+  expect((await audioCalls()).oscillatorStarts).toBe(0);
+
+  const initialSourceCount = await controlledEventSourceCount(page);
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("human_navigation_required", navigation, {
+      instruction: "Complete the public identity check.",
+    }),
+    90,
+    initialSourceCount - 1,
+  );
+  await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
+  await expect.poll(async () => (await audioCalls()).oscillatorStarts).toBe(1);
+  expect((await audioCalls()).audioContextsConstructed).toBeGreaterThan(0);
+
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("snapshot", newerSameNavigation, {}),
+    91,
+    initialSourceCount - 1,
+  );
+  await expect(applicationPanel.getByRole("alert", { name: "Application warnings" }))
+    .toHaveText("Newer navigation projection accepted.");
+  await settleClientEffects();
+  expect((await audioCalls()).oscillatorStarts).toBe(1);
+
+  const applicationReadsBeforeReconnect = mock.applicationGetCount;
+  mock.application = reconnectReplay;
+  await emitControlledEventSourceError(page, initialSourceCount - 1);
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThan(applicationReadsBeforeReconnect);
+  await expect(applicationPanel.getByRole("alert", { name: "Application warnings" }))
+    .toHaveText("Authoritative reconnect replay accepted.");
+  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(initialSourceCount);
+  await settleClientEffects();
+  expect((await audioCalls()).oscillatorStarts).toBe(1);
+
+  const reconnectedSourceCount = await controlledEventSourceCount(page);
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("review_required", review, {}),
+    1,
+    reconnectedSourceCount - 1,
+  );
+  await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
+  await expect.poll(async () => (await audioCalls()).oscillatorStarts).toBe(2);
+});
+
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
   const questions = questionFixtures();
   const initial = snapshotFixture({
