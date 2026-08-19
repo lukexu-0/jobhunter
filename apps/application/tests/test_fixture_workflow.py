@@ -216,7 +216,7 @@ async def runtime_action(
     session_id: UUID,
     action: Any,
 ) -> Any:
-    return await manager.runtime_action(session_id, action)
+    return await manager.runtime_model_action(session_id, action)
 
 
 def _element_ref(dom: str, accessible_name: str) -> str:

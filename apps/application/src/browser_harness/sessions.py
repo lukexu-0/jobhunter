@@ -177,6 +177,29 @@ def _redact_playwright_cli_url(
     return redacted if len(redacted) <= BROWSER_URL_MAX_CHARACTERS else "[redacted]"
 
 
+def _public_runtime_action_response(
+    response: RuntimeActionResponse,
+) -> RuntimeActionResponse:
+    if isinstance(
+        response,
+        (
+            AdditionalInfoRuntimeActionResponse,
+            ReviseRuntimeActionResponse,
+        ),
+    ):
+        return ContinueRuntimeActionResponse(type="continue")
+    return response
+
+
+def _private_model_step_url(value: str, fallback: str) -> str:
+    try:
+        sanitized = sanitize_public_url(value)
+        parsed = urlsplit(sanitized)
+        return f"{parsed.scheme}://{parsed.netloc}"
+    except ValueError:
+        return fallback
+
+
 ModelFactory = Callable[[UUID, str, str], PipelineApplicationAgentClient]
 ApplicationRunner = Callable[
     [
@@ -1607,6 +1630,30 @@ class ApplicationSessionManager:
         session_id: UUID,
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse:
+        return await self._runtime_action(
+            session_id,
+            action,
+            expose_applicant_values=False,
+        )
+
+    async def runtime_model_action(
+        self,
+        session_id: UUID,
+        action: RuntimeActionRequest,
+    ) -> RuntimeActionResponse:
+        return await self._runtime_action(
+            session_id,
+            action,
+            expose_applicant_values=True,
+        )
+
+    async def _runtime_action(
+        self,
+        session_id: UUID,
+        action: RuntimeActionRequest,
+        *,
+        expose_applicant_values: bool,
+    ) -> RuntimeActionResponse:
         record = self._active
         if record is None or record.session_id != session_id:
             if session_id in self._tombstones:
@@ -1705,6 +1752,7 @@ class ApplicationSessionManager:
                     action,
                     submission_attempt_active,
                     publish_submission_started,
+                    expose_applicant_values,
                 ),
                 name=f"browser-harness-runtime-action-{record.session_id}",
             )
@@ -1726,6 +1774,7 @@ class ApplicationSessionManager:
         action: RuntimeActionRequest,
         submission_attempt_active: bool,
         publish_submission_started: bool,
+        expose_applicant_values: bool,
     ) -> RuntimeActionResponse:
         current_task = asyncio.current_task()
         try:
@@ -1736,7 +1785,13 @@ class ApplicationSessionManager:
                     "submission_started",
                     {},
                 )
-            response = await self._dispatch_runtime_action(record, action)
+            response = await self._dispatch_runtime_action(
+                record,
+                action,
+                expose_applicant_values,
+            )
+            if not expose_applicant_values:
+                response = _public_runtime_action_response(response)
             if (
                 submission_attempt_active
                 and isinstance(action, RequestHumanNavigationRuntimeAction)
@@ -1778,6 +1833,7 @@ class ApplicationSessionManager:
         self,
         record: _ApplicationSession,
         action: RuntimeActionRequest,
+        expose_applicant_values: bool,
     ) -> RuntimeActionResponse:
         runtime = record.playwright_runtime
         gate = record.human_gate
@@ -1792,7 +1848,11 @@ class ApplicationSessionManager:
                 record.playwright_cli_action_count += 1
                 step = record.playwright_cli_action_count
             try:
-                result = await runtime.execute(action.command, action.args)
+                result = await runtime.execute(
+                    action.command,
+                    action.args,
+                    expose_applicant_values=expose_applicant_values,
+                )
             except PlaywrightCliRuntimeError as error:
                 async with record.request_lock:
                     self._append_playwright_cli_diagnostic(
@@ -1824,16 +1884,40 @@ class ApplicationSessionManager:
                     "submission_uncertain",
                     "closed",
                 }:
+                    current_url = (
+                        _private_model_step_url(
+                            result.observation.url,
+                            record.snapshot.job_url,
+                        )
+                        if expose_applicant_values
+                        else result.observation.url
+                    )
                     await self._agent_step(
                         record,
                         step,
-                        result.observation.url,
+                        current_url,
                         state=(
                             "submitting" if gate.submission_approved else "running"
                         ),
                     )
                 if result.exit_code == 0:
                     record.last_successful_inspection_step = step
+                if expose_applicant_values:
+                    model_observation = result.observation.model_copy(
+                        update={
+                            "screenshot": (
+                                None
+                                if gate.screenshots_suppressed
+                                else result.observation.screenshot
+                            ),
+                        }
+                    )
+                    return PlaywrightCliResultRuntimeActionResponse(
+                        type="playwright_cli_result",
+                        **result.model_copy(
+                            update={"observation": model_observation}
+                        ).model_dump(),
+                    )
                 private_values = gate.redaction_values
                 public_tabs = [
                     tab.model_copy(

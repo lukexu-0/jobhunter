@@ -351,8 +351,13 @@ class FakePlaywrightRuntime:
             raise self.start_error
 
     async def execute(
-        self, command: str, args: Sequence[str]
+        self,
+        command: str,
+        args: Sequence[str],
+        *,
+        expose_applicant_values: bool = False,
     ) -> PlaywrightCliExecutionResult:
+        del expose_applicant_values
         self.active_task = asyncio.current_task()
         self.commands.append((command, list(args)))
         self.started.set()
@@ -1208,7 +1213,7 @@ async def runtime_action(
     session_id: UUID,
     action: Any,
 ) -> Any:
-    return await manager.runtime_action(session_id, action)
+    return await manager.runtime_model_action(session_id, action)
 
 
 def decode_frame(frame: str) -> dict[str, Any]:
@@ -4090,7 +4095,7 @@ async def test_runtime_playwright_cli_actions_have_no_count_limit(
     await manager.delete(created.session_id)
 
 
-async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
+async def test_runtime_action_separates_public_and_model_results(
     tmp_path: Path,
 ) -> None:
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
@@ -4104,12 +4109,15 @@ async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
     execution = playwright_execution_result(private_url)
     execution = execution.model_copy(
         update={
+            "stdout": f"output {PROFILE_SECRET}",
+            "stderr": f"stderr {PROFILE_SECRET}",
             "observation": execution.observation.model_copy(
                 update={
+                    "title": f"Application {PROFILE_SECRET}",
                     "tabs": [
                         BrowserTab(
                             url=private_url,
-                            title="Application",
+                            title=f"Application {PROFILE_SECRET}",
                             tab_id="tab-1",
                         ),
                         BrowserTab(
@@ -4118,22 +4126,20 @@ async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
                             tab_id="tab-2",
                         ),
                     ],
+                    "dom": f"Application form for {PROFILE_SECRET}",
                     "page_info": {"url": private_url},
                 }
-            )
+            ),
         }
     )
     record.playwright_runtime = FakePlaywrightRuntime(result=execution)
 
-    response = await runtime_action(
-        manager,
-        created.session_id,
-        PlaywrightCliRuntimeAction(
-            type="playwright_cli",
-            command="snapshot",
-            args=[],
-        ),
+    action = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="snapshot",
+        args=[],
     )
+    response = await manager.runtime_action(created.session_id, action)
 
     assert isinstance(response, PlaywrightCliResultRuntimeActionResponse)
     assert response.observation.url == "https://jobs.example/openings/[redacted]"
@@ -4143,6 +4149,18 @@ async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
     serialized = response.model_dump_json()
     assert PROFILE_SECRET not in serialized
     assert "candidate=private" not in serialized
+
+    private_response = await manager.runtime_model_action(
+        created.session_id,
+        action,
+    )
+    private_serialized = private_response.model_dump_json()
+    assert PROFILE_SECRET in private_serialized
+    assert "candidate=private" in private_serialized
+    assert private_response.observation.page_info == {"url": private_url}
+    public_events = "".join(event.model_dump_json() for event in record.events)
+    assert PROFILE_SECRET not in public_events
+    assert "candidate=private" not in public_events
     await manager.delete(created.session_id)
 
 
@@ -4179,8 +4197,7 @@ async def test_runtime_playwright_cli_result_rebounds_expanded_redactions(
     )
     record.playwright_runtime = FakePlaywrightRuntime(result=execution)
 
-    response = await runtime_action(
-        manager,
+    response = await manager.runtime_action(
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -4672,6 +4689,9 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
         None,
     ]
     assert raw_answer_value not in response.model_dump_json()
+    public_response = sessions_module._public_runtime_action_response(response)
+    assert public_response == ContinueRuntimeActionResponse(type="continue")
+    assert answer_value not in public_response.model_dump_json()
     assert manager.get_snapshot(created.session_id).state == "running"
     assert manager.get_snapshot(created.session_id).pending_action is None
     saved = record.events[-1]
@@ -5115,10 +5135,7 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
         PlaywrightCliRuntimeAction(type="playwright_cli", command="click", args=["#final-submit"]),
     )
     assert isinstance(first, PlaywrightCliResultRuntimeActionResponse)
-    assert first.observation.url == "https://jobs.example/openings/42"
-    assert first.observation.tabs == []
-    assert first.observation.page_info is None
-    assert "?private=value" not in first.model_dump_json()
+    assert first.observation == first_execution.observation
     assert manager.get_snapshot(created.session_id).state == "submitting"
 
     second = await runtime_action(
@@ -5128,9 +5145,7 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
     )
     assert isinstance(second, PlaywrightCliResultRuntimeActionResponse)
     assert second.observation.url == "about:blank"
-    assert second.observation.tabs == []
-    assert second.observation.page_info is None
-    assert "?private=value" not in second.model_dump_json()
+    assert second.observation == second_execution.observation
     assert manager.get_snapshot(created.session_id).state == "submitting"
     assert runtime.commands == [('click', ['#final-submit']), ('snapshot', [])]
     assert record.playwright_cli_action_count == 2
@@ -5466,9 +5481,13 @@ async def test_submit_latch_wins_a_queued_cancel_race(
 
     completed = await submission
     assert isinstance(completed, PlaywrightCliResultRuntimeActionResponse)
-    assert completed.observation.url == "https://jobs.example/openings/42"
+    assert completed.observation.url == (
+        "https://jobs.example/openings/42?private=value"
+    )
     assert completed.observation.tabs == []
-    assert completed.observation.page_info is None
+    assert completed.observation.page_info == {
+        "url": "https://jobs.example/openings/42?private=value"
+    }
     await cancellation
     await wait_state(manager, created.session_id, "submission_uncertain")
     assert record.finalized is False
@@ -5531,7 +5550,9 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     completed = await submission
     assert isinstance(completed, PlaywrightCliResultRuntimeActionResponse)
     assert completed.observation.tabs == []
-    assert completed.observation.page_info is None
+    assert completed.observation.page_info == {
+        "url": "https://jobs.example/openings/42?private=value"
+    }
     await expiry
     await wait_state(manager, created.session_id, "closed")
     tombstone = manager._tombstones[created.session_id]
@@ -5594,7 +5615,9 @@ async def test_submit_latch_wins_a_queued_model_failure(
     completed = await submission
     assert isinstance(completed, PlaywrightCliResultRuntimeActionResponse)
     assert completed.observation.tabs == []
-    assert completed.observation.page_info is None
+    assert completed.observation.page_info == {
+        "url": "https://jobs.example/openings/42?private=value"
+    }
     await wait_state(manager, created.session_id, "submission_uncertain")
     assert record.finalized is False
     assert fakes.runtimes[0].commands == [
@@ -6274,7 +6297,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
 
 
 @pytest.mark.asyncio
-async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screenshots(
+async def test_transient_sign_in_exposes_model_output_but_keeps_public_state_sanitized(
     tmp_path: Path,
 ) -> None:
     tmp_path.chmod(0o700)
@@ -6369,8 +6392,7 @@ async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screens
         page_info={"username": username},
         screenshot={"data": "c2VjcmV0LXNjcmVlbnNob3Q="},
     ),)
-    later = await runtime_action(
-        manager,
+    later = await manager.runtime_model_action(
         created.session_id,
         PlaywrightCliRuntimeAction(
             type="playwright_cli",
@@ -6379,11 +6401,10 @@ async def test_transient_sign_in_redacts_all_later_output_and_suppresses_screens
         ),
     )
     dumped = later.model_dump_json()
-    assert username not in dumped
-    assert password not in dumped
-    assert "[redacted]" in dumped
+    assert username in dumped
+    assert password in dumped
     assert later.observation.screenshot is None
-    assert later.observation.page_info is None
+    assert later.observation.page_info == {"username": username}
     snapshot_dump = manager.get_snapshot(created.session_id).model_dump_json()
     assert username not in snapshot_dump
     assert password not in snapshot_dump

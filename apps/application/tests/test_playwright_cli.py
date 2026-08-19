@@ -214,12 +214,12 @@ def test_private_redaction_fragments_match_pinned_yaml_and_json_escaping() -> No
     assert quote("雪", safe="") in fragments
 
 @pytest.mark.asyncio
-async def test_private_observation_redacts_before_public_field_limits(
+async def test_model_observation_keeps_applicant_values_within_field_limits(
     session_dir: Path,
     cli_script: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    password = "😀" * 4_096
+    password = "😀" * 64
     username = "U" * 320
     mixed_secret = "mixed😀"
     literal_percent_secret = "secret%aFword"
@@ -292,20 +292,35 @@ async def test_private_observation_redacts_before_public_field_limits(
     assert playwright_cli._MAX_TITLE_CAPTURE_CHARS == 8_192
     assert metadata.url == raw_url
     assert metadata.tabs[0][0] == raw_url
-    assert encoded_password not in metadata.url
-    assert metadata.title == "x[redacted]"
-    assert metadata.tabs[0][1] == "x[redacted]"
+    assert encoded_password in metadata.url
+    assert metadata.title == raw_title
+    assert metadata.tabs[0][1] == raw_title
 
-    public_url = runtime._public_redacted_url(metadata.url)
-    assert len(public_url) <= playwright_cli._MAX_URL_CHARS
-    assert password not in public_url
-    assert encoded_password not in public_url
-    assert public_url == "https://example.com/[redacted]"
+    boundary_title = f"{'x' * 4_080}{password}"
+    runtime._set_applicant_redaction_enabled(True)
+    public_boundary_title = runtime._redact_bounded_text(
+        boundary_title,
+        playwright_cli._MAX_TITLE_CHARS,
+    )
+    assert password not in public_boundary_title
+    assert public_boundary_title.endswith("[redacted]")
+    runtime._set_applicant_redaction_enabled(False)
+    model_boundary_title = runtime._redact_bounded_text(
+        boundary_title,
+        playwright_cli._MAX_TITLE_CHARS,
+    )
+    assert "😀" in model_boundary_title
+    assert "[redacted]" not in model_boundary_title
+
+    model_url = runtime._public_redacted_url(metadata.url)
+    assert len(model_url) <= playwright_cli._MAX_URL_CHARS
+    assert encoded_password in model_url
+    assert model_url == raw_url
     double_encoded_url = (
         f"https://example.com/?secret={double_encoded_secret}"
     )
     assert runtime._public_redacted_url(double_encoded_url).endswith(
-        "secret=[redacted]"
+        f"secret={double_encoded_secret}"
     )
 
     double_encoded_with_incomplete_suffix = f"{double_encoded_url}%F"
@@ -322,11 +337,11 @@ async def test_private_observation_redacts_before_public_field_limits(
     mixed_encoded_secret = quote(mixed_secret, safe="").replace("%F0", "%f0")
     mixed_url = f"https://example.com/?secret={mixed_encoded_secret}"
     assert runtime._public_redacted_url(mixed_url).endswith(
-        "secret=[redacted]"
+        f"secret={mixed_encoded_secret}"
     )
     literal_url = f"https://example.com/?secret={literal_percent_secret}"
     assert runtime._public_redacted_url(literal_url).endswith(
-        "secret=[redacted]"
+        f"secret={literal_percent_secret}"
     )
 
     repeated_title = (
@@ -336,8 +351,8 @@ async def test_private_observation_redacts_before_public_field_limits(
         repeated_title,
         playwright_cli._MAX_TITLE_CHARS,
     )
-    assert password not in redacted_repeated_title
-    assert len(redacted_repeated_title) <= playwright_cli._MAX_TITLE_CHARS
+    assert password in redacted_repeated_title
+    assert "[redacted]" not in redacted_repeated_title
 
     combined_title = (
         f"{'x' * 3_900}{username}{password}"
@@ -346,8 +361,8 @@ async def test_private_observation_redacts_before_public_field_limits(
         combined_title,
         playwright_cli._MAX_TITLE_CHARS,
     )
-    assert username not in redacted_combined_title
-    assert password not in redacted_combined_title
+    assert "U" * 100 in redacted_combined_title
+    assert "[redacted]" not in redacted_combined_title
     assert len(redacted_combined_title) <= playwright_cli._MAX_TITLE_CHARS
 
     serialized_password = json.dumps(password)[1:-1]
@@ -362,8 +377,8 @@ async def test_private_observation_redacts_before_public_field_limits(
         stderr_truncated=False,
     )
     inline_dom = runtime._snapshot_from_execution(inline, remove_file=True)
-    assert serialized_password not in inline_dom
-    assert "[redacted]" in inline_dom
+    assert serialized_password in inline_dom
+    assert "[redacted]" not in inline_dom
     assert len(inline_dom) <= playwright_cli._MAX_DOM_CHARS
 
     artifact_path = runtime._internal_directory / "boundary.yml"
@@ -372,8 +387,8 @@ async def test_private_observation_redacts_before_public_field_limits(
         artifact_path,
         playwright_cli._MAX_DOM_CHARS,
     )
-    assert serialized_password not in file_dom
-    assert "[redacted]" in file_dom
+    assert serialized_password in file_dom
+    assert "[redacted]" not in file_dom
     assert len(file_dom) <= playwright_cli._MAX_DOM_CHARS
 
     invalid_utf8_path = runtime._internal_directory / "invalid-utf8.yml"
@@ -396,6 +411,12 @@ async def test_private_observation_redacts_before_public_field_limits(
     for _ in range(100):
         assert runtime._redact_bounded_text("public", 4_096) == "public"
     assert time.monotonic() - started < 2
+    redacted_infrastructure = runtime._redact_bounded_text(
+        f"public {session_dir}",
+        4_096,
+    )
+    assert str(session_dir) not in redacted_infrastructure
+    assert "[redacted]" in redacted_infrastructure
     assert not hasattr(runtime, "_private_redaction_prefixes")
 
     await runtime.close()
@@ -1702,7 +1723,7 @@ async def test_private_restore_keeps_secret_url_out_of_argv_and_memfd_on_disk(
 
 
 @pytest.mark.asyncio
-async def test_save_origin_verification_redacts_cached_modal_fallback_metadata(
+async def test_save_origin_verification_keeps_applicant_modal_metadata_for_model(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
@@ -1759,24 +1780,25 @@ async def test_save_origin_verification_redacts_cached_modal_fallback_metadata(
     cli_script=cli_script,)
     await runtime.start("https://example.com/login")
     await runtime.suppress_private_capture()
-    metadata_title = f"{'x' * 4_080}{username}{password}"
+    metadata_title = f"Welcome {username} {password}"
 
     verified = await runtime.verify_origin_and_activate_private_values(
         "https://example.com",
         (username, password),
     )
     modal_observation = True
-    result = await runtime.execute("click", ["e1"])
+    result = await runtime.execute(
+        "click",
+        ["e1"],
+        expose_applicant_values=True,
+    )
 
     assert verified == "https://example.com"
     dumped = result.model_dump_json()
-    assert username not in dumped
-    assert password not in dumped
-    assert len(result.observation.title) <= 4_096
-    assert result.observation.title == f"{'x' * 4_080}[redacted]"
-    assert result.observation.tabs[0].title == (
-        f"{'x' * 4_080}[redacted]"
-    )
+    assert username in dumped
+    assert password in dumped
+    assert result.observation.title == metadata_title
+    assert result.observation.tabs[0].title == metadata_title
 
     await runtime.close()
 
@@ -4048,7 +4070,7 @@ async def test_not_open_close_retains_ownership_when_daemon_survives(
 
 
 @pytest.mark.asyncio
-async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshots(
+async def test_private_sign_in_fills_refs_exposes_model_values_and_disables_screenshots(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
@@ -4248,19 +4270,22 @@ async def test_private_sign_in_fills_refs_redacts_values_and_disables_screenshot
     assert not runtime._artifact_monitor_task.done()
 
     invocations.clear()
-    result = await runtime.execute("snapshot", [])
-    assert result.stdout == "[redacted]"
-    assert result.stderr == "[redacted]"
+    result = await runtime.execute(
+        "snapshot",
+        [],
+        expose_applicant_values=True,
+    )
+    assert result.stdout != "[redacted]"
+    assert result.stderr != "[redacted]"
     assert result.stdout_truncated is False
     assert result.stderr_truncated is False
     assert result.exit_code == 7
     dumped = result.model_dump_json()
-    assert username not in dumped
-    assert password not in dumped
-    assert yaml_key_fragment not in dumped
-    assert yaml_value_fragment not in dumped
-    assert "[redacted]" in result.observation.title
-    assert "[redacted]" in result.observation.dom
+    assert result.observation.title == f"Welcome {username}"
+    assert result.observation.tabs[0].title == f"Account {password}"
+    assert yaml_key_fragment in result.observation.dom
+    assert yaml_value_fragment in result.observation.dom
+    assert "[redacted]" not in result.observation.dom
     assert result.observation.screenshot is None
     observation_scripts = [
         invocation[4]

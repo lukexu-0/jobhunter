@@ -138,6 +138,9 @@ class FakeSessionService:
     runtime_action_calls: list[tuple[UUID, RuntimeActionRequest]] = field(
         default_factory=list
     )
+    runtime_model_action_calls: list[tuple[UUID, RuntimeActionRequest]] = field(
+        default_factory=list
+    )
     runtime_action_response: RuntimeActionResponse = field(
         default_factory=lambda: ContinueRuntimeActionResponse(type="continue")
     )
@@ -275,6 +278,16 @@ class FakeSessionService:
         if session_id != SESSION_ID:
             raise HarnessServiceError(404, "session_not_found", "Session not found")
         self.runtime_action_calls.append((session_id, action))
+        return self.runtime_action_response
+
+    async def runtime_model_action(
+        self,
+        session_id: UUID,
+        action: RuntimeActionRequest,
+    ) -> RuntimeActionResponse:
+        if session_id != SESSION_ID:
+            raise HarnessServiceError(404, "session_not_found", "Session not found")
+        self.runtime_model_action_calls.append((session_id, action))
         return self.runtime_action_response
 
     async def delete(self, session_id: UUID) -> None:
@@ -2163,6 +2176,31 @@ async def test_runtime_action_endpoint_dispatches_strict_typed_actions_without_e
     dispatched_id, dispatched = service.runtime_action_calls[0]
     assert dispatched_id == SESSION_ID
     assert isinstance(dispatched, action_type)
+
+
+async def test_runtime_model_action_endpoint_dispatches_private_model_action(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    payload = {
+        "type": "playwright_cli",
+        "command": "snapshot",
+        "args": [],
+    }
+
+    response = await client.post(
+        f"/v1/sessions/{SESSION_ID}/runtime/model-actions",
+        headers=AUTHORIZATION,
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"type": "continue"}
+    assert response.headers["cache-control"] == "no-store"
+    assert len(service.runtime_model_action_calls) == 1
+    dispatched_id, dispatched = service.runtime_model_action_calls[0]
+    assert dispatched_id == SESSION_ID
+    assert isinstance(dispatched, PlaywrightCliRuntimeAction)
 
 
 async def test_request_sign_in_endpoint_returns_only_attempt_status(

@@ -677,7 +677,7 @@ export class HttpApplicationRuntimeClient implements ApplicationRuntimeClient {
     ) {
       throw new ApplicationRuntimeError("model_failed");
     }
-    this.#endpoint = `${runtimeOrigin}/v1/sessions/${sessionId}/runtime/actions`;
+    this.#endpoint = `${runtimeOrigin}/v1/sessions/${sessionId}/runtime/model-actions`;
     this.#bearerToken = bearerToken;
     this.#fetch = fetchImpl;
   }

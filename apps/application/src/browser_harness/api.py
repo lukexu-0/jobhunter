@@ -83,6 +83,12 @@ class HarnessSessionService(Protocol):
         action: RuntimeActionRequest,
     ) -> RuntimeActionResponse: ...
 
+    async def runtime_model_action(
+        self,
+        session_id: UUID,
+        action: RuntimeActionRequest,
+    ) -> RuntimeActionResponse: ...
+
     async def delete(self, session_id: UUID) -> None: ...
 
     async def shutdown(self) -> None: ...
@@ -325,6 +331,19 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         action: Annotated[RuntimeActionRequest, Body(discriminator="type")],
     ) -> RuntimeActionResponse:
         return await dependencies.sessions.runtime_action(session_id, action)
+
+    @app.post(
+        "/v1/sessions/{session_id}/runtime/model-actions",
+        response_model=RuntimeActionResponse,
+    )
+    async def runtime_model_action(
+        session_id: UUID,
+        action: Annotated[RuntimeActionRequest, Body(discriminator="type")],
+    ) -> RuntimeActionResponse:
+        return await dependencies.sessions.runtime_model_action(
+            session_id,
+            action,
+        )
 
 
     @app.delete("/v1/sessions/{session_id}", status_code=204)

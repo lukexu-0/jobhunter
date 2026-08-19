@@ -1615,6 +1615,8 @@ class PlaywrightCliRuntime:
             raise
         self._environment = self._build_environment()
         self._private_values = self._build_private_values()
+        self._applicant_values: tuple[str, ...] = ()
+        self._applicant_redaction_enabled = False
         self._refresh_private_redaction_values()
 
     async def activate_private_values(self, values: Iterable[str]) -> None:
@@ -1774,23 +1776,32 @@ class PlaywrightCliRuntime:
             raise PlaywrightCliRuntimeError("browser_failed")
 
     def _activate_private_values_unlocked(self, values: Iterable[str]) -> None:
-        private_values = set(self._private_values)
-        original_count = len(private_values)
-        for value in values:
-            if isinstance(value, str) and value:
-                private_values.add(value)
-        if len(private_values) != original_count:
-            self._private_values = tuple(
-                sorted(private_values, key=len, reverse=True)
-            )
-            self._refresh_private_redaction_values()
-            self._current_metadata = None
+        applicant_values = set(self._applicant_values)
+        applicant_values.update(
+            value for value in values if isinstance(value, str) and value
+        )
+        self._applicant_values = tuple(
+            sorted(applicant_values, key=len, reverse=True)
+        )
+        self._refresh_private_redaction_values()
+        self._current_metadata = None
         self._screenshots_suppressed = True
 
+    def _set_applicant_redaction_enabled(self, enabled: bool) -> None:
+        effective = enabled and bool(self._applicant_values)
+        if self._applicant_redaction_enabled == effective:
+            return
+        self._applicant_redaction_enabled = effective
+        self._refresh_private_redaction_values()
+        self._current_metadata = None
+
     def _refresh_private_redaction_values(self) -> None:
-        self._private_redaction_values = _private_redaction_fragments(
-            self._private_values
+        values = (
+            (*self._private_values, *self._applicant_values)
+            if self._applicant_redaction_enabled
+            else self._private_values
         )
+        self._private_redaction_values = _private_redaction_fragments(values)
         # Fragment strings are the only persistent redaction index.
         # Boundary redaction below performs no per-character metadata caching.
 
@@ -2310,10 +2321,19 @@ class PlaywrightCliRuntime:
         self,
         command: str,
         args: Sequence[str] | None = None,
+        *,
+        expose_applicant_values: bool = False,
     ) -> PlaywrightCliExecutionResult:
         async with self._operation_lock:
+            self._set_applicant_redaction_enabled(
+                not expose_applicant_values
+            )
             try:
-                return await self._execute_unlocked(command, args)
+                return await self._execute_unlocked(
+                    command,
+                    args,
+                    expose_applicant_values=expose_applicant_values,
+                )
             except _ActionRuntimeFailure as caught:
                 failure = caught.error
             await self._invalidate_after_action_failure_unlocked()
@@ -2323,6 +2343,8 @@ class PlaywrightCliRuntime:
         self,
         command: str,
         args: Sequence[str] | None,
+        *,
+        expose_applicant_values: bool,
     ) -> PlaywrightCliExecutionResult:
         if not self._started or self._closed or not self._guard_armed:
             raise PlaywrightCliRuntimeError("browser_failed")
@@ -2390,7 +2412,7 @@ class PlaywrightCliRuntime:
             except PlaywrightCliRuntimeError as error:
                 raise _ActionRuntimeFailure(error) from None
         self._current_metadata = post_metadata
-        if self._screenshots_suppressed:
+        if self._screenshots_suppressed and not expose_applicant_values:
             stdout = "[redacted]"
             stderr = "[redacted]"
             stdout_text_truncated = False
@@ -2402,7 +2424,7 @@ class PlaywrightCliRuntime:
             stderr, stderr_text_truncated = self._public_output(
                 execution.stderr
             )
-            if command == "tab-list":
+            if command == "tab-list" and not expose_applicant_values:
                 stdout = "[redacted]"
                 stdout_text_truncated = False
         exit_code = execution.exit_code

@@ -627,7 +627,7 @@ describe("HttpApplicationRuntimeClient", () => {
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]?.url).toBe(
-      "http://127.0.0.1:8765/v1/sessions/123e4567-e89b-42d3-a456-426614174000/runtime/actions",
+      "http://127.0.0.1:8765/v1/sessions/123e4567-e89b-42d3-a456-426614174000/runtime/model-actions",
     );
     const request = requests[0]?.init;
     expect(request).toMatchObject({
@@ -1216,9 +1216,9 @@ describe("HttpApplicationRuntimeClient", () => {
       await client.action({ type: "report_application_mismatch" }, new AbortController().signal);
     }
     expect(requestedUrls).toEqual([
-      `http://localhost:8765/v1/sessions/${SESSION_ID}/runtime/actions`,
-      `http://127.42.0.7:8765/v1/sessions/${SESSION_ID}/runtime/actions`,
-      `http://[::1]:8765/v1/sessions/${SESSION_ID}/runtime/actions`,
+      `http://localhost:8765/v1/sessions/${SESSION_ID}/runtime/model-actions`,
+      `http://127.42.0.7:8765/v1/sessions/${SESSION_ID}/runtime/model-actions`,
+      `http://[::1]:8765/v1/sessions/${SESSION_ID}/runtime/model-actions`,
     ]);
 
     const invalidArguments: Array<[string, string, string]> = [
