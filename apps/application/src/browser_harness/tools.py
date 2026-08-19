@@ -8,6 +8,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from .playwright_cli import PlaywrightCliRuntimeError
 from .credentials import CredentialStore
 from .models import (
+    BROWSER_URL_MAX_CHARACTERS,
     AcceptedAdditionalInfoAnswer,
     AdditionalInfoBooleanCommandAnswer,
     AdditionalInfoBooleanQuestion,
@@ -136,14 +137,15 @@ def _decode_public_text(value: str) -> str:
         decoded = next_value
 
 
-def redact_public_text(
+def _redact_public_text(
     value: str | None,
     private_values: Iterable[str],
     *,
-    max_length: int | None = None,
-) -> str | None:
+    max_length: int | None,
+    keep_tail: bool,
+) -> tuple[str | None, bool]:
     if value is None:
-        return None
+        return None, False
     redacted = _decode_public_text(value)
     secrets = {
         representation
@@ -156,20 +158,60 @@ def redact_public_text(
         redacted = redacted.replace(secret, "[redacted]")
     if not redacted:
         redacted = "[redacted]"
-    if max_length is not None:
-        if max_length < 1:
-            raise ValueError("max_length must be positive")
-        if len(redacted) > max_length:
-            redacted = redacted[: max_length - 1] + "…"
+    if max_length is not None and max_length < 1:
+        raise ValueError("max_length must be positive")
+    truncated = max_length is not None and len(redacted) > max_length
+    if truncated:
+        assert max_length is not None
+        redacted = (
+            redacted[-max_length:]
+            if keep_tail
+            else redacted[: max_length - 1] + "…"
+        )
+    return redacted, truncated
+
+
+def redact_public_text(
+    value: str | None,
+    private_values: Iterable[str],
+    *,
+    max_length: int | None = None,
+) -> str | None:
+    redacted, _truncated = _redact_public_text(
+        value,
+        private_values,
+        max_length=max_length,
+        keep_tail=False,
+    )
     return redacted
+
+
+def redact_public_text_with_truncation(
+    value: str | None,
+    private_values: Iterable[str],
+    *,
+    max_length: int | None = None,
+    keep_tail: bool = False,
+) -> tuple[str | None, bool]:
+    return _redact_public_text(
+        value,
+        private_values,
+        max_length=max_length,
+        keep_tail=keep_tail,
+    )
 
 
 def redact_public_url(value: str, private_values: Iterable[str]) -> str:
     parsed = urlsplit(value)
     redacted_path = redact_public_text(parsed.path, private_values) or ""
     safe_path = quote(redacted_path, safe="/:@-._~!$&'()*+,;=[]")
-    return sanitize_public_url(
+    redacted = sanitize_public_url(
         urlunsplit((parsed.scheme, parsed.netloc, safe_path, "", ""))
+    )
+    if len(redacted) <= BROWSER_URL_MAX_CHARACTERS:
+        return redacted
+    return sanitize_public_url(
+        urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     )
 
 
@@ -181,7 +223,11 @@ def sanitize_application_result(
     redaction_values = tuple(private_values)
 
     def safe_field(field: FieldResult) -> FieldResult:
-        label = redact_public_text(field.label, redaction_values) or "Field"
+        label = redact_public_text(
+            field.label,
+            redaction_values,
+            max_length=500,
+        ) or "Field"
         return FieldResult(
             label=label,
             field_type=field.field_type,
@@ -203,8 +249,16 @@ def sanitize_application_result(
     ]
     return ReviewApplicationResult(
         status="ready_for_submission",
-        company=redact_public_text(result.company, redaction_values),
-        role=redact_public_text(result.role, redaction_values),
+        company=redact_public_text(
+            result.company,
+            redaction_values,
+            max_length=500,
+        ),
+        role=redact_public_text(
+            result.role,
+            redaction_values,
+            max_length=500,
+        ),
         job_url=redact_public_url(result.job_url, redaction_values),
         final_url=redact_public_url(result.final_url, redaction_values),
         fields_filled=[safe_field(field) for field in result.fields_filled],
@@ -434,6 +488,7 @@ class HumanGate:
                     "instruction": redact_public_text(
                         instruction,
                         self._redaction_values,
+                        max_length=2_000,
                     )
                     or "Human action is required"
                 },

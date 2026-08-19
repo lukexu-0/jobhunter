@@ -34,6 +34,10 @@ from .playwright_cli import (
 )
 from .context import CandidateContext, CandidateContextProcess
 from .models import (
+    BROWSER_DOM_MAX_CHARACTERS,
+    BROWSER_TITLE_MAX_CHARACTERS,
+    BROWSER_URL_MAX_CHARACTERS,
+    PLAYWRIGHT_OUTPUT_MAX_CHARACTERS,
     AdditionalInfoRequiredDetail,
     ApplicationAnswerSuggestionsResponse,
     AdditionalInfoRuntimeActionResponse,
@@ -104,6 +108,7 @@ from .pipeline_agent import (
 from .tools import (
     HumanGate,
     redact_public_text,
+    redact_public_text_with_truncation,
     redact_public_url,
 )
 from .user_info import UserInfoSnapshot, UserInfoStore
@@ -166,9 +171,10 @@ def _redact_playwright_cli_url(
     if value == "about:blank":
         return value
     try:
-        return redact_public_url(value, private_values)
+        redacted = redact_public_url(value, private_values)
     except ValueError:
         return "[redacted]"
+    return redacted if len(redacted) <= BROWSER_URL_MAX_CHARACTERS else "[redacted]"
 
 
 ModelFactory = Callable[[UUID, str, str], PipelineApplicationAgentClient]
@@ -1837,7 +1843,11 @@ class ApplicationSessionManager:
                                 private_values,
                             ),
                             "title": (
-                                redact_public_text(tab.title, private_values)
+                                redact_public_text(
+                                    tab.title,
+                                    private_values,
+                                    max_length=BROWSER_TITLE_MAX_CHARACTERS,
+                                )
                                 or ""
                             ),
                         }
@@ -1846,18 +1856,32 @@ class ApplicationSessionManager:
                 ]
                 if gate.submission_approved:
                     public_tabs = []
+                public_stdout, stdout_redaction_truncated = (
+                    redact_public_text_with_truncation(
+                        result.stdout,
+                        private_values,
+                        max_length=PLAYWRIGHT_OUTPUT_MAX_CHARACTERS,
+                        keep_tail=True,
+                    )
+                )
+                public_stderr, stderr_redaction_truncated = (
+                    redact_public_text_with_truncation(
+                        result.stderr,
+                        private_values,
+                        max_length=PLAYWRIGHT_OUTPUT_MAX_CHARACTERS,
+                        keep_tail=True,
+                    )
+                )
                 public_result = result.model_copy(
                     update={
-                        "stdout": redact_public_text(
-                            result.stdout,
-                            private_values,
-                        )
-                        or "",
-                        "stderr": redact_public_text(
-                            result.stderr,
-                            private_values,
-                        )
-                        or "",
+                        "stdout": public_stdout or "",
+                        "stderr": public_stderr or "",
+                        "stdout_truncated": (
+                            result.stdout_truncated or stdout_redaction_truncated
+                        ),
+                        "stderr_truncated": (
+                            result.stderr_truncated or stderr_redaction_truncated
+                        ),
                         "observation": result.observation.model_copy(
                             update={
                                 "url": _redact_playwright_cli_url(
@@ -1868,6 +1892,7 @@ class ApplicationSessionManager:
                                     redact_public_text(
                                         result.observation.title,
                                         private_values,
+                                        max_length=BROWSER_TITLE_MAX_CHARACTERS,
                                     )
                                     or ""
                                 ),
@@ -1876,6 +1901,7 @@ class ApplicationSessionManager:
                                     redact_public_text(
                                         result.observation.dom,
                                         private_values,
+                                        max_length=BROWSER_DOM_MAX_CHARACTERS,
                                     )
                                     or ""
                                 ),

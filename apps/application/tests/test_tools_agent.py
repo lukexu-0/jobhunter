@@ -419,6 +419,8 @@ def test_public_redaction_and_result_sanitization_remove_direct_values() -> None
         == "Candidate [redacted] uses [redacted]"
     )
 
+
+
     result = ReviewApplicationResult.model_validate(
         {
             **make_result().model_dump(),
@@ -471,6 +473,22 @@ def test_public_redaction_and_result_sanitization_remove_direct_values() -> None
     assert "Ada%20Secret-Value" not in serialized
     assert sanitized.revision_count == 4
     assert sanitized.submit_attempted is False
+
+
+def test_public_redaction_respects_maximum_after_expansion() -> None:
+    private_value = "x"
+    source = private_value * 100
+
+    redacted = redact_public_text(
+        source,
+        [private_value],
+        max_length=len(source),
+    )
+
+    assert redacted is not None
+    assert len(redacted) == len(source)
+    assert private_value not in redacted
+    assert redacted.endswith("…")
 
 
 def make_result(

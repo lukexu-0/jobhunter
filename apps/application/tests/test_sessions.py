@@ -120,10 +120,13 @@ def pdf_bytes(text: str = "Deterministic resume evidence") -> bytes:
     return destination.getvalue()
 
 
-def valid_uploads() -> tuple[UploadFile, UploadFile, UploadFile]:
+def valid_uploads(
+    *,
+    full_name: str = "Ada Lovelace",
+) -> tuple[UploadFile, UploadFile, UploadFile]:
     personal = (
         "---\n"
-        "full_name: Ada Lovelace\n"
+        f"full_name: {full_name}\n"
         f"email: {PROFILE_SECRET}\n"
         "---\n"
         "Experienced analytical engineer.\n"
@@ -694,8 +697,9 @@ async def create_valid(
     auto_submit: bool = False,
     opportunity_kind: OpportunityKind = "job",
     allow_domains: Sequence[str] = (),
+    full_name: str = "Ada Lovelace",
 ):
-    personal, resume, resume_source = valid_uploads()
+    personal, resume, resume_source = valid_uploads(full_name=full_name)
     return await manager.create_session(
         session_id=session_id,
         job_url=JOB_URL,
@@ -4139,6 +4143,73 @@ async def test_runtime_playwright_cli_result_redacts_preapproval_urls(
     serialized = response.model_dump_json()
     assert PROFILE_SECRET not in serialized
     assert "candidate=private" not in serialized
+    await manager.delete(created.session_id)
+
+
+async def test_runtime_playwright_cli_result_rebounds_expanded_redactions(
+    tmp_path: Path,
+) -> None:
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    private_value = "x"
+    created = await create_valid(manager, full_name=private_value)
+    await wait_state(manager, created.session_id, "running")
+    record = manager._active
+    assert record is not None
+    private_url = f"https://jobs.example/{private_value * 4_000}"
+    execution = PlaywrightCliExecutionResult(
+        exit_code=0,
+        stdout=private_value * 20_000,
+        stderr=private_value * 20_000,
+        stdout_truncated=False,
+        stderr_truncated=False,
+        observation=BrowserObservation(
+            url=private_url,
+            title=private_value * 4_096,
+            tabs=[
+                BrowserTab(
+                    url=private_url,
+                    title=private_value * 4_096,
+                    tab_id="tab-1",
+                ),
+            ],
+            dom=private_value * 40_000,
+            page_info=None,
+            screenshot=None,
+        ),
+    )
+    record.playwright_runtime = FakePlaywrightRuntime(result=execution)
+
+    response = await runtime_action(
+        manager,
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+
+    assert isinstance(response, PlaywrightCliResultRuntimeActionResponse)
+    assert response.observation.url == "https://jobs.example"
+    assert len(response.observation.url) <= 4_096
+    assert response.observation.tabs[0].url == response.observation.url
+    step = record.events[-1]
+    assert step.event == "agent_step"
+    assert step.detail.current_url == response.observation.url
+    assert private_value * 2 not in response.observation.url
+    for value in (response.stdout, response.stderr):
+        assert len(value) == 20_000
+        assert private_value not in value
+    assert response.stdout_truncated
+    assert response.stderr_truncated
+    for value, maximum in (
+        (response.observation.title, 4_096),
+        (response.observation.tabs[0].title, 4_096),
+        (response.observation.dom, 40_000),
+    ):
+        assert len(value) == maximum
+        assert private_value not in value
+        assert value.endswith("…")
     await manager.delete(created.session_id)
 
 

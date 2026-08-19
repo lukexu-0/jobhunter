@@ -36,6 +36,10 @@ APPLICATION_CONTEXT_TOTAL_MAX_BYTES = 26_214_400
 APPLICATION_ANECDOTE_MAX_COUNT = 100
 APPLICATION_ANECDOTE_MAX_BYTES = 1_310_720
 APPLICATION_ANECDOTE_TOTAL_MAX_BYTES = 10_485_760
+BROWSER_URL_MAX_CHARACTERS = 4_096
+BROWSER_TITLE_MAX_CHARACTERS = 4_096
+BROWSER_DOM_MAX_CHARACTERS = 40_000
+PLAYWRIGHT_OUTPUT_MAX_CHARACTERS = 20_000
 
 OpportunityKind: TypeAlias = Literal[
     "job",
@@ -1110,8 +1114,14 @@ class SessionCreateResponse(PublicModel):
 
 
 class BrowserTab(PublicModel):
-    url: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
-    title: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
+    url: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=BROWSER_URL_MAX_CHARACTERS),
+    ]
+    title: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=BROWSER_TITLE_MAX_CHARACTERS),
+    ]
     tab_id: Annotated[str, StringConstraints(strict=True, max_length=512)]
     parent_tab_id: (
         Annotated[str, StringConstraints(strict=True, max_length=512)] | None
@@ -1127,18 +1137,33 @@ class BrowserScreenshot(PublicModel):
 
 
 class BrowserObservation(PublicModel):
-    url: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
-    title: Annotated[str, StringConstraints(strict=True, max_length=4_096)]
+    url: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=BROWSER_URL_MAX_CHARACTERS),
+    ]
+    title: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=BROWSER_TITLE_MAX_CHARACTERS),
+    ]
     tabs: list[BrowserTab] = Field(max_length=100)
-    dom: Annotated[str, StringConstraints(strict=True, max_length=40_000)]
+    dom: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=BROWSER_DOM_MAX_CHARACTERS),
+    ]
     page_info: dict[str, object] | None
     screenshot: BrowserScreenshot | None
 
 
 class PlaywrightCliExecutionResult(PublicModel):
     exit_code: int
-    stdout: Annotated[str, StringConstraints(strict=True, max_length=20_000)]
-    stderr: Annotated[str, StringConstraints(strict=True, max_length=20_000)]
+    stdout: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=PLAYWRIGHT_OUTPUT_MAX_CHARACTERS),
+    ]
+    stderr: Annotated[
+        str,
+        StringConstraints(strict=True, max_length=PLAYWRIGHT_OUTPUT_MAX_CHARACTERS),
+    ]
     stdout_truncated: bool
     stderr_truncated: bool
     observation: BrowserObservation
