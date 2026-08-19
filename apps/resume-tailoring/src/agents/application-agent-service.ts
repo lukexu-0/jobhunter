@@ -530,12 +530,10 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
           status: "completed",
         });
       } catch (error) {
-        await finishApplicationAgentTrace(trace, input.sessionId, {
-          status: "failed",
-          error,
-        });
-        if (signal.aborted) throw signal.reason;
-        if (error instanceof ApplicationAgentFailure) {
+        let failure: unknown;
+        if (signal.aborted) {
+          failure = signal.reason;
+        } else if (error instanceof ApplicationAgentFailure) {
           if (error.code === "MODEL_PROVIDER_FAILED") {
             reportApplicationAgentFailure(
               this.#diagnosticSink,
@@ -543,35 +541,46 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
               error,
             );
           }
-          throw error;
+          failure = error;
+        } else {
+          try {
+            const currentStatus = await runAbortable(
+              () => this.#authStatusReader(),
+              signal,
+            );
+            signal.throwIfAborted();
+            const oauthConnected = currentStatus.providers.some(
+              (provider) => provider.provider === APPLICATION_AGENT_MODEL_PROVIDER
+                && provider.state === "connected",
+            );
+            if (oauthConnected) {
+              reportApplicationAgentFailure(
+                this.#diagnosticSink,
+                input.sessionId,
+                error,
+              );
+              failure = new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+            } else {
+              failure = new ApplicationAgentFailure("OAUTH_REQUIRED");
+            }
+          } catch {
+            if (signal.aborted) {
+              failure = signal.reason;
+            } else {
+              reportApplicationAgentFailure(
+                this.#diagnosticSink,
+                input.sessionId,
+                error,
+              );
+              failure = new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+            }
+          }
         }
-        let oauthConnected = false;
-        try {
-          const currentStatus = await runAbortable(
-            () => this.#authStatusReader(),
-            signal,
-          );
-          signal.throwIfAborted();
-          oauthConnected = currentStatus.providers.some(
-            (provider) => provider.provider === APPLICATION_AGENT_MODEL_PROVIDER
-              && provider.state === "connected",
-          );
-        } catch {
-          if (signal.aborted) throw signal.reason;
-          reportApplicationAgentFailure(
-            this.#diagnosticSink,
-            input.sessionId,
-            error,
-          );
-          throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
-        }
-        if (!oauthConnected) throw new ApplicationAgentFailure("OAUTH_REQUIRED");
-        reportApplicationAgentFailure(
-          this.#diagnosticSink,
-          input.sessionId,
+        await finishApplicationAgentTrace(trace, input.sessionId, {
+          status: "failed",
           error,
-        );
-        throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
+        });
+        throw failure;
       }
       return {
         modelProvider: APPLICATION_AGENT_MODEL_PROVIDER,

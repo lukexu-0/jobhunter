@@ -790,6 +790,8 @@ describe("ApplicationAgentService", () => {
     const starts: ApplicationAgentTraceStart[] = [];
     const records: ModelTraceEvent[] = [];
     const outcomes: ApplicationAgentTraceOutcome[] = [];
+    const controller = new AbortController();
+    const abortReason = new Error("caller stopped failed trace finalization");
     const trace: ApplicationAgentTrace = {
       path: "/private/application-model-trace.jsonl",
       async record(event) {
@@ -797,6 +799,7 @@ describe("ApplicationAgentService", () => {
       },
       async finish(outcome) {
         outcomes.push(outcome);
+        controller.abort(abortReason);
       },
     };
     const invalidOutput = new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
@@ -828,10 +831,11 @@ describe("ApplicationAgentService", () => {
 
     const failure = await service.invoke(
       INPUT,
-      new AbortController().signal,
+      controller.signal,
     ).catch((error: unknown) => error);
 
     expect(failure).toBe(invalidOutput);
+    expect(controller.signal.reason).toBe(abortReason);
     expect(starts).toEqual([{
       sessionId: SESSION_ID,
       opportunityKind: "job",
@@ -849,5 +853,40 @@ describe("ApplicationAgentService", () => {
       status: "failed",
       error: invalidOutput,
     }]);
+  });
+
+  test("does not create a new abort boundary while the success trace finishes", async () => {
+    const controller = new AbortController();
+    const abortReason = new Error("caller stopped trace finalization");
+    let finished = false;
+    const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
+      authStatusReader: connectedStatus,
+      runtimeClientFactory: () => ({
+        action: async () => { throw new Error("unused"); },
+      }),
+      traceStore: {
+        async start() {
+          return {
+            path: "/private/application-model-trace.jsonl",
+            async record() {},
+            async finish() {
+              if (finished) return;
+              finished = true;
+              controller.abort(abortReason);
+            },
+          };
+        },
+      },
+      runApplicationAgent: async () => RESULT,
+    });
+
+    const outcome = await service.invoke(
+      INPUT,
+      controller.signal,
+    ).catch((error: unknown) => error);
+
+    expect(outcome).toMatchObject({ result: RESULT });
+    expect(finished).toBeTrue();
   });
 });

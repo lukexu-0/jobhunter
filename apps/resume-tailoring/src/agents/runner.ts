@@ -86,34 +86,71 @@ export interface ModelTraceSink {
   record(event: ModelTraceEvent): void | PromiseLike<void>;
 }
 
-function modelTraceError(value: unknown, seen = new Set<unknown>()): ModelTraceError {
-  if (!(value instanceof Error)) {
-    return { name: "NonError", message: String(value) };
-  }
-  if (seen.has(value)) {
-    return { name: value.name || "Error", message: "[circular error cause]" };
-  }
-  seen.add(value);
-  let code: string | number | undefined;
+const MAX_MODEL_TRACE_ERROR_DEPTH = 4;
+const MAX_MODEL_TRACE_ERROR_TEXT_CHARS = 8_192;
+
+function boundedModelTraceErrorText(value: string): string {
+  return value.length <= MAX_MODEL_TRACE_ERROR_TEXT_CHARS
+    ? value
+    : `${value.slice(0, MAX_MODEL_TRACE_ERROR_TEXT_CHARS)}[truncated]`;
+}
+
+
+function modelTraceError(
+  value: unknown,
+  seen = new Set<unknown>(),
+  depth = 0,
+): ModelTraceError {
   try {
-    const candidate = "code" in value ? value.code : undefined;
-    if (typeof candidate === "string" || typeof candidate === "number") code = candidate;
+    if (depth >= MAX_MODEL_TRACE_ERROR_DEPTH) {
+      return { name: "ErrorCauseLimit", message: "Additional error causes omitted" };
+    }
+    if (!(value instanceof Error)) {
+      return {
+        name: "NonError",
+        message: boundedModelTraceErrorText(String(value)),
+      };
+    }
+    const name = boundedModelTraceErrorText(value.name || "Error");
+    if (seen.has(value)) {
+      return { name, message: "[circular error cause]" };
+    }
+    seen.add(value);
+    let code: string | number | undefined;
+    try {
+      const candidate = "code" in value ? value.code : undefined;
+      if (typeof candidate === "string") {
+        code = boundedModelTraceErrorText(candidate);
+      } else if (typeof candidate === "number") {
+        code = candidate;
+      }
+    } catch {
+      code = undefined;
+    }
+    let cause: unknown;
+    try {
+      cause = value.cause;
+    } catch {
+      cause = undefined;
+    }
+    const stack = value.stack;
+    return {
+      name,
+      message: boundedModelTraceErrorText(value.message),
+      ...(stack === undefined
+        ? {}
+        : { stack: boundedModelTraceErrorText(stack) }),
+      ...(code === undefined ? {} : { code }),
+      ...(cause === undefined
+        ? {}
+        : { cause: modelTraceError(cause, seen, depth + 1) }),
+    };
   } catch {
-    code = undefined;
+    return {
+      name: "UninspectableError",
+      message: "Model error details could not be inspected",
+    };
   }
-  let cause: unknown;
-  try {
-    cause = value.cause;
-  } catch {
-    cause = undefined;
-  }
-  return {
-    name: value.name || "Error",
-    message: value.message,
-    ...(value.stack === undefined ? {} : { stack: value.stack }),
-    ...(code === undefined ? {} : { code }),
-    ...(cause === undefined ? {} : { cause: modelTraceError(cause, seen) }),
-  };
 }
 
 async function recordModelTrace(
