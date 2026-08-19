@@ -6,6 +6,7 @@ import {
   ApplicationAgentService,
   type ApplicationSubmissionGuardFactory,
 } from "../src/agents/application-agent-service.ts";
+import { ApplicationAgentTraceStore } from "../src/agents/application-agent-traces.ts";
 import { bootstrapAgentRuntime } from "../src/agents/runner.ts";
 import { createApplicationAgentRoutes } from "../src/api/application-agent-routes.ts";
 import { createApiHandler } from "../src/api/handler.ts";
@@ -189,6 +190,9 @@ export async function main(): Promise<void> {
     authStatusReader: getAuthStatus,
     submissionGuardFactory:
       createApplicationSmokeSubmissionGuardFactory(repository),
+    traceStore: new ApplicationAgentTraceStore(
+      resolve(dirname(databasePath), `${basename(databasePath)}.application-agent-traces`),
+    ),
   });
   const internalRoute = createApplicationAgentRoutes(service, token);
   const fetch = createApiHandler({

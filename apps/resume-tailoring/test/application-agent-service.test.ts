@@ -5,6 +5,12 @@ import {
   type ApplicationAgentRunInput,
   type ApplicationRunResult,
 } from "../src/agents/application-agent";
+import type {
+  ApplicationAgentTrace,
+  ApplicationAgentTraceOutcome,
+  ApplicationAgentTraceStart,
+} from "../src/agents/application-agent-traces.ts";
+import type { ModelTraceEvent } from "../src/agents/runner.ts";
 import { ApplicationRuntimeError } from "../src/agents/application-runtime-client.ts";
 import {
   APPLICATION_AGENT_MODEL,
@@ -778,5 +784,70 @@ describe("ApplicationAgentService", () => {
     ).catch((error: unknown) => error);
 
     expect(failure).toBe(abortReason);
+  });
+
+  test("finishes the private model trace with the original invalid-output failure", async () => {
+    const starts: ApplicationAgentTraceStart[] = [];
+    const records: ModelTraceEvent[] = [];
+    const outcomes: ApplicationAgentTraceOutcome[] = [];
+    const trace: ApplicationAgentTrace = {
+      path: "/private/application-model-trace.jsonl",
+      async record(event) {
+        records.push(event);
+      },
+      async finish(outcome) {
+        outcomes.push(outcome);
+      },
+    };
+    const invalidOutput = new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
+    const service = new ApplicationAgentService(TOKEN, {
+      submissionGuardFactory: SUBMISSION_GUARD_FACTORY,
+      authStatusReader: connectedStatus,
+      runtimeClientFactory: () => ({
+        action: async () => { throw new Error("unused"); },
+      }),
+      traceStore: {
+        async start(input) {
+          starts.push(input);
+          return trace;
+        },
+      },
+      runApplicationAgent: async (_input, _signal, dependencies) => {
+        expect(dependencies.modelTraceSink).toBe(trace);
+        await dependencies.modelTraceSink!.record({
+          type: "model_error",
+          model: "gpt-5.6-sol",
+          error: {
+            name: "ApplicationAgentFailure",
+            message: "tool workflow invariant failed",
+          },
+        });
+        throw invalidOutput;
+      },
+    });
+
+    const failure = await service.invoke(
+      INPUT,
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBe(invalidOutput);
+    expect(starts).toEqual([{
+      sessionId: SESSION_ID,
+      opportunityKind: "job",
+      autoSubmit: false,
+    }]);
+    expect(records).toEqual([{
+      type: "model_error",
+      model: "gpt-5.6-sol",
+      error: {
+        name: "ApplicationAgentFailure",
+        message: "tool workflow invariant failed",
+      },
+    }]);
+    expect(outcomes).toEqual([{
+      status: "failed",
+      error: invalidOutput,
+    }]);
   });
 });

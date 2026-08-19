@@ -51,6 +51,7 @@ import { DiscoveryService } from "./discovery/service.ts";
 import { ArtifactStore, DEFAULT_ARTIFACT_ROOT } from "./system/artifacts.ts";
 import { migrateRunOutputLayout } from "./system/run-output-migration.ts";
 import { ApplicationAgentService } from "./agents/application-agent-service.ts";
+import { ApplicationAgentTraceStore } from "./agents/application-agent-traces.ts";
 import {
   createPipelineWorkerRuntime,
   type PipelineWorkerRuntimeOptions,
@@ -367,6 +368,9 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
             finalize: async (outcome) =>
               repository.finalizeApplicationSubmission(sessionId, outcome),
           }),
+          traceStore: new ApplicationAgentTraceStore(
+            resolve(artifacts.root, "..", "application-agent-traces"),
+          ),
         }));
   const routeApplicationAgent = createApplicationAgentRoutes(
     applicationAgent,

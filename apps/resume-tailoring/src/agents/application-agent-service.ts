@@ -15,6 +15,11 @@ import {
   type ApplicationRunResult,
   type ApplicationSubmissionGuard,
 } from "./application-agent";
+import type {
+  ApplicationAgentTrace,
+  ApplicationAgentTraceOutcome,
+  ApplicationAgentTraceStore,
+} from "./application-agent-traces.ts";
 import {
   HttpApplicationRuntimeClient,
   type ApplicationRuntimeClient,
@@ -314,6 +319,7 @@ export interface ApplicationAgentServiceOptions {
   readonly submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly agentRuntime?: AgentRuntimeDependencies;
   readonly diagnosticSink?: ApplicationAgentDiagnosticSink;
+  readonly traceStore?: Pick<ApplicationAgentTraceStore, "start">;
 }
 
 export interface ApplicationAgentRouteService {
@@ -345,6 +351,51 @@ async function runAbortable<T>(
   }
 }
 
+function reportApplicationAgentTraceFailure(
+  sessionId: string,
+  operation: "start" | "finish",
+): void {
+  try {
+    console.error(JSON.stringify({
+      event: "application_agent_trace_failure",
+      sessionId,
+      operation,
+    }));
+  } catch {
+    // A private diagnostic failure must not change application execution.
+  }
+}
+
+async function startApplicationAgentTrace(
+  store: Pick<ApplicationAgentTraceStore, "start"> | undefined,
+  input: ApplicationAgentRunInput,
+): Promise<ApplicationAgentTrace | undefined> {
+  if (store === undefined) return undefined;
+  try {
+    return await store.start({
+      sessionId: input.sessionId,
+      opportunityKind: input.opportunityKind,
+      autoSubmit: input.autoSubmit,
+    });
+  } catch {
+    reportApplicationAgentTraceFailure(input.sessionId, "start");
+    return undefined;
+  }
+}
+
+async function finishApplicationAgentTrace(
+  trace: ApplicationAgentTrace | undefined,
+  sessionId: string,
+  outcome: ApplicationAgentTraceOutcome,
+): Promise<void> {
+  if (trace === undefined) return;
+  try {
+    await trace.finish(outcome);
+  } catch {
+    reportApplicationAgentTraceFailure(sessionId, "finish");
+  }
+}
+
 export class ApplicationAgentService implements ApplicationAgentRouteService {
   readonly #harnessToken: string;
   readonly #authStatusReader: ApplicationAgentAuthStatusReader;
@@ -354,6 +405,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
   readonly #submissionGuardFactory: ApplicationSubmissionGuardFactory;
   readonly #agentRuntime: AgentRuntimeDependencies;
   readonly #diagnosticSink: ApplicationAgentDiagnosticSink;
+  readonly #traceStore: Pick<ApplicationAgentTraceStore, "start"> | undefined;
   readonly #steeringInboxes = new Map<string, ApplicationAgentSteeringInbox>();
 
   constructor(
@@ -377,6 +429,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
     this.#agentRuntime = options.agentRuntime ?? {};
     this.#diagnosticSink = options.diagnosticSink
       ?? defaultApplicationAgentDiagnosticSink;
+    this.#traceStore = options.traceStore;
   }
 
   async status(signal?: AbortSignal): Promise<ApplicationAgentStatus> {
@@ -447,8 +500,10 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
         throw error;
       }
       signal.throwIfAborted();
+      const trace = await startApplicationAgentTrace(this.#traceStore, input);
       let result: ApplicationRunResult;
       try {
+        signal.throwIfAborted();
         const runtimeClient = this.#runtimeClientFactory(
           input.runtimeUrl,
           input.sessionId,
@@ -463,6 +518,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
           runtimeClient,
           submissionGuard,
           steeringInbox,
+          ...(trace === undefined ? {} : { modelTraceSink: trace }),
         });
         signal.throwIfAborted();
         const parsedResult = ApplicationRunResultSchema.safeParse(unparsedResult);
@@ -470,7 +526,14 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
           throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
         }
         result = parsedResult.data;
+        await finishApplicationAgentTrace(trace, input.sessionId, {
+          status: "completed",
+        });
       } catch (error) {
+        await finishApplicationAgentTrace(trace, input.sessionId, {
+          status: "failed",
+          error,
+        });
         if (signal.aborted) throw signal.reason;
         if (error instanceof ApplicationAgentFailure) {
           if (error.code === "MODEL_PROVIDER_FAILED") {

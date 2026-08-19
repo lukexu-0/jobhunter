@@ -3,7 +3,13 @@ import {
   setTracingDisabled,
   type Agent,
   type CallModelInputFilter,
+  type Model,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelRetryAdvice,
+  type ModelRetryAdviceRequest,
   type ModelProvider,
+  type StreamEvent,
 } from "@openai/agents-core";
 import { OAuthCodexModelProvider } from "../models/oauth-codex-provider.ts";
 
@@ -46,9 +52,170 @@ export type AgentRunnerFactory = (config: {
   toolExecution: { maxFunctionToolConcurrency: 1 };
 }) => AgentRunner;
 
+export interface ModelTraceError {
+  readonly name: string;
+  readonly message: string;
+  readonly stack?: string;
+  readonly code?: string | number;
+  readonly cause?: ModelTraceError;
+}
+
+export type ModelTraceEvent =
+  | {
+      readonly type: "model_request";
+      readonly model?: string;
+      readonly request: Omit<ModelRequest, "signal">;
+    }
+  | {
+      readonly type: "model_response";
+      readonly model?: string;
+      readonly response: ModelResponse;
+    }
+  | {
+      readonly type: "model_stream_event";
+      readonly model?: string;
+      readonly event: StreamEvent;
+    }
+  | {
+      readonly type: "model_error";
+      readonly model?: string;
+      readonly error: ModelTraceError;
+    };
+
+export interface ModelTraceSink {
+  record(event: ModelTraceEvent): void | PromiseLike<void>;
+}
+
+function modelTraceError(value: unknown, seen = new Set<unknown>()): ModelTraceError {
+  if (!(value instanceof Error)) {
+    return { name: "NonError", message: String(value) };
+  }
+  if (seen.has(value)) {
+    return { name: value.name || "Error", message: "[circular error cause]" };
+  }
+  seen.add(value);
+  let code: string | number | undefined;
+  try {
+    const candidate = "code" in value ? value.code : undefined;
+    if (typeof candidate === "string" || typeof candidate === "number") code = candidate;
+  } catch {
+    code = undefined;
+  }
+  let cause: unknown;
+  try {
+    cause = value.cause;
+  } catch {
+    cause = undefined;
+  }
+  return {
+    name: value.name || "Error",
+    message: value.message,
+    ...(value.stack === undefined ? {} : { stack: value.stack }),
+    ...(code === undefined ? {} : { code }),
+    ...(cause === undefined ? {} : { cause: modelTraceError(cause, seen) }),
+  };
+}
+
+async function recordModelTrace(
+  sink: ModelTraceSink,
+  event: ModelTraceEvent,
+): Promise<void> {
+  try {
+    await sink.record(event);
+  } catch {
+    // Local diagnostics must not change the model call or its public failure.
+  }
+}
+
+class ModelTraceModel implements Model {
+  readonly #modelName: string | undefined;
+  readonly #model: Model;
+  readonly #sink: ModelTraceSink;
+
+  constructor(modelName: string | undefined, model: Model, sink: ModelTraceSink) {
+    this.#modelName = modelName;
+    this.#model = model;
+    this.#sink = sink;
+  }
+
+  async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    const { signal: _signal, ...persistedRequest } = request;
+    await recordModelTrace(this.#sink, {
+      type: "model_request",
+      ...(this.#modelName === undefined ? {} : { model: this.#modelName }),
+      request: persistedRequest,
+    });
+    try {
+      const response = await this.#model.getResponse(request);
+      await recordModelTrace(this.#sink, {
+        type: "model_response",
+        ...(this.#modelName === undefined ? {} : { model: this.#modelName }),
+        response,
+      });
+      return response;
+    } catch (error) {
+      await recordModelTrace(this.#sink, {
+        type: "model_error",
+        ...(this.#modelName === undefined ? {} : { model: this.#modelName }),
+        error: modelTraceError(error),
+      });
+      throw error;
+    }
+  }
+
+  async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    const { signal: _signal, ...persistedRequest } = request;
+    await recordModelTrace(this.#sink, {
+      type: "model_request",
+      ...(this.#modelName === undefined ? {} : { model: this.#modelName }),
+      request: persistedRequest,
+    });
+    try {
+      for await (const event of this.#model.getStreamedResponse(request)) {
+        await recordModelTrace(this.#sink, {
+          type: "model_stream_event",
+          ...(this.#modelName === undefined ? {} : { model: this.#modelName }),
+          event,
+        });
+        yield event;
+      }
+    } catch (error) {
+      await recordModelTrace(this.#sink, {
+        type: "model_error",
+        ...(this.#modelName === undefined ? {} : { model: this.#modelName }),
+        error: modelTraceError(error),
+      });
+      throw error;
+    }
+  }
+
+  getRetryAdvice(
+    request: ModelRetryAdviceRequest,
+  ): Promise<ModelRetryAdvice | undefined> | ModelRetryAdvice | undefined {
+    return this.#model.getRetryAdvice?.(request);
+  }
+}
+
+class ModelTraceProvider implements ModelProvider {
+  readonly #provider: ModelProvider;
+  readonly #sink: ModelTraceSink;
+
+  constructor(provider: ModelProvider, sink: ModelTraceSink) {
+    this.#provider = provider;
+    this.#sink = sink;
+  }
+
+  async getModel(modelName?: string): Promise<Model> {
+    const model = await this.#provider.getModel(modelName);
+    return new ModelTraceModel(modelName, model, this.#sink);
+  }
+}
+
+
 export interface AgentRuntimeDependencies {
   readonly providerFactory?: ModelProviderFactory;
   readonly runnerFactory?: AgentRunnerFactory;
+  readonly modelTraceSink?: ModelTraceSink;
 }
 
 function defaultProviderFactory(attemptSessionId: string): ModelProvider {
@@ -68,9 +235,12 @@ export function createAttemptRunner(
   dependencies: AgentRuntimeDependencies = {},
 ): AgentRunner {
   bootstrapAgentRuntime();
-  const provider = (dependencies.providerFactory ?? defaultProviderFactory)(attemptSessionId);
+  const sourceProvider = (dependencies.providerFactory ?? defaultProviderFactory)(attemptSessionId);
+  const modelProvider = dependencies.modelTraceSink === undefined
+    ? sourceProvider
+    : new ModelTraceProvider(sourceProvider, dependencies.modelTraceSink);
   return (dependencies.runnerFactory ?? defaultRunnerFactory)({
-    modelProvider: provider,
+    modelProvider,
     tracingDisabled: true,
     toolExecution: { maxFunctionToolConcurrency: 1 },
   });
