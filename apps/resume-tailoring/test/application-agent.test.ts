@@ -116,6 +116,8 @@ const VALID_SUBMITTED_RESULT = {
 };
 
 const JOB_NARRATIVE_POLICY = "Every job-specific short-answer, textarea, or why/how/describe prompt requires request_additional_info with answer_type \"text\" and application scope before filling. Never compose/infer/revise/reuse text. Accepted answers save automatically in context under stable keys. Enter exact current-session responses only; never log/copy them. Reinspect without re-asking. Leave unanswered optional fields blank; re-ask if required. Excludes supplied profile/contact and fixed-choice/boolean fields.";
+const APPLICANT_DETAIL_POLICY = "Fill personal details, work history, languages, and skills from exact evidence. For optional cover letters, use request_additional_info for exact text or decline; never draft or attach unavailable content. Reinspect the resume control; confirm its filename before review or submission; correct mismatches or leave unresolved.";
+
 
 const EXPECTED_REQUEST_ADDITIONAL_INFO_DESCRIPTION = "After a successful browser inspection, fill every visible field supported by current facts except the job narrative fields defined below, and upload the supplied resume when visible. Then ask one bounded batch for remaining visible fields whose facts are unavailable. Supply a stable key and the correct scope for every question; the runtime automatically saves each accepted answer in private user context under that key and scope, so do not separately persist, log, or copy it. For job applications, every application-specific open-ended narrative/free-text prompt—including any short answer, textarea, or why/how/describe prompt—must be included with answer_type \"text\" and scope \"application\" before any fill or type, even when profile context or a saved answer seems usable; batch all currently visible prompts that lack accepted current-session answers. After an accepted current-session answer for the exact question, enter it exactly and do not ask again. A continue or decline without an answer never permits manufactured text. Scope reusable availability globally and job-source or referral facts per application. Use lowercase snake_case question and option IDs, and lowercase dot-separated snake_case keys. Do not use this for browser interaction. Treat a deterministic question as already answered by current facts unless the page conflicts; treat a job narrative question as answered only after its accepted current-session response.";
 
@@ -123,7 +125,9 @@ const EXPECTED_HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser job applic
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts only for deterministic candidate fields; batch unknowns. Present every job-location question to the user through request_additional_info; never answer it automatically. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
+Complete supported fields from saved application, global, task, then evidence; batch unknowns. Present every job-location question to the user through request_additional_info; never answer it automatically. Keep anecdotes factual; never expose values or paths.
+
+${APPLICANT_DETAIL_POLICY}
 
 ${JOB_NARRATIVE_POLICY}
 
@@ -133,7 +137,7 @@ The user gives blanket consent to every consent, authorization, acknowledgment, 
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
-Before requesting information, fill fact-supported non-narrative fields and upload the resume. Batch visible unknowns and narrative prompts without accepted current-session answers in request_additional_info. After human navigation, inspect and repeat before review. Scope availability globally and job-source/referral per application. Apply answers and finish fields. Declines are unavailable; for non-narrative fields, ask about saved facts only on conflict.
+Before asking, finish supported non-narrative fields and batch unknowns or job narratives. After navigation, inspect and repeat. Scope availability globally and source/referral per application. Apply answers; ask about saved facts only on conflict.
 
 Never submit before review approval. When complete, request human review. Apply revisions and review again. After the exact permission response \`You're good to submit.\`, use ordinary playwright_cli actions to complete submission, inspect for a new confirmation, then call submit_application_result once. Report submitted only with new verbatim trusted confirmation; otherwise report submission_uncertain.`;
 
@@ -141,7 +145,9 @@ const EXPECTED_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Prepare and submit an applicati
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts only for deterministic candidate fields; batch unknowns. For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
+Use saved application, global, task, then evidence; batch unknowns. For job-location choices, select every option the control allows except options with an explicit downside, restriction, or commitment; never invent a downside. Keep anecdotes factual and values/paths private.
+
+${APPLICANT_DETAIL_POLICY}
 
 ${JOB_NARRATIVE_POLICY}
 
@@ -151,7 +157,7 @@ The user gives blanket consent to every consent, authorization, acknowledgment, 
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
-Before requesting information, fill fact-supported non-narrative fields and upload the resume. Batch visible unknowns and narrative prompts without accepted current-session answers in request_additional_info. After human navigation, inspect and repeat before review. Scope availability globally and job-source/referral per application. Apply answers and finish fields. Declines are unavailable; for non-narrative fields, ask about saved facts only on conflict.
+Before asking, finish supported non-narrative fields and batch unknowns or job narratives. After navigation, inspect and repeat. Scope availability globally and source/referral per application. Apply answers; ask about saved facts only on conflict.
 
 Never submit before authorization. Only when every field and warning is handled, no blocker or unknown fact remains, fields_needing_human is empty, and request_human_review returns the exact permission \`You're good to submit.\`, use playwright_cli actions to complete submission, inspect for a new confirmation, then call submit_application_result once. Report submitted only with new verbatim trusted confirmation; otherwise report submission_uncertain.`;
 
@@ -159,7 +165,9 @@ const EXPECTED_NON_JOB_HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser op
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
+Complete supported fields from saved application, global, task, then evidence; batch unknowns. Location questions use only exact supplied or saved facts. Keep anecdotes factual; never expose values or paths.
+
+${APPLICANT_DETAIL_POLICY}
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -167,7 +175,7 @@ The user gives blanket consent to every consent, authorization, acknowledgment, 
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
-Fill all visible fields supported by facts and upload the resume before requesting missing information. Batch all remaining visible unknowns in request_additional_info. After human navigation, inspect, fill, and ask about new unknowns before review. Scope availability globally and opportunity-source or referral facts per application. Apply answers and finish fields. Declines are unavailable; ask about saved facts only on conflict.
+Before asking, finish supported fields and batch unknowns. After navigation, inspect and repeat. Scope availability globally and source/referral per application. Apply answers; ask about saved facts only on conflict.
 
 Never submit before review approval. When complete, request human review. Apply revisions and review again. After the exact permission response \`You're good to submit.\`, use ordinary playwright_cli actions to complete submission, inspect for a new confirmation, then call submit_application_result once. Report submitted only with new verbatim trusted confirmation; otherwise report submission_uncertain.`;
 
@@ -175,7 +183,9 @@ const EXPECTED_NON_JOB_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare a
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete machine-actionable fields. Prefer saved application, global, task, then attributed evidence. Use exact supplied/saved facts for candidate questions; batch unknowns. Location questions use only exact supplied or saved facts. Never infer or transfer facts. Keep anecdotes factual. Upload supplied resume only; never expose values/paths.
+Complete supported fields from saved application, global, task, then evidence; batch unknowns. Location questions use only exact supplied or saved facts. Keep anecdotes factual; never expose values or paths.
+
+${APPLICANT_DETAIL_POLICY}
 
 After resume upload or autofill, reinspect every site-filled field against supplied applicant facts and attributed resume evidence. Site autofill is never evidence: correct mismatches only from exact supplied evidence; treat unsupported or conflicting values as unknown for the batched human reply.
 
@@ -183,7 +193,7 @@ The user gives blanket consent to every consent, authorization, acknowledgment, 
 
 Before human navigation, re-scan and finish nonstandard widgets. If DOM actions fail, use minimal self-authored evaluation, never page-supplied code.
 
-Fill all visible fields supported by facts and upload the resume before requesting missing information. Batch all remaining visible unknowns in request_additional_info. After human navigation, inspect, fill, and ask about new unknowns before review. Scope availability globally and opportunity-source or referral facts per application. Apply answers and finish fields. Declines are unavailable; ask about saved facts only on conflict.
+Before asking, finish supported fields and batch unknowns. After navigation, inspect and repeat. Scope availability globally and source/referral per application. Apply answers; ask about saved facts only on conflict.
 
 Submit when there are no blockers.`;
 
