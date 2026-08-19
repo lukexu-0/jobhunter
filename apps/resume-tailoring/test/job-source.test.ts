@@ -1125,7 +1125,7 @@ describe("job source loading", () => {
     expect(cancellations).toEqual([1, 2]);
   });
 
-  test("enforces declared and streamed one-MiB body limits before decoding", async () => {
+  test("enforces declared and streamed four-MiB body limits before decoding", async () => {
     let pulled = false;
     let cancelled = false;
     const declared = new ReadableStream<Uint8Array>({
@@ -1135,7 +1135,7 @@ describe("job source loading", () => {
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       resolveHost: resolvePublic,
       fetchImpl: async () => new Response(declared, {
-        headers: { "content-type": "text/plain", "content-length": String(1024 * 1024 + 1) },
+        headers: { "content-type": "text/plain", "content-length": String(4 * 1024 * 1024 + 1) },
       }),
     })).rejects.toMatchObject({ code: "JOB_SOURCE_TOO_LARGE" });
     expect(pulled).toBe(true);
@@ -1144,7 +1144,7 @@ describe("job source loading", () => {
     let streamCancelled = false;
     const streamed = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(new Uint8Array(1024 * 1024));
+        controller.enqueue(new Uint8Array(4 * 1024 * 1024));
         controller.enqueue(new Uint8Array([1]));
       },
       cancel() { streamCancelled = true; },
@@ -1159,11 +1159,11 @@ describe("job source loading", () => {
       "@type": "JobPosting",
       description: VALID_TEXT,
     })}</script>`;
-    const exactBody = `${postingJson}<script>${"x".repeat(1024 * 1024 - postingJson.length - 17)}</script>`;
-    expect(new TextEncoder().encode(exactBody).byteLength).toBe(1024 * 1024);
+    const exactBody = `${postingJson}<script>${"x".repeat(4 * 1024 * 1024 - postingJson.length - 17)}</script>`;
+    expect(new TextEncoder().encode(exactBody).byteLength).toBe(4 * 1024 * 1024);
     await expect(loadJobSourceFromUrl("https://jobs.example.test/role", undefined, {
       resolveHost: resolvePublic,
-      fetchImpl: async () => htmlResponse(exactBody, { "content-length": String(1024 * 1024) }),
+      fetchImpl: async () => htmlResponse(exactBody, { "content-length": String(4 * 1024 * 1024) }),
     })).resolves.toEqual({ kind: "model-fallback", lines: [VALID_TEXT] });
   });
 

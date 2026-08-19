@@ -80,7 +80,7 @@ export class JobSourceError extends Error {
 
 const NETWORK_DEADLINE_MS = 10_000;
 const MAX_REDIRECT_HOPS = 5;
-const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const NEVER_ABORTED_SIGNAL = new AbortController().signal;
 const REDIRECT_STATUSES: Readonly<Record<number, true>> = {
   301: true,
