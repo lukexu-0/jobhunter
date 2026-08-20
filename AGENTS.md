@@ -8,7 +8,7 @@ Jobhunter is a local, evidence-grounded system for opportunity discovery, resume
 - `apps/web/`: Next.js App Router UI for starting and monitoring runs, reviewing revisions, browsing discovery results, managing application state, and connecting OpenAI Codex OAuth.
 - `apps/application/`: separately launched Python/FastAPI harness that owns one constrained Playwright CLI/Chrome application session with human gates.
 
-Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and public-safe failures. Candidate evidence under `apps/user-info/` is private input, not general engineering documentation.
+Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and public-safe failures. `apps/user-info/` and `jobhunter-resume-info.md` contain private candidate evidence; they are inputs, not operational engineering documentation.
 
 ## Architecture & Data Flow
 
@@ -17,7 +17,7 @@ Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and publi
 3. `WorkerScheduler` leases at most five SQLite claims. `PipelineStageProcessor` claim-fences `analyzing → tailoring/editing → compiling/repairing → deterministic_qa → visual_qa → review/approved`. Stages create new artifacts and guarded revisions; they do not mutate finalized output.
 4. `PipelineRepository` owns durable run, revision, attempt, claim, event, source-snapshot, and application-session state. `ArtifactStore` owns bounded, path-contained bytes. Writes are atomic and SHA-256/size verified; claim tokens and source/PDF hashes reject stale work.
 5. Shared React data lives in `DashboardDataProvider`; detail/review and application-stream state live in their owning workspace components. Poll only while work is active and reject stale responses with request/version or generation/event guards.
-6. For approved URL-backed runs, `ApplicationSessionService` sends the approved PDF, TeX source, profile, and mode to the bearer-protected Python harness. Python owns the singleton live browser session and human gates, and calls only the private Bun `/v1/internal/application-agent` model boundary. Harness snapshots/events return through SQLite and the web SSE bridge.
+6. For approved URL-backed runs, `ApplicationSessionService` sends the approved PDF, TeX source, profile, and mode to the bearer-protected Python harness. Python owns the singleton browser/source-capture slot and human gates, and calls only the private Bun `/v1/internal/application-agent` model boundary. Harness snapshots/events return through SQLite and the web SSE bridge; raw model traces remain private diagnostics.
 7. Runtime state is outside the checkout: `<data-root>/production/{pipeline.sqlite,context.sqlite,auth.sqlite,runs/}` or `<data-root>/development/<encoded-branch>/...`. `<data-root>` is absolute `JOBHUNTER_DATA_HOME`, otherwise absolute `$XDG_DATA_HOME/jobhunter`, otherwise `~/.local/share/jobhunter`. Never edit these stores directly.
 
 ## Key Directories
@@ -84,7 +84,7 @@ The workspace launcher never starts the Python harness. Keep development and sta
 - **Frontend state:** Reuse `DashboardDataProvider` and the existing detail/review state owners. Browser code must use the same-origin typed pipeline client, not direct loopback APIs.
 - **Naming and formatting:** TypeScript files are generally kebab-case; symbols use PascalCase/camelCase. Python modules/functions use snake_case and classes use PascalCase. Tests use `*.test.ts[x]`, `*.pw.ts`, and `test_*.py`. No formatter or linter is configured—match adjacent style and avoid broad restyling.
 - **Optional fields:** Pipeline TypeScript enables `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`; preserve distinctions among missing, `undefined`, and `null`.
-- **Documentation:** Before changing behavior, read the relevant `info/docs/` page and update every affected page afterward. These pages are standalone semantic HTML with source links, commands, boundaries, failure states, troubleshooting, and valid local links/fragments.
+- **Documentation:** Before changing behavior, read the relevant `info/docs/` page and update every affected page afterward. These pages are standalone semantic HTML with source links, commands, boundaries, failure states, troubleshooting, and valid local links/fragments. Prefer `info/docs/apps/` and current manifests over historical `info/planning/` or candidate dossiers.
 
 ## Important Files
 
@@ -103,6 +103,7 @@ The workspace launcher never starts the Python harness. Keep development and sta
 | `apps/web/app/components/run-review-workspace.tsx` | Application SSE projection, action latches, and review state. |
 | `apps/application/{pyproject.toml,uv.lock}` | Python runtime, exact dependencies, console entry point, and pytest setup. |
 | `apps/application/src/browser_harness/{cli,api,sessions}.py` | Harness composition, HTTP/auth boundary, and singleton browser-session state machine. |
+| `apps/resume-tailoring/src/{api/application-session-service,agents/application-agent-service}.ts` | Approved-run handoff, sanitized SSE projection, private model boundary, submission guards, and diagnostic traces. |
 | `info/docs/apps/index.html` | Canonical workspace operations and links to pipeline, web, and harness documentation. |
 
 ## Runtime/Tooling Preferences
@@ -111,6 +112,7 @@ The workspace launcher never starts the Python harness. Keep development and sta
 - Use Python `>=3.12,<3.13` with `uv` and committed `apps/application/uv.lock`.
 - The harness also requires Node.js, exact `@playwright/cli` `0.1.17`, matching `playwright` `1.62.0-alpha-1783623505000`, Chrome, and the installed ffmpeg codec.
 - Pipeline processing targets Linux. TeX/PDF work requires `latexmk`, `pdfinfo`, `pdftotext`, `pdffonts`, and `pdftoppm`; generic rendered HTML fallback also requires the documented Chrome/systemd boundary. Run `doctor` instead of guessing which prerequisite is missing.
+- Under WSL, the harness rejects automatic Windows Chrome discovery and `.exe` paths. Start Windows Chrome separately with an isolated profile and pass its loopback `--cdp-url`; follow `info/docs/apps/browser-harness/application.html`.
 - Provider access is OpenAI Codex OAuth only; do not add provider API keys. Pipeline and harness share a private `JOBHUNTER_HARNESS_TOKEN` of at least 32 code points. Never put it in browser code, URLs, source, or logs.
 - No project `.env` template, CI workflow, container deployment, formatter, or linter is configured. Follow manifests and canonical HTML docs rather than inventing tooling.
 - Do not edit generated `apps/web/next-env.d.ts`, pipeline `dist/`, Next `.next/`, test output, browser profiles, credentials, external SQLite state, or run artifacts.
@@ -122,5 +124,5 @@ The workspace launcher never starts the Python harness. Keep development and sta
 - Restore globals such as `fetch`, close databases/services/servers, and remove temporary resources in hooks or `finally`.
 - Web component tests use pure helpers or `renderToStaticMarkup`; browser interaction belongs in Playwright. E2E uses one worker, a fresh Next server, intercepted `/api/pipeline/**` calls, and controlled SSE. Prefer `expect.poll` or events over fixed sleeps.
 - Python uses pytest with `pytest-asyncio` automatic mode, `tmp_path`, `monkeypatch`, fake runtime collaborators, and HTTPX ASGI/Mock transports. The real-Chromium fixture is optional and skips when Chrome, Node, or Playwright CLI is unavailable.
-- `apps/resume-tailoring/test/docs.test.ts` validates canonical HTML docs, links/fragments, and documented commands. Run it when changing `info/docs/`.
+- `apps/resume-tailoring/test/docs.test.ts` validates canonical HTML docs, links/fragments, and documented commands. After changing `info/docs/`, run `cd apps && bun test resume-tailoring/test/docs.test.ts`.
 - No coverage tool or threshold is configured. For behavior changes, add or update the narrowest observable contract test, run the focused suite plus relevant typecheck, and use Playwright or the documented headed smoke when behavior crosses a browser/runtime boundary.
