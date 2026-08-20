@@ -161,7 +161,7 @@ export interface ApplicationHarnessSnapshot {
   readonly state: HarnessSessionState;
   readonly createdAt: number;
   readonly updatedAt: number;
-  readonly expiresAt: number;
+  readonly expiresAt: number | null;
   readonly slotReleased: boolean;
   readonly company: string | null;
   readonly role: string | null;
@@ -237,7 +237,7 @@ const RawSnapshotSchema = z.object({
   state: HarnessSessionStateSchema,
   created_at: TimestampSchema,
   updated_at: TimestampSchema,
-  expires_at: TimestampSchema,
+  expires_at: TimestampSchema.nullable(),
   slot_released: z.boolean(),
   job_url: z.string().max(4_096).refine(isSanitizedHttpUrl),
   company: z.string().refine((value) => codePointLength(value, 0, 500)).nullable(),
@@ -260,11 +260,11 @@ const RawSnapshotSchema = z.object({
 }).strict().superRefine((snapshot, context) => {
   const createdAt = Date.parse(snapshot.created_at);
   const updatedAt = Date.parse(snapshot.updated_at);
-  const expiresAt = Date.parse(snapshot.expires_at);
+  const expiresAt = snapshot.expires_at === null ? null : Date.parse(snapshot.expires_at);
   if (updatedAt < createdAt) {
     context.addIssue({ code: "custom", path: ["updated_at"], message: "updated_at precedes created_at" });
   }
-  if (expiresAt < createdAt) {
+  if (expiresAt !== null && expiresAt < createdAt) {
     context.addIssue({ code: "custom", path: ["expires_at"], message: "expires_at precedes created_at" });
   }
   if (snapshot.slot_released && SLOT_RELEASED_STATES[snapshot.state] !== true) {
@@ -789,7 +789,7 @@ function projectSnapshot(snapshot: RawSnapshot): ApplicationHarnessSnapshot {
     state: snapshot.state,
     createdAt: Date.parse(snapshot.created_at),
     updatedAt: Date.parse(snapshot.updated_at),
-    expiresAt: Date.parse(snapshot.expires_at),
+    expiresAt: snapshot.expires_at === null ? null : Date.parse(snapshot.expires_at),
     slotReleased: snapshot.slot_released,
     company: snapshot.company,
     role: snapshot.role,

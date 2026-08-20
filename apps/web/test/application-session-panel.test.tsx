@@ -150,6 +150,20 @@ describe("ApplicationSessionPanel", () => {
     expect(submitted).not.toContain("Retry applying");
     expect(submitted).not.toContain("Steer the agent");
 
+    const unlimitedSubmitted = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "submitted",
+          harnessState: "submitted",
+          submissionPhase: "submitted",
+          expiresAt: null,
+        })}
+      />,
+    );
+    expect(unlimitedSubmitted).toContain("stays open until you close it");
+    expect(unlimitedSubmitted).not.toContain("browser session expires");
+
     const uncertain = renderToStaticMarkup(
       <ApplicationSessionPanel
         {...callbacks}

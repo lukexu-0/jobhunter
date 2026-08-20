@@ -94,7 +94,7 @@ export const ApplicationAgentRunInputSchema = z.object({
   runtimeUrl: z.string().refine(isLoopbackHttpOrigin, "must be a loopback HTTP origin"),
   task: utf8Bounded(MAX_APPLICATION_TASK_BYTES),
   autoSubmit: z.boolean(),
-  deadlineMs: z.number().int().min(1_000).max(86_400_000),
+  deadlineMs: z.number().int().min(1_000).max(86_400_000).nullable(),
 }).strict();
 
 export type ApplicationAgentRunInput = z.infer<typeof ApplicationAgentRunInputSchema>;

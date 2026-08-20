@@ -427,6 +427,7 @@ describe("application agent HTTP boundary", () => {
   test("dispatches the exact POST before Origin policy and returns the exact success", async () => {
     let seenInput: unknown;
     let seenSignal: AbortSignal | undefined;
+    const unlimitedInput = { ...INPUT, deadlineMs: null };
     const handler = createApiHandler({
       webOrigin: "http://127.0.0.1:3456",
       internalRoute: createApplicationAgentRoutes(fakeService({
@@ -444,13 +445,13 @@ describe("application agent HTTP boundary", () => {
         "content-type": "application/json; charset=utf-8",
         origin: "https://attacker.invalid",
       },
-      body: JSON.stringify(INPUT),
+      body: JSON.stringify(unlimitedInput),
     }));
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.headers.get("access-control-allow-origin")).toBeNull();
     expect(await response.json()).toEqual(SUCCESS);
-    expect(seenInput).toEqual(INPUT);
+    expect(seenInput).toEqual(unlimitedInput);
     expect(seenSignal?.aborted).toBe(false);
   });
   test("settles on request abort when a streamed read and cancellation both stall", async () => {

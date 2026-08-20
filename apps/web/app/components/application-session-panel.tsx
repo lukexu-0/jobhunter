@@ -470,7 +470,7 @@ export function ApplicationSessionPanel({
       {parked ? (
         <p className={styles.workspaceNotice}>
           Headed Chrome stays open until {snapshot.expiresAt === null
-            ? "the browser session expires"
+            ? "you close it"
             : formatTimestamp(snapshot.expiresAt)} so you can inspect the final application state.
         </p>
       ) : null}

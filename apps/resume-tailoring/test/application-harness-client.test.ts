@@ -148,6 +148,16 @@ describe("HttpApplicationHarnessClient", () => {
     expect(JSON.stringify(snapshot)).not.toContain("ats.private.example");
     expect(JSON.stringify(snapshot)).not.toContain("model");
   });
+  test("projects a required null expiry for an unlimited harness session", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json(rawSnapshot({ expires_at: null })),
+    });
+
+    await expect(client.get(SESSION_ID, new AbortController().signal))
+      .resolves.toMatchObject({ expiresAt: null });
+  });
   test("defaults omitted Playwright CLI diagnostics to an empty public list", async () => {
     const client = new HttpApplicationHarnessClient({
       origin: ORIGIN,

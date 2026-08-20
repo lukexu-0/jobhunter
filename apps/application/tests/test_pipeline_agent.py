@@ -225,6 +225,29 @@ async def test_run_posts_exact_contract_without_transport_deadline(
     )
 
 
+async def test_run_posts_null_deadline_for_unlimited_session(
+    build_client: Callable[..., ClientHarness],
+) -> None:
+    harness = build_client(
+        lambda _request: httpx.Response(200, json=_success_payload())
+    )
+
+    await harness.agent.run(
+        runtime_url="http://localhost:8765",
+        opportunity_kind="job",
+        auto_submit=False,
+        task="complete the application",
+        deadline_ms=None,
+    )
+
+    assert len(harness.requests) == 1
+    assert harness.requests[0].read().decode("utf-8") == (
+        '{"sessionId":"52aa48d2-c3c8-40df-80de-d213631a04aa",'
+        '"runtimeUrl":"http://localhost:8765","opportunityKind":"job",'
+        '"task":"complete the application","autoSubmit":false,"deadlineMs":null}'
+    )
+
+
 async def test_steer_posts_exact_authenticated_path_body_and_requires_empty_202(
     build_client: Callable[..., ClientHarness],
 ) -> None:

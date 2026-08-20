@@ -145,7 +145,7 @@ class PipelineApplicationAgentClient:
         opportunity_kind: OpportunityKind,
         auto_submit: bool,
         task: str,
-        deadline_ms: int,
+        deadline_ms: int | None,
     ) -> ApplicationRunResult:
         runtime_origin = _normalize_loopback_origin(
             runtime_url, name="runtime_url"
@@ -165,7 +165,7 @@ class PipelineApplicationAgentClient:
             name="task",
             max_bytes=_MAX_APPLICATION_TASK_BYTES,
         )
-        if (
+        if deadline_ms is not None and (
             type(deadline_ms) is not int
             or not 1_000 <= deadline_ms <= 86_400_000
         ):

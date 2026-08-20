@@ -226,7 +226,7 @@ class _TerminalRequest:
 class _ApplicationSession:
     session_id: UUID
     snapshot: SessionSnapshot
-    deadline_monotonic: float
+    deadline_monotonic: float | None
     events: deque[HarnessEvent] = field(
         default_factory=lambda: deque(maxlen=_EVENT_LIMIT)
     )
@@ -481,6 +481,17 @@ class ApplicationSessionManager:
         session_id = session_id if session_id is not None else uuid4()
         created_at = _now()
         accepted_monotonic = asyncio.get_running_loop().time()
+        session_timeout = self._config.session_timeout
+        expires_at = (
+            None
+            if session_timeout is None
+            else created_at + timedelta(seconds=session_timeout)
+        )
+        deadline_monotonic = (
+            None
+            if session_timeout is None
+            else accepted_monotonic + session_timeout
+        )
         record = _ApplicationSession(
             session_id=session_id,
             snapshot=SessionSnapshot(
@@ -488,13 +499,11 @@ class ApplicationSessionManager:
                 state="starting",
                 created_at=created_at,
                 updated_at=created_at,
-                expires_at=created_at + timedelta(seconds=self._config.session_timeout),
+                expires_at=expires_at,
                 job_url=f"{origins[0]}/",
                 approved_origins=list(origins),
             ),
-            deadline_monotonic=(
-                accepted_monotonic + self._config.session_timeout
-            ),
+            deadline_monotonic=deadline_monotonic,
             setup_task=asyncio.current_task(),
         )
 
@@ -542,10 +551,11 @@ class ApplicationSessionManager:
                     session_id=self._active.session_id,
                 )
             self._active = record
-            record.ttl_task = asyncio.create_task(
-                self._expire_session(record),
-                name=f"browser-harness-ttl-{session_id}",
-            )
+            if deadline_monotonic is not None:
+                record.ttl_task = asyncio.create_task(
+                    self._expire_session(record),
+                    name=f"browser-harness-ttl-{session_id}",
+                )
 
         try:
             stored = await store_uploads(
@@ -1469,7 +1479,10 @@ class ApplicationSessionManager:
                 raise HarnessServiceError(
                     409, "command_conflict", "A terminal command is already pending"
                 )
-            if asyncio.get_running_loop().time() >= record.deadline_monotonic:
+            if (
+                record.deadline_monotonic is not None
+                and asyncio.get_running_loop().time() >= record.deadline_monotonic
+            ):
                 terminal = (
                     _TerminalRequest("closed", "closed")
                     if record.snapshot.state
@@ -1681,7 +1694,8 @@ class ApplicationSessionManager:
                     "Only closing the browser is allowed after a submission outcome",
                 )
             if (
-                asyncio.get_running_loop().time()
+                record.deadline_monotonic is not None
+                and asyncio.get_running_loop().time()
                 >= record.deadline_monotonic
             ):
                 await self._begin_finalization_locked(
@@ -2279,7 +2293,10 @@ class ApplicationSessionManager:
             if record.finalized or record.final_request is not None:
                 record.agent_task = None
                 return
-            if asyncio.get_running_loop().time() >= record.deadline_monotonic:
+            if (
+                record.deadline_monotonic is not None
+                and asyncio.get_running_loop().time() >= record.deadline_monotonic
+            ):
                 record.agent_task = None
                 await self._begin_finalization_locked(
                     record,
@@ -2295,22 +2312,25 @@ class ApplicationSessionManager:
             )
         try:
             if self._application_runner is None:
-                remaining_ms = int(
-                    (
-                        record.deadline_monotonic
-                        - asyncio.get_running_loop().time()
+                deadline_ms: int | None = None
+                if record.deadline_monotonic is not None:
+                    remaining_ms = int(
+                        (
+                            record.deadline_monotonic
+                            - asyncio.get_running_loop().time()
+                        )
+                        * 1_000
                     )
-                    * 1_000
-                )
-                if remaining_ms < 1_000:
-                    record.agent_task = None
-                    return
+                    if remaining_ms < 1_000:
+                        record.agent_task = None
+                        return
+                    deadline_ms = min(remaining_ms, 86_400_000)
                 result = await model.run(
                     runtime_url=f"http://127.0.0.1:{self._config.port}",
                     opportunity_kind=request.opportunity_kind,
                     auto_submit=request.auto_submit,
                     task=record.application_task,
-                    deadline_ms=min(remaining_ms, 86_400_000),
+                    deadline_ms=deadline_ms,
                 )
             else:
                 result = await self._application_runner(
@@ -2345,7 +2365,10 @@ class ApplicationSessionManager:
             async with record.request_lock:
                 if record.finalized or record.final_request is not None:
                     return
-                if asyncio.get_running_loop().time() >= record.deadline_monotonic:
+                if (
+                    record.deadline_monotonic is not None
+                    and asyncio.get_running_loop().time() >= record.deadline_monotonic
+                ):
                     record.agent_task = None
                     await self._begin_finalization_locked(
                         record,
@@ -2413,7 +2436,10 @@ class ApplicationSessionManager:
             record.agent_task = None
             if record.finalized or record.final_request is not None:
                 return
-            if asyncio.get_running_loop().time() >= record.deadline_monotonic:
+            if (
+                record.deadline_monotonic is not None
+                and asyncio.get_running_loop().time() >= record.deadline_monotonic
+            ):
                 request = _TerminalRequest(
                     "failed",
                     "failed",
@@ -2454,9 +2480,12 @@ class ApplicationSessionManager:
         )
 
     async def _expire_session(self, record: _ApplicationSession) -> None:
+        deadline_monotonic = record.deadline_monotonic
+        if deadline_monotonic is None:
+            return
         delay = max(
             0.0,
-            record.deadline_monotonic - asyncio.get_running_loop().time(),
+            deadline_monotonic - asyncio.get_running_loop().time(),
         )
         try:
             await asyncio.sleep(delay)
