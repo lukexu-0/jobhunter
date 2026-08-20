@@ -431,7 +431,7 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
 
 
 
-def test_default_session_timeout_is_four_hours(
+def test_default_session_timeout_is_unlimited(
     fake_playwright_cli: tuple[Path, Path],
 ) -> None:
     config, _launch = cli_module.parse_config(
@@ -443,8 +443,8 @@ def test_default_session_timeout_is_four_hours(
         environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
     )
 
-    assert config.session_timeout == 14_400
-    assert HarnessConfig(bearer_token=TOKEN).session_timeout == 14_400
+    assert config.session_timeout is None
+    assert HarnessConfig(bearer_token=TOKEN).session_timeout is None
 
 @pytest.mark.parametrize(
     ("provided", "canonical"),

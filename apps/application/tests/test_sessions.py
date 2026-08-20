@@ -585,7 +585,7 @@ def make_manager(
     runner: Runner | None,
     *,
     fakes: Fakes | None = None,
-    timeout: int = 14_400,
+    timeout: int | None = None,
     context_process_factory: Callable[[Any], Any] = ImmediateContextProcess,
     credential_store: CredentialStore | None = None,
 ) -> tuple[ApplicationSessionManager, Fakes, Path]:
@@ -1339,7 +1339,7 @@ async def test_steer_interrupts_a_pending_gate_but_rejects_inactive_generations(
 
 
 async def test_steer_deadline_wins_before_private_dispatch(tmp_path: Path) -> None:
-    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner, timeout=60)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
@@ -1729,12 +1729,14 @@ async def test_preflight_completes_before_playwright_runtime_and_create_contract
     assert snapshot.state == "starting"
     assert snapshot.job_url == "https://jobs.example/[redacted]/42"
     assert snapshot.approved_origins == ["https://jobs.example"]
-    assert (snapshot.expires_at - snapshot.created_at).total_seconds() == 14_400
+    assert snapshot.expires_at is None
 
     await asyncio.wait_for(runner_started.wait(), timeout=1)
     await wait_until(lambda: len(manager._active.events) >= 2)  # type: ignore[union-attr]
     record = manager._active
     assert record is not None
+    assert record.deadline_monotonic is None
+    assert record.ttl_task is None
     assert [event.event for event in list(record.events)[:2]] == [
         "session_started",
         "agent_step",
@@ -2537,7 +2539,7 @@ async def test_absolute_ttl_maps_to_session_timeout_without_real_sleep(tmp_path:
 async def test_expiry_cannot_publish_after_concurrent_delete_tombstones_session(
     tmp_path: Path,
 ) -> None:
-    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
+    manager, _fakes, _root = make_manager(tmp_path, blocked_runner, timeout=60)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
     record = manager._active
@@ -2762,6 +2764,7 @@ async def test_continue_at_absolute_deadline_fails_before_resuming_gate(
         tmp_path,
         runner,
         fakes=Fakes(runtime_close_blocker=cleanup_blocker),
+        timeout=60,
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
@@ -2837,6 +2840,7 @@ async def test_submission_action_cannot_start_after_absolute_deadline(
         tmp_path,
         runner,
         fakes=Fakes(runtime_close_blocker=cleanup_blocker),
+        timeout=60,
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "awaiting_human_review")
@@ -5997,7 +6001,7 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     assert "updated_at" not in call["task"]
     assert task["evidence"][0]["category"] == "resume"
     assert "workflow" not in call["task"].lower()
-    assert 1_000 <= call["deadline_ms"] <= 14_400_000
+    assert call["deadline_ms"] is None
     assert fakes.order.index("model.check_ready") < fakes.order.index(
         "runtime.factory"
     )

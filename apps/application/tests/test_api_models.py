@@ -799,8 +799,9 @@ def test_submission_session_states_are_strict_and_have_no_pending_action(
     assert snapshot.error is None
 
 
-def test_session_snapshot_requires_a_nonnegative_absolute_expiry() -> None:
+def test_session_snapshot_accepts_unlimited_or_nonnegative_finite_expiry() -> None:
     assert make_snapshot().expires_at == NOW + timedelta(hours=1)
+    assert make_snapshot(expires_at=None).expires_at is None
 
     values = make_snapshot().model_dump()
     del values["expires_at"]

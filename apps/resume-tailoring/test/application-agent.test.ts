@@ -337,6 +337,8 @@ describe("application agent", () => {
       autoSubmit: false,
     };
     expect(ApplicationAgentRunInputSchema.parse(input)).toEqual(input);
+    expect(ApplicationAgentRunInputSchema.parse({ ...input, deadlineMs: null }))
+      .toEqual({ ...input, deadlineMs: null });
     expect(ApplicationRunResultSchema.parse(VALID_SUBMITTED_RESULT)).toEqual(VALID_SUBMITTED_RESULT);
     expect(() => ApplicationAgentRunInputSchema.parse({ ...input, extra: true })).toThrow();
     const { autoSubmit: _autoSubmit, ...missingMode } = input;

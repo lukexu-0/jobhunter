@@ -550,6 +550,18 @@ describe("application session service", () => {
     expect(serialized).not.toContain(PROFILE);
   });
 
+  test("preserves an unlimited harness expiry in the public snapshot", async () => {
+    const target = await createTarget();
+    target.harness!.snapshotAfterCreate = {
+      ...harnessSnapshot(),
+      expiresAt: null,
+    };
+
+    await expect(
+      target.service.start(target.runId, target.pdf.sha256, signal()),
+    ).resolves.toMatchObject({ expiresAt: null });
+  });
+
   test("rejects approved PDF and source files one byte over their pipeline artifact caps", async () => {
     for (const kind of ["pdf", "tex"] as const) {
       const target = await createTarget();

@@ -20,7 +20,6 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
-from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 
 MODEL_PROVIDER = "openai-codex"
 MODEL_NAME = "gpt-5.6-sol"
@@ -579,11 +578,7 @@ class HarnessConfig(FrozenPrivateModel):
     ]
     pipeline_url: StrictText = "http://127.0.0.1:3457"
     port: int = Field(default=8765, ge=1, le=65_535)
-    session_timeout: int = Field(
-        default=DEFAULT_SESSION_TIMEOUT_SECONDS,
-        ge=1,
-        le=86_400,
-    )
+    session_timeout: int | None = Field(default=None, ge=1, le=86_400)
     node_executable: Path | None = None
     playwright_cli_script: Path | None = None
     user_info_json: Path = Path(
@@ -807,7 +802,7 @@ class SessionSnapshot(PublicModel):
     state: SessionState
     created_at: datetime
     updated_at: datetime
-    expires_at: datetime
+    expires_at: datetime | None
     slot_released: bool = False
     job_url: StrictText
     company: Annotated[str, StringConstraints(strict=True, max_length=500)] | None = None
@@ -850,7 +845,7 @@ class SessionSnapshot(PublicModel):
     def _validate_timestamps_error_and_pending_action(self) -> SessionSnapshot:
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not precede created_at")
-        if self.expires_at < self.created_at:
+        if self.expires_at is not None and self.expires_at < self.created_at:
             raise ValueError("expires_at must not precede created_at")
         if self.slot_released and self.state not in {"cancelled", "failed", "closed"}:
             raise ValueError("only cleaned terminal sessions may release the slot")

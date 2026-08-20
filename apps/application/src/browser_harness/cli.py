@@ -11,7 +11,6 @@ from shutil import which
 
 import uvicorn
 from pydantic import ValidationError
-from . import DEFAULT_SESSION_TIMEOUT_SECONDS
 
 from .credentials import CredentialStore
 from .api import HarnessDependencies, create_app
@@ -47,10 +46,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--session-timeout",
         type=int,
-        default=DEFAULT_SESSION_TIMEOUT_SECONDS,
+        default=None,
         help=(
-            "absolute session lifetime in seconds "
-            f"(default: {DEFAULT_SESSION_TIMEOUT_SECONDS})"
+            "optional absolute session lifetime in seconds "
+            "(default: unlimited)"
         ),
     )
     parser.add_argument(
