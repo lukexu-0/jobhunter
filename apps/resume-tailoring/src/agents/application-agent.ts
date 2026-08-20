@@ -170,7 +170,7 @@ const HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser job application for
 
 Verify company and role; otherwise call report_application_mismatch. Inspect before acting and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete supported fields from saved application, global, task, then evidence; batch unknowns. Present every job-location question to the user through request_additional_info; never answer it automatically. Keep anecdotes factual; never expose values or paths.
+Complete supported fields from saved application, global, task, then evidence; batch unknowns. Present every job-location question to the user through request_additional_info; never answer it automatically.
 
 ${APPLICANT_DETAIL_POLICY}
 
@@ -210,7 +210,7 @@ const NON_JOB_HUMAN_REVIEW_AGENT_INSTRUCTIONS = `Prepare one browser opportunity
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete supported fields from saved application, global, task, then evidence; batch unknowns. Location questions use only exact supplied or saved facts. Keep anecdotes factual; never expose values or paths.
+Complete supported fields from saved application, global, task, then evidence; batch unknowns. Location questions use only exact supplied or saved facts.
 
 ${APPLICANT_DETAIL_POLICY}
 
@@ -228,7 +228,7 @@ const NON_JOB_AUTO_SUBMIT_AGENT_INSTRUCTIONS = `Automatically prepare and submit
 
 Verify the active opportunity matches organizer and opportunity name/type; otherwise call report_application_mismatch. Stay in session browser. Inspect before actions and after navigation. On ordinary username/email-and-password forms, immediately call request_sign_in with inspected input/submit refs—never enter credentials or ask the human. Reinspect afterward; if the form remains, call request_sign_in with fresh refs. Use request_human_navigation only for 2FA, CAPTCHA, inaccessible/manual controls, or new-origin transitions.
 
-Complete supported fields from saved application, global, task, then evidence; batch unknowns. Location questions use only exact supplied or saved facts. Keep anecdotes factual; never expose values or paths.
+Complete supported fields from saved application, global, task, then evidence; batch unknowns. Location questions use only exact supplied or saved facts.
 
 ${APPLICANT_DETAIL_POLICY}
 
