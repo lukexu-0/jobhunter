@@ -165,9 +165,25 @@ def _canonical_session_name(session_id: UUID | str) -> str:
     return str(parsed)
 
 
+def session_artifact_directory(
+    root: Path,
+    session_id: UUID | str,
+) -> Path:
+    """Return the canonical path owned by one browser-harness session."""
+
+    absolute_root = _absolute_path(root)
+    if len(absolute_root.parts) <= 1:
+        raise ValueError("a filesystem root cannot be an artifact directory")
+    return absolute_root / _canonical_session_name(session_id)
+
+
 def _create_session_directory(root: Path, session_id: UUID | str) -> tuple[int, Path]:
-    session_name = _canonical_session_name(session_id)
-    root_descriptor, absolute_root = _open_directory_chain(root, create=True)
+    session_path = session_artifact_directory(root, session_id)
+    session_name = session_path.name
+    root_descriptor, _absolute_root = _open_directory_chain(
+        session_path.parent,
+        create=True,
+    )
     session_descriptor: int | None = None
     created = False
     try:
@@ -178,7 +194,7 @@ def _create_session_directory(root: Path, session_id: UUID | str) -> tuple[int, 
             session_name, _DIRECTORY_FLAGS, dir_fd=root_descriptor
         )
         os.fchmod(session_descriptor, 0o700)
-        return session_descriptor, absolute_root / session_name
+        return session_descriptor, session_path
     except BaseException:
         if session_descriptor is not None:
             os.close(session_descriptor)
@@ -689,6 +705,7 @@ __all__ = [
     "cleanup_orphaned_session_artifacts",
     "cleanup_session_artifacts",
     "remove_session_artifacts",
+    "session_artifact_directory",
     "retry_pending_cleanup",
     "store_uploads",
 ]

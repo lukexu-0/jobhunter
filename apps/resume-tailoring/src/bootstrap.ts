@@ -327,7 +327,9 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       ...schedulerOptions,
       afterDrain: async (signal) => {
         await schedulerOptions?.afterDrain?.(signal);
-        await applicationSessions.startNextAutomaticApplication(signal);
+        while (await applicationSessions.startNextAutomaticApplication(signal)) {
+          // Fill every currently available application-session slot in FIFO order.
+        }
       },
     },
   });

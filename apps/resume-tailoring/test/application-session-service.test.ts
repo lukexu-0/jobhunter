@@ -16,12 +16,13 @@ import {
   type ApplicationSessionStreamItem,
   readApplicantProfileMarkdown,
 } from "../src/api/application-session-service.ts";
-import type {
-  ApplicationAnswerSuggestionsResponse,
-  ApplicationProfessionalizeRequest,
-  ApplicationSessionCommand,
-  ApplicationSessionEventDto,
-  OpportunityKind,
+import {
+  ApplicationSessionSnapshotDtoSchema,
+  type ApplicationAnswerSuggestionsResponse,
+  type ApplicationProfessionalizeRequest,
+  type ApplicationSessionCommand,
+  type ApplicationSessionEventDto,
+  type OpportunityKind,
 } from "../src/contracts/index.ts";
 import { OAuthRequiredError } from "../src/auth/oauth-only-resolver.ts";
 import {
@@ -41,6 +42,8 @@ const PROFILE = "# Applicant profile\n\nPrivate candidate evidence.\n";
 const FIRST_SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const THIRD_SESSION_ID = "33333333-3333-4333-8333-333333333333";
+const FOURTH_SESSION_ID = "44444444-4444-4444-8444-444444444444";
+const FIFTH_SESSION_ID = "55555555-5555-4555-8555-555555555555";
 const PDF_BYTES = new TextEncoder().encode("%PDF-1.7\nprivate approved resume\n%%EOF\n");
 const TAILORED_TEX_BYTES = new TextEncoder().encode(
   "\\documentclass{article}\n% exact current Ω source\n",
@@ -121,6 +124,7 @@ class FakeHarness implements ApplicationHarnessClient {
   streamError: ApplicationHarnessError | null = null;
   snapshotAfterCreate = harnessSnapshot();
   storeSnapshotBeforeCreateError = false;
+  onGet: ((sessionId: string) => void) | undefined;
 
   async create(input: ApplicationHarnessCreateInput): Promise<void> {
     this.createCalls.push({
@@ -139,6 +143,7 @@ class FakeHarness implements ApplicationHarnessClient {
 
   async get(sessionId: string): Promise<ApplicationHarnessSnapshot> {
     this.getCalls.push(sessionId);
+    this.onGet?.(sessionId);
     const queued = this.getReplies.shift();
     if (queued) return await queued;
     const snapshot = this.snapshots.get(sessionId);
@@ -340,12 +345,15 @@ const signal = () => new AbortController().signal;
 function deferred<T>(): {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
+  readonly reject: (reason?: unknown) => void;
 } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((complete) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((complete, fail) => {
     resolve = complete;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 async function createProfileRoot(): Promise<{ root: string; profilePath: string }> {
@@ -372,12 +380,60 @@ describe("application session service", () => {
     expect(manual.harness!.createCalls).toHaveLength(0);
   });
 
-  test("serializes automatic starts while the harness is occupied and continues after close", async () => {
+  test("observes a fresh automatic session release without a public event client", async () => {
+    const released = deferred<void>();
+    let availabilityKicks = 0;
+    const target = await createTarget({
+      skipReview: true,
+      onApplicationSessionReleased: () => {
+        availabilityKicks++;
+        released.resolve();
+      },
+    });
+    const observerEvents = deferred<AsyncIterable<ApplicationHarnessEvent>>();
+    target.harness!.streamReplies.push(observerEvents.promise);
+
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.harness!.streamCalls).toEqual([{
+      sessionId: FIRST_SESSION_ID,
+      lastEventId: undefined,
+    }]);
+
+    observerEvents.resolve({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          id: 1,
+          event: "snapshot",
+          session: {
+            ...harnessSnapshot("closed"),
+            updatedAt: 10_200,
+          },
+          detail: {},
+        };
+      },
+    });
+    await released.promise;
+
+    expect(availabilityKicks).toBe(1);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "closed",
+      slotReleased: true,
+      lastUpstreamEventId: 1,
+    });
+    await target.service.dispose();
+  });
+
+  test("starts automatic applications in FIFO order up to three and reuses released capacity", async () => {
     let availabilityKicks = 0;
     const target = await createTarget({
       skipReview: true,
       onApplicationSessionReleased: () => { availabilityKicks++; },
-      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+      sessionIds: [
+        FIRST_SESSION_ID,
+        SECOND_SESSION_ID,
+        THIRD_SESSION_ID,
+        FOURTH_SESSION_ID,
+      ],
     });
     const second = await createApprovedRun(
       target.repository,
@@ -385,12 +441,35 @@ describe("application session service", () => {
       target.artifacts,
       { id: "run-2", skipReview: true, autoSubmit: true },
     );
+    const third = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-3", skipReview: true },
+    );
+    const fourth = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-4", skipReview: true },
+    );
 
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
     expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
     expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
     expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
       FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
+      THIRD_SESSION_ID,
     ]);
+    expect(target.repository.getLatestApplicationSession(target.runId)?.sessionId)
+      .toBe(FIRST_SESSION_ID);
+    expect(target.repository.getLatestApplicationSession(second.run.id)?.sessionId)
+      .toBe(SECOND_SESSION_ID);
+    expect(target.repository.getLatestApplicationSession(third.run.id)?.sessionId)
+      .toBe(THIRD_SESSION_ID);
+    expect(target.repository.getLatestApplicationSession(fourth.run.id)).toBeNull();
 
     await target.service.close(target.runId, signal());
     expect(availabilityKicks).toBe(1);
@@ -398,73 +477,323 @@ describe("application session service", () => {
     expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
       FIRST_SESSION_ID,
       SECOND_SESSION_ID,
+      THIRD_SESSION_ID,
+      FOURTH_SESSION_ID,
     ]);
     expect(target.harness!.createCalls[1]).toMatchObject({
       autoSubmit: true,
       jobUrl: JOB_URL,
     });
-    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+    expect(target.repository.getLatestApplicationSession(fourth.run.id)).toMatchObject({
       bridgeState: "running",
-      pdfSha256: second.pdf.sha256,
+      pdfSha256: fourth.pdf.sha256,
+      sessionId: FOURTH_SESSION_ID,
     });
   });
 
-  test("restores cleanup observation for an unreleased live session after restart", async () => {
-    const released = deferred<void>();
-    let availabilityKicks = 0;
+  test("manual and automatic starts share the same three-session capacity", async () => {
     const target = await createTarget({
-      skipReview: true,
+      sessionIds: [
+        FIRST_SESSION_ID,
+        SECOND_SESSION_ID,
+        THIRD_SESSION_ID,
+        FOURTH_SESSION_ID,
+      ],
+    });
+    await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true },
+    );
+    await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-3", skipReview: true },
+    );
+    const fourthAutomatic = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-4", skipReview: true },
+    );
+
+    expect(await target.service.start(target.runId, target.pdf.sha256, signal()))
+      .toMatchObject({ generation: 1, bridgeState: "running" });
+    expect(target.harness!.createCalls[0]?.sessionId).toBe(FIRST_SESSION_ID);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
+    expect(target.harness!.createCalls.map(({ sessionId }) => sessionId)).toEqual([
+      FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
+      THIRD_SESSION_ID,
+    ]);
+    expect(target.repository.getLatestApplicationSession(fourthAutomatic.run.id))
+      .toBeNull();
+
+    await target.service.close(target.runId, signal());
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.repository.getLatestApplicationSession(fourthAutomatic.run.id))
+      .toMatchObject({ sessionId: FOURTH_SESSION_ID, bridgeState: "running" });
+  });
+
+  test("does not reconcile another local start while its reservation is still resuming", async () => {
+    const target = await createTarget({
       sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
     });
     const second = await createApprovedRun(
       target.repository,
       target.database,
       target.artifacts,
+      { id: "run-2" },
+    );
+    const firstGet = deferred<ApplicationHarnessSnapshot>();
+    const firstGetStarted = deferred<void>();
+    target.harness!.getReplies.push(firstGet.promise);
+    target.harness!.onGet = (sessionId) => {
+      if (sessionId === FIRST_SESSION_ID) firstGetStarted.resolve();
+    };
+
+    const firstStart = target.service.start(
+      target.runId,
+      target.pdf.sha256,
+      signal(),
+    );
+    await firstGetStarted.promise;
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      sessionId: FIRST_SESSION_ID,
+      bridgeState: "reserved",
+      slotReleased: false,
+    });
+
+    await expect(target.service.start(
+      second.run.id,
+      second.pdf.sha256,
+      signal(),
+    )).resolves.toMatchObject({
+      generation: 1,
+      bridgeState: "running",
+    });
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      sessionId: FIRST_SESSION_ID,
+      bridgeState: "reserved",
+      slotReleased: false,
+    });
+    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+      sessionId: SECOND_SESSION_ID,
+      bridgeState: "running",
+      slotReleased: false,
+    });
+    expect(target.harness!.createCalls.map(({ sessionId }) => sessionId)).toEqual([
+      SECOND_SESSION_ID,
+    ]);
+
+    firstGet.reject(new ApplicationHarnessError("session_not_found"));
+    await expect(firstStart).resolves.toMatchObject({
+      generation: 1,
+      bridgeState: "running",
+    });
+    expect(target.harness!.createCalls.map(({ sessionId }) => sessionId)).toEqual([
+      SECOND_SESSION_ID,
+      FIRST_SESSION_ID,
+    ]);
+    expect(target.repository.listUnreleasedApplicationSessions()).toHaveLength(2);
+    await target.service.dispose();
+  });
+
+  test("restores cleanup observation for every unreleased session after restart", async () => {
+    const target = await createTarget({ skipReview: true });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
       { id: "run-2", skipReview: true },
     );
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    const third = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-3", skipReview: true },
+    );
+    const unreleased = [
+      {
+        runId: target.runId,
+        pdfSha256: target.pdf.sha256,
+        sessionId: FIRST_SESSION_ID,
+      },
+      {
+        runId: second.run.id,
+        pdfSha256: second.pdf.sha256,
+        sessionId: SECOND_SESSION_ID,
+      },
+      {
+        runId: third.run.id,
+        pdfSha256: third.pdf.sha256,
+        sessionId: THIRD_SESSION_ID,
+      },
+    ];
+    const runningSnapshot = harnessSnapshot();
+    const durableRunningSnapshot = ApplicationSessionSnapshotDtoSchema.parse({
+      generation: 1,
+      bridgeState: "running",
+      harnessState: "running",
+      submissionPhase: "not_attempted",
+      createdAt: 1_000,
+      updatedAt: runningSnapshot.updatedAt,
+      terminalAt: null,
+      expiresAt: runningSnapshot.expiresAt,
+      company: runningSnapshot.company,
+      role: runningSnapshot.role,
+      fieldsFilled: runningSnapshot.fieldsFilled,
+      fieldsNeedingHuman: runningSnapshot.fieldsNeedingHuman,
+      filesAttached: runningSnapshot.filesAttached,
+      playwrightCliDiagnostics: runningSnapshot.playwrightCliDiagnostics,
+      warnings: runningSnapshot.warnings,
+      revisionCount: runningSnapshot.revisionCount,
+      pendingAction: runningSnapshot.pendingAction,
+      error: runningSnapshot.error,
+    });
+    for (const session of unreleased) {
+      target.repository.reserveApplicationSession(
+        session.runId,
+        null,
+        session.sessionId,
+        session.pdfSha256,
+      );
+      target.repository.recordApplicationSnapshot(session.runId, {
+        generation: 1,
+        sessionId: session.sessionId,
+        bridgeState: "running",
+        publicSnapshot: durableRunningSnapshot,
+        slotReleased: false,
+      });
+      target.harness!.snapshots.set(session.sessionId, harnessSnapshot());
+    }
 
-    const cleanupStream = deferred<AsyncIterable<ApplicationHarnessEvent>>();
-    target.harness!.streamReplies.push(cleanupStream.promise);
+    const cleanupStreams = unreleased.map(() =>
+      deferred<AsyncIterable<ApplicationHarnessEvent>>());
+    target.harness!.streamReplies.push(
+      ...cleanupStreams.map(({ promise }) => promise),
+    );
     const restarted = new ApplicationSessionService({
       repository: target.repository,
       artifacts: target.artifacts,
       harness: target.harness!,
-      uuidFactory: () => SECOND_SESSION_ID,
+      uuidFactory: () => FOURTH_SESSION_ID,
       profileReader: () => PROFILE,
-      onApplicationSessionReleased: () => {
-        availabilityKicks++;
-        released.resolve();
-      },
     });
-    const previousStreamCalls = target.harness!.streamCalls.length;
 
     expect(await restarted.startNextAutomaticApplication(signal())).toBe(false);
-    expect(target.harness!.streamCalls).toHaveLength(previousStreamCalls + 1);
-    expect(target.harness!.streamCalls.at(-1)).toEqual({
-      sessionId: FIRST_SESSION_ID,
-      lastEventId: undefined,
-    });
+    expect(target.harness!.getCalls).toEqual(
+      unreleased.map(({ sessionId }) => sessionId),
+    );
+    expect(target.harness!.streamCalls).toEqual(
+      unreleased.map(({ sessionId }) => ({
+        sessionId,
+        lastEventId: undefined,
+      })),
+    );
 
-    target.harness!.snapshots.delete(FIRST_SESSION_ID);
-    cleanupStream.resolve({
-      async *[Symbol.asyncIterator]() {
-        throw new ApplicationHarnessError("session_not_found");
+    const disposal = restarted.dispose();
+    expect(target.harness!.streamSignals.every(({ aborted }) => aborted)).toBeTrue();
+    for (const stream of cleanupStreams) {
+      stream.resolve({
+        async *[Symbol.asyncIterator]() {
+          // Disposal aborts every restored cleanup observer.
+        },
+      });
+    }
+    await disposal;
+  });
+
+  test("reconciles later unreleased sessions before reporting the first harness failure", async () => {
+    const target = await createTarget({ skipReview: true });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true },
+    );
+    const third = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-3", skipReview: true },
+    );
+    const unreleased = [
+      {
+        runId: target.runId,
+        pdfSha256: target.pdf.sha256,
+        sessionId: FIRST_SESSION_ID,
       },
-    });
-    await released.promise;
-    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
-      bridgeState: "lost",
-      slotReleased: true,
-    });
-    expect(availabilityKicks).toBe(1);
+      {
+        runId: second.run.id,
+        pdfSha256: second.pdf.sha256,
+        sessionId: SECOND_SESSION_ID,
+      },
+      {
+        runId: third.run.id,
+        pdfSha256: third.pdf.sha256,
+        sessionId: THIRD_SESSION_ID,
+      },
+    ];
+    for (const session of unreleased) {
+      target.repository.reserveApplicationSession(
+        session.runId,
+        null,
+        session.sessionId,
+        session.pdfSha256,
+      );
+      target.harness!.snapshots.set(session.sessionId, harnessSnapshot());
+    }
 
-    expect(await restarted.startNextAutomaticApplication(signal())).toBe(true);
-    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
-      bridgeState: "running",
-      slotReleased: false,
+    const failedGet = deferred<ApplicationHarnessSnapshot>();
+    target.harness!.getReplies.push(
+      failedGet.promise,
+      Promise.resolve(harnessSnapshot()),
+      Promise.resolve(harnessSnapshot()),
+    );
+    const cleanupStreams = [SECOND_SESSION_ID, THIRD_SESSION_ID].map(() =>
+      deferred<AsyncIterable<ApplicationHarnessEvent>>());
+    target.harness!.streamReplies.push(
+      ...cleanupStreams.map(({ promise }) => promise),
+    );
+    const restarted = new ApplicationSessionService({
+      repository: target.repository,
+      artifacts: target.artifacts,
+      harness: target.harness!,
+      profileReader: () => PROFILE,
     });
-    await restarted.dispose();
+
+    const reconciliation = restarted.startNextAutomaticApplication(signal());
+    failedGet.reject(new ApplicationHarnessError("unavailable"));
+    await expect(reconciliation).rejects.toMatchObject({
+      code: "APPLICATION_HARNESS_UNAVAILABLE",
+      status: 503,
+    });
+    expect(target.harness!.getCalls).toEqual(
+      unreleased.map(({ sessionId }) => sessionId),
+    );
+    expect(target.harness!.streamCalls).toEqual([
+      { sessionId: SECOND_SESSION_ID, lastEventId: undefined },
+      { sessionId: THIRD_SESSION_ID, lastEventId: undefined },
+    ]);
+    expect(target.repository.getLatestApplicationSession(second.run.id))
+      .toMatchObject({ bridgeState: "running", slotReleased: false });
+    expect(target.repository.getLatestApplicationSession(third.run.id))
+      .toMatchObject({ bridgeState: "running", slotReleased: false });
+
+    const disposal = restarted.dispose();
+    for (const stream of cleanupStreams) {
+      stream.resolve({
+        async *[Symbol.asyncIterator]() {
+          // Disposal aborts every observer restored after the earlier failure.
+        },
+      });
+    }
+    await disposal;
   });
 
   test("releases a never-observed reservation after restart when the harness is missing", async () => {
@@ -937,7 +1266,7 @@ describe("application session service", () => {
     });
   });
 
-  test("recovers a timed-out or same-ID create and rejects an unrelated singleton", async () => {
+  test("recovers a timed-out or same-ID create and maps an unrelated harness capacity conflict", async () => {
     const timedOutHarness = new FakeHarness();
     timedOutHarness.createError = new ApplicationHarnessError("unavailable");
     timedOutHarness.storeSnapshotBeforeCreateError = true;
@@ -1206,7 +1535,10 @@ describe("application session service", () => {
       bridgeState: "failed",
       slotReleased: false,
     });
-    expect(target.repository.getNextAutomaticApplicationStart()).toBeNull();
+    expect(target.repository.getNextAutomaticApplicationStart()).toEqual({
+      runId: second.run.id,
+      approvedPdfSha256: second.pdf.sha256,
+    });
     expect(availabilityKicks).toBe(0);
 
     target.harness!.snapshots.set(FIRST_SESSION_ID, {
@@ -1268,6 +1600,11 @@ describe("application session service", () => {
       { id: "run-2", skipReview: true },
     );
     expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    const observerIndex = target.harness!.streamCalls.findIndex(
+      ({ sessionId, lastEventId }) =>
+        sessionId === FIRST_SESSION_ID && lastEventId === undefined,
+    );
+    const observerSignal = target.harness!.streamSignals[observerIndex];
 
     const earlyTimeout: ApplicationHarnessSnapshot = {
       ...harnessSnapshot("failed"),
@@ -1299,10 +1636,7 @@ describe("application session service", () => {
       bridgeState: "failed",
       slotReleased: false,
     });
-    expect(target.harness!.streamCalls.at(-1)).toEqual({
-      sessionId: FIRST_SESSION_ID,
-      lastEventId: 1,
-    });
+    expect(observerSignal?.aborted).toBeFalse();
     cleanupEvents.resolve({
       async *[Symbol.asyncIterator]() {
         yield {
@@ -1338,6 +1672,12 @@ describe("application session service", () => {
       onApplicationSessionReleased: () => { availabilityKicks++; },
     });
     await target.service.start(target.runId, target.pdf.sha256, signal());
+    const observerIndex = target.harness!.streamCalls.findIndex(
+      ({ sessionId, lastEventId }) =>
+        sessionId === FIRST_SESSION_ID && lastEventId === undefined,
+    );
+    const observerSignal = target.harness!.streamSignals[observerIndex];
+    expect(observerSignal?.aborted).toBeFalse();
     const earlyTimeout: ApplicationHarnessSnapshot = {
       ...harnessSnapshot("failed"),
       updatedAt: 10_200,
@@ -1359,8 +1699,6 @@ describe("application session service", () => {
     for await (const _event of clientStream) {
       // The client disconnects after persisting the early terminal snapshot.
     }
-    const observerSignal = target.harness!.streamSignals.at(-1);
-    expect(observerSignal?.aborted).toBeFalse();
 
     const disposal = target.service.dispose();
     expect(observerSignal?.aborted).toBeTrue();
@@ -1454,7 +1792,13 @@ describe("application session service", () => {
     const target = await createTarget({
       harness,
       skipReview: true,
-      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID, THIRD_SESSION_ID],
+      sessionIds: [
+        FIRST_SESSION_ID,
+        SECOND_SESSION_ID,
+        THIRD_SESSION_ID,
+        FOURTH_SESSION_ID,
+        FIFTH_SESSION_ID,
+      ],
     });
 
     const cancelled = await target.service.start(target.runId, target.pdf.sha256, signal());
@@ -1536,8 +1880,30 @@ describe("application session service", () => {
       target.artifacts,
       { id: "run-2" },
     );
+    const secondBlocker = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-3" },
+    );
+    const thirdBlocker = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-4" },
+    );
     expect(await target.service.start(blocker.run.id, blocker.pdf.sha256, signal()))
       .toMatchObject({ generation: 1, bridgeState: "running" });
+    expect(await target.service.start(
+      secondBlocker.run.id,
+      secondBlocker.pdf.sha256,
+      signal(),
+    )).toMatchObject({ generation: 1, bridgeState: "running" });
+    expect(await target.service.start(
+      thirdBlocker.run.id,
+      thirdBlocker.pdf.sha256,
+      signal(),
+    )).toMatchObject({ generation: 1, bridgeState: "running" });
 
     target.repository.approve(target.runId, editedPdf.sha256);
     expect(await target.service.get(target.runId)).toEqual({
@@ -1546,19 +1912,19 @@ describe("application session service", () => {
       canStartAfterApproval: false,
     });
     expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
-    expect(harness.createCalls).toHaveLength(2);
+    expect(harness.createCalls).toHaveLength(4);
 
     await target.service.close(blocker.run.id, signal());
     expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
-    expect(harness.createCalls).toHaveLength(3);
-    expect(harness.createCalls[2]).toMatchObject({
-      sessionId: THIRD_SESSION_ID,
+    expect(harness.createCalls).toHaveLength(5);
+    expect(harness.createCalls[4]).toMatchObject({
+      sessionId: FIFTH_SESSION_ID,
       resumePdf: editedPdfBytes,
       resumeSource: editedSourceBytes,
     });
     expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
       generation: 2,
-      sessionId: THIRD_SESSION_ID,
+      sessionId: FIFTH_SESSION_ID,
       bridgeState: "running",
       resumeRevision: 2,
       pdfSha256: editedPdf.sha256,
@@ -1599,7 +1965,10 @@ describe("application session service", () => {
       signal(),
     )) items.push(item);
 
-    expect(target.harness!.streamCalls).toEqual([{
+    expect(target.harness!.streamCalls.filter(
+      ({ sessionId, lastEventId }) =>
+        sessionId === FIRST_SESSION_ID && lastEventId === 5,
+    )).toEqual([{
       sessionId: FIRST_SESSION_ID,
       lastEventId: 5,
     }]);
@@ -1657,16 +2026,20 @@ describe("application session service", () => {
     expect(serialized).not.toContain(FIRST_SESSION_ID);
     expect(serialized).not.toContain(JOB_URL);
     expect(serialized).not.toContain(PROFILE);
+    const resetCursorCallsBefore = target.harness!.streamCalls.filter(
+      ({ sessionId, lastEventId }) =>
+        sessionId === FIRST_SESSION_ID && lastEventId === undefined,
+    ).length;
     const nextGeneration = (await target.service.events(
       target.runId,
       { generation: 2, upstreamEventId: 99 },
       signal(),
     ))[Symbol.asyncIterator]();
     await nextGeneration.next();
-    expect(target.harness!.streamCalls[1]).toEqual({
-      sessionId: FIRST_SESSION_ID,
-      lastEventId: undefined,
-    });
+    expect(target.harness!.streamCalls.filter(
+      ({ sessionId, lastEventId }) =>
+        sessionId === FIRST_SESSION_ID && lastEventId === undefined,
+    )).toHaveLength(resetCursorCallsBefore + 1);
     await nextGeneration.return?.(undefined);
   });
 

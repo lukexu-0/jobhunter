@@ -431,6 +431,50 @@ def test_resolve_browser_launch_cdp() -> None:
     assert launch.user_data_dir is None
 
 
+@pytest.mark.asyncio
+async def test_cdp_runtimes_share_endpoint_with_distinct_cli_sessions(
+    tmp_path: Path,
+    cli_script: Path,
+) -> None:
+    launch = ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    )
+    session_ids = (
+        UUID("55555555-5555-4555-8555-555555555551"),
+        UUID("55555555-5555-4555-8555-555555555552"),
+        UUID("55555555-5555-4555-8555-555555555553"),
+    )
+    runtimes: list[PlaywrightCliRuntime] = []
+    for slot, session_id in enumerate(session_ids, start=1):
+        directory = tmp_path / f"session-{slot}"
+        directory.mkdir(mode=0o700)
+        runtimes.append(
+            PlaywrightCliRuntime(
+                session_id=session_id,
+                launch=launch,
+                session_directory=directory,
+                cli_script=cli_script,
+            )
+        )
+
+    assert [runtime.session_name for runtime in runtimes] == [
+        f"jobhunter-{session_id.hex}" for session_id in session_ids
+    ]
+    assert len({runtime.session_name for runtime in runtimes}) == 3
+    assert len({runtime._config_path for runtime in runtimes}) == 3
+    assert [
+        json.loads(runtime._config_path.read_text(encoding="utf-8"))["browser"][
+            "cdpEndpoint"
+        ]
+        for runtime in runtimes
+    ] == ["http://127.0.0.1:9222"] * 3
+
+    for runtime in runtimes:
+        await runtime.close()
+
+
 def test_resolve_browser_launch_cdp_invalid() -> None:
     config = BrowserLaunchConfig.model_construct(cdp_url="http://google.com/path")
     with pytest.raises(BrowserConfigurationError):

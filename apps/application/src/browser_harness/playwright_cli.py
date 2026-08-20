@@ -553,6 +553,28 @@ def resolve_browser_launch(config: BrowserLaunchConfig) -> ResolvedBrowserLaunch
     )
 
 
+def browser_launch_for_slot(
+    launch: ResolvedBrowserLaunch,
+    slot: int,
+) -> ResolvedBrowserLaunch:
+    """Return the validated browser launch owned by one application slot."""
+
+    if type(slot) is not int or slot not in {1, 2, 3}:
+        raise BrowserConfigurationError("The browser slot is invalid")
+    if launch.is_cdp:
+        return launch
+    if launch.executable_path is None or launch.user_data_dir is None:
+        raise BrowserConfigurationError("The native browser launch is invalid")
+    profile = launch.user_data_dir
+    if slot > 1:
+        profile = profile.with_name(f"{profile.name}-slot-{slot}")
+    return ResolvedBrowserLaunch(
+        cdp_url=None,
+        executable_path=launch.executable_path,
+        user_data_dir=_resolve_dedicated_profile(profile),
+    )
+
+
 def _resolve_node_executable(configured: Path | None) -> Path:
     candidate = configured
     if candidate is None:
@@ -3748,6 +3770,7 @@ class PlaywrightCliRuntime:
 
 __all__ = [
     "BrowserConfigurationError",
+    "browser_launch_for_slot",
     "PlaywrightCliRuntime",
     "PlaywrightCliRuntimeError",
     "ResolvedBrowserLaunch",

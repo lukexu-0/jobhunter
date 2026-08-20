@@ -20,7 +20,11 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 import jobhunter_browser_harness.sessions as sessions_module
 from jobhunter_browser_harness.credentials import CredentialStore
-from jobhunter_browser_harness.artifacts import cleanup_session_artifacts, store_uploads
+from jobhunter_browser_harness.artifacts import (
+    cleanup_session_artifacts,
+    session_artifact_directory,
+    store_uploads,
+)
 from jobhunter_browser_harness.agent import ApplicationRunRequest
 from jobhunter_browser_harness.api import HarnessDependencies, create_app
 from jobhunter_browser_harness.context import (
@@ -588,6 +592,7 @@ def make_manager(
     timeout: int = 14_400,
     context_process_factory: Callable[[Any], Any] = ImmediateContextProcess,
     credential_store: CredentialStore | None = None,
+    browser_launch: ResolvedBrowserLaunch | None = None,
 ) -> tuple[ApplicationSessionManager, Fakes, Path]:
     doubles = fakes or Fakes()
     root = tmp_path / "sessions"
@@ -601,7 +606,8 @@ def make_manager(
             credentials_json=tmp_path / "credentials.json",
         ),
         artifacts_root=root,
-        browser_launch=ResolvedBrowserLaunch(
+        browser_launch=browser_launch
+        or ResolvedBrowserLaunch(
             cdp_url=None,
             executable_path=tmp_path / "fake-chrome",
             user_data_dir=tmp_path / "profile",
@@ -613,6 +619,11 @@ def make_manager(
         credential_store=credential_store,
     )
     return manager, doubles, root
+
+
+def sole_active_record(manager: ApplicationSessionManager) -> Any:
+    assert len(manager._active) == 1
+    return next(iter(manager._active.values()))
 
 
 @pytest.mark.asyncio
@@ -689,7 +700,7 @@ async def test_manager_passes_resolved_cli_config_to_one_runtime(
     assert call["node_executable"] == tmp_path / "node"
     assert call["cli_script"] == tmp_path / "playwright-cli.js"
     assert "deadline" not in call
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.playwright_runtime is runtime
 
     await manager.delete(created.session_id)
@@ -734,7 +745,7 @@ async def create_source_capture(
     )
 
 
-async def test_source_capture_and_application_session_share_one_browser_slot(
+async def test_source_capture_is_mutually_exclusive_with_all_application_slots(
     tmp_path: Path,
 ) -> None:
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
@@ -757,7 +768,7 @@ async def test_source_capture_and_application_session_share_one_browser_slot(
     )
 
     await manager.delete_source_capture(CAPTURE_ID)
-    application = await create_valid(manager)
+    applications = [await create_valid(manager) for _slot in range(3)]
     with pytest.raises(HarnessServiceError) as capture_conflict:
         await create_source_capture(
             manager,
@@ -769,7 +780,8 @@ async def test_source_capture_and_application_session_share_one_browser_slot(
         "source_capture_active",
         "A source capture is already active",
     )
-    await manager.delete(application.session_id)
+    for application in applications:
+        await manager.delete(application.session_id)
 
 
 async def test_source_capture_completion_returns_only_bounded_snapshot_and_releases_slot(
@@ -1238,7 +1250,7 @@ async def test_steer_dispatches_only_to_the_live_model_without_durable_projectio
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     snapshot_before = record.snapshot
     events_before = tuple(record.events)
@@ -1275,7 +1287,7 @@ async def test_steer_interrupts_a_pending_gate_but_rejects_inactive_generations(
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert (
         record is not None
         and record.human_gate is not None
@@ -1342,7 +1354,7 @@ async def test_steer_deadline_wins_before_private_dispatch(tmp_path: Path) -> No
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     record.deadline_monotonic = asyncio.get_running_loop().time()
 
@@ -1430,7 +1442,7 @@ async def test_cancel_is_not_blocked_by_in_flight_steer_and_remains_authoritativ
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     model = fakes.models[0]
 
@@ -1470,7 +1482,7 @@ async def test_gate_commands_conflict_while_steering_dispatch_is_in_flight(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     navigation = asyncio.create_task(
@@ -1520,7 +1532,7 @@ async def test_new_gate_can_steer_while_superseded_steer_is_unresolved(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     old_steering = asyncio.create_task(
@@ -1579,7 +1591,7 @@ async def test_final_submit_waits_for_superseded_steering_dispatch(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     old_steering = asyncio.create_task(
@@ -1732,8 +1744,10 @@ async def test_preflight_completes_before_playwright_runtime_and_create_contract
     assert (snapshot.expires_at - snapshot.created_at).total_seconds() == 14_400
 
     await asyncio.wait_for(runner_started.wait(), timeout=1)
-    await wait_until(lambda: len(manager._active.events) >= 2)  # type: ignore[union-attr]
-    record = manager._active
+    await wait_until(
+        lambda: len(manager._active[response.session_id].events) >= 2
+    )
+    record = sole_active_record(manager)
     assert record is not None
     assert [event.event for event in list(record.events)[:2]] == [
         "session_started",
@@ -1784,7 +1798,7 @@ async def test_preflight_errors_cleanup_before_playwright_runtime_factory(
     assert_service_error(caught.value, status, code, message)
     assert fakes.runtimes == []
     assert fakes.models[0].closed
-    assert manager._active is None
+    assert not manager._active
     assert not root.exists() or tuple(root.iterdir()) == ()
 
 
@@ -1819,28 +1833,166 @@ async def test_runtime_start_session_timeout_preserves_timeout_failure(
     }
     assert fakes.runtimes[0].closed
     assert fakes.models[0].closed
-    assert manager._active is None
+    assert not manager._active
     assert not root.exists() or tuple(root.iterdir()) == ()
 
 
-async def test_singleton_api_returns_exact_active_session_id(tmp_path: Path) -> None:
-    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
-    first = await create_valid(manager)
-    app = create_app(HarnessConfig(bearer_token=TOKEN), HarnessDependencies(sessions=manager))
+async def test_three_sessions_fill_capacity_fourth_reports_oldest_and_released_slot_reuses_profile(
+    tmp_path: Path,
+) -> None:
+    session_ids = (
+        UUID("ffffffff-ffff-4fff-8fff-fffffffffff1"),
+        UUID("11111111-1111-4111-8111-111111111112"),
+        UUID("22222222-2222-4222-8222-222222222223"),
+        UUID("33333333-3333-4333-8333-333333333334"),
+    )
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = [
+        await create_valid(manager, session_id=session_id)
+        for session_id in session_ids[:3]
+    ]
+    for session in created:
+        await wait_state(manager, session.session_id, "running")
+
+    assert list(manager._active) == list(session_ids[:3])
+    assert [
+        call["launch"].user_data_dir for call in fakes.runtime_factory_calls
+    ] == [
+        tmp_path / "profile",
+        tmp_path / "profile-slot-2",
+        tmp_path / "profile-slot-3",
+    ]
+
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=manager),
+    )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://harness.test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://harness.test",
+    ) as client:
         response = await client.post(
             "/v1/sessions",
             files=[
-                ("session_id", (None, str(uuid4()))),
+                ("session_id", (None, str(session_ids[3]))),
                 *multipart_parts(),
             ],
             headers=AUTHORIZATION,
         )
 
     assert response.status_code == 409
-    assert response.json() == {"code": "session_active", "session_id": str(first.session_id)}
-    await manager.delete(first.session_id)
+    assert response.json() == {
+        "code": "session_active",
+        "session_id": str(session_ids[0]),
+    }
+
+    await manager.delete(session_ids[1])
+    replacement = await create_valid(manager, session_id=session_ids[3])
+    await wait_state(manager, replacement.session_id, "running")
+    assert list(manager._active) == [
+        session_ids[0],
+        session_ids[2],
+        session_ids[3],
+    ]
+    assert fakes.runtime_factory_calls[-1]["launch"].user_data_dir == (
+        tmp_path / "profile-slot-2"
+    )
+
+    for session_id in tuple(manager._active):
+        await manager.delete(session_id)
+
+
+async def test_separate_harness_managers_each_own_three_session_slots(
+    tmp_path: Path,
+) -> None:
+    stable_root = tmp_path / "stable"
+    development_root = tmp_path / "development"
+    stable_root.mkdir()
+    development_root.mkdir()
+    stable, _stable_fakes, _stable_artifacts = make_manager(
+        stable_root,
+        blocked_runner,
+    )
+    development, _development_fakes, _development_artifacts = make_manager(
+        development_root,
+        blocked_runner,
+    )
+
+    for manager in (stable, development):
+        for _slot in range(3):
+            created = await create_valid(manager)
+            await wait_state(manager, created.session_id, "running")
+
+    assert len(stable._active) == 3
+    assert len(development._active) == 3
+
+    await stable.shutdown()
+    await development.shutdown()
+
+
+async def test_session_lookup_runtime_action_command_and_delete_are_isolated(
+    tmp_path: Path,
+) -> None:
+    session_ids = (
+        UUID("44444444-4444-4444-8444-444444444441"),
+        UUID("44444444-4444-4444-8444-444444444442"),
+        UUID("44444444-4444-4444-8444-444444444443"),
+    )
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    for session_id in session_ids:
+        await create_valid(manager, session_id=session_id)
+        await wait_state(manager, session_id, "running")
+
+    assert tuple(
+        manager.get_snapshot(session_id).session_id for session_id in session_ids
+    ) == session_ids
+    release_actions = asyncio.Event()
+    for index, runtime in enumerate(fakes.runtimes, start=1):
+        runtime.result = playwright_execution_result(
+            f"https://jobs.example/openings/{index}"
+        )
+        runtime.blocker = release_actions
+    action = PlaywrightCliRuntimeAction(
+        type="playwright_cli",
+        command="snapshot",
+        args=[],
+    )
+    action_tasks = [
+        asyncio.create_task(runtime_action(manager, session_id, action))
+        for session_id in session_ids
+    ]
+    for runtime in fakes.runtimes:
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+    assert all(not task.done() for task in action_tasks)
+    release_actions.set()
+    responses = await asyncio.gather(*action_tasks)
+    assert [
+        response.observation.url
+        for response in responses
+        if isinstance(response, PlaywrightCliResultRuntimeActionResponse)
+    ] == [
+        "https://jobs.example/openings/1",
+        "https://jobs.example/openings/2",
+        "https://jobs.example/openings/3",
+    ]
+    assert [runtime.commands for runtime in fakes.runtimes] == [
+        [("snapshot", [])],
+        [("snapshot", [])],
+        [("snapshot", [])],
+    ]
+
+    await manager.command(session_ids[1], CancelCommand(type="cancel"))
+    await wait_state(manager, session_ids[1], "cancelled")
+    assert manager.get_snapshot(session_ids[0]).state == "running"
+    assert manager.get_snapshot(session_ids[2]).state == "running"
+
+    await manager.delete(session_ids[2])
+    assert manager.get_snapshot(session_ids[2]).state == "closed"
+    assert manager.get_snapshot(session_ids[0]).state == "running"
+
+    await manager.delete(session_ids[0])
+    await manager.delete(session_ids[1])
 
 
 async def test_omitted_session_id_uses_uuid4(
@@ -1865,6 +2017,14 @@ async def test_same_active_caller_id_replays_create_without_uploads(
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     first = await create_valid(manager, session_id=requested)
     await wait_state(manager, requested, "running")
+    filler_ids = (
+        UUID("69a8263f-910a-46a0-8098-9c5975722e2c"),
+        UUID("69a8263f-910a-46a0-8098-9c5975722e3c"),
+    )
+    for session_id in filler_ids:
+        await create_valid(manager, session_id=session_id)
+        await wait_state(manager, session_id, "running")
+    assert len(manager._active) == 3
     storage_called = False
 
     async def forbidden_storage(*_args: Any, **_kwargs: Any) -> None:
@@ -1877,7 +2037,8 @@ async def test_same_active_caller_id_replays_create_without_uploads(
 
     assert replayed == first
     assert storage_called is False
-    await manager.delete(requested)
+    for session_id in (requested, *filler_ids):
+        await manager.delete(session_id)
 
 
 async def test_same_starting_caller_id_replays_before_setup_completes(
@@ -1998,7 +2159,7 @@ async def test_navigation_origin_auto_submission_and_resource_retention(
     manager, fakes, root = make_manager(tmp_path, runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.playwright_runtime is not None and record.human_gate is not None
     navigation_snapshot = manager.get_snapshot(created.session_id)
     assert navigation_snapshot.pending_action is not None
@@ -2153,7 +2314,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.stored is not None
     artifact_directory = record.stored.session_directory
     original_publish = manager._publish_event
@@ -2162,7 +2323,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
         current_record: Any, event: str, detail: dict[str, object]
     ) -> None:
         if event == "closed":
-            assert manager._active is current_record
+            assert manager._active.get(current_record.session_id) is current_record
             assert current_record.snapshot.slot_released is True
             assert not artifact_directory.exists()
             order.append("event.closed")
@@ -2183,7 +2344,7 @@ async def test_delete_orders_gate_runner_resources_artifacts_event_and_slot_rele
     assert snapshot.slot_released is True
     tombstone = manager._tombstones[created.session_id]
     assert tombstone.events[-1].event == "closed"
-    assert manager._active is None
+    assert not manager._active
     assert fakes.runtimes[0].closed and fakes.models[0].closed
     assert fakes.runtimes[0].closed
 
@@ -2204,7 +2365,7 @@ async def test_terminal_event_is_published_before_tombstone_exposure(
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     last_event_id = record.events[-1].id
     original_publish = manager._publish_event
@@ -2225,7 +2386,7 @@ async def test_terminal_event_is_published_before_tombstone_exposure(
     next_frame: asyncio.Task[str] | None = None
     try:
         await asyncio.wait_for(terminal_publish_started.wait(), timeout=1)
-        assert manager._active is record
+        assert manager._active.get(record.session_id) is record
         assert created.session_id not in manager._tombstones
 
         stream = manager.stream_events(created.session_id, last_event_id)
@@ -2259,7 +2420,7 @@ async def test_suggestions_cannot_read_saved_answers_after_finalization_starts(
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     assert record.human_gate is not None
     question = AdditionalInfoTextQuestion(
@@ -2411,7 +2572,7 @@ async def test_runner_failure_mappings_are_sanitized_and_cleanup(
     public = snapshot.model_dump_json()
     assert "raw provider secret" not in public
     assert fakes.runtimes[0].closed and fakes.models[0].closed
-    assert manager._active is None
+    assert not manager._active
     assert manager._tombstones[created.session_id].events[-1].event == "failed"
 
 
@@ -2453,7 +2614,7 @@ async def test_cancelled_runner_result_has_no_error_and_releases_slot(tmp_path: 
     assert snapshot.warnings == []
     assert PROFILE_SECRET not in snapshot.model_dump_json()
     assert manager._tombstones[created.session_id].events[-1].event == "cancelled"
-    assert manager._active is None
+    assert not manager._active
     assert fakes.runtimes[0].closed and fakes.models[0].closed
 
 
@@ -2494,7 +2655,7 @@ async def test_delete_during_blocked_preflight_cancels_setup_and_cleans_without_
     manager, fakes, root = make_manager(tmp_path, blocked_runner, fakes=fakes)
     creation = asyncio.create_task(create_valid(manager))
     await wait_until(lambda: bool(fakes.models) and fakes.models[0].check_started.is_set())
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
 
     await manager.delete(record.session_id)
@@ -2505,7 +2666,7 @@ async def test_delete_during_blocked_preflight_cancels_setup_and_cleans_without_
     assert fakes.models[0].closed
     assert manager.get_snapshot(record.session_id).state == "closed"
     assert manager._tombstones[record.session_id].events[-1].event == "closed"
-    assert manager._active is None
+    assert not manager._active
     await manager.delete(record.session_id)
     assert manager.get_snapshot(record.session_id).state == "closed"
     assert not root.exists() or tuple(root.iterdir()) == ()
@@ -2515,7 +2676,7 @@ async def test_absolute_ttl_maps_to_session_timeout_without_real_sleep(tmp_path:
     manager, fakes, _root = make_manager(tmp_path, blocked_runner, timeout=1)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.ttl_task is not None
     record.ttl_task.cancel()
     record.deadline_monotonic = asyncio.get_running_loop().time() - 1
@@ -2540,7 +2701,7 @@ async def test_expiry_cannot_publish_after_concurrent_delete_tombstones_session(
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.ttl_task is not None
     record.ttl_task.cancel()
     await asyncio.gather(record.ttl_task, return_exceptions=True)
@@ -2597,7 +2758,7 @@ async def test_expired_setup_cannot_publish_running_after_timeout(
     manager._expire_session = controlled_expiration  # type: ignore[method-assign]
     creation = asyncio.create_task(create_valid(manager))
     await wait_until(lambda: bool(fakes.models) and fakes.models[0].check_started.is_set())
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     record.deadline_monotonic = asyncio.get_running_loop().time() - 1
     ttl_release.set()
@@ -2655,7 +2816,7 @@ async def test_expired_agent_result_cannot_beat_absolute_timeout(
     manager._expire_session = controlled_expiration  # type: ignore[method-assign]
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     record.deadline_monotonic = asyncio.get_running_loop().time() - 1
     result_release.set()
@@ -2715,7 +2876,7 @@ async def test_expired_agent_error_cannot_beat_absolute_timeout(
     manager._expire_session = controlled_expiration  # type: ignore[method-assign]
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     record.deadline_monotonic = asyncio.get_running_loop().time() - 1
     error_release.set()
@@ -2765,7 +2926,7 @@ async def test_continue_at_absolute_deadline_fails_before_resuming_gate(
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.ttl_task is not None
     record.ttl_task.cancel()
     await asyncio.gather(record.ttl_task, return_exceptions=True)
@@ -2842,7 +3003,7 @@ async def test_submission_action_cannot_start_after_absolute_deadline(
     await wait_state(manager, created.session_id, "awaiting_human_review")
     await manager.command(created.session_id, SubmitCommand(type="submit"))
     await asyncio.wait_for(review_released.wait(), timeout=1)
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.ttl_task is not None
     record.ttl_task.cancel()
     await asyncio.gather(record.ttl_task, return_exceptions=True)
@@ -2874,16 +3035,22 @@ async def test_submission_action_cannot_start_after_absolute_deadline(
     assert manager.get_snapshot(created.session_id).state == "failed"
 
 
-async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_path: Path) -> None:
+async def test_shutdown_finalizes_all_active_sessions_and_rejects_new_sessions(
+    tmp_path: Path,
+) -> None:
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
+    created = [await create_valid(manager) for _slot in range(3)]
+    for session in created:
+        await wait_state(manager, session.session_id, "running")
 
     await manager.shutdown()
 
-    assert manager.get_snapshot(created.session_id).state == "closed"
-    assert manager._tombstones[created.session_id].events[-1].event == "closed"
-    assert fakes.runtimes[0].closed and fakes.models[0].closed
+    assert not manager._active
+    for session in created:
+        assert manager.get_snapshot(session.session_id).state == "closed"
+        assert manager._tombstones[session.session_id].events[-1].event == "closed"
+    assert all(runtime.closed for runtime in fakes.runtimes)
+    assert all(model.closed for model in fakes.models)
     personal, resume, resume_source = valid_uploads()
     with pytest.raises(HarnessServiceError) as caught:
         await manager.create_session(
@@ -2902,6 +3069,38 @@ async def test_shutdown_finalizes_active_session_and_rejects_new_sessions(tmp_pa
         "service_unavailable",
         "The browser harness is shutting down",
     )
+
+
+async def test_shutdown_starts_every_session_finalizer_before_waiting_for_cleanup(
+    tmp_path: Path,
+) -> None:
+    release_cleanup = asyncio.Event()
+    fakes = Fakes(runtime_close_blocker=release_cleanup)
+    manager, fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        fakes=fakes,
+    )
+    created = [await create_valid(manager) for _slot in range(3)]
+    for session in created:
+        await wait_state(manager, session.session_id, "running")
+
+    shutdown = asyncio.create_task(manager.shutdown())
+    try:
+        await asyncio.gather(
+            *(
+                asyncio.wait_for(runtime.close_started.wait(), timeout=1)
+                for runtime in fakes.runtimes
+            )
+        )
+        assert not shutdown.done()
+        assert all(
+            manager._active[session.session_id].finalizer_task is not None
+            for session in created
+        )
+    finally:
+        release_cleanup.set()
+        await asyncio.gather(shutdown, return_exceptions=True)
 
 
 async def test_tombstones_are_bounded_to_32_and_oldest_id_is_evicted(tmp_path: Path) -> None:
@@ -2934,7 +3133,7 @@ async def test_event_buffer_replay_eviction_snapshot_and_monotonic_ids(tmp_path:
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
 
     for step in range(1, 301):
@@ -2972,7 +3171,7 @@ async def test_agent_step_uses_job_url_for_internal_runtime_page(tmp_path: Path)
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
 
     await manager._agent_step(record, 1, "chrome://newtab/")
@@ -2990,7 +3189,7 @@ async def test_sse_heartbeat_and_disconnect_do_not_cancel_work(
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     latest = record.events[-1].id
     monkeypatch.setattr(sessions_module, "_HEARTBEAT_SECONDS", 0.001)
@@ -3000,7 +3199,7 @@ async def test_sse_heartbeat_and_disconnect_do_not_cancel_work(
     assert heartbeat == ": heartbeat\n\n"
     await stream.aclose()
 
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert record.agent_task is not None and not record.agent_task.done()
     assert fakes.runtimes[0].closed is False
     await manager.delete(created.session_id)
@@ -3080,7 +3279,7 @@ async def test_duplicate_cancel_conflicts_while_first_finalizer_is_pending(
     await wait_until(
         lambda: bool(fakes.runtimes) and fakes.runtimes[0].close_started.is_set()
     )
-    assert manager._active is not None
+    assert bool(manager._active)
     assert manager.get_snapshot(created.session_id).state == "running"
     with pytest.raises(HarnessServiceError) as duplicate:
         await manager.command(created.session_id, CancelCommand(type="cancel"))
@@ -3093,7 +3292,7 @@ async def test_duplicate_cancel_conflicts_while_first_finalizer_is_pending(
 
     close_blocker.set()
     await wait_state(manager, created.session_id, "cancelled")
-    assert manager._active is None
+    assert not manager._active
 
 
 async def test_delete_during_natural_finalization_joins_shielded_owner_and_closes(
@@ -3114,7 +3313,7 @@ async def test_delete_during_natural_finalization_joins_shielded_owner_and_close
     manager, fakes, _root = make_manager(tmp_path, failing_runner, fakes=fakes)
     created = await create_valid(manager)
     await wait_until(lambda: fakes.runtimes[0].close_started.is_set())
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.finalizer_task is not None
 
     first_delete = asyncio.create_task(manager.delete(created.session_id))
@@ -3168,7 +3367,7 @@ async def test_cleanup_observation_timeouts_do_not_cancel_owned_tasks_or_release
     await manager.command(created.session_id, CancelCommand(type="cancel"))
     await original_wait_for(fakes.runtimes[0].close_started.wait(), timeout=1)
     await original_sleep(0)
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.runtime_close_task is not None
     assert not record.runtime_close_task.cancelled()
     assert fakes.runtimes[0].closed is False
@@ -3176,7 +3375,7 @@ async def test_cleanup_observation_timeouts_do_not_cancel_owned_tasks_or_release
     runtime_close_blocker.set()
     await original_wait_for(fakes.models[0].close_started.wait(), timeout=1)
     await original_sleep(0)
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert record.model_close_task is not None
     assert not record.model_close_task.cancelled()
     assert fakes.models[0].closed is False
@@ -3185,7 +3384,7 @@ async def test_cleanup_observation_timeouts_do_not_cancel_owned_tasks_or_release
     await wait_state(manager, created.session_id, "cancelled")
     assert timed_out == {30}
     assert observations == 4
-    assert manager._active is None
+    assert not manager._active
     assert fakes.runtimes[0].closed and fakes.models[0].closed
     assert fakes.order.count("runtime.close") == 1
     assert fakes.order.count("model.aclose") == 1
@@ -3230,14 +3429,14 @@ async def test_slow_context_process_terminate_is_joined_before_artifact_cleanup(
     creation = asyncio.create_task(create_valid(manager))
     await wait_until(lambda: bool(instances) and instances[0].started.is_set())
     process = instances[0]
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.stored is not None
     artifact_directory = record.stored.session_directory
 
     deletion = asyncio.create_task(manager.delete(record.session_id))
     await asyncio.wait_for(process.terminate_started.wait(), timeout=1)
     assert not deletion.done()
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert artifact_directory.exists()
     process.allow_terminate.set()
     await asyncio.wait_for(deletion, timeout=1)
@@ -3246,7 +3445,7 @@ async def test_slow_context_process_terminate_is_joined_before_artifact_cleanup(
 
     assert process.worker_finished.is_set()
     assert not artifact_directory.exists()
-    assert manager._active is None
+    assert not manager._active
     assert manager.get_snapshot(record.session_id).state == "closed"
 
 
@@ -3258,7 +3457,7 @@ async def test_absolute_ttl_begins_during_model_preflight_setup(tmp_path: Path) 
     )
     creation = asyncio.create_task(create_valid(manager))
     await wait_until(lambda: bool(fakes.models) and fakes.models[0].check_started.is_set())
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.ttl_task is not None
     record.ttl_task.cancel()
     record.deadline_monotonic = asyncio.get_running_loop().time() - 1
@@ -3288,7 +3487,7 @@ async def test_cancel_while_starting_publishes_terminal_tombstone_then_delete_is
     manager, fakes, _root = make_manager(tmp_path, blocked_runner, fakes=fakes)
     creation = asyncio.create_task(create_valid(manager))
     await wait_until(lambda: bool(fakes.models) and fakes.models[0].check_started.is_set())
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
 
     await manager.command(record.session_id, CancelCommand(type="cancel"))
@@ -3297,7 +3496,7 @@ async def test_cancel_while_starting_publishes_terminal_tombstone_then_delete_is
     await wait_state(manager, record.session_id, "cancelled")
     tombstone = manager._tombstones[record.session_id]
     assert tombstone.events[-1].event == "cancelled"
-    assert manager._active is None
+    assert not manager._active
 
     await manager.delete(record.session_id)
     await manager.delete(record.session_id)
@@ -3317,7 +3516,7 @@ async def test_repeated_starting_delete_cancellation_does_not_cancel_cleanup(
     manager, fakes, _root = make_manager(tmp_path, blocked_runner, fakes=fakes)
     creation = asyncio.create_task(create_valid(manager))
     await wait_until(lambda: bool(fakes.models) and fakes.models[0].check_started.is_set())
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
 
     first_delete = asyncio.create_task(manager.delete(record.session_id))
@@ -3326,7 +3525,7 @@ async def test_repeated_starting_delete_cancellation_does_not_cancel_cleanup(
     with pytest.raises(asyncio.CancelledError):
         await first_delete
     assert record.finalizer_task is not None and not record.finalizer_task.cancelled()
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
 
     second_delete = asyncio.create_task(manager.delete(record.session_id))
     await asyncio.sleep(0)
@@ -3341,7 +3540,7 @@ async def test_repeated_starting_delete_cancellation_does_not_cancel_cleanup(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(creation, timeout=1)
     assert manager.get_snapshot(record.session_id).state == "closed"
-    assert manager._active is None
+    assert not manager._active
 
 
 async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
@@ -3380,9 +3579,10 @@ async def test_direct_values_literal_and_url_encoded_are_redacted_from_paths(
         anecdotes=[],
     )
     await wait_until(
-        lambda: manager._active is not None and len(manager._active.events) >= 2
+        lambda: created.session_id in manager._active
+        and len(manager._active[created.session_id].events) >= 2
     )
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     public = json.dumps(
         {
@@ -3421,7 +3621,7 @@ async def test_concurrent_cancel_commands_are_serialized_by_request_lock(
         "command_conflict",
         "A terminal command is already pending",
     )
-    assert manager._active is not None
+    assert bool(manager._active)
     close_blocker.set()
     await wait_state(manager, created.session_id, "cancelled")
 
@@ -3485,8 +3685,9 @@ async def test_delete_closes_session_that_moves_from_active_to_tombstone_mid_req
     assert [event.event for event in tombstone.events][-2:] == ["cancelled", "closed"]
 
 
-async def test_pending_cleanup_false_blocks_terminal_publish_and_slot_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_shutdown_drains_global_pending_cleanup_after_sessions_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_sleep = asyncio.sleep
     allow_cleanup = asyncio.Event()
@@ -3500,19 +3701,184 @@ async def test_pending_cleanup_false_blocks_terminal_publish_and_slot_release(
     async def no_delay(_delay: float) -> None:
         await original_sleep(0)
 
-    manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = [await create_valid(manager) for _slot in range(3)]
+    for session in created:
+        await wait_state(manager, session.session_id, "running")
     monkeypatch.setattr(sessions_module, "retry_pending_cleanup", pending_cleanup)
     monkeypatch.setattr(sessions_module.asyncio, "sleep", no_delay)
-    await manager.command(created.session_id, CancelCommand(type="cancel"))
 
-    await wait_until(lambda: cleanup_calls > 0)
-    assert manager._active is not None
-    assert created.session_id not in manager._tombstones
-    allow_cleanup.set()
-    await wait_state(manager, created.session_id, "cancelled")
-    assert manager._active is None
+    shutdown = asyncio.create_task(manager.shutdown())
+    try:
+        await wait_until(lambda: cleanup_calls > 0)
+        assert not shutdown.done()
+        assert not manager._active
+        assert all(
+            manager.get_snapshot(session.session_id).state == "closed"
+            for session in created
+        )
+        assert all(runtime.closed for runtime in fakes.runtimes)
+        assert all(model.closed for model in fakes.models)
+    finally:
+        allow_cleanup.set()
+        await asyncio.gather(shutdown, return_exceptions=True)
+
+
+async def test_blocked_path_cleanup_does_not_hold_other_session_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_cleanup = sessions_module.cleanup_session_artifacts
+    allow_blocked_cleanup = asyncio.Event()
+    blocked_cleanup_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    manager, fakes, _root = make_manager(tmp_path, blocked_runner)
+    created = [await create_valid(manager) for _slot in range(3)]
+    for session in created:
+        await wait_state(manager, session.session_id, "running")
+    blocked_record = manager._active[created[0].session_id]
+    assert blocked_record.stored is not None
+    blocked_path = blocked_record.stored.session_directory
+
+    def path_cleanup(path: Path) -> bool | None:
+        if path == blocked_path and not allow_blocked_cleanup.is_set():
+            loop.call_soon_threadsafe(blocked_cleanup_started.set)
+            return False
+        return original_cleanup(path)
+
+    monkeypatch.setattr(
+        sessions_module,
+        "cleanup_session_artifacts",
+        path_cleanup,
+    )
+
+    blocked_delete = asyncio.create_task(manager.delete(created[0].session_id))
+    try:
+        await asyncio.wait_for(blocked_cleanup_started.wait(), timeout=1)
+        await asyncio.wait_for(manager.delete(created[1].session_id), timeout=1)
+
+        assert not blocked_delete.done()
+        assert manager.get_snapshot(created[1].session_id).state == "closed"
+        assert created[0].session_id in manager._active
+        assert blocked_path.exists()
+
+        replacement = await create_valid(manager)
+        await wait_state(manager, replacement.session_id, "running")
+        assert len(manager._active) == 3
+        assert fakes.runtime_factory_calls[-1]["launch"].user_data_dir == (
+            tmp_path / "profile-slot-2"
+        )
+    finally:
+        allow_blocked_cleanup.set()
+        await asyncio.wait_for(
+            asyncio.gather(blocked_delete, return_exceptions=True),
+            timeout=1,
+        )
+        await asyncio.wait_for(manager.shutdown(), timeout=1)
+
+
+async def test_failed_upload_retains_exact_path_and_slot_without_blocking_healthy_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_id = UUID("66666666-6666-4666-8666-666666666661")
+    healthy_id = UUID("66666666-6666-4666-8666-666666666662")
+    replacement_id = UUID("66666666-6666-4666-8666-666666666663")
+    original_store = sessions_module.store_uploads
+    original_cleanup = sessions_module.cleanup_session_artifacts
+    allow_failed_cleanup = asyncio.Event()
+    failed_cleanup_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    manager, fakes, root = make_manager(tmp_path, blocked_runner)
+    failed_path = session_artifact_directory(root, failed_id)
+
+    async def store_with_failed_upload(
+        artifacts_root: Path,
+        session_id: UUID,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if session_id == failed_id:
+            failed_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            failed_path.parent.chmod(0o700)
+            failed_path.mkdir(mode=0o700)
+            raise HarnessServiceError(
+                422,
+                "invalid_request",
+                "Request is invalid",
+            )
+        return await original_store(
+            artifacts_root,
+            session_id,
+            *args,
+            **kwargs,
+        )
+
+    def path_cleanup(path: Path) -> bool | None:
+        if path == failed_path and not allow_failed_cleanup.is_set():
+            loop.call_soon_threadsafe(failed_cleanup_started.set)
+            return False
+        return original_cleanup(path)
+
+    monkeypatch.setattr(
+        sessions_module,
+        "store_uploads",
+        store_with_failed_upload,
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "cleanup_session_artifacts",
+        path_cleanup,
+    )
+
+    failed_creation = asyncio.create_task(
+        create_valid(manager, session_id=failed_id)
+    )
+    try:
+        await asyncio.wait_for(failed_cleanup_started.wait(), timeout=1)
+        assert not failed_creation.done()
+        assert list(manager._active) == [failed_id]
+        assert failed_id not in manager._tombstones
+        assert failed_path.exists()
+
+        healthy = await create_valid(manager, session_id=healthy_id)
+        await wait_state(manager, healthy.session_id, "running")
+        assert list(manager._active) == [failed_id, healthy_id]
+        assert fakes.runtime_factory_calls[-1]["launch"].user_data_dir == (
+            tmp_path / "profile-slot-2"
+        )
+
+        await asyncio.wait_for(manager.delete(healthy_id), timeout=1)
+        assert list(manager._active) == [failed_id]
+        assert failed_path.exists()
+
+        allow_failed_cleanup.set()
+        with pytest.raises(HarnessServiceError) as caught:
+            await asyncio.wait_for(failed_creation, timeout=1)
+        assert_service_error(
+            caught.value,
+            422,
+            "invalid_request",
+            "Request is invalid",
+        )
+        assert failed_id not in manager._active
+        assert manager.get_snapshot(failed_id).state == "closed"
+        assert not failed_path.exists()
+
+        replacement = await create_valid(manager, session_id=replacement_id)
+        await wait_state(manager, replacement.session_id, "running")
+        assert fakes.runtime_factory_calls[-1]["launch"].user_data_dir == (
+            tmp_path / "profile"
+        )
+        await manager.delete(replacement_id)
+    finally:
+        allow_failed_cleanup.set()
+        await asyncio.wait_for(
+            asyncio.gather(failed_creation, return_exceptions=True),
+            timeout=1,
+        )
+        await asyncio.wait_for(manager.shutdown(), timeout=1)
 
 
 @pytest.mark.parametrize(
@@ -3546,7 +3912,7 @@ async def test_transient_cleanup_failure_retries_while_retaining_ownership(
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
     monkeypatch.setattr(sessions_module.asyncio, "sleep", no_delay)
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
 
     caller = asyncio.create_task(
@@ -3559,14 +3925,14 @@ async def test_transient_cleanup_failure_retries_while_retaining_ownership(
 
     assert not caller.done()
     assert record.finalizer_task is not None and not record.finalizer_task.done()
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert created.session_id not in manager._tombstones
     assert manager.get_snapshot(created.session_id).state == "running"
     blocker.set()
     await asyncio.wait_for(caller, timeout=1)
 
     assert fakes.order.count(cleanup_name) == 2
-    assert manager._active is None
+    assert not manager._active
     assert manager.get_snapshot(created.session_id).state == "closed"
     assert manager._tombstones[created.session_id].events[-1].event == "closed"
 
@@ -3607,7 +3973,7 @@ async def test_create_session_uses_latex_source_as_resume_evidence_and_pdf_for_u
     created = response.json()
     session_id = UUID(created["session_id"])
     await wait_state(manager, session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     assert record.stored is not None
     assert record.application_task is not None
@@ -3677,7 +4043,7 @@ async def test_application_task_preserves_absolute_stored_resume_path(
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
 
     assert record is not None
     assert record.stored is not None
@@ -3738,9 +4104,10 @@ async def test_mixed_encoded_path_redaction_preserves_scheme_and_authority(
         anecdotes=[],
     )
     await wait_until(
-        lambda: manager._active is not None and len(manager._active.events) >= 2
+        lambda: created.session_id in manager._active
+        and len(manager._active[created.session_id].events) >= 2
     )
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     snapshot = manager.get_snapshot(created.session_id)
     payload = json.dumps(
@@ -3836,9 +4203,9 @@ async def test_encoded_gate_result_and_file_values_project_actionable_warnings(
     await wait_state(manager, created.session_id, "awaiting_human_navigation")
     await manager.command(created.session_id, ContinueCommand(type="continue"))
     await wait_until(
-        lambda: manager._active is not None
-        and manager._active.human_gate is not None
-        and manager._active.human_gate.submission_approved
+        lambda: created.session_id in manager._active
+        and manager._active[created.session_id].human_gate is not None
+        and manager._active[created.session_id].human_gate.submission_approved
     )
     review_snapshot = manager.get_snapshot(created.session_id)
     assert review_snapshot.company == "[redacted]"
@@ -3847,7 +4214,7 @@ async def test_encoded_gate_result_and_file_values_project_actionable_warnings(
     assert review_snapshot.fields_filled[0].note == "Filled"
     assert review_snapshot.files_attached == ["resume.pdf"]
     assert review_snapshot.warnings == expected_warnings
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     public = json.dumps(
         {
@@ -3970,7 +4337,7 @@ async def test_context_terminate_failure_retries_before_other_cleanup(
     )
     creation = asyncio.create_task(create_valid(manager))
     await wait_until(lambda: bool(instances) and instances[0].started.is_set())
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.stored is not None
     artifact_directory = record.stored.session_directory
     monkeypatch.setattr(sessions_module.asyncio, "sleep", no_delay)
@@ -3978,7 +4345,7 @@ async def test_context_terminate_failure_retries_before_other_cleanup(
     await wait_until(lambda: instances[0].calls >= 2)
 
     assert not deletion.done()
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert artifact_directory.exists()
     assert fakes.runtimes == []
     assert fakes.models == []
@@ -3988,7 +4355,7 @@ async def test_context_terminate_failure_retries_before_other_cleanup(
         await asyncio.wait_for(creation, timeout=1)
     assert instances[0].calls == 2
     assert not artifact_directory.exists()
-    assert manager._active is None
+    assert not manager._active
     assert manager.get_snapshot(record.session_id).state == "closed"
     assert manager._tombstones[record.session_id].events[-1].event == "closed"
 
@@ -4068,7 +4435,7 @@ async def test_runtime_playwright_cli_actions_have_no_count_limit(
         anecdotes=[],
     )
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     runtime = FakePlaywrightRuntime()
     record.playwright_runtime = runtime
@@ -4101,7 +4468,7 @@ async def test_runtime_action_separates_public_and_model_results(
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     private_url = (
         f"https://jobs.example/openings/{PROFILE_SECRET}?candidate=private"
@@ -4171,7 +4538,7 @@ async def test_runtime_playwright_cli_result_rebounds_expanded_redactions(
     private_value = "x"
     created = await create_valid(manager, full_name=private_value)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     private_url = f"https://jobs.example/{private_value * 4_000}"
     execution = PlaywrightCliExecutionResult(
@@ -4245,7 +4612,7 @@ async def test_runtime_human_navigation_maps_guard_suspension_runtime_errors(
     manager, fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     runtime = fakes.runtimes[0]
     private_error = PlaywrightCliRuntimeError(error_code)
@@ -4294,7 +4661,7 @@ async def test_runtime_playwright_cli_errors_keep_monotonic_steps(
         anecdotes=[],
     )
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     runtime = FakePlaywrightRuntime(error=PlaywrightCliRuntimeError("browser_failed"))
     record.playwright_runtime = runtime
@@ -4327,7 +4694,7 @@ async def test_runtime_playwright_cli_action_persists_only_redacted_process_diag
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     record.playwright_runtime = FakePlaywrightRuntime(
         result=playwright_execution_result().model_copy(
@@ -4373,7 +4740,7 @@ async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagno
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     record.playwright_runtime = FakePlaywrightRuntime(
         error=PlaywrightCliRuntimeError("browser_failed")
@@ -4417,7 +4784,7 @@ async def test_runtime_additional_info_continue_resumes_same_run_without_persist
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     record.playwright_runtime = FakePlaywrightRuntime()
     await runtime_action(
@@ -4472,7 +4839,7 @@ async def test_runtime_additional_info_continue_resumes_same_run_without_persist
     assert response == ContinueWithoutAdditionalInfoRuntimeActionResponse(
         type="continue_without_additional_info"
     )
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert record.session_id == created.session_id
     snapshot = manager.get_snapshot(created.session_id)
     assert snapshot.state == "running"
@@ -4489,7 +4856,7 @@ async def test_runtime_additional_info_requires_playwright_cli_then_resumes_same
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     record.playwright_runtime = FakePlaywrightRuntime()
     private_question = f"What dates are available for {PROFILE_SECRET}?"
@@ -4854,7 +5221,7 @@ async def test_runtime_action_rejects_concurrency_without_cancelling_active_call
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     blocker = asyncio.Event()
     runtime = FakePlaywrightRuntime(blocker=blocker)
@@ -4895,7 +5262,7 @@ async def test_runtime_action_continues_once_after_requester_cancellation_and_re
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     blocker = asyncio.Event()
     runtime = FakePlaywrightRuntime(blocker=blocker)
@@ -4951,7 +5318,7 @@ async def test_runtime_navigation_registers_exact_origin_automatically(
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert (
         record is not None
         and record.playwright_runtime is not None
@@ -4987,7 +5354,7 @@ async def test_runtime_review_rejects_a_result_for_another_job_before_gate(
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     record.playwright_runtime = FakePlaywrightRuntime()
     mismatched_result = review_result().model_copy(
@@ -5020,7 +5387,7 @@ async def test_runtime_review_auto_approves_explicit_playwright_cli_submission_a
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert (
         record is not None
         and record.playwright_runtime is not None
@@ -5165,7 +5532,7 @@ async def test_manual_review_returns_exact_submit_permission(
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     review = asyncio.create_task(
@@ -5193,7 +5560,7 @@ async def test_steer_rejects_after_submission_approval_before_browser_action(
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     review = asyncio.create_task(
@@ -5235,7 +5602,7 @@ async def test_submission_approval_rejects_while_steering_is_in_flight(
     manager, fakes, _ = make_manager(tmp_path, blocked_runner, fakes=fakes)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     review = asyncio.create_task(
@@ -5292,7 +5659,7 @@ async def test_auto_submit_review_conflicts_while_steering_is_in_flight(
     )
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     steering = asyncio.create_task(
@@ -5339,7 +5706,7 @@ async def test_first_approved_playwright_cli_execution_failure_parks_uncertainty
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     runtime = FakePlaywrightRuntime(
         error=PlaywrightCliRuntimeError("browser_failed")
@@ -5377,7 +5744,7 @@ async def test_first_approved_playwright_cli_execution_failure_parks_uncertainty
         "submission_started",
         "submission_uncertain",
     ]
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert record.final_request is None
     assert record.finalized is False
     assert runtime.closed is False
@@ -5396,7 +5763,7 @@ async def test_first_approved_human_navigation_guard_failure_parks_uncertainty_w
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     runtime = fakes.runtimes[0]
 
@@ -5436,7 +5803,7 @@ async def test_first_approved_human_navigation_guard_failure_parks_uncertainty_w
         "submission_started",
         "submission_uncertain",
     ]
-    assert manager._active is record
+    assert manager._active.get(record.session_id) is record
     assert record.final_request is None
     assert record.finalized is False
     assert record.runtime_action_task is None
@@ -5451,7 +5818,7 @@ async def test_submit_latch_wins_a_queued_cancel_race(
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     review = await runtime_action(
@@ -5510,7 +5877,7 @@ async def test_submit_latch_wins_a_queued_ttl_expiry_and_then_closes(
     manager, fakes, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     review = await runtime_action(
@@ -5592,11 +5959,11 @@ async def test_submit_latch_wins_a_queued_model_failure(
     manager, fakes, _ = make_manager(tmp_path, runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_until(
-        lambda: manager._active is not None
-        and manager._active.human_gate is not None
-        and manager._active.human_gate.submission_approved
+        lambda: created.session_id in manager._active
+        and manager._active[created.session_id].human_gate is not None
+        and manager._active[created.session_id].human_gate.submission_approved
     )
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
 
     await record.request_lock.acquire()
@@ -5660,7 +6027,7 @@ async def test_post_action_model_failures_park_uncertainty(
 
     manager, fakes, _ = make_manager(tmp_path, runner)
     created = await create_valid(manager, auto_submit=True)
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     await wait_until(lambda: record.human_gate.submission_approved)
     await runtime_action(
@@ -5715,7 +6082,7 @@ async def test_runtime_review_rejects_unresolved_fields_without_approval(
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager, auto_submit=True)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None and record.human_gate is not None
     record.playwright_runtime = FakePlaywrightRuntime()
     unresolved = ReviewApplicationResult.model_validate(
@@ -5756,7 +6123,7 @@ async def test_runtime_mismatch_is_typed_and_unknown_session_is_not_found(
     manager, _, _ = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     record.playwright_runtime = FakePlaywrightRuntime()
 
@@ -5796,7 +6163,7 @@ async def test_runtime_action_rejects_starting_and_terminal_sessions(
     await wait_until(
         lambda: bool(fakes.models) and fakes.models[0].check_started.is_set()
     )
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     action = ReportApplicationMismatchRuntimeAction(
         type="report_application_mismatch"
@@ -5834,7 +6201,7 @@ async def test_create_starts_playwright_runtime_before_accepting_runtime_actions
 
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
 
     assert record is not None
     assert record.playwright_runtime is fakes.runtimes[0]
@@ -5864,7 +6231,7 @@ async def test_terminal_cleanup_cancels_active_runtime_action_before_playwright_
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    record = manager._active
+    record = sole_active_record(manager)
     runtime = fakes.runtimes[0]
     runtime.blocker = asyncio.Event()
     assert record is not None
@@ -5951,7 +6318,7 @@ async def test_full_application_agent_receives_one_session_scoped_run_request(
     )
 
     created = await create_valid(manager, opportunity_kind=opportunity_kind)
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     assert record.human_gate is not None
     await wait_state(manager, created.session_id, "cancelled")
@@ -6027,7 +6394,7 @@ async def test_oversized_data_task_fails_before_preflight_and_playwright_runtime
     assert fakes.models == []
     assert fakes.runtimes == []
     assert fakes.runtimes == []
-    assert manager._active is None
+    assert not manager._active
     assert not root.exists() or tuple(root.iterdir()) == ()
 
 
@@ -6135,7 +6502,7 @@ async def test_subsecond_remaining_deadline_waits_for_ttl_without_posting(
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert manager.get_snapshot(created.session_id).state == "running"
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     assert record.final_request is None
     assert fakes.models[0].run_calls == []
@@ -6267,7 +6634,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
     assert snapshot.pending_action.model_dump(mode="json") == {
         "type": "credentials"
     }
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     assert record.playwright_cli_action_count == 8
     credentials_event = next(
@@ -6408,7 +6775,7 @@ async def test_transient_sign_in_exposes_model_output_but_keeps_public_state_san
     snapshot_dump = manager.get_snapshot(created.session_id).model_dump_json()
     assert username not in snapshot_dump
     assert password not in snapshot_dump
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     event_dump = "".join(event.model_dump_json() for event in record.events)
     assert username not in event_dump
@@ -6624,7 +6991,7 @@ async def test_saved_sign_in_preserves_private_runtime_session_timeout(
     )
     assert runtime.capture_suppression_calls == 1
     assert runtime.video_recording is False
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     assert record.human_gate is not None
     assert record.human_gate.screenshots_suppressed is True
@@ -6825,7 +7192,7 @@ async def test_capture_failure_never_opens_or_executes_the_credentials_gate(
         SESSION_ERROR_MESSAGES["browser_failed"],
     )
     assert manager.get_snapshot(created.session_id).state == "running"
-    record = manager._active
+    record = sole_active_record(manager)
     assert record is not None
     assert all(event.event != "credentials_required" for event in record.events)
     assert runtime.sign_in_calls == []

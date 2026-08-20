@@ -865,7 +865,7 @@ describe("pipeline application bootstrap", () => {
     await fixture.app.close();
   });
 
-  test("an empty startup kick preserves old run artifacts and starts automatic applications after injected maintenance", async () => {
+  test("an empty startup kick preserves old run artifacts and fills three automatic application slots after injected maintenance", async () => {
     const pipelineDatabase = openPipelineDatabase(":memory:");
     const contextDatabase = openContextDatabase(":memory:");
     const artifactRoot = join(mkdtempSync(join(tmpdir(), "pipeline-empty-startup-")), "runs");
@@ -927,15 +927,18 @@ describe("pipeline application bootstrap", () => {
     });
     let signalAutomaticStart!: () => void;
     const automaticStart = new Promise<void>((resolve) => { signalAutomaticStart = resolve; });
+    let automaticStartCalls = 0;
     app.services.applicationSessions.startNextAutomaticApplication = async (signal) => {
       expect(signal.aborted).toBe(false);
-      maintenanceOrder.push("automatic-application");
-      signalAutomaticStart();
-      return false;
+      automaticStartCalls++;
+      maintenanceOrder.push(`automatic-application-${automaticStartCalls}`);
+      if (automaticStartCalls === 1) signalAutomaticStart();
+      return automaticStartCalls <= 3;
     };
 
     app.kick();
     await automaticStart;
+    for (let turn = 0; turn < 8; turn++) await Promise.resolve();
     const artifactContents = artifactFiles.map((artifactFile) =>
       existsSync(artifactFile) ? readFileSync(artifactFile, "utf8") : undefined,
     );
@@ -947,7 +950,10 @@ describe("pipeline application bootstrap", () => {
     expect(providerCalls).toBe(0);
     expect(maintenanceOrder).toEqual([
       "injected",
-      "automatic-application",
+      "automatic-application-1",
+      "automatic-application-2",
+      "automatic-application-3",
+      "automatic-application-4",
     ]);
     expect(artifactContents).toEqual(
       artifactFiles.map((_, index) => `artifact ${index}`),

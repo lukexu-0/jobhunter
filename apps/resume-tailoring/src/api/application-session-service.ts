@@ -416,7 +416,7 @@ export class ApplicationSessionService {
 
   async startNextAutomaticApplication(signal: AbortSignal): Promise<boolean> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal);
+    await this.#reconcileApplicationSlots(signal);
     const candidate = this.dependencies.repository.getNextAutomaticApplicationStart();
     if (!candidate) return false;
     await this.start(candidate.runId, candidate.approvedPdfSha256, signal);
@@ -563,7 +563,7 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal, runId);
+    await this.#reconcileApplicationSlots(signal, runId);
     let latest: PublicApplicationSession | null;
     try {
       latest = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -650,7 +650,7 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal);
+    await this.#reconcileApplicationSlots(signal);
     let previous: PublicApplicationSession | null;
     try {
       previous = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -1538,11 +1538,7 @@ export class ApplicationSessionService {
         );
       const recorded = result.session;
       this.#notifyApplicationSessionReleased(result.slotReleasedTransitioned);
-      if (
-        observeSlotRelease
-        && TERMINAL_APPLICATION_STATES[snapshot.state] === true
-        && !recorded.slotReleased
-      ) {
+      if (observeSlotRelease && !recorded.slotReleased) {
         this.#ensureSlotReleaseObserver(runId, recorded);
       }
       return this.#storedView(recorded);
@@ -1682,48 +1678,48 @@ export class ApplicationSessionService {
     }
   }
 
-  async #reconcileApplicationSlot(
+  async #reconcileApplicationSlots(
     signal: AbortSignal,
     resumableRunId?: string,
   ): Promise<void> {
-    let session: PublicApplicationSession | null;
+    let sessions: readonly PublicApplicationSession[];
     try {
-      session = this.dependencies.repository.getUnreleasedApplicationSession();
+      sessions = this.dependencies.repository.listUnreleasedApplicationSessions();
     } catch (error) {
       mapRepositoryError(error);
     }
-    if (
-      session
-      && session.runId === resumableRunId
-      && session.publicSnapshot === null
-      && (session.bridgeState === "reserved" || session.bridgeState === "starting")
-    ) {
-      return;
-    }
-    if (!session) return;
     const harness = this.dependencies.harness;
     if (!harness) return;
-    try {
-      const snapshot = await harness.get(session.sessionId, signal);
-      this.#recordHarnessSnapshot(session.runId, session, snapshot);
-      const current =
-        this.dependencies.repository.getLatestApplicationSession(session.runId);
+    let firstFailure: unknown;
+    let hasFailure = false;
+    for (const session of sessions) {
+      signal.throwIfAborted();
       if (
-        current
-        && current.generation === session.generation
-        && current.sessionId === session.sessionId
-        && !current.slotReleased
+        session.publicSnapshot === null
+        && (session.bridgeState === "reserved" || session.bridgeState === "starting")
+        && (
+          session.runId === resumableRunId
+          || this.#pendingResumes.has(session.sessionId)
+        )
       ) {
-        this.#ensureSlotReleaseObserver(current.runId, current);
+        continue;
       }
-    } catch (error) {
-      if (signal.aborted) signal.throwIfAborted();
-      if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
-        this.#reconcileMissingHarnessSession(session);
-        return;
+      try {
+        const snapshot = await harness.get(session.sessionId, signal);
+        this.#recordHarnessSnapshot(session.runId, session, snapshot);
+      } catch (error) {
+        if (signal.aborted) signal.throwIfAborted();
+        if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
+          this.#reconcileMissingHarnessSession(session);
+          continue;
+        }
+        if (!hasFailure) {
+          firstFailure = error;
+          hasFailure = true;
+        }
       }
-      this.#throwHarnessError(error);
     }
+    if (hasFailure) this.#throwHarnessError(firstFailure);
   }
 
   #ensureSlotReleaseObserver(

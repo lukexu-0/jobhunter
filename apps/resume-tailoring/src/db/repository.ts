@@ -22,6 +22,8 @@ export const APPLICATION_STATUSES = [
   "failed",
 ] as const;
 export type ApplicationStatus = (typeof APPLICATION_STATUSES)[number];
+
+export const APPLICATION_SESSION_CAPACITY = 3;
 export type ActiveStage = Exclude<RunStatus, "queued" | "review" | "approved" | "failed">;
 export type RevisionOrigin = "initial" | "retry" | "machine_regenerate" | "human_edit";
 export type AttemptOrigin = RevisionOrigin | "repair_loop";
@@ -712,7 +714,7 @@ export class PipelineRepository {
       run_id: string;
       approved_pdf_sha256: string;
       current_revision: number;
-    }, []>(`
+    }, [number]>(`
       SELECT runs.id AS run_id, runs.approved_pdf_sha256, runs.current_revision
       FROM runs
       WHERE runs.deleted_at IS NULL
@@ -740,13 +742,13 @@ export class PipelineRepository {
               AND latest_session.submission_phase = 'not_attempted'
           )
         )
-        AND NOT EXISTS (
-          SELECT 1
+        AND (
+          SELECT count(*)
           FROM run_application_sessions
           WHERE slot_released = 0
-        )
+        ) < ?
       ORDER BY runs.queue_sequence
-    `).all();
+    `).all(APPLICATION_SESSION_CAPACITY);
     for (const row of rows) {
       const source = this.getArtifact(
         row.run_id,
@@ -809,13 +811,16 @@ export class PipelineRepository {
       if (latest && TERMINAL_APPLICATION_SESSION_STATES[latest.bridge_state] !== true) {
         throw new RepositoryConflictError("application session is active");
       }
-      const occupyingSession = this.#db.query<{ session_id: string }, []>(`
-        SELECT session_id
+      if (latest?.slot_released === 0) {
+        throw new RepositoryConflictError("previous application browser slot cleanup is pending");
+      }
+      const occupancy = this.#db.query<{ count: number }, []>(`
+        SELECT count(*) AS count
         FROM run_application_sessions
         WHERE slot_released = 0
       `).get();
-      if (occupyingSession) {
-        throw new RepositoryConflictError("application browser slot is active");
+      if ((occupancy?.count ?? 0) >= APPLICATION_SESSION_CAPACITY) {
+        throw new RepositoryConflictError("application browser capacity is full");
       }
       const generation = (latest?.generation ?? 0) + 1;
       const now = this.#now();
@@ -1230,15 +1235,13 @@ export class PipelineRepository {
     };
   }
 
-  getUnreleasedApplicationSession(): PublicApplicationSession | null {
-    const row = this.#db.query<ApplicationSessionRow, []>(`
+  listUnreleasedApplicationSessions(): readonly PublicApplicationSession[] {
+    return this.#db.query<ApplicationSessionRow, []>(`
       SELECT *
       FROM run_application_sessions
       WHERE slot_released = 0
       ORDER BY created_at, run_id, generation
-      LIMIT 1
-    `).get();
-    return row ? publicApplicationSession(row) : null;
+    `).all().map(publicApplicationSession);
   }
 
   releaseApplicationSessionSlot(

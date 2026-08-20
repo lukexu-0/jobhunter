@@ -422,7 +422,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert created.session_id == _CALLER_SESSION_ID
             await _wait_for_state(manager, created.session_id, "running")
             await asyncio.wait_for(agent.started.wait(), timeout=5)
-            record = manager._active
+            record = manager._active.get(created.session_id)
             assert record is not None
             assert len(runtimes) == 1
             runtime = record.playwright_runtime
