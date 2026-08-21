@@ -27,7 +27,7 @@ from .artifacts import (
 )
 from .playwright_cli import (
     BrowserConfigurationError,
-    browser_launch_for_slot,
+    PlaywrightCliNativeBrowserHost,
     PlaywrightCliRuntime,
     PlaywrightCliRuntimeError,
     ResolvedBrowserLaunch,
@@ -408,9 +408,20 @@ class ApplicationSessionManager:
         self._context_process_factory = context_process_factory
         self._application_runner = application_runner
         self._runtime_factory = runtime_factory
+        self._native_browser_host = (
+            None
+            if self._browser_launch.is_cdp
+            else PlaywrightCliNativeBrowserHost(
+                launch=self._browser_launch,
+                artifacts_root=self._artifacts_root,
+                node_executable=self._config.node_executable,
+                cli_script=self._config.playwright_cli_script,
+            )
+        )
         self._user_info_store = user_info_store or UserInfoStore(config.user_info_json)
         self._credential_store = credential_store
         self._lock = asyncio.Lock()
+        self._browser_operation_lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
         self._startup_complete = False
         self._active: dict[UUID, _ApplicationSession] = {}
@@ -427,6 +438,8 @@ class ApplicationSessionManager:
         async with self._startup_lock:
             if self._startup_complete:
                 return
+            if self._native_browser_host is not None:
+                await self._native_browser_host.startup()
             await recover_stale_playwright_cli_sessions(
                 artifacts_root=self._artifacts_root,
                 node_executable=self._config.node_executable,
@@ -646,13 +659,12 @@ class ApplicationSessionManager:
 
             runtime = self._runtime_factory(
                 session_id=session_id,
-                launch=browser_launch_for_slot(
-                    self._browser_launch,
-                    record.browser_slot,
-                ),
+                launch=self._browser_launch,
                 session_directory=stored.session_directory,
                 node_executable=self._config.node_executable,
                 cli_script=self._config.playwright_cli_script,
+                browser_host=self._native_browser_host,
+                operation_lock=self._browser_operation_lock,
             )
             record.playwright_runtime = runtime
             await runtime.start(validated_job_url)
@@ -941,6 +953,8 @@ class ApplicationSessionManager:
                 session_directory=record.session_directory,
                 node_executable=self._config.node_executable,
                 cli_script=self._config.playwright_cli_script,
+                browser_host=self._native_browser_host,
+                operation_lock=self._browser_operation_lock,
             )
             record.runtime = runtime
             await runtime.start(record.request.job_url)
@@ -2270,6 +2284,8 @@ class ApplicationSessionManager:
             await self._join_finalizer(record)
             await self._close_terminal_tombstone(record.session_id)
         await self._drain_pending_cleanup()
+        if self._native_browser_host is not None:
+            await self._native_browser_host.close()
     async def _drain_pending_cleanup(self) -> None:
         retry_delay = 0.05
         while True:

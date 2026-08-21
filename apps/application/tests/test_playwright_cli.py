@@ -20,6 +20,7 @@ import jobhunter_browser_harness.playwright_cli as playwright_cli
 from jobhunter_browser_harness.models import BrowserLaunchConfig
 from jobhunter_browser_harness.playwright_cli import (
     BrowserConfigurationError,
+    PlaywrightCliNativeBrowserHost,
     PlaywrightCliRuntime,
     PlaywrightCliRuntimeError,
     ResolvedBrowserLaunch,
@@ -51,7 +52,7 @@ class DummyProcess:
         if (
             not stdout
             and len(argv) > 3
-            and argv[3] == "close"
+            and argv[3] in {"close", "detach"}
         ):
             session_name = next(
                 value.removeprefix("--session=")
@@ -59,7 +60,12 @@ class DummyProcess:
                 if value.startswith("--session=")
             )
             stdout = json.dumps(
-                {"session": session_name, "status": "closed"}
+                {
+                    "session": session_name,
+                    "status": (
+                        "detached" if argv[3] == "detach" else "closed"
+                    ),
+                }
             ).encode()
         self.argv = argv
         self.returncode = exit_code
@@ -169,6 +175,21 @@ def _successful_metadata_result() -> bytes:
         ],
     }
     return json.dumps({"result": json.dumps(metadata)}).encode()
+
+def _successful_owned_cleanup_result(
+    *,
+    keeper_global: int | None = 0,
+) -> bytes:
+    return json.dumps(
+        {
+            "result": json.dumps(
+                {
+                    "closed": 0,
+                    "keeperCurrent": keeper_global is not None,
+                }
+            )
+        }
+    ).encode()
 
 
 def _runtime_for_process_factory(
@@ -474,6 +495,89 @@ async def test_cdp_runtimes_share_endpoint_with_distinct_cli_sessions(
     for runtime in runtimes:
         await runtime.close()
 
+@pytest.mark.asyncio
+async def test_native_host_shares_one_profile_until_last_release_and_reuses_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+    chrome = tmp_path / "chrome"
+    chrome.write_text("", encoding="utf-8")
+    launches: list[ResolvedBrowserLaunch] = []
+    host_runtimes: list[Any] = []
+    host_session_names: list[str] = []
+
+    class FakeNativeHostRuntime:
+        def __init__(self, **kwargs: Any) -> None:
+            launches.append(kwargs["launch"])
+            host_session_names.append(
+                f"{kwargs['session_name_prefix']}{kwargs['session_id'].hex}"
+            )
+            self.closed = False
+            host_runtimes.append(self)
+
+        async def start_native_host(self) -> ResolvedBrowserLaunch:
+            return ResolvedBrowserLaunch(
+                cdp_url="http://127.0.0.1:49152",
+                executable_path=None,
+                user_data_dir=None,
+            )
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        playwright_cli,
+        "PlaywrightCliRuntime",
+        FakeNativeHostRuntime,
+    )
+    host = PlaywrightCliNativeBrowserHost(
+        launch=ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=chrome,
+            user_data_dir=profile,
+        ),
+        artifacts_root=tmp_path / "sessions",
+    )
+    owners = (
+        UUID("55555555-5555-4555-8555-555555555551"),
+        UUID("55555555-5555-4555-8555-555555555552"),
+        UUID("55555555-5555-4555-8555-555555555553"),
+    )
+
+    endpoints = [await host.acquire(owner) for owner in owners]
+
+    assert [endpoint.cdp_url for endpoint in endpoints] == [
+        "http://127.0.0.1:49152"
+    ] * 3
+    assert launches == [
+        ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=chrome,
+            user_data_dir=profile,
+        )
+    ]
+    assert host_session_names == [
+        f"jobhunter-native-host-{playwright_cli._NATIVE_HOST_SESSION_ID.hex}"
+    ]
+    assert host_session_names[0] != (
+        f"jobhunter-{playwright_cli._NATIVE_HOST_SESSION_ID.hex}"
+    )
+    assert not profile.with_name("profile-slot-2").exists()
+    assert not profile.with_name("profile-slot-3").exists()
+
+    await host.release(owners[0])
+    await host.release(owners[1])
+    assert host_runtimes[0].closed is False
+    await host.release(owners[2])
+    assert host_runtimes[0].closed is True
+
+    reused = await host.acquire(owners[0])
+    assert reused.cdp_url == "http://127.0.0.1:49152"
+    assert len(host_runtimes) == 2
+    await host.release(owners[0])
+
 
 def test_resolve_browser_launch_cdp_invalid() -> None:
     config = BrowserLaunchConfig.model_construct(cdp_url="http://google.com/path")
@@ -551,12 +655,27 @@ def test_resolve_browser_launch_missing_executable(tmp_path: Path) -> None:
         resolve_browser_launch(config)
 
 
-def test_runtime_init_validation(session_dir: Path, cli_script: Path) -> None:
+@pytest.mark.asyncio
+async def test_runtime_init_validation(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
     launch = ResolvedBrowserLaunch(cdp_url="http://127.0.0.1:9222", executable_path=None, user_data_dir=None)
     with pytest.raises(BrowserConfigurationError):
         PlaywrightCliRuntime(session_id=cast(Any, "not-a-uuid"),
         launch=launch,
         session_directory=session_dir, cli_script=cli_script,)
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000095"),
+        launch=launch,
+        session_directory=session_dir,
+        cli_script=cli_script,
+    )
+    assert runtime._root_url == (
+        f"about:blank#jobhunter-{runtime._ownership_token}-root"
+    )
+    assert runtime._root_url in runtime._private_values
+    await runtime.close()
 
 
 
@@ -623,12 +742,24 @@ async def test_runtime_start_lifecycle_argv(session_dir: Path, cli_script: Path)
         spawns.append(list(argv))
         cmd = argv[3]
         stdout = b""
-        if cmd == "run-code":
+        if cmd == "attach":
+            stdout = json.dumps(
+                {"session": "jobhunter-00000000000000000000000000000001", "pid": 4101}
+            ).encode("utf-8")
+        elif cmd == "detach":
+            stdout = json.dumps(
+                {
+                    "session": "jobhunter-00000000000000000000000000000001",
+                    "status": "detached",
+                }
+            ).encode("utf-8")
+        elif cmd == "run-code":
             stdout = json.dumps({
                 "result": json.dumps({
                     "url": "https://example.com/jobs/1",
                     "title": "Software Engineer",
                     "currentIndex": 0,
+                    "globalIndices": [1],
                     "tabs": [{"url": "https://example.com/jobs/1", "title": "Software Engineer"}],
                 })
             }).encode("utf-8")
@@ -645,16 +776,121 @@ async def test_runtime_start_lifecycle_argv(session_dir: Path, cli_script: Path)
     assert "cdpTimeout" not in config["browser"]
 
 
-    # Commands invoked: open about:blank, run-code (install guard), video-start, goto, run-code (metadata check)
-    assert len(spawns) == 5
-    assert spawns[0][3] == "open"
-    assert spawns[0][4] == "about:blank"
-    assert spawns[1][3] == "run-code"  # navigation guard
-    assert spawns[2][3] == "video-start"
-    assert spawns[3][3] == "goto"
-    assert spawns[3][4] == "https://example.com/jobs/1"
-    assert spawns[4][3] == "run-code"  # metadata
+    assert [spawn[3] for spawn in spawns] == [
+        "attach",
+        "tab-new",
+        "run-code",  # bind the owned root
+        "run-code",  # install its scoped guard
+        "run-code",  # start owned-page video
+        "goto",
+        "run-code",  # owned metadata
+    ]
+    assert spawns[0][4] == "--cdp=http://127.0.0.1:9222"
+    assert spawns[5][4] == "https://example.com/jobs/1"
 
+    await runtime.close()
+    assert [spawn[3] for spawn in spawns[-5:]] == [
+        "run-code",  # stop owned-page video
+        "run-code",  # close owned descendants and mark the keeper
+        "tab-close",  # close the owned root
+        "run-code",  # finalize the owned-page Symbol
+        "detach",
+    ]
+
+@pytest.mark.asyncio
+async def test_runtime_keeps_current_owned_tab_and_scopes_pinned_tab_output(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    commands: list[tuple[str, list[str]]] = []
+    foreign_url = "https://foreign.example/private"
+    metadata = {
+        "url": "https://example.com/jobs/2",
+        "title": "Owned second tab",
+        "currentIndex": 1,
+        "globalIndices": [1, 3],
+        "tabs": [
+            {"url": "https://example.com/jobs/1", "title": "Owned root"},
+            {"url": "https://example.com/jobs/2", "title": "Owned second tab"},
+        ],
+    }
+
+    def process_factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        command = argv[3]
+        commands.append((command, list(argv[4:-1])))
+        if command == "run-code":
+            stdout = json.dumps(
+                {"result": json.dumps({**metadata, "screenshot": False})}
+            ).encode("utf-8")
+        else:
+            stdout = json.dumps(
+                {
+                    "result": (
+                        "### Open tabs\n"
+                        f"- 0: Foreign ({foreign_url})\n"
+                        "- 1: Owned root (https://example.com/jobs/1)\n"
+                        "### Page\n"
+                        "Owned second tab"
+                    )
+                }
+            ).encode("utf-8")
+        return DummyProcess(argv=argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000099"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        process_factory=process_factory,
+        cli_script=cli_script,
+    )
+    runtime._opened = True
+    runtime._started = True
+    runtime._guard_armed = True
+    runtime._approved_origins = ("https://example.com",)
+    runtime._current_metadata = runtime._parse_metadata(metadata)
+
+    selected = await runtime.execute(
+        "tab-select",
+        ["1"],
+        expose_applicant_values=True,
+    )
+
+    assert all(command != "tab-select" for command, _args in commands)
+    assert foreign_url not in selected.stdout
+    assert [tab.url for tab in selected.observation.tabs] == [
+        "https://example.com/jobs/1",
+        "https://example.com/jobs/2",
+    ]
+    with pytest.raises(PlaywrightCliRuntimeError):
+        await runtime.execute(
+            "tab-select",
+            ["0"],
+            expose_applicant_values=True,
+        )
+    pinned = json.dumps(
+        {
+            "open tabs": [
+                {"url": foreign_url, "title": "Foreign"}
+            ],
+            "result": f"0: Foreign ({foreign_url})",
+        }
+    ).encode()
+    for command in ("tab-list", "tab-new", "tab-select"):
+        scoped = runtime._scope_cli_output(
+            pinned,
+            command=command,
+            metadata=runtime._current_metadata,
+        ).decode()
+        assert foreign_url not in scoped
+        assert "https://example.com/jobs/1" in scoped
+    assert all(
+        foreign_url not in tab.url
+        for tab in selected.observation.tabs
+    )
     await runtime.close()
 
 
@@ -714,7 +950,10 @@ async def test_source_capture_binds_bounded_rendered_text_and_url_to_one_page(
     assert [invocation[3] for invocation in invocations] == ["run-code"]
     capture_script = invocations[0][4]
     assert "page.evaluate" not in capture_script
-    assert "page.context().newCDPSession(page)" in capture_script
+    assert "context.newCDPSession(page)" in capture_script
+    assert capture_script.index("ownership.pages.has(page)") < capture_script.index(
+        "context.newCDPSession(page)"
+    )
     assert capture_script.count("Page.getFrameTree") == 2
     assert "Page.createIsolatedWorld" in capture_script
     assert "Runtime.callFunctionOn" in capture_script
@@ -797,7 +1036,10 @@ async def test_source_capture_script_accepts_exact_origin_without_url_global(
             "return {result:{type:'string',value:'Verified role'}};"
             "throw new Error(command);},"
             "detach:async()=>{detached=true;}};"
-            "const page={context:()=>({newCDPSession:async()=>cdp})};"
+            "const context={newCDPSession:async()=>cdp};"
+            "const page={context:()=>context};"
+            "context[Symbol.for('jobhunter.playwrightCli.ownedPages')]="
+            "{root:page,pages:new Set([page])};"
             "const value=await generated(page);"
             "return {value,frameReads,detached};"
         )
@@ -823,6 +1065,33 @@ async def test_source_capture_script_accepts_exact_origin_without_url_global(
         "Verified role",
     )
     await runtime.close()
+
+def test_source_capture_rejects_same_origin_foreign_current_page_before_cdp() -> None:
+    exercise = (
+        "let cdpCalls=0;"
+        "const context={newCDPSession:async()=>{cdpCalls+=1;"
+        "throw new Error('foreign CDP read');}};"
+        "const ownedRoot={context:()=>context};"
+        "const foreignPage={context:()=>context};"
+        "context[Symbol.for('jobhunter.playwrightCli.ownedPages')]="
+        "{root:ownedRoot,pages:new Set([ownedRoot])};"
+        "let error='';"
+        "try{await generated(foreignPage);}catch(caught){error=String(caught.message);}"
+        "return {error,cdpCalls};"
+    )
+
+    result = run_url_less_generated_script(
+        PlaywrightCliRuntime._source_capture_script(
+            "https://example.com",
+            "function(){return 'foreign source';}",
+        ),
+        exercise,
+    )
+
+    assert result == {
+        "error": "owned page scope is unavailable",
+        "cdpCalls": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -1141,9 +1410,10 @@ async def test_runtime_returns_cached_observation_while_file_chooser_is_open(
 ) -> None:
     modal = False
     commands: list[str] = []
+    modal_clears = 0
 
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
-        nonlocal modal
+        nonlocal modal, modal_clears
         command = argv[3]
         commands.append(command)
         if command == "click":
@@ -1159,6 +1429,15 @@ async def test_runtime_returns_cached_observation_while_file_chooser_is_open(
                     }
                 }
             ).encode()
+        elif command == "upload":
+            assert argv[4] == str(runtime._modal_cleanup_upload_path)
+            assert runtime._modal_cleanup_upload_path.read_bytes() == b""
+            assert stat.S_IMODE(
+                runtime._modal_cleanup_upload_path.stat().st_mode
+            ) == 0o600
+            modal_clears += 1
+            modal = False
+            stdout = b""
         elif command == "run-code" and modal:
             stdout = json.dumps(
                 {
@@ -1169,6 +1448,13 @@ async def test_runtime_returns_cached_observation_while_file_chooser_is_open(
                     ),
                 }
             ).encode()
+        elif (
+            command == "run-code"
+            and "state.closingMode=true" in argv[4]
+        ):
+            stdout = _successful_owned_cleanup_result(
+                keeper_global=None
+            )
         elif command == "run-code":
             stdout = json.dumps(
                 {
@@ -1210,7 +1496,80 @@ async def test_runtime_returns_cached_observation_while_file_chooser_is_open(
     assert commands == ["click", "run-code"]
 
     await runtime.close()
+    assert modal_clears == 1
+    assert commands[-5:] == [
+        "run-code",
+        "run-code",
+        "upload",
+        "run-code",
+        "detach",
+    ]
 
+
+
+@pytest.mark.asyncio
+async def test_modal_cleanup_clears_file_chooser_without_closing_foreign_tabs(
+    session_dir: Path,
+    cli_script: Path,
+) -> None:
+    tabs = ["owned-root", "owned-popup", "foreign-after"]
+    modal = True
+    modal_clears = 0
+
+    def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        nonlocal modal, modal_clears
+        command = argv[3]
+        if command == "run-code" and modal:
+            stdout = json.dumps(
+                {
+                    "isError": True,
+                    "error": (
+                        'Error: Tool "browser_run_code_unsafe" '
+                        "does not handle the modal state."
+                    ),
+                }
+            ).encode()
+        elif command == "upload":
+            assert argv[4] == str(runtime._modal_cleanup_upload_path)
+            modal_clears += 1
+            modal = False
+            stdout = b""
+        elif command == "run-code":
+            stdout = _successful_owned_cleanup_result(
+                keeper_global=None
+            )
+        else:
+            stdout = b""
+        return DummyProcess(argv, stdout=stdout)
+
+    runtime = PlaywrightCliRuntime(
+        session_id=UUID("00000000-0000-0000-0000-000000000096"),
+        launch=ResolvedBrowserLaunch(
+            cdp_url="http://127.0.0.1:9222",
+            executable_path=None,
+            user_data_dir=None,
+        ),
+        session_directory=session_dir,
+        process_factory=factory,
+        cli_script=cli_script,
+    )
+    runtime._current_metadata = playwright_cli._PageMetadata(
+        url="https://example.com/jobs/1",
+        title="Owned root",
+        current_index=0,
+        tabs=(
+            ("https://example.com/jobs/1", "Owned root"),
+            ("https://example.com/popup", "Owned popup"),
+        ),
+        global_indices=(0, 1),
+    )
+    runtime._owned_page_scope_installed = True
+
+    await runtime._close_owned_page_group(timeout=1)
+
+    assert modal_clears == 1
+    assert tabs == ["owned-root", "owned-popup", "foreign-after"]
+    await runtime.close()
 
 @pytest.mark.asyncio
 async def test_action_waits_for_caller_cancellation_and_reclaims_child(
@@ -1254,7 +1613,7 @@ async def test_action_waits_for_caller_cancellation_and_reclaims_child(
     assert commands == ["click"]
 
     await runtime.close()
-    assert commands == ["click", "video-stop", "close"]
+    assert commands == ["click", "run-code", "run-code", "tab-close", "run-code", "detach"]
 
 
 @pytest.mark.asyncio
@@ -1321,7 +1680,7 @@ async def test_permanent_cleanup_failure_returns_bounded_fixed_error(
         emergency_cleanup,
     )
     await runtime.close()
-    assert commands == ["click", "video-stop", "close"]
+    assert commands == ["click", "run-code", "run-code", "tab-close", "run-code", "detach"]
 
 
 
@@ -1414,13 +1773,13 @@ async def test_action_process_failure_preserves_error_while_cleanup_runs(
 
     assert first.value.code == "browser_failed"
     assert "private process failure" not in str(first.value)
-    assert commands == ["click", "video-stop", "close"]
+    assert commands == ["click", "run-code", "run-code", "tab-close", "run-code", "detach"]
 
     with pytest.raises(PlaywrightCliRuntimeError) as later:
         await runtime.execute("click", ["e4"])
 
     assert later.value.code == "browser_failed"
-    assert commands == ["click", "video-stop", "close"]
+    assert commands == ["click", "run-code", "run-code", "tab-close", "run-code", "detach"]
 
     await runtime.close()
 
@@ -1460,13 +1819,13 @@ async def test_internal_observation_process_failure_invalidates_runtime(
         await runtime.execute("click", ["e3"])
 
     assert first.value.code == "browser_failed"
-    assert commands == ["click", "run-code", "video-stop", "close"]
+    assert commands == ["click", "run-code", "run-code", "run-code", "detach"]
 
     with pytest.raises(PlaywrightCliRuntimeError) as later:
         await runtime.execute("click", ["e4"])
 
     assert later.value.code == "browser_failed"
-    assert commands == ["click", "run-code", "video-stop", "close"]
+    assert commands == ["click", "run-code", "run-code", "run-code", "detach"]
 
     await runtime.close()
 
@@ -1644,36 +2003,55 @@ async def test_runtime_execute_exact_origin_direct_navigation(session_dir: Path,
                     }
                 }
             ).encode()
-        elif command == "goto" and escaped:
-            assert argv[4] == "https://example.com/jobs/1"
-            escaped = False
         elif command == "run-code":
-            url = (
-                "chrome-error://chromewebdata/"
-                if escaped
-                else "https://example.com/jobs/1"
+            filename_argument = next(
+                (
+                    value
+                    for value in argv[4:]
+                    if value.startswith("--filename=")
+                ),
+                None,
             )
-            stdout = json.dumps(
-                {
-                    "result": json.dumps(
-                        {
-                            "url": url,
-                            "title": "Blocked" if escaped else "Software Engineer",
-                            "currentIndex": 0,
-                            "tabs": [
-                                {
-                                    "url": url,
-                                    "title": (
-                                        "Blocked"
-                                        if escaped
-                                        else "Software Engineer"
-                                    ),
-                                }
-                            ],
-                        }
-                    )
-                }
-            ).encode()
+            script = (
+                Path(filename_argument.split("=", 1)[1]).read_text(
+                    encoding="utf-8"
+                )
+                if filename_argument is not None
+                else argv[4]
+            )
+            if escaped and "await page.goto(target)" in script:
+                assert script.index(
+                    "ownership.pages.has(page)"
+                ) < script.index("await page.goto(target)")
+                escaped = False
+                stdout = b"{}"
+            else:
+                url = (
+                    "chrome-error://chromewebdata/"
+                    if escaped
+                    else "https://example.com/jobs/1"
+                )
+                stdout = json.dumps(
+                    {
+                        "result": json.dumps(
+                            {
+                                "url": url,
+                                "title": "Blocked" if escaped else "Software Engineer",
+                                "currentIndex": 0,
+                                "tabs": [
+                                    {
+                                        "url": url,
+                                        "title": (
+                                            "Blocked"
+                                            if escaped
+                                            else "Software Engineer"
+                                        ),
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                ).encode()
         return DummyProcess(argv=argv, stdout=stdout)
 
     runtime._process_factory = mock_process_factory_redirect
@@ -1683,11 +2061,10 @@ async def test_runtime_execute_exact_origin_direct_navigation(session_dir: Path,
     assert result.exit_code == 2
     assert result.stderr == "[redacted]"
     assert result.observation.url == "https://example.com/jobs/1"
-    assert redirected_commands[:6] == [
+    assert redirected_commands[:5] == [
         "click",
         "run-code",
-        "tab-select",
-        "goto",
+        "run-code",
         "run-code",
         "snapshot",
     ]
@@ -1708,6 +2085,14 @@ async def test_private_restore_keeps_secret_url_out_of_argv_and_memfd_on_disk(
 
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
         invocations.append(list(argv))
+        if (
+            argv[3] == "run-code"
+            and "state.closingMode=true" in argv[4]
+        ):
+            return DummyProcess(
+                argv,
+                stdout=_successful_owned_cleanup_result(),
+            )
         if argv[3] == "run-code":
             filename = next(
                 value.split("=", 1)[1]
@@ -1744,10 +2129,7 @@ async def test_private_restore_keeps_secret_url_out_of_argv_and_memfd_on_disk(
 
     await runtime._restore_allowed_page(previous, current)
 
-    assert [invocation[3] for invocation in invocations] == [
-        "tab-select",
-        "run-code",
-    ]
+    assert [invocation[3] for invocation in invocations] == ["run-code"]
     assert all(
         password not in argument
         for invocation in invocations
@@ -1790,6 +2172,8 @@ async def test_save_origin_verification_keeps_applicant_modal_metadata_for_model
                         ),
                     }
                 ).encode()
+            elif "state.closingMode=true" in script:
+                stdout = _successful_owned_cleanup_result()
             elif "const pages=" in script:
                 stdout = json.dumps(
                     {
@@ -1904,6 +2288,8 @@ async def test_runtime_metadata_transport_covers_declared_tab_bounds(
     cli_script: Path,
 ) -> None:
     long_value = "x" * 4_096
+
+
     tabs = [
         {
             "url": f"https://example.com/{index}?value={long_value}",
@@ -1949,6 +2335,137 @@ async def test_runtime_metadata_transport_covers_declared_tab_bounds(
     assert len(runtime._current_metadata.tabs[-1][1]) == 4_096
 
     await runtime.close()
+
+def test_owned_page_scripts_scope_guard_cleanup_and_video_to_the_root_group() -> None:
+    scope = PlaywrightCliRuntime._owned_page_scope_script(
+        "about:blank#private-root"
+    )
+    guard = PlaywrightCliRuntime._guard_script(("https://example.com",))
+    video = PlaywrightCliRuntime._start_owned_video_script(
+        Path("/private/session.webm")
+    )
+    stop_video = PlaywrightCliRuntime._stop_owned_video_script()
+    cleanup = PlaywrightCliRuntime._close_owned_pages_script()
+
+    assert "pages:new Set()" in scope
+    assert "cursor.opener()" in scope
+    assert "isOwned(requestPage)" in guard
+    assert "return route.fallback()" in guard
+    assert "state.startVideo(page)" in video
+    assert "filter(candidate=>state.pages.has(candidate))" in stop_video
+    assert "filter(candidate=>state.pages.has(candidate))" in cleanup
+    assert "candidate.close()" in cleanup
+
+def test_owned_root_and_new_tab_binding_reject_foreign_current_page() -> None:
+    root_result = run_url_less_generated_script(
+        PlaywrightCliRuntime._owned_page_scope_script(
+            "about:blank#private-root"
+        ),
+        (
+            "const context={};"
+            "const foreign={url:()=> 'https://example.com/foreign',"
+            "context:()=>context};"
+            "let error='';"
+            "try{await generated(foreign);}catch(caught){error=String(caught.message);}"
+            "return {error,symbols:Object.getOwnPropertySymbols(context).length};"
+        ),
+    )
+    adopt_result = run_url_less_generated_script(
+        PlaywrightCliRuntime._adopt_current_page_script(
+            "about:blank#private-tab"
+        ),
+        (
+            "let videoStarts=0;"
+            "const context={};"
+            "const root={};"
+            "const foreign={url:()=> 'https://example.com/foreign',"
+            "context:()=>context};"
+            "const state={pages:new Set([root]),"
+            "startVideo:async()=>{videoStarts+=1;}};"
+            "context[Symbol.for('jobhunter.playwrightCli.ownedPages')]=state;"
+            "let error='';"
+            "try{await generated(foreign);}catch(caught){error=String(caught.message);}"
+            "return {error,owned:state.pages.size,videoStarts};"
+        ),
+    )
+
+    assert root_result == {
+        "error": "owned root identity is unavailable",
+        "symbols": 0,
+    }
+    assert adopt_result == {
+        "error": "owned tab identity is unavailable",
+        "owned": 1,
+        "videoStarts": 0,
+    }
+
+
+def test_cleanup_waits_for_delayed_nested_popup_adoption_and_closes_it() -> None:
+    scope = PlaywrightCliRuntime._owned_page_scope_script(
+        "about:blank#private-root"
+    )
+    cleanup = PlaywrightCliRuntime._close_owned_pages_script()
+    combined = (
+        "async (page) => {"
+        f"await ({scope})(page);"
+        "const context=page.context();"
+        "context.emitPage(context.child);"
+        f"const cleaning=({cleanup})(page);"
+        "context.releaseOpener();"
+        "const result=await cleaning;"
+        "return {result,pages:context.pages().map(item=>item.name)};"
+        "}"
+    )
+    exercise = (
+        "let pageListener=null;let releaseOpener;"
+        "const openerReady=new Promise(resolve=>{releaseOpener=resolve;});"
+        "const pages=[];"
+        "const makePage=(name,url,opener)=>{"
+        "const closeListeners=[];"
+        "const item={name,url:()=>url,context:()=>context,"
+        "opener:async()=>{if(opener){await openerReady;return opener;}return null;},"
+        "on:(event,listener)=>{if(event==='close')closeListeners.push(listener);},"
+        "screencast:{start:async()=>{},stop:async()=>{}},"
+        "close:async()=>{const index=pages.indexOf(item);if(index>=0)pages.splice(index,1);"
+        "for(const listener of closeListeners)listener();}};pages.push(item);return item;};"
+        "const context={pages:()=>pages,on:(event,listener)=>{if(event==='page')pageListener=listener;},"
+        "off:()=>{},emitPage:item=>pageListener(item),"
+        "releaseOpener:()=>releaseOpener()};"
+        "const root=makePage('root','about:blank#private-root',null);"
+        "context.child=makePage('child','about:blank',root);"
+        "return await generated(root);"
+    )
+
+    result = run_url_less_generated_script(combined, exercise)
+
+    assert result["pages"] == ["root"]
+    assert result["result"]["keeperCurrent"] is True
+
+
+def test_owned_video_stop_attempts_every_page_and_reports_any_rejection() -> None:
+    exercise = (
+        "const calls=[];"
+        "const context={pages:()=>[page,other]};"
+        "const page={context:()=>context,screencast:{stop:async()=>{calls.push('root');}}};"
+        "const other={screencast:{stop:async()=>{calls.push('popup');"
+        "throw new Error('stop failed');}}};"
+        "context[Symbol.for('jobhunter.playwrightCli.ownedPages')]="
+        "{pages:new Set([page,other]),recording:{}};"
+        "let error='';"
+        "try{await generated(page);}catch(caught){error=String(caught.message);}"
+        "return {calls,error};"
+    )
+
+    result = run_url_less_generated_script(
+        PlaywrightCliRuntime._stop_owned_video_script(),
+        exercise,
+    )
+
+    assert result == {
+        "calls": ["root", "popup"],
+        "error": "owned video stop failed",
+    }
+
 
 @pytest.mark.asyncio
 async def test_runtime_execute_output_bounds(
@@ -2023,6 +2540,7 @@ def test_navigation_guard_rearm_reuses_persistent_state_and_handler() -> None:
     assert script.count("context.route('**/*',handler)") == 1
     assert script.count("const handler=async route=>{") == 1
     assert "unroute" not in script
+    assert "ownership.pages.has(page)" in script
 
 
 def test_navigation_guard_matches_exact_origins_without_url_global() -> None:
@@ -2064,18 +2582,22 @@ def test_navigation_guard_matches_exact_origins_without_url_global() -> None:
         "const context={handler:null,"
         "route:async(_pattern,handler)=>{context.handler=handler;}};"
         "const page={context:()=>context};"
+        "context[Symbol.for('jobhunter.playwrightCli.ownedPages')]="
+        "{root:page,pages:new Set([page]),startVideo:async()=>{}};"
         "await generated(page);"
-        "const state=context[Object.getOwnPropertySymbols(context)[0]];"
+        "const state=context[Symbol.for('jobhunter.playwrightCli.navigationGuard')];"
         "const decisions=[];"
         "for(const item of cases){"
         "state.armed=!item.disarmed;"
         "let decision='none';"
         "const request={"
         "isNavigationRequest:()=>item.navigation!==false,"
-        "frame:()=>({parentFrame:()=>item.topLevel===false?{}:null}),"
+        "frame:()=>({parentFrame:()=>item.topLevel===false?{}:null,"
+        "page:()=>page}),"
         "url:()=>item.url};"
         "const route={request:()=>request,"
         "continue:()=>{decision='continue';},"
+        "fallback:()=>{decision='fallback';},"
         "abort:()=>{decision='abort';}};"
         "await context.handler(route);"
         "decisions.push(decision);}"
@@ -2092,8 +2614,47 @@ def test_navigation_guard_matches_exact_origins_without_url_global() -> None:
         ),
         exercise,
     )
-
     assert decisions == [case["expected"] for case in cases]
+
+
+def test_metadata_after_guard_suspension_marks_handoff_for_owned_root() -> None:
+    exercise = (
+        "const guard={armed:false,handoffPending:false,handoffChanged:true};"
+        "let page;"
+        "const context={pages:()=>[page]};"
+        "page={context:()=>context,url:()=>"
+        "'https://example.com/jobs/1',title:async()=> 'Owned role'};"
+        "context[Symbol.for('jobhunter.playwrightCli.ownedPages')]="
+        "{root:page,pages:new Set([page])};"
+        "context[Symbol.for('jobhunter.playwrightCli.navigationGuard')]=guard;"
+        "const metadata=await generated(page);"
+        "return {metadata,guard};"
+    )
+
+    result = run_url_less_generated_script(
+        PlaywrightCliRuntime._metadata_script(True),
+        exercise,
+    )
+
+    assert result == {
+        "metadata": {
+            "url": "https://example.com/jobs/1",
+            "title": "Owned role",
+            "currentIndex": 0,
+            "globalIndices": [0],
+            "tabs": [
+                {
+                    "url": "https://example.com/jobs/1",
+                    "title": "Owned role",
+                }
+            ],
+        },
+        "guard": {
+            "armed": False,
+            "handoffPending": True,
+            "handoffChanged": False,
+        },
+    }
 
 
 def test_sign_in_script_accepts_exact_origin_without_url_global() -> None:
@@ -2118,6 +2679,8 @@ def test_sign_in_script_accepts_exact_origin_without_url_global() -> None:
         "const context={newCDPSession:async()=>cdp};"
         "const page={url:()=>pageUrl,context:()=>context,"
         "locator:(selector)=>({elementHandle:async()=>elements[selector]})};"
+        "context[Symbol.for('jobhunter.playwrightCli.ownedPages')]="
+        "{pages:new Set([page])};"
         "await generated(page);"
         "return events;"
     )
@@ -2150,6 +2713,7 @@ def test_navigation_guard_handler_bypasses_routes_while_disarmed() -> None:
         "return route.continue();}"
     )
     assert bypass in script
+    assert "ownership.pages.has(page)" in script
     assert script.index("const handler=async route=>{") < script.index(bypass)
     assert script.index(
         "if(!request.isNavigationRequest())return route.continue();"
@@ -2167,6 +2731,8 @@ def test_navigation_guard_rearm_rejects_a_navigation_seen_after_handoff() -> Non
         "state.handoffPending=false;state.handoffChanged=false;"
         "if(handoffChanged)throw new Error('navigation changed during guard handoff');"
     )
+    assert "ownership.pages.has(page)" in script
+    assert "ownership.pages.has(page)" in suspension
     assert marker in script
     assert rearm in script
     assert "state.handoffPending=false;state.handoffChanged=false;" in suspension
@@ -2488,10 +3054,13 @@ async def test_runtime_idempotent_cleanup(session_dir: Path, cli_script: Path) -
     spawns.clear()
     await runtime.close()
 
-    # Should call video-stop and close
-    assert len(spawns) == 2
-    assert spawns[0][3] == "video-stop"
-    assert spawns[1][3] == "close"
+    assert [spawn[3] for spawn in spawns] == [
+        "run-code",
+        "run-code",
+        "tab-close",
+        "run-code",
+        "detach",
+    ]
 
     # Subsequent close should be a no-op
     spawns.clear()
@@ -3038,7 +3607,7 @@ async def test_native_lifecycle_journals_and_reclaims_owned_browser(
 
 
 @pytest.mark.asyncio
-async def test_model_paths_limits_redaction_and_unapproved_tab_are_guarded(
+async def test_model_paths_limits_and_foreign_tab_indices_are_guarded(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
@@ -3049,8 +3618,10 @@ async def test_model_paths_limits_redaction_and_unapproved_tab_are_guarded(
     )
     outside_snapshot = session_dir.parent / "outside-snapshot.yml"
     outside_snapshot.write_text("must remain", encoding="utf-8")
+    commands: list[str] = []
 
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
+        commands.append(argv[3])
         stdout = b""
         if argv[3] == "run-code":
             stdout = json.dumps(
@@ -3060,14 +3631,11 @@ async def test_model_paths_limits_redaction_and_unapproved_tab_are_guarded(
                             "url": "https://example.com/jobs/1",
                             "title": "Job",
                             "currentIndex": 0,
+                            "globalIndices": [1],
                             "tabs": [
                                 {
                                     "url": "https://example.com/jobs/1",
                                     "title": "Job",
-                                },
-                                {
-                                    "url": "https://unapproved.example/login",
-                                    "title": "Human login",
                                 },
                             ],
                         }
@@ -3087,6 +3655,7 @@ async def test_model_paths_limits_redaction_and_unapproved_tab_are_guarded(
     session_directory=session_dir, cli_script=cli_script,
     process_factory=factory,)
     await runtime.start("https://example.com/jobs/1")
+    commands.clear()
 
     with pytest.raises(PlaywrightCliRuntimeError):
         await runtime.execute("tab-select", ["1"])
@@ -3114,6 +3683,9 @@ async def test_model_paths_limits_redaction_and_unapproved_tab_are_guarded(
         await runtime.execute("click", ["\ud800"])
     with pytest.raises(PlaywrightCliRuntimeError):
         await runtime.execute("click", ["-sother-session"])
+    assert commands == []
+    assert runtime._started is True
+    assert runtime._guard_armed is True
     await runtime.execute("click", ["e1"])
     assert outside_snapshot.read_text(encoding="utf-8") == "must remain"
 
@@ -3125,7 +3697,7 @@ async def test_model_paths_limits_redaction_and_unapproved_tab_are_guarded(
 
 
 @pytest.mark.asyncio
-async def test_close_retries_browser_ownership_after_failed_cli_close(
+async def test_close_retries_browser_ownership_after_failed_cli_detach(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
@@ -3161,7 +3733,7 @@ async def test_close_retries_browser_ownership_after_failed_cli_close(
                     )
                 }
             ).encode()
-        elif command == "close":
+        elif command == "detach":
             close_calls += 1
             exit_code = 1 if close_calls == 1 else 0
         return DummyProcess(argv, exit_code=exit_code, stdout=stdout)
@@ -3175,19 +3747,18 @@ async def test_close_retries_browser_ownership_after_failed_cli_close(
 
     with pytest.raises(PlaywrightCliRuntimeError):
         await runtime.close()
-    assert commands == ["video-stop", "close"]
+    assert commands == ["run-code", "run-code", "tab-close", "run-code", "detach"]
 
     commands.clear()
     await runtime.close()
-    assert commands == ["close"]
+    assert commands == ["detach"]
 
     commands.clear()
     await runtime.close()
     assert commands == []
 
-
 @pytest.mark.asyncio
-async def test_close_reports_video_stop_failure_after_browser_close(
+async def test_close_reports_owned_video_stop_failure_after_browser_detach(
     session_dir: Path,
     cli_script: Path,
 ) -> None:
@@ -3197,7 +3768,12 @@ async def test_close_reports_video_stop_failure_after_browser_close(
         command = argv[3]
         commands.append(command)
         stdout = b""
-        exit_code = 1 if command == "video-stop" else 0
+        exit_code = (
+            1
+            if command == "run-code"
+            and "candidate.screencast.stop" in argv[4]
+            else 0
+        )
         if command == "run-code":
             stdout = json.dumps(
                 {
@@ -3231,7 +3807,7 @@ async def test_close_reports_video_stop_failure_after_browser_close(
 
     with pytest.raises(PlaywrightCliRuntimeError):
         await runtime.close()
-    assert commands == ["video-stop", "close"]
+    assert commands == ["run-code", "run-code", "tab-close", "run-code", "detach"]
 
     commands.clear()
     await runtime.close()
@@ -3250,7 +3826,7 @@ async def test_cancelled_open_still_closes_attempted_cli_session(
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess | HangingProcess:
         command = argv[3]
         commands.append(command)
-        if command == "open":
+        if command == "attach":
             open_spawned.set()
             return open_process
         return DummyProcess(argv)
@@ -3272,7 +3848,7 @@ async def test_cancelled_open_still_closes_attempted_cli_session(
         await start
 
     assert open_process.terminated is True
-    assert commands == ["open", "close"]
+    assert commands == ["attach", "detach"]
 
 
 @pytest.mark.asyncio
@@ -3506,7 +4082,7 @@ async def test_internal_observation_waits_for_caller_cancellation(
 
     assert commands == ["click"]
     await runtime.close()
-    assert commands == ["click", "video-stop", "close"]
+    assert commands == ["click", "run-code", "run-code", "tab-close", "run-code", "detach"]
 
 
 def test_browser_artifact_budgets_use_the_configured_capacity_limits() -> None:
@@ -3600,7 +4176,7 @@ async def test_live_artifact_budget_closes_the_owned_cli_session(
 
     await asyncio.wait_for(wait_for_close(), timeout=1)
 
-    assert commands == ["video-stop", "close"]
+    assert commands == ["run-code", "run-code", "tab-close", "run-code", "detach"]
     assert not runtime._ownership_path.exists()
     commands.clear()
     await runtime.close()
@@ -3695,7 +4271,7 @@ async def test_budget_emergency_terminates_a_wedged_owned_daemon(
         command = argv[3]
         commands.append(command)
         stdout = b""
-        if command == "open":
+        if command == "attach":
             stdout = json.dumps({"pid": 4545}).encode()
         elif command == "run-code":
             stdout = json.dumps(
@@ -3718,7 +4294,7 @@ async def test_budget_emergency_terminates_a_wedged_owned_daemon(
         return DummyProcess(
             argv,
             stdout=stdout,
-            timed_out=command in {"video-stop", "close"},
+            timed_out=command == "detach",
         )
 
     def matching(_session_name: str, recorded_pid: int | None) -> tuple[int, ...]:
@@ -3769,7 +4345,7 @@ async def test_budget_emergency_terminates_a_wedged_owned_daemon(
 
     await asyncio.wait_for(wait_for_close(), timeout=1)
 
-    assert commands == ["video-stop", "close"]
+    assert commands == ["run-code", "run-code", "tab-close", "run-code", "detach"]
     assert terminated == [4545]
     assert not runtime._ownership_path.exists()
 
@@ -3981,7 +4557,7 @@ async def test_not_open_close_reconciles_recorded_daemon_before_release(
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
         command = argv[3]
         stdout = b""
-        if command == "open":
+        if command == "attach":
             stdout = json.dumps({"pid": 4242}).encode()
         elif command == "run-code":
             stdout = json.dumps(
@@ -4001,11 +4577,11 @@ async def test_not_open_close_reconciles_recorded_daemon_before_release(
                     )
                 }
             ).encode()
-        elif command == "close":
+        elif command == "detach":
             stdout = json.dumps(
                 {
                     "session": "jobhunter-00000000000000000000000000000013",
-                    "status": "not-open",
+                    "status": "not-attached",
                 }
             ).encode()
         return DummyProcess(argv, stdout=stdout)
@@ -4055,7 +4631,7 @@ async def test_not_open_close_retains_ownership_when_daemon_survives(
     def factory(*argv: str, **_kwargs: Any) -> DummyProcess:
         command = argv[3]
         stdout = b""
-        if command == "open":
+        if command == "attach":
             stdout = json.dumps({"pid": 4343}).encode()
         elif command == "run-code":
             stdout = json.dumps(
@@ -4075,11 +4651,11 @@ async def test_not_open_close_retains_ownership_when_daemon_survives(
                     )
                 }
             ).encode()
-        elif command == "close":
+        elif command == "detach":
             stdout = json.dumps(
                 {
                     "session": "jobhunter-00000000000000000000000000000014",
-                    "status": "not-open",
+                    "status": "not-attached",
                 }
             ).encode()
         return DummyProcess(argv, stdout=stdout)
@@ -4233,7 +4809,7 @@ async def test_private_sign_in_fills_refs_exposes_model_values_and_disables_scre
     )
 
     assert [invocation[3] for invocation in invocations] == [
-        "video-stop",
+        "run-code",
         "run-code",
         "run-code",
         "run-code",
@@ -4267,7 +4843,7 @@ async def test_private_sign_in_fills_refs_exposes_model_values_and_disables_scre
     assert expected_url_check in payload_scripts[0]
     assert payload_scripts[0].count(".elementHandle()") == 3
     cdp_origin_check = (
-        "const cdp=await page.context().newCDPSession(page);"
+        "const cdp=await context.newCDPSession(page);"
         "const frameTree=(await cdp.send('Page.getFrameTree')).frameTree;"
         "await cdp.detach();"
         "const frames=[];"
@@ -4278,6 +4854,9 @@ async def test_private_sign_in_fills_refs_exposes_model_values_and_disables_scre
         "throw new Error('Unexpected sign-in origin');"
     )
     assert cdp_origin_check in payload_scripts[0]
+    assert payload_scripts[0].index(
+        "ownership.pages.has(page)"
+    ) < payload_scripts[0].index("context.newCDPSession(page)")
     control_origin_check = (
         "const controlOriginsApproved=await Promise.all("
         "[usernameElement,passwordElement,submitElement].map("
@@ -4338,7 +4917,11 @@ async def test_private_sign_in_fills_refs_exposes_model_values_and_disables_scre
     ]
     assert all("const screenshotPath=" not in script for script in observation_scripts)
     assert runtime._video_started is False
-    assert all(invocation[3] != "video-start" for invocation in invocations)
+    assert all(
+        "screencast.start" not in invocation[4]
+        for invocation in invocations
+        if invocation[3] == "run-code"
+    )
     assert all(
         not any(
             argument == "--filename" or argument.startswith("--filename=")
@@ -4387,7 +4970,8 @@ async def test_private_sign_in_fills_refs_exposes_model_values_and_disables_scre
 
     await runtime.close()
     assert all(
-        invocation[3] != "video-stop"
+        invocation[3] != "run-code"
+        or "candidate.screencast.stop" not in invocation[4]
         for invocation in invocations[spawn_count:]
     )
 
@@ -4484,7 +5068,7 @@ async def test_gate_capture_suppression_blocks_private_extraction_commands(
     invocations.clear()
 
     await runtime.suppress_private_capture()
-    assert [invocation[3] for invocation in invocations] == ["video-stop"]
+    assert [invocation[3] for invocation in invocations] == ["run-code"]
     for blocked_command, blocked_args in (
         (
             "eval",
@@ -4537,7 +5121,12 @@ async def test_failed_video_stop_closes_runtime_before_private_fill(
             ).encode()
         return DummyProcess(
             argv,
-            exit_code=1 if command == "video-stop" else 0,
+            exit_code=(
+                1
+                if command == "run-code"
+                and "candidate.screencast.stop" in argv[4]
+                else 0
+            ),
             stdout=stdout,
         )
 
@@ -4563,7 +5152,14 @@ async def test_failed_video_stop_closes_runtime_before_private_fill(
         )
 
     assert caught.value.code == "browser_failed"
-    assert commands == ["video-stop", "video-stop", "close"]
+    assert commands == [
+        "run-code",
+        "run-code",
+        "run-code",
+        "tab-close",
+        "run-code",
+        "detach",
+    ]
     assert "fill" not in commands
     assert "click" not in commands
     assert runtime._closed is True

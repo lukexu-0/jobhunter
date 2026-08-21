@@ -10,6 +10,7 @@ import math
 import os
 import platform
 import shutil
+import secrets
 import re
 import stat
 import sys
@@ -36,6 +37,12 @@ from .models import (
     validate_job_url,
     validate_loopback_http_url,
     validate_https_origin,
+)
+
+from .artifacts import (
+    cleanup_orphaned_session_artifacts,
+    cleanup_session_artifacts,
+    create_session_artifact_directory,
 )
 logger = logging.getLogger(__name__)
 
@@ -83,6 +90,12 @@ _ELEMENT_REF_PATTERN = re.compile(
 _CHROME_SINGLETON_SOCKET_LIMIT = 108
 _CHROME_SINGLETON_SOCKET_SUFFIX = Path(
     "com.google.Chrome.XXXXXX/SingletonSocket"
+)
+_OWNED_PAGES_KEY = "jobhunter.playwrightCli.ownedPages"
+_NATIVE_HOST_SESSION_ID = UUID("00000000-0000-0000-0000-000000000001")
+_DEVTOOLS_ACTIVE_PORT_NAME = "DevToolsActivePort"
+_DEVTOOLS_BROWSER_PATH_PATTERN = re.compile(
+    r"^/devtools/browser/[A-Za-z0-9_-]{1,128}$"
 )
 
 def _is_unicode_scalar_text(value: str) -> bool:
@@ -306,6 +319,11 @@ class ResolvedBrowserLaunch:
     def is_cdp(self) -> bool:
         return self.cdp_url is not None
 
+class BrowserRuntimeHost(Protocol):
+    async def acquire(self, owner_id: UUID) -> ResolvedBrowserLaunch: ...
+
+    async def release(self, owner_id: UUID) -> None: ...
+
 
 class _ReadableStream(Protocol):
     async def read(self, size: int = -1) -> bytes: ...
@@ -372,6 +390,7 @@ class _PageMetadata:
     title: str
     current_index: int
     tabs: tuple[tuple[str, str], ...]
+    global_indices: tuple[int, ...] = ()
 
 
 def _is_wsl() -> bool:
@@ -557,22 +576,11 @@ def browser_launch_for_slot(
     launch: ResolvedBrowserLaunch,
     slot: int,
 ) -> ResolvedBrowserLaunch:
-    """Return the validated browser launch owned by one application slot."""
+    """Return the shared browser launch used by one fixed-capacity slot."""
 
     if type(slot) is not int or slot not in {1, 2, 3}:
         raise BrowserConfigurationError("The browser slot is invalid")
-    if launch.is_cdp:
-        return launch
-    if launch.executable_path is None or launch.user_data_dir is None:
-        raise BrowserConfigurationError("The native browser launch is invalid")
-    profile = launch.user_data_dir
-    if slot > 1:
-        profile = profile.with_name(f"{profile.name}-slot-{slot}")
-    return ResolvedBrowserLaunch(
-        cdp_url=None,
-        executable_path=launch.executable_path,
-        user_data_dir=_resolve_dedicated_profile(profile),
-    )
+    return launch
 
 
 def _resolve_node_executable(configured: Path | None) -> Path:
@@ -716,6 +724,23 @@ def _prepare_private_directory(path: Path) -> Path:
         raise BrowserConfigurationError(
             "The Playwright CLI session directory is unavailable"
         ) from None
+
+
+def _create_private_empty_file(path: Path) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+    except OSError:
+        raise BrowserConfigurationError(
+            "The Playwright CLI session directory is unavailable"
+        ) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _create_private_temporary_directory(session_id: UUID) -> Path:
@@ -870,6 +895,12 @@ async def _run_recovery_close(
     session_directory: Path,
     home_directory: Path,
     process_factory: ProcessFactory,
+    attached: bool = False,
+    cleanup_attached: bool = True,
+    pending_page_url: str | None = None,
+    cleanup_only: bool = False,
+    cleanup_pending: bool = False,
+    cleanup_current: bool = False,
 ) -> tuple[str, int | None]:
     environment = {
         "HOME": str(home_directory),
@@ -881,12 +912,84 @@ async def _run_recovery_close(
         value = os.environ.get(name)
         if value:
             environment[name] = value
+    if (
+        attached
+        and cleanup_attached
+        and not cleanup_only
+        and not cleanup_pending
+        and not cleanup_current
+    ):
+        if pending_page_url is not None:
+            await _run_recovery_close(
+                node_executable=node_executable,
+                cli_script=cli_script,
+                session_name=session_name,
+                session_directory=session_directory,
+                home_directory=home_directory,
+                process_factory=process_factory,
+                pending_page_url=pending_page_url,
+                cleanup_pending=True,
+            )
+        _status, keeper_current = await _run_recovery_close(
+            node_executable=node_executable,
+            cli_script=cli_script,
+            session_name=session_name,
+            session_directory=session_directory,
+            home_directory=home_directory,
+            process_factory=process_factory,
+            cleanup_only=True,
+        )
+        if keeper_current is not None:
+            await _run_recovery_close(
+                node_executable=node_executable,
+                cli_script=cli_script,
+                session_name=session_name,
+                session_directory=session_directory,
+                home_directory=home_directory,
+                process_factory=process_factory,
+                cleanup_current=True,
+            )
+    if cleanup_pending:
+        command = "run-code"
+        command_args = [
+            "async (page) => {"
+            "const context=page.context();"
+            f"const expected={json.dumps(pending_page_url)};"
+            f"const state=context[Symbol.for({json.dumps(_OWNED_PAGES_KEY)})];"
+            "if(state){while(state.pendingTasks.size)"
+            "await Promise.allSettled([...state.pendingTasks]);"
+            "if(state.pendingErrors.length)"
+            "throw new Error('pending owned page adoption failed');}"
+            "const matches=context.pages().filter(candidate=>"
+            "candidate.url()===expected);"
+            "if(matches.length>1)"
+            "throw new Error('pending owned page identity is ambiguous');"
+            "if(matches.length===1){"
+            "if(state&&state.pages.has(matches[0]))"
+            "state.closingPages.add(matches[0]);"
+            "await matches[0].close();}"
+            "if(state){while(state.pendingTasks.size)"
+            "await Promise.allSettled([...state.pendingTasks]);}"
+            "if(context.pages().some(candidate=>candidate.url()===expected))"
+            "throw new Error('pending owned page remains open');"
+            "return {closed:matches.length===1};}"
+        ]
+    elif cleanup_only:
+        command = "run-code"
+        command_args = [PlaywrightCliRuntime._close_owned_pages_script()]
+    elif cleanup_current:
+        command = "tab-close"
+        command_args = []
+    else:
+        command = "detach" if attached else "close"
+        command_args = []
     try:
         created = process_factory(
             str(node_executable),
             str(cli_script),
             f"--session={session_name}",
-            "close",
+            command,
+            *command_args,
             "--json",
             cwd=str(session_directory),
             env=environment,
@@ -953,13 +1056,38 @@ async def _run_recovery_close(
         )
     try:
         payload = json.loads(bytes(stdout.data).decode("utf-8"))
-        if (
-            not isinstance(payload, dict)
-            or payload.get("session") != session_name
-            or payload.get("status") not in {"closed", "not-open"}
-        ):
+        if not isinstance(payload, dict):
             raise TypeError
-        status = cast(str, payload["status"])
+        if cleanup_only:
+            if payload.get("isError") is True:
+                raise TypeError
+            raw_result: object = payload.get("result")
+            for _ in range(2):
+                if not isinstance(raw_result, str):
+                    break
+                raw_result = json.loads(raw_result)
+            if not isinstance(raw_result, dict):
+                raise TypeError
+            keeper_current = raw_result.get("keeperCurrent")
+            if not isinstance(keeper_current, bool):
+                raise TypeError
+            return "cleaned", 0 if keeper_current else None
+        if cleanup_pending or cleanup_current:
+            if payload.get("isError") is True:
+                raise TypeError
+            status = "cleaned"
+        else:
+            expected_statuses = (
+                {"detached", "not-attached"}
+                if attached
+                else {"closed", "not-open"}
+            )
+            if (
+                payload.get("session") != session_name
+                or payload.get("status") not in expected_statuses
+            ):
+                raise TypeError
+            status = cast(str, payload["status"])
     except (json.JSONDecodeError, KeyError, TypeError, UnicodeError):
         raise BrowserConfigurationError(
             "A stale Playwright CLI session could not be reclaimed"
@@ -1395,9 +1523,8 @@ def _parse_native_browser_ownership(
         or not isinstance(raw_pid, int)
         or isinstance(raw_pid, bool)
         or raw_pid <= 1
-        or not isinstance(raw_create_time, (int, float))
+        or not isinstance(raw_create_time, (float, int))
         or isinstance(raw_create_time, bool)
-        or not math.isfinite(raw_create_time)
         or raw_create_time <= 0
     ):
         raise BrowserConfigurationError(
@@ -1426,6 +1553,10 @@ async def recover_stale_playwright_cli_sessions(
     node_executable: Path | None = None,
     cli_script: Path | None = None,
     process_factory: ProcessFactory | None = None,
+    session_name_prefix: Literal[
+        "jobhunter-",
+        "jobhunter-native-host-",
+    ] = "jobhunter-",
 ) -> None:
     """Reclaim durable CLI ownership markers left by an interrupted harness."""
 
@@ -1474,7 +1605,7 @@ async def recover_stale_playwright_cli_sessions(
             ):
                 raise OSError
             payload = json.loads(ownership_path.read_text(encoding="utf-8"))
-            expected_name = f"jobhunter-{session_id.hex}"
+            expected_name = f"{session_name_prefix}{session_id.hex}"
             if (
                 not isinstance(payload, dict)
                 or payload.get("session_name") != expected_name
@@ -1488,6 +1619,19 @@ async def recover_stale_playwright_cli_sessions(
             ):
                 raise OSError
             daemon_pid = cast(int | None, raw_pid)
+            raw_attached = payload.get("attached", False)
+            if not isinstance(raw_attached, bool):
+                raise OSError
+            attached = raw_attached
+            raw_pending_page_url = payload.get("pending_page_url")
+            if raw_pending_page_url is not None and (
+                not isinstance(raw_pending_page_url, str)
+                or not raw_pending_page_url.startswith("about:blank#jobhunter-")
+                or len(raw_pending_page_url) > 256
+                or not _is_unicode_scalar_text(raw_pending_page_url)
+            ):
+                raise OSError
+            pending_page_url = cast(str | None, raw_pending_page_url)
             native_ownership = _parse_native_browser_ownership(payload)
             raw_temporary_directory = payload.get("temporary_directory")
             if not isinstance(raw_temporary_directory, str):
@@ -1522,6 +1666,7 @@ async def recover_stale_playwright_cli_sessions(
                 "A stale Playwright CLI ownership record is invalid"
             ) from None
 
+        initial_daemons = _matching_cli_daemon_pids(expected_name, daemon_pid)
         _status, _exit_code = await _run_recovery_close(
             node_executable=resolved_node,
             cli_script=resolved_cli,
@@ -1529,6 +1674,9 @@ async def recover_stale_playwright_cli_sessions(
             session_directory=session_directory,
             home_directory=home_directory,
             process_factory=factory,
+            attached=attached,
+            cleanup_attached=bool(initial_daemons),
+            pending_page_url=pending_page_url,
         )
         for pid in _matching_cli_daemon_pids(expected_name, daemon_pid):
             await _terminate_owned_daemon(pid, expected_name)
@@ -1564,10 +1712,16 @@ class PlaywrightCliRuntime:
         node_executable: Path | None = None,
         cli_script: Path | None = None,
         process_factory: ProcessFactory | None = None,
+        browser_host: BrowserRuntimeHost | None = None,
+        native_host_mode: bool = False,
+        operation_lock: asyncio.Lock | None = None,
+        session_name_prefix: Literal[
+            "jobhunter-",
+            "jobhunter-native-host-",
+        ] = "jobhunter-",
     ) -> None:
         if not isinstance(session_id, UUID):
             raise BrowserConfigurationError("The Playwright CLI session is invalid")
-
         try:
             root = session_directory.expanduser().resolve(strict=True)
         except OSError:
@@ -1586,8 +1740,18 @@ class PlaywrightCliRuntime:
             ) from None
 
         self._session_id = session_id
-        self._session_name = f"jobhunter-{session_id.hex}"
+        self._session_name = f"{session_name_prefix}{session_id.hex}"
+        self._ownership_token = secrets.token_urlsafe(32)
+        self._root_url = f"about:blank#jobhunter-{self._ownership_token}-root"
+        self._pending_page_url: str | None = None
+        self._owned_tab_number = 0
+        self._configured_launch = launch
         self._launch = launch
+        self._browser_host = browser_host
+        self._host_acquired = False
+        self._native_host_mode = native_host_mode
+        self._attached = browser_host is not None or launch.cdp_url is not None
+        self._owned_page_scope_installed = False
         self._session_directory = root
         self._scope_directory = _prepare_private_directory(root / "playwright-cli")
         self._output_directory = _prepare_private_directory(
@@ -1603,7 +1767,7 @@ class PlaywrightCliRuntime:
         self._node_executable = _resolve_node_executable(node_executable)
         self._cli_script = _resolve_cli_script(cli_script)
         self._process_factory = process_factory or _default_process_factory
-        self._operation_lock = asyncio.Lock()
+        self._operation_lock = operation_lock or asyncio.Lock()
         self._opened = False
         self._open_attempted = False
         self._daemon_process_id: int | None = None
@@ -1611,6 +1775,10 @@ class PlaywrightCliRuntime:
         self._native_browser_create_time: float | None = None
         self._native_browser_executable: Path | None = None
         self._started = False
+        self._modal_cleanup_upload_path = (
+            self._internal_directory / "modal-cleanup-upload.bin"
+        )
+        _create_private_empty_file(self._modal_cleanup_upload_path)
         self._closed = False
         self._video_started = False
         self._artifact_monitor_task: asyncio.Task[None] | None = None
@@ -1635,6 +1803,7 @@ class PlaywrightCliRuntime:
         except BrowserConfigurationError:
             shutil.rmtree(self._temporary_directory, ignore_errors=True)
             raise
+        self._fail_stop_path = self._internal_directory / "fail-stop.json"
         self._environment = self._build_environment()
         self._private_values = self._build_private_values()
         self._applicant_values: tuple[str, ...] = ()
@@ -1689,7 +1858,11 @@ class PlaywrightCliRuntime:
         self._screenshots_suppressed = True
         if self._video_started:
             try:
-                stopped = await self._invoke("video-stop")
+                stopped = await self._invoke(
+                    "run-code",
+                    [self._stop_owned_video_script()],
+                    capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+                )
                 self._require_success(stopped)
             except PlaywrightCliRuntimeError:
                 try:
@@ -1847,13 +2020,16 @@ class PlaywrightCliRuntime:
                 raise BrowserConfigurationError(
                     "Local Chrome configuration is incomplete"
                 )
+            launch_args = list(_FOCUS_SUPPRESSION_ARGS)
+            if self._native_host_mode:
+                launch_args.append("--remote-debugging-port=0")
             browser.update(
                 {
                     "userDataDir": str(self._launch.user_data_dir),
                     "launchOptions": {
                         "headless": False,
                         "executablePath": str(self._launch.executable_path),
-                        "args": list(_FOCUS_SUPPRESSION_ARGS),
+                        "args": launch_args,
                         "chromiumSandbox": True,
                     },
                 }
@@ -1908,14 +2084,18 @@ class PlaywrightCliRuntime:
             str(self._cli_script),
             str(self._config_path),
             self._session_name,
+            self._root_url,
+            self._ownership_token,
+            str(self._modal_cleanup_upload_path),
             self._playwright_browsers_path,
         ]
-        if self._launch.cdp_url:
-            values.append(self._launch.cdp_url)
-        if self._launch.executable_path:
-            values.append(str(self._launch.executable_path))
-        if self._launch.user_data_dir:
-            values.append(str(self._launch.user_data_dir))
+        for launch in (self._configured_launch, self._launch):
+            if launch.cdp_url:
+                values.append(launch.cdp_url)
+            if launch.executable_path:
+                values.append(str(launch.executable_path))
+            if launch.user_data_dir:
+                values.append(str(launch.user_data_dir))
         return tuple(sorted(set(values), key=len, reverse=True))
 
 
@@ -2142,26 +2322,55 @@ class PlaywrightCliRuntime:
             except (TypeError, ValueError):
                 raise PlaywrightCliRuntimeError("browser_failed") from None
 
-            open_args = ["about:blank", f"--config={self._config_path}"]
-            if self._launch.cdp_url is None:
-                assert self._launch.user_data_dir is not None
-                open_args.append(f"--profile={self._launch.user_data_dir}")
             try:
+                if self._browser_host is not None:
+                    self._launch = await self._browser_host.acquire(self._session_id)
+                    self._host_acquired = True
+                    self._write_config()
+                    self._private_values = self._build_private_values()
+                    self._refresh_private_redaction_values()
+
                 self._open_attempted = True
+                self._attached = self._launch.cdp_url is not None
                 self._write_ownership()
-                opened = await self._invoke("open", open_args)
+                if self._attached:
+                    assert self._launch.cdp_url is not None
+                    opened = await self._invoke(
+                        "attach",
+                        [
+                            f"--cdp={self._launch.cdp_url}",
+                            f"--config={self._config_path}",
+                        ],
+                    )
+                else:
+                    assert self._launch.user_data_dir is not None
+                    opened = await self._invoke(
+                        "open",
+                        [
+                            "about:blank",
+                            f"--config={self._config_path}",
+                            f"--profile={self._launch.user_data_dir}",
+                        ],
+                    )
                 self._require_success(opened)
                 self._opened = True
                 self._daemon_process_id = self._daemon_pid(opened)
                 self._write_ownership()
                 await self._record_native_browser_ownership()
+
+                self._pending_page_url = self._root_url
+                self._write_ownership()
+                if self._attached:
+                    root = await self._invoke("tab-new", [self._root_url])
+                    self._require_success(root)
+                else:
+                    bound_root = await self._invoke("goto", [self._root_url])
+                    self._require_success(bound_root)
+                await self._install_owned_page_scope(self._root_url)
+                self._pending_page_url = None
+                self._write_ownership()
                 await self._install_navigation_guard((origin,))
-                video = await self._invoke(
-                    "video-start",
-                    [str(self._video_path)],
-                )
-                self._require_success(video)
-                self._video_started = True
+                await self._start_owned_video()
                 self._artifact_monitor_task = asyncio.create_task(
                     self._monitor_artifact_budget(),
                     name=f"playwright-video-budget-{self._session_id}",
@@ -2179,6 +2388,458 @@ class PlaywrightCliRuntime:
                 except BaseException:
                     pass
                 raise
+
+    async def start_native_host(self) -> ResolvedBrowserLaunch:
+        async with self._operation_lock:
+            if (
+                not self._native_host_mode
+                or self._launch.cdp_url is not None
+                or self._started
+                or self._opened
+                or self._closed
+            ):
+                raise PlaywrightCliRuntimeError("browser_failed")
+            assert self._launch.user_data_dir is not None
+            self._clear_devtools_active_port()
+            try:
+                self._open_attempted = True
+                self._write_ownership()
+                opened = await self._invoke(
+                    "open",
+                    [
+                        "about:blank",
+                        f"--config={self._config_path}",
+                        f"--profile={self._launch.user_data_dir}",
+                    ],
+                )
+                self._require_success(opened)
+                self._opened = True
+                self._daemon_process_id = self._daemon_pid(opened)
+                self._write_ownership()
+                await self._record_native_browser_ownership()
+                endpoint = await self._read_devtools_active_endpoint()
+                self._started = True
+                return ResolvedBrowserLaunch(
+                    cdp_url=endpoint,
+                    executable_path=None,
+                    user_data_dir=None,
+                )
+            except BaseException:
+                try:
+                    await self._cleanup_unlocked()
+                except BaseException:
+                    pass
+                raise
+
+    def _devtools_active_port_path(self) -> Path:
+        if self._launch.user_data_dir is None:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        return self._launch.user_data_dir / _DEVTOOLS_ACTIVE_PORT_NAME
+
+    def _clear_devtools_active_port(self) -> None:
+        path = self._devtools_active_port_path()
+        try:
+            status = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+            raise PlaywrightCliRuntimeError("browser_failed")
+        try:
+            path.unlink()
+        except OSError:
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+
+    async def _read_devtools_active_endpoint(self) -> str:
+        path = self._devtools_active_port_path()
+        while True:
+            try:
+                status = path.lstat()
+                if (
+                    stat.S_ISLNK(status.st_mode)
+                    or not stat.S_ISREG(status.st_mode)
+                    or status.st_size > 512
+                ):
+                    raise PlaywrightCliRuntimeError("browser_failed")
+                lines = path.read_text(encoding="ascii").splitlines()
+            except FileNotFoundError:
+                await asyncio.sleep(0.05)
+                continue
+            except (OSError, UnicodeError):
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+            if (
+                len(lines) != 2
+                or not lines[0].isascii()
+                or not lines[0].isdigit()
+                or _DEVTOOLS_BROWSER_PATH_PATTERN.fullmatch(lines[1]) is None
+            ):
+                raise PlaywrightCliRuntimeError("browser_failed")
+            port = int(lines[0], 10)
+            if not 1 <= port <= 65_535:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            return f"http://127.0.0.1:{port}"
+
+    async def _install_owned_page_scope(self, expected_url: str) -> None:
+        result = await self._invoke(
+            "run-code",
+            [
+                self._owned_page_scope_script(
+                    expected_url,
+                    self._fail_stop_path,
+                )
+            ],
+            capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+        )
+        self._require_success(result)
+        self._owned_page_scope_installed = True
+
+    @staticmethod
+    def _owned_page_scope_script(
+        expected_url: str,
+        fail_stop_path: Path | None = None,
+    ) -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        expected = json.dumps(expected_url)
+        marker = json.dumps(str(fail_stop_path)) if fail_stop_path else "null"
+        return (
+            "async (page) => {"
+            f"if(page.url()!=={expected})"
+            "throw new Error('owned root identity is unavailable');"
+            "const context=page.context();"
+            f"const key=Symbol.for({key});"
+            "if(context[key])throw new Error('owned page scope already exists');"
+            "const state={root:page,pages:new Set(),listener:null,"
+            "recording:null,startVideo:null,closingPages:new WeakSet(),"
+            "pendingKeeper:null,pendingTasks:new Set(),pendingErrors:[],"
+            "closingMode:false,failStop:null,addOwned:null,isOwned:null};"
+            "state.failStop=target=>{"
+            "if(state.closingPages.has(target)){state.closingPages.delete(target);return;}"
+            "const remaining=context.pages().filter(candidate=>"
+            "candidate!==target&&state.pages.has(candidate)).length;"
+            f"const marker={marker};"
+            "if(marker)require('node:fs').writeFileSync(marker,"
+            "JSON.stringify({remaining}),{encoding:'utf8',mode:0o600});"
+            "process.exit(70);};"
+            "state.startVideo=async target=>{"
+            "const recording=state.recording;if(!recording)return;"
+            "const index=recording.next++;"
+            "const path=index===0?recording.path:"
+            "recording.path.replace(/\\.webm$/,`-${index}.webm`);"
+            "await target.screencast.start({path});};"
+            "state.addOwned=async target=>{"
+            "if(state.pages.has(target))return;"
+            "state.pages.add(target);"
+            "target.on('close',()=>state.failStop(target));"
+            "if(!state.closingMode)await state.startVideo(target);};"
+            "state.isOwned=async candidate=>{"
+            "if(state.pages.has(candidate))return true;"
+            "const chain=[];let cursor=candidate;"
+            "while(cursor&&!state.pages.has(cursor)){chain.push(cursor);"
+            "cursor=await cursor.opener().catch(()=>null);}"
+            "if(!cursor)return false;"
+            "for(const target of chain.reverse())await state.addOwned(target);"
+            "return true;};"
+            "await state.addOwned(page);"
+            "state.listener=candidate=>{"
+            "const task=(async()=>{"
+            "if(!(await state.isOwned(candidate))||!state.closingMode)return;"
+            "if(!context.pages().includes(candidate))return;"
+            "state.closingPages.add(candidate);await candidate.close();})();"
+            "state.pendingTasks.add(task);"
+            "void task.catch(error=>state.pendingErrors.push(error))"
+            ".finally(()=>state.pendingTasks.delete(task));};"
+            "context.on('page',state.listener);context[key]=state;"
+            "return {owned:true};}"
+        )
+    @staticmethod
+    def _adopt_current_page_script(expected_url: str) -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        expected = json.dumps(expected_url)
+        return (
+            "async (page) => {"
+            f"if(page.url()!=={expected})"
+            "throw new Error('owned tab identity is unavailable');"
+            f"const state=page.context()[Symbol.for({key})];"
+            "if(!state)throw new Error('owned page scope is unavailable');"
+            "await state.addOwned(page);"
+            "return {owned:true};}"
+        )
+
+    def _next_owned_tab_url(self) -> str:
+        self._owned_tab_number += 1
+        return (
+            "about:blank#jobhunter-"
+            f"{self._ownership_token}-tab-{self._owned_tab_number}"
+        )
+
+    async def _start_owned_video(self) -> None:
+        result = await self._invoke(
+            "run-code",
+            [self._start_owned_video_script(self._video_path)],
+            capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+        )
+        self._require_success(result)
+        self._video_started = True
+
+    @staticmethod
+    def _start_owned_video_script(video_path: Path) -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        path = json.dumps(str(video_path))
+        return (
+            "async (page) => {"
+            f"const state=page.context()[Symbol.for({key})];"
+            "if(!state||!state.pages.has(page)||state.recording)"
+            "throw new Error('owned video scope is unavailable');"
+            f"state.recording={{path:{path},next:0}};"
+            "await state.startVideo(page);return {recording:true};}"
+        )
+
+    @staticmethod
+    def _stop_owned_video_script() -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        return (
+            "async (page) => {"
+            "const context=page.context();"
+            f"const state=context[Symbol.for({key})];"
+            "if(!state)return {recording:false};"
+            "state.recording=null;"
+            "const owned=context.pages().filter(candidate=>state.pages.has(candidate));"
+            "const results=await Promise.allSettled(owned.map(candidate=>"
+            "candidate.screencast.stop()));"
+            "if(results.some(result=>result.status==='rejected'))"
+            "throw new Error('owned video stop failed');"
+            "return {recording:false};}"
+        )
+
+    @staticmethod
+    def _close_owned_pages_script() -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        return (
+            "async (page) => {"
+            "const context=page.context();"
+            f"const key=Symbol.for({key});const state=context[key];"
+            "if(!state)return {closed:0,keeperCurrent:false};"
+            "state.recording=null;state.closingMode=true;"
+            "const drain=async()=>{"
+            "while(state.pendingTasks.size)"
+            "await Promise.allSettled([...state.pendingTasks]);"
+            "if(state.pendingErrors.length){state.pendingErrors.length=0;"
+            "throw new Error('owned popup adoption failed');}};"
+            "await drain();"
+            "let owned=context.pages().filter(candidate=>state.pages.has(candidate));"
+            "if(!owned.length){if(state.listener)context.off('page',state.listener);"
+            "delete context[key];return {closed:0,keeperCurrent:false};}"
+            "if(!state.pages.has(page))"
+            "throw new Error('owned current page is unavailable');"
+            "let closed=0;"
+            "while(true){"
+            "await drain();"
+            "const closing=context.pages().filter(candidate=>"
+            "state.pages.has(candidate)&&candidate!==page);"
+            "if(!closing.length)break;"
+            "for(const target of closing)state.closingPages.add(target);"
+            "const results=await Promise.allSettled("
+            "closing.map(candidate=>candidate.close()));"
+            "results.forEach((result,index)=>{if(result.status==='rejected')"
+            "state.closingPages.delete(closing[index]);});"
+            "const survivors=context.pages().filter(candidate=>closing.includes(candidate));"
+            "if(results.some(result=>result.status==='rejected')||survivors.length)"
+            "throw new Error('owned page close failed');"
+            "closed+=closing.length;}"
+            "await drain();"
+            "state.pendingKeeper=page;state.closingPages.add(page);"
+            "return {closed,keeperCurrent:true};}"
+        )
+
+    @staticmethod
+    def _finalize_owned_pages_script() -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        return (
+            "async (page) => {"
+            "const context=page.context();"
+            f"const key=Symbol.for({key});const state=context[key];"
+            "if(!state)return {closed:true};"
+            "state.closingMode=true;"
+            "while(state.pendingTasks.size)"
+            "await Promise.allSettled([...state.pendingTasks]);"
+            "if(state.pendingErrors.length)"
+            "throw new Error('owned popup adoption failed');"
+            "const live=context.pages().filter(candidate=>state.pages.has(candidate));"
+            "if(live.length)throw new Error('owned page remains open');"
+            "if(state.listener)context.off('page',state.listener);"
+            "delete context[key];return {closed:true};}"
+        )
+
+    @staticmethod
+    def _reset_owned_keeper_close_script() -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        return (
+            "async (page) => {"
+            f"const state=page.context()[Symbol.for({key})];"
+            "if(state&&state.pendingKeeper){"
+            "state.closingPages.delete(state.pendingKeeper);"
+            "state.pendingKeeper=null;}"
+            "return {reset:true};}"
+        )
+
+    async def _close_pending_page(self, *, timeout: float) -> None:
+        pending_url = self._pending_page_url
+        if pending_url is None:
+            return
+        script = (
+            "async (page) => {"
+            "const context=page.context();"
+            f"const expected={json.dumps(pending_url)};"
+            f"const state=context[Symbol.for({json.dumps(_OWNED_PAGES_KEY)})];"
+            "if(state){while(state.pendingTasks.size)"
+            "await Promise.allSettled([...state.pendingTasks]);"
+            "if(state.pendingErrors.length)"
+            "throw new Error('pending owned page adoption failed');}"
+            "const matches=context.pages().filter(candidate=>"
+            "candidate.url()===expected);"
+            "if(matches.length>1)"
+            "throw new Error('pending owned page identity is ambiguous');"
+            "if(matches.length===1){"
+            "if(state&&state.pages.has(matches[0]))"
+            "state.closingPages.add(matches[0]);"
+            "await matches[0].close();}"
+            "if(state){while(state.pendingTasks.size)"
+            "await Promise.allSettled([...state.pendingTasks]);}"
+            "if(context.pages().some(candidate=>candidate.url()===expected))"
+            "throw new Error('pending owned page remains open');"
+            "return {closed:matches.length===1};}"
+        )
+        checked = await self._invoke(
+            "run-code",
+            [script],
+            timeout=timeout,
+            capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+        )
+        self._require_success(checked)
+        self._pending_page_url = None
+        self._write_ownership()
+    async def _close_owned_page_group(self, *, timeout: float) -> None:
+        async def run_cleanup_script() -> _InvocationResult:
+            return await self._invoke(
+                "run-code",
+                [self._close_owned_pages_script()],
+                timeout=timeout,
+                capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+            )
+
+        closed_pages = await run_cleanup_script()
+        modal_fallback = self._blocked_by_modal_state(closed_pages)
+        if modal_fallback:
+            modal_cleared = False
+            for command, args in (
+                ("upload", [str(self._modal_cleanup_upload_path)]),
+                ("dialog-dismiss", []),
+            ):
+                try:
+                    cleared = await self._invoke(
+                        command,
+                        args,
+                        timeout=timeout,
+                    )
+                    self._require_success(cleared)
+                except PlaywrightCliRuntimeError:
+                    continue
+                modal_cleared = True
+                break
+            if modal_cleared:
+                closed_pages = await run_cleanup_script()
+        self._require_success(closed_pages)
+        payload = self._decode_run_code_result(closed_pages)
+        keeper_current = payload.get("keeperCurrent")
+        if keeper_current is None:
+            keeper_current = (
+                isinstance(payload.get("currentIndex"), int)
+                and not isinstance(payload.get("currentIndex"), bool)
+            )
+        if not isinstance(keeper_current, bool):
+            raise PlaywrightCliRuntimeError("browser_failed")
+        if not keeper_current:
+            self._owned_page_scope_installed = False
+            return
+        try:
+            closed_keeper = await self._invoke(
+                "tab-close",
+                timeout=timeout,
+            )
+            self._require_success(closed_keeper)
+        except PlaywrightCliRuntimeError:
+            reset = await self._invoke(
+                "run-code",
+                [self._reset_owned_keeper_close_script()],
+                timeout=timeout,
+                capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+            )
+            self._require_success(reset)
+            raise
+        finalized = await self._invoke(
+            "run-code",
+            [self._finalize_owned_pages_script()],
+            timeout=timeout,
+            capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+        )
+        self._require_success(finalized)
+        self._owned_page_scope_installed = False
+    def _fail_stop_marker_present(self) -> bool:
+        path = self._fail_stop_path
+        try:
+            status = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+        if (
+            stat.S_ISLNK(status.st_mode)
+            or not stat.S_ISREG(status.st_mode)
+            or status.st_size > 128
+        ):
+            raise PlaywrightCliRuntimeError("browser_failed")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"remaining"}
+                or not isinstance(payload["remaining"], int)
+                or isinstance(payload["remaining"], bool)
+                or payload["remaining"] < 0
+            ):
+                raise ValueError
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+        if payload["remaining"] != 0:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        return True
+
+    async def _reconcile_fail_stop_marker(self) -> bool:
+        if not self._fail_stop_marker_present():
+            return False
+        try:
+            for pid in _matching_cli_daemon_pids(
+                self._session_name,
+                self._daemon_process_id,
+            ):
+                await _terminate_owned_daemon(pid, self._session_name)
+            if _matching_cli_daemon_pids(
+                self._session_name,
+                self._daemon_process_id,
+            ):
+                raise BrowserConfigurationError(
+                    "The Playwright CLI daemon could not be reclaimed"
+                )
+        except BrowserConfigurationError:
+            raise PlaywrightCliRuntimeError("browser_failed") from None
+        self._owned_page_scope_installed = False
+        self._video_started = False
+        self._started = False
+        self._guard_armed = False
+        self._current_metadata = None
+        return True
+
 
     async def _record_native_browser_ownership(self) -> None:
         if self._launch.cdp_url is not None:
@@ -2213,8 +2874,13 @@ class PlaywrightCliRuntime:
         username: str,
         password: str,
     ) -> str:
+        owned_key = json.dumps(_OWNED_PAGES_KEY)
         return (
             "async (page) => {"
+            "const context=page.context();"
+            f"const ownership=context[Symbol.for({owned_key})];"
+            "if(!ownership||!ownership.pages.has(page))"
+            "throw new Error('owned page scope is unavailable');"
             f"const expectedOrigin={json.dumps(expected_origin)};"
             f"const username={json.dumps(username)};"
             f"const password={json.dumps(password)};"
@@ -2226,7 +2892,7 @@ class PlaywrightCliRuntime:
             f"const submitElement=await page.locator('aria-ref={submit_ref}').elementHandle();"
             "if(!usernameElement||!passwordElement||!submitElement)"
             "throw new Error('Sign-in elements unavailable');"
-            "const cdp=await page.context().newCDPSession(page);"
+            "const cdp=await context.newCDPSession(page);"
             "const frameTree=(await cdp.send('Page.getFrameTree')).frameTree;"
             "await cdp.detach();"
             "const frames=[];"
@@ -2390,12 +3056,13 @@ class PlaywrightCliRuntime:
                 raise _ActionRuntimeFailure(error) from None
         if not self._url_is_allowed(pre_metadata.url, self._approved_origins):
             raise PlaywrightCliRuntimeError("browser_failed")
-        self._validate_tab_command(command, normalized, pre_metadata)
+        normalized = self._translate_tab_command(
+            command,
+            normalized,
+            pre_metadata,
+        )
         try:
-            execution = await self._invoke(
-                command,
-                normalized,
-            )
+            execution = await self._invoke_scoped_action(command, normalized)
         except PlaywrightCliRuntimeError as error:
             raise _ActionRuntimeFailure(error) from None
         if execution.timed_out:
@@ -2440,12 +3107,18 @@ class PlaywrightCliRuntime:
             stdout_text_truncated = False
             stderr_text_truncated = False
         else:
-            stdout, stdout_text_truncated = self._public_output(
-                execution.stdout
+            scoped_stdout = self._scope_cli_output(
+                execution.stdout,
+                command=command,
+                metadata=post_metadata,
             )
-            stderr, stderr_text_truncated = self._public_output(
-                execution.stderr
+            scoped_stderr = self._scope_cli_output(
+                execution.stderr,
+                command=None,
+                metadata=post_metadata,
             )
+            stdout, stdout_text_truncated = self._public_output(scoped_stdout)
+            stderr, stderr_text_truncated = self._public_output(scoped_stderr)
             if command == "tab-list" and not expose_applicant_values:
                 stdout = "[redacted]"
                 stdout_text_truncated = False
@@ -2586,52 +3259,9 @@ class PlaywrightCliRuntime:
                 "return lines.join('\\n');"
                 "}"
             )
-            script = (
-                "async (page) => {"
-                f"const expectedOrigin={json.dumps(canonical_origin)};"
-                f"{_EXACT_ORIGIN_MATCHER_SCRIPT}"
-                "const cdp=await page.context().newCDPSession(page);"
-                "try{"
-                "const beforeTree=(await cdp.send('Page.getFrameTree')).frameTree;"
-                "if(!beforeTree||!beforeTree.frame"
-                "||typeof beforeTree.frame.id!=='string'"
-                "||typeof beforeTree.frame.url!=='string')"
-                "throw new Error('Source frame unavailable');"
-                "const beforeUrl=beforeTree.frame.url;"
-                "if(!hasExactOrigin(beforeUrl,expectedOrigin))"
-                "return {url:beforeUrl,source:null};"
-                "const isolated=await cdp.send('Page.createIsolatedWorld',{"
-                "frameId:beforeTree.frame.id,"
-                "worldName:'jobhunter.sourceCapture.'+Date.now()+'.'+Math.random(),"
-                "grantUniveralAccess:false});"
-                "const executionContextId=isolated&&isolated.executionContextId;"
-                "if(!Number.isSafeInteger(executionContextId)"
-                "||executionContextId<=0)"
-                "throw new Error('Source context unavailable');"
-                "const evaluated=await cdp.send('Runtime.callFunctionOn',{"
-                f"functionDeclaration:{json.dumps(traversal_function)},"
-                "executionContextId,"
-                "returnByValue:true,"
-                "awaitPromise:false,"
-                "userGesture:false});"
-                "if(!evaluated||evaluated.exceptionDetails"
-                "||!evaluated.result"
-                "||evaluated.result.type!=='string'"
-                "||typeof evaluated.result.value!=='string'"
-                "||evaluated.result.objectId!==undefined)"
-                "throw new Error('Source result unavailable');"
-                "const source=evaluated.result.value;"
-                "const afterTree=(await cdp.send('Page.getFrameTree')).frameTree;"
-                "if(!afterTree||!afterTree.frame"
-                "||afterTree.frame.id!==beforeTree.frame.id"
-                "||typeof afterTree.frame.url!=='string')"
-                "return {url:'',source:null};"
-                "const afterUrl=afterTree.frame.url;"
-                "if(!hasExactOrigin(afterUrl,expectedOrigin))"
-                "return {url:afterUrl,source:null};"
-                "return {url:afterUrl,source};"
-                "}finally{await cdp.detach();}"
-                "}"
+            script = self._source_capture_script(
+                canonical_origin,
+                traversal_function,
             )
             captured = await self._invoke(
                 "run-code",
@@ -2664,6 +3294,64 @@ class PlaywrightCliRuntime:
             if not source:
                 raise PlaywrightCliRuntimeError("browser_failed")
             return final_url, source
+
+    @staticmethod
+    def _source_capture_script(
+        canonical_origin: str,
+        traversal_function: str,
+    ) -> str:
+        owned_key = json.dumps(_OWNED_PAGES_KEY)
+        return (
+            "async (page) => {"
+            "const context=page.context();"
+            f"const ownership=context[Symbol.for({owned_key})];"
+            "if(!ownership||!ownership.pages.has(page))"
+            "throw new Error('owned page scope is unavailable');"
+            f"const expectedOrigin={json.dumps(canonical_origin)};"
+            f"{_EXACT_ORIGIN_MATCHER_SCRIPT}"
+            "const cdp=await context.newCDPSession(page);"
+            "try{"
+            "const beforeTree=(await cdp.send('Page.getFrameTree')).frameTree;"
+            "if(!beforeTree||!beforeTree.frame"
+            "||typeof beforeTree.frame.id!=='string'"
+            "||typeof beforeTree.frame.url!=='string')"
+            "throw new Error('Source frame unavailable');"
+            "const beforeUrl=beforeTree.frame.url;"
+            "if(!hasExactOrigin(beforeUrl,expectedOrigin))"
+            "return {url:beforeUrl,source:null};"
+            "const isolated=await cdp.send('Page.createIsolatedWorld',{"
+            "frameId:beforeTree.frame.id,"
+            "worldName:'jobhunter.sourceCapture.'+Date.now()+'.'+Math.random(),"
+            "grantUniveralAccess:false});"
+            "const executionContextId=isolated&&isolated.executionContextId;"
+            "if(!Number.isSafeInteger(executionContextId)"
+            "||executionContextId<=0)"
+            "throw new Error('Source context unavailable');"
+            "const evaluated=await cdp.send('Runtime.callFunctionOn',{"
+            f"functionDeclaration:{json.dumps(traversal_function)},"
+            "executionContextId,"
+            "returnByValue:true,"
+            "awaitPromise:false,"
+            "userGesture:false});"
+            "if(!evaluated||evaluated.exceptionDetails"
+            "||!evaluated.result"
+            "||evaluated.result.type!=='string'"
+            "||typeof evaluated.result.value!=='string'"
+            "||evaluated.result.objectId!==undefined)"
+            "throw new Error('Source result unavailable');"
+            "const source=evaluated.result.value;"
+            "const afterTree=(await cdp.send('Page.getFrameTree')).frameTree;"
+            "if(!afterTree||!afterTree.frame"
+            "||afterTree.frame.id!==beforeTree.frame.id"
+            "||typeof afterTree.frame.url!=='string')"
+            "return {url:'',source:null};"
+            "const afterUrl=afterTree.frame.url;"
+            "if(!hasExactOrigin(afterUrl,expectedOrigin))"
+            "return {url:afterUrl,source:null};"
+            "return {url:afterUrl,source};"
+            "}finally{await cdp.detach();}"
+            "}"
+        )
 
     async def set_approved_origins(self, origins: Iterable[str]) -> None:
         async with self._operation_lock:
@@ -2752,7 +3440,7 @@ class PlaywrightCliRuntime:
             await recovery_task
 
     def _native_browser_ownership(self) -> _NativeBrowserOwnership | None:
-        if self._launch.cdp_url is not None:
+        if self._browser_host is not None or self._launch.cdp_url is not None:
             return None
         if (
             self._launch.executable_path is None
@@ -2784,7 +3472,10 @@ class PlaywrightCliRuntime:
         payload: dict[str, object] = {
             "session_name": self._session_name,
             "temporary_directory": str(self._temporary_directory),
+            "attached": self._attached,
         }
+        if self._pending_page_url is not None:
+            payload["pending_page_url"] = self._pending_page_url
         if self._daemon_process_id is not None:
             payload["daemon_pid"] = self._daemon_process_id
         native = self._native_browser_ownership()
@@ -2810,14 +3501,24 @@ class PlaywrightCliRuntime:
             return None
         return pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 else None
 
-    async def _require_closed_session(self, result: _InvocationResult) -> None:
+    async def _require_stopped_session(
+        self,
+        result: _InvocationResult,
+        *,
+        attached: bool,
+    ) -> None:
         self._require_success(result)
+        expected_statuses = (
+            {"detached", "not-attached"}
+            if attached
+            else {"closed", "not-open"}
+        )
         try:
             payload = json.loads(result.stdout.decode("utf-8"))
             if (
                 not isinstance(payload, dict)
                 or payload.get("session") != self._session_name
-                or payload.get("status") not in {"closed", "not-open"}
+                or payload.get("status") not in expected_statuses
             ):
                 raise TypeError
         except (json.JSONDecodeError, TypeError, UnicodeError):
@@ -2835,7 +3536,8 @@ class PlaywrightCliRuntime:
                 raise BrowserConfigurationError(
                     "The Playwright CLI daemon could not be reclaimed"
                 )
-            await _reclaim_native_browser(self._native_browser_ownership())
+            if not attached:
+                await _reclaim_native_browser(self._native_browser_ownership())
         except BrowserConfigurationError:
             raise PlaywrightCliRuntimeError("browser_failed") from None
 
@@ -2874,29 +3576,51 @@ class PlaywrightCliRuntime:
         if active is not None:
             await self._terminate_process(active)
         await self._cancel_artifact_monitor_unlocked()
+        await self._reconcile_fail_stop_marker()
 
         if self._video_started:
             try:
                 stopped = await self._invoke(
-                    "video-stop",
+                    "run-code",
+                    [self._stop_owned_video_script()],
                     timeout=_BUDGET_CLEANUP_TIMEOUT_SECONDS,
+                    capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
                 )
                 self._require_success(stopped)
             except PlaywrightCliRuntimeError:
                 pass
 
-        if self._open_attempted:
-            close_confirmed = False
-            try:
-                closed = await self._invoke(
-                    "close",
-                    timeout=_BUDGET_CLEANUP_TIMEOUT_SECONDS,
+        if self._pending_page_url is not None:
+            if self._opened:
+                await self._close_pending_page(
+                    timeout=_BUDGET_CLEANUP_TIMEOUT_SECONDS
                 )
-                await self._require_closed_session(closed)
-                close_confirmed = True
+            else:
+                self._pending_page_url = None
+        if self._owned_page_scope_installed:
+            try:
+                await self._close_owned_page_group(
+                    timeout=_BUDGET_CLEANUP_TIMEOUT_SECONDS
+                )
             except PlaywrightCliRuntimeError:
                 pass
-            if not close_confirmed:
+
+        if self._open_attempted:
+            attached = self._attached
+            stop_confirmed = False
+            try:
+                stopped_session = await self._invoke(
+                    "detach" if attached else "close",
+                    timeout=_BUDGET_CLEANUP_TIMEOUT_SECONDS,
+                )
+                await self._require_stopped_session(
+                    stopped_session,
+                    attached=attached,
+                )
+                stop_confirmed = True
+            except PlaywrightCliRuntimeError:
+                pass
+            if not stop_confirmed:
                 try:
                     for pid in _matching_cli_daemon_pids(
                         self._session_name,
@@ -2910,9 +3634,10 @@ class PlaywrightCliRuntime:
                         raise BrowserConfigurationError(
                             "The Playwright CLI daemon could not be reclaimed"
                         )
-                    await _reclaim_native_browser(
-                        self._native_browser_ownership()
-                    )
+                    if not attached:
+                        await _reclaim_native_browser(
+                            self._native_browser_ownership()
+                        )
                 except BrowserConfigurationError:
                     raise PlaywrightCliRuntimeError("browser_failed") from None
 
@@ -2921,11 +3646,14 @@ class PlaywrightCliRuntime:
                 self._temporary_directory,
                 self._session_id,
             )
+            self._modal_cleanup_upload_path.unlink(missing_ok=True)
+            self._fail_stop_path.unlink(missing_ok=True)
             self._ownership_path.unlink(missing_ok=True)
         except (BrowserConfigurationError, OSError):
             raise PlaywrightCliRuntimeError("browser_failed") from None
         self._opened = False
         self._open_attempted = False
+        self._attached = False
         self._daemon_process_id = None
         self._native_browser_process_id = None
         self._native_browser_create_time = None
@@ -2934,6 +3662,11 @@ class PlaywrightCliRuntime:
         self._started = False
         self._guard_armed = False
         self._current_metadata = None
+        if self._host_acquired:
+            if self._browser_host is None:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            await self._browser_host.release(self._session_id)
+            self._host_acquired = False
         self._closed = True
 
     async def _monitor_artifact_budget(self) -> None:
@@ -2997,32 +3730,56 @@ class PlaywrightCliRuntime:
         if active is not None:
             await self._terminate_process(active)
         await self._cancel_artifact_monitor_unlocked()
+        await self._reconcile_fail_stop_marker()
 
         video_error: PlaywrightCliRuntimeError | None = None
         if self._video_started:
+            stopped: _InvocationResult | None = None
             try:
                 stopped = await self._invoke(
-                    "video-stop",
+                    "run-code",
+                    [self._stop_owned_video_script()],
                     timeout=_CLEANUP_TIMEOUT_SECONDS,
+                    capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
                 )
                 self._require_success(stopped)
                 self._video_started = False
             except PlaywrightCliRuntimeError as error:
-                video_error = error
+                if stopped is not None and self._blocked_by_modal_state(stopped):
+                    self._video_started = False
+                else:
+                    video_error = error
+
+        if self._pending_page_url is not None:
+            if self._opened:
+                await self._close_pending_page(timeout=_CLEANUP_TIMEOUT_SECONDS)
+            else:
+                self._pending_page_url = None
+        if self._owned_page_scope_installed:
+            await self._close_owned_page_group(
+                timeout=_CLEANUP_TIMEOUT_SECONDS
+            )
 
         if self._open_attempted:
-            closed = await self._invoke(
-                "close",
+            attached = self._attached
+            stopped_session = await self._invoke(
+                "detach" if attached else "close",
                 timeout=_CLEANUP_TIMEOUT_SECONDS,
             )
-            await self._require_closed_session(closed)
+            await self._require_stopped_session(
+                stopped_session,
+                attached=attached,
+            )
             self._opened = False
             self._open_attempted = False
+            self._attached = False
             self._video_started = False
             self._daemon_process_id = None
             self._native_browser_process_id = None
             self._native_browser_create_time = None
             self._native_browser_executable = None
+            if self._native_host_mode:
+                self._clear_devtools_active_port()
         if video_error is not None:
             raise video_error
 
@@ -3035,9 +3792,16 @@ class PlaywrightCliRuntime:
                 self._session_id,
             )
             _remove_stale_private_sign_in_links(self._internal_directory)
+            self._modal_cleanup_upload_path.unlink(missing_ok=True)
+            self._fail_stop_path.unlink(missing_ok=True)
             self._ownership_path.unlink(missing_ok=True)
         except (BrowserConfigurationError, OSError):
             raise PlaywrightCliRuntimeError("browser_failed") from None
+        if self._host_acquired:
+            if self._browser_host is None:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            await self._browser_host.release(self._session_id)
+            self._host_acquired = False
 
     async def _install_navigation_guard(self, origins: tuple[str, ...]) -> None:
         self._current_metadata = None
@@ -3053,12 +3817,21 @@ class PlaywrightCliRuntime:
     @staticmethod
     def _guard_script(origins: tuple[str, ...]) -> str:
         encoded = json.dumps(origins, separators=(",", ":"))
+        owned_key = json.dumps(_OWNED_PAGES_KEY)
         return (
             "async (page) => {"
             "const context=page.context();"
             "const key=Symbol.for('jobhunter.playwrightCli.navigationGuard');"
+            f"const ownership=context[Symbol.for({owned_key})];"
+            "if(!ownership||!ownership.pages.has(page))"
+            "throw new Error('owned page scope is unavailable');"
             f"const allowed={encoded};"
             f"{_EXACT_ORIGIN_MATCHER_SCRIPT}"
+            "const isOwned=async candidate=>{"
+            "if(ownership.pages.has(candidate))return true;"
+            "const opener=await candidate.opener().catch(()=>null);"
+            "if(!opener||!(await isOwned(opener)))return false;"
+            "await ownership.addOwned(candidate);return true;};"
             "let state=context[key];"
             "if(state){"
             "const handoffChanged=state.handoffPending&&state.handoffChanged;"
@@ -3070,6 +3843,9 @@ class PlaywrightCliRuntime:
             "handoffPending:false,handoffChanged:false};"
             "const handler=async route=>{"
             "const request=route.request();"
+            "let requestPage=null;"
+            "try{requestPage=request.frame().page();}catch{}"
+            "if(!requestPage||!(await isOwned(requestPage)))return route.fallback();"
             "if(!request.isNavigationRequest())return route.continue();"
             "let topLevel=false;"
             "try{topLevel=request.frame().parentFrame()===null;}catch{}"
@@ -3090,9 +3866,13 @@ class PlaywrightCliRuntime:
 
     @staticmethod
     def _suspend_guard_script() -> str:
+        owned_key = json.dumps(_OWNED_PAGES_KEY)
         return (
             "async (page) => {"
             "const context=page.context();"
+            f"const ownership=context[Symbol.for({owned_key})];"
+            "if(!ownership||!ownership.pages.has(page))"
+            "throw new Error('owned page scope is unavailable');"
             "const key=Symbol.for('jobhunter.playwrightCli.navigationGuard');"
             "const state=context[key];"
             "if(state){state.armed=false;"
@@ -3253,102 +4033,181 @@ class PlaywrightCliRuntime:
             index += 1
         return rewritten
 
-    def _validate_tab_command(
+    def _translate_tab_command(
         self,
         command: str,
         args: Sequence[str],
         metadata: _PageMetadata,
-    ) -> None:
+    ) -> list[str]:
+        values = list(args)
         if command == "tab-new":
             if len(metadata.tabs) >= _MAX_TABS:
                 raise PlaywrightCliRuntimeError("browser_failed")
-            return
-        if command not in {"tab-select", "tab-close"}:
-            return
-        if command == "tab-select" and len(args) != 1:
+            return values
+        if command == "tab-close":
             raise PlaywrightCliRuntimeError("browser_failed")
-        if command == "tab-close" and len(args) > 1:
+        if command != "tab-select":
+            return values
+        if len(values) != 1:
             raise PlaywrightCliRuntimeError("browser_failed")
         try:
-            index = (
-                int(args[0], 10)
-                if args
-                else metadata.current_index
-            )
+            index = int(values[0], 10)
         except ValueError:
             raise PlaywrightCliRuntimeError("browser_failed") from None
-        if index < 0 or index >= len(metadata.tabs):
+        if index != metadata.current_index:
             raise PlaywrightCliRuntimeError("browser_failed")
-        if not self._url_is_allowed(
-            metadata.tabs[index][0],
-            self._approved_origins,
-        ):
-            raise PlaywrightCliRuntimeError("browser_failed")
+        return []
+    async def _invoke_scoped_action(
+        self,
+        command: str,
+        args: Sequence[str],
+    ) -> _InvocationResult:
         if command == "tab-select":
-            return
+            return _InvocationResult(
+                exit_code=0,
+                stdout=b'{"result":"Current owned tab remains selected."}',
+                stderr=b"",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+        if command == "tab-new":
+            target = args[0] if args else "about:blank"
+            pending_url = self._next_owned_tab_url()
+            self._pending_page_url = pending_url
+            self._write_ownership()
+            execution = await self._invoke("tab-new", [pending_url])
+            if execution.exit_code != 0 or self._reported_cli_error(execution):
+                await self._close_pending_page(
+                    timeout=_CLEANUP_TIMEOUT_SECONDS
+                )
+                return execution
+            adopted = await self._invoke(
+                "run-code",
+                [self._adopt_current_page_script(pending_url)],
+                capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+            )
+            self._require_success(adopted)
+            self._pending_page_url = None
+            self._write_ownership()
+            return await self._invoke("goto", [target])
+        return await self._invoke(command, args)
 
-        remaining = [
-            tab
-            for tab_index, tab in enumerate(metadata.tabs)
-            if tab_index != index
-        ]
-        if remaining and not any(
-            self._url_is_allowed(url, self._approved_origins)
-            for url, _title in remaining
+    async def _ensure_owned_current_page(self) -> None:
+        result = await self._invoke(
+            "run-code",
+            [self._owned_current_page_script()],
+            capture_limit=_MAX_INTERNAL_CAPTURE_BYTES,
+        )
+        self._require_success(result)
+        payload = self._decode_run_code_result(result)
+        current_owned = payload.get("currentOwned")
+        first_global = payload.get("firstGlobal")
+        if (
+            not isinstance(current_owned, bool)
+            or not isinstance(first_global, int)
+            or isinstance(first_global, bool)
+            or first_global < 0
         ):
             raise PlaywrightCliRuntimeError("browser_failed")
+        if not current_owned:
+            selected = await self._invoke("tab-select", [str(first_global)])
+            self._require_success(selected)
+
+    @staticmethod
+    def _owned_current_page_script() -> str:
+        key = json.dumps(_OWNED_PAGES_KEY)
+        return (
+            "async (page) => {"
+            "const context=page.context();"
+            f"const state=context[Symbol.for({key})];"
+            "if(!state)throw new Error('owned page scope is unavailable');"
+            "const allPages=context.pages();"
+            "const owned=allPages.filter(candidate=>state.pages.has(candidate));"
+            "if(!owned.length)throw new Error('owned page is unavailable');"
+            "return {currentOwned:state.pages.has(page),"
+            "firstGlobal:allPages.indexOf(owned[0])};}"
+        )
+
+    def _scope_cli_output(
+        self,
+        raw: bytes,
+        *,
+        command: str | None,
+        metadata: _PageMetadata,
+    ) -> bytes:
+        decoded = raw.decode("utf-8", errors="replace")
+        owned_tabs = ["### Open tabs"]
+        for index, (url, title) in enumerate(metadata.tabs):
+            marker = " (current)" if index == metadata.current_index else ""
+            owned_tabs.append(f"- {index}{marker}: {title} ({url})")
+        owned_section = "\n".join(owned_tabs)
+        section_pattern = re.compile(
+            r"(?ms)^### Open tabs[^\n]*\n.*?(?=^### |\Z)"
+        )
+
+        def scrub(value: object) -> object:
+            if isinstance(value, str):
+                return section_pattern.sub("", value)
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    key: (
+                        owned_section
+                        if key.casefold() == "open tabs"
+                        else scrub(item)
+                    )
+                    for key, item in value.items()
+                }
+            return value
+
+        try:
+            payload = json.loads(decoded)
+        except json.JSONDecodeError:
+            text = section_pattern.sub("", decoded)
+            return (owned_section if command == "tab-list" else text).encode()
+        scoped = scrub(payload)
+        if (
+            command in {"tab-list", "tab-new", "tab-select", "tab-close"}
+            and isinstance(scoped, dict)
+        ):
+            scoped["result"] = owned_section
+        return json.dumps(
+            scoped,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
 
     async def _restore_allowed_page(
         self,
         previous: _PageMetadata,
         current: _PageMetadata,
     ) -> None:
-        allowed_index = next(
-            (
-                index
-                for index, (url, _title) in enumerate(current.tabs)
-                if self._url_is_allowed(url, self._approved_origins)
-            ),
-            None,
-        )
-        if allowed_index is not None:
-            selected = await self._invoke(
-                "tab-select",
-                [str(allowed_index)],
-            )
-            self._require_success(selected)
-            return
-
+        del current
         if (
             previous.current_index < 0
-            or previous.current_index >= len(current.tabs)
+            or previous.current_index >= len(previous.tabs)
             or not self._url_is_allowed(
                 previous.url,
                 self._approved_origins,
             )
         ):
             raise PlaywrightCliRuntimeError("browser_failed")
-        selected = await self._invoke(
-            "tab-select",
-            [str(previous.current_index)],
+        owned_key = json.dumps(_OWNED_PAGES_KEY)
+        restore_script = (
+            "async (page) => {"
+            "const context=page.context();"
+            f"const ownership=context[Symbol.for({owned_key})];"
+            "if(!ownership||!ownership.pages.has(page))"
+            "throw new Error('owned page scope is unavailable');"
+            f"const target={json.dumps(previous.url)};"
+            "await page.goto(target);"
+            "}"
         )
-        self._require_success(selected)
-        if self._screenshots_suppressed:
-            restore_script = (
-                "async (page) => {"
-                f"const target={json.dumps(previous.url)};"
-                "await page.goto(target);"
-                "}"
-            )
-            restored = await self._invoke_private_script_unlocked(
-                restore_script,
-                label="restore",
-            )
-        else:
-            restored = await self._invoke(
-                "goto",
-                [previous.url],
-            )
+        restored = await self._invoke_private_script_unlocked(
+            restore_script,
+            label="restore",
+        )
         self._require_success(restored)
 
     async def _metadata(
@@ -3356,28 +4215,7 @@ class PlaywrightCliRuntime:
         *,
         mark_navigation_handoff: bool = False,
     ) -> _PageMetadata:
-        handoff = (
-            "const context=page.context();"
-            "const guard=context[Symbol.for('jobhunter.playwrightCli.navigationGuard')];"
-            "if(guard&&!guard.armed&&!guard.handoffPending){"
-            "guard.handoffPending=true;guard.handoffChanged=false;}"
-            if mark_navigation_handoff
-            else ""
-        )
-        script = (
-            "async (page) => {"
-            f"{handoff}"
-            "const clip=(value,limit)=>Array.from(value.slice(0,limit*2)).slice(0,limit).join('');"
-            "const pages=page.context().pages();"
-            "return {"
-            f"url:clip(page.url(),{_MAX_URL_CAPTURE_CHARS}),"
-            f"title:clip(await page.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS}),"
-            "currentIndex:pages.indexOf(page),"
-            f"tabs:await Promise.all(pages.slice(0,{_MAX_TABS}).map(async p=>({{"
-            f"url:clip(p.url(),{_MAX_URL_CAPTURE_CHARS}),"
-            f"title:clip(await p.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS})}})))"
-            "};}"
-        )
+        script = self._metadata_script(mark_navigation_handoff)
         result = await self._invoke(
             "run-code",
             [script],
@@ -3385,6 +4223,37 @@ class PlaywrightCliRuntime:
         )
         self._require_success(result)
         return self._parse_metadata(self._decode_run_code_result(result))
+
+    @staticmethod
+    def _metadata_script(mark_navigation_handoff: bool) -> str:
+        handoff = (
+            "const guard=context[Symbol.for('jobhunter.playwrightCli.navigationGuard')];"
+            "if(guard&&!guard.armed&&!guard.handoffPending){"
+            "guard.handoffPending=true;guard.handoffChanged=false;}"
+            if mark_navigation_handoff
+            else ""
+        )
+        owned_key = json.dumps(_OWNED_PAGES_KEY)
+        return (
+            "async (page) => {"
+            "const context=page.context();"
+            f"{handoff}"
+            f"const ownership=context[Symbol.for({owned_key})];"
+            "if(!ownership||!ownership.pages.has(page))"
+            "throw new Error('owned page scope is unavailable');"
+            "const clip=(value,limit)=>Array.from(value.slice(0,limit*2)).slice(0,limit).join('');"
+            "const allPages=context.pages();"
+            f"const pages=allPages.filter(candidate=>ownership.pages.has(candidate)).slice(0,{_MAX_TABS});"
+            "return {"
+            f"url:clip(page.url(),{_MAX_URL_CAPTURE_CHARS}),"
+            f"title:clip(await page.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS}),"
+            "currentIndex:pages.indexOf(page),"
+            "globalIndices:pages.map(candidate=>allPages.indexOf(candidate)),"
+            "tabs:await Promise.all(pages.map(async candidate=>({"
+            f"url:clip(candidate.url(),{_MAX_URL_CAPTURE_CHARS}),"
+            f"title:clip(await candidate.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS})}})))"
+            "};}"
+        )
 
     @staticmethod
     def _decode_run_code_result(result: _InvocationResult) -> dict[str, object]:
@@ -3430,11 +4299,24 @@ class PlaywrightCliRuntime:
             url = raw_metadata["url"]
             title = raw_metadata["title"]
             current_index = raw_metadata["currentIndex"]
+            raw_global_indices = raw_metadata.get(
+                "globalIndices",
+                list(range(len(tabs))),
+            )
             if (
                 not isinstance(url, str)
                 or not isinstance(title, str)
                 or not isinstance(current_index, int)
                 or isinstance(current_index, bool)
+                or not isinstance(raw_global_indices, list)
+                or len(raw_global_indices) != len(tabs)
+                or any(
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or index < 0
+                    for index in raw_global_indices
+                )
+                or len(set(raw_global_indices)) != len(raw_global_indices)
             ):
                 raise TypeError
             if current_index < 0 or current_index >= len(tabs):
@@ -3449,6 +4331,7 @@ class PlaywrightCliRuntime:
             ),
             current_index=current_index,
             tabs=tuple(tabs),
+            global_indices=tuple(cast(list[int], raw_global_indices)),
         )
 
     @staticmethod
@@ -3463,22 +4346,29 @@ class PlaywrightCliRuntime:
                 "page.screenshot({path:screenshotPath,type:'png'})"
                 ".then(()=>true,()=>false)"
             )
+        owned_key = json.dumps(_OWNED_PAGES_KEY)
         return (
             "async (page) => {"
             f"{screenshot_setup}"
             "const clip=(value,limit)=>Array.from(value.slice(0,limit*2)).slice(0,limit).join('');"
-            "const allPages=page.context().pages();"
-            f"const pages=allPages.slice(0,{_MAX_TABS});"
+            "const context=page.context();"
+            f"const ownership=context[Symbol.for({owned_key})];"
+            "if(!ownership||!ownership.pages.has(page))"
+            "throw new Error('owned page scope is unavailable');"
+            "const allPages=context.pages();"
+            f"const pages=allPages.filter(candidate=>ownership.pages.has(candidate)).slice(0,{_MAX_TABS});"
             "const [title,tabs,screenshot]=await Promise.all(["
             f"page.title().then(value=>clip(value,{_MAX_TITLE_CAPTURE_CHARS}),()=>''),"
-            "Promise.all(pages.map(async p=>({"
-            f"url:clip(p.url(),{_MAX_URL_CAPTURE_CHARS}),"
-            f"title:clip(await p.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS})"
+            "Promise.all(pages.map(async candidate=>({"
+            f"url:clip(candidate.url(),{_MAX_URL_CAPTURE_CHARS}),"
+            f"title:clip(await candidate.title().catch(()=>'' ),{_MAX_TITLE_CAPTURE_CHARS})"
             "}))),"
             f"{screenshot_expression}"
             "]);"
             f"return {{url:clip(page.url(),{_MAX_URL_CAPTURE_CHARS}),title,"
-            "currentIndex:allPages.indexOf(page),tabs,screenshot};}"
+            "currentIndex:pages.indexOf(page),"
+            "globalIndices:pages.map(candidate=>allPages.indexOf(candidate)),"
+            "tabs,screenshot};}"
         )
 
     async def _collect_observation(
@@ -3768,9 +4658,141 @@ class PlaywrightCliRuntime:
         return redacted[-_MAX_OUTPUT_CHARS:], True
 
 
+class PlaywrightCliNativeBrowserHost:
+    """Own one native persistent browser shared by manager-scoped runtimes."""
+
+    def __init__(
+        self,
+        *,
+        launch: ResolvedBrowserLaunch,
+        artifacts_root: Path,
+        node_executable: Path | None = None,
+        cli_script: Path | None = None,
+        process_factory: ProcessFactory | None = None,
+    ) -> None:
+        if (
+            launch.cdp_url is not None
+            or launch.executable_path is None
+            or launch.user_data_dir is None
+        ):
+            raise BrowserConfigurationError("The native browser launch is invalid")
+        self._launch = launch
+        self._artifacts_root = artifacts_root.expanduser() / ".native-host"
+        self._node_executable = node_executable
+        self._cli_script = cli_script
+        self._process_factory = process_factory
+        self._lock = asyncio.Lock()
+        self._startup_complete = False
+        self._owners: set[UUID] = set()
+        self._runtime: PlaywrightCliRuntime | None = None
+        self._endpoint: ResolvedBrowserLaunch | None = None
+        self._stopping = False
+
+    @property
+    def artifacts_root(self) -> Path:
+        return self._artifacts_root
+
+    async def startup(self) -> None:
+        async with self._lock:
+            if self._startup_complete:
+                return
+            await recover_stale_playwright_cli_sessions(
+                artifacts_root=self._artifacts_root,
+                node_executable=self._node_executable,
+                cli_script=self._cli_script,
+                process_factory=self._process_factory,
+                session_name_prefix="jobhunter-native-host-",
+            )
+            retry_delay = 0.05
+            while not await asyncio.to_thread(
+                cleanup_orphaned_session_artifacts,
+                self._artifacts_root,
+            ):
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 5.0)
+            self._startup_complete = True
+
+    async def acquire(self, owner_id: UUID) -> ResolvedBrowserLaunch:
+        if not isinstance(owner_id, UUID):
+            raise PlaywrightCliRuntimeError("browser_failed")
+        await self.startup()
+        async with self._lock:
+            if self._stopping or owner_id in self._owners:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            if self._runtime is None:
+                session_directory = create_session_artifact_directory(
+                    self._artifacts_root,
+                    _NATIVE_HOST_SESSION_ID,
+                )
+                try:
+                    runtime = PlaywrightCliRuntime(
+                        session_id=_NATIVE_HOST_SESSION_ID,
+                        launch=self._launch,
+                        session_directory=session_directory,
+                        node_executable=self._node_executable,
+                        cli_script=self._cli_script,
+                        process_factory=self._process_factory,
+                        native_host_mode=True,
+                        session_name_prefix="jobhunter-native-host-",
+                    )
+                    endpoint = await runtime.start_native_host()
+                except BaseException:
+                    if not cleanup_session_artifacts(session_directory):
+                        raise PlaywrightCliRuntimeError("browser_failed") from None
+                    raise
+                self._runtime = runtime
+                self._endpoint = endpoint
+            endpoint = self._endpoint
+            if endpoint is None:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            self._owners.add(owner_id)
+            return endpoint
+
+    async def release(self, owner_id: UUID) -> None:
+        async with self._lock:
+            if owner_id not in self._owners:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            if len(self._owners) > 1:
+                self._owners.remove(owner_id)
+                return
+            runtime = self._runtime
+            if runtime is None:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            self._stopping = True
+            await runtime.close()
+            session_directory = self._artifacts_root / str(
+                _NATIVE_HOST_SESSION_ID
+            )
+            if not cleanup_session_artifacts(session_directory):
+                raise PlaywrightCliRuntimeError("browser_failed")
+            self._owners.remove(owner_id)
+            self._runtime = None
+            self._endpoint = None
+            self._stopping = False
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._owners:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            runtime = self._runtime
+            if runtime is None:
+                return
+            self._stopping = True
+            await runtime.close()
+            session_directory = self._artifacts_root / str(
+                _NATIVE_HOST_SESSION_ID
+            )
+            if not cleanup_session_artifacts(session_directory):
+                raise PlaywrightCliRuntimeError("browser_failed")
+            self._runtime = None
+            self._endpoint = None
+            self._stopping = False
+
+
 __all__ = [
     "BrowserConfigurationError",
     "browser_launch_for_slot",
+    "PlaywrightCliNativeBrowserHost",
     "PlaywrightCliRuntime",
     "PlaywrightCliRuntimeError",
     "ResolvedBrowserLaunch",

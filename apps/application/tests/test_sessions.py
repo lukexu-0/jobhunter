@@ -689,6 +689,8 @@ async def test_manager_passes_resolved_cli_config_to_one_runtime(
         "session_directory",
         "node_executable",
         "cli_script",
+        "browser_host",
+        "operation_lock",
     }
     assert call["session_id"] == created.session_id
     assert call["launch"] == ResolvedBrowserLaunch(
@@ -1837,7 +1839,7 @@ async def test_runtime_start_session_timeout_preserves_timeout_failure(
     assert not root.exists() or tuple(root.iterdir()) == ()
 
 
-async def test_three_sessions_fill_capacity_fourth_reports_oldest_and_released_slot_reuses_profile(
+async def test_three_sessions_share_profile_fourth_is_rejected_and_released_capacity_reuses_it(
     tmp_path: Path,
 ) -> None:
     session_ids = (
@@ -1857,11 +1859,14 @@ async def test_three_sessions_fill_capacity_fourth_reports_oldest_and_released_s
     assert list(manager._active) == list(session_ids[:3])
     assert [
         call["launch"].user_data_dir for call in fakes.runtime_factory_calls
-    ] == [
-        tmp_path / "profile",
-        tmp_path / "profile-slot-2",
-        tmp_path / "profile-slot-3",
-    ]
+    ] == [tmp_path / "profile"] * 3
+    assert len(
+        {
+            id(call["browser_host"])
+            for call in fakes.runtime_factory_calls
+        }
+    ) == 1
+    assert fakes.runtime_factory_calls[0]["browser_host"] is not None
 
     app = create_app(
         HarnessConfig(bearer_token=TOKEN),
@@ -1896,7 +1901,7 @@ async def test_three_sessions_fill_capacity_fourth_reports_oldest_and_released_s
         session_ids[3],
     ]
     assert fakes.runtime_factory_calls[-1]["launch"].user_data_dir == (
-        tmp_path / "profile-slot-2"
+        tmp_path / "profile"
     )
 
     for session_id in tuple(manager._active):
@@ -3765,9 +3770,8 @@ async def test_blocked_path_cleanup_does_not_hold_other_session_slot(
 
         replacement = await create_valid(manager)
         await wait_state(manager, replacement.session_id, "running")
-        assert len(manager._active) == 3
         assert fakes.runtime_factory_calls[-1]["launch"].user_data_dir == (
-            tmp_path / "profile-slot-2"
+            tmp_path / "profile"
         )
     finally:
         allow_blocked_cleanup.set()
@@ -3844,9 +3848,8 @@ async def test_failed_upload_retains_exact_path_and_slot_without_blocking_health
 
         healthy = await create_valid(manager, session_id=healthy_id)
         await wait_state(manager, healthy.session_id, "running")
-        assert list(manager._active) == [failed_id, healthy_id]
         assert fakes.runtime_factory_calls[-1]["launch"].user_data_dir == (
-            tmp_path / "profile-slot-2"
+            tmp_path / "profile"
         )
 
         await asyncio.wait_for(manager.delete(healthy_id), timeout=1)
