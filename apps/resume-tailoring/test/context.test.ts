@@ -46,7 +46,7 @@ describe("allowlisted context ingestion", () => {
       "apps/user-info/resume-main/Alex_Example_Resume.tex",
       "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
       "apps/user-info/current-context/projects/sample-project.md",
-      "jobhunter-resume-info.md",
+      "apps/user-info/current-context/projects/sample-tool-resume-info.md",
     ]);
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
@@ -93,15 +93,15 @@ describe("allowlisted context ingestion", () => {
       .toEqual([...CONTEXT_SOURCE_ALLOWLIST].reverse());
 
     for (const mutation of [
-      { id: "jobhunter-resume-info-alias" },
+      { id: "sample-tool-resume-info-alias" },
       { entityId: "project:wrong" },
-      { displayName: "Aliased Jobhunter resume information" },
-      { baselineEntityIds: ["Jobhunter"] },
+      { displayName: "Aliased Sample Tool resume information" },
+      { baselineEntityIds: ["Local Sample Tool"] },
     ]) {
       const candidate = JSON.parse(JSON.stringify(parsed));
-      const jobhunter = candidate.sources.find((source: { relativePath: string }) =>
-        source.relativePath === "jobhunter-resume-info.md");
-      Object.assign(jobhunter, mutation);
+      const sampleTool = candidate.sources.find((source: { relativePath: string }) =>
+        source.relativePath === "apps/user-info/current-context/projects/sample-tool-resume-info.md");
+      Object.assign(sampleTool, mutation);
       writeFileSync(manifestPath, JSON.stringify(candidate));
       expect(() => loadFixture(root)).toThrow("does not match the literal contract");
     }
@@ -114,11 +114,11 @@ describe("allowlisted context ingestion", () => {
     expect(() => loadFixture(root)).toThrow("does not match the literal contract");
   });
 
-  test("rejects an extra Jobhunter binding that could activate its directives", () => {
+  test("rejects an extra Sample Tool binding outside the sole explicit alias", () => {
     const root = createRepositoryFixture();
     const manifestPath = join(root, "apps/resume-tailoring/context-sources.json");
     const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
-    parsed.explicitEntityBindings["project:jobhunter"] = "Example Company";
+    parsed.explicitEntityBindings["project:sampleTool"] = "Example Company";
     writeFileSync(manifestPath, JSON.stringify(parsed));
     expect(() => loadFixture(root)).toThrow(
       "explicitEntityBindings must contain only the Sample Project binding",
@@ -171,17 +171,17 @@ describe("allowlisted context ingestion", () => {
       ...loaded,
       manifest: {
         ...loaded.manifest,
-        sources: loaded.manifest.sources.map((source) => source.id === "jobhunter-resume-info"
-          ? { ...source, baselineEntityIds: ["Jobhunter"] }
+        sources: loaded.manifest.sources.map((source) => source.id === "sample-tool-resume-info"
+          ? { ...source, baselineEntityIds: ["Local Sample Tool"] }
           : source),
       },
-      manifestSha256: sha256("legacy Jobhunter alias"),
+      manifestSha256: sha256("legacy Local Sample Tool alias"),
     };
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, legacyLoaded, 100);
       const legacySource = createContextSnapshot(database, legacyLoaded).sources
-        .find((source) => source.id === "jobhunter-resume-info")!;
+        .find((source) => source.id === "sample-tool-resume-info")!;
       expect(checkContextFreshness(database, loaded)).toEqual({
         fresh: false,
         manifestMatches: false,
@@ -191,14 +191,14 @@ describe("allowlisted context ingestion", () => {
 
       const report = syncContext(database, loaded, 200);
       const currentSource = createContextSnapshot(database, loaded).sources
-        .find((source) => source.id === "jobhunter-resume-info")!;
+        .find((source) => source.id === "sample-tool-resume-info")!;
       const versions = database.query<{ count: number }, []>(
-        "SELECT count(*) AS count FROM source_versions WHERE source_id = 'jobhunter-resume-info'",
+        "SELECT count(*) AS count FROM source_versions WHERE source_id = 'sample-tool-resume-info'",
       ).get();
 
-      expect(legacySource.baselineEntityIds).toEqual(["Jobhunter"]);
-      expect(report.changedSources).not.toContain("jobhunter-resume-info");
-      expect(currentSource.baselineEntityIds).toEqual(["Resume Tailoring and Application Agent"]);
+      expect(legacySource.baselineEntityIds).toEqual(["Local Sample Tool"]);
+      expect(report.changedSources).not.toContain("sample-tool-resume-info");
+      expect(currentSource.baselineEntityIds).toEqual(["Sample Tool"]);
       expect(currentSource.sourceVersionId).toBe(legacySource.sourceVersionId);
       expect(currentSource.sha256).toBe(legacySource.sha256);
       expect(versions?.count).toBe(1);
@@ -207,31 +207,27 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
-  test("synchronizes the Jobhunter source and exposes its three directives alongside two Sample Testing directives", () => {
+  test("synchronizes the Sample Tool source without adding directives alongside Sample Testing directives", () => {
     const loaded = loadContextManifest();
     const database = openContextDatabase(":memory:");
     try {
       syncContext(database, loaded);
       const snapshot = createContextSnapshot(database, loaded);
       expect(Object.keys(snapshot.sourceHashes)).toHaveLength(4);
-      expect(snapshot.sources.find((source) => source.id === "jobhunter-resume-info")).toMatchObject({
-        relativePath: "jobhunter-resume-info.md",
+      expect(snapshot.sources.find((source) => source.id === "sample-tool-resume-info")).toMatchObject({
+        relativePath: "apps/user-info/current-context/projects/sample-tool-resume-info.md",
         kind: "authoritative-markdown",
-        entityId: "project:jobhunter",
-        displayName: "Jobhunter resume information",
-        baselineEntityIds: ["Resume Tailoring and Application Agent"],
+        entityId: "project:sampleTool",
+        displayName: "Sample Tool resume information",
+        baselineEntityIds: ["Sample Tool"],
       });
       expect(snapshot.mustIncludeDirectives
-        .filter((directive) => directive.sourceId === "jobhunter-resume-info")
-        .map((directive) => directive.text)).toEqual([
-        "- Include the **Browser Use** harness.",
-        "- Include the **OpenAI Agents SDK**.",
-        "- Include the user-reported impact: **saved over 100 hours rewriting resumes and applying to jobs**.",
-      ]);
+        .filter((directive) => directive.sourceId === "sample-tool-resume-info")
+        .map((directive) => directive.text)).toEqual([]);
       expect(snapshot.mustIncludeDirectives
         .filter((directive) => directive.sourceId === "automated-testing-resume-info")
         .map((directive) => directive.text)).toEqual([
-        "- **Required framing:** Present Sample Testing/System A as an **agentic testing platform/workflow**, not as generic automation.",
+        "- **Required framing:** Present Sample Testing/System A as a synthetic validation workflow, not production experience.",
         "- **Required outcome directive:** Include only the synthetic fixture outcome.",
       ]);
     } finally {
@@ -243,7 +239,7 @@ describe("allowlisted context ingestion", () => {
     const root = createRepositoryFixture();
     const loaded = loadFixture(root);
     const [baseline, requiredSource, nonmatchingSource, sentinelSource] = loaded.manifest.sources;
-    const requiredText = "Keep the Jobhunter framing.\n- Preserve exact directive provenance.";
+    const requiredText = "Keep the Sample Tool framing.\n- Preserve exact directive provenance.";
     writeFileSync(join(root, baseline!.relativePath), "## 21. Must Include\nBaseline content is not a directive.\n");
     writeFileSync(join(root, requiredSource!.relativePath), `# Required\n## 21. Must Include\n${requiredText}\n`);
     writeFileSync(join(root, nonmatchingSource!.relativePath), "# Context\n## 22. Must Include\nA nonmatching heading is not a directive.\n");

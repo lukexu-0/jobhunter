@@ -8,7 +8,7 @@ Jobhunter is a local, evidence-grounded system for opportunity discovery, resume
 - `apps/web/`: Next.js App Router UI for starting and monitoring runs, reviewing revisions, browsing discovery results, managing application state, and connecting OpenAI Codex OAuth.
 - `apps/application/`: separately launched Python/FastAPI harness that owns one constrained Playwright CLI/Chrome application session with human gates.
 
-Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and public-safe failures. `apps/user-info/` and `jobhunter-resume-info.md` contain private candidate evidence; they are inputs, not operational engineering documentation.
+Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and public-safe failures. `apps/user-info/` contains private candidate evidence; those files are inputs, not operational engineering documentation.
 
 ## Architecture & Data Flow
 

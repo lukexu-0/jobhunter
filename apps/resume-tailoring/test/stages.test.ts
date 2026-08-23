@@ -38,8 +38,8 @@ setDefaultTimeout(15_000);
 
 const baseline = await Bun.file(resolve(import.meta.dir, "../../user-info/resume-main/Alex_Example_Resume.tex")).text();
 const parsedBaseline = parseBaselineResume(baseline);
-const JOBHUNTER_PROJECT_TITLE = "Resume Tailoring and Application Agent";
-const JOBHUNTER_ENTITY_ID = "project:jobhunter";
+const SAMPLE_TOOL_PROJECT_TITLE = "Sample Tool";
+const SAMPLE_TOOL_ENTITY_ID = "project:sampleTool";
 const databases: Database[] = [];
 const roots: string[] = [];
 
@@ -95,13 +95,13 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       indexedAt: 1,
     },
     {
-      id: "source-jobhunter",
-      relativePath: "jobhunter-resume-info.md",
+      id: "source-sampleTool",
+      relativePath: "apps/user-info/current-context/projects/sample-tool-resume-info.md",
       kind: "authoritative-markdown",
-      entityId: JOBHUNTER_ENTITY_ID,
-      displayName: "Synthetic Jobhunter context",
-      baselineEntityIds: [JOBHUNTER_PROJECT_TITLE],
-      sourceVersionId: "version-jobhunter",
+      entityId: SAMPLE_TOOL_ENTITY_ID,
+      displayName: "Synthetic Sample Tool context",
+      baselineEntityIds: [SAMPLE_TOOL_PROJECT_TITLE],
+      sourceVersionId: "version-sampleTool",
       sha256: "e".repeat(64),
       bytes: 10,
       indexedAt: 1,
@@ -109,7 +109,7 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
   ];
   const sourceIndexByEntity: Readonly<Record<string, number>> = {
     "Example Company": 1,
-    [JOBHUNTER_PROJECT_TITLE]: 3,
+    [SAMPLE_TOOL_PROJECT_TITLE]: 3,
     "Sample Project": 2,
     SampleProject: 2,
   };
@@ -121,8 +121,8 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       sourceId: source.id,
       entityId: entity.entityId === "Sample Project"
         ? "SampleProject"
-        : entity.entityId === JOBHUNTER_PROJECT_TITLE
-          ? JOBHUNTER_ENTITY_ID
+        : entity.entityId === SAMPLE_TOOL_PROJECT_TITLE
+          ? SAMPLE_TOOL_ENTITY_ID
           : entity.entityId,
       ordinal: 0,
       headingPath: [entity.entityId],
@@ -131,34 +131,13 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       sha256: source.sha256,
     };
   });
-  const jobhunterSource = sources[3]!;
-  const jobhunterDirectiveEvidence: EvidenceBlock[] = [
-    "- Include the **Browser Use** harness.",
-    "- Include the **OpenAI Agents SDK**.",
-    "- Include the user-reported impact: **saved over 100 hours rewriting resumes and applying to jobs**.",
-  ].map((text, index) => ({
-    id: `jobhunter-directive-${index}`,
-    sourceVersionId: jobhunterSource.sourceVersionId,
-    sourceId: jobhunterSource.id,
-    entityId: jobhunterSource.entityId,
-    ordinal: index + 1,
-    headingPath: ["21. Must Include"],
-    text,
-    caveats: [],
-    sha256: jobhunterSource.sha256,
-  }));
   const snapshot: ContextSnapshot = {
     manifestSha256: "a".repeat(64),
     baselineSha256: parsedBaseline.sha256,
     sourceHashes: Object.fromEntries(sources.map((source) => [source.id, source.sha256])),
     sources,
-    evidence: [...evidence, ...jobhunterDirectiveEvidence],
-    mustIncludeDirectives: jobhunterDirectiveEvidence.map((directive) => ({
-      evidenceId: directive.id,
-      sourceId: directive.sourceId,
-      entityId: directive.entityId,
-      text: directive.text,
-    })),
+    evidence,
+    mustIncludeDirectives: [],
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
   const atsKeywordExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
@@ -523,30 +502,24 @@ const ONE_PAGE_QA: DeterministicQaReport = {
 };
 
 describe.skipIf(process.platform !== "linux")("pipeline stage processor cases requiring Linux /proc process identity", () => {
-  test("binds Jobhunter facts and directives to the replacement baseline title without another entity", () => {
+  test("binds Sample Tool facts to the baseline title without directives or another entity", () => {
     const { snapshot } = resumeFixtures("Strong TypeScript engineer");
-    const jobhunterSource = snapshot.sources.find((source) => source.id === "source-jobhunter")!;
-    const jobhunterFact = snapshot.evidence.find((evidence) =>
-      evidence.sourceId === jobhunterSource.id
+    const sampleToolSource = snapshot.sources.find((source) => source.id === "source-sampleTool")!;
+    const sampleToolFact = snapshot.evidence.find((evidence) =>
+      evidence.sourceId === sampleToolSource.id
       && evidence.headingPath.at(-1) !== "21. Must Include")!;
 
-    expect(jobhunterSource.baselineEntityIds).toEqual([JOBHUNTER_PROJECT_TITLE]);
-    expect(jobhunterFact).toMatchObject({
-      sourceVersionId: jobhunterSource.sourceVersionId,
-      sourceId: jobhunterSource.id,
-      entityId: JOBHUNTER_ENTITY_ID,
+    expect(sampleToolSource.baselineEntityIds).toEqual([SAMPLE_TOOL_PROJECT_TITLE]);
+    expect(sampleToolFact).toMatchObject({
+      sourceVersionId: sampleToolSource.sourceVersionId,
+      sourceId: sampleToolSource.id,
+      entityId: SAMPLE_TOOL_ENTITY_ID,
     });
-    expect(snapshot.mustIncludeDirectives).toHaveLength(3);
-    expect(snapshot.mustIncludeDirectives.every((directive) =>
-      directive.sourceId === jobhunterSource.id
-      && directive.entityId === JOBHUNTER_ENTITY_ID)).toBe(true);
-    expect([
-      jobhunterFact.entityId,
-      ...snapshot.mustIncludeDirectives.map((directive) => directive.entityId),
-    ].every((entityId) => equivalentEntities(JOBHUNTER_PROJECT_TITLE, entityId, snapshot))).toBe(true);
+    expect(snapshot.mustIncludeDirectives).toEqual([]);
+    expect(equivalentEntities(SAMPLE_TOOL_PROJECT_TITLE, sampleToolFact.entityId, snapshot)).toBe(true);
     expect(snapshot.sources
-      .filter((source) => source.baselineEntityIds.includes(JOBHUNTER_PROJECT_TITLE))
-      .map((source) => source.entityId)).toEqual([JOBHUNTER_ENTITY_ID]);
+      .filter((source) => source.baselineEntityIds.includes(SAMPLE_TOOL_PROJECT_TITLE))
+      .map((source) => source.entityId)).toEqual([SAMPLE_TOOL_ENTITY_ID]);
     expect(parsedBaseline.entities.map((entity) => entity.entityId))
       .not.toContain("Sample Project Archive");
   });
@@ -1307,12 +1280,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     await processToStop(harness);
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
     expect(harness.agentInputs.tailoring[0]?.mustIncludeEvidenceIds)
-      .toEqual([
-        "jobhunter-directive-0",
-        "jobhunter-directive-1",
-        "jobhunter-directive-2",
-        ACTIVE_DIRECTIVE_EVIDENCE_ID,
-      ]);
+      .toEqual([ACTIVE_DIRECTIVE_EVIDENCE_ID]);
     const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
     harness.repository.editRun(
       harness.runId,

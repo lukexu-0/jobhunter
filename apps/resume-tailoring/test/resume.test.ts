@@ -219,21 +219,21 @@ describe("strict resume contracts", () => {
     const projects = parsedBaseline.entities.filter((item) => item.section === "projects");
     const projectTitles = projects.map((item) => item.entityId);
     expect(projectTitles).toEqual([
-      "Resume Tailoring and Application Agent",
+      "Sample Tool",
       "Sample Project",
     ]);
     expect(projectTitles).not.toContain("Sample Project Archive");
     const legacyBaseline = baseline.replaceAll("\\enspace\\textbar\\enspace", () => "$|$");
     expect(parseBaselineResume(legacyBaseline).entities.filter((item) => item.section === "projects").map((item) => item.entityId)).toEqual([
-      "Resume Tailoring and Application Agent",
+      "Sample Tool",
       "Sample Project",
     ]);
-    const jobhunter = projects.find((item) => item.entityId === "Resume Tailoring and Application Agent");
-    expect(jobhunter?.headingArguments[1]).toBe("Jan 2020 -- Present");
-    expect(jobhunter?.bullets.map((item) => item.text)).toEqual([
-      "Saved over 100 hours rewriting resumes and applying to jobs by building a local agent that produces evidence-backed, ATS-aligned one-page resumes and human-reviewed application workflows.",
-      "Orchestrated ATS extraction, analysis, tailoring, and bounded compile repair with the OpenAI Agents SDK, preserving source provenance and revision lineage through deterministic and visual QA.",
-      "Engineered a Python Browser Use harness with Bubblewrap sandboxing, exact-origin navigation, human approval gates, and one-shot submission controls without automatic retries.",
+    const sampleTool = projects.find((item) => item.entityId === "Sample Tool");
+    expect(sampleTool?.headingArguments[1]).toBe("Jul 2026 -- Aug 2026");
+    expect(sampleTool?.bullets.map((item) => item.text)).toEqual([
+      "Built a local learning workspace that captures selected browser text into a hierarchical snippet library and generates source-grounded Anki flashcards through an AI-assisted review workflow.",
+      "Engineered a Bun/Hono API with SQLite and Drizzle, a React/Vite dashboard, and a browser extension Chrome extension in a shared TypeScript monorepo.",
+      "Integrated OMP with Codex OAuth and strict Zod contracts to generate exactly one card per source snippet, support human review, and export approved cards as APKG files.",
     ]);
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");

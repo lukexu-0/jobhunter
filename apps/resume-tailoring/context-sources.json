@@ -26,12 +26,12 @@
       "baselineEntityIds": ["Sample Project", "SampleProject"]
     },
     {
-      "id": "jobhunter-resume-info",
-      "relativePath": "jobhunter-resume-info.md",
+      "id": "sample-tool-resume-info",
+      "relativePath": "apps/user-info/current-context/projects/sample-tool-resume-info.md",
       "kind": "authoritative-markdown",
-      "entityId": "project:jobhunter",
-      "displayName": "Jobhunter resume information",
-      "baselineEntityIds": ["Resume Tailoring and Application Agent"]
+      "entityId": "project:sampleTool",
+      "displayName": "Sample Tool resume information",
+      "baselineEntityIds": ["Sample Tool"]
     }
   ],
   "explicitEntityBindings": {

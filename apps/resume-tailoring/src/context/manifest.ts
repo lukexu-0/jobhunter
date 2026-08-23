@@ -15,7 +15,7 @@ export const CONTEXT_SOURCE_ALLOWLIST = Object.freeze([
   "apps/user-info/resume-main/Alex_Example_Resume.tex",
   "apps/user-info/current-context/jobs/Example-Company/automated-testing-resume-info.md",
   "apps/user-info/current-context/projects/sample-project.md",
-  "jobhunter-resume-info.md",
+  "apps/user-info/current-context/projects/sample-tool-resume-info.md",
 ] as const);
 
 type ContextSourceContract = Omit<ContextSourceDefinition, "relativePath">;
@@ -42,12 +42,12 @@ const SOURCE_CONTRACTS: Readonly<Record<string, ContextSourceContract>> = Object
     displayName: "SampleProject / Sample Project",
     baselineEntityIds: Object.freeze(["Sample Project", "SampleProject"]),
   }),
-  "jobhunter-resume-info.md": Object.freeze({
-    id: "jobhunter-resume-info",
+  "apps/user-info/current-context/projects/sample-tool-resume-info.md": Object.freeze({
+    id: "sample-tool-resume-info",
     kind: "authoritative-markdown",
-    entityId: "project:jobhunter",
-    displayName: "Jobhunter resume information",
-    baselineEntityIds: Object.freeze(["Resume Tailoring and Application Agent"]),
+    entityId: "project:sampleTool",
+    displayName: "Sample Tool resume information",
+    baselineEntityIds: Object.freeze(["Sample Tool"]),
   }),
 });
 const SOURCE_KEYS: Readonly<Record<string, true>> = Object.freeze({

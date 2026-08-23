@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   cpSync,
   chmodSync,
@@ -47,8 +48,12 @@ function checkout(branch = "main"): {
     recursive: true,
     mode: 0o700,
   });
+  mkdirSync(join(appsRoot, "user-info", "current-context", "projects"), {
+    recursive: true,
+    mode: 0o700,
+  });
   writeFileSync(join(checkoutRoot, ".git", "HEAD"), `ref: refs/heads/${branch}\n`);
-  writeFileSync(join(checkoutRoot, "jobhunter-resume-info.md"), "synthetic root profile\n");
+  writeFileSync(join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "synthetic project info\n");
   writeFileSync(
     join(appsRoot, "user-info", "current-context", "personal", "user-info.json"),
     '{"synthetic":"answer"}\n',
@@ -93,6 +98,25 @@ function readManifest(snapshotPath: string): UserContextSnapshotManifest {
   return JSON.parse(readFileSync(join(snapshotPath, "manifest.json"), "utf8"));
 }
 
+function addLegacyRootDossier(snapshotPath: string, contents: string): void {
+  const relativePath = "jobhunter-resume-info.md";
+  writeFileSync(join(snapshotPath, "files", relativePath), contents, { mode: 0o600 });
+  const manifest = readManifest(snapshotPath);
+  const files = [
+    ...manifest.files,
+    {
+      path: relativePath,
+      size: Buffer.byteLength(contents),
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    },
+  ].sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  writeFileSync(
+    join(snapshotPath, "manifest.json"),
+    `${JSON.stringify({ ...manifest, files })}\n`,
+    { mode: 0o600 },
+  );
+}
+
 describe("private user-context snapshots", () => {
   test("backs up every configured regular file in deterministic path order with private modes", async () => {
     const { appsRoot, checkoutRoot } = checkout();
@@ -130,7 +154,7 @@ describe("private user-context snapshots", () => {
           path: "apps/user-info/current-context/personal/user-info.json",
           size: 23,
         }),
-        expect.objectContaining({ path: "jobhunter-resume-info.md", size: 23 }),
+        expect.objectContaining({ path: "apps/user-info/current-context/projects/sample-tool-resume-info.md", size: 23 }),
       ],
     });
     expect(manifest.files.every(({ sha256 }) => /^[0-9a-f]{64}$/.test(sha256))).toBe(true);
@@ -139,8 +163,8 @@ describe("private user-context snapshots", () => {
     for (const file of manifest.files) {
       expect(lstatSync(join(result.snapshotPath, "files", file.path)).mode & 0o777).toBe(0o600);
     }
-    expect(readFileSync(join(result.snapshotPath, "files", "jobhunter-resume-info.md"), "utf8"))
-      .toBe("synthetic root profile\n");
+    expect(readFileSync(join(result.snapshotPath, "files", "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "utf8"))
+      .toBe("synthetic project info\n");
   });
 
   test("versions unchanged snapshots and never replaces an already published snapshot", async () => {
@@ -152,12 +176,12 @@ describe("private user-context snapshots", () => {
     expect(second.snapshotId).not.toBe(first.snapshotId);
     expect(readManifest(second.snapshotPath).files).toEqual(readManifest(first.snapshotPath).files);
 
-    writeFileSync(join(appsRoot, "..", "jobhunter-resume-info.md"), "changed synthetic profile\n");
+    writeFileSync(join(appsRoot, "..", "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "changed synthetic profile\n");
     await expect(deterministicSnapshot(appsRoot, launchEnvironment, 1)).rejects.toThrow(
       /already exists/i,
     );
-    expect(readFileSync(join(first.snapshotPath, "files", "jobhunter-resume-info.md"), "utf8"))
-      .toBe("synthetic root profile\n");
+    expect(readFileSync(join(first.snapshotPath, "files", "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "utf8"))
+      .toBe("synthetic project info\n");
     expect(readdirSync(dirname(first.snapshotPath)).some((name) => name.startsWith(".staging-")))
       .toBe(false);
   });
@@ -184,7 +208,7 @@ describe("private user-context snapshots", () => {
     const reader = holder.stdout.getReader();
     const ready = await reader.read();
     expect(new TextDecoder().decode(ready.value)).toContain("locked");
-    writeFileSync(join(checkoutRoot, "jobhunter-resume-info.md"), "current root profile\n");
+    writeFileSync(join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "current project info\n");
     try {
       await expect(deterministicSnapshot(appsRoot, launchEnvironment, 2)).rejects.toThrow(
         /operation is already in progress/i,
@@ -210,7 +234,7 @@ describe("private user-context snapshots", () => {
     const dataHome = join(temporaryRoot("jobhunter-context-data-parent-"), "data");
     const launchEnvironment = environment(dataHome);
     const personal = join(appsRoot, "user-info", "current-context", "personal");
-    symlinkSync(join(checkoutRoot, "jobhunter-resume-info.md"), join(personal, "linked-profile.md"));
+    symlinkSync(join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), join(personal, "linked-profile.md"));
 
     await expect(deterministicSnapshot(appsRoot, launchEnvironment, 1)).rejects.toThrow(
       /symbolic link/i,
@@ -250,13 +274,45 @@ describe("private user-context snapshots", () => {
 });
 
 describe("private user-context restore", () => {
+  test("restores a legacy version-one root dossier and snapshots its rollback bytes", async () => {
+    const { appsRoot, checkoutRoot } = checkout();
+    const dataHome = join(temporaryRoot("jobhunter-context-data-parent-"), "data");
+    const launchEnvironment = environment(dataHome);
+    const snapshot = await deterministicSnapshot(appsRoot, launchEnvironment, 1);
+    addLegacyRootDossier(snapshot.snapshotPath, "legacy snapshot dossier\n");
+    const legacyDossier = join(checkoutRoot, "jobhunter-resume-info.md");
+    writeFileSync(legacyDossier, "current legacy dossier\n", { mode: 0o600 });
+
+    const result = await restoreUserContextSnapshot({
+      mode: "start",
+      appsRoot,
+      environment: launchEnvironment,
+      snapshotId: snapshot.snapshotId,
+      now: new Date("2026-08-15T12:00:02.000Z"),
+      nonce: "00000000-0000-4000-8000-000000000002",
+    });
+
+    expect(readFileSync(legacyDossier, "utf8")).toBe("legacy snapshot dossier\n");
+    const preRestorePath = join(
+      dataHome,
+      "production",
+      "user-context-backups",
+      "snapshots",
+      result.preRestoreSnapshotId,
+    );
+    expect(readManifest(preRestorePath).files.map(({ path }) => path))
+      .toContain("jobhunter-resume-info.md");
+    expect(readFileSync(join(preRestorePath, "files", "jobhunter-resume-info.md"), "utf8"))
+      .toBe("current legacy dossier\n");
+  });
+
   test("verifies checksums and strict contained manifest paths before replacing source files", async () => {
     const { appsRoot, checkoutRoot } = checkout();
     const launchEnvironment = environment();
     const snapshot = await deterministicSnapshot(appsRoot, launchEnvironment, 1);
-    const source = join(checkoutRoot, "jobhunter-resume-info.md");
+    const source = join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md");
     writeFileSync(source, "newer synthetic profile\n");
-    const snapshotFile = join(snapshot.snapshotPath, "files", "jobhunter-resume-info.md");
+    const snapshotFile = join(snapshot.snapshotPath, "files", "apps/user-info/current-context/projects/sample-tool-resume-info.md");
     writeFileSync(snapshotFile, "tampered snapshot bytes\n", { mode: 0o600 });
 
     await expect(restoreUserContextSnapshot({
@@ -307,7 +363,7 @@ describe("private user-context restore", () => {
     const launchEnvironment = environment(dataHome);
     const snapshot = await deterministicSnapshot(first.appsRoot, launchEnvironment, 1);
     const second = checkout("main");
-    const secondSource = join(second.checkoutRoot, "jobhunter-resume-info.md");
+    const secondSource = join(second.checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md");
     writeFileSync(secondSource, "second checkout value\n");
 
     await expect(restoreUserContextSnapshot({
@@ -334,8 +390,8 @@ describe("private user-context restore", () => {
       environment: launchEnvironment,
       snapshotId: snapshot.snapshotId,
     })).rejects.toThrow(/mode scope/i);
-    expect(readFileSync(join(first.checkoutRoot, "jobhunter-resume-info.md"), "utf8"))
-      .toBe("synthetic root profile\n");
+    expect(readFileSync(join(first.checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "utf8"))
+      .toBe("synthetic project info\n");
 
     rmSync(join(devSnapshots, snapshot.snapshotId), { recursive: true });
     const devSnapshot = await deterministicSnapshot(first.appsRoot, launchEnvironment, 3, "dev");
@@ -356,8 +412,8 @@ describe("private user-context restore", () => {
       environment: launchEnvironment,
       snapshotId: devSnapshot.snapshotId,
     })).rejects.toThrow(/branch scope/i);
-    expect(readFileSync(join(otherBranch.checkoutRoot, "jobhunter-resume-info.md"), "utf8"))
-      .toBe("synthetic root profile\n");
+    expect(readFileSync(join(otherBranch.checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "utf8"))
+      .toBe("synthetic project info\n");
   });
   test("retains the selected recovery point when restore staging fails after the pre-restore snapshot", async () => {
     const { appsRoot, checkoutRoot } = checkout();
@@ -368,7 +424,7 @@ describe("private user-context restore", () => {
       const snapshot = await deterministicSnapshot(appsRoot, launchEnvironment, sequence);
       if (sequence === 1) selectedSnapshotPath = snapshot.snapshotPath;
     }
-    writeFileSync(join(checkoutRoot, "jobhunter-resume-info.md"), "current root profile\n");
+    writeFileSync(join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "current project info\n");
     const answerDirectory = join(appsRoot, "user-info", "current-context", "personal");
     writeFileSync(join(answerDirectory, "user-info.json"), '{"synthetic":"current"}\n');
     chmodSync(answerDirectory, 0o500);
@@ -391,24 +447,25 @@ describe("private user-context restore", () => {
     const { appsRoot, checkoutRoot } = checkout();
     const launchEnvironment = environment();
     const answerPath = join(appsRoot, "user-info", "current-context", "personal", "user-info.json");
-    const rootProfilePath = join(checkoutRoot, "jobhunter-resume-info.md");
+    const sampleToolDossierPath = join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md");
+    const sampleToolDossierDirectory = dirname(sampleToolDossierPath);
     const selectedOnlyPath = join(appsRoot, "user-info", "archive", "selected-only.txt");
     mkdirSync(dirname(selectedOnlyPath), { recursive: true, mode: 0o700 });
     writeFileSync(selectedOnlyPath, "selected snapshot only\n");
-    writeFileSync(rootProfilePath, `${"snapshot".repeat(1024 * 1024)}\n`);
+    writeFileSync(sampleToolDossierPath, `${"snapshot".repeat(1024 * 1024)}\n`);
     const snapshot = await deterministicSnapshot(appsRoot, launchEnvironment, 1);
     rmSync(selectedOnlyPath);
     writeFileSync(answerPath, '{"synthetic":"current answer"}\n');
-    writeFileSync(rootProfilePath, "current root profile\n");
-    let blockedRootPublication = false;
-    const watcher = watch(checkoutRoot, (_event, filename) => {
+    writeFileSync(sampleToolDossierPath, "current project info\n");
+    let blockedDossierPublication = false;
+    const watcher = watch(sampleToolDossierDirectory, (_event, filename) => {
       if (
-        !blockedRootPublication
+        !blockedDossierPublication
         && typeof filename === "string"
         && filename.startsWith(".user-context-restore-")
       ) {
-        blockedRootPublication = true;
-        chmodSync(checkoutRoot, 0o500);
+        blockedDossierPublication = true;
+        chmodSync(sampleToolDossierDirectory, 0o500);
       }
     });
     try {
@@ -422,11 +479,11 @@ describe("private user-context restore", () => {
       })).rejects.toThrow();
     } finally {
       watcher.close();
-      chmodSync(checkoutRoot, 0o700);
+      chmodSync(sampleToolDossierDirectory, 0o700);
     }
-    expect(blockedRootPublication).toBe(true);
+    expect(blockedDossierPublication).toBe(true);
     expect(readFileSync(answerPath, "utf8")).toBe('{"synthetic":"current answer"}\n');
-    expect(readFileSync(rootProfilePath, "utf8")).toBe("current root profile\n");
+    expect(readFileSync(sampleToolDossierPath, "utf8")).toBe("current project info\n");
     expect(existsSync(selectedOnlyPath)).toBe(false);
   });
 
@@ -437,10 +494,10 @@ describe("private user-context restore", () => {
     const dataHome = join(temporaryRoot("jobhunter-context-data-parent-"), "data");
     const launchEnvironment = environment(dataHome);
     const snapshot = await deterministicSnapshot(appsRoot, launchEnvironment, 1);
-    const rootProfile = join(checkoutRoot, "jobhunter-resume-info.md");
+    const sampleToolDossier = join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md");
     const answerFile = join(appsRoot, "user-info", "current-context", "personal", "user-info.json");
     const newerFile = join(appsRoot, "user-info", "current-context", "personal", "newer-note.txt");
-    writeFileSync(rootProfile, "newer root profile\n");
+    writeFileSync(sampleToolDossier, "newer project info\n");
     writeFileSync(answerFile, '{"synthetic":"newer answer"}\n');
     writeFileSync(newerFile, "unlisted newer file\n");
 
@@ -455,7 +512,7 @@ describe("private user-context restore", () => {
 
     expect(result.preRestoreSnapshotId)
       .toBe("2026-08-15T12-01-00-000Z-00000000-0000-4000-8000-000000000100");
-    expect(readFileSync(rootProfile, "utf8")).toBe("synthetic root profile\n");
+    expect(readFileSync(sampleToolDossier, "utf8")).toBe("synthetic project info\n");
     expect(readFileSync(answerFile, "utf8")).toBe('{"synthetic":"answer"}\n');
     expect(readFileSync(newerFile, "utf8")).toBe("unlisted newer file\n");
     const preRestore = snapshotDirectories(dataHome).find((id) => id === result.preRestoreSnapshotId)!;
@@ -464,7 +521,7 @@ describe("private user-context restore", () => {
     expect(preManifest.files.map(({ path }) => path)).toContain(
       "apps/user-info/current-context/personal/newer-note.txt",
     );
-    expect(lstatSync(rootProfile).mode & 0o777).toBe(0o600);
+    expect(lstatSync(sampleToolDossier).mode & 0o777).toBe(0o600);
     expect(lstatSync(answerFile).mode & 0o777).toBe(0o600);
   });
 
@@ -472,10 +529,10 @@ describe("private user-context restore", () => {
     const { appsRoot, checkoutRoot } = checkout();
     const launchEnvironment = environment();
     const snapshot = await deterministicSnapshot(appsRoot, launchEnvironment, 1);
-    const snapshotFile = join(snapshot.snapshotPath, "files", "jobhunter-resume-info.md");
+    const snapshotFile = join(snapshot.snapshotPath, "files", "apps/user-info/current-context/projects/sample-tool-resume-info.md");
     rmSync(snapshotFile);
-    symlinkSync(join(checkoutRoot, "jobhunter-resume-info.md"), snapshotFile);
-    writeFileSync(join(checkoutRoot, "jobhunter-resume-info.md"), "new source bytes\n");
+    symlinkSync(join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), snapshotFile);
+    writeFileSync(join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "new source bytes\n");
 
     await expect(restoreUserContextSnapshot({
       mode: "start",
@@ -483,7 +540,7 @@ describe("private user-context restore", () => {
       environment: launchEnvironment,
       snapshotId: snapshot.snapshotId,
     })).rejects.toThrow(/symbolic link/i);
-    expect(readFileSync(join(checkoutRoot, "jobhunter-resume-info.md"), "utf8"))
+    expect(readFileSync(join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md"), "utf8"))
       .toBe("new source bytes\n");
   });
 });
@@ -502,7 +559,7 @@ describe("workspace launch backup hook", () => {
 
     const answerFile = join(appsRoot, "user-info", "current-context", "personal", "user-info.json");
     rmSync(answerFile);
-    symlinkSync(join(appsRoot, "..", "jobhunter-resume-info.md"), answerFile);
+    symlinkSync(join(appsRoot, "..", "apps/user-info/current-context/projects/sample-tool-resume-info.md"), answerFile);
     await expect(backupUserContextForLaunch("start", appsRoot, launchEnvironment)).rejects.toThrow(
       /symbolic link/i,
     );

@@ -40,7 +40,7 @@ const RETAINED_SNAPSHOT_COUNT = 30;
 const FLOCK_EXECUTABLE = "/usr/bin/flock";
 const FLOCK_CONFLICT_EXIT_CODE = 73;
 const OPERATION_LOCK_NAME = ".operation.lock";
-const ROOT_PROFILE_PATH = "jobhunter-resume-info.md";
+const LEGACY_ROOT_DOSSIER_PATH = "jobhunter-resume-info.md";
 const USER_INFO_PATH = "apps/user-info";
 const SNAPSHOT_ID_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -227,7 +227,7 @@ function validateSnapshotPath(path: string): void {
   ) {
     throw new Error("Snapshot manifest contains an unsafe path");
   }
-  if (path !== ROOT_PROFILE_PATH && !path.startsWith(`${USER_INFO_PATH}/`)) {
+  if (path !== LEGACY_ROOT_DOSSIER_PATH && !path.startsWith(`${USER_INFO_PATH}/`)) {
     throw new Error("Snapshot manifest path is outside private user context");
   }
 }
@@ -438,6 +438,7 @@ async function collectSourceFiles(
   context: ResolvedBackupContext,
   limits: UserContextBackupLimits,
   allowMissingRoots: boolean,
+  includeLegacyRootDossier: boolean,
 ): Promise<CollectionResult> {
   const files: SourceFile[] = [];
   let totalBytes = 0;
@@ -510,20 +511,19 @@ async function collectSourceFiles(
     }
   };
 
-  const rootProfile = join(context.checkoutRoot, ROOT_PROFILE_PATH);
-  const rootProfileStatus = await lstatIfPresent(rootProfile);
-  if (rootProfileStatus === undefined) {
-    if (!allowMissingRoots) throw new Error(`Required backup source is unavailable: ${ROOT_PROFILE_PATH}`);
-  } else {
-    await observeFile(rootProfile, ROOT_PROFILE_PATH);
-  }
-
   const userInfoRoot = join(context.checkoutRoot, ...USER_INFO_PATH.split("/"));
   const userInfoStatus = await lstatIfPresent(userInfoRoot);
   if (userInfoStatus === undefined) {
     if (!allowMissingRoots) throw new Error(`Required backup source is unavailable: ${USER_INFO_PATH}`);
   } else {
     await walkDirectory(userInfoRoot, USER_INFO_PATH, 1);
+  }
+
+  if (includeLegacyRootDossier) {
+    const legacyDossier = join(context.checkoutRoot, LEGACY_ROOT_DOSSIER_PATH);
+    if (await lstatIfPresent(legacyDossier) !== undefined) {
+      await observeFile(legacyDossier, LEGACY_ROOT_DOSSIER_PATH);
+    }
   }
 
   files.sort((left, right) => compareText(left.relativePath, right.relativePath));
@@ -854,6 +854,7 @@ async function createSnapshot(
     nonce?: string;
     limits?: UserContextBackupLimits;
     allowMissingRoots?: boolean;
+    includeLegacyRootDossier?: boolean;
     retain?: boolean;
   }>,
 ): Promise<UserContextSnapshotResult> {
@@ -870,6 +871,7 @@ async function createSnapshot(
     context,
     limits,
     options.allowMissingRoots ?? false,
+    options.includeLegacyRootDossier ?? false,
   );
   await ensurePrivateDirectoryTree(context.storageRoot);
   await ensurePrivateDirectoryTree(context.backupRoot);
@@ -1178,6 +1180,8 @@ export async function restoreUserContextSnapshot(
   return withOperationLock(context, async () => {
     const restoreNonce = randomUUID();
     const staged = await stageVerifiedRestore(context, options.snapshotId, restoreNonce);
+    const includesLegacyRootDossier = staged.manifest.files
+      .some((file) => file.path === LEGACY_ROOT_DOSSIER_PATH);
     let replacements: PendingReplacement[] = [];
     try {
       for (const file of staged.manifest.files) {
@@ -1189,6 +1193,7 @@ export async function restoreUserContextSnapshot(
         nonce: options.nonce,
         limits: options.limits,
         allowMissingRoots: true,
+        includeLegacyRootDossier: includesLegacyRootDossier,
         retain: false,
       });
       const preRestoreManifest = await readStrictManifest(preRestore.snapshotPath);
