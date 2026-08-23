@@ -229,11 +229,11 @@ describe("strict resume contracts", () => {
       "Sample Project",
     ]);
     const sampleTool = projects.find((item) => item.entityId === "Sample Tool");
-    expect(sampleTool?.headingArguments[1]).toBe("Jul 2026 -- Aug 2026");
+    expect(sampleTool?.headingArguments[1]).toBe("Jan 2020 -- Present");
     expect(sampleTool?.bullets.map((item) => item.text)).toEqual([
       "Built a local learning workspace that captures selected browser text into a hierarchical snippet library and generates source-grounded Anki flashcards through an AI-assisted review workflow.",
-      "Engineered a Bun/Hono API with SQLite and Drizzle, a React/Vite dashboard, and a browser extension Chrome extension in a shared TypeScript monorepo.",
-      "Integrated OMP with Codex OAuth and strict Zod contracts to generate exactly one card per source snippet, support human review, and export approved cards as APKG files.",
+      "Developed a Go service with SQLite and a TypeScript dashboard for a synthetic dataset.",
+      "Integrated OMP with Codex OAuth to generate exactly one source-grounded card per snippet, then built human review and APKG export workflows.",
     ]);
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");

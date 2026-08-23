@@ -207,7 +207,7 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
-  test("synchronizes the Sample Tool source without adding directives alongside Sample Testing directives", () => {
+  test("synchronizes the Sample Tool Go-port directive alongside Sample Testing directives", () => {
     const loaded = loadContextManifest();
     const database = openContextDatabase(":memory:");
     try {
@@ -223,7 +223,9 @@ describe("allowlisted context ingestion", () => {
       });
       expect(snapshot.mustIncludeDirectives
         .filter((directive) => directive.sourceId === "sample-tool-resume-info")
-        .map((directive) => directive.text)).toEqual([]);
+        .map((directive) => directive.text)).toEqual([
+        "- **Required technology framing:** Present Sample Tool as a reference implementation and distinguish planned work from completed work.",
+      ]);
       expect(snapshot.mustIncludeDirectives
         .filter((directive) => directive.sourceId === "automated-testing-resume-info")
         .map((directive) => directive.text)).toEqual([

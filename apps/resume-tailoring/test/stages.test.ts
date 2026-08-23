@@ -131,13 +131,30 @@ function resumeFixtures(jobDescription: string): ResumeFixtures {
       sha256: source.sha256,
     };
   });
+  const sampleToolSource = sources[3]!;
+  const sampleToolDirective: EvidenceBlock = {
+    id: "sampleTool-go-port-directive",
+    sourceVersionId: sampleToolSource.sourceVersionId,
+    sourceId: sampleToolSource.id,
+    entityId: sampleToolSource.entityId,
+    ordinal: 1,
+    headingPath: ["21. Must Include"],
+    text: "- **Required technology framing:** Present Sample Tool as a reference implementation and distinguish planned work from completed work.",
+    caveats: [],
+    sha256: sampleToolSource.sha256,
+  };
   const snapshot: ContextSnapshot = {
     manifestSha256: "a".repeat(64),
     baselineSha256: parsedBaseline.sha256,
     sourceHashes: Object.fromEntries(sources.map((source) => [source.id, source.sha256])),
     sources,
-    evidence,
-    mustIncludeDirectives: [],
+    evidence: [...evidence, sampleToolDirective],
+    mustIncludeDirectives: [{
+      evidenceId: sampleToolDirective.id,
+      sourceId: sampleToolDirective.sourceId,
+      entityId: sampleToolDirective.entityId,
+      text: sampleToolDirective.text,
+    }],
     explicitEntityBindings: { "Sample Project": "SampleProject" },
   };
   const atsKeywordExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
@@ -502,7 +519,7 @@ const ONE_PAGE_QA: DeterministicQaReport = {
 };
 
 describe.skipIf(process.platform !== "linux")("pipeline stage processor cases requiring Linux /proc process identity", () => {
-  test("binds Sample Tool facts to the baseline title without directives or another entity", () => {
+  test("binds Sample Tool facts and the Go-port directive to one baseline entity", () => {
     const { snapshot } = resumeFixtures("Strong TypeScript engineer");
     const sampleToolSource = snapshot.sources.find((source) => source.id === "source-sampleTool")!;
     const sampleToolFact = snapshot.evidence.find((evidence) =>
@@ -515,7 +532,12 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       sourceId: sampleToolSource.id,
       entityId: SAMPLE_TOOL_ENTITY_ID,
     });
-    expect(snapshot.mustIncludeDirectives).toEqual([]);
+    expect(snapshot.mustIncludeDirectives).toEqual([{
+      evidenceId: "sampleTool-go-port-directive",
+      sourceId: sampleToolSource.id,
+      entityId: SAMPLE_TOOL_ENTITY_ID,
+      text: "- **Required technology framing:** Present Sample Tool as a reference implementation and distinguish planned work from completed work.",
+    }]);
     expect(equivalentEntities(SAMPLE_TOOL_PROJECT_TITLE, sampleToolFact.entityId, snapshot)).toBe(true);
     expect(snapshot.sources
       .filter((source) => source.baselineEntityIds.includes(SAMPLE_TOOL_PROJECT_TITLE))
@@ -1280,7 +1302,7 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     await processToStop(harness);
     expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
     expect(harness.agentInputs.tailoring[0]?.mustIncludeEvidenceIds)
-      .toEqual([ACTIVE_DIRECTIVE_EVIDENCE_ID]);
+      .toEqual(["sampleTool-go-port-directive", ACTIVE_DIRECTIVE_EVIDENCE_ID]);
     const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
     harness.repository.editRun(
       harness.runId,
