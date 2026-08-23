@@ -233,7 +233,7 @@ describe("strict resume contracts", () => {
     expect(sampleTool?.bullets.map((item) => item.text)).toEqual([
       "Built a sample workflow that transforms structured inputs into reviewable outputs.",
       "Developed a Go service with SQLite and a TypeScript dashboard for a synthetic dataset.",
-      "Integrated OMP with Codex OAuth to generate exactly one source-grounded card per snippet, then built human review and APKG export workflows.",
+      "Integrated the OMP SDK into a human-in-the-loop review workflow to ensure flashcard quality before APKG export.",
     ]);
     const competition = parsedBaseline.entities.find((item) => item.section === "competitions-other");
     expect(competition?.entityId).toBe("Example Engineering Competition");
