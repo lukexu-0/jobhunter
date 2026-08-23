@@ -231,7 +231,7 @@ describe("strict resume contracts", () => {
     const sampleTool = projects.find((item) => item.entityId === "Sample Tool");
     expect(sampleTool?.headingArguments[1]).toBe("Jan 2020 -- Present");
     expect(sampleTool?.bullets.map((item) => item.text)).toEqual([
-      "Built a local learning workspace that captures selected browser text into a hierarchical snippet library and generates source-grounded Anki flashcards through an AI-assisted review workflow.",
+      "Built a sample workflow that transforms structured inputs into reviewable outputs.",
       "Developed a Go service with SQLite and a TypeScript dashboard for a synthetic dataset.",
       "Integrated OMP with Codex OAuth to generate exactly one source-grounded card per snippet, then built human review and APKG export workflows.",
     ]);
