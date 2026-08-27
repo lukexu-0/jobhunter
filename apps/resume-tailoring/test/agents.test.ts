@@ -1158,13 +1158,16 @@ describe("guarded agents", () => {
     })).resolves.toEqual({ plan: PLAN, toolCount: 19 });
   });
 
-  test("propagates the bounded one-page correction note into model input and applies its cut", async () => {
+  test("propagates bounded one-page correction metrics into model input and applies its cut", async () => {
     const bullet = BASELINE_INVENTORY.bullets.at(-1);
     expect(bullet).toBeDefined();
     const onePageCorrection: OnePageCorrection = {
-      note: "1 visible line over one page. Remove lower-priority content until it fits.",
+      note: "Resume is 2 pages, 1 page over the one-page limit, with 1 visible line after page 1. Remove lower-priority content until it fits.",
       failureCount: 1,
       requiredOmissionCount: 1,
+      pageCount: 2,
+      pagesOverLimit: 1,
+      overflowLineCount: 1,
       candidates: [{
         baselineItemId: bullet!.id,
         section: bullet!.section,
@@ -1173,13 +1176,25 @@ describe("guarded agents", () => {
         evidenceIds: ["baseline-evidence"],
       }],
     };
+    for (const invalidMetrics of [
+      { pageCount: 1, pagesOverLimit: 0, overflowLineCount: 1 },
+      { pageCount: 3, pagesOverLimit: 1, overflowLineCount: 1 },
+      { pageCount: 2, pagesOverLimit: 1, overflowLineCount: 0 },
+    ]) {
+      expect(() => buildMechanicalTailoringPlan(ANALYSIS, BASELINE, {
+        ...onePageCorrection,
+        ...invalidMetrics,
+      })).toThrow("one-page correction metrics are invalid");
+    }
     const correctedPlan = buildMechanicalTailoringPlan(ANALYSIS, BASELINE, onePageCorrection);
     const correctedTex = `${BASELINE}\n% one-page corrected copy`;
     const runtime = runtimeWith(async (agent, input, options) => {
       runOptionsAreFresh(options, MAX_TAILORING_TOOL_CALLS + 1);
       const parsedInput = JSON.parse(input);
       expect(parsedInput.onePageCorrection).toEqual(onePageCorrection);
-      expect(input).toContain("1 visible line over one page.");
+      expect(input).toContain("\"pageCount\":2");
+      expect(input).toContain("\"pagesOverLimit\":1");
+      expect(input).toContain("\"overflowLineCount\":1");
       expect(input).toContain("Remove lower-priority content until it fits.");
       await invoke(agent, "read_working_tex", {});
       await invoke(agent, "apply_analysis_edits", {});

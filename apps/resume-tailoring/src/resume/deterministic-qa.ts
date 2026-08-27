@@ -7,6 +7,7 @@ export type DeterministicQaCheckId =
   | "pdfinfo-output"
   | "unencrypted"
   | "one-page"
+  | "page-count-consistency"
   | "letter-size"
   | "text-output"
   | "required-headings"
@@ -22,6 +23,8 @@ export interface DeterministicQaCheck {
 
 export interface DeterministicQaReport {
   readonly pass: boolean;
+  readonly pageCount: number | null;
+  readonly pagesOverLimit: number | null;
   readonly overflowLineCount: number | null;
   readonly checks: readonly DeterministicQaCheck[];
   readonly warnings: readonly string[];
@@ -54,6 +57,7 @@ interface PdfInfo {
 }
 
 interface TextOutput {
+  readonly pageCount: number;
   readonly pageTexts: readonly string[];
   readonly pageWidth: number;
   readonly pageHeight: number;
@@ -304,6 +308,7 @@ function parseTextOutput(value: string): TextOutput | null {
     || pageHeight === null
   ) return null;
   return {
+    pageCount,
     pageTexts,
     pageWidth,
     pageHeight,
@@ -394,6 +399,7 @@ export async function runDeterministicPdfQa(options: DeterministicQaOptions): Pr
     check("one-page", info?.pages === 1, "PDF has exactly one page", info ? "PDF does not have exactly one page" : "page count could not be verified"),
     check("letter-size", info !== null && isLetter(info), "page is US Letter", info ? "page is not US Letter" : "page size could not be verified"),
     check("text-output", text !== null, "text and word boxes parsed", textTool.ok ? "pdftotext output was malformed" : textTool.reason),
+    check("page-count-consistency", info !== null && text !== null && info.pages === text.pageCount, "pdfinfo and extracted-text page counts match", info && text ? "pdfinfo and extracted-text page counts disagree" : "page counts could not be compared"),
     check("required-headings", text !== null && missingHeadings.length === 0, "all required headings are visible", text ? `${missingHeadings.length} required heading(s) are missing` : "required headings could not be verified"),
     check("font-output", fonts.valid, "font output parsed", fontTool.ok ? "pdffonts output was malformed" : fontTool.reason),
     check("embedded-fonts", fonts.valid && fonts.embedded, "all fonts are embedded and non-Type 3", fonts.valid ? "an unembedded or Type 3 font is present" : "font embedding could not be verified"),
@@ -401,6 +407,8 @@ export async function runDeterministicPdfQa(options: DeterministicQaOptions): Pr
   ];
   return Object.freeze({
     pass: checks.every(({ status }) => status === "pass"),
+    pageCount: info?.pages ?? null,
+    pagesOverLimit: info === null ? null : Math.max(0, info.pages - 1),
     overflowLineCount: text?.overflowLineCount ?? null,
     checks: Object.freeze(checks),
     warnings: boundedWarnings(options.latexLog),

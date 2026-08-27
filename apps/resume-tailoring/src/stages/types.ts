@@ -2,6 +2,7 @@ import type { ContextSnapshot } from "../context/types.ts";
 import type {
   ActiveStage,
   AttemptOrigin,
+  AttemptArtifactInput,
   PublicArtifact,
   PublicAttempt,
   PublicEditRequest,
@@ -41,6 +42,7 @@ export interface StageRepository {
     attemptId: string,
     outcome: "succeeded" | "failed",
     audit?: { toolCount?: number; compileCount?: number },
+    artifacts?: readonly AttemptArtifactInput[],
   ): PublicAttempt;
   acknowledgeCancellation(attemptId: string, token: string): boolean;
   finalizeArtifact(

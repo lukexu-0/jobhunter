@@ -48,6 +48,8 @@ function healthyDependencies(overrides: Partial<RenderSmokeDependencies> = {}): 
     compile: async () => compileSuccess(),
     deterministicQa: async () => ({
       pass: true,
+      pageCount: 1,
+      pagesOverLimit: 0,
       checks: [
         { id: "one-page", status: "pass", detail: "PDF has exactly one page" },
         { id: "required-headings", status: "pass", detail: "all required headings are visible" },
@@ -81,6 +83,8 @@ describe("render smoke public boundary", () => {
         headings = request.requiredHeadings;
         return {
           pass: true,
+          pageCount: 1,
+          pagesOverLimit: 0,
           checks: [{ id: "required-headings", status: "pass", detail: "all required headings are visible" }],
           warnings: ["bounded warning"],
           overflowLineCount: 0,

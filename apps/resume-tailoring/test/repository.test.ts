@@ -427,6 +427,42 @@ describe("persisted workflow commands", () => {
     expect(serialized.toLowerCase()).not.toContain("claim_token");
   });
 
+  test("atomically finalizes failure diagnostics with the failed attempt outcome", () => {
+    const { repo } = fixture();
+    const run = repo.createRun("JD");
+    const claim = repo.acquire()!;
+    repo.transition(claim, "analyzing");
+    const attempt = repo.startAttempt(claim, "analyzing");
+    const duplicateDiagnostics = [
+      { stage: "analyzing", kind: "stage-error", sha256: "a".repeat(64), path: "/tmp/error-one", byteSize: 1 },
+      { stage: "analyzing", kind: "stage-error", sha256: "b".repeat(64), path: "/tmp/error-two", byteSize: 1 },
+    ] as const;
+
+    expect(() => repo.finishAttempt(
+      claim,
+      attempt.id,
+      "failed",
+      {},
+      duplicateDiagnostics,
+    )).toThrow();
+    expect(repo.getArtifact(run.id, "stage-error")).toBeNull();
+    expect(repo.timeline(run.id).attempts.at(-1)?.status).toBe("running");
+
+    const diagnostic = {
+      stage: "analyzing",
+      kind: "stage-error",
+      sha256: "c".repeat(64),
+      path: "/tmp/error-final",
+      byteSize: 1,
+    } as const;
+    repo.finishAttempt(claim, attempt.id, "failed", {}, [diagnostic]);
+    expect(repo.getArtifact(run.id, "stage-error")).toMatchObject({
+      attemptId: attempt.id,
+      sha256: diagnostic.sha256,
+    });
+    expect(repo.timeline(run.id).attempts.at(-1)?.status).toBe("failed");
+  });
+
   test("selects tied artifact timestamps by append-only insertion order", () => {
     const { db, repo, now } = fixture({ now: 1_234 });
     const run = repo.createRun("JD");

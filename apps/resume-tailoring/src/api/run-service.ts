@@ -204,8 +204,15 @@ function safeDetail(value: unknown): Record<string, unknown> | undefined {
 }
 
 function timeline(events: readonly PublicEvent[], fallback: RunStatus): TimelineEvent[] {
+  const publicEvents = events.filter((event) => {
+    if (event.kind !== "artifact.finalized"
+      || !event.payload
+      || typeof event.payload !== "object"
+      || Array.isArray(event.payload)) return true;
+    return (event.payload as Record<string, unknown>).kind !== "agent-transcript";
+  });
   let status: RunStatus = "queued";
-  return events.map((event) => {
+  return publicEvents.map((event) => {
     const detail = safeDetail(event.payload);
     const candidate = detail?.to ?? detail?.status;
     if (isRunStatus(candidate)) {
@@ -217,7 +224,7 @@ function timeline(events: readonly PublicEvent[], fallback: RunStatus): Timeline
     return {
       id: event.sequence,
       type: event.kind,
-      status: events.length === 1 && event.kind !== "run.created" ? fallback : status,
+      status: publicEvents.length === 1 && event.kind !== "run.created" ? fallback : status,
       revision: event.revision ?? 0,
       at: event.createdAt,
       ...(detail ? { detail } : {}),

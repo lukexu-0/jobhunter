@@ -1135,6 +1135,19 @@ describe("RunApplicationService", () => {
       path: storedExtraction.path,
       byteSize: storedExtraction.bytes,
     });
+    const storedTranscript = await target.artifacts.write(
+      join(analysisRoot, "agent-transcript.json"),
+      JSON.stringify({ schemaVersion: 1, events: [{ type: "model_response" }] }),
+      1024 * 1024,
+    );
+    const transcriptArtifact = target.repository.finalizeArtifact(claim, {
+      attemptId: analysisAttempt.id,
+      stage: "analyzing",
+      kind: "agent-transcript",
+      sha256: storedTranscript.sha256,
+      path: storedTranscript.path,
+      byteSize: storedTranscript.bytes,
+    });
     target.repository.finishAttempt(claim, analysisAttempt.id, "succeeded");
     transition(target.repository, claim, ["tailoring", "compiling"]);
     target.repository.transition(claim, "failed", { failedStage: "compiling" });
@@ -1156,6 +1169,9 @@ describe("RunApplicationService", () => {
       }),
     ]);
     expect(failedDto.artifacts.some((artifact) => artifact.id === extractionArtifact.id)).toBeFalse();
+    expect(failedDto.artifacts.some((artifact) => artifact.id === transcriptArtifact.id)).toBeFalse();
+    expect(failedDto.timeline.some((event) => event.detail?.kind === "agent-transcript"))
+      .toBeFalse();
 
     const analysisResponse = await target.service.getArtifact(run.id, analysisArtifact.id);
     expect(analysisResponse?.status).toBe(200);
@@ -1166,6 +1182,7 @@ describe("RunApplicationService", () => {
       organization: "Example Labs",
     });
     expect(await target.service.getArtifact(run.id, extractionArtifact.id)).toBeUndefined();
+    expect(await target.service.getArtifact(run.id, transcriptArtifact.id)).toBeUndefined();
 
     target.pipelineDatabase.query(`
       INSERT INTO run_artifact_retention(run_id, state, selected_at)

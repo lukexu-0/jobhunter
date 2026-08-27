@@ -82,12 +82,15 @@ describe("deterministic PDF QA", () => {
 
     expect(report.pass).toBe(true);
     expect(report.overflowLineCount).toBe(0);
+    expect(report.pageCount).toBe(1);
+    expect(report.pagesOverLimit).toBe(0);
     expect(report.checks.map(({ id, status }) => [id, status])).toEqual([
       ["pdfinfo-output", "pass"],
       ["unencrypted", "pass"],
       ["one-page", "pass"],
       ["letter-size", "pass"],
       ["text-output", "pass"],
+      ["page-count-consistency", "pass"],
       ["required-headings", "pass"],
       ["font-output", "pass"],
       ["embedded-fonts", "pass"],
@@ -178,6 +181,8 @@ describe("deterministic PDF QA", () => {
     expect(report.checks.find(({ id }) => id === "text-output")?.status).toBe("pass");
     expect(report.checks.find(({ id }) => id === "required-headings")?.status).toBe("pass");
     expect(report.overflowLineCount).toBe(6);
+    expect(report.pageCount).toBe(2);
+    expect(report.pagesOverLimit).toBe(1);
     expect(contracts.find(({ command }) => command === "pdftotext")?.args).toEqual([
       "-bbox-layout",
       "-enc",
@@ -185,6 +190,60 @@ describe("deterministic PDF QA", () => {
       pdf,
       "-",
     ]);
+  });
+
+  test("reports exact page excess and aggregates visible lines across every overflow page", async () => {
+    const { root, pdf } = await fixture();
+    const threePageBbox = `<doc>
+  <page width="612.000000" height="792.000000">
+    <line><word xMin="72" yMin="72" xMax="130" yMax="84">Experience</word></line>
+  </page>
+  <page width="612.000000" height="792.000000">
+    <line><word xMin="72" yMin="72" xMax="130" yMax="84">Overflow</word></line>
+  </page>
+  <page width="612.000000" height="792.000000">
+    <line><word xMin="72" yMin="72" xMax="130" yMax="84">More</word></line>
+    <line><word xMin="72" yMin="96" xMax="130" yMax="108">Content</word></line>
+  </page>
+</doc>`;
+    const report = await runDeterministicPdfQa({
+      pdfPath: pdf,
+      cwd: root,
+      requiredHeadings: ["Experience"],
+      boundary: fakeBoundary([
+        { stdout: [PDFINFO.replace("Pages:           1", "Pages:           3")] },
+        { stdout: [threePageBbox] },
+        { stdout: [FONTS] },
+      ]),
+    });
+
+    expect(report.pageCount).toBe(3);
+    expect(report.pagesOverLimit).toBe(2);
+    expect(report.overflowLineCount).toBe(3);
+  });
+
+  test("fails closed when pdfinfo and extracted-text page counts disagree", async () => {
+    const { root, pdf } = await fixture();
+    const twoPageBbox = BBOX.replace(
+      "</page></doc>",
+      '</page><page width="612.000000" height="792.000000"><word xMin="72" yMin="72" xMax="130" yMax="84">Overflow</word></page></doc>',
+    );
+    for (const pages of [1, 3]) {
+      const report = await runDeterministicPdfQa({
+        pdfPath: pdf,
+        cwd: root,
+        requiredHeadings: ["Experience"],
+        boundary: fakeBoundary([
+          { stdout: [PDFINFO.replace("Pages:           1", `Pages:           ${pages}`)] },
+          { stdout: [twoPageBbox] },
+          { stdout: [FONTS] },
+        ]),
+      });
+
+      expect(report.pass).toBe(false);
+      expect(report.checks.find(({ id }) => id === "page-count-consistency")?.status)
+        .toBe("fail");
+    }
   });
 
   test("does not match a required heading across a page boundary", async () => {
@@ -263,6 +322,8 @@ describe("deterministic PDF QA", () => {
     });
 
     expect(report.pass).toBe(false);
+    expect(report.pageCount).toBeNull();
+    expect(report.pagesOverLimit).toBeNull();
     expect(Object.fromEntries(report.checks.map(({ id, status }) => [id, status]))).toMatchObject({
       "pdfinfo-output": "fail",
       "text-output": "fail",

@@ -57,6 +57,9 @@ export interface OnePageCorrection {
   readonly note: string;
   readonly failureCount: number;
   readonly requiredOmissionCount: number;
+  readonly pageCount: number | null;
+  readonly pagesOverLimit: number | null;
+  readonly overflowLineCount: number;
   readonly candidates: readonly OnePageCorrectionCandidate[];
 }
 
@@ -76,6 +79,17 @@ export function buildMechanicalTailoringPlan(
     }
     if (!Number.isSafeInteger(onePageCorrection.failureCount) || onePageCorrection.failureCount < 1) {
       throw new ResumeValidationError("one-page correction failure count is invalid");
+    }
+    const legacyPageMetrics = onePageCorrection.pageCount === null
+      && onePageCorrection.pagesOverLimit === null;
+    const validCurrentPageMetrics = Number.isSafeInteger(onePageCorrection.pageCount)
+      && onePageCorrection.pageCount! >= 2
+      && Number.isSafeInteger(onePageCorrection.pagesOverLimit)
+      && onePageCorrection.pagesOverLimit === onePageCorrection.pageCount! - 1;
+    if ((!legacyPageMetrics && !validCurrentPageMetrics)
+      || !Number.isSafeInteger(onePageCorrection.overflowLineCount)
+      || onePageCorrection.overflowLineCount < 1) {
+      throw new ResumeValidationError("one-page correction metrics are invalid");
     }
     if (!Number.isSafeInteger(onePageCorrection.requiredOmissionCount)
       || onePageCorrection.requiredOmissionCount < 1

@@ -460,7 +460,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     }),
     deterministicQa: options.deterministicQa ?? (async () => deterministicReports.shift()
       ?? (options.deterministicPass === false
-        ? { pass: false, checks: [], warnings: [], overflowLineCount: null }
+        ? { pass: false, pageCount: null, pagesOverLimit: null, checks: [], warnings: [], overflowLineCount: null }
         : ONE_PAGE_QA)),
     rasterizer: async (request) => {
       const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
@@ -502,9 +502,11 @@ async function reportUnexpectedFailure(harness: Harness): Promise<void> {
 }
 
 
-function multiPageQa(overflowLineCount: number): DeterministicQaReport {
+function multiPageQa(overflowLineCount: number, pageCount = 2): DeterministicQaReport {
   return {
     pass: false,
+    pageCount,
+    pagesOverLimit: pageCount - 1,
     checks: [{ id: "one-page", status: "fail", detail: "PDF does not have exactly one page" }],
     warnings: [],
     overflowLineCount,
@@ -513,6 +515,8 @@ function multiPageQa(overflowLineCount: number): DeterministicQaReport {
 
 const ONE_PAGE_QA: DeterministicQaReport = {
   pass: true,
+  pageCount: 1,
+  pagesOverLimit: 0,
   checks: [{ id: "one-page", status: "pass", detail: "PDF has exactly one page" }],
   warnings: [],
   overflowLineCount: 0,
@@ -769,9 +773,12 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       expect(harness.agentInputs.tailoring).toHaveLength(2);
       expect(harness.agentInputs.tailoring[0]?.onePageCorrection).toBeUndefined();
       expect(harness.agentInputs.tailoring[1]?.onePageCorrection).toMatchObject({
-        note: "6 visible lines over one page. Remove lower-priority content until it fits.",
+        note: "Resume is 2 pages, 1 page over the one-page limit, with 6 visible lines after page 1. Remove lower-priority content until it fits.",
         failureCount: 1,
         requiredOmissionCount: 1,
+        pageCount: 2,
+        pagesOverLimit: 1,
+        overflowLineCount: 6,
       });
       expect(harness.tailoringResults[1]?.plan.omissions).toHaveLength(1);
       const timeline = harness.repository.timeline(harness.runId);
@@ -781,6 +788,11 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
         .filter((attempt) => attempt.stage === "compiling");
       const correction = harness.repository.getArtifact(harness.runId, "one-page-correction");
       const deterministicReport = harness.repository.getArtifact(harness.runId, "deterministic-qa");
+      expect(await Bun.file(correction!.path).json()).toMatchObject({
+        pageCount: 2,
+        pagesOverLimit: 1,
+        overflowLineCount: 6,
+      });
       const compiled = harness.repository.getArtifact(harness.runId, "compiled-pdf");
       const compiledTex = harness.repository.getArtifact(harness.runId, "tailored-tex");
       const tailoringPlan = harness.repository.getArtifact(harness.runId, "tailoring-plan");
@@ -842,6 +854,41 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
       expect(harness.repository.getArtifact(harness.runId, "keyword-map") !== null)
         .toBe(generateKeywordMap);
     }
+  });
+
+  test("continues a tailoring stage from a pre-page-metrics correction artifact", async () => {
+    let harness: Harness;
+    let replacedCorrection = false;
+    harness = await createHarness({
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
+      loadSourceContext: async () => {
+        const correction = harness?.repository.getArtifact(
+          harness.runId,
+          "one-page-correction",
+        );
+        if (!replacedCorrection && correction) {
+          await Bun.write(correction.path, JSON.stringify({
+            failureCount: 1,
+            overflowLineCount: 6,
+            note: "6 visible lines over one page. Remove lower-priority content until it fits.",
+          }));
+          replacedCorrection = true;
+        }
+        return { snapshot: harness.fixtures.snapshot, baseline };
+      },
+    });
+
+    await processToStop(harness);
+
+    expect(replacedCorrection).toBe(true);
+    expect(harness.agentInputs.tailoring[1]?.onePageCorrection).toMatchObject({
+      pageCount: null,
+      pagesOverLimit: null,
+      overflowLineCount: 6,
+      note: "6 visible lines over one page. Remove lower-priority content until it fits.",
+    });
+    await reportUnexpectedFailure(harness);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
   });
 
   test("excludes must-include directive evidence from one-page correction candidates", async () => {
@@ -959,8 +1006,8 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(harness.agentInputs.tailoring.map((input) =>
       input.onePageCorrection?.note)).toEqual([
       undefined,
-      "6 visible lines over one page. Remove lower-priority content until it fits.",
-      "1 visible line over one page. Remove lower-priority content until it fits.",
+      "Resume is 2 pages, 1 page over the one-page limit, with 6 visible lines after page 1. Remove lower-priority content until it fits.",
+      "Resume is 2 pages, 1 page over the one-page limit, with 1 visible line after page 1. Remove lower-priority content until it fits.",
     ]);
     expect(harness.agentInputs.tailoring.map((input) =>
       input.onePageCorrection?.requiredOmissionCount ?? 0)).toEqual([0, 1, 2]);
@@ -1117,8 +1164,121 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
     expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(2);
   });
 
+  test("persists bounded private model responses when an agent attempt fails", async () => {
+    let analysisCalls = 0;
+    const harness = await createHarness({
+      analysisAgent: async (attempt) => {
+        analysisCalls += 1;
+        if (analysisCalls === 1) {
+          await attempt.runtime?.modelTraceSink?.record({
+            type: "model_response",
+            model: "gpt-5.6-sol",
+            response: {
+              usage: {
+                requests: 1,
+                inputTokens: 10,
+                outputTokens: 5,
+                totalTokens: 15,
+              } as never,
+              output: [{
+                type: "function_call",
+                callId: "call-rejected",
+                name: "submit_job_analysis",
+                arguments: "{\"unsupported\":\"model output\"}",
+              }],
+            },
+          });
+          throw new Error("model output rejected");
+        }
+        return harness.fixtures.analysis;
+      },
+    });
+
+    await processToStop(harness);
+
+    const run = harness.repository.getRun(harness.runId)!;
+    const transcript = harness.repository.getArtifact(
+      harness.runId,
+      "agent-transcript",
+      run.currentRevision,
+    );
+    expect(transcript).not.toBeNull();
+    const payload = JSON.parse(
+      Buffer.from(await harness.artifacts.read(transcript!.path, 2 * 1024 * 1024))
+        .toString("utf8"),
+    );
+    expect(payload).toMatchObject({
+      schemaVersion: 1,
+      stage: "analyzing",
+      attemptId: transcript!.attemptId,
+      truncated: false,
+      events: [{
+        type: "model_response",
+        model: "gpt-5.6-sol",
+        response: {
+          output: [{
+            type: "function_call",
+            callId: "call-rejected",
+            name: "submit_job_analysis",
+            arguments: "{\"unsupported\":\"model output\"}",
+          }],
+        },
+      }],
+    });
+  });
+
+  test("bounds an oversized rejected model response while preserving its head and tail", async () => {
+    const oversizedArguments = `{"head":"${"x".repeat(2 * 1024 * 1024)}","tail":"kept"}`;
+    const harness = await createHarness({
+      analysisAgent: async (attempt) => {
+        await attempt.runtime?.modelTraceSink?.record({
+          type: "model_response",
+          response: {
+            usage: {
+              requests: 1,
+              inputTokens: 10,
+              outputTokens: 5,
+              totalTokens: 15,
+            } as never,
+            output: [{
+              type: "function_call",
+              callId: "call-oversized",
+              name: "submit_job_analysis",
+              arguments: oversizedArguments,
+            }],
+          },
+        });
+        throw new Error("oversized model output rejected");
+      },
+    });
+
+    await processToStop(harness);
+
+    const transcript = harness.repository.getArtifact(harness.runId, "agent-transcript")!;
+    expect(transcript.byteSize).toBeLessThan(2 * 1024 * 1024);
+    const payload = JSON.parse(
+      Buffer.from(await harness.artifacts.read(transcript.path, 2 * 1024 * 1024))
+        .toString("utf8"),
+    );
+    expect(payload.events[0].head).toHaveLength(32 * 1024);
+    expect(payload.events[0].tail).toHaveLength(32 * 1024);
+    expect(payload).toMatchObject({
+      schemaVersion: 1,
+      truncated: true,
+      events: [{
+        type: "trace_event_truncated",
+        originalType: "model_response",
+        originalBytes: expect.any(Number),
+        head: expect.stringContaining("\"type\":\"model_response\""),
+        tail: expect.stringContaining("tail"),
+      }],
+    });
+  });
+
   test("inherits analyzing artifacts on later-stage retry without rerunning either agent", async () => {
     const deterministicFailure: DeterministicQaReport = {
+      pageCount: null,
+      pagesOverLimit: null,
       pass: false,
       checks: [{ id: "text-output", status: "fail", detail: "Synthetic deterministic failure" }],
       warnings: [],
@@ -1259,6 +1419,8 @@ describe.skipIf(process.platform !== "linux")("pipeline stage processor cases re
   test("fails deterministic defects but keeps visual issues and uncertainty reviewable with acknowledgement", async () => {
     const deterministic = await createHarness({
       deterministicReports: [{
+        pageCount: null,
+        pagesOverLimit: null,
         pass: false,
         checks: [{ id: "letter-size", status: "fail", detail: "page is not US Letter" }],
         warnings: [],

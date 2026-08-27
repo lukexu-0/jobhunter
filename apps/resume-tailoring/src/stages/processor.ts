@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   ANALYSIS_WORKFLOW_SHA256,
@@ -12,12 +13,14 @@ import {
   validatePersistedAnalysisAgainstAtsKeywordExtraction,
   validatePersistedAtsKeywordExtractionAgainstJobDescription,
   type AgentRuntimeDependencies,
+  type ModelTraceEvent,
+  type ModelTraceSink,
   type OnePageCorrection,
 } from "../agents/index.ts";
 import type { ContextSnapshot } from "../context/types.ts";
 import { isMustIncludeEvidenceBlock } from "../context/directives.ts";
 import { ResumeDiffSchema } from "../contracts/index.ts";
-import { ClaimRejectedError, type PublicArtifact, type PublicAttempt, type PublicRun } from "../db/repository.ts";
+import { ClaimRejectedError, type AttemptArtifactInput, type PublicArtifact, type PublicAttempt, type PublicRun } from "../db/repository.ts";
 import { inspectResumePng, type VisualInspectorOptions } from "../models/visual-inspector.ts";
 import { compileResume, type CompileResult } from "../resume/compiler.ts";
 import { renderKeywordMapArtifacts } from "../resume/keyword-map.ts";
@@ -49,8 +52,18 @@ const JSON_LIMIT = 2 * 1024 * 1024;
 const JOB_DESCRIPTION_LIMIT = 1024 * 1024;
 const REQUIRED_HEADINGS = ["Education", "Experience", "Projects", "Competitions & Other", "Technical Skills"] as const;
 const MAX_ONE_PAGE_CORRECTIONS = 5;
+const MAX_AGENT_TRANSCRIPT_EVENTS = 128;
+const MAX_AGENT_TRANSCRIPT_BYTES = JSON_LIMIT - 128 * 1024;
+const MAX_AGENT_TRANSCRIPT_PREVIEW_CHARS = 32 * 1024;
 
-function onePageCorrectionNote(overflowLineCount: number): string {
+function onePageCorrectionNote(pageCount: number, overflowLineCount: number): string {
+  const pagesOverLimit = pageCount - 1;
+  const pageNoun = pagesOverLimit === 1 ? "page" : "pages";
+  const lineNoun = overflowLineCount === 1 ? "line" : "lines";
+  return `Resume is ${pageCount} pages, ${pagesOverLimit} ${pageNoun} over the one-page limit, with ${overflowLineCount} visible ${lineNoun} after page 1. Remove lower-priority content until it fits.`;
+}
+
+function legacyOnePageCorrectionNote(overflowLineCount: number): string {
   const noun = overflowLineCount === 1 ? "line" : "lines";
   return `${overflowLineCount} visible ${noun} over one page. Remove lower-priority content until it fits.`;
 }
@@ -69,6 +82,8 @@ function mustIncludeSectionEvidenceIds(snapshot: ContextSnapshot): readonly stri
 
 interface OnePageCorrectionArtifact {
   readonly failureCount: number;
+  readonly pageCount: number | null;
+  readonly pagesOverLimit: number | null;
   readonly overflowLineCount: number;
   readonly note: string;
 }
@@ -81,14 +96,30 @@ function parseOnePageCorrectionArtifact(value: unknown): OnePageCorrectionArtifa
     || candidate.failureCount! > MAX_ONE_PAGE_CORRECTIONS) {
     throw new Error("one-page correction failure count is invalid");
   }
+  const legacyArtifact = candidate.pageCount === undefined
+    && candidate.pagesOverLimit === undefined;
+  if (!legacyArtifact) {
+    if (!Number.isSafeInteger(candidate.pageCount) || candidate.pageCount! < 2) {
+      throw new Error("one-page correction page count is invalid");
+    }
+    if (!Number.isSafeInteger(candidate.pagesOverLimit)
+      || candidate.pagesOverLimit !== candidate.pageCount! - 1) {
+      throw new Error("one-page correction page excess is invalid");
+    }
+  }
   if (!Number.isSafeInteger(candidate.overflowLineCount) || candidate.overflowLineCount! < 1) {
     throw new Error("one-page correction overflow line count is invalid");
   }
-  if (candidate.note !== onePageCorrectionNote(candidate.overflowLineCount!)) {
+  const expectedNote = legacyArtifact
+    ? legacyOnePageCorrectionNote(candidate.overflowLineCount!)
+    : onePageCorrectionNote(candidate.pageCount!, candidate.overflowLineCount!);
+  if (candidate.note !== expectedNote) {
     throw new Error("one-page correction note is invalid");
   }
   return {
     failureCount: candidate.failureCount!,
+    pageCount: legacyArtifact ? null : candidate.pageCount!,
+    pagesOverLimit: legacyArtifact ? null : candidate.pagesOverLimit!,
     overflowLineCount: candidate.overflowLineCount!,
     note: candidate.note,
   };
@@ -136,6 +167,85 @@ export interface PipelineStageDependencies {
 interface AttemptAudit {
   toolCount: number;
   compileCount: number;
+}
+
+interface BoundedTranscriptEntry {
+  readonly bytes: number;
+  readonly serialized: string;
+}
+
+class BoundedAgentTranscript implements ModelTraceSink {
+  readonly #entries: BoundedTranscriptEntry[] = [];
+  #bytes = 0;
+  #truncated = false;
+
+  get isEmpty(): boolean {
+    return this.#entries.length === 0;
+  }
+
+  record(event: ModelTraceEvent): void {
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(event);
+    } catch {
+      this.#truncated = true;
+      return;
+    }
+    const originalBytes = Buffer.byteLength(serialized);
+    let persistedEvent: string;
+    let bytes: number;
+    if (originalBytes > MAX_AGENT_TRANSCRIPT_BYTES) {
+      this.#truncated = true;
+      const preview = {
+        type: "trace_event_truncated",
+        originalType: event.type,
+        originalBytes,
+        head: serialized.slice(0, MAX_AGENT_TRANSCRIPT_PREVIEW_CHARS),
+        tail: serialized.slice(-MAX_AGENT_TRANSCRIPT_PREVIEW_CHARS),
+      };
+      persistedEvent = JSON.stringify(preview);
+      bytes = Buffer.byteLength(persistedEvent);
+    } else {
+      persistedEvent = serialized;
+      bytes = originalBytes;
+    }
+    this.#entries.push({ bytes, serialized: persistedEvent });
+    this.#bytes += bytes;
+    while (
+      this.#entries.length > MAX_AGENT_TRANSCRIPT_EVENTS
+      || this.#bytes > MAX_AGENT_TRANSCRIPT_BYTES
+    ) {
+      const removed = this.#entries.shift();
+      if (!removed) break;
+      this.#bytes -= removed.bytes;
+      this.#truncated = true;
+    }
+  }
+
+  serialize(stage: PublicAttempt["stage"], attemptId: string): string {
+    const header = JSON.stringify({
+      schemaVersion: 1,
+      stage,
+      attemptId,
+      truncated: this.#truncated,
+    });
+    return `${header.slice(0, -1)},"events":[${this.#entries.map((entry) => entry.serialized).join(",")}]}\n`;
+  }
+}
+
+function agentRuntimeWithTranscript(
+  runtime: AgentRuntimeDependencies | undefined,
+  transcript: BoundedAgentTranscript,
+): AgentRuntimeDependencies {
+  const existingSink = runtime?.modelTraceSink;
+  if (!existingSink) return { ...runtime, modelTraceSink: transcript };
+  const combinedSink: ModelTraceSink = {
+    async record(event) {
+      transcript.record(event);
+      await existingSink.record(event);
+    },
+  };
+  return { ...runtime, modelTraceSink: combinedSink };
 }
 
 function isCancellation(error: unknown, signal: AbortSignal): boolean {
@@ -211,6 +321,8 @@ export class PipelineStageProcessor {
       const stage = run.status;
       let attempt: PublicAttempt | undefined;
       const audit: AttemptAudit = { toolCount: 0, compileCount: 0 };
+      const transcript = new BoundedAgentTranscript();
+      const agentRuntime = agentRuntimeWithTranscript(this.#agentRuntime, transcript);
       try {
         const sources = await this.#verifiedSources(run.id, signal);
         signal.throwIfAborted();
@@ -221,24 +333,29 @@ export class PipelineStageProcessor {
           processPid: process.pid,
           processStartToken,
         });
-        await this.#runStage(claim, run, attempt, sources, signal, audit);
+        await this.#runStage(claim, run, attempt, sources, signal, audit, agentRuntime);
       } catch (error) {
         if (isCancellation(error, signal)) {
           if (attempt) this.#repository.acknowledgeCancellation(attempt.id, claim.token);
           return;
         }
         if (attempt) {
+          let failureArtifacts: AttemptArtifactInput[] = [];
           try {
-            await this.#recordFailure(claim, run, attempt, error);
+            failureArtifacts = await this.#recordFailure(run, attempt, error, transcript);
           } catch (diagnosticError) {
-            if (isCancellation(diagnosticError, signal)) {
-              this.#repository.acknowledgeCancellation(attempt.id, claim.token);
-              return;
-            }
             console.error("Failed to persist stage diagnostic", diagnosticError);
           }
-          try { this.#repository.finishAttempt(claim, attempt.id, "failed", audit); }
-          catch (finishError) {
+          try {
+            this.#repository.finishAttempt(
+              claim,
+              attempt.id,
+              "failed",
+              audit,
+              failureArtifacts,
+            );
+          } catch (finishError) {
+            await this.#removeFailureArtifacts(failureArtifacts);
             if (isCancellation(finishError, signal)) {
               this.#repository.acknowledgeCancellation(attempt.id, claim.token);
               return;
@@ -259,19 +376,20 @@ export class PipelineStageProcessor {
     sources: StageSourceContext,
     signal: AbortSignal,
     audit: AttemptAudit,
+    agentRuntime: AgentRuntimeDependencies,
   ): Promise<void> {
     switch (attempt.stage) {
-      case "analyzing": await this.#analyze(claim, run, attempt, sources, signal, audit); return;
-      case "tailoring": await this.#tailor(claim, run, attempt, sources, signal, audit); return;
-      case "editing": await this.#edit(claim, run, attempt, sources, signal, audit); return;
+      case "analyzing": await this.#analyze(claim, run, attempt, sources, signal, audit, agentRuntime); return;
+      case "tailoring": await this.#tailor(claim, run, attempt, sources, signal, audit, agentRuntime); return;
+      case "editing": await this.#edit(claim, run, attempt, sources, signal, audit, agentRuntime); return;
       case "compiling": await this.#compile(claim, run, attempt, sources, signal, audit); return;
-      case "repairing": await this.#repair(claim, run, attempt, sources, signal, audit); return;
+      case "repairing": await this.#repair(claim, run, attempt, sources, signal, audit, agentRuntime); return;
       case "deterministic_qa": await this.#deterministic(claim, run, attempt, sources, signal, audit); return;
       case "visual_qa": await this.#visual(claim, run, attempt, sources, signal, audit); return;
     }
   }
 
-  async #analyze(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
+  async #analyze(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit, agentRuntime: AgentRuntimeDependencies): Promise<void> {
     if (this.#repository.getArtifact(run.id, "ats-keyword-extraction")) {
       throw new Error("ATS keyword extraction is immutable once finalized");
     }
@@ -288,7 +406,7 @@ export class PipelineStageProcessor {
         rawJobDescription,
       },
       signal,
-      ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
+      runtime: agentRuntime,
     });
     audit.toolCount = 1;
     validateAtsKeywordExtractionAgainstJobDescription(
@@ -306,7 +424,7 @@ export class PipelineStageProcessor {
         context: sources.snapshot,
       },
       signal,
-      ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
+      runtime: agentRuntime,
     });
     audit.toolCount = 2;
     if (analysis.analysisWorkflowSha256 !== ANALYSIS_WORKFLOW_SHA256) {
@@ -345,7 +463,7 @@ export class PipelineStageProcessor {
     this.#repository.transition(claim, "tailoring");
   }
 
-  async #tailor(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
+  async #tailor(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit, agentRuntime: AgentRuntimeDependencies): Promise<void> {
     const analysisArtifact = this.#requiredArtifact(run.id, "job-analysis");
     const analysis = JobAnalysisSchema.parse(await this.#readJson(analysisArtifact));
     const mustIncludeEvidenceIds = mustIncludeSectionEvidenceIds(sources.snapshot);
@@ -370,7 +488,7 @@ export class PipelineStageProcessor {
         ...(onePageCorrection ? { onePageCorrection } : {}),
       },
       signal,
-      ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
+      runtime: agentRuntime,
     });
     audit.toolCount = result.toolCount;
     validateAnalysisImmutability(result.plan, analysis);
@@ -396,7 +514,7 @@ export class PipelineStageProcessor {
     this.#repository.transition(claim, "compiling");
   }
 
-  async #edit(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
+  async #edit(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit, agentRuntime: AgentRuntimeDependencies): Promise<void> {
     const request = this.#repository.getEditRequest(run.id, run.currentRevision);
     if (!request) throw new Error("edit request is missing");
     const analysisArtifact = this.#requiredArtifact(run.id, "job-analysis");
@@ -424,7 +542,7 @@ export class PipelineStageProcessor {
         ...(request.origin === "machine_regenerate" ? { machineFindings: { deterministicQa, visualQa } } : {}),
       },
       signal,
-      ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
+      runtime: agentRuntime,
     });
     audit.toolCount = 1;
     const tailoredTex = renderEditedResume(result, comments, analysis, sources.baseline, sources.snapshot);
@@ -497,7 +615,7 @@ export class PipelineStageProcessor {
     else this.#repository.transition(claim, "failed", { failedStage: "compiling" });
   }
 
-  async #repair(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit): Promise<void> {
+  async #repair(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, sources: StageSourceContext, signal: AbortSignal, audit: AttemptAudit, agentRuntime: AgentRuntimeDependencies): Promise<void> {
     const texArtifact = this.#requiredArtifact(run.id, "tailored-tex");
     const logArtifact = this.#requiredArtifact(run.id, "latex-log");
     const failedTex = await this.#readText(texArtifact, ARTIFACT_LIMITS.tex);
@@ -544,7 +662,7 @@ export class PipelineStageProcessor {
         },
       },
       signal,
-      ...(this.#agentRuntime ? { runtime: this.#agentRuntime } : {}),
+      runtime: agentRuntime,
     });
     audit.toolCount += 1;
     signal.throwIfAborted();
@@ -592,7 +710,11 @@ export class PipelineStageProcessor {
       && failedChecks[0]?.id === "one-page";
     const hasPositiveOverflowLineCount = Number.isSafeInteger(report.overflowLineCount)
       && report.overflowLineCount! > 0;
-    if (pureOnePageFailure && hasPositiveOverflowLineCount) {
+    const hasValidPageExcess = Number.isSafeInteger(report.pageCount)
+      && report.pageCount! >= 2
+      && Number.isSafeInteger(report.pagesOverLimit)
+      && report.pagesOverLimit === report.pageCount! - 1;
+    if (pureOnePageFailure && hasPositiveOverflowLineCount && hasValidPageExcess) {
       const priorArtifact = this.#currentRevisionArtifact(run, "one-page-correction");
       const prior = priorArtifact
         ? parseOnePageCorrectionArtifact(await this.#readJson(priorArtifact))
@@ -610,8 +732,10 @@ export class PipelineStageProcessor {
         if (priorFailureCount < candidates.length) {
           const correction: OnePageCorrectionArtifact = {
             failureCount: priorFailureCount + 1,
+            pageCount: report.pageCount!,
+            pagesOverLimit: report.pagesOverLimit!,
             overflowLineCount: report.overflowLineCount!,
-            note: onePageCorrectionNote(report.overflowLineCount!),
+            note: onePageCorrectionNote(report.pageCount!, report.overflowLineCount!),
           };
           const correctionMeta = await this.#artifacts.write(
             join(root, "one-page-correction.json"),
@@ -696,7 +820,12 @@ export class PipelineStageProcessor {
     this.#repository.completeVisualQa(claim, pdf.sha256, visual.status !== "pass");
   }
 
-  async #recordFailure(claim: RunClaim, run: PublicRun, attempt: PublicAttempt, error: unknown): Promise<void> {
+  async #recordFailure(
+    run: PublicRun,
+    attempt: PublicAttempt,
+    error: unknown,
+    transcript: BoundedAgentTranscript,
+  ): Promise<AttemptArtifactInput[]> {
     const root = this.#artifacts.attemptRoot(this.#address(run, attempt));
     if (!await artifactExists(root)) await this.#artifacts.createAttempt(this.#address(run, attempt));
     const metadata = await this.#artifacts.write(
@@ -704,7 +833,41 @@ export class PipelineStageProcessor {
       failureDiagnostic(error),
       ARTIFACT_LIMITS.log,
     );
-    this.#finalize(claim, attempt, "stage-error", metadata);
+    const failureArtifacts: AttemptArtifactInput[] = [{
+      stage: attempt.stage,
+      kind: "stage-error",
+      sha256: metadata.sha256,
+      path: metadata.path,
+      byteSize: metadata.bytes,
+    }];
+    if (transcript.isEmpty) return failureArtifacts;
+    try {
+      const transcriptMetadata = await this.#artifacts.write(
+        join(root, "agent-transcript.json"),
+        transcript.serialize(attempt.stage, attempt.id),
+        JSON_LIMIT,
+      );
+      failureArtifacts.push({
+        stage: attempt.stage,
+        kind: "agent-transcript",
+        sha256: transcriptMetadata.sha256,
+        path: transcriptMetadata.path,
+        byteSize: transcriptMetadata.bytes,
+      });
+    } catch (transcriptError) {
+      console.error("Failed to persist agent transcript", transcriptError);
+    }
+    return failureArtifacts;
+  }
+
+  async #removeFailureArtifacts(artifacts: readonly AttemptArtifactInput[]): Promise<void> {
+    await Promise.all(artifacts.map(async (artifact) => {
+      try {
+        await rm(artifact.path, { force: true });
+      } catch (error) {
+        console.error("Failed to remove uncommitted stage diagnostic", error);
+      }
+    }));
   }
 
   #requiredRun(runId: string): PublicRun {
@@ -748,6 +911,9 @@ export class PipelineStageProcessor {
       throw new Error("one-page correction has no evidence-backed omission candidates");
     }
     return {
+      pageCount: state.pageCount,
+      pagesOverLimit: state.pagesOverLimit,
+      overflowLineCount: state.overflowLineCount,
       note: state.note,
       failureCount: state.failureCount,
       requiredOmissionCount: Math.min(state.failureCount, candidates.length),

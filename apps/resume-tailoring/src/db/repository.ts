@@ -194,6 +194,14 @@ export interface PublicAttempt {
 export interface PublicEvent { readonly sequence: number; readonly revision: number | null; readonly kind: string; readonly payload: unknown; readonly createdAt: number }
 export interface PublicTimeline { readonly events: readonly PublicEvent[]; readonly attempts: readonly PublicAttempt[] }
 export interface PublicArtifact { readonly id: string; readonly revision: number; readonly attemptId: string | null; readonly stage: string; readonly kind: string; readonly sha256: string; readonly path: string; readonly byteSize: number; readonly createdAt: number }
+export interface AttemptArtifactInput {
+  readonly stage: string;
+  readonly kind: string;
+  readonly sha256: string;
+  readonly path: string;
+  readonly byteSize: number;
+  readonly sourceArtifactId?: string;
+}
 export interface PrunedRunArtifact {
   readonly id: string;
   readonly path: string;
@@ -1871,9 +1879,26 @@ export class PipelineRepository {
     });
   }
 
-  finishAttempt(claim: Pick<RunClaim, "runId" | "token">, attemptId: string, outcome: "succeeded" | "failed", audit: { toolCount?: number; compileCount?: number } = {}): PublicAttempt {
+  finishAttempt(
+    claim: Pick<RunClaim, "runId" | "token">,
+    attemptId: string,
+    outcome: "succeeded" | "failed",
+    audit: { toolCount?: number; compileCount?: number } = {},
+    artifacts: readonly AttemptArtifactInput[] = [],
+  ): PublicAttempt {
     return this.#immediate(() => {
-      const now = this.#now(); this.#assertClaim(claim, now);
+      const now = this.#now();
+      this.#assertClaim(claim, now);
+      const attempt = this.#db.query<AttemptRow, [string, string, string]>(
+        "SELECT * FROM attempts WHERE id=? AND run_id=? AND claim_token=? AND status='running'",
+      ).get(attemptId, claim.runId, claim.token);
+      if (!attempt) throw new ClaimRejectedError("attempt is not owned by this live claim");
+      for (const artifact of artifacts) {
+        const id = this.#idFactory();
+        this.#db.query("INSERT INTO artifacts(id,run_id,revision,attempt_id,stage,kind,sha256,path,byte_size,source_artifact_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+          .run(id, attempt.run_id, attempt.revision, attemptId, artifact.stage, artifact.kind, artifact.sha256, artifact.path, artifact.byteSize, artifact.sourceArtifactId ?? null, now);
+        this.#event(attempt.run_id, attempt.revision, "artifact.finalized", { artifactId: id, attemptId, kind: artifact.kind, sha256: artifact.sha256, byteSize: artifact.byteSize }, now);
+      }
       const result = this.#db.query("UPDATE attempts SET status=?, tool_count=?, compile_count=?, finished_at=? WHERE id=? AND run_id=? AND claim_token=? AND status='running'")
         .run(outcome, audit.toolCount ?? 0, audit.compileCount ?? 0, now, attemptId, claim.runId, claim.token);
       if (result.changes !== 1) throw new ClaimRejectedError("attempt is not owned by this live claim");
