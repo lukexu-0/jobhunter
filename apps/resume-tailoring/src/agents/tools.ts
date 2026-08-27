@@ -2,7 +2,7 @@ import { tool, type Tool } from "@openai/agents-core";
 import { z } from "zod";
 
 export const MAX_SUBMISSION_BYTES = 512 * 1024;
-export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
+export const DEFAULT_TOOL_TIMEOUT_MS = 5 * 60 * 1_000;
 
 export interface TerminalSubmission<T> {
   readonly tool: Tool<unknown>;

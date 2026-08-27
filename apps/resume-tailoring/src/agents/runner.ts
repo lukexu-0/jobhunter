@@ -13,11 +13,11 @@ import {
 } from "@openai/agents-core";
 import { OAuthCodexModelProvider } from "../models/oauth-codex-provider.ts";
 
-export const ATS_KEYWORD_EXTRACTION_DEADLINE_MS = 120_000;
-export const ANALYSIS_DEADLINE_MS = 20 * 60 * 1_000;
-export const REPAIR_DEADLINE_MS = 10 * 60 * 1_000;
-export const TAILORING_DEADLINE_MS = 15 * 60 * 1_000;
-export const EDIT_DEADLINE_MS = 15 * 60 * 1_000;
+export const ATS_KEYWORD_EXTRACTION_DEADLINE_MS = 10 * 60 * 1_000;
+export const ANALYSIS_DEADLINE_MS = 100 * 60 * 1_000;
+export const REPAIR_DEADLINE_MS = 50 * 60 * 1_000;
+export const TAILORING_DEADLINE_MS = 75 * 60 * 1_000;
+export const EDIT_DEADLINE_MS = 75 * 60 * 1_000;
 export const MAX_AGENT_INPUT_BYTES = 1024 * 1024;
 export const MAX_AGENT_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 

@@ -19,6 +19,10 @@ import {
   AgentDeadlineError,
   ANALYSIS_DEADLINE_MS,
   ATS_KEYWORD_EXTRACTION_DEADLINE_MS,
+  DEFAULT_TOOL_TIMEOUT_MS,
+  EDIT_DEADLINE_MS,
+  REPAIR_DEADLINE_MS,
+  TAILORING_DEADLINE_MS,
   createTerminalSubmission,
   runAnalysisAgent,
   runAtsKeywordExtractionAgent,
@@ -190,6 +194,15 @@ function runOptionsAreFresh(options: { maxTurns: number | null; signal: AbortSig
 }
 
 describe("guarded agents", () => {
+  test("publishes fivefold resume pipeline agent deadlines", () => {
+    expect(ATS_KEYWORD_EXTRACTION_DEADLINE_MS).toBe(10 * 60 * 1_000);
+    expect(ANALYSIS_DEADLINE_MS).toBe(100 * 60 * 1_000);
+    expect(REPAIR_DEADLINE_MS).toBe(50 * 60 * 1_000);
+    expect(TAILORING_DEADLINE_MS).toBe(75 * 60 * 1_000);
+    expect(EDIT_DEADLINE_MS).toBe(75 * 60 * 1_000);
+    expect(DEFAULT_TOOL_TIMEOUT_MS).toBe(5 * 60 * 1_000);
+  });
+
   test("owns short, hash-locked prompts without legacy workflow sections", () => {
     expect(ANALYSIS_TASK).toBe(
       "Identify evidence-backed JD keywords and exact replacements for existing resume bullets and skills.",
@@ -224,8 +237,6 @@ describe("guarded agents", () => {
       .toBeLessThanOrEqual(120);
     expect(`${TAILORING_TASK} ${TAILORING_INSTRUCTIONS}`.trim().split(/\s+/).length)
       .toBeLessThanOrEqual(50);
-    expect(ATS_KEYWORD_EXTRACTION_DEADLINE_MS).toBe(120_000);
-    expect(ANALYSIS_DEADLINE_MS).toBe(20 * 60 * 1_000);
     const prompts = `${ANALYSIS_TASK}\n${ANALYSIS_INSTRUCTIONS}\n${TAILORING_TASK}\n${TAILORING_INSTRUCTIONS}`;
     for (const legacySection of [
       "Role-market analysis",
