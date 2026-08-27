@@ -46,6 +46,34 @@ describe("concurrent worker scheduler", () => {
       new Set(claims.map(({ runId, token }) => `${runId}:${token}`)),
     );
   });
+  test("starts newly kicked work while an earlier processor remains active", async () => {
+    const queue = [claim("run-1", 1)];
+    const started: string[] = [];
+    const gates = new Map<string, () => void>();
+    let signalFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { signalFirstStarted = resolve; });
+    const scheduler = new WorkerScheduler({
+      acquire: () => queue.shift() ?? null,
+      heartbeat: (value) => ({ ...value, expiresAt: 60_000 }),
+      release: () => undefined,
+    }, async (value) => {
+      started.push(value.runId);
+      if (value.runId === "run-1") signalFirstStarted();
+      await new Promise<void>((resolve) => { gates.set(value.runId, resolve); });
+    }, { concurrency: 2 });
+
+    scheduler.kick();
+    await firstStarted;
+    queue.push(claim("run-2", 2));
+    scheduler.kick();
+    for (let index = 0; index < 5; index++) await Promise.resolve();
+
+    expect(started).toEqual(["run-1", "run-2"]);
+
+    gates.get("run-1")!();
+    gates.get("run-2")!();
+    await scheduler.waitForIdle();
+  });
 
   test("close aborts and joins all five active processors", async () => {
     const queue = Array.from({ length: 5 }, (_, index) => claim(`run-${index + 1}`, index + 1));
@@ -130,6 +158,110 @@ describe("concurrent worker scheduler", () => {
     recovery();
     await scheduler.waitForIdle();
     expect(afterDrainCalls).toBe(1);
+    await scheduler.close();
+  });
+  test("does not acquire kicked work during heartbeat-loss recovery", async () => {
+    const queue = [claim("run-1", 1)];
+    const started: string[] = [];
+    let heartbeat!: () => void;
+    let recovery!: () => void;
+    let releaseAbortCleanup!: () => void;
+    let signalFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { signalFirstStarted = resolve; });
+    const scheduler = new WorkerScheduler({
+      acquire: () => queue.shift() ?? null,
+      heartbeat: () => { throw new Error("stale claim"); },
+      release: () => undefined,
+    }, async (value, signal) => {
+      started.push(value.runId);
+      if (value.runId !== "run-1") return;
+      signalFirstStarted();
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => { releaseAbortCleanup = resolve; }, { once: true });
+      });
+    }, {
+      concurrency: 2,
+      setInterval: ((callback: () => void) => {
+        heartbeat = callback;
+        return { unref() {} };
+      }) as unknown as typeof globalThis.setInterval,
+      clearInterval: (() => undefined) as unknown as typeof globalThis.clearInterval,
+      setTimeout: ((callback: () => void) => {
+        recovery = callback;
+        return { unref() {} };
+      }) as unknown as typeof globalThis.setTimeout,
+    });
+
+    scheduler.kick();
+    await firstStarted;
+    heartbeat();
+    queue.push(claim("run-2", 2));
+    scheduler.kick();
+    for (let index = 0; index < 5; index++) await Promise.resolve();
+    expect(started).toEqual(["run-1"]);
+
+    releaseAbortCleanup();
+    await scheduler.waitForIdle();
+    expect(started).toEqual(["run-1"]);
+
+    recovery();
+    await scheduler.waitForIdle();
+    expect(started).toEqual(["run-1", "run-2"]);
+    await scheduler.close();
+  });
+  test("fills a free slot after recovery while another processor remains active", async () => {
+    const queue = [claim("run-1", 1), claim("run-2", 2)];
+    const started: string[] = [];
+    const heartbeats: Array<() => void> = [];
+    let recovery!: () => void;
+    let releaseSecond!: () => void;
+    let signalTwoStarted!: () => void;
+    const twoStarted = new Promise<void>((resolve) => { signalTwoStarted = resolve; });
+    let signalRecoveryScheduled!: () => void;
+    const recoveryScheduled = new Promise<void>((resolve) => { signalRecoveryScheduled = resolve; });
+    const scheduler = new WorkerScheduler({
+      acquire: () => queue.shift() ?? null,
+      heartbeat: (value) => {
+        if (value.runId === "run-1") throw new Error("stale claim");
+        return { ...value, expiresAt: 60_000 };
+      },
+      release: () => undefined,
+    }, async (value, signal) => {
+      started.push(value.runId);
+      if (started.length === 2) signalTwoStarted();
+      if (value.runId === "run-1") {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      } else if (value.runId === "run-2") {
+        await new Promise<void>((resolve) => { releaseSecond = resolve; });
+      }
+    }, {
+      concurrency: 2,
+      setInterval: ((callback: () => void) => {
+        heartbeats.push(callback);
+        return { unref() {} };
+      }) as unknown as typeof globalThis.setInterval,
+      clearInterval: (() => undefined) as unknown as typeof globalThis.clearInterval,
+      setTimeout: ((callback: () => void) => {
+        recovery = callback;
+        signalRecoveryScheduled();
+        return { unref() {} };
+      }) as unknown as typeof globalThis.setTimeout,
+    });
+
+    scheduler.kick();
+    await twoStarted;
+    queue.push(claim("run-3", 3));
+    heartbeats[0]!();
+    await recoveryScheduled;
+    recovery();
+    for (let index = 0; index < 5; index++) await Promise.resolve();
+
+    expect(started).toEqual(["run-1", "run-2", "run-3"]);
+
+    releaseSecond();
+    await scheduler.waitForIdle();
     await scheduler.close();
   });
 

@@ -33,6 +33,7 @@ export class WorkerScheduler {
   readonly #activeControllers = new Set<AbortController>();
   #running: Promise<void> | undefined;
   #kickPending = false;
+  #wakeDrain: (() => void) | undefined;
   #recoveryPending = 0;
   #closed = false;
 
@@ -59,6 +60,7 @@ export class WorkerScheduler {
     if (this.#closed || this.#recoveryPending > 0) return;
     if (this.#running) {
       this.#kickPending = true;
+      this.#wakeDrain?.();
       return;
     }
     const running = Promise.resolve().then(() => this.#drain()).finally(() => {
@@ -88,9 +90,8 @@ export class WorkerScheduler {
     const active = new Set<Promise<boolean>>();
     let acquisitionFailed = false;
     let queueExhausted = false;
-    let recoveryInterrupted = false;
 
-    while (!this.#closed && !acquisitionFailed && !recoveryInterrupted) {
+    while (!this.#closed && !acquisitionFailed) {
       while (
         !this.#closed
         && this.#recoveryPending === 0
@@ -116,7 +117,7 @@ export class WorkerScheduler {
         active.add(processing);
       }
 
-      if (this.#closed || acquisitionFailed || recoveryInterrupted) break;
+      if (this.#closed || acquisitionFailed) break;
       if (active.size === 0) {
         if (queueExhausted && this.#recoveryPending === 0) {
           try {
@@ -128,9 +129,21 @@ export class WorkerScheduler {
         return;
       }
 
-      const leaseLive = await Promise.race(active);
+      if (queueExhausted || this.#recoveryPending > 0) {
+        const kicked = new Promise<undefined>((resolve) => {
+          this.#wakeDrain = () => resolve(undefined);
+        });
+        const result = await Promise.race([...active, kicked]);
+        this.#wakeDrain = undefined;
+        if (result === undefined) {
+          this.#kickPending = false;
+          queueExhausted = false;
+          continue;
+        }
+      } else {
+        await Promise.race(active);
+      }
       queueExhausted = false;
-      if (!leaseLive) recoveryInterrupted = true;
     }
 
     if (active.size > 0) await Promise.all(active);
@@ -140,6 +153,13 @@ export class WorkerScheduler {
     const controller = new AbortController();
     this.#activeControllers.add(controller);
     let leaseLive = true;
+    let recoveryRegistered = false;
+    const registerRecovery = () => {
+      if (recoveryRegistered || this.#closed) return;
+      recoveryRegistered = true;
+      this.#recoveryPending += 1;
+      this.#kickPending = false;
+    };
     let heartbeatRunning = false;
     const heartbeat = async () => {
       if (heartbeatRunning || controller.signal.aborted) return;
@@ -148,6 +168,7 @@ export class WorkerScheduler {
         this.repository.heartbeat(claim);
       } catch (error) {
         leaseLive = false;
+        registerRecovery();
         controller.abort(error);
       } finally {
         heartbeatRunning = false;
@@ -166,18 +187,17 @@ export class WorkerScheduler {
           this.repository.release(claim);
         } catch (error) {
           leaseLive = false;
+          registerRecovery();
           controller.abort(error);
         }
       }
-      if (!leaseLive && !this.#closed) this.#scheduleRecovery();
+      if (recoveryRegistered && !this.#closed) this.#scheduleRecovery();
       this.#activeControllers.delete(controller);
     }
     return leaseLive;
   }
 
   #scheduleRecovery(): void {
-    this.#recoveryPending += 1;
-    this.#kickPending = false;
     const recovery = this.#setTimeout(() => {
       if (this.#closed) return;
       this.#recoveryPending -= 1;
