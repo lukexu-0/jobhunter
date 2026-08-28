@@ -585,6 +585,8 @@ class HarnessConfig(FrozenPrivateModel):
         "apps/user-info/current-context/personal/user-info.json"
     )
     credentials_json: Path = Path("~/.jobhunter/browser-harness/credentials.json")
+    gmail_token_json: Path = Path("~/.jobhunter/browser-harness/gmail-token.json")
+    gmail_verification_timeout: int = Field(default=180, ge=1, le=900)
     browser: BrowserLaunchConfig = Field(default_factory=BrowserLaunchConfig)
 
     @field_validator("pipeline_url")

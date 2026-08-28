@@ -416,6 +416,9 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
         credentials_json=Path(
             "~/.jobhunter/browser-harness/credentials.json"
         ).expanduser().absolute(),
+        gmail_token_json=Path(
+            "~/.jobhunter/browser-harness/gmail-token.json"
+        ).expanduser().absolute(),
         browser=BrowserLaunchConfig(
             chrome_executable=executable,
             chrome_user_data_dir=profile,
@@ -483,6 +486,7 @@ def test_runtime_paths_are_explicit_resolved_configuration(
     node, script = fake_playwright_cli
     user_info_json = tmp_path / "private" / "user-info.json"
     credentials_json = tmp_path / "private-credentials" / "credentials.json"
+    gmail_token_json = tmp_path / "private-gmail" / "token.json"
 
     config, _ = cli_module.parse_config(
         [
@@ -496,6 +500,10 @@ def test_runtime_paths_are_explicit_resolved_configuration(
             str(user_info_json),
             "--credentials-json",
             str(credentials_json),
+            "--gmail-token-json",
+            str(gmail_token_json),
+            "--gmail-verification-timeout",
+            "240",
         ],
         environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
     )
@@ -503,6 +511,8 @@ def test_runtime_paths_are_explicit_resolved_configuration(
     assert config.playwright_cli_script == script.resolve()
     assert config.user_info_json == user_info_json.resolve()
     assert config.credentials_json == credentials_json.absolute()
+    assert config.gmail_token_json == gmail_token_json.absolute()
+    assert config.gmail_verification_timeout == 240
 
 
 
@@ -825,6 +835,9 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         playwright_cli_script=fake_playwright_cli[1].resolve(),
         credentials_json=Path(
             "~/.jobhunter/browser-harness/credentials.json"
+        ).expanduser().absolute(),
+        gmail_token_json=Path(
+            "~/.jobhunter/browser-harness/gmail-token.json"
         ).expanduser().absolute(),
         browser=expected_browser,
     )

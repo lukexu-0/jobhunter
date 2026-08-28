@@ -365,10 +365,20 @@ def test_harness_config_requires_long_token_and_loopback_pipeline() -> None:
         session_timeout=1,
     )
     assert config.pipeline_url == "http://LOCALHOST:3457"
+    assert config.gmail_token_json == Path(
+        "~/.jobhunter/browser-harness/gmail-token.json"
+    )
+    assert config.gmail_verification_timeout == 180
 
     for token in ("", "x" * 31):
         with pytest.raises(ValidationError):
             HarnessConfig(bearer_token=token)
+    for timeout in (0, 901):
+        with pytest.raises(ValidationError):
+            HarnessConfig(
+                bearer_token=TOKEN,
+                gmail_verification_timeout=timeout,
+            )
 
     for pipeline_url in (
         "https://127.0.0.1:3457",

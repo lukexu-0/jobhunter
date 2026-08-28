@@ -82,6 +82,21 @@ def _parser() -> argparse.ArgumentParser:
             "(default: ~/.jobhunter/browser-harness/credentials.json)"
         ),
     )
+    parser.add_argument(
+        "--gmail-token-json",
+        type=Path,
+        default=None,
+        help=(
+            "private authorized-user Gmail token with read-only scope "
+            "(default: ~/.jobhunter/browser-harness/gmail-token.json)"
+        ),
+    )
+    parser.add_argument(
+        "--gmail-verification-timeout",
+        type=int,
+        default=180,
+        help="seconds to wait for a verification email (default: 180)",
+    )
     launch = parser.add_mutually_exclusive_group()
     launch.add_argument(
         "--chrome-executable",
@@ -120,6 +135,7 @@ def _resolve_regular_file(
 
 _DEFAULT_TOKEN_PATH = Path("~/.jobhunter/browser-harness/token")
 _DEFAULT_CREDENTIALS_PATH = Path("~/.jobhunter/browser-harness/credentials.json")
+_DEFAULT_GMAIL_TOKEN_PATH = Path("~/.jobhunter/browser-harness/gmail-token.json")
 _MAX_TOKEN_FILE_BYTES = 4096
 
 def _absolute_without_symlink_resolution(path: Path) -> Path:
@@ -277,6 +293,12 @@ def parse_config(
                 if args.credentials_json is None
                 else args.credentials_json
             ),
+            gmail_token_json=_absolute_without_symlink_resolution(
+                _DEFAULT_GMAIL_TOKEN_PATH
+                if args.gmail_token_json is None
+                else args.gmail_token_json
+            ),
+            gmail_verification_timeout=args.gmail_verification_timeout,
             browser=browser,
         )
         resolved = resolve_browser_launch(browser)
