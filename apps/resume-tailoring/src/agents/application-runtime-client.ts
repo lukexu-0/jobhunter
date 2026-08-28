@@ -255,6 +255,7 @@ export const PlaywrightSnapshotElementRefSchema = z.string().regex(
 
 export const RequestSignInRuntimeActionSchema = z.object({
   type: z.literal("request_sign_in"),
+  account_action: z.enum(["create_account", "sign_in"]),
   username_ref: PlaywrightSnapshotElementRefSchema,
   password_ref: PlaywrightSnapshotElementRefSchema,
   password_confirmation_ref: PlaywrightSnapshotElementRefSchema.optional(),

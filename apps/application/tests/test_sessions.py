@@ -471,14 +471,14 @@ class FakePlaywrightRuntime:
     async def complete_email_verification(
         self,
         *,
-        approved_origins: Sequence[str],
+        expected_origin: str,
         challenge: VerificationChallenge,
         code_ref: str | None,
         submit_ref: str | None,
     ) -> bool:
         self.email_verification_calls.append(
             {
-                "approved_origins": tuple(approved_origins),
+                "expected_origin": expected_origin,
                 "challenge": challenge,
                 "code_ref": code_ref,
                 "submit_ref": submit_ref,
@@ -513,12 +513,14 @@ class FakeVerificationInbox:
         self,
         *,
         recipient: str,
+        expected_origin: str,
         not_before: datetime,
         timeout_seconds: int,
     ) -> VerificationChallenge:
         self.calls.append(
             {
                 "recipient": recipient,
+                "expected_origin": expected_origin,
                 "not_before": not_before,
                 "timeout_seconds": timeout_seconds,
             }
@@ -6921,7 +6923,7 @@ async def test_default_signup_scans_gmail_and_completes_code_verification(
         received_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
         sender="accounts@jobs.example",
         subject="Verification code",
-        urls=(),
+        urls=("https://jobs.example/verify?token=private-token",),
         codes=("482913",),
     )
     inbox = FakeVerificationInbox(challenge)
@@ -6938,24 +6940,42 @@ async def test_default_signup_scans_gmail_and_completes_code_verification(
         created.session_id,
         PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
     )
-    before_sign_in = datetime.now(UTC)
+    before_create = datetime.now(UTC)
     sign_in = await runtime_action(
         manager,
         created.session_id,
         RequestSignInRuntimeAction(
             type="request_sign_in",
+            account_action="create_account",
             username_ref="e1",
             password_ref="e2",
             password_confirmation_ref="e3",
             submit_ref="e4",
         ),
     )
-    after_sign_in = datetime.now(UTC)
+    after_create = datetime.now(UTC)
     assert sign_in == SignInRuntimeActionResponse(type="sign_in", status="attempted")
     assert fakes.runtimes[0].sign_in_calls[-1]["username"] == "candidate@example.test"
     assert fakes.runtimes[0].sign_in_calls[-1]["password"] == "ExamplePassword123$$"
     assert fakes.runtimes[0].sign_in_calls[-1]["password_confirmation_ref"] == "e3"
 
+    await runtime_action(
+        manager,
+        created.session_id,
+        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
+    )
+    fallback = await runtime_action(
+        manager,
+        created.session_id,
+        RequestSignInRuntimeAction(
+            type="request_sign_in",
+            account_action="sign_in",
+            username_ref="e5",
+            password_ref="e6",
+            submit_ref="e7",
+        ),
+    )
+    assert fallback == SignInRuntimeActionResponse(type="sign_in", status="attempted")
     await runtime_action(
         manager,
         created.session_id,
@@ -6977,13 +6997,14 @@ async def test_default_signup_scans_gmail_and_completes_code_verification(
     )
     assert len(inbox.calls) == 1
     assert inbox.calls[0]["recipient"] == "candidate@example.test"
+    assert inbox.calls[0]["expected_origin"] == "https://jobs.example"
     assert inbox.calls[0]["timeout_seconds"] == 180
     not_before = inbox.calls[0]["not_before"]
     assert isinstance(not_before, datetime)
-    assert before_sign_in <= not_before <= after_sign_in
+    assert before_create <= not_before <= after_create
     assert fakes.runtimes[0].email_verification_calls == [
         {
-            "approved_origins": ("https://jobs.example",),
+            "expected_origin": "https://jobs.example",
             "challenge": challenge,
             "code_ref": "e41",
             "submit_ref": "e42",
@@ -6991,6 +7012,8 @@ async def test_default_signup_scans_gmail_and_completes_code_verification(
     ]
     record = manager._active
     assert record is not None
+    assert record.verification_not_before is None
+    assert record.verification_origin is None
     action_count = record.playwright_cli_action_count
     with pytest.raises(HarnessServiceError) as caught:
         await runtime_action(

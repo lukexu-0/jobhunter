@@ -441,7 +441,7 @@ class HumanGate:
         self._cancelled = False
         self._revision_count = 0
         self._submission_approved = False
-        self._tried_credentials: set[tuple[str, str]] = set()
+        self._tried_credentials: set[tuple[str, str, str, str]] = set()
         self._credential_values_activated = False
         self._credential_command_task: asyncio.Task[None] | None = None
 
@@ -539,6 +539,7 @@ class HumanGate:
     async def request_sign_in(
         self,
         *,
+        account_action: Literal["create_account", "sign_in"] = "sign_in",
         username_ref: str,
         password_ref: str,
         password_confirmation_ref: str | None = None,
@@ -581,9 +582,19 @@ class HumanGate:
         default_credentials = self._default_credentials
         credential = None
         used_default = False
+        credential_key = (
+            (
+                login_origin,
+                default_credentials[0],
+                default_credentials[1],
+                account_action,
+            )
+            if default_credentials is not None
+            else None
+        )
         if (
             default_credentials is not None
-            and (login_origin, default_credentials[0]) not in self._tried_credentials
+            and credential_key not in self._tried_credentials
         ):
             username, password = default_credentials
             used_default = True
@@ -593,7 +604,12 @@ class HumanGate:
                 (
                     candidate
                     for candidate in saved
-                    if (candidate.origin, candidate.username)
+                    if (
+                        candidate.origin,
+                        candidate.username,
+                        candidate.password,
+                        account_action,
+                    )
                     not in self._tried_credentials
                 ),
                 None,
@@ -604,7 +620,9 @@ class HumanGate:
                 username = credential.username
                 password = credential.password
         if username is not None and password is not None:
-            self._tried_credentials.add((login_origin, username))
+            self._tried_credentials.add(
+                (login_origin, username, password, account_action)
+            )
             await self._perform_sign_in(
                 runtime=runtime,
                 login_origin=login_origin,
@@ -615,7 +633,10 @@ class HumanGate:
                 username=username,
                 password=password,
             )
-            metadata: dict[str, object] = {"sign_in_status": "attempted"}
+            metadata: dict[str, object] = {
+                "sign_in_status": "attempted",
+                "account_origin": login_origin,
+            }
             if used_default:
                 metadata["default_account"] = True
             return GateResult(metadata=metadata)

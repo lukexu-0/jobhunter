@@ -232,11 +232,12 @@ async def test_sign_in_tries_default_application_account_before_saved_credential
     credential_store = CredentialStore(tmp_path / "credentials.json")
     await credential_store.upsert(
         JOB_ORIGIN,
-        "saved@example.test",
+        "candidate@example.test",
         "saved-private-password",
     )
 
-    result = await gate.request_sign_in(
+    create_result = await gate.request_sign_in(
+        account_action="create_account",
         username_ref="e1",
         password_ref="e2",
         password_confirmation_ref="e3",
@@ -244,10 +245,10 @@ async def test_sign_in_tries_default_application_account_before_saved_credential
         runtime=runtime,
         credential_store=credential_store,
     )
-
-    assert result.metadata == {
+    assert create_result.metadata == {
         "sign_in_status": "attempted",
         "default_account": True,
+        "account_origin": JOB_ORIGIN,
     }
     assert publisher.events == []
     assert runtime.sign_in_calls == [
@@ -261,6 +262,47 @@ async def test_sign_in_tries_default_application_account_before_saved_credential
             "password": "ExamplePassword123$$",
         }
     ]
+    sign_in_result = await gate.request_sign_in(
+        account_action="sign_in",
+        username_ref="e5",
+        password_ref="e6",
+        submit_ref="e7",
+        runtime=runtime,
+        credential_store=credential_store,
+    )
+    assert sign_in_result.metadata == {
+        "sign_in_status": "attempted",
+        "default_account": True,
+        "account_origin": JOB_ORIGIN,
+    }
+    assert runtime.sign_in_calls[-1] == {
+        "expected_origin": JOB_ORIGIN,
+        "username_ref": "e5",
+        "password_ref": "e6",
+        "submit_ref": "e7",
+        "username": "candidate@example.test",
+        "password": "ExamplePassword123$$",
+    }
+    corrected_result = await gate.request_sign_in(
+        account_action="sign_in",
+        username_ref="e8",
+        password_ref="e9",
+        submit_ref="e10",
+        runtime=runtime,
+        credential_store=credential_store,
+    )
+    assert corrected_result.metadata == {
+        "sign_in_status": "attempted",
+        "account_origin": JOB_ORIGIN,
+    }
+    assert runtime.sign_in_calls[-1] == {
+        "expected_origin": JOB_ORIGIN,
+        "username_ref": "e8",
+        "password_ref": "e9",
+        "submit_ref": "e10",
+        "username": "candidate@example.test",
+        "password": "saved-private-password",
+    }
 
 
 @pytest.mark.asyncio

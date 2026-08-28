@@ -441,16 +441,20 @@ function canonicalPlaywrightElementRef(value: z.infer<typeof PlaywrightToolEleme
 }
 
 const SignInToolParameters = z.object({
+  account_action: z.enum(["create_account", "sign_in"]),
   username_ref: PlaywrightToolElementRefSchema,
   password_ref: PlaywrightToolElementRefSchema,
   password_confirmation_ref: PlaywrightToolElementRefSchema.optional(),
   submit_ref: PlaywrightToolElementRefSchema,
 }).strict();
-
 const EmailVerificationToolParameters = z.object({
   code_ref: PlaywrightToolElementRefSchema.optional(),
   submit_ref: PlaywrightToolElementRefSchema.optional(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.submit_ref !== undefined && value.code_ref === undefined) {
+    context.addIssue({ code: "custom", message: "submit_ref requires code_ref" });
+  }
+});
 
 const HumanNavigationToolParameters = z.object({
   instruction: z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
@@ -649,11 +653,17 @@ async function runApplicationAgentWithProfile(
 
   const requestSignIn = runtimeTool({
     name: "request_sign_in",
-    description: "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login or account-creation form. Pass only the inspected refs for the username/email input, password input, optional password-confirmation input, and submit control; main-frame eN refs, frame-scoped fNeN refs, and exact snapshot ref=eN or ref=fNeN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
+    description: "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login or account-creation form. Set account_action to create_account for account creation and sign_in for login so each path gets its own private default attempt. Pass only the inspected refs for the username/email input, password input, optional password-confirmation input, and submit control; main-frame eN refs, frame-scoped fNeN refs, and exact snapshot ref=eN or ref=fNeN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
     parameters: SignInToolParameters,
     isEnabled: (runtimeContext) => runtimeContext.playwrightCliCompleted,
     execute: async (
-      { username_ref, password_ref, password_confirmation_ref, submit_ref },
+      {
+        account_action,
+        username_ref,
+        password_ref,
+        password_confirmation_ref,
+        submit_ref,
+      },
       runtimeContext,
       actionSignal,
     ) => {
@@ -666,6 +676,7 @@ async function runApplicationAgentWithProfile(
         runtimeContext,
         {
           type: "request_sign_in",
+          account_action,
           username_ref: canonicalPlaywrightElementRef(username_ref),
           password_ref: canonicalPlaywrightElementRef(password_ref),
           ...(password_confirmation_ref === undefined
@@ -696,9 +707,6 @@ async function runApplicationAgentWithProfile(
     execute: async ({ code_ref, submit_ref }, runtimeContext, actionSignal) => {
       rejectMissingBrowserInspection(runtimeContext);
       rejectMissingPostNavigationInspection(runtimeContext);
-      if (submit_ref !== undefined && code_ref === undefined) {
-        throw new ApplicationAgentFailure("INVALID_MODEL_OUTPUT");
-      }
       runtimeContext.playwrightCliCompleted = false;
       runtimeContext.postNavigationInspectionRequired = true;
       delete runtimeContext.latestScreenshotDataUrl;

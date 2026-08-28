@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, cast
-from urllib.parse import parse_qsl, quote, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 from uuid import UUID
 
 import psutil
@@ -637,6 +637,14 @@ def _origin_for_url(value: str) -> str:
         port = None
     return validate_approved_origin(
         f"{parsed.scheme.lower()}://{host}{f':{port}' if port is not None else ''}"
+    )
+
+
+def _url_with_canonical_origin(value: str, origin: str) -> str:
+    parsed = urlsplit(value)
+    canonical = urlsplit(origin)
+    return urlunsplit(
+        (canonical.scheme, canonical.netloc, parsed.path, parsed.query, parsed.fragment)
     )
 
 
@@ -1810,7 +1818,7 @@ class PlaywrightCliRuntime:
     async def complete_email_verification(
         self,
         *,
-        approved_origins: Sequence[str],
+        expected_origin: str,
         challenge: VerificationChallenge,
         code_ref: str | None,
         submit_ref: str | None,
@@ -1819,17 +1827,9 @@ class PlaywrightCliRuntime:
             if not self._started or self._closed:
                 raise PlaywrightCliRuntimeError("browser_failed")
             try:
-                canonical_origins = tuple(
-                    validate_approved_origin(origin) for origin in approved_origins
-                )
+                canonical_origins = (validate_approved_origin(expected_origin),)
             except (TypeError, ValueError):
                 raise PlaywrightCliRuntimeError("browser_failed") from None
-            if (
-                not canonical_origins
-                or len(canonical_origins) > 20
-                or len(set(canonical_origins)) != len(canonical_origins)
-            ):
-                raise PlaywrightCliRuntimeError("browser_failed")
             try:
                 pre_metadata = await self._metadata()
                 current_origin = _origin_for_url(pre_metadata.url)
@@ -1838,31 +1838,32 @@ class PlaywrightCliRuntime:
             if current_origin not in canonical_origins:
                 return False
 
-            expected_origin: str | None = None
+            expected_origin = canonical_origins[0]
             code: str | None = None
-            verification_url: str | None = None
+            origin_binding_url: str | None = None
+            for candidate in challenge.urls:
+                try:
+                    parsed = urlsplit(candidate)
+                    origin = _origin_for_url(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    parsed.scheme.lower() == "https"
+                    and parsed.username is None
+                    and parsed.password is None
+                    and len(candidate) <= 4_096
+                    and origin == expected_origin
+                ):
+                    origin_binding_url = _url_with_canonical_origin(candidate, origin)
+                    break
+            if origin_binding_url is None:
+                return False
+            verification_url: str | None
             if code_ref is not None and challenge.codes:
                 code = challenge.codes[0]
-                expected_origin = current_origin
+                verification_url = None
             else:
-                for candidate in challenge.urls:
-                    try:
-                        parsed = urlsplit(candidate)
-                        origin = _origin_for_url(candidate)
-                    except (TypeError, ValueError):
-                        continue
-                    if (
-                        parsed.scheme == "https"
-                        and parsed.username is None
-                        and parsed.password is None
-                        and len(candidate) <= 4_096
-                        and origin == current_origin
-                    ):
-                        expected_origin = origin
-                        verification_url = candidate
-                        break
-            if expected_origin is None:
-                return False
+                verification_url = origin_binding_url
             if code is not None:
                 if (
                     _ELEMENT_REF_PATTERN.fullmatch(code_ref or "") is None

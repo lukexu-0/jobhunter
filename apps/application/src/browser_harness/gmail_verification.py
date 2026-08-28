@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .models import validate_approved_origin
+
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 _GMAIL_API_ROOT = "https://gmail.googleapis.com"
@@ -87,11 +89,27 @@ class VerificationChallenge:
     codes: tuple[str, ...]
 
 
+def _challenge_matches_origin(
+    challenge: VerificationChallenge,
+    expected_origin: str,
+) -> bool:
+    for url in challenge.urls:
+        parsed = urlsplit(url)
+        try:
+            origin = validate_approved_origin(f"{parsed.scheme}://{parsed.netloc}")
+        except (TypeError, ValueError):
+            continue
+        if origin == expected_origin:
+            return True
+    return False
+
+
 class VerificationInbox(Protocol):
     async def wait_for_challenge(
         self,
         *,
         recipient: str,
+        expected_origin: str,
         not_before: datetime,
         timeout_seconds: int,
     ) -> VerificationChallenge: ...
@@ -157,10 +175,12 @@ class GmailVerificationInbox:
         self,
         *,
         recipient: str,
+        expected_origin: str,
         not_before: datetime,
         timeout_seconds: int,
     ) -> VerificationChallenge:
         canonical_recipient = _validate_recipient(recipient)
+        canonical_origin = validate_approved_origin(expected_origin)
         if not isinstance(not_before, datetime) or not_before.tzinfo is None:
             raise ValueError("not_before must be timezone-aware")
         not_before = not_before.astimezone(UTC)
@@ -173,6 +193,7 @@ class GmailVerificationInbox:
                 self._http_client,
                 token=token,
                 recipient=canonical_recipient,
+                expected_origin=canonical_origin,
                 not_before=not_before,
                 deadline=deadline,
             )
@@ -181,6 +202,7 @@ class GmailVerificationInbox:
                 client,
                 token=token,
                 recipient=canonical_recipient,
+                expected_origin=canonical_origin,
                 not_before=not_before,
                 deadline=deadline,
             )
@@ -212,6 +234,7 @@ class GmailVerificationInbox:
         *,
         token: str,
         recipient: str,
+        expected_origin: str,
         not_before: datetime,
         deadline: float,
     ) -> VerificationChallenge:
@@ -228,7 +251,7 @@ class GmailVerificationInbox:
                     params={
                         "q": query,
                         "maxResults": str(_MAX_RESULTS),
-                        "includeSpamTrash": "true",
+                        "includeSpamTrash": "false",
                     },
                     deadline=deadline,
                 )
@@ -238,7 +261,6 @@ class GmailVerificationInbox:
                 for message_id in message_ids:
                     if message_id in seen:
                         continue
-                    seen.add(message_id)
                     try:
                         message_response = await self._get(
                             client,
@@ -248,6 +270,7 @@ class GmailVerificationInbox:
                             deadline=deadline,
                         )
                         if message_response.status_code == 404:
+                            seen.add(message_id)
                             continue
                         _raise_for_status(message_response)
                         challenge = _challenge_from_response(
@@ -258,7 +281,11 @@ class GmailVerificationInbox:
                     except _TransientGmailError:
                         transient_failure = True
                         continue
-                    if challenge is not None:
+                    seen.add(message_id)
+                    if challenge is not None and _challenge_matches_origin(
+                        challenge,
+                        expected_origin,
+                    ):
                         candidates.append(challenge)
                 if candidates:
                     return max(candidates, key=lambda candidate: candidate.received_at)

@@ -59,6 +59,7 @@ async def test_readonly_gmail_poll_returns_recent_verification_challenge() -> No
         )
         challenge = await inbox.wait_for_challenge(
             recipient="candidate@example.test",
+            expected_origin="https://jobs.example",
             not_before=not_before,
             timeout_seconds=1,
         )
@@ -78,7 +79,7 @@ async def test_readonly_gmail_poll_returns_recent_verification_challenge() -> No
     )
     list_params = requests[0].url.params
     assert list_params["maxResults"] == "20"
-    assert list_params["includeSpamTrash"] == "true"
+    assert list_params["includeSpamTrash"] == "false"
     assert list_params["q"].startswith(
         f"after:{int(not_before.timestamp()) - 1} "
     )
@@ -98,6 +99,7 @@ async def test_missing_gmail_token_is_lazy_and_reports_not_configured(
     with pytest.raises(GmailNotConfigured, match="not configured"):
         await inbox.wait_for_challenge(
             recipient="candidate@example.test",
+            expected_origin="https://jobs.example",
             not_before=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
             timeout_seconds=1,
         )
@@ -110,7 +112,10 @@ async def test_poll_ignores_stale_message_and_returns_new_arrival() -> None:
     message["From"] = "accounts@jobs.example"
     message["To"] = "candidate@example.test"
     message["Subject"] = "Confirmation code"
-    message.set_content("Confirmation code: 739204")
+    message.set_content(
+        "Confirmation code: 739204\n"
+        "https://jobs.example/verify?token=recent-token"
+    )
     encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
     now = 0.0
     list_calls = 0
@@ -159,6 +164,7 @@ async def test_poll_ignores_stale_message_and_returns_new_arrival() -> None:
             sleep=sleep,
         ).wait_for_challenge(
             recipient="candidate@example.test",
+            expected_origin="https://jobs.example",
             not_before=not_before,
             timeout_seconds=10,
         )
@@ -167,6 +173,125 @@ async def test_poll_ignores_stale_message_and_returns_new_arrival() -> None:
     assert challenge.codes == ("739204",)
     assert list_calls == 2
     assert get_calls == ["stale", "recent"]
+
+
+@pytest.mark.asyncio
+async def test_poll_ignores_newer_challenge_for_an_unrelated_origin() -> None:
+    not_before = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    encoded_messages: dict[str, str] = {}
+    for message_id, origin, code in (
+        ("unrelated", "https://unrelated.example", "111111"),
+        ("correct", "https://jobs.example", "482913"),
+    ):
+        message = EmailMessage()
+        message["From"] = f"accounts@{origin.removeprefix('https://')}"
+        message["To"] = "candidate@example.test"
+        message["Subject"] = "Verification code"
+        message.set_content(
+            f"Verification code: {code}\n{origin}/verify?token={message_id}"
+        )
+        encoded_messages[message_id] = base64.urlsafe_b64encode(
+            message.as_bytes()
+        ).decode("ascii").rstrip("=")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(
+                200,
+                json={"messages": [{"id": "unrelated"}, {"id": "correct"}]},
+            )
+        message_id = request.url.path.rsplit("/", 1)[-1]
+        offset = 2 if message_id == "unrelated" else 1
+        return httpx.Response(
+            200,
+            json={
+                "id": message_id,
+                "internalDate": str(
+                    int((not_before + timedelta(seconds=offset)).timestamp() * 1000)
+                ),
+                "raw": encoded_messages[message_id],
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        challenge = await GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+        ).wait_for_challenge(
+            recipient="candidate@example.test",
+            expected_origin="https://jobs.example",
+            not_before=not_before,
+            timeout_seconds=1,
+        )
+
+    assert challenge.message_id == "correct"
+    assert challenge.codes == ("482913",)
+
+
+@pytest.mark.asyncio
+async def test_poll_retries_message_after_transient_fetch_failure() -> None:
+    not_before = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    message = EmailMessage()
+    message["From"] = "accounts@jobs.example"
+    message["To"] = "candidate@example.test"
+    message["Subject"] = "Verify email"
+    message.set_content(
+        "Verification code: 482913\nhttps://jobs.example/verify?token=retry"
+    )
+    encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+    now = 0.0
+    get_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_calls
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(200, json={"messages": [{"id": "retry"}]})
+        get_calls += 1
+        if get_calls == 1:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "id": "retry",
+                "internalDate": str(
+                    int((not_before + timedelta(seconds=1)).timestamp() * 1000)
+                ),
+                "raw": encoded,
+            },
+        )
+
+    def clock() -> float:
+        return now
+
+    async def sleep(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        challenge = await GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+            clock=clock,
+            sleep=sleep,
+        ).wait_for_challenge(
+            recipient="candidate@example.test",
+            expected_origin="https://jobs.example",
+            not_before=not_before,
+            timeout_seconds=10,
+        )
+
+    assert challenge.message_id == "retry"
+    assert get_calls == 2
+
+
+async def _access_token() -> str:
+    return "access-token"
 
 
 @pytest.mark.asyncio
@@ -191,6 +316,7 @@ async def test_gmail_token_rejects_any_scope_beyond_readonly(tmp_path: Path) -> 
     with pytest.raises(GmailAuthorizationError) as raised:
         await GmailVerificationInbox(token_path).wait_for_challenge(
             recipient="candidate@example.test",
+            expected_origin="https://jobs.example",
             not_before=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
             timeout_seconds=1,
         )

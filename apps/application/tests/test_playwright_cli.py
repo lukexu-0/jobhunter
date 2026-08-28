@@ -2195,16 +2195,31 @@ async def test_email_verification_uses_private_payload_and_rejects_new_origin_li
     monkeypatch.setattr(runtime, "_snapshot_from_execution", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runtime, "_require_success", lambda *_args, **_kwargs: None)
 
+    unbound_code = VerificationChallenge(
+        message_id="message-unbound",
+        received_at=datetime.now(UTC),
+        sender="accounts@unrelated.example",
+        subject="Verify",
+        urls=(),
+        codes=("111111",),
+    )
+    assert not await runtime.complete_email_verification(
+        expected_origin="https://example.com",
+        challenge=unbound_code,
+        code_ref="e1",
+        submit_ref="e2",
+    )
+    assert invocations == []
     challenge = VerificationChallenge(
         message_id="message-1",
         received_at=datetime.now(UTC),
         sender="accounts@example.com",
         subject="Verify",
-        urls=(),
+        urls=("https://example.com/verify?token=code-binding",),
         codes=("482913",),
     )
     assert await runtime.complete_email_verification(
-        approved_origins=("https://example.com",),
+        expected_origin="https://example.com",
         challenge=challenge,
         code_ref="e1",
         submit_ref="e2",
@@ -2223,15 +2238,18 @@ async def test_email_verification_uses_private_payload_and_rejects_new_origin_li
         received_at=datetime.now(UTC),
         sender="accounts@example.com",
         subject="Verify",
-        urls=(f"https://example.com/verify?token={token}",),
+        urls=(f"https://EXAMPLE.com:443/verify?token={token}",),
         codes=(),
     )
     assert await runtime.complete_email_verification(
-        approved_origins=("https://example.com",),
+        expected_origin="https://example.com",
         challenge=same_origin_link,
         code_ref=None,
         submit_ref=None,
     )
+    link_script, _ = invocations[-1]
+    assert f"https://example.com/verify?token={token}" in link_script
+    assert "https://EXAMPLE.com:443" not in link_script
     assert token not in runtime._redact_text(f"verification token {token}")
 
     cross_origin = VerificationChallenge(
@@ -2243,7 +2261,7 @@ async def test_email_verification_uses_private_payload_and_rejects_new_origin_li
         codes=(),
     )
     assert not await runtime.complete_email_verification(
-        approved_origins=("https://example.com", "https://verify.other.example"),
+        expected_origin="https://example.com",
         challenge=cross_origin,
         code_ref=None,
         submit_ref=None,

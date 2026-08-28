@@ -366,6 +366,7 @@ test("mirrors strict additional-information question and request constraints", (
 test("strictly validates credential-free sign-in runtime wire contracts", () => {
   const request = {
     type: "request_sign_in" as const,
+    account_action: "create_account" as const,
     username_ref: "f2e248",
     password_ref: "f2e255",
     password_confirmation_ref: "f2e256",
@@ -379,6 +380,7 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
     { ...request, username_ref: "e1000000000" },
     { ...request, password_ref: " e2" },
     { ...request, password_confirmation_ref: "password-confirmation" },
+    { ...request, account_action: "register" },
     { ...request, submit_ref: "button" },
     { ...request, submit_ref: "e3\n" },
     { ...request, username_ref: "f0e1" },
@@ -860,6 +862,7 @@ describe("HttpApplicationRuntimeClient", () => {
       { type: "playwright_cli", command: "eval", args: ["document.body.innerText"] },
       {
         type: "request_sign_in",
+        account_action: "sign_in",
         username_ref: "e1",
         password_ref: "e2",
         submit_ref: "e3",
@@ -1111,6 +1114,7 @@ describe("HttpApplicationRuntimeClient", () => {
       },
       {
         type: "request_sign_in",
+        account_action: "sign_in",
         username_ref: "e0",
         password_ref: "e2",
         submit_ref: "e3",

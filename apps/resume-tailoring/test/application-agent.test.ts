@@ -372,7 +372,7 @@ describe("application agent", () => {
       {
         toolName: "request_sign_in",
         actionType: "request_sign_in",
-        input: { username_ref: "e1", password_ref: "e2", submit_ref: "e3" },
+        input: { account_action: "sign_in", username_ref: "e1", password_ref: "e2", submit_ref: "e3" },
       },
       {
         toolName: "request_email_verification",
@@ -1041,18 +1041,21 @@ describe("application agent", () => {
           const review = functionTool(agent, "request_human_review");
           const signInParameters = status === "attempted"
             ? {
+                account_action: "create_account" as const,
                 username_ref: "f2e248",
                 password_ref: "f2e255",
                 password_confirmation_ref: "f2e256",
                 submit_ref: "f2e261",
               }
             : {
+                account_action: "create_account" as const,
                 username_ref: "ref=f2e248",
                 password_ref: "ref=f2e255",
                 password_confirmation_ref: "ref=f2e256",
                 submit_ref: "ref=f2e261",
               };
           const canonicalSignInParameters = {
+            account_action: "create_account" as const,
             username_ref: "f2e248",
             password_ref: "f2e255",
             password_confirmation_ref: "f2e256",
@@ -1143,6 +1146,7 @@ describe("application agent", () => {
         { type: "playwright_cli", command: "snapshot", args: [] },
         {
           type: "request_sign_in",
+          account_action: "create_account",
           username_ref: "f2e248",
           password_ref: "f2e255",
           password_confirmation_ref: "f2e256",
@@ -1173,6 +1177,13 @@ describe("application agent", () => {
           JSON.stringify({ command: "snapshot", args: [] }),
         );
         const verification = functionTool(agent, "request_email_verification");
+        await expect(verification.invoke(
+          runContext,
+          JSON.stringify({ submit_ref: "ref=f2e261" }),
+        )).rejects.toMatchObject({ name: "InvalidToolInputError" });
+        expect(runtimeRequests).toHaveLength(1);
+        expect(context.playwrightCliCompleted).toBe(true);
+        expect(context.postNavigationInspectionRequired).toBe(false);
         expect(await verification.invoke(
           runContext,
           JSON.stringify({ code_ref: "ref=f2e248", submit_ref: "ref=f2e261" }),
@@ -1207,6 +1218,7 @@ describe("application agent", () => {
       async (request) => {
         expect(request).toEqual({
           type: "request_sign_in",
+          account_action: "sign_in",
           username_ref: "e1",
           password_ref: "e2",
           submit_ref: "e3",
@@ -1222,6 +1234,7 @@ describe("application agent", () => {
         await functionTool(agent, "request_sign_in").invoke(
           new RunContext(context),
           JSON.stringify({
+            account_action: "sign_in",
             username_ref: "e1",
             password_ref: "e2",
             submit_ref: "e3",
@@ -1252,6 +1265,7 @@ describe("application agent", () => {
         async (request) => {
           expect(request).toEqual({
             type: "request_sign_in",
+            account_action: "sign_in",
             username_ref: "e1",
             password_ref: "e2",
             submit_ref: "e3",
@@ -1266,6 +1280,7 @@ describe("application agent", () => {
           const runContext = new RunContext(context);
           const signIn = functionTool(agent, "request_sign_in");
           const parameters = JSON.stringify({
+            account_action: "sign_in",
             username_ref: "e1",
             password_ref: "e2",
             submit_ref: "e3",
@@ -1318,6 +1333,7 @@ describe("application agent", () => {
           await expect(signIn.invoke(
             runContext,
             JSON.stringify({
+              account_action: "sign_in",
               username_ref: "e1",
               password_ref: "e2",
               submit_ref: "e3",
@@ -1673,7 +1689,7 @@ describe("application agent", () => {
         ]);
         expect(agent.tools.map((item) => item.type === "function" ? item.description : undefined)).toEqual([
           EXPECTED_PLAYWRIGHT_CLI_DESCRIPTION,
-          "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login or account-creation form. Pass only the inspected refs for the username/email input, password input, optional password-confirmation input, and submit control; main-frame eN refs, frame-scoped fNeN refs, and exact snapshot ref=eN or ref=fNeN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
+          "Call immediately when the latest successful browser inspection shows an ordinary username/email and password login or account-creation form. Set account_action to create_account for account creation and sign_in for login so each path gets its own private default attempt. Pass only the inspected refs for the username/email input, password input, optional password-confirmation input, and submit control; main-frame eN refs, frame-scoped fNeN refs, and exact snapshot ref=eN or ref=fNeN notation are accepted. After it returns, inspect again and call it with fresh refs if the form remains. Never use this for 2FA, CAPTCHA, inaccessible controls, or navigation to a new origin; use request_human_navigation instead. Never request, expose, or repeat credential values.",
           "Call immediately after the latest successful browser inspection shows that account creation sent a verification email or presents an email verification-code control. Pass the inspected code input ref and optional submit ref for a code form, or no refs for an emailed link. The runtime reads Gmail and applies the private code or same-origin link without exposing either value. If the result is human_required, use request_human_navigation with only a generic instruction. Never request, expose, or repeat verification values.",
           "Pause for browser interaction reserved for the human: 2FA, CAPTCHA, an inaccessible or explicitly manual control, or a required transition to a new origin. Use request_sign_in for ordinary username/password login.",
           EXPECTED_REQUEST_ADDITIONAL_INFO_DESCRIPTION,

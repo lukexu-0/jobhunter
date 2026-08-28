@@ -1333,22 +1333,27 @@ class RequestHumanNavigationRuntimeAction(PublicModel):
             max_length=2_000,
         ),
     ]
+
+
 class RequestSignInRuntimeAction(PublicModel):
     type: Literal["request_sign_in"]
+    account_action: Literal["create_account", "sign_in"] = "sign_in"
     username_ref: ElementRef
     password_ref: ElementRef
     password_confirmation_ref: ElementRef | None = None
     submit_ref: ElementRef
 
-    @field_validator(
-        "username_ref",
-        "password_ref",
-        "password_confirmation_ref",
-        "submit_ref",
-    )
+    @field_validator("username_ref", "password_ref", "submit_ref")
     @classmethod
     def _validate_ref(cls, value: str) -> str:
         if _ELEMENT_REF_PATTERN.fullmatch(value) is None:
+            raise ValueError("element ref is invalid")
+        return value
+
+    @field_validator("password_confirmation_ref")
+    @classmethod
+    def _validate_optional_ref(cls, value: str | None) -> str | None:
+        if value is not None and _ELEMENT_REF_PATTERN.fullmatch(value) is None:
             raise ValueError("element ref is invalid")
         return value
 

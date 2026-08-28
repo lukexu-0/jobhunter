@@ -2124,8 +2124,10 @@ def test_playwright_cli_runtime_action_rejects_prohibited_commands(
         (
             {
                 "type": "request_sign_in",
+                "account_action": "create_account",
                 "username_ref": "e1",
                 "password_ref": "e22",
+                "password_confirmation_ref": None,
                 "submit_ref": "e333",
             },
             RequestSignInRuntimeAction,
