@@ -197,6 +197,7 @@ def make_gate(
     review_snapshot: Any = None,
     user_info_store: Any = None,
     auto_submit: bool = False,
+    default_credentials: tuple[str, str] | None = None,
 ) -> tuple[HumanGate, EventPublisher]:
     publisher = publisher or EventPublisher()
     origins = approved_origins or [JOB_ORIGIN]
@@ -208,8 +209,48 @@ def make_gate(
         publish=publisher,
         review_snapshot=review_snapshot,
         auto_submit=auto_submit,
+        default_credentials=default_credentials,
     )
     return gate, publisher
+
+
+@pytest.mark.asyncio
+async def test_sign_in_tries_default_application_account_before_saved_credentials(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    gate, publisher = make_gate(
+        default_credentials=("candidate@example.test", "ExamplePassword123$$")
+    )
+    runtime = CredentialRuntime()
+    runtime.mutation_release.set()
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    await credential_store.upsert(
+        JOB_ORIGIN,
+        "saved@example.test",
+        "saved-private-password",
+    )
+
+    result = await gate.request_sign_in(
+        username_ref="e1",
+        password_ref="e2",
+        submit_ref="e3",
+        runtime=runtime,
+        credential_store=credential_store,
+    )
+
+    assert result.metadata == {"sign_in_status": "attempted"}
+    assert publisher.events == []
+    assert runtime.sign_in_calls == [
+        {
+            "expected_origin": JOB_ORIGIN,
+            "username_ref": "e1",
+            "password_ref": "e2",
+            "submit_ref": "e3",
+            "username": "candidate@example.test",
+            "password": "ExamplePassword123$$",
+        }
+    ]
 
 
 @pytest.mark.asyncio

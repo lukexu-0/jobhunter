@@ -14,6 +14,10 @@ from uuid import UUID, uuid4
 from fastapi import UploadFile
 from pydantic import Field, TypeAdapter, ValidationError
 
+from .application_account import (
+    DEFAULT_APPLICATION_EMAIL,
+    DEFAULT_APPLICATION_PASSWORD,
+)
 from .credentials import CredentialStore
 from .agent import ApplicationRunRequest, build_application_task
 from .artifacts import (
@@ -664,6 +668,10 @@ class ApplicationSessionManager:
                 approved_origins=origins,
                 publish=publish_gate,
                 review_snapshot=review_snapshot,
+                default_credentials=(
+                    DEFAULT_APPLICATION_EMAIL,
+                    DEFAULT_APPLICATION_PASSWORD,
+                ),
             )
             if record.final_request is not None:
                 raise asyncio.CancelledError

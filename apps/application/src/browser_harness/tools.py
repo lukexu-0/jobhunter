@@ -401,6 +401,7 @@ class HumanGate:
         publish: GateEventPublisher,
         review_snapshot: ReviewSnapshotSink | None = None,
         auto_submit: bool = False,
+        default_credentials: tuple[str, str] | None = None,
     ) -> None:
         canonical_origins = [validate_approved_origin(origin) for origin in approved_origins]
         if not canonical_origins or len(canonical_origins) > MAX_APPROVED_ORIGINS:
@@ -409,6 +410,16 @@ class HumanGate:
             raise ValueError("approved origins must be unique")
         if type(auto_submit) is not bool:
             raise ValueError("auto_submit must be a boolean")
+        if default_credentials is not None:
+            username, password = default_credentials
+            if (
+                not isinstance(username, str)
+                or not username
+                or username != username.strip()
+                or not isinstance(password, str)
+                or not password
+            ):
+                raise ValueError("default credentials are invalid")
         self._job_url = validate_job_url(job_url)
         self._approved_origins = canonical_origins
         self._redaction_values = {
@@ -416,10 +427,13 @@ class HumanGate:
             for value in private_values
             if isinstance(value, str) and value
         }
+        if default_credentials is not None:
+            self._redaction_values.update(default_credentials)
         self._user_info_store = user_info_store
         self._publish = publish
         self._review_snapshot = review_snapshot
         self._auto_submit = auto_submit
+        self._default_credentials = default_credentials
         self._lock = asyncio.Lock()
         self._pending: _PendingGate | None = None
         self._cancelled = False
@@ -561,26 +575,39 @@ class HumanGate:
                 "Sign-in requires an approved exact origin",
             )
 
-        saved = credential_store.credentials_for_origin(login_origin)
-        credential = next(
-            (
-                candidate
-                for candidate in saved
-                if (candidate.origin, candidate.username)
-                not in self._tried_credentials
-            ),
-            None,
-        )
-        if credential is not None:
-            self._tried_credentials.add((credential.origin, credential.username))
+        default_credentials = self._default_credentials
+        credential = None
+        if (
+            default_credentials is not None
+            and (login_origin, default_credentials[0]) not in self._tried_credentials
+        ):
+            username, password = default_credentials
+        else:
+            saved = credential_store.credentials_for_origin(login_origin)
+            credential = next(
+                (
+                    candidate
+                    for candidate in saved
+                    if (candidate.origin, candidate.username)
+                    not in self._tried_credentials
+                ),
+                None,
+            )
+            if credential is None:
+                username = password = None
+            else:
+                username = credential.username
+                password = credential.password
+        if username is not None and password is not None:
+            self._tried_credentials.add((login_origin, username))
             await self._perform_sign_in(
                 runtime=runtime,
                 login_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
                 submit_ref=submit_ref,
-                username=credential.username,
-                password=credential.password,
+                username=username,
+                password=password,
             )
             return GateResult(metadata={"sign_in_status": "attempted"})
 
