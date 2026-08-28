@@ -259,6 +259,8 @@ export const FieldResultSchema = z.object({
 }).strict();
 export type FieldResult = z.infer<typeof FieldResultSchema>;
 
+export const MAX_ADDITIONAL_INFO_OPTIONS = 100;
+export const MAX_ADDITIONAL_INFO_SELECTED_OPTIONS = 100;
 export const AdditionalInfoQuestionIdSchema = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/);
 export const UserInfoKeySchema = z.string()
   .refine((value) => hasCodePointLength(value, 1, 100))
@@ -277,7 +279,9 @@ const AdditionalInfoQuestionBaseShape = {
   scope: z.enum(["global", "application"]),
   question: AdditionalInfoQuestionTextSchema,
 };
-const AdditionalInfoOptionsSchema = z.array(AdditionalInfoOptionSchema).min(2).max(20)
+const AdditionalInfoOptionsSchema = z.array(AdditionalInfoOptionSchema)
+  .min(2)
+  .max(MAX_ADDITIONAL_INFO_OPTIONS)
   .superRefine((options, context) => {
     if (new Set(options.map((option) => option.id)).size !== options.length) {
       context.addIssue({ code: "custom", message: "option ids must be unique" });
@@ -1062,7 +1066,9 @@ const ApplicationSessionAnswerSchema = z.union([
   z.object({
     id: AdditionalInfoQuestionIdSchema,
     status: z.literal("answered"),
-    option_ids: z.array(AdditionalInfoQuestionIdSchema).min(1).max(20)
+    option_ids: z.array(AdditionalInfoQuestionIdSchema)
+      .min(1)
+      .max(MAX_ADDITIONAL_INFO_SELECTED_OPTIONS)
       .refine((values) => new Set(values).size === values.length, {
         message: "option ids must be unique",
       }),

@@ -990,6 +990,116 @@ def test_text_additional_info_command_rejects_missing_extra_and_oversize_values(
         )
 
 
+def test_additional_info_fixed_choices_accept_one_hundred_and_reject_one_hundred_one() -> None:
+    options = [
+        {"id": f"option_{index}", "label": f"Option {index}"}
+        for index in range(100)
+    ]
+    option_ids = [option["id"] for option in options]
+    option_labels = [option["label"] for option in options]
+
+    request = RUNTIME_ACTION_ADAPTER.validate_python(
+        {
+            "type": "request_additional_info",
+            "questions": [
+                {
+                    "id": "work_locations",
+                    "key": "application.work_locations",
+                    "scope": "application",
+                    "question": "Which locations work for you?",
+                    "answer_type": "multi_select",
+                    "options": options,
+                }
+            ],
+        }
+    )
+    command = COMMAND_ADAPTER.validate_python(
+        {
+            "type": "provide_additional_info",
+            "answers": [
+                {
+                    "id": "work_locations",
+                    "status": "answered",
+                    "option_ids": option_ids,
+                }
+            ],
+        }
+    )
+    response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {
+            "type": "additional_info",
+            "answers": [
+                {
+                    "id": "work_locations",
+                    "key": "application.work_locations",
+                    "scope": "application",
+                    "answer_type": "multi_select",
+                    "status": "answered",
+                    "value": option_labels,
+                }
+            ],
+        }
+    )
+
+    assert len(request.questions[0].options) == 100
+    assert len(command.answers[0].option_ids) == 100
+    assert len(response.answers[0].value) == 100
+
+    invalid_payloads = [
+        (
+            RUNTIME_ACTION_ADAPTER,
+            {
+                "type": "request_additional_info",
+                "questions": [
+                    {
+                        "id": "work_locations",
+                        "key": "application.work_locations",
+                        "scope": "application",
+                        "question": "Which locations work for you?",
+                        "answer_type": "multi_select",
+                        "options": [
+                            *options,
+                            {"id": "option_100", "label": "Option 100"},
+                        ],
+                    }
+                ],
+            },
+        ),
+        (
+            COMMAND_ADAPTER,
+            {
+                "type": "provide_additional_info",
+                "answers": [
+                    {
+                        "id": "work_locations",
+                        "status": "answered",
+                        "option_ids": [*option_ids, "option_100"],
+                    }
+                ],
+            },
+        ),
+        (
+            RUNTIME_ACTION_RESPONSE_ADAPTER,
+            {
+                "type": "additional_info",
+                "answers": [
+                    {
+                        "id": "work_locations",
+                        "key": "application.work_locations",
+                        "scope": "application",
+                        "answer_type": "multi_select",
+                        "status": "answered",
+                        "value": [*option_labels, "Option 100"],
+                    }
+                ],
+            },
+        ),
+    ]
+    for adapter, payload in invalid_payloads:
+        with pytest.raises(ValidationError):
+            adapter.validate_python(payload)
+
+
 @pytest.mark.parametrize(
     "payload",
     [

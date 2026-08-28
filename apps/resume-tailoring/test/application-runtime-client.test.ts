@@ -479,6 +479,44 @@ test("mirrors strict accepted-answer and additional-information response constra
   expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
 });
 
+test("accepts one hundred available and selected multi-select options", () => {
+  const options = Array.from({ length: 100 }, (_, index) => ({
+    id: `option_${index}`,
+    label: `Option ${index}`,
+  }));
+  expect(AdditionalInfoQuestionSchema.safeParse({
+    id: "work_locations",
+    key: "preferences.work_locations",
+    scope: "global",
+    question: "Which work locations can you accept?",
+    answer_type: "multi_select",
+    options,
+  }).success).toBe(true);
+  expect(AcceptedAdditionalInfoAnswerSchema.safeParse({
+    id: "work_locations",
+    key: "preferences.work_locations",
+    scope: "global",
+    answer_type: "multi_select",
+    status: "answered",
+    value: options.map(({ label }) => label),
+  }).success).toBe(true);
+  expect(ApplicationSessionCommandSchema.safeParse({
+    type: "provide_additional_info",
+    answers: [{
+      id: "work_locations",
+      status: "answered",
+      option_ids: options.map(({ id }) => id),
+    }],
+  }).success).toBe(true);
+  expect(ApplicationSessionCommandSchema.safeParse({
+    type: "provide_additional_info",
+    answers: [{
+      id: "work_locations",
+      status: "answered",
+      option_ids: [...options.map(({ id }) => id), "option_100"],
+    }],
+  }).success).toBe(false);
+});
 test("rejects malformed additional-information questions, batches, and accepted answers", () => {
   const textQuestion = ADDITIONAL_INFO_QUESTIONS[0]!;
   const selectQuestion = ADDITIONAL_INFO_QUESTIONS[1]!;
@@ -515,7 +553,7 @@ test("rejects malformed additional-information questions, batches, and accepted 
     {
       ...selectQuestion,
       options: Array.from(
-        { length: 21 },
+        { length: 101 },
         (_, index) => ({ id: `option_${index}`, label: `Option ${index}` }),
       ),
     },
@@ -569,7 +607,7 @@ test("rejects malformed additional-information questions, batches, and accepted 
     {
       ...acceptedText,
       answer_type: "multi_select",
-      value: Array.from({ length: 21 }, (_, index) => `Option ${index}`),
+      value: Array.from({ length: 101 }, (_, index) => `Option ${index}`),
     },
     { ...acceptedText, unexpected: true },
   ];

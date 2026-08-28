@@ -39,6 +39,9 @@ BROWSER_URL_MAX_CHARACTERS = 4_096
 BROWSER_TITLE_MAX_CHARACTERS = 4_096
 BROWSER_DOM_MAX_CHARACTERS = 40_000
 PLAYWRIGHT_OUTPUT_MAX_CHARACTERS = 20_000
+MAX_ADDITIONAL_INFO_OPTIONS = 100
+MAX_ADDITIONAL_INFO_SELECTED_OPTIONS = 100
+
 
 OpportunityKind: TypeAlias = Literal[
     "job",
@@ -375,7 +378,10 @@ class AdditionalInfoBooleanQuestion(_AdditionalInfoQuestionBase):
 
 
 class _AdditionalInfoSelectQuestion(_AdditionalInfoQuestionBase):
-    options: list[AdditionalInfoOption] = Field(min_length=2, max_length=20)
+    options: list[AdditionalInfoOption] = Field(
+        min_length=2,
+        max_length=MAX_ADDITIONAL_INFO_OPTIONS,
+    )
 
     @field_validator("options")
     @classmethod
@@ -453,7 +459,7 @@ class AdditionalInfoMultiSelectCommandAnswer(FrozenPrivateModel):
     status: Literal["answered"]
     option_ids: list[AdditionalInfoQuestionId] = Field(
         min_length=1,
-        max_length=20,
+        max_length=MAX_ADDITIONAL_INFO_SELECTED_OPTIONS,
     )
 
     @field_validator("option_ids")
@@ -505,7 +511,7 @@ class AcceptedAdditionalInfoAnswer(FrozenPrivateModel):
             return self
         if (
             not isinstance(self.value, list)
-            or not 1 <= len(self.value) <= 20
+            or not 1 <= len(self.value) <= MAX_ADDITIONAL_INFO_SELECTED_OPTIONS
             or any(
                 not value or value != value.strip() or len(value) > 200
                 for value in self.value

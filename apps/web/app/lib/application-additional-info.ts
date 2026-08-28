@@ -1,5 +1,6 @@
 import {
   ApplicationSessionCommandSchema,
+  MAX_ADDITIONAL_INFO_SELECTED_OPTIONS,
   type ApplicationAdditionalInfoQuestion,
   type ApplicationSessionCommand,
 } from "@jobhunter/pipeline/contracts";
@@ -97,7 +98,7 @@ export function buildAdditionalInfoCommand(
         const available = new Set(question.options.map((option) => option.id));
         if (
           values.length < 1
-          || values.length > 20
+          || values.length > MAX_ADDITIONAL_INFO_SELECTED_OPTIONS
           || new Set(values).size !== values.length
           || values.some((value) => typeof value !== "string" || !available.has(value))
         ) {

@@ -3,6 +3,7 @@ import {
   AdditionalInfoQuestionSchema,
   AdditionalInfoQuestionIdSchema,
   FieldResultSchema,
+  MAX_ADDITIONAL_INFO_SELECTED_OPTIONS,
   UserInfoKeySchema,
 } from "../contracts";
 
@@ -459,7 +460,9 @@ export const AcceptedAdditionalInfoAnswerSchema = z.union([
     ...AcceptedAdditionalInfoAnswerBaseShape,
     answer_type: z.literal("multi_select"),
     status: z.literal("answered"),
-    value: z.array(acceptedStringValue(200)).min(1).max(20),
+    value: z.array(acceptedStringValue(200))
+      .min(1)
+      .max(MAX_ADDITIONAL_INFO_SELECTED_OPTIONS),
   }).strict(),
 ]);
 export type AcceptedAdditionalInfoAnswer = z.infer<typeof AcceptedAdditionalInfoAnswerSchema>;

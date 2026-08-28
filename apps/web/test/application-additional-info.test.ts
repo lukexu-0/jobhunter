@@ -181,4 +181,52 @@ describe("buildAdditionalInfoCommand", () => {
       questionId: "available_days",
     });
   });
+
+  test("builds a multi-select answer containing one hundred selected options", () => {
+    const options = Array.from({ length: 100 }, (_, index) => ({
+      id: `option_${index}`,
+      label: `Option ${index}`,
+    }));
+    const question: ApplicationAdditionalInfoQuestion = {
+      id: "work_locations",
+      scope: "global",
+      question: "Which work locations can you accept?",
+      answerType: "multi_select",
+      options,
+    };
+
+    expect(buildAdditionalInfoCommand([question], {
+      work_locations: {
+        status: "answered",
+        value: options.map(({ id }) => id),
+      },
+    })).toEqual({
+      success: true,
+      command: {
+        type: "provide_additional_info",
+        answers: [{
+          id: "work_locations",
+          status: "answered",
+          option_ids: options.map(({ id }) => id),
+        }],
+      },
+    });
+
+    const tooManyOptions = [
+      ...options,
+      { id: "option_100", label: "Option 100" },
+    ];
+    expect(buildAdditionalInfoCommand([{
+      ...question,
+      options: tooManyOptions,
+    }], {
+      work_locations: {
+        status: "answered",
+        value: tooManyOptions.map(({ id }) => id),
+      },
+    })).toMatchObject({
+      success: false,
+      questionId: "work_locations",
+    });
+  });
 });
