@@ -28,6 +28,11 @@ from .artifacts import (
     retry_pending_cleanup,
     store_uploads,
 )
+from .gmail_verification import (
+    GmailVerificationError,
+    GmailVerificationInbox,
+    VerificationInbox,
+)
 from .playwright_cli import (
     BrowserConfigurationError,
     PlaywrightCliRuntime,
@@ -65,6 +70,7 @@ from .models import (
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     InterruptedRuntimeActionResponse,
+    EmailVerificationRuntimeActionResponse,
     ContinueCommand,
     ContinueWithoutAdditionalInfoCommand,
     EmptyEventDetail,
@@ -80,6 +86,7 @@ from .models import (
     SubmitRuntimeActionResponse,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
+    RequestEmailVerificationRuntimeAction,
     RequestSignInRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
@@ -241,6 +248,8 @@ class _ApplicationSession:
     playwright_cli_action_count: int = 0
     last_successful_inspection_step: int = 0
     sign_in_inspection_step: int = 0
+    email_verification_inspection_step: int = 0
+    verification_not_before: datetime | None = None
     additional_info_question_count: int = 0
     submission_action_started: bool = False
     steering_epoch: int = 0
@@ -396,6 +405,11 @@ class ApplicationSessionManager:
         runtime_factory: RuntimeFactory = PlaywrightCliRuntime,
         user_info_store: UserInfoStore | None = None,
         credential_store: CredentialStore | None = None,
+        verification_inbox: VerificationInbox | None = None,
+        default_credentials: tuple[str, str] | None = (
+            DEFAULT_APPLICATION_EMAIL,
+            DEFAULT_APPLICATION_PASSWORD,
+        ),
     ) -> None:
         self._config = config
         self._artifacts_root = (
@@ -408,6 +422,8 @@ class ApplicationSessionManager:
         self._runtime_factory = runtime_factory
         self._user_info_store = user_info_store or UserInfoStore(config.user_info_json)
         self._credential_store = credential_store
+        self._verification_inbox = verification_inbox
+        self._default_credentials = default_credentials
         self._lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
         self._startup_complete = False
@@ -668,10 +684,7 @@ class ApplicationSessionManager:
                 approved_origins=origins,
                 publish=publish_gate,
                 review_snapshot=review_snapshot,
-                default_credentials=(
-                    DEFAULT_APPLICATION_EMAIL,
-                    DEFAULT_APPLICATION_PASSWORD,
-                ),
+                default_credentials=self._default_credentials,
             )
             if record.final_request is not None:
                 raise asyncio.CancelledError
@@ -2053,9 +2066,11 @@ class ApplicationSessionManager:
                 record.sign_in_inspection_step = (
                     record.last_successful_inspection_step
                 )
+            sign_in_started_at = _now()
             gate_result = await gate.request_sign_in(
                 username_ref=action.username_ref,
                 password_ref=action.password_ref,
+                password_confirmation_ref=action.password_confirmation_ref,
                 submit_ref=action.submit_ref,
                 runtime=runtime,
                 credential_store=self._credential_store_for_use(),
@@ -2065,11 +2080,8 @@ class ApplicationSessionManager:
                 return terminal
             if gate_result.interrupted:
                 return InterruptedRuntimeActionResponse(type="interrupted")
-            status = (
-                gate_result.metadata.get("sign_in_status")
-                if gate_result.metadata is not None
-                else None
-            )
+            metadata = gate_result.metadata or {}
+            status = metadata.get("sign_in_status")
             if status not in {"attempted", "saved"}:
                 public = session_error("browser_failed")
                 raise HarnessServiceError(
@@ -2077,9 +2089,55 @@ class ApplicationSessionManager:
                     public.code,
                     public.message,
                 )
+            if metadata.get("default_account") is True:
+                record.verification_not_before = sign_in_started_at
             return SignInRuntimeActionResponse(
                 type="sign_in",
                 status=status,
+            )
+
+        if isinstance(action, RequestEmailVerificationRuntimeAction):
+            async with record.request_lock:
+                if (
+                    record.last_successful_inspection_step
+                    <= record.email_verification_inspection_step
+                ):
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "Inspect the application before requesting email verification",
+                    )
+                not_before = record.verification_not_before
+                if not_before is None:
+                    raise HarnessServiceError(
+                        409,
+                        "command_conflict",
+                        "Email verification requires a default account attempt",
+                    )
+                record.email_verification_inspection_step = (
+                    record.last_successful_inspection_step
+                )
+                record.playwright_cli_action_count += 1
+            try:
+                challenge = await self._verification_inbox_for_use().wait_for_challenge(
+                    recipient=DEFAULT_APPLICATION_EMAIL,
+                    not_before=not_before,
+                    timeout_seconds=self._config.gmail_verification_timeout,
+                )
+            except GmailVerificationError:
+                return EmailVerificationRuntimeActionResponse(
+                    type="email_verification",
+                    status="human_required",
+                )
+            completed = await runtime.complete_email_verification(
+                approved_origins=gate.approved_origins,
+                challenge=challenge,
+                code_ref=action.code_ref,
+                submit_ref=action.submit_ref,
+            )
+            return EmailVerificationRuntimeActionResponse(
+                type="email_verification",
+                status="completed" if completed else "human_required",
             )
 
         if isinstance(action, RequestAdditionalInfoRuntimeAction):
@@ -2169,6 +2227,13 @@ class ApplicationSessionManager:
             credential_store = CredentialStore(self._config.credentials_json)
             self._credential_store = credential_store
         return credential_store
+
+    def _verification_inbox_for_use(self) -> VerificationInbox:
+        inbox = self._verification_inbox
+        if inbox is None:
+            inbox = GmailVerificationInbox(self._config.gmail_token_json)
+            self._verification_inbox = inbox
+        return inbox
 
     @staticmethod
     def _runtime_gate_terminal_response(

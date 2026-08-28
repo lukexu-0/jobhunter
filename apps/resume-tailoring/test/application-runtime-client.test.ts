@@ -10,6 +10,7 @@ import {
 import {
   AcceptedAdditionalInfoAnswerSchema,
   AdditionalInfoRuntimeActionResponseSchema,
+  EmailVerificationRuntimeActionResponseSchema,
   ApplicationRunResultSchema,
   CancelledApplicationResultSchema,
   ReviewApplicationResultSchema,
@@ -19,6 +20,7 @@ import {
   HttpApplicationRuntimeClient,
   InterruptedRuntimeActionResponseSchema,
   RequestAdditionalInfoRuntimeActionSchema,
+  RequestEmailVerificationRuntimeActionSchema,
   RequestSignInRuntimeActionSchema,
   PLAYWRIGHT_CLI_READ_ONLY_COMMANDS,
   PlaywrightCliToolParametersSchema,
@@ -366,6 +368,7 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
     type: "request_sign_in" as const,
     username_ref: "f2e248",
     password_ref: "f2e255",
+    password_confirmation_ref: "f2e256",
     submit_ref: "f2e261",
   };
   expect(RequestSignInRuntimeActionSchema.parse(request)).toEqual(request);
@@ -375,6 +378,7 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
     { ...request, username_ref: "e01" },
     { ...request, username_ref: "e1000000000" },
     { ...request, password_ref: " e2" },
+    { ...request, password_confirmation_ref: "password-confirmation" },
     { ...request, submit_ref: "button" },
     { ...request, submit_ref: "e3\n" },
     { ...request, username_ref: "f0e1" },
@@ -399,6 +403,31 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
   ]) {
     expect(SignInRuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
     expect(RuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
+  }
+});
+test("validates private email-verification runtime contracts", () => {
+  const request = {
+    type: "request_email_verification" as const,
+    code_ref: "e41",
+    submit_ref: "e42",
+  };
+  expect(RequestEmailVerificationRuntimeActionSchema.parse(request)).toEqual(request);
+  expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
+  expect(RequestEmailVerificationRuntimeActionSchema.parse({
+    type: "request_email_verification",
+  })).toEqual({ type: "request_email_verification" });
+  for (const invalid of [
+    { type: "request_email_verification", submit_ref: "e42" },
+    { ...request, code_ref: "e0" },
+    { ...request, detail: "private code" },
+  ]) {
+    expect(RequestEmailVerificationRuntimeActionSchema.safeParse(invalid).success).toBe(false);
+    expect(RuntimeActionRequestSchema.safeParse(invalid).success).toBe(false);
+  }
+  for (const status of ["completed", "human_required"] as const) {
+    const response = { type: "email_verification" as const, status };
+    expect(EmailVerificationRuntimeActionResponseSchema.parse(response)).toEqual(response);
+    expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
   }
 });
 

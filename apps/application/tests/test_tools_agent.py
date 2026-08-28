@@ -80,6 +80,7 @@ class CredentialRuntime(FakeRuntime):
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -96,6 +97,10 @@ class CredentialRuntime(FakeRuntime):
                 "password": password,
             }
         )
+        if password_confirmation_ref is not None:
+            self.sign_in_calls[-1]["password_confirmation_ref"] = (
+                password_confirmation_ref
+            )
         self.mutation_finished.set()
 
     async def verify_origin_and_activate_private_values(
@@ -234,19 +239,24 @@ async def test_sign_in_tries_default_application_account_before_saved_credential
     result = await gate.request_sign_in(
         username_ref="e1",
         password_ref="e2",
-        submit_ref="e3",
+        password_confirmation_ref="e3",
+        submit_ref="e4",
         runtime=runtime,
         credential_store=credential_store,
     )
 
-    assert result.metadata == {"sign_in_status": "attempted"}
+    assert result.metadata == {
+        "sign_in_status": "attempted",
+        "default_account": True,
+    }
     assert publisher.events == []
     assert runtime.sign_in_calls == [
         {
             "expected_origin": JOB_ORIGIN,
             "username_ref": "e1",
             "password_ref": "e2",
-            "submit_ref": "e3",
+            "password_confirmation_ref": "e3",
+            "submit_ref": "e4",
             "username": "candidate@example.test",
             "password": "ExamplePassword123$$",
         }

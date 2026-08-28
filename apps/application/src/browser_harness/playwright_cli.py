@@ -19,11 +19,12 @@ from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, cast
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from uuid import UUID
 
 import psutil
 
+from .gmail_verification import VerificationChallenge
 from .models import (
     BrowserLaunchConfig,
     BrowserObservation,
@@ -637,6 +638,23 @@ def _origin_for_url(value: str) -> str:
     return validate_approved_origin(
         f"{parsed.scheme.lower()}://{host}{f':{port}' if port is not None else ''}"
     )
+
+
+def _verification_private_values(url: str) -> tuple[str, ...]:
+    parsed = urlsplit(url)
+    values = {url}
+    for encoded in (parsed.query, parsed.fragment):
+        if not encoded:
+            continue
+        values.add(unquote(encoded))
+        for _name, value in parse_qsl(encoded, keep_blank_values=False):
+            if value:
+                values.add(value)
+    for encoded_segment in parsed.path.split("/"):
+        segment = unquote(encoded_segment)
+        if len(segment) >= 8:
+            values.add(segment)
+    return tuple(sorted(values, key=len, reverse=True))
 
 
 def _atomic_write_private_json(path: Path, value: object) -> None:
@@ -1616,6 +1634,7 @@ class PlaywrightCliRuntime:
         self._environment = self._build_environment()
         self._private_values = self._build_private_values()
         self._applicant_values: tuple[str, ...] = ()
+        self._runtime_private_values: tuple[str, ...] = ()
         self._applicant_redaction_enabled = False
         self._refresh_private_redaction_values()
 
@@ -1684,6 +1703,7 @@ class PlaywrightCliRuntime:
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None = None,
         submit_ref: str,
         username: str,
         password: str,
@@ -1694,6 +1714,7 @@ class PlaywrightCliRuntime:
                 expected_origin=expected_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 username=username,
                 password=password,
@@ -1705,6 +1726,7 @@ class PlaywrightCliRuntime:
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -1717,7 +1739,16 @@ class PlaywrightCliRuntime:
             raise PlaywrightCliRuntimeError("browser_failed") from None
         if canonical_origin != expected_origin:
             raise PlaywrightCliRuntimeError("browser_failed")
-        refs = (username_ref, password_ref, submit_ref)
+        refs = tuple(
+            ref
+            for ref in (
+                username_ref,
+                password_ref,
+                password_confirmation_ref,
+                submit_ref,
+            )
+            if ref is not None
+        )
         if any(
             not isinstance(ref, str) or _ELEMENT_REF_PATTERN.fullmatch(ref) is None
             for ref in refs
@@ -1749,6 +1780,7 @@ class PlaywrightCliRuntime:
             expected_origin=canonical_origin,
             username_ref=username_ref,
             password_ref=password_ref,
+            password_confirmation_ref=password_confirmation_ref,
             submit_ref=submit_ref,
             username=username,
             password=password,
@@ -1775,6 +1807,113 @@ class PlaywrightCliRuntime:
             await self._emergency_budget_cleanup_unlocked()
             raise PlaywrightCliRuntimeError("browser_failed")
 
+    async def complete_email_verification(
+        self,
+        *,
+        approved_origins: Sequence[str],
+        challenge: VerificationChallenge,
+        code_ref: str | None,
+        submit_ref: str | None,
+    ) -> bool:
+        async with self._operation_lock:
+            if not self._started or self._closed:
+                raise PlaywrightCliRuntimeError("browser_failed")
+            try:
+                canonical_origins = tuple(
+                    validate_approved_origin(origin) for origin in approved_origins
+                )
+            except (TypeError, ValueError):
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+            if (
+                not canonical_origins
+                or len(canonical_origins) > 20
+                or len(set(canonical_origins)) != len(canonical_origins)
+            ):
+                raise PlaywrightCliRuntimeError("browser_failed")
+            try:
+                pre_metadata = await self._metadata()
+                current_origin = _origin_for_url(pre_metadata.url)
+            except (TypeError, ValueError):
+                raise PlaywrightCliRuntimeError("browser_failed") from None
+            if current_origin not in canonical_origins:
+                return False
+
+            expected_origin: str | None = None
+            code: str | None = None
+            verification_url: str | None = None
+            if code_ref is not None and challenge.codes:
+                code = challenge.codes[0]
+                expected_origin = current_origin
+            else:
+                for candidate in challenge.urls:
+                    try:
+                        parsed = urlsplit(candidate)
+                        origin = _origin_for_url(candidate)
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        parsed.scheme == "https"
+                        and parsed.username is None
+                        and parsed.password is None
+                        and len(candidate) <= 4_096
+                        and origin == current_origin
+                    ):
+                        expected_origin = origin
+                        verification_url = candidate
+                        break
+            if expected_origin is None:
+                return False
+            if code is not None:
+                if (
+                    _ELEMENT_REF_PATTERN.fullmatch(code_ref or "") is None
+                    or (
+                        submit_ref is not None
+                        and _ELEMENT_REF_PATTERN.fullmatch(submit_ref) is None
+                    )
+                    or not 1 <= len(code) <= 128
+                    or "\x00" in code
+                    or not _is_unicode_scalar_text(code)
+                ):
+                    raise PlaywrightCliRuntimeError("browser_failed")
+            elif code_ref is not None or submit_ref is not None:
+                code_ref = submit_ref = None
+
+            await self._suppress_private_capture_unlocked()
+            private_values = (
+                (code,)
+                if code is not None
+                else _verification_private_values(verification_url or "")
+            )
+            self._activate_runtime_private_values_unlocked(private_values)
+            script = self._private_email_verification_script(
+                expected_origin=expected_origin,
+                code_ref=code_ref,
+                submit_ref=submit_ref,
+                code=code,
+                verification_url=verification_url,
+            )
+            result = await self._invoke_private_script_unlocked(
+                script,
+                label="verification",
+            )
+            self._snapshot_from_execution(result, remove_file=True)
+            self._require_success(result)
+            post_metadata = await self._metadata()
+            if self._guard_armed and not self._url_is_allowed(
+                post_metadata.url,
+                self._approved_origins,
+            ):
+                await self._restore_allowed_page(pre_metadata, post_metadata)
+                raise PlaywrightCliRuntimeError("browser_failed")
+            self._current_metadata = post_metadata
+            if self._directory_size_exceeds(
+                self._output_directory,
+                _MAX_OUTPUT_DIRECTORY_BYTES,
+            ):
+                await self._emergency_budget_cleanup_unlocked()
+                raise PlaywrightCliRuntimeError("browser_failed")
+            return True
+
     def _activate_private_values_unlocked(self, values: Iterable[str]) -> None:
         applicant_values = set(self._applicant_values)
         applicant_values.update(
@@ -1782,6 +1921,21 @@ class PlaywrightCliRuntime:
         )
         self._applicant_values = tuple(
             sorted(applicant_values, key=len, reverse=True)
+        )
+        self._refresh_private_redaction_values()
+        self._current_metadata = None
+        self._screenshots_suppressed = True
+
+    def _activate_runtime_private_values_unlocked(
+        self,
+        values: Iterable[str],
+    ) -> None:
+        private_values = set(self._runtime_private_values)
+        private_values.update(
+            value for value in values if isinstance(value, str) and value
+        )
+        self._runtime_private_values = tuple(
+            sorted(private_values, key=len, reverse=True)
         )
         self._refresh_private_redaction_values()
         self._current_metadata = None
@@ -1796,10 +1950,14 @@ class PlaywrightCliRuntime:
         self._current_metadata = None
 
     def _refresh_private_redaction_values(self) -> None:
+        always_private_values = (
+            *self._private_values,
+            *self._runtime_private_values,
+        )
         values = (
-            (*self._private_values, *self._applicant_values)
+            (*always_private_values, *self._applicant_values)
             if self._applicant_redaction_enabled
-            else self._private_values
+            else always_private_values
         )
         self._private_redaction_values = _private_redaction_fragments(values)
         # Fragment strings are the only persistent redaction index.
@@ -2187,10 +2345,32 @@ class PlaywrightCliRuntime:
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
     ) -> str:
+        confirmation_element = (
+            "const passwordConfirmationElement=null;"
+            if password_confirmation_ref is None
+            else (
+                "const passwordConfirmationElement=await page.locator("
+                f"'aria-ref={password_confirmation_ref}').elementHandle();"
+            )
+        )
+        elements = (
+            "[usernameElement,passwordElement,submitElement]"
+            if password_confirmation_ref is None
+            else (
+                "[usernameElement,passwordElement,"
+                "passwordConfirmationElement,submitElement]"
+            )
+        )
+        confirmation_fill = (
+            ""
+            if password_confirmation_ref is None
+            else "await passwordConfirmationElement.fill(password);"
+        )
         return (
             "async (page) => {"
             f"const expectedOrigin={json.dumps(expected_origin)};"
@@ -2201,8 +2381,10 @@ class PlaywrightCliRuntime:
             "throw new Error('Unexpected sign-in origin');"
             f"const usernameElement=await page.locator('aria-ref={username_ref}').elementHandle();"
             f"const passwordElement=await page.locator('aria-ref={password_ref}').elementHandle();"
+            f"{confirmation_element}"
             f"const submitElement=await page.locator('aria-ref={submit_ref}').elementHandle();"
-            "if(!usernameElement||!passwordElement||!submitElement)"
+            f"const elements={elements};"
+            "if(elements.some((element)=>!element))"
             "throw new Error('Sign-in elements unavailable');"
             "const cdp=await page.context().newCDPSession(page);"
             "const frameTree=(await cdp.send('Page.getFrameTree')).frameTree;"
@@ -2214,7 +2396,7 @@ class PlaywrightCliRuntime:
             "if(frameTree.frame.securityOrigin!==expectedOrigin)"
             "throw new Error('Unexpected sign-in origin');"
             "const controlOriginsApproved=await Promise.all("
-            "[usernameElement,passwordElement,submitElement].map("
+            "elements.map("
             "async(element)=>{const frame=await element.ownerFrame();"
             "if(frame===null)return false;"
             "const frameUrl=frame.url().split('#')[0];"
@@ -2227,15 +2409,79 @@ class PlaywrightCliRuntime:
             "throw new Error('Unexpected sign-in control origin');"
             "await usernameElement.fill(username);"
             "await passwordElement.fill(password);"
+            f"{confirmation_fill}"
             "await submitElement.click();"
             "}"
+        )
+
+    @staticmethod
+    def _private_email_verification_script(
+        *,
+        expected_origin: str,
+        code_ref: str | None,
+        submit_ref: str | None,
+        code: str | None,
+        verification_url: str | None,
+    ) -> str:
+        prefix = (
+            "async (page) => {"
+            f"const expectedOrigin={json.dumps(expected_origin)};"
+            f"{_EXACT_ORIGIN_MATCHER_SCRIPT}"
+        )
+        if verification_url is not None:
+            return (
+                prefix
+                + f"const verificationUrl={json.dumps(verification_url)};"
+                + "if(!hasExactOrigin(verificationUrl,expectedOrigin))"
+                + "throw new Error('Unexpected verification origin');"
+                + "await page.goto(verificationUrl);"
+                + "}"
+            )
+        if code_ref is None or code is None:
+            raise PlaywrightCliRuntimeError("browser_failed")
+        refs = [code_ref] + ([] if submit_ref is None else [submit_ref])
+        encoded_refs = json.dumps(refs, separators=(",", ":"))
+        submit = "" if submit_ref is None else "await elements[1].click();"
+        return (
+            prefix
+            + f"const code={json.dumps(code)};"
+            + "if(!hasExactOrigin(page.url(),expectedOrigin))"
+            + "throw new Error('Unexpected verification origin');"
+            + f"const refs={encoded_refs};"
+            + "const elements=await Promise.all(refs.map(async(ref)=>"
+            + "page.locator('aria-ref='+ref).elementHandle()));"
+            + "if(elements.some((element)=>!element))"
+            + "throw new Error('Verification elements unavailable');"
+            + "const cdp=await page.context().newCDPSession(page);"
+            + "const frameTree=(await cdp.send('Page.getFrameTree')).frameTree;"
+            + "await cdp.detach();"
+            + "const frames=[];"
+            + "const collectFrames=(tree)=>{frames.push(tree.frame);"
+            + "for(const child of tree.childFrames||[])collectFrames(child);};"
+            + "collectFrames(frameTree);"
+            + "if(frameTree.frame.securityOrigin!==expectedOrigin)"
+            + "throw new Error('Unexpected verification origin');"
+            + "const controlOriginsApproved=await Promise.all(elements.map("
+            + "async(element)=>{const frame=await element.ownerFrame();"
+            + "if(frame===null)return false;"
+            + "const frameUrl=frame.url().split('#')[0];"
+            + "const frameName=frame.name();"
+            + "const matches=frames.filter((candidate)=>"
+            + "candidate.url===frameUrl&&(candidate.name||'')===frameName);"
+            + "return matches.length>0&&matches.every((candidate)=>"
+            + "candidate.securityOrigin===expectedOrigin);}));"
+            + "if(controlOriginsApproved.some((approved)=>!approved))"
+            + "throw new Error('Unexpected verification control origin');"
+            + "await elements[0].fill(code);"
+            + submit
+            + "}"
         )
 
     def _create_private_script_memfd(
         self,
         script: str,
         *,
-        label: Literal["sign-in", "restore"],
+        label: Literal["sign-in", "verification", "restore"],
     ) -> tuple[int, Path]:
         payload = script.encode("utf-8")
         descriptor = -1
@@ -2286,7 +2532,7 @@ class PlaywrightCliRuntime:
         self,
         script: str,
         *,
-        label: Literal["sign-in", "restore"],
+        label: Literal["sign-in", "verification", "restore"],
     ) -> _InvocationResult:
         descriptor, payload_path = self._create_private_script_memfd(
             script,

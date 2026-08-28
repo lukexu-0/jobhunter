@@ -29,6 +29,7 @@ from jobhunter_browser_harness.models import (
     CancelledApplicationResult,
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
+    EmailVerificationRuntimeActionResponse,
     ContinueWithoutAdditionalInfoRuntimeActionResponse,
     ProvideAdditionalInfoCommand,
     ApproveOriginCommand,
@@ -43,6 +44,7 @@ from jobhunter_browser_harness.models import (
     OpportunityKind,
     HarnessServiceError,
     RequestAdditionalInfoRuntimeAction,
+    RequestEmailVerificationRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestSignInRuntimeAction,
     RequestHumanReviewRuntimeAction,
@@ -2604,3 +2606,31 @@ async def test_unexpected_secret_bearing_exception_is_sanitized(
     assert secret not in response.text
     assert TOKEN not in response.text
     assert response.headers["cache-control"] == "no-store"
+@pytest.mark.parametrize("status", ["completed", "human_required"])
+def test_email_verification_runtime_action_contract(status: str) -> None:
+    action = RUNTIME_ACTION_ADAPTER.validate_python(
+        {
+            "type": "request_email_verification",
+            "code_ref": "e41",
+            "submit_ref": "e42",
+        }
+    )
+    assert isinstance(action, RequestEmailVerificationRuntimeAction)
+    assert action.code_ref == "e41"
+    assert action.submit_ref == "e42"
+    without_code_input = RUNTIME_ACTION_ADAPTER.validate_python(
+        {"type": "request_email_verification"}
+    )
+    assert isinstance(without_code_input, RequestEmailVerificationRuntimeAction)
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_ADAPTER.validate_python(
+            {
+                "type": "request_email_verification",
+                "submit_ref": "e42",
+            }
+        )
+
+    response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {"type": "email_verification", "status": status}
+    )
+    assert isinstance(response, EmailVerificationRuntimeActionResponse)

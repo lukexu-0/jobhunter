@@ -81,6 +81,7 @@ class BrowserGateRuntime(Protocol):
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None = None,
         submit_ref: str,
         username: str,
         password: str,
@@ -108,6 +109,7 @@ class _PendingGate:
     login_origin: str | None = None
     username_ref: str | None = None
     password_ref: str | None = None
+    password_confirmation_ref: str | None = None
     submit_ref: str | None = None
     credential_store: CredentialStore | None = None
 
@@ -539,6 +541,7 @@ class HumanGate:
         *,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None = None,
         submit_ref: str,
         runtime: BrowserGateRuntime,
         credential_store: CredentialStore,
@@ -577,11 +580,13 @@ class HumanGate:
 
         default_credentials = self._default_credentials
         credential = None
+        used_default = False
         if (
             default_credentials is not None
             and (login_origin, default_credentials[0]) not in self._tried_credentials
         ):
             username, password = default_credentials
+            used_default = True
         else:
             saved = credential_store.credentials_for_origin(login_origin)
             credential = next(
@@ -605,11 +610,15 @@ class HumanGate:
                 login_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 username=username,
                 password=password,
             )
-            return GateResult(metadata={"sign_in_status": "attempted"})
+            metadata: dict[str, object] = {"sign_in_status": "attempted"}
+            if used_default:
+                metadata["default_account"] = True
+            return GateResult(metadata=metadata)
 
         decision, _ = await self._wait_for_gate(
             kind="credentials",
@@ -620,6 +629,7 @@ class HumanGate:
             login_origin=login_origin,
             username_ref=username_ref,
             password_ref=password_ref,
+            password_confirmation_ref=password_confirmation_ref,
             submit_ref=submit_ref,
             credential_store=credential_store,
         )
@@ -830,6 +840,7 @@ class HumanGate:
                     login_origin=pending.login_origin,
                     username_ref=pending.username_ref,
                     password_ref=pending.password_ref,
+                    password_confirmation_ref=pending.password_confirmation_ref,
                     submit_ref=pending.submit_ref,
                     username=username,
                     password=password,
@@ -850,6 +861,7 @@ class HumanGate:
         login_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -861,6 +873,7 @@ class HumanGate:
                 login_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 username=username,
                 password=password,
@@ -1051,6 +1064,7 @@ class HumanGate:
         login_origin: str | None = None,
         username_ref: str | None = None,
         password_ref: str | None = None,
+        password_confirmation_ref: str | None = None,
         submit_ref: str | None = None,
         credential_store: CredentialStore | None = None,
     ) -> GateDecision:
@@ -1074,6 +1088,7 @@ class HumanGate:
                 login_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 credential_store=credential_store,
             )
@@ -1103,6 +1118,7 @@ class HumanGate:
         login_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -1113,6 +1129,7 @@ class HumanGate:
                 expected_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 username=username,
                 password=password,

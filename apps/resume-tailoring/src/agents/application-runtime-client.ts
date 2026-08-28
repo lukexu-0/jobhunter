@@ -257,10 +257,24 @@ export const RequestSignInRuntimeActionSchema = z.object({
   type: z.literal("request_sign_in"),
   username_ref: PlaywrightSnapshotElementRefSchema,
   password_ref: PlaywrightSnapshotElementRefSchema,
+  password_confirmation_ref: PlaywrightSnapshotElementRefSchema.optional(),
   submit_ref: PlaywrightSnapshotElementRefSchema,
 }).strict();
 export type RequestSignInRuntimeAction = z.infer<
   typeof RequestSignInRuntimeActionSchema
+>;
+
+export const RequestEmailVerificationRuntimeActionSchema = z.object({
+  type: z.literal("request_email_verification"),
+  code_ref: PlaywrightSnapshotElementRefSchema.optional(),
+  submit_ref: PlaywrightSnapshotElementRefSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (value.submit_ref !== undefined && value.code_ref === undefined) {
+    context.addIssue({ code: "custom", message: "submit_ref requires code_ref" });
+  }
+});
+export type RequestEmailVerificationRuntimeAction = z.infer<
+  typeof RequestEmailVerificationRuntimeActionSchema
 >;
 
 export const RequestHumanNavigationRuntimeActionSchema = z.object({
@@ -312,6 +326,7 @@ export type ReportApplicationMismatchRuntimeAction = z.infer<
 export const RuntimeActionRequestSchema = z.discriminatedUnion("type", [
   PlaywrightCliRuntimeActionSchema,
   RequestSignInRuntimeActionSchema,
+  RequestEmailVerificationRuntimeActionSchema,
   RequestHumanNavigationRuntimeActionSchema,
   RequestAdditionalInfoRuntimeActionSchema,
   RequestHumanReviewRuntimeActionSchema,
@@ -368,6 +383,14 @@ export const SignInRuntimeActionResponseSchema = z.object({
 }).strict();
 export type SignInRuntimeActionResponse = z.infer<
   typeof SignInRuntimeActionResponseSchema
+>;
+
+export const EmailVerificationRuntimeActionResponseSchema = z.object({
+  type: z.literal("email_verification"),
+  status: z.enum(["completed", "human_required"]),
+}).strict();
+export type EmailVerificationRuntimeActionResponse = z.infer<
+  typeof EmailVerificationRuntimeActionResponseSchema
 >;
 
 export const ContinueRuntimeActionResponseSchema = z.object({
@@ -483,6 +506,7 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   PlaywrightCliResultRuntimeActionResponseSchema,
   SignInRuntimeActionResponseSchema,
+  EmailVerificationRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   InterruptedRuntimeActionResponseSchema,
   ContinueWithoutAdditionalInfoRuntimeActionResponseSchema,

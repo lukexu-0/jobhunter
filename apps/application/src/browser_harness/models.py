@@ -1337,9 +1337,15 @@ class RequestSignInRuntimeAction(PublicModel):
     type: Literal["request_sign_in"]
     username_ref: ElementRef
     password_ref: ElementRef
+    password_confirmation_ref: ElementRef | None = None
     submit_ref: ElementRef
 
-    @field_validator("username_ref", "password_ref", "submit_ref")
+    @field_validator(
+        "username_ref",
+        "password_ref",
+        "password_confirmation_ref",
+        "submit_ref",
+    )
     @classmethod
     def _validate_ref(cls, value: str) -> str:
         if _ELEMENT_REF_PATTERN.fullmatch(value) is None:
@@ -1347,6 +1353,23 @@ class RequestSignInRuntimeAction(PublicModel):
         return value
 
 
+class RequestEmailVerificationRuntimeAction(PublicModel):
+    type: Literal["request_email_verification"]
+    code_ref: ElementRef | None = None
+    submit_ref: ElementRef | None = None
+
+    @field_validator("code_ref", "submit_ref")
+    @classmethod
+    def _validate_optional_ref(cls, value: str | None) -> str | None:
+        if value is not None and _ELEMENT_REF_PATTERN.fullmatch(value) is None:
+            raise ValueError("element ref is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_refs(self) -> RequestEmailVerificationRuntimeAction:
+        if self.submit_ref is not None and self.code_ref is None:
+            raise ValueError("submit_ref requires code_ref")
+        return self
 
 
 class RequestAdditionalInfoRuntimeAction(PublicModel):
@@ -1374,6 +1397,7 @@ RuntimeActionRequest: TypeAlias = Annotated[
     PlaywrightCliRuntimeAction
     | RequestHumanNavigationRuntimeAction
     | RequestSignInRuntimeAction
+    | RequestEmailVerificationRuntimeAction
     | RequestAdditionalInfoRuntimeAction
     | RequestHumanReviewRuntimeAction
     | ReportApplicationMismatchRuntimeAction,
@@ -1389,13 +1413,17 @@ class SignInRuntimeActionResponse(PublicModel):
     status: Literal["attempted", "saved"]
 
 
+class EmailVerificationRuntimeActionResponse(PublicModel):
+    type: Literal["email_verification"]
+    status: Literal["completed", "human_required"]
+
 
 class ContinueRuntimeActionResponse(PublicModel):
     type: Literal["continue"]
 
+
 class InterruptedRuntimeActionResponse(PublicModel):
     type: Literal["interrupted"]
-
 
 
 class ContinueWithoutAdditionalInfoRuntimeActionResponse(PublicModel):
@@ -1439,6 +1467,7 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 RuntimeActionResponse: TypeAlias = Annotated[
     PlaywrightCliResultRuntimeActionResponse
     | SignInRuntimeActionResponse
+    | EmailVerificationRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | InterruptedRuntimeActionResponse
     | ContinueWithoutAdditionalInfoRuntimeActionResponse
