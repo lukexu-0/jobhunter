@@ -9,12 +9,13 @@ import {
   useRef,
   type ReactNode,
 } from "react";
-import type { ApplicationSessionView } from "@jobhunter/pipeline/contracts";
+import type { ApplicationSessionView, RunDto } from "@jobhunter/pipeline/contracts";
 import { SoundAlertController } from "../lib/sound-alerts";
 
 const ENABLED_STORAGE_KEY = "jobhunter.sound-alerts.enabled";
 
 interface SoundAlerts {
+  readonly observeRun: (run: RunDto) => void;
   readonly observeApplication: (runId: string, view: ApplicationSessionView) => void;
 }
 
@@ -24,6 +25,10 @@ export function SoundAlertProvider({ children }: Readonly<{ children: ReactNode 
   const controllerRef = useRef<SoundAlertController | null>(null);
   if (controllerRef.current === null) controllerRef.current = new SoundAlertController();
   const controller = controllerRef.current;
+
+  const observeRun = useCallback((run: RunDto) => {
+    controller.observeRun(run);
+  }, [controller]);
 
   const observeApplication = useCallback((runId: string, view: ApplicationSessionView) => {
     controller.observeApplication(runId, view);
@@ -48,7 +53,10 @@ export function SoundAlertProvider({ children }: Readonly<{ children: ReactNode 
     };
   }, [controller]);
 
-  const value = useMemo(() => ({ observeApplication }), [observeApplication]);
+  const value = useMemo(
+    () => ({ observeApplication, observeRun }),
+    [observeApplication, observeRun],
+  );
   return <SoundAlertsContext.Provider value={value}>{children}</SoundAlertsContext.Provider>;
 }
 

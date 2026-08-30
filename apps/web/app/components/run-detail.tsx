@@ -624,7 +624,10 @@ export function RunDetail({ runId }: RunDetailProps) {
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
   const viewerPaneRef = useRef<HTMLElement>(null);
-  const { observeApplication } = useSoundAlerts();
+  const { observeApplication, observeRun } = useSoundAlerts();
+  useEffect(() => {
+    if (run !== null) observeRun(run);
+  }, [observeRun, run]);
 
   const loadRun = useCallback(async (initial = false) => {
     const request = ++requestVersion.current;

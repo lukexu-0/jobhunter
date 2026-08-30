@@ -1390,6 +1390,43 @@ test("plays one failure alert when the application agent fails", async ({ page }
   expect(await frequencies()).toEqual([]);
 });
 
+test("plays an attention alert when resume tailoring becomes ready for review", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  const visualQa = runFixture({
+    status: "visual_qa",
+    revision: 5,
+    origin: "human-comments",
+    pdfSha256: pdfHash4,
+  });
+  const review = runFixture({
+    status: "review",
+    revision: 5,
+    origin: "human-comments",
+    pdfSha256: pdfHash4,
+  });
+  const mock = await installPipeline(page, {
+    run: visualQa,
+    application: notStartedAfterApproval(),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const workflow = page.getByRole("list", { name: "Workflow progress" });
+  const visualQaStage = workflow.getByRole("listitem").filter({ hasText: "Visual QA" });
+  const reviewStage = workflow.getByRole("listitem").filter({ hasText: "Review" });
+  await expect(visualQaStage).toHaveAttribute("aria-current", "step");
+  await visualQaStage.click();
+  mock.run = review;
+
+  await expect(reviewStage).toHaveAttribute("aria-current", "step", { timeout: 6_000 });
+  await expect.poll(frequencies).toEqual([740, 988]);
+
+  await page.reload();
+  await expect(reviewStage).toHaveAttribute("aria-current", "step");
+  await reviewStage.click();
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([]);
+});
+
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
   const questions = questionFixtures();
   const initial = snapshotFixture({

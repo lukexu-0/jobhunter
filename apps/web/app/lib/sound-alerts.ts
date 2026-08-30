@@ -2,6 +2,7 @@ import type {
   ApplicationPendingAction,
   ApplicationSessionSnapshotDto,
   ApplicationSessionView,
+  RunDto,
 } from "@jobhunter/pipeline/contracts";
 
 export type SoundAlertKind = "attention" | "success" | "failure";
@@ -74,6 +75,14 @@ function applicationAlertDescriptor(
   };
 }
 
+function runAlertDescriptor(run: RunDto): AlertDescriptor | null {
+  if (run.status !== "review") return null;
+  return {
+    identity: JSON.stringify([run.id, run.revision, "review"]),
+    kind: "attention",
+  };
+}
+
 function isDescriptor(value: unknown): value is AlertDescriptor {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<AlertDescriptor>;
@@ -135,6 +144,10 @@ export class SoundAlertController {
     }
   }
 
+  observeRun(run: RunDto): void {
+    this.observe(`run:${run.id}`, runAlertDescriptor(run), false);
+  }
+
   observeApplication(runId: string, view: ApplicationSessionView): void {
     this.observe(
       `application:${runId}`,
@@ -161,12 +174,19 @@ export class SoundAlertController {
     void context.close().catch(() => undefined);
   }
 
-  private observe(scope: string, descriptor: AlertDescriptor | null): void {
+  private observe(
+    scope: string,
+    descriptor: AlertDescriptor | null,
+    alertInitial = true,
+  ): void {
     const entry = this.ledger[scope];
     if (entry === undefined) {
-      this.ledger[scope] = { current: descriptor, deliveredIdentity: null };
+      this.ledger[scope] = {
+        current: descriptor,
+        deliveredIdentity: alertInitial ? null : descriptor?.identity ?? null,
+      };
       this.persistLedger();
-      if (descriptor !== null && this.enabled) this.deliver(scope, descriptor);
+      if (alertInitial && descriptor !== null && this.enabled) this.deliver(scope, descriptor);
       return;
     }
     if (descriptor === null) {
