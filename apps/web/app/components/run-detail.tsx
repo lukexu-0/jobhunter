@@ -34,6 +34,7 @@ import {
   type ResumeIterationSelection,
 } from "../lib/run-detail-artifacts";
 import { RunReviewWorkspace } from "./run-review-workspace";
+import { useSoundAlerts } from "../providers/sound-alert-provider";
 import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
@@ -623,6 +624,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
   const viewerPaneRef = useRef<HTMLElement>(null);
+  const { observeApplication } = useSoundAlerts();
 
   const loadRun = useCallback(async (initial = false) => {
     const request = ++requestVersion.current;
@@ -670,6 +672,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   }, [runId]);
 
   const reportApplicationView = useCallback((next: ApplicationSessionView | null): void => {
+    if (next !== null) observeApplication(runId, next);
     setApplicationView(next);
     if (next === null || "state" in next) return;
     const refreshKey = next.submissionPhase === "submitted"
@@ -680,7 +683,7 @@ export function RunDetail({ runId }: RunDetailProps) {
     if (refreshKey === null || applicationStatusRefreshKeyRef.current === refreshKey) return;
     applicationStatusRefreshKeyRef.current = refreshKey;
     void refreshApplicationStatus();
-  }, [refreshApplicationStatus, runId]);
+  }, [observeApplication, refreshApplicationStatus, runId]);
 
   useEffect(() => {
     setRun(null);

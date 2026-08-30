@@ -1239,6 +1239,51 @@ test("an accepted live projection clears a stale application load failure", asyn
 });
 
 
+test("alerts once when an application is already waiting for human input", async ({ page }) => {
+  await page.addInitScript(() => {
+    const audioWindow = window as typeof window & { __soundFrequencies: number[] };
+    Object.defineProperty(audioWindow, "__soundFrequencies", {
+      configurable: true,
+      value: [],
+    });
+    const nativeStart = OscillatorNode.prototype.start;
+    OscillatorNode.prototype.start = function (when?: number): void {
+      audioWindow.__soundFrequencies.push(this.frequency.value);
+      nativeStart.call(this, when);
+    };
+  });
+  const navigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    generation: 4,
+    pendingAction: {
+      type: "human_navigation",
+      instruction: "Complete the public identity check.",
+    },
+    updatedAt: createdAt + 200,
+  });
+  await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: navigation,
+  });
+  const frequencies = () => page.evaluate(() => (
+    window as typeof window & { __soundFrequencies: number[] }
+  ).__soundFrequencies);
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
+  expect(await frequencies()).toEqual([]);
+
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  await expect.poll(frequencies).toEqual([740, 988]);
+
+  await page.reload();
+  await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([]);
+});
+
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
   const questions = questionFixtures();
   const initial = snapshotFixture({
