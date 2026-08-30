@@ -1427,6 +1427,42 @@ test("plays an attention alert when resume tailoring becomes ready for review", 
   expect(await frequencies()).toEqual([]);
 });
 
+test("persists sound alerts and lets the user test the attention sound", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: snapshotFixture({ bridgeState: "running" }),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const soundToggle = page.getByRole("checkbox", { name: "Sound alerts" });
+  const testSound = page.getByRole("button", { name: "Test sound" });
+  await expect(soundToggle).toBeChecked();
+  await expect(testSound).toBeEnabled();
+
+  await testSound.click();
+  await expect.poll(frequencies).toEqual([740, 988]);
+  await soundToggle.uncheck();
+  await expect(testSound).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.sound-alerts.enabled")
+  ))).toBe("false");
+
+  await page.reload();
+  await expect(soundToggle).not.toBeChecked();
+  await expect(testSound).toBeDisabled();
+  expect(await frequencies()).toEqual([]);
+
+  await soundToggle.check();
+  await expect(testSound).toBeEnabled();
+  await testSound.click();
+  await expect.poll(frequencies).toEqual([740, 988]);
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.sound-alerts.enabled")
+  ))).toBe("true");
+});
+
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
   const questions = questionFixtures();
   const initial = snapshotFixture({

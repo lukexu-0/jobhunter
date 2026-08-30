@@ -166,6 +166,22 @@ export class SoundAlertController {
     this.flushPending();
   }
 
+  playTest(): boolean {
+    if (!this.enabled) return false;
+    this.primed = true;
+    const context = this.getAudioContext();
+    if (context === null) return false;
+    const play = () => {
+      if (context.state !== "closed") this.play(context, "attention", 0);
+    };
+    if (context.state === "suspended") {
+      void context.resume().then(play).catch(() => undefined);
+    } else {
+      play();
+    }
+    return true;
+  }
+
   deactivate(): void {
     this.primed = false;
     const context = this.audioContext;

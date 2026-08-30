@@ -624,7 +624,14 @@ export function RunDetail({ runId }: RunDetailProps) {
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
   const viewerPaneRef = useRef<HTMLElement>(null);
-  const { observeApplication, observeRun } = useSoundAlerts();
+  const {
+    enabled: soundAlertsEnabled,
+    observeApplication,
+    observeRun,
+    setEnabled: setSoundAlertsEnabled,
+    testSound,
+    testStatus: soundTestStatus,
+  } = useSoundAlerts();
   useEffect(() => {
     if (run !== null) observeRun(run);
   }, [observeRun, run]);
@@ -1090,6 +1097,29 @@ export function RunDetail({ runId }: RunDetailProps) {
       <header className={styles.topBar}>
         <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to opportunities</Link>
         <WorkflowProgress applicationView={applicationView} run={run} />
+        <div className={styles.soundControls}>
+          <label className={styles.soundToggle}>
+            <input
+              aria-label="Sound alerts"
+              checked={soundAlertsEnabled ?? false}
+              disabled={soundAlertsEnabled === null}
+              onChange={(event) => setSoundAlertsEnabled(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>Sound alerts</span>
+          </label>
+          <button
+            className={styles.secondaryButton}
+            disabled={soundAlertsEnabled !== true}
+            onClick={testSound}
+            type="button"
+          >
+            Test sound
+          </button>
+          <span aria-live="polite" className="visually-hidden" role="status">
+            {soundTestStatus}
+          </span>
+        </div>
       </header>
       <div className={styles.topAlerts}>
         {awaitingHumanReview ? (
