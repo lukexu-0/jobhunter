@@ -5,7 +5,7 @@ import logging
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date as Date, datetime, time as Time, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -19,6 +19,11 @@ from .application_account import (
     DEFAULT_APPLICATION_PASSWORD,
 )
 from .credentials import CredentialStore
+from .gmail_verification import (
+    GmailVerificationError,
+    GmailVerificationInbox,
+    InboxReader,
+)
 from .agent import ApplicationRunRequest, build_application_task
 from .artifacts import (
     StoredCandidateArtifacts,
@@ -78,6 +83,11 @@ from .models import (
     SubmitCommand,
     ReviseCommand,
     SubmitRuntimeActionResponse,
+    InboxMessageSummary,
+    ReadEmailRuntimeAction,
+    ReadEmailRuntimeActionResponse,
+    ReadInboxRuntimeAction,
+    ReadInboxRuntimeActionResponse,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
     RequestSignInRuntimeAction,
@@ -396,6 +406,7 @@ class ApplicationSessionManager:
         runtime_factory: RuntimeFactory = PlaywrightCliRuntime,
         user_info_store: UserInfoStore | None = None,
         credential_store: CredentialStore | None = None,
+        gmail_inbox: InboxReader | None = None,
         default_credentials: tuple[str, str] | None = (
             DEFAULT_APPLICATION_EMAIL,
             DEFAULT_APPLICATION_PASSWORD,
@@ -412,6 +423,7 @@ class ApplicationSessionManager:
         self._runtime_factory = runtime_factory
         self._user_info_store = user_info_store or UserInfoStore(config.user_info_json)
         self._credential_store = credential_store
+        self._gmail_inbox = gmail_inbox
         self._default_credentials = default_credentials
         self._lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
@@ -1732,6 +1744,8 @@ class ApplicationSessionManager:
                 action,
                 (
                     PlaywrightCliRuntimeAction,
+                    ReadEmailRuntimeAction,
+                    ReadInboxRuntimeAction,
                     RequestHumanNavigationRuntimeAction,
                 ),
             ):
@@ -1866,6 +1880,49 @@ class ApplicationSessionManager:
                 409, "command_conflict", "The session is still starting"
             )
         request = record.request
+        if isinstance(action, (ReadInboxRuntimeAction, ReadEmailRuntimeAction)):
+            if not expose_applicant_values:
+                raise HarnessServiceError(
+                    409,
+                    "command_conflict",
+                    "Inbox actions are model-only",
+                )
+            inbox = self._gmail_inbox_for_use()
+            try:
+                if isinstance(action, ReadInboxRuntimeAction):
+                    result = await inbox.search_inbox(
+                        query=action.query,
+                        date=Date.fromisoformat(action.date) if action.date else None,
+                        time=Time.fromisoformat(action.time) if action.time else None,
+                        received_within_minutes=action.received_within_minutes,
+                    )
+                    return ReadInboxRuntimeActionResponse(
+                        type="read_inbox_result",
+                        messages=[
+                            InboxMessageSummary(
+                                email_id=message.message_id,
+                                subject=message.subject,
+                                sent_at=message.sent_at.astimezone(UTC)
+                                .isoformat()
+                                .replace("+00:00", "Z"),
+                            )
+                            for message in result.messages
+                        ],
+                        truncated=result.truncated,
+                    )
+                email = await inbox.read_email(action.email_id)
+                return ReadEmailRuntimeActionResponse(
+                    type="read_email_result",
+                    content=email.content,
+                )
+            except GmailVerificationError:
+                public = session_error("browser_failed")
+                raise HarnessServiceError(
+                    502,
+                    public.code,
+                    public.message,
+                ) from None
+
 
         if isinstance(action, PlaywrightCliRuntimeAction):
             async with record.request_lock:
@@ -2170,6 +2227,13 @@ class ApplicationSessionManager:
             credential_store = CredentialStore(self._config.credentials_json)
             self._credential_store = credential_store
         return credential_store
+
+    def _gmail_inbox_for_use(self) -> InboxReader:
+        gmail_inbox = self._gmail_inbox
+        if gmail_inbox is None:
+            gmail_inbox = GmailVerificationInbox(self._config.gmail_token_json)
+            self._gmail_inbox = gmail_inbox
+        return gmail_inbox
 
 
     @staticmethod

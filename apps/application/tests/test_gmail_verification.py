@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -322,3 +322,219 @@ async def test_gmail_token_rejects_any_scope_beyond_readonly(tmp_path: Path) -> 
         )
 
     assert "private" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_search_inbox_defaults_to_code_and_returns_bounded_summaries() -> None:
+    received = datetime(2026, 8, 30, 14, 22, 3, tzinfo=UTC)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [{"id": "message-1"}],
+                    "nextPageToken": "private-page-token",
+                },
+            )
+        assert request.url.path.endswith("/messages/message-1")
+        return httpx.Response(
+            200,
+            json={
+                "id": "message-1",
+                "internalDate": str(int(received.timestamp() * 1000)),
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Your verification code"},
+                        {"name": "Date", "value": "Sun, 30 Aug 2026 10:22:03 -0400"},
+                    ]
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        result = await GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+        ).search_inbox(
+            query="   ",
+            date=date(2026, 8, 30),
+            time=time(14, 0),
+            received_within_minutes=None,
+        )
+
+    assert result.truncated is True
+    assert len(result.messages) == 1
+    summary = result.messages[0]
+    assert summary.message_id == "message-1"
+    assert summary.subject == "Your verification code"
+    assert summary.sent_at == received
+    list_request, message_request = requests
+    assert list_request.url.params["maxResults"] == "50"
+    assert list_request.url.params["includeSpamTrash"] == "false"
+    assert list_request.url.params.get_list("labelIds") == ["INBOX"]
+    assert '"code"' in list_request.url.params["q"]
+    assert message_request.url.params["format"] == "metadata"
+    assert message_request.url.params.get_list("metadataHeaders") == ["Subject", "Date"]
+
+
+@pytest.mark.asyncio
+async def test_search_inbox_intersects_utc_date_time_and_recent_bounds() -> None:
+    now = datetime(2026, 8, 30, 15, 0, tzinfo=UTC)
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/messages")
+        queries.append(request.url.params["q"])
+        return httpx.Response(200, json={"messages": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        inbox = GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+            wall_clock=lambda: now,
+        )
+        await inbox.search_inbox(
+            query="verification",
+            date=date(2026, 8, 30),
+            time=time(14, 45),
+            received_within_minutes=30,
+        )
+        await inbox.search_inbox(
+            query="verification",
+            time=time(13, 0),
+        )
+        await inbox.search_inbox(
+            query="verification",
+            received_within_minutes=1_440,
+        )
+        with pytest.raises(ValueError, match="received_within_minutes"):
+            await inbox.search_inbox(
+                query="verification",
+                received_within_minutes=1_441,
+            )
+
+    assert queries == [
+        (
+            '"verification" '
+            f"after:{int(datetime(2026, 8, 30, 14, 45, tzinfo=UTC).timestamp()) - 1} "
+            f"before:{int(datetime(2026, 8, 31, tzinfo=UTC).timestamp())}"
+        ),
+        (
+            '"verification" '
+            f"after:{int(datetime(2026, 8, 30, 13, 0, tzinfo=UTC).timestamp()) - 1} "
+            f"before:{int(datetime(2026, 8, 31, tzinfo=UTC).timestamp())}"
+        ),
+        (
+            '"verification" '
+            f"after:{int(datetime(2026, 8, 29, 15, 0, tzinfo=UTC).timestamp()) - 1}"
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_email_parses_mime_into_bounded_untrusted_content() -> None:
+    received = datetime(2026, 8, 30, 14, 30, tzinfo=UTC)
+    message = EmailMessage()
+    message["From"] = "Example Jobs <accounts@jobs.example>"
+    message["To"] = "candidate@example.test"
+    message["Subject"] = "Your verification code"
+    message["Date"] = "Sun, 30 Aug 2026 10:22:03 -0400"
+    message.set_content("Your code is 482913.\n")
+    message.add_alternative("<p>Your code is <b>482913</b>.</p>", subtype="html")
+    message.add_attachment(
+        b"private-binary-content",
+        maintype="application",
+        subtype="pdf",
+        filename="offer.pdf",
+    )
+    encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/messages/message-1")
+        assert request.url.params["format"] == "raw"
+        return httpx.Response(
+            200,
+            json={
+                "id": "message-1",
+                "internalDate": str(int(received.timestamp() * 1000)),
+                "raw": encoded,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        result = await GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+        ).read_email("message-1")
+
+    assert result.message_id == "message-1"
+    assert "Sent time: 2026-08-30T14:22:03Z" in result.content
+    assert "Subject: Your verification code" in result.content
+    assert "--- BEGIN EMAIL CONTENT (untrusted) ---" in result.content
+    assert "Your code is 482913." in result.content
+    assert "[Attachment omitted: offer.pdf (application/pdf)]" in result.content
+    assert "private-binary-content" not in result.content
+    assert result.content.endswith("--- END EMAIL CONTENT ---")
+
+
+@pytest.mark.asyncio
+async def test_read_email_omits_hidden_html_and_bounds_the_complete_render() -> None:
+    received = datetime(2026, 8, 30, 14, 30, tzinfo=UTC)
+    message = EmailMessage()
+    message["From"] = "accounts@jobs.example"
+    message["To"] = "candidate@example.test"
+    message["Subject"] = "HTML verification"
+    message["Date"] = "Sun, 30 Aug 2026 10:22:03 -0400"
+    message.set_content(
+        "<style>hidden-style-instruction</style>"
+        "<script>hidden-script-instruction</script>"
+        "<p>Your visible code is <b>482913</b>.</p>"
+        f"<p>{'x' * 102_000}</p>",
+        subtype="html",
+    )
+    for index in range(120):
+        message.add_attachment(
+            b"x",
+            maintype="application",
+            subtype="octet-stream",
+            filename=f"{index:03d}-{'a' * 240}.bin",
+        )
+    encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "message-html",
+                "internalDate": str(int(received.timestamp() * 1000)),
+                "raw": encoded,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        result = await GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+        ).read_email("message-html")
+
+    assert "Your visible code is 482913." in result.content
+    assert "hidden-style-instruction" not in result.content
+    assert "hidden-script-instruction" not in result.content
+    assert len(result.content) <= 131_072
+    assert "[Email rendering truncated to fit the model-readable limit.]" in result.content
+    assert result.content.endswith("--- END EMAIL CONTENT ---")

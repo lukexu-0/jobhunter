@@ -2608,16 +2608,66 @@ async def test_unexpected_secret_bearing_exception_is_sanitized(
     assert response.headers["cache-control"] == "no-store"
 
 
-def test_rejects_model_facing_email_verification_runtime_contracts() -> None:
+def test_model_inbox_runtime_contracts_are_strict_and_bounded() -> None:
+    search = RUNTIME_ACTION_ADAPTER.validate_python(
+        {
+            "type": "read_inbox",
+            "query": "",
+            "date": "2026-08-30",
+            "time": "14:05",
+            "received_within_minutes": 1_440,
+        }
+    )
+    assert search.type == "read_inbox"
+    assert search.query == "code"
+    assert search.date == "2026-08-30"
+    assert search.time == "14:05"
     with pytest.raises(ValidationError):
         RUNTIME_ACTION_ADAPTER.validate_python(
-            {
-                "type": "request_email_verification",
-                "code_ref": "e41",
-                "submit_ref": "e42",
-            }
+            {"type": "read_inbox", "query": "code", "received_within_minutes": 1_441}
         )
     with pytest.raises(ValidationError):
-        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
-            {"type": "email_verification", "status": "completed"}
+        RUNTIME_ACTION_ADAPTER.validate_python(
+            {"type": "read_inbox", "query": "code\nsubject"}
         )
+    email = RUNTIME_ACTION_ADAPTER.validate_python(
+        {"type": "read_email", "email_id": "message-1"}
+    )
+    assert email.email_id == "message-1"
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_ADAPTER.validate_python(
+            {"type": "read_email", "email_id": "!message-1!"}
+        )
+
+    inbox_response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {
+            "type": "read_inbox_result",
+            "messages": [
+                {
+                    "email_id": "message-1",
+                    "subject": "Your verification code",
+                    "sent_at": "2026-08-30T14:22:03Z",
+                }
+            ],
+            "truncated": True,
+        }
+    )
+    assert inbox_response.messages[0].subject == "Your verification code"
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {
+                "type": "read_inbox_result",
+                "messages": [
+                    {
+                        "email_id": "!message-1!",
+                        "subject": "Your verification code",
+                        "sent_at": "prefix-2026-08-30T14:22:03Z-suffix",
+                    }
+                ],
+                "truncated": False,
+            }
+        )
+    email_response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {"type": "read_email_result", "content": "parsed MIME content"}
+    )
+    assert email_response.content == "parsed MIME content"
