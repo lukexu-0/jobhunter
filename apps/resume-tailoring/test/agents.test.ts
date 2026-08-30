@@ -1279,14 +1279,14 @@ describe("guarded agents", () => {
 
   test("edit is one isolated plan-only run over current immutable artifacts and requirements", async () => {
     const runtime = runtimeWith(async (agent, input, options) => {
-      runOptionsAreFresh(options, 1);
+      runOptionsAreFresh(options, 2);
       expect(agent.modelSettings).toMatchObject({
         reasoning: { effort: "medium" }, toolChoice: "submit_edit_plan", parallelToolCalls: false, store: false,
         retry: { maxRetries: 0 },
       });
       expect(agent.handoffs).toEqual([]);
       expect(agent.mcpServers).toEqual([]);
-      expect(agent.toolUseBehavior).toBe("stop_on_first_tool");
+      expect(typeof agent.toolUseBehavior).toBe("function");
       const parsed = JSON.parse(input);
       expect(parsed).toMatchObject({
         analysis: ANALYSIS,
@@ -1329,6 +1329,57 @@ describe("guarded agents", () => {
     })).rejects.toThrow("requires exactly one validated terminal call");
   });
 
+  test("returns bounded edit correction feedback and accepts a corrected plan", async () => {
+    const submittedRationale = "Sensitive rationale from the rejected edit payload";
+    const valid = {
+      plan: PLAN,
+      commentDispositions: [{
+        commentIndex: 0,
+        status: "rejected" as const,
+        rationale: "The requested omission is unsupported.",
+        evidenceIds: [],
+      }],
+    };
+    let feedback = "";
+    const runtime = runtimeWith(async (agent, _input, options) => {
+      const invalid = {
+        ...valid,
+        plan: {
+          ...PLAN,
+          omissions: [{
+            baselineItemId: "unsupported-omission",
+            rationale: submittedRationale,
+            evidenceIds: [],
+          }],
+        },
+      };
+      feedback = String(await invoke(agent, "submit_edit_plan", invalid));
+      runOptionsAreFresh(options, 2);
+      expect(feedback.length).toBeLessThanOrEqual(2_048);
+      expect(feedback).toContain("$.plan.omissions[0].evidenceIds:");
+      expect(feedback).toContain("expected array to have >=1 items");
+      expect(feedback).toContain("call submit_edit_plan again");
+      expect(feedback).not.toContain(submittedRationale);
+      expect(feedback).not.toContain(JSON.stringify(invalid));
+      expect(await invoke(agent, "submit_edit_plan", valid)).toEqual(valid);
+      return {};
+    });
+    await expect(runEditAgent({
+      attemptSessionId: "edit-correction",
+      signal: new AbortController().signal,
+      runtime,
+      input: {
+        analysis: ANALYSIS,
+        currentPlan: PLAN,
+        currentTailoredTex: "immutable tex",
+        context: CONTEXT,
+        deterministicQa: { ok: true },
+        visualQa: { status: "pass" },
+        comments: ["Remove an unsupported item"],
+      },
+    })).resolves.toEqual(valid);
+    expect(feedback).not.toBe("");
+  });
   test("separates requirement directives from factual edit evidence", async () => {
     const requirementBlock = {
       ...CONTEXT.evidence[1]!,
