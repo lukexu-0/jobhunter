@@ -4,7 +4,7 @@ import type {
   ApplicationSessionView,
 } from "@jobhunter/pipeline/contracts";
 
-export type SoundAlertKind = "attention";
+export type SoundAlertKind = "attention" | "success";
 
 interface AlertDescriptor {
   readonly identity: string;
@@ -23,7 +23,10 @@ type AudioContextWindow = typeof window & {
 };
 
 const LEDGER_STORAGE_KEY = "jobhunter.sound-alerts.ledger.v1";
-const ATTENTION_FREQUENCIES = [740, 988] as const;
+const FREQUENCIES_BY_KIND: Record<SoundAlertKind, readonly number[]> = {
+  attention: [740, 988],
+  success: [523, 659, 784],
+};
 const TONE_VOLUME = 0.12;
 const TONE_ATTACK_SECONDS = 0.015;
 const TONE_DURATION_SECONDS = 0.18;
@@ -44,7 +47,14 @@ function applicationAlertDescriptor(
   runId: string,
   view: ApplicationSessionView,
 ): AlertDescriptor | null {
-  if ("state" in view || !("bridgeState" in view) || view.pendingAction === null) return null;
+  if ("state" in view || !("bridgeState" in view)) return null;
+  if (view.submissionPhase === "submitted") {
+    return {
+      identity: JSON.stringify([runId, view.generation, "submitted"]),
+      kind: "success",
+    };
+  }
+  if (view.pendingAction === null) return null;
   const action = view.pendingAction;
   return {
     identity: JSON.stringify([
@@ -60,7 +70,8 @@ function applicationAlertDescriptor(
 function isDescriptor(value: unknown): value is AlertDescriptor {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<AlertDescriptor>;
-  return typeof candidate.identity === "string" && candidate.kind === "attention";
+  return typeof candidate.identity === "string"
+    && (candidate.kind === "attention" || candidate.kind === "success");
 }
 
 function readLedger(): AlertLedger {
@@ -205,7 +216,7 @@ export class SoundAlertController {
   }
 
   private play(context: AudioContext, kind: SoundAlertKind, delay: number): void {
-    const frequencies = kind === "attention" ? ATTENTION_FREQUENCIES : ATTENTION_FREQUENCIES;
+    const frequencies = FREQUENCIES_BY_KIND[kind];
     frequencies.forEach((frequency, index) => {
       const oscillator = context.createOscillator();
       const gain = context.createGain();

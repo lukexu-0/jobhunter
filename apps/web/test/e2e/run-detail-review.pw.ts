@@ -182,6 +182,24 @@ function deferred(): Deferred {
   });
   return { promise, resolve };
 }
+async function installSoundProbe(page: Page): Promise<() => Promise<number[]>> {
+  await page.addInitScript(() => {
+    const audioWindow = window as typeof window & { __soundFrequencies: number[] };
+    Object.defineProperty(audioWindow, "__soundFrequencies", {
+      configurable: true,
+      value: [],
+    });
+    const nativeStart = OscillatorNode.prototype.start;
+    OscillatorNode.prototype.start = function (when?: number): void {
+      audioWindow.__soundFrequencies.push(this.frequency.value);
+      nativeStart.call(this, when);
+    };
+  });
+  return () => page.evaluate(() => (
+    window as typeof window & { __soundFrequencies: number[] }
+  ).__soundFrequencies);
+}
+
 
 function onePagePdfFixture(): Buffer {
   const stream = "BT /F1 24 Tf 72 540 Td (Review workspace fixture) Tj ET";
@@ -1240,18 +1258,7 @@ test("an accepted live projection clears a stale application load failure", asyn
 
 
 test("alerts once when an application is already waiting for human input", async ({ page }) => {
-  await page.addInitScript(() => {
-    const audioWindow = window as typeof window & { __soundFrequencies: number[] };
-    Object.defineProperty(audioWindow, "__soundFrequencies", {
-      configurable: true,
-      value: [],
-    });
-    const nativeStart = OscillatorNode.prototype.start;
-    OscillatorNode.prototype.start = function (when?: number): void {
-      audioWindow.__soundFrequencies.push(this.frequency.value);
-      nativeStart.call(this, when);
-    };
-  });
+  const frequencies = await installSoundProbe(page);
   const navigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
     generation: 4,
@@ -1266,9 +1273,6 @@ test("alerts once when an application is already waiting for human input", async
     iterations: approvedIterations(),
     application: navigation,
   });
-  const frequencies = () => page.evaluate(() => (
-    window as typeof window & { __soundFrequencies: number[] }
-  ).__soundFrequencies);
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
@@ -1282,6 +1286,67 @@ test("alerts once when an application is already waiting for human input", async
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
   await page.waitForTimeout(100);
   expect(await frequencies()).toEqual([]);
+});
+
+test("plays one success alert when the application is submitted", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  await installControlledEventSource(page);
+  const running = snapshotFixture({
+    bridgeState: "running",
+    generation: 6,
+    updatedAt: createdAt + 100,
+  });
+  const submitted = snapshotFixture({
+    bridgeState: "submitted",
+    generation: 6,
+    updatedAt: createdAt + 200,
+  });
+  const submittedReplay = snapshotFixture({
+    bridgeState: "submitted",
+    generation: 6,
+    updatedAt: createdAt + 300,
+    warnings: ["Newer submitted projection accepted."],
+  });
+  const closed = snapshotFixture({
+    bridgeState: "closed",
+    generation: 6,
+    submissionPhase: "submitted",
+    updatedAt: createdAt + 400,
+  });
+  await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: running,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(0);
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  const sourceIndex = (await controlledEventSourceCount(page)) - 1;
+
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("application_submitted", submitted, {}),
+    40,
+    sourceIndex,
+  );
+  await expect.poll(frequencies).toEqual([523, 659, 784]);
+
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("snapshot", submittedReplay, {}),
+    41,
+    sourceIndex,
+  );
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("closed", closed, {}),
+    42,
+    sourceIndex,
+  );
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([523, 659, 784]);
 });
 
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
