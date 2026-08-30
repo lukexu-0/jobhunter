@@ -864,7 +864,7 @@ describe("job source loading", () => {
     expect(headers.get("accept")).toBe("text/html, application/xhtml+xml, text/plain");
     expect(headers.get("accept-encoding")).toBe("identity");
     expect(headers.get("user-agent")).toBe(
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      "jobhunter/0.1",
     );
     expect(attempts[0]!.init.redirect).toBe("manual");
     expect(attempts[0]!.init.decompress).toBe(false);
