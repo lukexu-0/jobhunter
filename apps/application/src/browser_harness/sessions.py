@@ -28,11 +28,6 @@ from .artifacts import (
     retry_pending_cleanup,
     store_uploads,
 )
-from .gmail_verification import (
-    GmailVerificationError,
-    GmailVerificationInbox,
-    VerificationInbox,
-)
 from .playwright_cli import (
     BrowserConfigurationError,
     PlaywrightCliRuntime,
@@ -70,7 +65,6 @@ from .models import (
     CancelRuntimeActionResponse,
     ContinueRuntimeActionResponse,
     InterruptedRuntimeActionResponse,
-    EmailVerificationRuntimeActionResponse,
     ContinueCommand,
     ContinueWithoutAdditionalInfoCommand,
     EmptyEventDetail,
@@ -86,7 +80,6 @@ from .models import (
     SubmitRuntimeActionResponse,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
-    RequestEmailVerificationRuntimeAction,
     RequestSignInRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
@@ -248,9 +241,6 @@ class _ApplicationSession:
     playwright_cli_action_count: int = 0
     last_successful_inspection_step: int = 0
     sign_in_inspection_step: int = 0
-    email_verification_inspection_step: int = 0
-    verification_not_before: datetime | None = None
-    verification_origin: str | None = None
     additional_info_question_count: int = 0
     submission_action_started: bool = False
     steering_epoch: int = 0
@@ -406,7 +396,6 @@ class ApplicationSessionManager:
         runtime_factory: RuntimeFactory = PlaywrightCliRuntime,
         user_info_store: UserInfoStore | None = None,
         credential_store: CredentialStore | None = None,
-        verification_inbox: VerificationInbox | None = None,
         default_credentials: tuple[str, str] | None = (
             DEFAULT_APPLICATION_EMAIL,
             DEFAULT_APPLICATION_PASSWORD,
@@ -423,7 +412,6 @@ class ApplicationSessionManager:
         self._runtime_factory = runtime_factory
         self._user_info_store = user_info_store or UserInfoStore(config.user_info_json)
         self._credential_store = credential_store
-        self._verification_inbox = verification_inbox
         self._default_credentials = default_credentials
         self._lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
@@ -2067,7 +2055,6 @@ class ApplicationSessionManager:
                 record.sign_in_inspection_step = (
                     record.last_successful_inspection_step
                 )
-            sign_in_started_at = _now()
             gate_result = await gate.request_sign_in(
                 account_action=action.account_action,
                 username_ref=action.username_ref,
@@ -2091,75 +2078,9 @@ class ApplicationSessionManager:
                     public.code,
                     public.message,
                 )
-            default_account = metadata.get("default_account") is True
-            account_origin = metadata.get("account_origin")
-            if (
-                default_account
-                and isinstance(account_origin, str)
-                and action.account_action == "create_account"
-            ):
-                record.verification_not_before = sign_in_started_at
-                record.verification_origin = account_origin
-            elif not (
-                default_account
-                and action.account_action == "sign_in"
-                and account_origin == record.verification_origin
-            ):
-                record.verification_not_before = None
-                record.verification_origin = None
             return SignInRuntimeActionResponse(
                 type="sign_in",
                 status=status,
-            )
-
-        if isinstance(action, RequestEmailVerificationRuntimeAction):
-            async with record.request_lock:
-                if (
-                    record.last_successful_inspection_step
-                    <= record.email_verification_inspection_step
-                ):
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "Inspect the application before requesting email verification",
-                    )
-                not_before = record.verification_not_before
-                expected_origin = record.verification_origin
-                if not_before is None or expected_origin is None:
-                    raise HarnessServiceError(
-                        409,
-                        "command_conflict",
-                        "Email verification requires a default account attempt",
-                    )
-                record.email_verification_inspection_step = (
-                    record.last_successful_inspection_step
-                )
-                record.playwright_cli_action_count += 1
-            try:
-                challenge = await self._verification_inbox_for_use().wait_for_challenge(
-                    expected_origin=expected_origin,
-                    recipient=DEFAULT_APPLICATION_EMAIL,
-                    not_before=not_before,
-                    timeout_seconds=self._config.gmail_verification_timeout,
-                )
-            except GmailVerificationError:
-                return EmailVerificationRuntimeActionResponse(
-                    type="email_verification",
-                    status="human_required",
-                )
-            completed = await runtime.complete_email_verification(
-                expected_origin=expected_origin,
-                challenge=challenge,
-                code_ref=action.code_ref,
-                submit_ref=action.submit_ref,
-            )
-            if completed:
-                async with record.request_lock:
-                    record.verification_not_before = None
-                    record.verification_origin = None
-            return EmailVerificationRuntimeActionResponse(
-                type="email_verification",
-                status="completed" if completed else "human_required",
             )
 
         if isinstance(action, RequestAdditionalInfoRuntimeAction):
@@ -2250,12 +2171,6 @@ class ApplicationSessionManager:
             self._credential_store = credential_store
         return credential_store
 
-    def _verification_inbox_for_use(self) -> VerificationInbox:
-        inbox = self._verification_inbox
-        if inbox is None:
-            inbox = GmailVerificationInbox(self._config.gmail_token_json)
-            self._verification_inbox = inbox
-        return inbox
 
     @staticmethod
     def _runtime_gate_terminal_response(

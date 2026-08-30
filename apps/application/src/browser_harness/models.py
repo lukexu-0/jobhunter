@@ -1358,25 +1358,6 @@ class RequestSignInRuntimeAction(PublicModel):
         return value
 
 
-class RequestEmailVerificationRuntimeAction(PublicModel):
-    type: Literal["request_email_verification"]
-    code_ref: ElementRef | None = None
-    submit_ref: ElementRef | None = None
-
-    @field_validator("code_ref", "submit_ref")
-    @classmethod
-    def _validate_optional_ref(cls, value: str | None) -> str | None:
-        if value is not None and _ELEMENT_REF_PATTERN.fullmatch(value) is None:
-            raise ValueError("element ref is invalid")
-        return value
-
-    @model_validator(mode="after")
-    def _validate_refs(self) -> RequestEmailVerificationRuntimeAction:
-        if self.submit_ref is not None and self.code_ref is None:
-            raise ValueError("submit_ref requires code_ref")
-        return self
-
-
 class RequestAdditionalInfoRuntimeAction(PublicModel):
     type: Literal["request_additional_info"]
     questions: list[AdditionalInfoQuestion] = Field(min_length=1, max_length=20)
@@ -1402,7 +1383,6 @@ RuntimeActionRequest: TypeAlias = Annotated[
     PlaywrightCliRuntimeAction
     | RequestHumanNavigationRuntimeAction
     | RequestSignInRuntimeAction
-    | RequestEmailVerificationRuntimeAction
     | RequestAdditionalInfoRuntimeAction
     | RequestHumanReviewRuntimeAction
     | ReportApplicationMismatchRuntimeAction,
@@ -1413,14 +1393,10 @@ RuntimeActionRequest: TypeAlias = Annotated[
 class PlaywrightCliResultRuntimeActionResponse(PlaywrightCliExecutionResult):
     type: Literal["playwright_cli_result"]
 
+
 class SignInRuntimeActionResponse(PublicModel):
     type: Literal["sign_in"]
     status: Literal["attempted", "saved"]
-
-
-class EmailVerificationRuntimeActionResponse(PublicModel):
-    type: Literal["email_verification"]
-    status: Literal["completed", "human_required"]
 
 
 class ContinueRuntimeActionResponse(PublicModel):
@@ -1472,7 +1448,6 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 RuntimeActionResponse: TypeAlias = Annotated[
     PlaywrightCliResultRuntimeActionResponse
     | SignInRuntimeActionResponse
-    | EmailVerificationRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | InterruptedRuntimeActionResponse
     | ContinueWithoutAdditionalInfoRuntimeActionResponse

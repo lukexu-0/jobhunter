@@ -10,7 +10,6 @@ import {
 import {
   AcceptedAdditionalInfoAnswerSchema,
   AdditionalInfoRuntimeActionResponseSchema,
-  EmailVerificationRuntimeActionResponseSchema,
   ApplicationRunResultSchema,
   CancelledApplicationResultSchema,
   ReviewApplicationResultSchema,
@@ -20,7 +19,6 @@ import {
   HttpApplicationRuntimeClient,
   InterruptedRuntimeActionResponseSchema,
   RequestAdditionalInfoRuntimeActionSchema,
-  RequestEmailVerificationRuntimeActionSchema,
   RequestSignInRuntimeActionSchema,
   PLAYWRIGHT_CLI_READ_ONLY_COMMANDS,
   PlaywrightCliToolParametersSchema,
@@ -407,30 +405,16 @@ test("strictly validates credential-free sign-in runtime wire contracts", () => 
     expect(RuntimeActionResponseSchema.safeParse(invalidResponse).success).toBe(false);
   }
 });
-test("validates private email-verification runtime contracts", () => {
-  const request = {
-    type: "request_email_verification" as const,
+test("rejects model-facing email-verification runtime contracts", () => {
+  expect(RuntimeActionRequestSchema.safeParse({
+    type: "request_email_verification",
     code_ref: "e41",
     submit_ref: "e42",
-  };
-  expect(RequestEmailVerificationRuntimeActionSchema.parse(request)).toEqual(request);
-  expect(RuntimeActionRequestSchema.parse(request)).toEqual(request);
-  expect(RequestEmailVerificationRuntimeActionSchema.parse({
-    type: "request_email_verification",
-  })).toEqual({ type: "request_email_verification" });
-  for (const invalid of [
-    { type: "request_email_verification", submit_ref: "e42" },
-    { ...request, code_ref: "e0" },
-    { ...request, detail: "private code" },
-  ]) {
-    expect(RequestEmailVerificationRuntimeActionSchema.safeParse(invalid).success).toBe(false);
-    expect(RuntimeActionRequestSchema.safeParse(invalid).success).toBe(false);
-  }
-  for (const status of ["completed", "human_required"] as const) {
-    const response = { type: "email_verification" as const, status };
-    expect(EmailVerificationRuntimeActionResponseSchema.parse(response)).toEqual(response);
-    expect(RuntimeActionResponseSchema.parse(response)).toEqual(response);
-  }
+  }).success).toBe(false);
+  expect(RuntimeActionResponseSchema.safeParse({
+    type: "email_verification",
+    status: "completed",
+  }).success).toBe(false);
 });
 
 test("strictly validates the interrupted runtime response", () => {

@@ -32,10 +32,6 @@ from jobhunter_browser_harness.context import (
     CandidateContextProcess,
     load_candidate_context,
 )
-from jobhunter_browser_harness.gmail_verification import (
-    VerificationChallenge,
-    VerificationInbox,
-)
 from jobhunter_browser_harness.playwright_cli import (
     BrowserConfigurationError,
     PlaywrightCliRuntimeError,
@@ -67,7 +63,6 @@ from jobhunter_browser_harness.models import (
     PlaywrightCliResultRuntimeActionResponse,
     PlaywrightCliRuntimeAction,
     ContinueRuntimeActionResponse,
-    EmailVerificationRuntimeActionResponse,
     InterruptedRuntimeActionResponse,
     ContinueWithoutAdditionalInfoRuntimeActionResponse,
     CancelCommand,
@@ -84,7 +79,6 @@ from jobhunter_browser_harness.models import (
     SubmitRuntimeActionResponse,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
-    RequestEmailVerificationRuntimeAction,
     RequestSignInRuntimeAction,
     RequestHumanNavigationRuntimeAction,
     RequestHumanReviewRuntimeAction,
@@ -337,7 +331,6 @@ class FakePlaywrightRuntime:
     navigation_guard_suspended: bool = False
     activated_private_values: list[tuple[str, ...]] = field(default_factory=list)
     sign_in_calls: list[dict[str, str]] = field(default_factory=list)
-    email_verification_calls: list[dict[str, object]] = field(default_factory=list)
     capture_suppression_calls: int = 0
     source_snapshot_result: Any = (
         "https://jobs.example/openings/42?verified=true",
@@ -468,23 +461,6 @@ class FakePlaywrightRuntime:
                 password_confirmation_ref
             )
 
-    async def complete_email_verification(
-        self,
-        *,
-        expected_origin: str,
-        challenge: VerificationChallenge,
-        code_ref: str | None,
-        submit_ref: str | None,
-    ) -> bool:
-        self.email_verification_calls.append(
-            {
-                "expected_origin": expected_origin,
-                "challenge": challenge,
-                "code_ref": code_ref,
-                "submit_ref": submit_ref,
-            }
-        )
-        return True
 
     async def close(self) -> None:
         if self.close_observer is not None:
@@ -504,28 +480,6 @@ class FakePlaywrightRuntime:
         self.closed = True
 
 
-@dataclass(slots=True)
-class FakeVerificationInbox:
-    challenge: VerificationChallenge
-    calls: list[dict[str, object]] = field(default_factory=list)
-
-    async def wait_for_challenge(
-        self,
-        *,
-        recipient: str,
-        expected_origin: str,
-        not_before: datetime,
-        timeout_seconds: int,
-    ) -> VerificationChallenge:
-        self.calls.append(
-            {
-                "recipient": recipient,
-                "expected_origin": expected_origin,
-                "not_before": not_before,
-                "timeout_seconds": timeout_seconds,
-            }
-        )
-        return self.challenge
 def playwright_execution_result(
     url: str = "https://jobs.example/openings/42?private=value",
 ) -> PlaywrightCliExecutionResult:
@@ -644,7 +598,6 @@ def make_manager(
     timeout: int | None = None,
     context_process_factory: Callable[[Any], Any] = ImmediateContextProcess,
     credential_store: CredentialStore | None = None,
-    verification_inbox: VerificationInbox | None = None,
     default_credentials: tuple[str, str] | None = None,
 ) -> tuple[ApplicationSessionManager, Fakes, Path]:
     doubles = fakes or Fakes()
@@ -669,7 +622,6 @@ def make_manager(
         application_runner=runner,
         runtime_factory=doubles.runtime_factory,
         credential_store=credential_store,
-        verification_inbox=verification_inbox,
         default_credentials=default_credentials,
     )
     return manager, doubles, root
@@ -6913,124 +6865,4 @@ async def test_capture_failure_never_opens_or_executes_the_credentials_gate(
     assert all(event.event != "credentials_required" for event in record.events)
     assert runtime.sign_in_calls == []
     assert runtime.capture_suppression_calls == 1
-    await manager.delete(created.session_id)
-@pytest.mark.asyncio
-async def test_default_signup_scans_gmail_and_completes_code_verification(
-    tmp_path: Path,
-) -> None:
-    challenge = VerificationChallenge(
-        message_id="verification-message",
-        received_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-        sender="accounts@jobs.example",
-        subject="Verification code",
-        urls=("https://jobs.example/verify?token=private-token",),
-        codes=("482913",),
-    )
-    inbox = FakeVerificationInbox(challenge)
-    manager, fakes, _root = make_manager(
-        tmp_path,
-        blocked_runner,
-        verification_inbox=inbox,
-        default_credentials=(DEFAULT_APPLICATION_EMAIL, DEFAULT_APPLICATION_PASSWORD),
-    )
-    created = await create_valid(manager)
-    await wait_state(manager, created.session_id, "running")
-    await runtime_action(
-        manager,
-        created.session_id,
-        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
-    )
-    before_create = datetime.now(UTC)
-    sign_in = await runtime_action(
-        manager,
-        created.session_id,
-        RequestSignInRuntimeAction(
-            type="request_sign_in",
-            account_action="create_account",
-            username_ref="e1",
-            password_ref="e2",
-            password_confirmation_ref="e3",
-            submit_ref="e4",
-        ),
-    )
-    after_create = datetime.now(UTC)
-    assert sign_in == SignInRuntimeActionResponse(type="sign_in", status="attempted")
-    assert fakes.runtimes[0].sign_in_calls[-1]["username"] == "candidate@example.test"
-    assert fakes.runtimes[0].sign_in_calls[-1]["password"] == "ExamplePassword123$$"
-    assert fakes.runtimes[0].sign_in_calls[-1]["password_confirmation_ref"] == "e3"
-
-    await runtime_action(
-        manager,
-        created.session_id,
-        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
-    )
-    fallback = await runtime_action(
-        manager,
-        created.session_id,
-        RequestSignInRuntimeAction(
-            type="request_sign_in",
-            account_action="sign_in",
-            username_ref="e5",
-            password_ref="e6",
-            submit_ref="e7",
-        ),
-    )
-    assert fallback == SignInRuntimeActionResponse(type="sign_in", status="attempted")
-    await runtime_action(
-        manager,
-        created.session_id,
-        PlaywrightCliRuntimeAction(type="playwright_cli", command="snapshot", args=[]),
-    )
-    verification = await runtime_action(
-        manager,
-        created.session_id,
-        RequestEmailVerificationRuntimeAction(
-            type="request_email_verification",
-            code_ref="e41",
-            submit_ref="e42",
-        ),
-    )
-
-    assert verification == EmailVerificationRuntimeActionResponse(
-        type="email_verification",
-        status="completed",
-    )
-    assert len(inbox.calls) == 1
-    assert inbox.calls[0]["recipient"] == "candidate@example.test"
-    assert inbox.calls[0]["expected_origin"] == "https://jobs.example"
-    assert inbox.calls[0]["timeout_seconds"] == 180
-    not_before = inbox.calls[0]["not_before"]
-    assert isinstance(not_before, datetime)
-    assert before_create <= not_before <= after_create
-    assert fakes.runtimes[0].email_verification_calls == [
-        {
-            "expected_origin": "https://jobs.example",
-            "challenge": challenge,
-            "code_ref": "e41",
-            "submit_ref": "e42",
-        }
-    ]
-    record = manager._active
-    assert record is not None
-    assert record.verification_not_before is None
-    assert record.verification_origin is None
-    action_count = record.playwright_cli_action_count
-    with pytest.raises(HarnessServiceError) as caught:
-        await runtime_action(
-            manager,
-            created.session_id,
-            RequestEmailVerificationRuntimeAction(
-                type="request_email_verification",
-                code_ref="e41",
-                submit_ref="e42",
-            ),
-        )
-    assert_service_error(
-        caught.value,
-        409,
-        "command_conflict",
-        "Inspect the application before requesting email verification",
-    )
-    assert record.playwright_cli_action_count == action_count
-    assert len(inbox.calls) == 1
     await manager.delete(created.session_id)
