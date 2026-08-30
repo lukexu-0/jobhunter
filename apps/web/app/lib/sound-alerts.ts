@@ -4,7 +4,7 @@ import type {
   ApplicationSessionView,
 } from "@jobhunter/pipeline/contracts";
 
-export type SoundAlertKind = "attention" | "success";
+export type SoundAlertKind = "attention" | "success" | "failure";
 
 interface AlertDescriptor {
   readonly identity: string;
@@ -26,6 +26,7 @@ const LEDGER_STORAGE_KEY = "jobhunter.sound-alerts.ledger.v1";
 const FREQUENCIES_BY_KIND: Record<SoundAlertKind, readonly number[]> = {
   attention: [740, 988],
   success: [523, 659, 784],
+  failure: [392, 262],
 };
 const TONE_VOLUME = 0.12;
 const TONE_ATTACK_SECONDS = 0.015;
@@ -48,6 +49,12 @@ function applicationAlertDescriptor(
   view: ApplicationSessionView,
 ): AlertDescriptor | null {
   if ("state" in view || !("bridgeState" in view)) return null;
+  if (view.bridgeState === "failed") {
+    return {
+      identity: JSON.stringify([runId, view.generation, "failed"]),
+      kind: "failure",
+    };
+  }
   if (view.submissionPhase === "submitted") {
     return {
       identity: JSON.stringify([runId, view.generation, "submitted"]),
@@ -71,7 +78,11 @@ function isDescriptor(value: unknown): value is AlertDescriptor {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<AlertDescriptor>;
   return typeof candidate.identity === "string"
-    && (candidate.kind === "attention" || candidate.kind === "success");
+    && (
+      candidate.kind === "attention"
+      || candidate.kind === "success"
+      || candidate.kind === "failure"
+    );
 }
 
 function readLedger(): AlertLedger {

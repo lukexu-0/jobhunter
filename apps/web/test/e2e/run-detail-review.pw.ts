@@ -1349,6 +1349,47 @@ test("plays one success alert when the application is submitted", async ({ page 
   expect(await frequencies()).toEqual([523, 659, 784]);
 });
 
+test("plays one failure alert when the application agent fails", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  await installControlledEventSource(page);
+  const running = snapshotFixture({
+    bridgeState: "running",
+    generation: 8,
+    updatedAt: createdAt + 100,
+  });
+  const failed = snapshotFixture({
+    bridgeState: "failed",
+    generation: 8,
+    updatedAt: createdAt + 200,
+  });
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: running,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(0);
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  const sourceIndex = (await controlledEventSourceCount(page)) - 1;
+
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("failed", failed, {}),
+    50,
+    sourceIndex,
+  );
+  await expect.poll(frequencies).toEqual([392, 262]);
+
+  mock.application = failed;
+  await page.reload();
+  await expect(page.getByRole("status").filter({ hasText: "Failed" })).toBeVisible();
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([]);
+});
+
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
   const questions = questionFixtures();
   const initial = snapshotFixture({
