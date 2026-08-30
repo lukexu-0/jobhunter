@@ -19,6 +19,10 @@ import {
   HttpApplicationRuntimeClient,
   InterruptedRuntimeActionResponseSchema,
   RequestAdditionalInfoRuntimeActionSchema,
+  ReadEmailRuntimeActionSchema,
+  ReadEmailRuntimeActionResponseSchema,
+  ReadInboxRuntimeActionSchema,
+  ReadInboxRuntimeActionResponseSchema,
   RequestSignInRuntimeActionSchema,
   PLAYWRIGHT_CLI_READ_ONLY_COMMANDS,
   PlaywrightCliToolParametersSchema,
@@ -813,6 +817,54 @@ describe("HttpApplicationRuntimeClient", () => {
     }).success).toBe(false);
   });
 
+  test("validates bounded inbox search and MIME read runtime contracts", () => {
+    expect(ReadInboxRuntimeActionSchema.parse({
+      type: "read_inbox",
+      query: "   ",
+      date: "2026-08-30",
+      time: "14:05",
+      received_within_minutes: 1_440,
+    })).toEqual({
+      type: "read_inbox",
+      query: "code",
+      date: "2026-08-30",
+      time: "14:05",
+      received_within_minutes: 1_440,
+    });
+    for (const invalidRequest of [
+      { type: "read_inbox", received_within_minutes: 0 },
+      { type: "read_inbox", received_within_minutes: 1_441 },
+      { type: "read_inbox", date: "2026-02-30" },
+      { type: "read_inbox", date: "0000-01-01" },
+      { type: "read_inbox", time: "24:00" },
+      { type: "read_inbox", query: "code\nsubject" },
+      { type: "read_inbox", unexpected: true },
+    ]) {
+      expect(RuntimeActionRequestSchema.safeParse(invalidRequest).success).toBe(false);
+    }
+    expect(ReadEmailRuntimeActionSchema.parse({
+      type: "read_email",
+      email_id: "message_1-abc",
+    })).toEqual({ type: "read_email", email_id: "message_1-abc" });
+
+    const inboxResponse = {
+      type: "read_inbox_result" as const,
+      messages: [{
+        email_id: "message_1-abc",
+        subject: "Your verification code",
+        sent_at: "2026-08-30T14:22:03Z",
+      }],
+      truncated: true,
+    };
+    expect(ReadInboxRuntimeActionResponseSchema.parse(inboxResponse))
+      .toEqual(inboxResponse);
+    expect(RuntimeActionResponseSchema.parse(inboxResponse)).toEqual(inboxResponse);
+    expect(ReadEmailRuntimeActionResponseSchema.parse({
+      type: "read_email_result",
+      content: "parsed MIME content",
+    })).toEqual({ type: "read_email_result", content: "parsed MIME content" });
+  });
+
   test("validates and serializes every runtime action variant", async () => {
     expect(RuntimeActionRequestSchema.parse({
       type: "playwright_cli",
@@ -844,6 +896,14 @@ describe("HttpApplicationRuntimeClient", () => {
     );
     const actions: RuntimeActionRequest[] = [
       { type: "playwright_cli", command: "eval", args: ["document.body.innerText"] },
+      {
+        type: "read_inbox",
+        query: "verification code",
+        date: "2026-08-30",
+        time: "14:00",
+        received_within_minutes: 30,
+      },
+      { type: "read_email", email_id: "message_1-abc" },
       {
         type: "request_sign_in",
         account_action: "sign_in",
@@ -896,6 +956,16 @@ describe("HttpApplicationRuntimeClient", () => {
       },
       { type: "sign_in", status: "attempted" },
       { type: "sign_in", status: "saved" },
+      {
+        type: "read_inbox_result",
+        messages: [{
+          email_id: "message_1-abc",
+          subject: "Your verification code",
+          sent_at: "2026-08-30T14:22:03Z",
+        }],
+        truncated: false,
+      },
+      { type: "read_email_result", content: "parsed MIME content" },
       { type: "continue" },
       {
         type: "additional_info",
