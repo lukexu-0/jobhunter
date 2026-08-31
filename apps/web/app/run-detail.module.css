@@ -30,12 +30,55 @@
   grid-row: 1;
   display: grid;
   min-height: calc(var(--control-height) + var(--space-5));
-  grid-template-columns: max-content minmax(0, 1fr);
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
   align-items: center;
   gap: var(--space-4);
   padding: var(--space-3) var(--space-5);
   border-bottom: var(--border-width) solid var(--color-border);
   background: var(--color-canvas);
+}
+
+.alertControls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.alertToggle {
+  display: inline-flex;
+  min-height: var(--control-height);
+  align-items: center;
+  gap: var(--space-2);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-text);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: var(--tracking-label);
+  line-height: var(--line-tight);
+  text-transform: uppercase;
+}
+
+.alertToggle:hover,
+.alertToggle:focus-within {
+  border-color: var(--color-accent);
+}
+
+.alertToggle:has(input:disabled) {
+  border-color: var(--color-border);
+  color: var(--color-faint);
+  cursor: not-allowed;
+}
+
+.alertToggle input {
+  width: var(--space-4);
+  height: var(--space-4);
+  margin: 0;
+  accent-color: var(--color-accent);
 }
 
 .topAlerts {
@@ -1280,6 +1323,11 @@
   .topBar {
     grid-template-columns: minmax(0, 1fr);
     padding: var(--space-3) var(--space-4);
+  }
+
+  .alertControls {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
 

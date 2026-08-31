@@ -114,9 +114,9 @@ body {
 
 .app-navigation ul {
   display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin: 0;
   padding: 0;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
   list-style: none;
 }
 
@@ -2173,8 +2173,6 @@ a {
   color: var(--color-accent);
 }
 
-
-
 @container route-workspace (max-width: 48rem) {
   .workspace {
     padding: var(--space-4);
@@ -2288,6 +2286,7 @@ a {
     align-items: flex-start;
     flex-direction: column;
   }
+
 }
 
 @container route-workspace (max-width: 35rem) {

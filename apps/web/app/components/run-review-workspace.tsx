@@ -3,7 +3,6 @@
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
   type FormEvent,
@@ -31,7 +30,6 @@ import {
   parseApplicationSessionStreamEvent,
   shouldAcceptApplicationView,
 } from "../lib/application-session-stream";
-import { ApplicationHelpSound } from "../lib/application-help-sound";
 import {
   PipelineClientError,
   applicationEventsHref,
@@ -293,14 +291,12 @@ export function RunReviewWorkspace({
   const applicationLifecycleLatchRef = useRef<ApplicationActionLatch | null>(null);
   const applicationCommandLatchRef = useRef<ApplicationActionLatch | null>(null);
   const applicationSteeringLatchRef = useRef<ApplicationSteeringLatch | null>(null);
-  const applicationHelpSoundRef = useRef<ApplicationHelpSound | null>(null);
   activeRunContextRef.current = applicationContextKey;
   const installApplicationView = useCallback((next: ApplicationSessionView): boolean => {
     if (activeRunContextRef.current !== applicationContextKey) return false;
     if (!shouldAcceptApplicationView(applicationViewRef.current, next)) return false;
     applicationViewEpochRef.current += 1;
     applicationViewRef.current = next;
-    applicationHelpSoundRef.current?.observeAcceptedView(next);
     setApplicationLoadError(null);
     setApplicationStreamError(null);
     const lifecycleLatch = applicationLifecycleLatchRef.current;
@@ -389,21 +385,6 @@ export function RunReviewWorkspace({
     ? snapshot.generation
     : null;
 
-  useLayoutEffect(() => {
-    const helpSound = new ApplicationHelpSound();
-    const primeHelpSound = () => helpSound.prime();
-    applicationHelpSoundRef.current = helpSound;
-    document.addEventListener("pointerdown", primeHelpSound, true);
-    document.addEventListener("keydown", primeHelpSound, true);
-    return () => {
-      document.removeEventListener("pointerdown", primeHelpSound, true);
-      document.removeEventListener("keydown", primeHelpSound, true);
-      if (applicationHelpSoundRef.current === helpSound) {
-        applicationHelpSoundRef.current = null;
-      }
-      helpSound.dispose();
-    };
-  }, [applicationContextKey]);
 
   useEffect(() => {
     applicationViewRef.current = null;

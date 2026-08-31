@@ -182,6 +182,89 @@ function deferred(): Deferred {
   });
   return { promise, resolve };
 }
+async function installSoundProbe(page: Page): Promise<() => Promise<number[]>> {
+  await page.addInitScript(() => {
+    const audioWindow = window as typeof window & { __soundFrequencies: number[] };
+    Object.defineProperty(audioWindow, "__soundFrequencies", {
+      configurable: true,
+      value: [],
+    });
+    const nativeStart = OscillatorNode.prototype.start;
+    OscillatorNode.prototype.start = function (when?: number): void {
+      audioWindow.__soundFrequencies.push(this.frequency.value);
+      nativeStart.call(this, when);
+    };
+  });
+  return () => page.evaluate(() => (
+    window as typeof window & { __soundFrequencies: number[] }
+  ).__soundFrequencies);
+}
+
+interface BrowserNotificationRecord {
+  readonly body: string;
+  readonly tag: string;
+  readonly title: string;
+}
+
+async function installBrowserNotificationProbe(
+  page: Page,
+  options: {
+    readonly initialPermission?: NotificationPermission;
+    readonly notificationsEnabled?: boolean;
+  } = {},
+): Promise<() => Promise<BrowserNotificationRecord[]>> {
+  await page.addInitScript((initial) => {
+    const notificationWindow = window as typeof window & {
+      __browserNotifications: BrowserNotificationRecord[];
+    };
+    Object.defineProperty(notificationWindow, "__browserNotifications", {
+      configurable: true,
+      value: [],
+    });
+    const permissionStorageKey = "jobhunter.test.browser-notification-permission";
+    let permission = window.localStorage.getItem(permissionStorageKey) as NotificationPermission | null;
+    if (permission === null) {
+      permission = initial.permission;
+      window.localStorage.setItem(permissionStorageKey, permission);
+    }
+    class BrowserNotificationProbe {
+      static get permission(): NotificationPermission {
+        return permission!;
+      }
+
+      static requestPermission(): Promise<NotificationPermission> {
+        permission = "granted";
+        window.localStorage.setItem(permissionStorageKey, permission);
+        return Promise.resolve(permission);
+      }
+
+      constructor(title: string, notificationOptions: NotificationOptions = {}) {
+        notificationWindow.__browserNotifications.push({
+          body: notificationOptions.body ?? "",
+          tag: notificationOptions.tag ?? "",
+          title,
+        });
+      }
+    }
+    Object.defineProperty(notificationWindow, "Notification", {
+      configurable: true,
+      value: BrowserNotificationProbe,
+    });
+    if (window.localStorage.getItem("jobhunter.browser-notifications.enabled") === null) {
+      window.localStorage.setItem(
+        "jobhunter.browser-notifications.enabled",
+        String(initial.notificationsEnabled),
+      );
+    }
+  }, {
+    notificationsEnabled: options.notificationsEnabled ?? true,
+    permission: options.initialPermission ?? "granted",
+  });
+  return () => page.evaluate(() => (
+    window as typeof window & { __browserNotifications: BrowserNotificationRecord[] }
+  ).__browserNotifications);
+}
+
 
 function onePagePdfFixture(): Buffer {
   const stream = "BT /F1 24 Tf 72 540 Td (Review workspace fixture) Tj ET";
@@ -1238,52 +1321,10 @@ test("an accepted live projection clears a stale application load failure", asyn
   mock.application = failed;
 });
 
-test("sounds once for each newly actionable application gate after user audio priming", async ({ page }) => {
-  await page.addInitScript(() => {
-    const calls = {
-      audioContextsConstructed: 0,
-      oscillatorStarts: 0,
-    };
-    const audioWindow = window as typeof window & {
-      __webAudioCalls: typeof calls;
-      webkitAudioContext?: typeof AudioContext;
-    };
-    Object.defineProperty(audioWindow, "__webAudioCalls", {
-      configurable: true,
-      value: calls,
-    });
 
-    const nativeOscillatorStart = OscillatorNode.prototype.start;
-    OscillatorNode.prototype.start = function (when?: number): void {
-      calls.oscillatorStarts += 1;
-      nativeOscillatorStart.call(this, when);
-    };
-
-    const NativeAudioContext = window.AudioContext;
-    class ObservableAudioContext extends NativeAudioContext {
-      constructor(options?: AudioContextOptions) {
-        super(options);
-        calls.audioContextsConstructed += 1;
-      }
-    }
-    Object.defineProperty(window, "AudioContext", {
-      configurable: true,
-      value: ObservableAudioContext,
-    });
-    if (audioWindow.webkitAudioContext === NativeAudioContext) {
-      Object.defineProperty(audioWindow, "webkitAudioContext", {
-        configurable: true,
-        value: ObservableAudioContext,
-      });
-    }
-  });
-  await installControlledEventSource(page);
-
-  const running = snapshotFixture({
-    bridgeState: "running",
-    generation: 4,
-    updatedAt: createdAt + 100,
-  });
+test("alerts once when an application is already waiting for human input", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
   const navigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
     generation: 4,
@@ -1293,106 +1334,232 @@ test("sounds once for each newly actionable application gate after user audio pr
     },
     updatedAt: createdAt + 200,
   });
-  const newerSameNavigation = snapshotFixture({
-    bridgeState: "awaiting_human_navigation",
-    generation: 4,
-    pendingAction: {
-      type: "human_navigation",
-      instruction: "Complete the public identity check.",
-    },
+  await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: navigation,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
+  expect(await frequencies()).toEqual([]);
+  await expect.poll(notifications).toEqual([{
+    body: "Return to Jobhunter to continue the application.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Application needs attention",
+  }]);
+
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  await expect.poll(frequencies).toEqual([740, 988]);
+
+  await page.reload();
+  await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([]);
+  expect(await notifications()).toEqual([]);
+});
+
+test("plays one success alert when the application is submitted", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
+  await installControlledEventSource(page);
+  const running = snapshotFixture({
+    bridgeState: "running",
+    generation: 6,
+    updatedAt: createdAt + 100,
+  });
+  const submitted = snapshotFixture({
+    bridgeState: "submitted",
+    generation: 6,
+    updatedAt: createdAt + 200,
+  });
+  const submittedReplay = snapshotFixture({
+    bridgeState: "submitted",
+    generation: 6,
     updatedAt: createdAt + 300,
-    warnings: ["Newer navigation projection accepted."],
+    warnings: ["Newer submitted projection accepted."],
   });
-  const reconnectReplay = snapshotFixture({
-    bridgeState: "awaiting_human_navigation",
-    generation: 4,
-    pendingAction: {
-      type: "human_navigation",
-      instruction: "Complete the public identity check.",
-    },
+  const closed = snapshotFixture({
+    bridgeState: "closed",
+    generation: 6,
+    submissionPhase: "submitted",
     updatedAt: createdAt + 400,
-    warnings: ["Authoritative reconnect replay accepted."],
   });
-  const review = snapshotFixture({
-    bridgeState: "awaiting_human_review",
-    generation: 4,
-    pendingAction: { type: "human_review" },
-    updatedAt: createdAt + 500,
+  await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: running,
+  });
+
+  await page.goto(`/runs/${runId}`);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(0);
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  const sourceIndex = (await controlledEventSourceCount(page)) - 1;
+
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("application_submitted", submitted, {}),
+    40,
+    sourceIndex,
+  );
+  await expect.poll(frequencies).toEqual([523, 659, 784]);
+  await expect.poll(notifications).toEqual([{
+    body: "Jobhunter submitted the application successfully.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Application submitted",
+  }]);
+
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("snapshot", submittedReplay, {}),
+    41,
+    sourceIndex,
+  );
+  await emitControlledApplicationEvent(
+    page,
+    eventFixture("closed", closed, {}),
+    42,
+    sourceIndex,
+  );
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([523, 659, 784]);
+  expect(await notifications()).toHaveLength(1);
+});
+
+test("plays one failure alert when the application agent fails", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
+  await installControlledEventSource(page);
+  const running = snapshotFixture({
+    bridgeState: "running",
+    generation: 8,
+    updatedAt: createdAt + 100,
+  });
+  const failed = snapshotFixture({
+    bridgeState: "failed",
+    generation: 8,
+    updatedAt: createdAt + 200,
   });
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
     application: running,
   });
-  const audioCalls = () => page.evaluate(() => (
-    window as typeof window & {
-      __webAudioCalls: {
-        audioContextsConstructed: number;
-        oscillatorStarts: number;
-      };
-    }
-  ).__webAudioCalls);
-  const settleClientEffects = () => page.evaluate(() => new Promise<void>((resolve) => {
-    window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
-  }));
-  const applicationPanel = page.getByRole("region", {
-    name: "Application",
-    exact: true,
-  });
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
   await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(0);
-  await settleClientEffects();
-  expect((await audioCalls()).oscillatorStarts).toBe(0);
-
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
-  await settleClientEffects();
-  expect((await audioCalls()).oscillatorStarts).toBe(0);
-
-  const initialSourceCount = await controlledEventSourceCount(page);
-  await emitControlledApplicationEvent(
-    page,
-    eventFixture("human_navigation_required", navigation, {
-      instruction: "Complete the public identity check.",
-    }),
-    90,
-    initialSourceCount - 1,
-  );
-  await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
-  await expect.poll(async () => (await audioCalls()).oscillatorStarts).toBe(1);
-  expect((await audioCalls()).audioContextsConstructed).toBeGreaterThan(0);
+  const sourceIndex = (await controlledEventSourceCount(page)) - 1;
 
   await emitControlledApplicationEvent(
     page,
-    eventFixture("snapshot", newerSameNavigation, {}),
-    91,
-    initialSourceCount - 1,
+    eventFixture("failed", failed, {}),
+    50,
+    sourceIndex,
   );
-  await expect(applicationPanel.getByRole("alert", { name: "Application warnings" }))
-    .toHaveText("Newer navigation projection accepted.");
-  await settleClientEffects();
-  expect((await audioCalls()).oscillatorStarts).toBe(1);
+  await expect.poll(frequencies).toEqual([392, 262]);
+  await expect.poll(notifications).toEqual([{
+    body: "Open Jobhunter to review the failure and retry.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Application failed",
+  }]);
 
-  const applicationReadsBeforeReconnect = mock.applicationGetCount;
-  mock.application = reconnectReplay;
-  await emitControlledEventSourceError(page, initialSourceCount - 1);
-  await expect.poll(() => mock.applicationGetCount).toBeGreaterThan(applicationReadsBeforeReconnect);
-  await expect(applicationPanel.getByRole("alert", { name: "Application warnings" }))
-    .toHaveText("Authoritative reconnect replay accepted.");
-  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(initialSourceCount);
-  await settleClientEffects();
-  expect((await audioCalls()).oscillatorStarts).toBe(1);
+  mock.application = failed;
+  await page.reload();
+  await expect(page.getByRole("status").filter({ hasText: "Failed" })).toBeVisible();
+  await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([]);
+  expect(await notifications()).toEqual([]);
+});
 
-  const reconnectedSourceCount = await controlledEventSourceCount(page);
-  await emitControlledApplicationEvent(
-    page,
-    eventFixture("review_required", review, {}),
-    1,
-    reconnectedSourceCount - 1,
-  );
-  await expect(page.getByRole("heading", { name: "Review the application" })).toBeVisible();
-  await expect.poll(async () => (await audioCalls()).oscillatorStarts).toBe(2);
+test("plays an attention alert when resume tailoring becomes ready for review", async ({ page }) => {
+  const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
+  const visualQa = runFixture({
+    status: "visual_qa",
+    revision: 5,
+    origin: "human-comments",
+    pdfSha256: pdfHash4,
+  });
+  const review = runFixture({
+    status: "review",
+    revision: 5,
+    origin: "human-comments",
+    pdfSha256: pdfHash4,
+  });
+  const mock = await installPipeline(page, {
+    run: visualQa,
+    application: notStartedAfterApproval(),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const workflow = page.getByRole("list", { name: "Workflow progress" });
+  const visualQaStage = workflow.getByRole("listitem").filter({ hasText: "Visual QA" });
+  const reviewStage = workflow.getByRole("listitem").filter({ hasText: "Review" });
+  await expect(visualQaStage).toHaveAttribute("aria-current", "step");
+  await visualQaStage.click();
+  mock.run = review;
+
+  await expect(reviewStage).toHaveAttribute("aria-current", "step", { timeout: 6_000 });
+  await expect.poll(frequencies).toEqual([740, 988]);
+  await expect.poll(notifications).toEqual([{
+    body: "Review the tailored resume in Jobhunter.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Resume ready for review",
+  }]);
+
+  await page.reload();
+  await expect(reviewStage).toHaveAttribute("aria-current", "step");
+  await reviewStage.click();
+  await page.waitForTimeout(100);
+  expect(await frequencies()).toEqual([]);
+  expect(await notifications()).toEqual([]);
+});
+
+test("persists alert settings in the application workflow", async ({ page }) => {
+  await installBrowserNotificationProbe(page, {
+    initialPermission: "default",
+    notificationsEnabled: false,
+  });
+  await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: snapshotFixture({ bridgeState: "running" }),
+  });
+
+  await page.goto(`/runs/${runId}`);
+  const soundToggle = page.getByRole("checkbox", { name: "Sound alerts" });
+  const notificationToggle = page.getByRole("checkbox", { name: "Browser notifications" });
+  await expect(soundToggle).toBeChecked();
+  await expect(notificationToggle).not.toBeChecked();
+  await expect(notificationToggle).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Test sound" })).toHaveCount(0);
+
+  await soundToggle.uncheck();
+  await notificationToggle.check();
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.sound-alerts.enabled")
+  ))).toBe("false");
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.browser-notifications.enabled")
+  ))).toBe("true");
+
+  await page.reload();
+  await expect(soundToggle).not.toBeChecked();
+  await expect(notificationToggle).toBeChecked();
+
+  await soundToggle.check();
+  await notificationToggle.uncheck();
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.sound-alerts.enabled")
+  ))).toBe("true");
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.browser-notifications.enabled")
+  ))).toBe("false");
 });
 
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {

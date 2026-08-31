@@ -34,6 +34,7 @@ import {
   type ResumeIterationSelection,
 } from "../lib/run-detail-artifacts";
 import { RunReviewWorkspace } from "./run-review-workspace";
+import { useAlerts } from "../providers/alert-provider";
 import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
@@ -623,6 +624,19 @@ export function RunDetail({ runId }: RunDetailProps) {
   const keywordMapTabRef = useRef<HTMLButtonElement>(null);
   const diffTabRef = useRef<HTMLButtonElement>(null);
   const viewerPaneRef = useRef<HTMLElement>(null);
+  const {
+    notificationPermission,
+    notificationsEnabled,
+    observeApplication,
+    observeRun,
+    setNotificationsEnabled,
+    setSoundEnabled: setSoundAlertsEnabled,
+    soundEnabled: soundAlertsEnabled,
+    statusMessage: alertStatus,
+  } = useAlerts();
+  useEffect(() => {
+    if (run !== null) observeRun(run);
+  }, [observeRun, run]);
 
   const loadRun = useCallback(async (initial = false) => {
     const request = ++requestVersion.current;
@@ -670,6 +684,7 @@ export function RunDetail({ runId }: RunDetailProps) {
   }, [runId]);
 
   const reportApplicationView = useCallback((next: ApplicationSessionView | null): void => {
+    if (next !== null) observeApplication(runId, next);
     setApplicationView(next);
     if (next === null || "state" in next) return;
     const refreshKey = next.submissionPhase === "submitted"
@@ -680,7 +695,7 @@ export function RunDetail({ runId }: RunDetailProps) {
     if (refreshKey === null || applicationStatusRefreshKeyRef.current === refreshKey) return;
     applicationStatusRefreshKeyRef.current = refreshKey;
     void refreshApplicationStatus();
-  }, [refreshApplicationStatus, runId]);
+  }, [observeApplication, refreshApplicationStatus, runId]);
 
   useEffect(() => {
     setRun(null);
@@ -1070,6 +1085,14 @@ export function RunDetail({ runId }: RunDetailProps) {
   const awaitingHumanReview = applicationView !== null
     && !("state" in applicationView)
     && applicationView.bridgeState === "awaiting_human_review";
+  const browserNotificationsUnavailable = notificationPermission === null
+    || notificationPermission === "denied"
+    || notificationPermission === "unsupported";
+  const browserNotificationLabel = notificationPermission === "denied"
+    ? "Notifications blocked"
+    : notificationPermission === "unsupported"
+      ? "Notifications unavailable"
+      : "Browser notifications";
   return (
     <main
       className={styles.detailShell}
@@ -1084,6 +1107,32 @@ export function RunDetail({ runId }: RunDetailProps) {
       <header className={styles.topBar}>
         <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to opportunities</Link>
         <WorkflowProgress applicationView={applicationView} run={run} />
+        <div className={styles.alertControls}>
+          <label className={styles.alertToggle}>
+            <input
+              aria-label="Sound alerts"
+              checked={soundAlertsEnabled ?? false}
+              disabled={soundAlertsEnabled === null}
+              onChange={(event) => setSoundAlertsEnabled(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>Sound alerts</span>
+          </label>
+          <label className={styles.alertToggle}>
+            <input
+              aria-label="Browser notifications"
+              checked={notificationsEnabled ?? false}
+              disabled={browserNotificationsUnavailable}
+              onChange={(event) => void setNotificationsEnabled(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>{browserNotificationLabel}</span>
+          </label>
+
+          <span aria-live="polite" className="visually-hidden" role="status">
+            {alertStatus}
+          </span>
+        </div>
       </header>
       <div className={styles.topAlerts}>
         {awaitingHumanReview ? (

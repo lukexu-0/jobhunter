@@ -9,8 +9,6 @@ function NavIcon({ name }: { readonly name: "applications" | "discovery" | "prov
   if (name === "discovery") {
     return <Compass aria-hidden="true" strokeWidth={1.7} />;
   }
-
-
   if (name === "providers") {
     return <KeyRound aria-hidden="true" strokeWidth={1.7} />;
   }
