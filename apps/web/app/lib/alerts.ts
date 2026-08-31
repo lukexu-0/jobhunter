@@ -5,16 +5,24 @@ import type {
   RunDto,
 } from "@jobhunter/pipeline/contracts";
 
-export type SoundAlertKind = "attention" | "success" | "failure";
+export type AlertKind = "attention" | "success" | "failure";
+
+interface BrowserAlertNotification {
+  readonly href: string;
+  readonly body: string;
+  readonly title: string;
+}
 
 interface AlertDescriptor {
   readonly identity: string;
-  readonly kind: SoundAlertKind;
+  readonly kind: AlertKind;
+  readonly notification: BrowserAlertNotification;
 }
 
 interface AlertLedgerEntry {
   current: AlertDescriptor | null;
-  deliveredIdentity: string | null;
+  deliveredNotificationIdentity: string | null;
+  deliveredSoundIdentity: string | null;
 }
 
 type AlertLedger = Record<string, AlertLedgerEntry>;
@@ -23,16 +31,34 @@ type AudioContextWindow = typeof window & {
   readonly webkitAudioContext?: typeof AudioContext;
 };
 
-const LEDGER_STORAGE_KEY = "jobhunter.sound-alerts.ledger.v1";
-const FREQUENCIES_BY_KIND: Record<SoundAlertKind, readonly number[]> = {
+const LEDGER_STORAGE_KEY = "jobhunter.alerts.ledger.v2";
+const FREQUENCIES_BY_KIND: Record<AlertKind, readonly number[]> = {
   attention: [740, 988],
   success: [523, 659, 784],
   failure: [392, 262],
+};
+const NOTIFICATION_COPY_BY_KIND: Record<AlertKind, Readonly<{ body: string; title: string }>> = {
+  attention: {
+    body: "Return to Jobhunter to continue the application.",
+    title: "Application needs attention",
+  },
+  success: {
+    body: "Jobhunter submitted the application successfully.",
+    title: "Application submitted",
+  },
+  failure: {
+    body: "Open Jobhunter to review the failure and retry.",
+    title: "Application failed",
+  },
 };
 const TONE_VOLUME = 0.12;
 const TONE_ATTACK_SECONDS = 0.015;
 const TONE_DURATION_SECONDS = 0.18;
 const TONE_GAP_SECONDS = 0.07;
+
+function notificationForKind(kind: AlertKind, href: string): BrowserAlertNotification {
+  return { ...NOTIFICATION_COPY_BY_KIND[kind], href };
+}
 
 function pendingActionPayload(
   action: ApplicationPendingAction,
@@ -54,12 +80,20 @@ function applicationAlertDescriptor(
     return {
       identity: JSON.stringify([runId, view.generation, "failed"]),
       kind: "failure",
+      notification: notificationForKind(
+        "failure",
+        `/runs/${encodeURIComponent(runId)}`,
+      ),
     };
   }
   if (view.submissionPhase === "submitted") {
     return {
       identity: JSON.stringify([runId, view.generation, "submitted"]),
       kind: "success",
+      notification: notificationForKind(
+        "success",
+        `/runs/${encodeURIComponent(runId)}`,
+      ),
     };
   }
   if (view.pendingAction === null) return null;
@@ -72,6 +106,10 @@ function applicationAlertDescriptor(
       pendingActionPayload(action, view),
     ]),
     kind: "attention",
+    notification: notificationForKind(
+      "attention",
+      `/runs/${encodeURIComponent(runId)}`,
+    ),
   };
 }
 
@@ -80,18 +118,27 @@ function runAlertDescriptor(run: RunDto): AlertDescriptor | null {
   return {
     identity: JSON.stringify([run.id, run.revision, "review"]),
     kind: "attention",
+    notification: {
+      body: "Review the tailored resume in Jobhunter.",
+      href: `/runs/${encodeURIComponent(run.id)}`,
+      title: "Resume ready for review",
+    },
   };
 }
 
 function isDescriptor(value: unknown): value is AlertDescriptor {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<AlertDescriptor>;
+  const notification = candidate.notification as Partial<BrowserAlertNotification> | undefined;
   return typeof candidate.identity === "string"
     && (
       candidate.kind === "attention"
       || candidate.kind === "success"
       || candidate.kind === "failure"
-    );
+    )
+    && typeof notification?.body === "string"
+    && typeof notification.href === "string"
+    && typeof notification.title === "string";
 }
 
 function readLedger(): AlertLedger {
@@ -106,10 +153,19 @@ function readLedger(): AlertLedger {
       if (typeof rawEntry !== "object" || rawEntry === null) continue;
       const candidate = rawEntry as Partial<AlertLedgerEntry>;
       const current = candidate.current;
-      const deliveredIdentity = candidate.deliveredIdentity;
+      const deliveredNotificationIdentity = candidate.deliveredNotificationIdentity;
+      const deliveredSoundIdentity = candidate.deliveredSoundIdentity;
       if (current !== null && !isDescriptor(current)) continue;
-      if (deliveredIdentity !== null && typeof deliveredIdentity !== "string") continue;
-      ledger[scope] = { current, deliveredIdentity };
+      if (
+        deliveredNotificationIdentity !== null
+        && typeof deliveredNotificationIdentity !== "string"
+      ) continue;
+      if (deliveredSoundIdentity !== null && typeof deliveredSoundIdentity !== "string") continue;
+      ledger[scope] = {
+        current,
+        deliveredNotificationIdentity,
+        deliveredSoundIdentity,
+      };
     }
     return ledger;
   } catch {
@@ -117,30 +173,27 @@ function readLedger(): AlertLedger {
   }
 }
 
-export class SoundAlertController {
+export class AlertController {
   private readonly ledger: AlertLedger;
   private readonly pending = new Map<string, AlertDescriptor>();
   private audioContext: AudioContext | null = null;
-  private enabled = false;
+  private browserNotificationsEnabled = false;
+  private soundEnabled = false;
   private primed = false;
 
   constructor() {
     this.ledger = readLedger();
   }
 
-  setEnabled(enabled: boolean): void {
-    this.enabled = enabled;
-    if (!enabled) {
-      this.pending.clear();
-      return;
-    }
+  configure(options: {
+    readonly browserNotificationsEnabled: boolean;
+    readonly soundEnabled: boolean;
+  }): void {
+    this.browserNotificationsEnabled = options.browserNotificationsEnabled;
+    this.soundEnabled = options.soundEnabled;
+    if (!this.soundEnabled) this.pending.clear();
     for (const [scope, entry] of Object.entries(this.ledger)) {
-      if (
-        entry.current !== null
-        && entry.current.identity !== entry.deliveredIdentity
-      ) {
-        this.deliver(scope, entry.current);
-      }
+      this.deliverEnabledChannels(scope, entry);
     }
   }
 
@@ -166,13 +219,13 @@ export class SoundAlertController {
     this.flushPending();
   }
 
-  playTest(): boolean {
-    if (!this.enabled) return false;
+  playTestSound(kind: AlertKind): boolean {
+    if (!this.soundEnabled) return false;
     this.primed = true;
     const context = this.getAudioContext();
     if (context === null) return false;
     const play = () => {
-      if (context.state !== "closed") this.play(context, "attention", 0);
+      if (context.state !== "closed") this.play(context, kind, 0);
     };
     if (context.state === "suspended") {
       void context.resume().then(play).catch(() => undefined);
@@ -180,6 +233,15 @@ export class SoundAlertController {
       play();
     }
     return true;
+  }
+
+  showTestNotification(kind: AlertKind): boolean {
+    if (!this.browserNotificationsEnabled) return false;
+    return this.showBrowserNotification(`preview:${kind}`, {
+      identity: `preview:${kind}`,
+      kind,
+      notification: notificationForKind(kind, "/notifications"),
+    });
   }
 
   deactivate(): void {
@@ -197,18 +259,26 @@ export class SoundAlertController {
   ): void {
     const entry = this.ledger[scope];
     if (entry === undefined) {
-      this.ledger[scope] = {
+      const deliveredIdentity = alertInitial ? null : descriptor?.identity ?? null;
+      const nextEntry = {
         current: descriptor,
-        deliveredIdentity: alertInitial ? null : descriptor?.identity ?? null,
+        deliveredNotificationIdentity: deliveredIdentity,
+        deliveredSoundIdentity: deliveredIdentity,
       };
+      this.ledger[scope] = nextEntry;
       this.persistLedger();
-      if (alertInitial && descriptor !== null && this.enabled) this.deliver(scope, descriptor);
+      if (alertInitial) this.deliverEnabledChannels(scope, nextEntry);
       return;
     }
     if (descriptor === null) {
-      if (entry.current !== null || entry.deliveredIdentity !== null) {
+      if (
+        entry.current !== null
+        || entry.deliveredNotificationIdentity !== null
+        || entry.deliveredSoundIdentity !== null
+      ) {
         entry.current = null;
-        entry.deliveredIdentity = null;
+        entry.deliveredNotificationIdentity = null;
+        entry.deliveredSoundIdentity = null;
         this.pending.delete(scope);
         this.persistLedger();
       }
@@ -216,26 +286,35 @@ export class SoundAlertController {
     }
     if (entry.current?.identity !== descriptor.identity) {
       entry.current = descriptor;
-      entry.deliveredIdentity = null;
+      entry.deliveredNotificationIdentity = null;
+      entry.deliveredSoundIdentity = null;
       this.pending.delete(scope);
       this.persistLedger();
     }
-    if (entry.deliveredIdentity !== descriptor.identity && this.enabled) {
-      this.deliver(scope, descriptor);
+    this.deliverEnabledChannels(scope, entry);
+  }
+
+  private deliverEnabledChannels(scope: string, entry: AlertLedgerEntry): void {
+    const descriptor = entry.current;
+    if (descriptor === null) return;
+    if (this.soundEnabled && entry.deliveredSoundIdentity !== descriptor.identity) {
+      entry.deliveredSoundIdentity = descriptor.identity;
+      this.pending.set(scope, descriptor);
+      this.persistLedger();
+      if (this.primed) this.flushPending();
+    }
+    if (
+      this.browserNotificationsEnabled
+      && entry.deliveredNotificationIdentity !== descriptor.identity
+    ) {
+      entry.deliveredNotificationIdentity = descriptor.identity;
+      this.persistLedger();
+      this.showBrowserNotification(scope, descriptor);
     }
   }
 
-  private deliver(scope: string, descriptor: AlertDescriptor): void {
-    const entry = this.ledger[scope];
-    if (entry === undefined || entry.current?.identity !== descriptor.identity) return;
-    entry.deliveredIdentity = descriptor.identity;
-    this.pending.set(scope, descriptor);
-    this.persistLedger();
-    if (this.primed) this.flushPending();
-  }
-
   private flushPending(): void {
-    if (!this.enabled || !this.primed || this.pending.size === 0) return;
+    if (!this.soundEnabled || !this.primed || this.pending.size === 0) return;
     const context = this.getAudioContext();
     if (context === null || context.state === "closed") return;
     let delay = 0;
@@ -262,7 +341,7 @@ export class SoundAlertController {
     }
   }
 
-  private play(context: AudioContext, kind: SoundAlertKind, delay: number): void {
+  private play(context: AudioContext, kind: AlertKind, delay: number): void {
     const frequencies = FREQUENCIES_BY_KIND[kind];
     frequencies.forEach((frequency, index) => {
       const oscillator = context.createOscillator();
@@ -285,6 +364,28 @@ export class SoundAlertController {
       oscillator.start(startAt);
       oscillator.stop(stopAt);
     });
+  }
+
+  private showBrowserNotification(scope: string, descriptor: AlertDescriptor): boolean {
+    if (
+      typeof window === "undefined"
+      || !("Notification" in window)
+      || window.Notification.permission !== "granted"
+    ) return false;
+    try {
+      const browserNotification = new window.Notification(descriptor.notification.title, {
+        body: descriptor.notification.body,
+        tag: `jobhunter:${scope}`,
+      });
+      browserNotification.onclick = () => {
+        window.focus();
+        window.location.assign(descriptor.notification.href);
+        browserNotification.close();
+      };
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private persistLedger(): void {

@@ -11,7 +11,7 @@ import {
   type SetStateAction,
 } from "react";
 import type { AuthStatusResponse, RunDto } from "@jobhunter/pipeline/contracts";
-import { useSoundAlerts } from "./sound-alert-provider";
+import { useAlerts } from "./alert-provider";
 
 export interface JobIdentity {
   title: string;
@@ -33,7 +33,7 @@ export function DashboardDataProvider({ children }: Readonly<{ children: ReactNo
   const [runs, setRuns] = useState<RunDto[]>();
   const [jobIdentities, setJobIdentities] = useState<Record<string, JobIdentity>>({});
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse>();
-  const { observeRun } = useSoundAlerts();
+  const { observeRun } = useAlerts();
   useEffect(() => {
     if (runs === undefined) return;
     for (const run of runs) observeRun(run);

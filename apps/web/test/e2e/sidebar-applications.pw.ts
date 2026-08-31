@@ -335,7 +335,7 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
 async function expectFolderNavigation(
   page: Page,
   width: number,
-  currentLabel: "Applications" | "Discovery" | "Providers",
+  currentLabel: "Alerts" | "Applications" | "Discovery" | "Providers",
 ): Promise<void> {
   const strip = page.locator("header.app-navigation");
   const stripBox = await strip.boundingBox();
@@ -2716,7 +2716,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
   const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
-  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Providers"]);
+  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Alerts", "Providers"]);
   await expect(applicationCount).toHaveText("7");
 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();

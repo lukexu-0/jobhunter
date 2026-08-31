@@ -34,7 +34,7 @@ import {
   type ResumeIterationSelection,
 } from "../lib/run-detail-artifacts";
 import { RunReviewWorkspace } from "./run-review-workspace";
-import { useSoundAlerts } from "../providers/sound-alert-provider";
+import { useAlerts } from "../providers/alert-provider";
 import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
@@ -625,13 +625,13 @@ export function RunDetail({ runId }: RunDetailProps) {
   const diffTabRef = useRef<HTMLButtonElement>(null);
   const viewerPaneRef = useRef<HTMLElement>(null);
   const {
-    enabled: soundAlertsEnabled,
     observeApplication,
     observeRun,
-    setEnabled: setSoundAlertsEnabled,
+    setSoundEnabled: setSoundAlertsEnabled,
+    soundEnabled: soundAlertsEnabled,
     testSound,
     testStatus: soundTestStatus,
-  } = useSoundAlerts();
+  } = useAlerts();
   useEffect(() => {
     if (run !== null) observeRun(run);
   }, [observeRun, run]);
@@ -1111,7 +1111,7 @@ export function RunDetail({ runId }: RunDetailProps) {
           <button
             className={styles.secondaryButton}
             disabled={soundAlertsEnabled !== true}
-            onClick={testSound}
+            onClick={() => testSound("attention")}
             type="button"
           >
             Test sound

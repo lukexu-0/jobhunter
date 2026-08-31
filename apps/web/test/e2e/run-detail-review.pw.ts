@@ -200,6 +200,49 @@ async function installSoundProbe(page: Page): Promise<() => Promise<number[]>> {
   ).__soundFrequencies);
 }
 
+interface BrowserNotificationRecord {
+  readonly body: string;
+  readonly tag: string;
+  readonly title: string;
+}
+
+async function installBrowserNotificationProbe(
+  page: Page,
+): Promise<() => Promise<BrowserNotificationRecord[]>> {
+  await page.addInitScript(() => {
+    const notificationWindow = window as typeof window & {
+      __browserNotifications: BrowserNotificationRecord[];
+    };
+    Object.defineProperty(notificationWindow, "__browserNotifications", {
+      configurable: true,
+      value: [],
+    });
+    class BrowserNotificationProbe {
+      static readonly permission: NotificationPermission = "granted";
+
+      static requestPermission(): Promise<NotificationPermission> {
+        return Promise.resolve(BrowserNotificationProbe.permission);
+      }
+
+      constructor(title: string, options: NotificationOptions = {}) {
+        notificationWindow.__browserNotifications.push({
+          body: options.body ?? "",
+          tag: options.tag ?? "",
+          title,
+        });
+      }
+    }
+    Object.defineProperty(notificationWindow, "Notification", {
+      configurable: true,
+      value: BrowserNotificationProbe,
+    });
+    window.localStorage.setItem("jobhunter.browser-notifications.enabled", "true");
+  });
+  return () => page.evaluate(() => (
+    window as typeof window & { __browserNotifications: BrowserNotificationRecord[] }
+  ).__browserNotifications);
+}
+
 
 function onePagePdfFixture(): Buffer {
   const stream = "BT /F1 24 Tf 72 540 Td (Review workspace fixture) Tj ET";
@@ -1259,6 +1302,7 @@ test("an accepted live projection clears a stale application load failure", asyn
 
 test("alerts once when an application is already waiting for human input", async ({ page }) => {
   const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
   const navigation = snapshotFixture({
     bridgeState: "awaiting_human_navigation",
     generation: 4,
@@ -1277,6 +1321,11 @@ test("alerts once when an application is already waiting for human input", async
   await page.goto(`/runs/${runId}`);
   await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
   expect(await frequencies()).toEqual([]);
+  await expect.poll(notifications).toEqual([{
+    body: "Return to Jobhunter to continue the application.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Application needs attention",
+  }]);
 
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
   await expect.poll(frequencies).toEqual([740, 988]);
@@ -1286,10 +1335,12 @@ test("alerts once when an application is already waiting for human input", async
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
   await page.waitForTimeout(100);
   expect(await frequencies()).toEqual([]);
+  expect(await notifications()).toEqual([]);
 });
 
 test("plays one success alert when the application is submitted", async ({ page }) => {
   const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
   await installControlledEventSource(page);
   const running = snapshotFixture({
     bridgeState: "running",
@@ -1332,6 +1383,11 @@ test("plays one success alert when the application is submitted", async ({ page 
     sourceIndex,
   );
   await expect.poll(frequencies).toEqual([523, 659, 784]);
+  await expect.poll(notifications).toEqual([{
+    body: "Jobhunter submitted the application successfully.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Application submitted",
+  }]);
 
   await emitControlledApplicationEvent(
     page,
@@ -1347,10 +1403,12 @@ test("plays one success alert when the application is submitted", async ({ page 
   );
   await page.waitForTimeout(100);
   expect(await frequencies()).toEqual([523, 659, 784]);
+  expect(await notifications()).toHaveLength(1);
 });
 
 test("plays one failure alert when the application agent fails", async ({ page }) => {
   const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
   await installControlledEventSource(page);
   const running = snapshotFixture({
     bridgeState: "running",
@@ -1381,6 +1439,11 @@ test("plays one failure alert when the application agent fails", async ({ page }
     sourceIndex,
   );
   await expect.poll(frequencies).toEqual([392, 262]);
+  await expect.poll(notifications).toEqual([{
+    body: "Open Jobhunter to review the failure and retry.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Application failed",
+  }]);
 
   mock.application = failed;
   await page.reload();
@@ -1388,10 +1451,12 @@ test("plays one failure alert when the application agent fails", async ({ page }
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
   await page.waitForTimeout(100);
   expect(await frequencies()).toEqual([]);
+  expect(await notifications()).toEqual([]);
 });
 
 test("plays an attention alert when resume tailoring becomes ready for review", async ({ page }) => {
   const frequencies = await installSoundProbe(page);
+  const notifications = await installBrowserNotificationProbe(page);
   const visualQa = runFixture({
     status: "visual_qa",
     revision: 5,
@@ -1419,12 +1484,18 @@ test("plays an attention alert when resume tailoring becomes ready for review", 
 
   await expect(reviewStage).toHaveAttribute("aria-current", "step", { timeout: 6_000 });
   await expect.poll(frequencies).toEqual([740, 988]);
+  await expect.poll(notifications).toEqual([{
+    body: "Review the tailored resume in Jobhunter.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Resume ready for review",
+  }]);
 
   await page.reload();
   await expect(reviewStage).toHaveAttribute("aria-current", "step");
   await reviewStage.click();
   await page.waitForTimeout(100);
   expect(await frequencies()).toEqual([]);
+  expect(await notifications()).toEqual([]);
 });
 
 test("persists sound alerts and lets the user test the attention sound", async ({ page }) => {
