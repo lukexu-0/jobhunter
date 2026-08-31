@@ -99,3 +99,51 @@ test("WEB-AUTH-001 retains connected provider controls across a transient backgr
   await expect(codex.getByText("connected", { exact: true })).toBeVisible();
   await expect(codex.getByRole("button", { name: "Logout OpenAI Codex" })).toBeEnabled();
 });
+
+test("WEB-AUTH-002 opens Gmail authorization in a popup window", async ({ page }) => {
+  await page.context().route("**/api/pipeline/auth", fulfillProviderStatuses);
+  await page.context().route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [] }),
+    });
+  });
+  await page.context().route("**/api/pipeline/auth/gmail/sessions", async (route) => {
+    expect(route.request().method()).toBe("POST");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "gmail-popup-session",
+        provider: "gmail",
+        state: "pending",
+        url: `${new URL(page.url()).origin}/providers?oauth-popup=1`,
+        progress: [],
+        expiresAt: Date.now() + 60_000,
+      }),
+    });
+  });
+  await page.context().route("**/api/pipeline/auth/sessions/gmail-popup-session", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "gmail-popup-session",
+        provider: "gmail",
+        state: "pending",
+        progress: [],
+        expiresAt: Date.now() + 60_000,
+      }),
+    });
+  });
+  await page.goto("/providers");
+  const popupOpened = page.waitForEvent("popup");
+  await page.getByRole("button", { name: "Connect Gmail" }).click();
+  const popup = await popupOpened;
+  await popup.waitForURL(/oauth-popup=1/);
+  await popup.waitForLoadState("domcontentloaded");
+  const dimensions = await popup.evaluate(() => ({ width: outerWidth, height: outerHeight }));
+
+  expect(dimensions.width).toBeGreaterThanOrEqual(560);
+  expect(dimensions.width).toBeLessThanOrEqual(700);
+  expect(dimensions.height).toBeGreaterThanOrEqual(650);
+  expect(dimensions.height).toBeLessThanOrEqual(850);
+});
