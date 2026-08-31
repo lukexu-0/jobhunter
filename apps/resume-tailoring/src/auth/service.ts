@@ -1,4 +1,10 @@
-import type { AuthIdentity, AuthProvider, AuthSession, AuthStatusResponse } from "../contracts";
+import type {
+  AuthIdentity,
+  AuthProvider,
+  AuthProviderStatus,
+  AuthSession,
+  AuthStatusResponse,
+} from "../contracts";
 import {
   AuthSessionError,
   AuthSessionManager,
@@ -7,8 +13,8 @@ import {
   type PublicAuthSession,
 } from "./sessions";
 import {
-  AUTH_PROVIDERS,
   assertOAuthOnlyStorage,
+  assertProviderOAuthConnected,
   closeAuthStorage,
   getAuthStorage,
   type AuthStorageLike,
@@ -58,7 +64,9 @@ function redact(value: string): string {
   return value.length <= 4 ? "***" : `***${value.slice(-4)}`;
 }
 
-function redactedIdentity(identity: { email?: string; accountId?: string } | undefined): AuthIdentity | undefined {
+function redactedIdentity(
+  identity: { email?: string | undefined; accountId?: string | undefined } | undefined,
+): AuthIdentity | undefined {
   if (!identity) return undefined;
   const redacted: AuthIdentity = {
     ...(identity.email ? { email: redact(identity.email) } : {}),
@@ -85,50 +93,89 @@ function contractSession(session: PublicAuthSession): AuthSession {
 }
 
 
-export interface AuthServiceDependencies extends Omit<AuthSessionDependencies, "providerLogin"> {
-  readonly providerLogin?: AuthProviderLogin;
+export type AuthProviderConnection = Omit<AuthProviderStatus, "provider">;
+
+export interface AuthProviderHooks {
+  status(): Promise<AuthProviderConnection> | AuthProviderConnection;
+  login(controller: Parameters<AuthProviderLogin>[1]): Promise<void>;
+  assertConnected(): Promise<void> | void;
+  logout(): Promise<void>;
+}
+
+export interface AuthServiceDependencies extends Omit<
+  AuthSessionDependencies,
+  "providerLogin" | "providerAssertConnected" | "providerLogout"
+> {
+  readonly providerHooks?: Partial<Record<AuthProvider, AuthProviderHooks>>;
 }
 
 export class AuthService {
   readonly #sessions: AuthSessionManager;
+  readonly #providerHooks: Record<AuthProvider, AuthProviderHooks>;
 
   constructor(private readonly storage: AuthStorageLike, dependencies: AuthServiceDependencies = {}) {
     scrubProviderEnvironment();
     assertOAuthOnlyStorage(storage);
-    const providerLogin: AuthProviderLogin = dependencies.providerLogin
-      ?? ((provider, controller) => storage.login(provider, controller));
+    const codexHooks: AuthProviderHooks = {
+      status: () => {
+        const rows = storage.listStoredCredentials("openai-codex");
+        if (rows.length === 0) return { state: "disconnected" };
+        const identity = storage.getOAuthAccountIdentity("openai-codex");
+        return { state: "connected", ...(identity ? { identity } : {}) };
+      },
+      login: (controller) => storage.login("openai-codex", controller),
+      assertConnected: () => assertProviderOAuthConnected(storage, "openai-codex"),
+      logout: () => storage.logout("openai-codex"),
+    };
+    const unavailableGmailHooks: AuthProviderHooks = {
+      status: () => ({ state: "disconnected" }),
+      login: async () => { throw new Error("Gmail OAuth is unavailable"); },
+      assertConnected: () => { throw new Error("Gmail OAuth is unavailable"); },
+      logout: async () => undefined,
+    };
+    this.#providerHooks = {
+      "openai-codex": dependencies.providerHooks?.["openai-codex"] ?? codexHooks,
+      gmail: dependencies.providerHooks?.gmail ?? unavailableGmailHooks,
+    };
     this.#sessions = new AuthSessionManager(storage, {
       ...(dependencies.now ? { now: dependencies.now } : {}),
       ...(dependencies.randomId ? { randomId: dependencies.randomId } : {}),
       ...(dependencies.schedule ? { schedule: dependencies.schedule } : {}),
-      providerLogin,
+      providerLogin: (provider, controller) => this.#providerHooks[provider].login(controller),
+      providerAssertConnected: (provider) => this.#providerHooks[provider].assertConnected(),
+      providerLogout: (provider) => this.#providerHooks[provider].logout(),
     });
   }
 
-  getAuthStatus(): AuthStatusResponse {
+  async getAuthStatus(): Promise<AuthStatusResponse> {
     assertOAuthOnlyStorage(this.storage);
+    const codex = await this.#providerHooks["openai-codex"].status();
+    const codexIdentity = redactedIdentity(codex.identity);
+    const gmail = await this.#providerHooks.gmail.status();
+    const gmailIdentity = redactedIdentity(gmail.identity);
     return {
-      providers: AUTH_PROVIDERS.map((provider) => {
-        const rows = this.storage.listStoredCredentials(provider);
-        if (rows.length === 0) return { provider, state: "disconnected" as const };
-        const identity = redactedIdentity(this.storage.getOAuthAccountIdentity(provider));
-        return {
-          provider,
-          state: "connected" as const,
-          ...(identity ? { identity } : {}),
-        };
-      }) as AuthStatusResponse["providers"],
+      providers: [
+        {
+          provider: "openai-codex",
+          state: codex.state,
+          ...(codexIdentity ? { identity: codexIdentity } : {}),
+        },
+        {
+          provider: "gmail",
+          state: gmail.state,
+          ...(gmailIdentity ? { identity: gmailIdentity } : {}),
+        },
+      ],
     };
   }
 
   async startSession(provider: AuthProvider): Promise<AuthSession> {
     assertOAuthOnlyStorage(this.storage);
-    if (this.storage.listStoredCredentials(provider).length !== 0) {
+    if ((await this.#providerHooks[provider].status()).state === "connected") {
       throw new AuthServiceError("AUTH_ALREADY_CONNECTED", `${provider} is already connected; log out first`, 409);
     }
     return contractSession(await this.#sessions.start(provider));
   }
-
   getSession(id: string): AuthSession | undefined {
     try {
       return contractSession(this.#sessions.get(id));
@@ -154,7 +201,7 @@ export class AuthService {
 
   async logout(provider: AuthProvider): Promise<void> {
     await this.#sessions.cancelProvider(provider);
-    await this.storage.logout(provider);
+    await this.#providerHooks[provider].logout();
     assertOAuthOnlyStorage(this.storage);
   }
 
@@ -163,46 +210,51 @@ export class AuthService {
   }
 }
 
-let servicePromise: Promise<AuthService> | undefined;
-
-
-async function defaultService(): Promise<AuthService> {
-  servicePromise ??= getAuthStorage().then((storage) => new AuthService(storage));
-  return servicePromise;
+export interface ManagedAuthService {
+  getAuthStatus(): Promise<AuthStatusResponse>;
+  startSession(provider: AuthProvider): Promise<AuthSession>;
+  getSession(id: string): Promise<AuthSession | undefined>;
+  answerPrompt(id: string, value: string): Promise<AuthSession>;
+  cancelSession(id: string): Promise<AuthSession | undefined>;
+  logout(provider: AuthProvider): Promise<void>;
+  close(): Promise<void>;
 }
 
-export async function getAuthStatus(): Promise<AuthStatusResponse> {
-  return (await defaultService()).getAuthStatus();
+export function createManagedAuthService(
+  dependencies: AuthServiceDependencies = {},
+): ManagedAuthService {
+  let servicePromise: Promise<AuthService> | undefined;
+  const service = (): Promise<AuthService> => {
+    servicePromise ??= getAuthStorage().then((storage) => new AuthService(storage, dependencies));
+    return servicePromise;
+  };
+
+  return {
+    getAuthStatus: async () => (await service()).getAuthStatus(),
+    startSession: async (provider) => (await service()).startSession(provider),
+    getSession: async (id) => (await service()).getSession(id),
+    answerPrompt: async (id, value) => (await service()).answerPrompt(id, value),
+    cancelSession: async (id) => (await service()).cancelSession(id),
+    logout: async (provider) => (await service()).logout(provider),
+    close: async () => {
+      const current = servicePromise;
+      servicePromise = undefined;
+      try {
+        const authService = current ? await current : undefined;
+        await authService?.close();
+      } finally {
+        await closeAuthStorage();
+      }
+    },
+  };
 }
 
-export async function startSession(provider: AuthProvider): Promise<AuthSession> {
-  return (await defaultService()).startSession(provider);
-}
+const defaultManagedAuth = createManagedAuthService();
 
-export async function getSession(id: string): Promise<AuthSession | undefined> {
-  return (await defaultService()).getSession(id);
-}
-
-export async function answerPrompt(id: string, value: string): Promise<AuthSession> {
-  return (await defaultService()).answerPrompt(id, value);
-}
-
-export async function cancelSession(id: string): Promise<AuthSession | undefined> {
-  return (await defaultService()).cancelSession(id);
-}
-
-
-export async function logout(provider: AuthProvider): Promise<void> {
-  await (await defaultService()).logout(provider);
-}
-
-export async function closeAuth(): Promise<void> {
-  const current = servicePromise;
-  servicePromise = undefined;
-  try {
-    const service = current ? await current : undefined;
-    await service?.close();
-  } finally {
-    await closeAuthStorage();
-  }
-}
+export const getAuthStatus = defaultManagedAuth.getAuthStatus;
+export const startSession = defaultManagedAuth.startSession;
+export const getSession = defaultManagedAuth.getSession;
+export const answerPrompt = defaultManagedAuth.answerPrompt;
+export const cancelSession = defaultManagedAuth.cancelSession;
+export const logout = defaultManagedAuth.logout;
+export const closeAuth = defaultManagedAuth.close;

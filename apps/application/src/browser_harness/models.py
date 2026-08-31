@@ -591,6 +591,9 @@ class HarnessConfig(FrozenPrivateModel):
         "apps/user-info/current-context/personal/user-info.json"
     )
     credentials_json: Path = Path("~/.jobhunter/browser-harness/credentials.json")
+    gmail_oauth_client_json: Path = Path(
+        "~/.jobhunter/browser-harness/gmail-oauth-client.json"
+    )
     gmail_token_json: Path = Path("~/.jobhunter/browser-harness/gmail-token.json")
     gmail_verification_timeout: int = Field(default=180, ge=1, le=900)
     browser: BrowserLaunchConfig = Field(default_factory=BrowserLaunchConfig)
@@ -599,6 +602,78 @@ class HarnessConfig(FrozenPrivateModel):
     @classmethod
     def _validate_pipeline_url(cls, value: str) -> str:
         return validate_loopback_http_url(value, field_name="pipeline_url")
+
+
+class GmailAuthIdentity(PublicModel):
+    email: Annotated[str, StringConstraints(strict=True, min_length=3, max_length=320)]
+
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, value: str) -> str:
+        if (
+            value != value.strip()
+            or "@" not in value
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("email is invalid")
+        return value
+
+
+class GmailAuthStatus(PublicModel):
+    state: Literal["connected", "disconnected"]
+    identity: GmailAuthIdentity | None = None
+
+    @model_validator(mode="after")
+    def _validate_identity(self) -> GmailAuthStatus:
+        if self.state == "disconnected" and self.identity is not None:
+            raise ValueError("disconnected status cannot include identity")
+        return self
+
+
+class GmailAuthSessionCreateRequest(PublicModel):
+    pass
+
+
+GmailAuthSessionId = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=43,
+        max_length=43,
+        pattern=r"^[A-Za-z0-9_-]{43}$",
+    ),
+]
+
+
+class GmailAuthSession(PublicModel):
+    id: GmailAuthSessionId
+    state: Literal["pending", "succeeded", "failed", "expired"]
+    authorization_url: Annotated[
+        str, StringConstraints(strict=True, max_length=8_192)
+    ] | None = None
+    expires_at: datetime
+
+    @field_validator("authorization_url")
+    @classmethod
+    def _validate_authorization_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = _split_absolute_http_url(value, field_name="authorization_url")
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname != "accounts.google.com"
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("authorization_url must use Google HTTPS")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def _validate_expires_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expires_at must include a timezone")
+        return value
 
 
 class UploadedArtifacts(FrozenPrivateModel):

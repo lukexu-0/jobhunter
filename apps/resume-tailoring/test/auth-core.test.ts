@@ -21,7 +21,7 @@ import type {
   StoredOAuthRefreshResult,
 } from "@oh-my-pi/pi-ai";
 import { createOAuthOnlyApiKeyResolver, OAuthRequiredError, resolveOAuthOnlyWithStorage } from "../src/auth/oauth-only-resolver";
-import { AuthService, scrubProviderEnvironment } from "../src/auth/service";
+import { AuthService, scrubProviderEnvironment, type AuthProviderHooks } from "../src/auth/service";
 import {
   assertOAuthOnlyStorage,
   AuthConfigurationError,
@@ -127,7 +127,28 @@ class FakeStorage implements AuthStorageLike {
     this.rows = this.rows.filter((row) => row.provider !== provider);
   }
 }
-
+function customCodexHooks(
+  storage: FakeStorage,
+  login: AuthProviderHooks["login"],
+): AuthProviderHooks {
+  return {
+    status: () => storage.listStoredCredentials("openai-codex").length === 0
+      ? { state: "disconnected" }
+      : {
+        state: "connected",
+        ...(storage.getOAuthAccountIdentity("openai-codex")
+          ? { identity: storage.getOAuthAccountIdentity("openai-codex") }
+          : {}),
+      },
+    login,
+    assertConnected: () => {
+      if (storage.listStoredCredentials("openai-codex").length === 0) {
+        throw new Error("OpenAI Codex did not persist OAuth");
+      }
+    },
+    logout: () => storage.logout("openai-codex"),
+  };
+}
 const ids = {
   first: "AAAAAAAAAAAAAAAAAAAAAA",
   second: "BBBBBBBBBBBBBBBBBBBBBB",
@@ -210,17 +231,19 @@ describe("app-owned OAuth storage and sessions", () => {
     const service = new AuthService(storage, {
       randomId: () => ids.first,
       schedule: () => undefined,
-      providerLogin: async (provider, controller) => {
-        controller.onAuth({ url: "https://provider.example/authorize?state=opaque" });
-        await releaseCallback.promise;
-        await storage.set(provider, {
-          type: "oauth",
-          access: "late-access",
-          refresh: "late-refresh",
-          expires: 2_000_000_000_000,
-          accountId: "late-codex-account",
-        } as OAuthCredential);
-        credentialPersisted.resolve();
+      providerHooks: {
+        "openai-codex": customCodexHooks(storage, async (controller) => {
+          controller.onAuth({ url: "https://provider.example/authorize?state=opaque" });
+          await releaseCallback.promise;
+          await storage.set("openai-codex", {
+            type: "oauth",
+            access: "late-access",
+            refresh: "late-refresh",
+            expires: 2_000_000_000_000,
+            accountId: "late-codex-account",
+          } as OAuthCredential);
+          credentialPersisted.resolve();
+        }),
       },
     });
     const started = await service.startSession("openai-codex");
@@ -239,7 +262,7 @@ describe("app-owned OAuth storage and sessions", () => {
     await logout;
     expect(logoutSettled).toBe(true);
     expect(service.getSession(started.id)?.state).toBe("cancelled");
-    expect(service.getAuthStatus().providers[0]).toEqual({
+    expect((await service.getAuthStatus()).providers[0]).toEqual({
       provider: "openai-codex",
       state: "disconnected",
     });
@@ -253,17 +276,19 @@ describe("app-owned OAuth storage and sessions", () => {
     const service = new AuthService(storage, {
       randomId: () => ids.first,
       schedule: () => undefined,
-      providerLogin: async (provider, controller) => {
-        controller.onAuth({ url: "https://provider.example/authorize?state=opaque" });
-        await releaseCallback.promise;
-        await storage.set(provider, {
-          type: "oauth",
-          access: "late-access",
-          refresh: "late-refresh",
-          expires: 2_000_000_000_000,
-          accountId: "late-codex-account",
-        } as OAuthCredential);
-        credentialPersisted.resolve();
+      providerHooks: {
+        "openai-codex": customCodexHooks(storage, async (controller) => {
+          controller.onAuth({ url: "https://provider.example/authorize?state=opaque" });
+          await releaseCallback.promise;
+          await storage.set("openai-codex", {
+            type: "oauth",
+            access: "late-access",
+            refresh: "late-refresh",
+            expires: 2_000_000_000_000,
+            accountId: "late-codex-account",
+          } as OAuthCredential);
+          credentialPersisted.resolve();
+        }),
       },
     });
     await service.startSession("openai-codex");
@@ -345,34 +370,98 @@ describe("app-owned OAuth storage and sessions", () => {
     storage.rows = [oauthRow("openai-codex")];
     storage.loginGate.resolve();
     await storage.loginValidated.promise;
+    await Promise.resolve();
 
     expect(service.getSession(ids.first)?.state).toBe("succeeded");
-    expect(service.getAuthStatus().providers).toEqual([
+    expect((await service.getAuthStatus()).providers).toEqual([
       expect.objectContaining({
         provider: "openai-codex",
         state: "connected",
       }),
+      { provider: "gmail", state: "disconnected" },
     ]);
+  });
+
+  test("routes Gmail through external provider hooks without touching model OAuth storage", async () => {
+    const storage = new FakeStorage();
+    const finishLogin = Promise.withResolvers<void>();
+    const loginFinished = Promise.withResolvers<void>();
+    const connectedVerified = Promise.withResolvers<void>();
+    let connected = false;
+    let logouts = 0;
+    const service = new AuthService(storage, {
+      randomId: () => ids.first,
+      schedule: () => undefined,
+      providerHooks: {
+        gmail: {
+          status: () => connected
+            ? { state: "connected", identity: { email: "person@gmail.example" } }
+            : { state: "disconnected" },
+          login: async (controller) => {
+            controller.onAuth({ url: "https://accounts.google.com/o/oauth2/v2/auth?state=opaque" });
+            await finishLogin.promise;
+            connected = true;
+            loginFinished.resolve();
+          },
+          assertConnected: () => {
+            if (!connected) throw new Error("Gmail did not connect");
+            connectedVerified.resolve();
+          },
+          logout: async () => {
+            connected = false;
+            logouts += 1;
+          },
+        },
+      },
+    });
+
+    const started = await service.startSession("gmail");
+    expect(started).toMatchObject({
+      id: ids.first,
+      provider: "gmail",
+      state: "pending",
+      url: "https://accounts.google.com/o/oauth2/v2/auth?state=opaque",
+    });
+    expect(storage.loginProviders).toEqual([]);
+    expect(storage.rows).toEqual([]);
+
+    finishLogin.resolve();
+    await loginFinished.promise;
+    await connectedVerified.promise;
+    await Promise.resolve();
+    expect(service.getSession(ids.first)?.state).toBe("succeeded");
+    expect(await service.getAuthStatus()).toEqual({
+      providers: [
+        { provider: "openai-codex", state: "disconnected" },
+        { provider: "gmail", state: "connected", identity: { email: "p***@gmail.example" } },
+      ],
+    });
+
+    await service.logout("gmail");
+    expect(logouts).toBe(1);
+    expect(storage.loginProviders).toEqual([]);
+    expect(storage.rows).toEqual([]);
   });
 
   test("returns only redacted account identity and explicitly logs out", async () => {
     const storage = new FakeStorage();
     storage.rows = [oauthRow("openai-codex", { email: "person@example.com" })];
-    const status = new AuthService(storage).getAuthStatus();
+    const status = await new AuthService(storage).getAuthStatus();
     const encoded = JSON.stringify(status);
     expect(status.providers[0]).toMatchObject({
       state: "connected",
       identity: { email: "p***@example.com", accountId: "***1234" },
     });
-    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex"]);
+    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex", "gmail"]);
     expect(encoded).not.toContain("stored-access-secret");
     expect(encoded).not.toContain("stored-refresh-secret");
     expect(encoded).not.toContain("person@example.com");
     expect(encoded).not.toContain("acct-secret");
     const service = new AuthService(storage);
     await service.logout("openai-codex");
-    expect(service.getAuthStatus().providers).toEqual([
+    expect((await service.getAuthStatus()).providers).toEqual([
       { provider: "openai-codex", state: "disconnected" },
+      { provider: "gmail", state: "disconnected" },
     ]);
   });
 });

@@ -20,6 +20,10 @@ const PROVIDERS = [
     provider: "openai-codex",
     name: "OpenAI Codex",
   },
+  {
+    provider: "gmail",
+    name: "Gmail",
+  },
 ] as const satisfies ReadonlyArray<{
   provider: AuthProvider;
   name: string;
@@ -208,6 +212,21 @@ function usePendingSessionPolling(
   }, [provider, refreshAuthStatus, sessionId, setNotice, updateSession]);
 }
 
+function PendingSessionPolling({
+  session,
+  updateSession,
+  refreshAuthStatus,
+  setNotice,
+}: {
+  session: BrowserAuthSession | undefined;
+  updateSession: (session: BrowserAuthSession) => void;
+  refreshAuthStatus: () => Promise<void>;
+  setNotice: (provider: AuthProvider, notice: Notice | undefined) => void;
+}): null {
+  usePendingSessionPolling(session, updateSession, refreshAuthStatus, setNotice);
+  return null;
+}
+
 export function OAuthDashboard() {
   const { authStatus, setAuthStatus } = useDashboardData();
   const showInitialLoading = useRef(authStatus === undefined);
@@ -267,12 +286,6 @@ export function OAuthDashboard() {
     });
   }, []);
 
-  usePendingSessionPolling(
-    sessions["openai-codex"],
-    updateSession,
-    refreshAuthStatus,
-    setNotice,
-  );
 
   const startSession = useCallback(
     async (provider: AuthProvider) => {
@@ -417,6 +430,15 @@ export function OAuthDashboard() {
 
   return (
     <section className="oauth-dashboard" aria-label="OAuth provider connections">
+      {PROVIDERS.map(({ provider }) => (
+        <PendingSessionPolling
+          key={provider}
+          session={sessions[provider]}
+          updateSession={updateSession}
+          refreshAuthStatus={refreshAuthStatus}
+          setNotice={setNotice}
+        />
+      ))}
 
       {statusError ? (
         <p className="dashboard-notice dashboard-notice--error" role="alert">

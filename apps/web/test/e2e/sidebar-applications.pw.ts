@@ -2707,6 +2707,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
+          { provider: "gmail", state: "disconnected" },
         ],
       }),
     });
@@ -2722,8 +2723,8 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await expect(page).toHaveURL(/\/providers$/);
   const providerBadges = page.locator(".status-badge");
-  await expect(providerBadges).toHaveText(["connected"]);
-  await expect(page.locator(".provider-row")).toHaveCount(1);
+  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
+  await expect(page.locator(".provider-row")).toHaveCount(2);
   await expect(page.getByText("Google Antigravity", { exact: true })).toHaveCount(0);
 
   holdRunRefresh = true;
@@ -2737,7 +2738,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   holdAuthRefresh = true;
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();
   await authRefreshStarted;
-  await expect(providerBadges).toHaveText(["connected"]);
+  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
   await expect(providerBadges.filter({ hasText: "Checking" })).toHaveCount(0);
   releaseAuthRefresh();
   await authRefreshCompleted;
@@ -2781,6 +2782,7 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
+          { provider: "gmail", state: "disconnected" },
         ],
       }),
     });
@@ -2802,10 +2804,11 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
     await expectFolderNavigation(page, width, "Providers");
     await expectNoDocumentOverflow(page);
     const providerRows = page.locator(".provider-row");
-    await expect(providerRows).toHaveCount(1);
-    await expect(providerRows).toContainText(["OpenAI Codex"]);
-    await expect(providerRows.locator(".status-badge")).toHaveText(["connected"]);
+    await expect(providerRows).toHaveCount(2);
+    await expect(providerRows).toContainText(["OpenAI Codex", "Gmail"]);
+    await expect(providerRows.locator(".status-badge")).toHaveText(["connected", "disconnected"]);
     await expect(providerRows.getByRole("button", { name: "Logout OpenAI Codex" })).toBeEnabled();
+    await expect(providerRows.getByRole("button", { name: "Connect Gmail" })).toBeEnabled();
     for (const providerRow of await providerRows.all()) {
       expect(await providerRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(1);
       const providerRowBox = await providerRow.boundingBox();

@@ -10,7 +10,9 @@ async function fulfillProviderStatuses(route: Route): Promise<void> {
         provider: "openai-codex",
         state: "connected",
         identity: { email: "codex-connected@example.test" },
-      }],
+      },
+      { provider: "gmail", state: "disconnected" },
+      ],
     }),
   });
 }
@@ -52,7 +54,8 @@ test("WEB-AUTH-001 retains connected provider controls across a transient backgr
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
   const providers = page.getByRole("list", { name: "OAuth providers" });
   const codex = providers.getByRole("listitem").filter({ hasText: "OpenAI Codex" });
-  await expect(providers.getByRole("listitem")).toHaveCount(1);
+  await expect(providers.getByRole("listitem")).toHaveCount(2);
+  await expect(providers.getByRole("listitem").filter({ hasText: "Gmail" }).getByRole("button", { name: "Connect Gmail" })).toBeEnabled();
   await expect(providers).not.toContainText("Indeed Jobs");
 
   await expect(codex.getByText("connected", { exact: true })).toBeVisible();

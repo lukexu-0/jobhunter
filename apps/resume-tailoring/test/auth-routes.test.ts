@@ -16,6 +16,7 @@ function fakeService(overrides: Partial<AuthRouteService> = {}): AuthRouteServic
   const status: AuthStatusResponse = {
     providers: [
       { provider: "openai-codex", state: "disconnected" },
+      { provider: "gmail", state: "disconnected" },
     ],
   };
   return {
@@ -48,13 +49,15 @@ describe("OAuth HTTP routes", () => {
     expect(await response.json()).toEqual({
       providers: [
         { provider: "openai-codex", state: "disconnected" },
+        { provider: "gmail", state: "disconnected" },
       ],
     });
   });
 
-  test("validates exactly the OpenAI Codex provider status", () => {
+  test("validates the exact ordered OpenAI Codex and Gmail provider statuses", () => {
     const providers = [
       { provider: "openai-codex", state: "disconnected" },
+      { provider: "gmail", state: "connected", identity: { email: "g***@example.test" } },
     ];
     expect(AuthStatusResponseSchema.safeParse({ providers }).success).toBe(true);
     expect(AuthStatusResponseSchema.safeParse({
@@ -63,16 +66,17 @@ describe("OAuth HTTP routes", () => {
     expect(AuthStatusResponseSchema.safeParse({ providers: [] }).success).toBe(false);
   });
 
-  test("starts the exact provider with an empty JSON object", async () => {
+  test.each(["openai-codex", "gmail"] as const)("starts the exact %s provider with an empty JSON object", async (provider) => {
     let started: AuthProvider | undefined;
+    const expected = { ...session, provider };
     const response = await request(
-      fakeService({ startSession: async (provider) => ((started = provider), session) }),
-      "/v1/auth/openai-codex/sessions",
+      fakeService({ startSession: async (requested) => ((started = requested), expected) }),
+      `/v1/auth/${provider}/sessions`,
       jsonMutation("POST"),
     );
     expect(response.status).toBe(201);
-    expect(started).toBe("openai-codex");
-    expect(await response.json()).toEqual(session);
+    expect(started).toBe(provider);
+    expect(await response.json()).toEqual(expected);
   });
   test("returns public not-found for the retired Google provider route without starting a session", async () => {
     let started = false;

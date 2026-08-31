@@ -416,6 +416,9 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
         credentials_json=Path(
             "~/.jobhunter/browser-harness/credentials.json"
         ).expanduser().absolute(),
+        gmail_oauth_client_json=Path(
+            "~/.jobhunter/browser-harness/gmail-oauth-client.json"
+        ).expanduser().absolute(),
         gmail_token_json=Path(
             "~/.jobhunter/browser-harness/gmail-token.json"
         ).expanduser().absolute(),
@@ -486,6 +489,7 @@ def test_runtime_paths_are_explicit_resolved_configuration(
     node, script = fake_playwright_cli
     user_info_json = tmp_path / "private" / "user-info.json"
     credentials_json = tmp_path / "private-credentials" / "credentials.json"
+    gmail_oauth_client_json = tmp_path / "private-gmail" / "client.json"
     gmail_token_json = tmp_path / "private-gmail" / "token.json"
 
     config, _ = cli_module.parse_config(
@@ -500,6 +504,8 @@ def test_runtime_paths_are_explicit_resolved_configuration(
             str(user_info_json),
             "--credentials-json",
             str(credentials_json),
+            "--gmail-oauth-client-json",
+            str(gmail_oauth_client_json),
             "--gmail-token-json",
             str(gmail_token_json),
             "--gmail-verification-timeout",
@@ -511,6 +517,7 @@ def test_runtime_paths_are_explicit_resolved_configuration(
     assert config.playwright_cli_script == script.resolve()
     assert config.user_info_json == user_info_json.resolve()
     assert config.credentials_json == credentials_json.absolute()
+    assert config.gmail_oauth_client_json == gmail_oauth_client_json.absolute()
     assert config.gmail_token_json == gmail_token_json.absolute()
     assert config.gmail_verification_timeout == 240
 
@@ -760,6 +767,7 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         user_data_dir=tmp_path / "resolved-profile",
     )
     manager = object()
+    gmail_auth = object()
     app = object()
     resolve_calls: list[BrowserLaunchConfig] = []
     credential_store = object()
@@ -767,6 +775,7 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     manager_calls: list[
         tuple[HarnessConfig, ResolvedBrowserLaunch, object]
     ] = []
+    gmail_auth_calls: list[tuple[Path, Path, str]] = []
     create_app_calls: list[tuple[HarnessConfig, HarnessDependencies]] = []
     uvicorn_calls: list[tuple[object, dict[str, Any]]] = []
 
@@ -787,6 +796,15 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         manager_calls.append((config, browser_launch, credential_store))
         return manager
 
+    def fake_gmail_oauth_manager(
+        *,
+        client_json: Path,
+        token_json: Path,
+        redirect_uri: str,
+    ) -> object:
+        gmail_auth_calls.append((client_json, token_json, redirect_uri))
+        return gmail_auth
+
     def fake_create_app(
         config: HarnessConfig,
         dependencies: HarnessDependencies,
@@ -801,6 +819,7 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     monkeypatch.setattr(cli_module, "resolve_browser_launch", fake_resolve)
     monkeypatch.setattr(cli_module, "CredentialStore", fake_credential_store)
     monkeypatch.setattr(cli_module, "ApplicationSessionManager", fake_manager)
+    monkeypatch.setattr(cli_module, "GmailOAuthManager", fake_gmail_oauth_manager)
     monkeypatch.setattr(cli_module, "create_app", fake_create_app)
     monkeypatch.setattr(cli_module.uvicorn, "run", fake_uvicorn_run)
     for logger_name in ("httpx", "httpcore"):
@@ -836,6 +855,9 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         credentials_json=Path(
             "~/.jobhunter/browser-harness/credentials.json"
         ).expanduser().absolute(),
+        gmail_oauth_client_json=Path(
+            "~/.jobhunter/browser-harness/gmail-oauth-client.json"
+        ).expanduser().absolute(),
         gmail_token_json=Path(
             "~/.jobhunter/browser-harness/gmail-token.json"
         ).expanduser().absolute(),
@@ -846,11 +868,19 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     assert manager_calls == [
         (expected_config, resolved_launch, credential_store)
     ]
+    assert gmail_auth_calls == [
+        (
+            expected_config.gmail_oauth_client_json,
+            expected_config.gmail_token_json,
+            "http://127.0.0.1:8766/oauth/gmail/callback",
+        )
+    ]
     assert len(create_app_calls) == 1
     created_config, dependencies = create_app_calls[0]
     assert created_config == expected_config
     assert isinstance(dependencies, HarnessDependencies)
     assert dependencies.sessions is manager
+    assert dependencies.gmail_auth is gmail_auth
     assert uvicorn_calls == [
         (
             app,
