@@ -256,13 +256,47 @@ export const PlaywrightSnapshotElementRefSchema = z.string().regex(
 
 export const RequestSignInRuntimeActionSchema = z.object({
   type: z.literal("request_sign_in"),
+  account_action: z.enum(["create_account", "sign_in"]),
   username_ref: PlaywrightSnapshotElementRefSchema,
   password_ref: PlaywrightSnapshotElementRefSchema,
+  password_confirmation_ref: PlaywrightSnapshotElementRefSchema.optional(),
   submit_ref: PlaywrightSnapshotElementRefSchema,
 }).strict();
 export type RequestSignInRuntimeAction = z.infer<
   typeof RequestSignInRuntimeActionSchema
 >;
+
+const GmailMessageIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,256}$/);
+const InboxDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
+  if (value.startsWith("0000")) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+});
+const InboxTimeSchema = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/);
+
+export const ReadInboxRuntimeActionSchema = z.object({
+  type: z.literal("read_inbox"),
+  query: z.string()
+    .refine((value) => {
+      const canonical = value.trim();
+      return hasCodePointLength(canonical, 0, 500)
+        && [...canonical].every((character) => character.codePointAt(0)! >= 32);
+    })
+    .transform((value) => value.trim() || "code")
+    .default("code"),
+  date: InboxDateSchema.optional(),
+  time: InboxTimeSchema.optional(),
+  received_within_minutes: z.number().int().min(1).max(1_440).optional(),
+  received_before_minutes_ago: z.number().int().min(1).max(1_440).optional(),
+}).strict();
+export type ReadInboxRuntimeAction = z.infer<typeof ReadInboxRuntimeActionSchema>;
+
+export const ReadEmailRuntimeActionSchema = z.object({
+  type: z.literal("read_email"),
+  email_id: GmailMessageIdSchema,
+  offset: z.number().int().min(0).max(131_071).default(0),
+}).strict();
+export type ReadEmailRuntimeAction = z.infer<typeof ReadEmailRuntimeActionSchema>;
 
 export const RequestHumanNavigationRuntimeActionSchema = z.object({
   type: z.literal("request_human_navigation"),
@@ -312,6 +346,8 @@ export type ReportApplicationMismatchRuntimeAction = z.infer<
 
 export const RuntimeActionRequestSchema = z.discriminatedUnion("type", [
   PlaywrightCliRuntimeActionSchema,
+  ReadInboxRuntimeActionSchema,
+  ReadEmailRuntimeActionSchema,
   RequestSignInRuntimeActionSchema,
   RequestHumanNavigationRuntimeActionSchema,
   RequestAdditionalInfoRuntimeActionSchema,
@@ -370,6 +406,36 @@ export const SignInRuntimeActionResponseSchema = z.object({
 export type SignInRuntimeActionResponse = z.infer<
   typeof SignInRuntimeActionResponseSchema
 >;
+
+const InboxMessageSummarySchema = z.object({
+  email_id: GmailMessageIdSchema,
+  subject: z.string().refine((value) => hasCodePointLength(value, 0, 998)),
+  sent_at: z.string().regex(
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/,
+  ),
+}).strict();
+
+export const ReadInboxRuntimeActionResponseSchema = z.object({
+  type: z.literal("read_inbox_result"),
+  messages: z.array(InboxMessageSummarySchema).max(50),
+  truncated: z.boolean(),
+}).strict();
+export type ReadInboxRuntimeActionResponse = z.infer<
+  typeof ReadInboxRuntimeActionResponseSchema
+>;
+
+export const ReadEmailRuntimeActionResponseSchema = z.object({
+  type: z.literal("read_email_result"),
+  content: z.string().refine((value) => {
+    if (!hasOnlyPairedUtf16Surrogates(value)) return false;
+    const bytes = Buffer.byteLength(value, "utf8");
+    return bytes >= 1 && bytes <= 50 * 1024;
+  }),
+}).strict();
+export type ReadEmailRuntimeActionResponse = z.infer<
+  typeof ReadEmailRuntimeActionResponseSchema
+>;
+
 
 export const ContinueRuntimeActionResponseSchema = z.object({
   type: z.literal("continue"),
@@ -486,6 +552,8 @@ export type ApplicationMismatchRuntimeActionResponse = z.infer<
 export const RuntimeActionResponseSchema = z.discriminatedUnion("type", [
   PlaywrightCliResultRuntimeActionResponseSchema,
   SignInRuntimeActionResponseSchema,
+  ReadInboxRuntimeActionResponseSchema,
+  ReadEmailRuntimeActionResponseSchema,
   ContinueRuntimeActionResponseSchema,
   InterruptedRuntimeActionResponseSchema,
   ContinueWithoutAdditionalInfoRuntimeActionResponseSchema,

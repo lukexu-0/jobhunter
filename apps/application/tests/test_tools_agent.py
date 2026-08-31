@@ -80,6 +80,7 @@ class CredentialRuntime(FakeRuntime):
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -96,6 +97,10 @@ class CredentialRuntime(FakeRuntime):
                 "password": password,
             }
         )
+        if password_confirmation_ref is not None:
+            self.sign_in_calls[-1]["password_confirmation_ref"] = (
+                password_confirmation_ref
+            )
         self.mutation_finished.set()
 
     async def verify_origin_and_activate_private_values(
@@ -197,6 +202,7 @@ def make_gate(
     review_snapshot: Any = None,
     user_info_store: Any = None,
     auto_submit: bool = False,
+    default_credentials: tuple[str, str] | None = None,
 ) -> tuple[HumanGate, EventPublisher]:
     publisher = publisher or EventPublisher()
     origins = approved_origins or [JOB_ORIGIN]
@@ -208,8 +214,95 @@ def make_gate(
         publish=publisher,
         review_snapshot=review_snapshot,
         auto_submit=auto_submit,
+        default_credentials=default_credentials,
     )
     return gate, publisher
+
+
+@pytest.mark.asyncio
+async def test_sign_in_tries_default_application_account_before_saved_credentials(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    gate, publisher = make_gate(
+        default_credentials=("candidate@example.test", "ExamplePassword123$$")
+    )
+    runtime = CredentialRuntime()
+    runtime.mutation_release.set()
+    credential_store = CredentialStore(tmp_path / "credentials.json")
+    await credential_store.upsert(
+        JOB_ORIGIN,
+        "candidate@example.test",
+        "saved-private-password",
+    )
+
+    create_result = await gate.request_sign_in(
+        account_action="create_account",
+        username_ref="e1",
+        password_ref="e2",
+        password_confirmation_ref="e3",
+        submit_ref="e4",
+        runtime=runtime,
+        credential_store=credential_store,
+    )
+    assert create_result.metadata == {
+        "sign_in_status": "attempted",
+        "default_account": True,
+        "account_origin": JOB_ORIGIN,
+    }
+    assert publisher.events == []
+    assert runtime.sign_in_calls == [
+        {
+            "expected_origin": JOB_ORIGIN,
+            "username_ref": "e1",
+            "password_ref": "e2",
+            "password_confirmation_ref": "e3",
+            "submit_ref": "e4",
+            "username": "candidate@example.test",
+            "password": "ExamplePassword123$$",
+        }
+    ]
+    sign_in_result = await gate.request_sign_in(
+        account_action="sign_in",
+        username_ref="e5",
+        password_ref="e6",
+        submit_ref="e7",
+        runtime=runtime,
+        credential_store=credential_store,
+    )
+    assert sign_in_result.metadata == {
+        "sign_in_status": "attempted",
+        "default_account": True,
+        "account_origin": JOB_ORIGIN,
+    }
+    assert runtime.sign_in_calls[-1] == {
+        "expected_origin": JOB_ORIGIN,
+        "username_ref": "e5",
+        "password_ref": "e6",
+        "submit_ref": "e7",
+        "username": "candidate@example.test",
+        "password": "ExamplePassword123$$",
+    }
+    corrected_result = await gate.request_sign_in(
+        account_action="sign_in",
+        username_ref="e8",
+        password_ref="e9",
+        submit_ref="e10",
+        runtime=runtime,
+        credential_store=credential_store,
+    )
+    assert corrected_result.metadata == {
+        "sign_in_status": "attempted",
+        "account_origin": JOB_ORIGIN,
+    }
+    assert runtime.sign_in_calls[-1] == {
+        "expected_origin": JOB_ORIGIN,
+        "username_ref": "e8",
+        "password_ref": "e9",
+        "submit_ref": "e10",
+        "username": "candidate@example.test",
+        "password": "saved-private-password",
+    }
 
 
 @pytest.mark.asyncio

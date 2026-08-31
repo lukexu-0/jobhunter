@@ -8,6 +8,7 @@ import logging
 import stat
 import subprocess
 import time
+from datetime import UTC, datetime
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -17,6 +18,7 @@ from urllib.parse import quote
 import pytest
 
 import jobhunter_browser_harness.playwright_cli as playwright_cli
+from jobhunter_browser_harness.gmail_verification import VerificationChallenge
 from jobhunter_browser_harness.models import BrowserLaunchConfig
 from jobhunter_browser_harness.playwright_cli import (
     BrowserConfigurationError,
@@ -2064,6 +2066,8 @@ def test_sign_in_script_accepts_exact_origin_without_url_global() -> None:
         "'aria-ref=e2':{ownerFrame:async()=>frame,"
         "fill:async(value)=>events.push(['password',value])},"
         "'aria-ref=e3':{ownerFrame:async()=>frame,"
+        "fill:async(value)=>events.push(['password_confirmation',value])},"
+        "'aria-ref=e4':{ownerFrame:async()=>frame,"
         "click:async()=>events.push(['submit'])}};"
         "const cdp={"
         "send:async(command)=>{"
@@ -2083,7 +2087,8 @@ def test_sign_in_script_accepts_exact_origin_without_url_global() -> None:
             expected_origin="https://example.com",
             username_ref="e1",
             password_ref="e2",
-            submit_ref="e3",
+            password_confirmation_ref="e3",
+            submit_ref="e4",
             username="candidate@example.com",
             password="private-test-password",
         ),
@@ -2093,8 +2098,175 @@ def test_sign_in_script_accepts_exact_origin_without_url_global() -> None:
     assert events == [
         ["username", "candidate@example.com"],
         ["password", "private-test-password"],
+        ["password_confirmation", "private-test-password"],
         ["submit"],
     ]
+def test_email_verification_script_handles_private_code_and_same_origin_link() -> None:
+    page_url = "https://example.com/verify"
+    code_exercise = (
+        f"const pageUrl={json.dumps(page_url)};"
+        "const events=[];"
+        "const frame={url:()=>pageUrl,name:()=>''};"
+        "const elements={"
+        "'aria-ref=e1':{ownerFrame:async()=>frame,"
+        "fill:async(value)=>events.push(['code',value])},"
+        "'aria-ref=e2':{ownerFrame:async()=>frame,"
+        "click:async()=>events.push(['submit'])}};"
+        "const cdp={send:async()=>({frameTree:{frame:{url:pageUrl,name:'',"
+        "securityOrigin:'https://example.com'},childFrames:[]}}),detach:async()=>{}};"
+        "const context={newCDPSession:async()=>cdp};"
+        "const page={url:()=>pageUrl,context:()=>context,"
+        "locator:(selector)=>({elementHandle:async()=>elements[selector]})};"
+        "await generated(page);return events;"
+    )
+    code_events = run_url_less_generated_script(
+        PlaywrightCliRuntime._private_email_verification_script(
+            expected_origin="https://example.com",
+            code_ref="e1",
+            submit_ref="e2",
+            code="482913",
+            verification_url=None,
+        ),
+        code_exercise,
+    )
+    assert code_events == [["code", "482913"], ["submit"]]
+
+    verification_url = "https://example.com/verify?token=private-token"
+    link_exercise = (
+        f"const pageUrl={json.dumps(page_url)};"
+        "const events=[];"
+        "const page={url:()=>pageUrl,"
+        "goto:async(value)=>events.push(['goto',value])};"
+        "await generated(page);return events;"
+    )
+    link_events = run_url_less_generated_script(
+        PlaywrightCliRuntime._private_email_verification_script(
+            expected_origin="https://example.com",
+            code_ref=None,
+            submit_ref=None,
+            code=None,
+            verification_url=verification_url,
+        ),
+        link_exercise,
+    )
+    assert link_events == [["goto", verification_url]]
+
+@pytest.mark.asyncio
+async def test_email_verification_uses_private_payload_and_rejects_new_origin_links(
+    session_dir: Path,
+    cli_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime_for_process_factory(
+        session_id=UUID("00000000-0000-0000-0000-000000000021"),
+        session_directory=session_dir,
+        cli_script=cli_script,
+        process_factory=lambda *_args, **_kwargs: DummyProcess([]),
+    )
+    runtime._started = True
+    runtime._approved_origins = ("https://example.com",)
+    metadata = playwright_cli._PageMetadata(
+        url="https://example.com/verify",
+        title="Verify",
+        current_index=0,
+        tabs=(("https://example.com/verify", "Verify"),),
+    )
+    invocations: list[tuple[str, str]] = []
+
+    async def current_metadata(**_kwargs: Any) -> Any:
+        return metadata
+
+    async def suppress_private_capture() -> None:
+        return None
+
+    async def invoke_private(script: str, *, label: str) -> Any:
+        invocations.append((script, label))
+        return playwright_cli._InvocationResult(
+            exit_code=0,
+            stdout=b"",
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
+
+    monkeypatch.setattr(runtime, "_metadata", current_metadata)
+    monkeypatch.setattr(runtime, "_suppress_private_capture_unlocked", suppress_private_capture)
+    monkeypatch.setattr(runtime, "_invoke_private_script_unlocked", invoke_private)
+    monkeypatch.setattr(runtime, "_snapshot_from_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime, "_require_success", lambda *_args, **_kwargs: None)
+
+    unbound_code = VerificationChallenge(
+        message_id="message-unbound",
+        received_at=datetime.now(UTC),
+        sender="accounts@unrelated.example",
+        subject="Verify",
+        urls=(),
+        codes=("111111",),
+    )
+    assert not await runtime.complete_email_verification(
+        expected_origin="https://example.com",
+        challenge=unbound_code,
+        code_ref="e1",
+        submit_ref="e2",
+    )
+    assert invocations == []
+    challenge = VerificationChallenge(
+        message_id="message-1",
+        received_at=datetime.now(UTC),
+        sender="accounts@example.com",
+        subject="Verify",
+        urls=("https://example.com/verify?token=code-binding",),
+        codes=("482913",),
+    )
+    assert await runtime.complete_email_verification(
+        expected_origin="https://example.com",
+        challenge=challenge,
+        code_ref="e1",
+        submit_ref="e2",
+    )
+    assert len(invocations) == 1
+    script, label = invocations[0]
+    assert label == "verification"
+    assert "482913" in script
+    assert "e1" in script
+    assert "e2" in script
+    runtime._set_applicant_redaction_enabled(False)
+    assert "482913" not in runtime._redact_text("verification code 482913")
+    token = "private-verification-token"
+    same_origin_link = VerificationChallenge(
+        message_id="message-link",
+        received_at=datetime.now(UTC),
+        sender="accounts@example.com",
+        subject="Verify",
+        urls=(f"https://EXAMPLE.com:443/verify?token={token}",),
+        codes=(),
+    )
+    assert await runtime.complete_email_verification(
+        expected_origin="https://example.com",
+        challenge=same_origin_link,
+        code_ref=None,
+        submit_ref=None,
+    )
+    link_script, _ = invocations[-1]
+    assert f"https://example.com/verify?token={token}" in link_script
+    assert "https://EXAMPLE.com:443" not in link_script
+    assert token not in runtime._redact_text(f"verification token {token}")
+
+    cross_origin = VerificationChallenge(
+        message_id="message-2",
+        received_at=datetime.now(UTC),
+        sender="accounts@example.com",
+        subject="Verify",
+        urls=("https://verify.other.example/?token=private",),
+        codes=(),
+    )
+    assert not await runtime.complete_email_verification(
+        expected_origin="https://example.com",
+        challenge=cross_origin,
+        code_ref=None,
+        submit_ref=None,
+    )
+    assert len(invocations) == 2
 
 
 def test_navigation_guard_handler_bypasses_routes_while_disarmed() -> None:
@@ -4234,9 +4406,10 @@ async def test_private_sign_in_fills_refs_exposes_model_values_and_disables_scre
         "throw new Error('Unexpected sign-in origin');"
     )
     assert cdp_origin_check in payload_scripts[0]
+    assert "const elements=[usernameElement,passwordElement,submitElement];" in payload_scripts[0]
     control_origin_check = (
         "const controlOriginsApproved=await Promise.all("
-        "[usernameElement,passwordElement,submitElement].map("
+        "elements.map("
         "async(element)=>{const frame=await element.ownerFrame();"
         "if(frame===null)return false;"
         "const frameUrl=frame.url().split('#')[0];"

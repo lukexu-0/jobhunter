@@ -365,10 +365,20 @@ def test_harness_config_requires_long_token_and_loopback_pipeline() -> None:
         session_timeout=1,
     )
     assert config.pipeline_url == "http://LOCALHOST:3457"
+    assert config.gmail_token_json == Path(
+        "~/.jobhunter/browser-harness/gmail-token.json"
+    )
+    assert config.gmail_verification_timeout == 180
 
     for token in ("", "x" * 31):
         with pytest.raises(ValidationError):
             HarnessConfig(bearer_token=token)
+    for timeout in (0, 901):
+        with pytest.raises(ValidationError):
+            HarnessConfig(
+                bearer_token=TOKEN,
+                gmail_verification_timeout=timeout,
+            )
 
     for pipeline_url in (
         "https://127.0.0.1:3457",
@@ -2222,8 +2232,10 @@ def test_playwright_cli_runtime_action_rejects_prohibited_commands(
         (
             {
                 "type": "request_sign_in",
+                "account_action": "create_account",
                 "username_ref": "e1",
                 "password_ref": "e22",
+                "password_confirmation_ref": None,
                 "submit_ref": "e333",
             },
             RequestSignInRuntimeAction,
@@ -2704,3 +2716,91 @@ async def test_unexpected_secret_bearing_exception_is_sanitized(
     assert secret not in response.text
     assert TOKEN not in response.text
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_model_inbox_runtime_contracts_are_strict_and_bounded() -> None:
+    search = RUNTIME_ACTION_ADAPTER.validate_python(
+        {
+            "type": "read_inbox",
+            "query": "",
+            "date": "2026-08-30",
+            "time": "14:05",
+            "received_within_minutes": 1_440,
+            "received_before_minutes_ago": 15,
+        }
+    )
+    assert search.type == "read_inbox"
+    assert search.query == "code"
+    assert search.date == "2026-08-30"
+    assert search.time == "14:05"
+    assert search.received_before_minutes_ago == 15
+    for invalid_search in (
+        {"type": "read_inbox", "received_within_minutes": 1_441},
+        {"type": "read_inbox", "received_before_minutes_ago": 0},
+        {"type": "read_inbox", "received_before_minutes_ago": 1_441},
+        {"type": "read_inbox", "received_before_minutes_ago": True},
+    ):
+        with pytest.raises(ValidationError):
+            RUNTIME_ACTION_ADAPTER.validate_python(invalid_search)
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_ADAPTER.validate_python(
+            {"type": "read_inbox", "query": "code\nsubject"}
+        )
+    email = RUNTIME_ACTION_ADAPTER.validate_python(
+        {"type": "read_email", "email_id": "message-1"}
+    )
+    assert email.email_id == "message-1"
+    assert email.offset == 0
+    continued_email = RUNTIME_ACTION_ADAPTER.validate_python(
+        {"type": "read_email", "email_id": "message-1", "offset": 51_000}
+    )
+    assert continued_email.offset == 51_000
+    for invalid_email in (
+        {"type": "read_email", "email_id": "!message-1!"},
+        {"type": "read_email", "email_id": "message-1", "offset": -1},
+        {"type": "read_email", "email_id": "message-1", "offset": 131_072},
+        {"type": "read_email", "email_id": "message-1", "offset": True},
+    ):
+        with pytest.raises(ValidationError):
+            RUNTIME_ACTION_ADAPTER.validate_python(invalid_email)
+
+    inbox_response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {
+            "type": "read_inbox_result",
+            "messages": [
+                {
+                    "email_id": "message-1",
+                    "subject": "Your verification code",
+                    "sent_at": "2026-08-30T14:22:03Z",
+                }
+            ],
+            "truncated": True,
+        }
+    )
+    assert inbox_response.messages[0].subject == "Your verification code"
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {
+                "type": "read_inbox_result",
+                "messages": [
+                    {
+                        "email_id": "!message-1!",
+                        "subject": "Your verification code",
+                        "sent_at": "prefix-2026-08-30T14:22:03Z-suffix",
+                    }
+                ],
+                "truncated": False,
+            }
+        )
+    email_response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+        {"type": "read_email_result", "content": "parsed MIME content"}
+    )
+    assert email_response.content == "parsed MIME content"
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {"type": "read_email_result", "content": "🙂" * 12_801}
+        )
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {"type": "read_email_result", "content": chr(0xD800)}
+        )

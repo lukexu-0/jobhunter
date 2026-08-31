@@ -81,6 +81,7 @@ class BrowserGateRuntime(Protocol):
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None = None,
         submit_ref: str,
         username: str,
         password: str,
@@ -108,6 +109,7 @@ class _PendingGate:
     login_origin: str | None = None
     username_ref: str | None = None
     password_ref: str | None = None
+    password_confirmation_ref: str | None = None
     submit_ref: str | None = None
     credential_store: CredentialStore | None = None
 
@@ -401,6 +403,7 @@ class HumanGate:
         publish: GateEventPublisher,
         review_snapshot: ReviewSnapshotSink | None = None,
         auto_submit: bool = False,
+        default_credentials: tuple[str, str] | None = None,
     ) -> None:
         canonical_origins = [validate_approved_origin(origin) for origin in approved_origins]
         if not canonical_origins or len(canonical_origins) > MAX_APPROVED_ORIGINS:
@@ -409,6 +412,16 @@ class HumanGate:
             raise ValueError("approved origins must be unique")
         if type(auto_submit) is not bool:
             raise ValueError("auto_submit must be a boolean")
+        if default_credentials is not None:
+            username, password = default_credentials
+            if (
+                not isinstance(username, str)
+                or not username
+                or username != username.strip()
+                or not isinstance(password, str)
+                or not password
+            ):
+                raise ValueError("default credentials are invalid")
         self._job_url = validate_job_url(job_url)
         self._approved_origins = canonical_origins
         self._redaction_values = {
@@ -416,16 +429,19 @@ class HumanGate:
             for value in private_values
             if isinstance(value, str) and value
         }
+        if default_credentials is not None:
+            self._redaction_values.update(default_credentials)
         self._user_info_store = user_info_store
         self._publish = publish
         self._review_snapshot = review_snapshot
         self._auto_submit = auto_submit
+        self._default_credentials = default_credentials
         self._lock = asyncio.Lock()
         self._pending: _PendingGate | None = None
         self._cancelled = False
         self._revision_count = 0
         self._submission_approved = False
-        self._tried_credentials: set[tuple[str, str]] = set()
+        self._tried_credentials: set[tuple[str, str, str, str]] = set()
         self._credential_values_activated = False
         self._credential_command_task: asyncio.Task[None] | None = None
 
@@ -523,8 +539,10 @@ class HumanGate:
     async def request_sign_in(
         self,
         *,
+        account_action: Literal["create_account", "sign_in"] = "sign_in",
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None = None,
         submit_ref: str,
         runtime: BrowserGateRuntime,
         credential_store: CredentialStore,
@@ -561,28 +579,67 @@ class HumanGate:
                 "Sign-in requires an approved exact origin",
             )
 
-        saved = credential_store.credentials_for_origin(login_origin)
-        credential = next(
+        default_credentials = self._default_credentials
+        credential = None
+        used_default = False
+        credential_key = (
             (
-                candidate
-                for candidate in saved
-                if (candidate.origin, candidate.username)
-                not in self._tried_credentials
-            ),
-            None,
+                login_origin,
+                default_credentials[0],
+                default_credentials[1],
+                account_action,
+            )
+            if default_credentials is not None
+            else None
         )
-        if credential is not None:
-            self._tried_credentials.add((credential.origin, credential.username))
+        if (
+            default_credentials is not None
+            and credential_key not in self._tried_credentials
+        ):
+            username, password = default_credentials
+            used_default = True
+        else:
+            saved = credential_store.credentials_for_origin(login_origin)
+            credential = next(
+                (
+                    candidate
+                    for candidate in saved
+                    if (
+                        candidate.origin,
+                        candidate.username,
+                        candidate.password,
+                        account_action,
+                    )
+                    not in self._tried_credentials
+                ),
+                None,
+            )
+            if credential is None:
+                username = password = None
+            else:
+                username = credential.username
+                password = credential.password
+        if username is not None and password is not None:
+            self._tried_credentials.add(
+                (login_origin, username, password, account_action)
+            )
             await self._perform_sign_in(
                 runtime=runtime,
                 login_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
-                username=credential.username,
-                password=credential.password,
+                username=username,
+                password=password,
             )
-            return GateResult(metadata={"sign_in_status": "attempted"})
+            metadata: dict[str, object] = {
+                "sign_in_status": "attempted",
+                "account_origin": login_origin,
+            }
+            if used_default:
+                metadata["default_account"] = True
+            return GateResult(metadata=metadata)
 
         decision, _ = await self._wait_for_gate(
             kind="credentials",
@@ -593,6 +650,7 @@ class HumanGate:
             login_origin=login_origin,
             username_ref=username_ref,
             password_ref=password_ref,
+            password_confirmation_ref=password_confirmation_ref,
             submit_ref=submit_ref,
             credential_store=credential_store,
         )
@@ -803,6 +861,7 @@ class HumanGate:
                     login_origin=pending.login_origin,
                     username_ref=pending.username_ref,
                     password_ref=pending.password_ref,
+                    password_confirmation_ref=pending.password_confirmation_ref,
                     submit_ref=pending.submit_ref,
                     username=username,
                     password=password,
@@ -823,6 +882,7 @@ class HumanGate:
         login_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -834,6 +894,7 @@ class HumanGate:
                 login_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 username=username,
                 password=password,
@@ -1024,6 +1085,7 @@ class HumanGate:
         login_origin: str | None = None,
         username_ref: str | None = None,
         password_ref: str | None = None,
+        password_confirmation_ref: str | None = None,
         submit_ref: str | None = None,
         credential_store: CredentialStore | None = None,
     ) -> GateDecision:
@@ -1047,6 +1109,7 @@ class HumanGate:
                 login_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 credential_store=credential_store,
             )
@@ -1076,6 +1139,7 @@ class HumanGate:
         login_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -1086,6 +1150,7 @@ class HumanGate:
                 expected_origin=login_origin,
                 username_ref=username_ref,
                 password_ref=password_ref,
+                password_confirmation_ref=password_confirmation_ref,
                 submit_ref=submit_ref,
                 username=username,
                 password=password,

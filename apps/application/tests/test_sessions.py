@@ -5,7 +5,7 @@ import json
 import stat
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +19,10 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 import jobhunter_browser_harness.sessions as sessions_module
+from jobhunter_browser_harness.application_account import (
+    DEFAULT_APPLICATION_EMAIL,
+    DEFAULT_APPLICATION_PASSWORD,
+)
 from jobhunter_browser_harness.credentials import CredentialStore
 from jobhunter_browser_harness.artifacts import cleanup_session_artifacts, store_uploads
 from jobhunter_browser_harness.agent import ApplicationRunRequest
@@ -27,6 +31,11 @@ from jobhunter_browser_harness.context import (
     CandidateContext,
     CandidateContextProcess,
     load_candidate_context,
+)
+from jobhunter_browser_harness.gmail_verification import (
+    InboxEmail,
+    InboxMessageSummary,
+    InboxSearchResult,
 )
 from jobhunter_browser_harness.playwright_cli import (
     BrowserConfigurationError,
@@ -73,6 +82,8 @@ from jobhunter_browser_harness.models import (
     HarnessServiceError,
     SubmitCommand,
     SubmitRuntimeActionResponse,
+    ReadEmailRuntimeAction,
+    ReadInboxRuntimeAction,
     ReportApplicationMismatchRuntimeAction,
     RequestAdditionalInfoRuntimeAction,
     RequestSignInRuntimeAction,
@@ -429,6 +440,7 @@ class FakePlaywrightRuntime:
         expected_origin: str,
         username_ref: str,
         password_ref: str,
+        password_confirmation_ref: str | None,
         submit_ref: str,
         username: str,
         password: str,
@@ -451,6 +463,11 @@ class FakePlaywrightRuntime:
                 "password": password,
             }
         )
+        if password_confirmation_ref is not None:
+            self.sign_in_calls[-1]["password_confirmation_ref"] = (
+                password_confirmation_ref
+            )
+
 
     async def close(self) -> None:
         if self.close_observer is not None:
@@ -568,6 +585,21 @@ class ImmediateContextProcess:
         self.terminated = True
 
 
+@dataclass(slots=True)
+class FakeInbox:
+    search_result: InboxSearchResult
+    email: InboxEmail
+    calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+
+    async def search_inbox(self, **filters: object) -> InboxSearchResult:
+        self.calls.append(("search", filters))
+        return self.search_result
+
+    async def read_email(self, email_id: str, *, offset: int = 0) -> InboxEmail:
+        self.calls.append(("read", {"email_id": email_id, "offset": offset}))
+        return self.email
+
+
 Runner = Callable[
     [
         ApplicationRunRequest,
@@ -588,6 +620,8 @@ def make_manager(
     timeout: int | None = None,
     context_process_factory: Callable[[Any], Any] = ImmediateContextProcess,
     credential_store: CredentialStore | None = None,
+    gmail_inbox: FakeInbox | None = None,
+    default_credentials: tuple[str, str] | None = None,
 ) -> tuple[ApplicationSessionManager, Fakes, Path]:
     doubles = fakes or Fakes()
     root = tmp_path / "sessions"
@@ -611,6 +645,8 @@ def make_manager(
         application_runner=runner,
         runtime_factory=doubles.runtime_factory,
         credential_store=credential_store,
+        gmail_inbox=gmail_inbox,
+        default_credentials=default_credentials,
     )
     return manager, doubles, root
 
@@ -6152,7 +6188,7 @@ async def test_subsecond_remaining_deadline_waits_for_ttl_without_posting(
 
 
 @pytest.mark.asyncio
-async def test_saved_credentials_try_newest_once_per_successful_inspection_then_gate(
+async def test_default_then_saved_credentials_try_once_per_inspection_then_gate(
     tmp_path: Path,
 ) -> None:
     tmp_path.chmod(0o700)
@@ -6180,6 +6216,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
         tmp_path,
         blocked_runner,
         credential_store=credential_store,
+        default_credentials=(DEFAULT_APPLICATION_EMAIL, DEFAULT_APPLICATION_PASSWORD),
     )
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
@@ -6213,7 +6250,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
         type="sign_in",
         status="attempted",
     )
-    assert fakes.runtimes[0].sign_in_calls[-1]["username"] == "new@example.test"
+    assert fakes.runtimes[0].sign_in_calls[-1]["username"] == DEFAULT_APPLICATION_EMAIL
 
     with pytest.raises(HarnessServiceError) as stale_inspection:
         await runtime_action(manager, created.session_id, request)
@@ -6240,7 +6277,25 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
     )
     assert [
         call["username"] for call in fakes.runtimes[0].sign_in_calls
-    ] == ["new@example.test", "old@example.test"]
+    ] == [DEFAULT_APPLICATION_EMAIL, "new@example.test"]
+
+    await runtime_action(
+        manager,
+        created.session_id,
+        PlaywrightCliRuntimeAction(
+            type="playwright_cli",
+            command="snapshot",
+            args=[],
+        ),
+    )
+    third = await runtime_action(manager, created.session_id, request)
+    assert third == SignInRuntimeActionResponse(
+        type="sign_in",
+        status="attempted",
+    )
+    assert [
+        call["username"] for call in fakes.runtimes[0].sign_in_calls
+    ] == [DEFAULT_APPLICATION_EMAIL, "new@example.test", "old@example.test"]
 
     await runtime_action(
         manager,
@@ -6260,7 +6315,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
         "awaiting_human_navigation",
     )
     runtime = fakes.runtimes[0]
-    assert runtime.capture_suppression_calls == 3
+    assert runtime.capture_suppression_calls == 4
     assert runtime.video_recording is False
     assert runtime.navigation_guard_suspended is False
     assert runtime.order.index(
@@ -6273,7 +6328,7 @@ async def test_saved_credentials_try_newest_once_per_successful_inspection_then_
     }
     record = manager._active
     assert record is not None
-    assert record.playwright_cli_action_count == 8
+    assert record.playwright_cli_action_count == 10
     credentials_event = next(
         event for event in record.events if event.event == "credentials_required"
     )
@@ -6834,4 +6889,87 @@ async def test_capture_failure_never_opens_or_executes_the_credentials_gate(
     assert all(event.event != "credentials_required" for event in record.events)
     assert runtime.sign_in_calls == []
     assert runtime.capture_suppression_calls == 1
+    await manager.delete(created.session_id)
+
+
+@pytest.mark.asyncio
+async def test_model_runtime_can_search_and_read_inbox_but_public_runtime_cannot(
+    tmp_path: Path,
+) -> None:
+    inbox = FakeInbox(
+        search_result=InboxSearchResult(
+            messages=(
+                InboxMessageSummary(
+                    message_id="message-1",
+                    subject="Your verification code",
+                    sent_at=datetime(2026, 8, 30, 14, 22, 3, tzinfo=UTC),
+                ),
+            ),
+            truncated=True,
+        ),
+        email=InboxEmail(message_id="message-1", content="parsed MIME content"),
+    )
+    manager, _fakes, _root = make_manager(
+        tmp_path,
+        blocked_runner,
+        gmail_inbox=inbox,
+    )
+    created = await create_valid(manager)
+    await wait_state(manager, created.session_id, "running")
+
+    search = await runtime_action(
+        manager,
+        created.session_id,
+        ReadInboxRuntimeAction(
+            type="read_inbox",
+            query="code",
+            date="2026-08-30",
+            time="14:00",
+            received_within_minutes=30,
+            received_before_minutes_ago=15,
+        ),
+    )
+    assert search.model_dump(mode="json") == {
+        "type": "read_inbox_result",
+        "messages": [
+            {
+                "email_id": "message-1",
+                "subject": "Your verification code",
+                "sent_at": "2026-08-30T14:22:03Z",
+            }
+        ],
+        "truncated": True,
+    }
+    email = await runtime_action(
+        manager,
+        created.session_id,
+        ReadEmailRuntimeAction(
+            type="read_email",
+            email_id="message-1",
+            offset=51_000,
+        ),
+    )
+    assert email.model_dump() == {
+        "type": "read_email_result",
+        "content": "parsed MIME content",
+    }
+    assert inbox.calls == [
+        (
+            "search",
+            {
+                "query": "code",
+                "date": date(2026, 8, 30),
+                "time": time(14, 0),
+                "received_within_minutes": 30,
+                "received_before_minutes_ago": 15,
+            },
+        ),
+        ("read", {"email_id": "message-1", "offset": 51_000}),
+    ]
+
+    with pytest.raises(HarnessServiceError, match="model-only"):
+        await manager.runtime_action(
+            created.session_id,
+            ReadEmailRuntimeAction(type="read_email", email_id="message-1"),
+        )
     await manager.delete(created.session_id)

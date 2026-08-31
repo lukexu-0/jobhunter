@@ -41,7 +41,7 @@ BROWSER_DOM_MAX_CHARACTERS = 40_000
 PLAYWRIGHT_OUTPUT_MAX_CHARACTERS = 20_000
 MAX_ADDITIONAL_INFO_OPTIONS = 100
 MAX_ADDITIONAL_INFO_SELECTED_OPTIONS = 100
-
+READ_EMAIL_OUTPUT_MAX_BYTES = 50 * 1024
 
 OpportunityKind: TypeAlias = Literal[
     "job",
@@ -591,6 +591,8 @@ class HarnessConfig(FrozenPrivateModel):
         "apps/user-info/current-context/personal/user-info.json"
     )
     credentials_json: Path = Path("~/.jobhunter/browser-harness/credentials.json")
+    gmail_token_json: Path = Path("~/.jobhunter/browser-harness/gmail-token.json")
+    gmail_verification_timeout: int = Field(default=180, ge=1, le=900)
     browser: BrowserLaunchConfig = Field(default_factory=BrowserLaunchConfig)
 
     @field_validator("pipeline_url")
@@ -1337,10 +1339,14 @@ class RequestHumanNavigationRuntimeAction(PublicModel):
             max_length=2_000,
         ),
     ]
+
+
 class RequestSignInRuntimeAction(PublicModel):
     type: Literal["request_sign_in"]
+    account_action: Literal["create_account", "sign_in"] = "sign_in"
     username_ref: ElementRef
     password_ref: ElementRef
+    password_confirmation_ref: ElementRef | None = None
     submit_ref: ElementRef
 
     @field_validator("username_ref", "password_ref", "submit_ref")
@@ -1350,7 +1356,71 @@ class RequestSignInRuntimeAction(PublicModel):
             raise ValueError("element ref is invalid")
         return value
 
+    @field_validator("password_confirmation_ref")
+    @classmethod
+    def _validate_optional_ref(cls, value: str | None) -> str | None:
+        if value is not None and _ELEMENT_REF_PATTERN.fullmatch(value) is None:
+            raise ValueError("element ref is invalid")
+        return value
 
+
+class ReadInboxRuntimeAction(PublicModel):
+    type: Literal["read_inbox"]
+    query: Annotated[
+        str,
+        StringConstraints(strict=True, strip_whitespace=True, max_length=500),
+    ] = "code"
+    date: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    ] | None = None
+    time: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^\d{2}:\d{2}$"),
+    ] | None = None
+    received_within_minutes: int | None = Field(default=None, strict=True, ge=1, le=1_440)
+    received_before_minutes_ago: int | None = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        le=1_440,
+    )
+
+    @field_validator("query")
+    @classmethod
+    def _default_query(cls, value: str) -> str:
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("query is invalid")
+        return value or "code"
+
+    @field_validator("date")
+    @classmethod
+    def _validate_date(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError("date is invalid") from None
+        return value
+
+    @field_validator("time")
+    @classmethod
+    def _validate_time(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                datetime.strptime(value, "%H:%M")
+            except ValueError:
+                raise ValueError("time is invalid") from None
+        return value
+
+
+class ReadEmailRuntimeAction(PublicModel):
+    type: Literal["read_email"]
+    email_id: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^[A-Za-z0-9_-]{1,256}$"),
+    ]
+    offset: Annotated[int, Field(strict=True, ge=0, lt=131_072)] = 0
 
 
 class RequestAdditionalInfoRuntimeAction(PublicModel):
@@ -1378,6 +1448,8 @@ RuntimeActionRequest: TypeAlias = Annotated[
     PlaywrightCliRuntimeAction
     | RequestHumanNavigationRuntimeAction
     | RequestSignInRuntimeAction
+    | ReadInboxRuntimeAction
+    | ReadEmailRuntimeAction
     | RequestAdditionalInfoRuntimeAction
     | RequestHumanReviewRuntimeAction
     | ReportApplicationMismatchRuntimeAction,
@@ -1388,18 +1460,55 @@ RuntimeActionRequest: TypeAlias = Annotated[
 class PlaywrightCliResultRuntimeActionResponse(PlaywrightCliExecutionResult):
     type: Literal["playwright_cli_result"]
 
+
 class SignInRuntimeActionResponse(PublicModel):
     type: Literal["sign_in"]
     status: Literal["attempted", "saved"]
 
 
+class InboxMessageSummary(PublicModel):
+    email_id: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^[A-Za-z0-9_-]{1,256}$"),
+    ]
+    subject: Annotated[str, StringConstraints(strict=True, max_length=998)]
+    sent_at: Annotated[
+        str,
+        StringConstraints(
+            strict=True,
+            max_length=35,
+            pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$",
+        ),
+    ]
+
+
+class ReadInboxRuntimeActionResponse(PublicModel):
+    type: Literal["read_inbox_result"]
+    messages: list[InboxMessageSummary] = Field(max_length=50)
+    truncated: bool
+
+
+class ReadEmailRuntimeActionResponse(PublicModel):
+    type: Literal["read_email_result"]
+    content: Annotated[
+        str,
+        StringConstraints(strict=True, min_length=1, max_length=50 * 1024),
+    ]
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content_size(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > READ_EMAIL_OUTPUT_MAX_BYTES:
+            raise ValueError("content exceeds the UTF-8 byte limit")
+        return value
+
 
 class ContinueRuntimeActionResponse(PublicModel):
     type: Literal["continue"]
 
+
 class InterruptedRuntimeActionResponse(PublicModel):
     type: Literal["interrupted"]
-
 
 
 class ContinueWithoutAdditionalInfoRuntimeActionResponse(PublicModel):
@@ -1443,6 +1552,8 @@ class ApplicationMismatchRuntimeActionResponse(PublicModel):
 RuntimeActionResponse: TypeAlias = Annotated[
     PlaywrightCliResultRuntimeActionResponse
     | SignInRuntimeActionResponse
+    | ReadInboxRuntimeActionResponse
+    | ReadEmailRuntimeActionResponse
     | ContinueRuntimeActionResponse
     | InterruptedRuntimeActionResponse
     | ContinueWithoutAdditionalInfoRuntimeActionResponse
