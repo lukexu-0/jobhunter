@@ -1417,7 +1417,11 @@ async def test_gmail_callback_is_unauthenticated_one_way_html_without_secrets(
 
     response = await client.get(
         "/oauth/gmail/callback",
-        params={"state": private_state, "code": private_code},
+        params={
+            "state": private_state,
+            "code": private_code,
+            "iss": "https://accounts.google.com",
+        },
     )
 
     assert response.status_code == 200
