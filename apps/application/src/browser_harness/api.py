@@ -294,10 +294,13 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
             "authuser",
             "prompt",
             "hd",
+            "iss",
         }
         keys = set(request.query_params.keys())
         valid = (
             keys <= allowed
+            and request.query_params.get("iss", "https://accounts.google.com")
+            == "https://accounts.google.com"
             and all(len(request.query_params.getlist(key)) == 1 for key in keys)
             and all(
                 len(value) <= 8_192
