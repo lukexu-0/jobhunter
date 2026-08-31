@@ -38,6 +38,9 @@ from jobhunter_browser_harness.models import (
     ContinueWithoutAdditionalInfoCommand,
     SaveCredentialsCommand,
     SignInCommand,
+    GmailAuthIdentity,
+    GmailAuthSession,
+    GmailAuthStatus,
     FieldResult,
     HarnessConfig,
     OpportunityKind,
@@ -122,7 +125,63 @@ def make_snapshot(**overrides: Any) -> SessionSnapshot:
 
 
 @dataclass(slots=True)
+class FakeGmailAuthService:
+    auth_status: GmailAuthStatus = field(
+        default_factory=lambda: GmailAuthStatus(state="disconnected")
+    )
+    auth_session: GmailAuthSession = field(
+        default_factory=lambda: GmailAuthSession(
+            id="A" * 43,
+            state="pending",
+            authorization_url=(
+                "https://accounts.google.com/o/oauth2/v2/auth?state=private"
+            ),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+    )
+    status_calls: int = 0
+    start_calls: int = 0
+    session_calls: list[str] = field(default_factory=list)
+    callback_calls: list[tuple[str | None, str | None, str | None]] = field(
+        default_factory=list
+    )
+    disconnect_calls: int = 0
+    shutdown_calls: int = 0
+
+    async def status(self) -> GmailAuthStatus:
+        self.status_calls += 1
+        return self.auth_status
+
+    async def start(self) -> GmailAuthSession:
+        self.start_calls += 1
+        return self.auth_session
+
+    async def get_session(self, session_id: str) -> GmailAuthSession:
+        self.session_calls.append(session_id)
+        return self.auth_session.model_copy(
+            update={"id": session_id, "authorization_url": None}
+        )
+
+    async def complete_callback(
+        self,
+        *,
+        state: str | None,
+        code: str | None,
+        error: str | None,
+    ) -> bool:
+        self.callback_calls.append((state, code, error))
+        return error is None and code is not None
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+@dataclass(slots=True)
 class FakeSessionService:
+    gmail_auth: FakeGmailAuthService = field(default_factory=FakeGmailAuthService)
     snapshot: SessionSnapshot = field(default_factory=make_snapshot)
     create_error: HarnessServiceError | None = None
     snapshot_error: Exception | None = None
@@ -305,7 +364,7 @@ async def api_client() -> AsyncIterator[tuple[httpx.AsyncClient, FakeSessionServ
     service = FakeSessionService()
     app = create_app(
         HarnessConfig(bearer_token=TOKEN),
-        HarnessDependencies(sessions=service),
+        HarnessDependencies(sessions=service, gmail_auth=service.gmail_auth),
     )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://harness.test") as client:
@@ -1209,6 +1268,189 @@ def test_command_union_rejects_unknown_empty_oversize_and_extra_values(
     with pytest.raises(ValidationError):
         COMMAND_ADAPTER.validate_python(payload)
 
+async def test_gmail_auth_status_is_authenticated_strict_and_redacted_safe(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    service.gmail_auth.auth_status = GmailAuthStatus(
+        state="connected",
+        identity=GmailAuthIdentity(email="L***@e***.com"),
+    )
+
+    unauthorized = await client.get("/v1/gmail-auth")
+    response = await client.get("/v1/gmail-auth", headers=AUTHORIZATION)
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "state": "connected",
+        "identity": {"email": "L***@e***.com"},
+    }
+    assert service.gmail_auth.status_calls == 1
+
+
+async def test_gmail_auth_session_start_accepts_exact_empty_json(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        "/v1/gmail-auth/sessions",
+        headers=AUTHORIZATION,
+        json={},
+    )
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": "A" * 43,
+        "state": "pending",
+        "authorization_url": (
+            "https://accounts.google.com/o/oauth2/v2/auth?state=private"
+        ),
+        "expires_at": "2026-07-13T12:10:00Z",
+    }
+    assert service.gmail_auth.start_calls == 1
+
+
+@pytest.mark.parametrize("body", [None, [], {"extra": True}, ""])
+async def test_gmail_auth_session_start_rejects_every_nonempty_object_shape(
+    body: object,
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+
+    response = await client.post(
+        "/v1/gmail-auth/sessions",
+        headers=AUTHORIZATION,
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.gmail_auth.start_calls == 0
+
+
+async def test_gmail_auth_session_poll_returns_only_public_state(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    session_id = "B" * 43
+    service.gmail_auth.auth_session = service.gmail_auth.auth_session.model_copy(
+        update={"state": "succeeded", "authorization_url": None}
+    )
+
+    response = await client.get(
+        f"/v1/gmail-auth/sessions/{session_id}",
+        headers=AUTHORIZATION,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": session_id,
+        "state": "succeeded",
+        "expires_at": "2026-07-13T12:10:00Z",
+    }
+    assert service.gmail_auth.session_calls == [session_id]
+
+
+async def test_gmail_disconnect_is_authenticated_bodyless_and_idempotent(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+
+    first = await client.delete("/v1/gmail-auth", headers=AUTHORIZATION)
+    second = await client.delete("/v1/gmail-auth", headers=AUTHORIZATION)
+
+    assert first.status_code == 204
+    assert first.content == b""
+    assert second.status_code == 204
+    assert service.gmail_auth.disconnect_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "request_kwargs"),
+    [
+        ("GET", "/v1/gmail-auth", {"content": b"{}"}),
+        ("GET", f"/v1/gmail-auth/sessions/{'A' * 43}", {"content": b"{}"}),
+        ("DELETE", "/v1/gmail-auth", {"content": b"{}"}),
+        ("GET", "/v1/gmail-auth?extra=1", {}),
+        ("GET", f"/v1/gmail-auth/sessions/{'A' * 43}?extra=1", {}),
+        ("DELETE", "/v1/gmail-auth?extra=1", {}),
+        ("POST", "/v1/gmail-auth/sessions?extra=1", {"json": {}}),
+    ],
+)
+async def test_gmail_v1_routes_reject_queries_and_noncontract_bodies(
+    method: str,
+    path: str,
+    request_kwargs: dict[str, Any],
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+
+    response = await client.request(
+        method,
+        path,
+        headers=AUTHORIZATION,
+        **request_kwargs,
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+    assert service.gmail_auth.status_calls == 0
+    assert service.gmail_auth.start_calls == 0
+    assert service.gmail_auth.session_calls == []
+    assert service.gmail_auth.disconnect_calls == 0
+
+
+async def test_gmail_callback_is_unauthenticated_one_way_html_without_secrets(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    private_state = "S" * 43
+    private_code = "private-authorization-code"
+
+    response = await client.get(
+        "/oauth/gmail/callback",
+        params={"state": private_state, "code": private_code},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "window.close()" in response.text
+    assert private_state not in response.text
+    assert private_code not in response.text
+    assert "client_secret" not in response.text
+    assert service.gmail_auth.callback_calls == [
+        (private_state, private_code, None)
+    ]
+
+
+async def test_gmail_callback_cancellation_returns_only_close_window_failure_html(
+    api_client: tuple[httpx.AsyncClient, FakeSessionService],
+) -> None:
+    client, service = api_client
+    private_state = "C" * 43
+
+    response = await client.get(
+        "/oauth/gmail/callback",
+        params={"state": private_state, "error": "access_denied"},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("text/html")
+    assert "window.close()" in response.text
+    assert private_state not in response.text
+    assert "access_denied" not in response.text
+    assert service.gmail_auth.callback_calls == [
+        (private_state, None, "access_denied")
+    ]
+
 
 async def test_health_is_unauthenticated_and_returns_only_status(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
@@ -1220,16 +1462,18 @@ async def test_health_is_unauthenticated_and_returns_only_status(
     assert response.json() == {"status": "ok"}
     assert response.headers["cache-control"] == "no-store"
 
-async def test_application_lifespan_shuts_down_session_service() -> None:
+async def test_application_lifespan_shuts_down_both_services() -> None:
     service = FakeSessionService()
     app = create_app(
         HarnessConfig(bearer_token=TOKEN),
-        HarnessDependencies(sessions=service),
+        HarnessDependencies(sessions=service, gmail_auth=service.gmail_auth),
     )
     async with app.router.lifespan_context(app):
         assert service.startup_calls == 1
         assert service.shutdown_calls == 0
+        assert service.gmail_auth.shutdown_calls == 0
     assert service.shutdown_calls == 1
+    assert service.gmail_auth.shutdown_calls == 1
     assert service.startup_calls == 1
 
 

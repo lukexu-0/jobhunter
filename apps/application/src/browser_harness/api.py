@@ -10,7 +10,7 @@ from uuid import UUID
 
 from fastapi import Body, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
 from .models import (
@@ -18,6 +18,10 @@ from .models import (
     APPLICATION_CONTEXT_MAX_COUNT,
     AdditionalInfoQuestionId,
     ApplicationAnswerSuggestionsResponse,
+    GmailAuthSession,
+    GmailAuthSessionId,
+    GmailAuthSessionCreateRequest,
+    GmailAuthStatus,
     HarnessConfig,
     OpportunityKind,
     HarnessServiceError,
@@ -94,10 +98,30 @@ class HarnessSessionService(Protocol):
     async def shutdown(self) -> None: ...
 
 
+class GmailAuthService(Protocol):
+    async def status(self) -> GmailAuthStatus: ...
+
+    async def start(self) -> GmailAuthSession: ...
+
+    async def get_session(self, session_id: str) -> GmailAuthSession: ...
+
+    async def complete_callback(
+        self,
+        *,
+        state: str | None,
+        code: str | None,
+        error: str | None,
+    ) -> bool: ...
+
+    async def disconnect(self) -> None: ...
+
+    async def shutdown(self) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class HarnessDependencies:
     sessions: HarnessSessionService
-
+    gmail_auth: GmailAuthService
 
 def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
@@ -105,6 +129,27 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
         content={"code": code, "message": message},
         headers={"cache-control": "no-store"},
     )
+
+def _gmail_callback_response(succeeded: bool) -> HTMLResponse:
+    result = "connected" if succeeded else "was not connected"
+    return HTMLResponse(
+        status_code=200 if succeeded else 400,
+        content=(
+            "<!doctype html><meta charset=utf-8><title>Gmail connection</title>"
+            f"<p>Gmail {result}. You may close this window.</p>"
+            "<script>window.close()</script>"
+        ),
+        headers={
+            "cache-control": "no-store",
+            "content-security-policy": (
+                "default-src 'none'; script-src 'unsafe-inline'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "referrer-policy": "no-referrer",
+            "x-content-type-options": "nosniff",
+        },
+    )
+
 
 async def _require_bodyless_request(request: Request) -> None:
     content_length = request.headers.get("content-length")
@@ -135,7 +180,10 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
         try:
             yield
         finally:
-            await dependencies.sessions.shutdown()
+            try:
+                await dependencies.sessions.shutdown()
+            finally:
+                await dependencies.gmail_auth.shutdown()
 
     app = FastAPI(
         title="Jobhunter Browser Harness",
@@ -180,6 +228,89 @@ def create_app(config: HarnessConfig, dependencies: HarnessDependencies) -> Fast
     @app.exception_handler(Exception)
     async def handle_unexpected_error(_request: Request, _error: Exception) -> JSONResponse:
         return _error_response(500, "internal_error", "Request failed")
+
+    @app.get(
+        "/v1/gmail-auth",
+        response_model=GmailAuthStatus,
+        response_model_exclude_none=True,
+    )
+    async def get_gmail_auth(request: Request) -> GmailAuthStatus:
+        if request.query_params:
+            raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+        await _require_bodyless_request(request)
+        return await dependencies.gmail_auth.status()
+
+    @app.post(
+        "/v1/gmail-auth/sessions",
+        status_code=201,
+        response_model=GmailAuthSession,
+        response_model_exclude_none=True,
+    )
+    async def start_gmail_auth(
+        _body: GmailAuthSessionCreateRequest,
+        request: Request,
+    ) -> GmailAuthSession:
+        if request.query_params:
+            raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+        return await dependencies.gmail_auth.start()
+
+    @app.get(
+        "/v1/gmail-auth/sessions/{session_id}",
+        response_model=GmailAuthSession,
+        response_model_exclude_none=True,
+    )
+    async def get_gmail_auth_session(
+        session_id: GmailAuthSessionId,
+        request: Request,
+    ) -> GmailAuthSession:
+        if request.query_params:
+            raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+        await _require_bodyless_request(request)
+        return await dependencies.gmail_auth.get_session(session_id)
+
+    @app.delete("/v1/gmail-auth", status_code=204)
+    async def disconnect_gmail_auth(request: Request) -> Response:
+        if request.query_params:
+            raise HarnessServiceError(422, "invalid_request", "Request is invalid")
+        await _require_bodyless_request(request)
+        await dependencies.gmail_auth.disconnect()
+        return Response(status_code=204, headers={"cache-control": "no-store"})
+
+    @app.get("/oauth/gmail/callback", response_class=HTMLResponse)
+    async def gmail_oauth_callback(request: Request) -> HTMLResponse:
+        allowed = {
+            "state",
+            "code",
+            "error",
+            "error_description",
+            "error_uri",
+            "scope",
+            "authuser",
+            "prompt",
+            "hd",
+        }
+        keys = set(request.query_params.keys())
+        valid = (
+            keys <= allowed
+            and all(len(request.query_params.getlist(key)) == 1 for key in keys)
+            and all(
+                len(value) <= 8_192
+                and all(ord(character) != 0 for character in value)
+                for _key, value in request.query_params.multi_items()
+            )
+        )
+        if not valid:
+            return _gmail_callback_response(False)
+        try:
+            await _require_bodyless_request(request)
+            succeeded = await dependencies.gmail_auth.complete_callback(
+                state=request.query_params.get("state"),
+                code=request.query_params.get("code"),
+                error=request.query_params.get("error"),
+            )
+        except Exception:
+            succeeded = False
+        return _gmail_callback_response(succeeded)
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:

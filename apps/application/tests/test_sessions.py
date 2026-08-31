@@ -103,6 +103,35 @@ AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
 JOB_URL = "https://jobs.example/openings/42?candidate=private-secret"
 PROFILE_SECRET = "ada.private@example.test"
 
+class _UnusedGmailAuth:
+    async def status(self) -> Any:
+        raise AssertionError("Gmail auth is outside this test")
+
+    async def start(self) -> Any:
+        raise AssertionError("Gmail auth is outside this test")
+
+    async def get_session(self, _session_id: str) -> Any:
+        raise AssertionError("Gmail auth is outside this test")
+
+    async def complete_callback(
+        self,
+        *,
+        state: str | None,
+        code: str | None,
+        error: str | None,
+    ) -> bool:
+        raise AssertionError("Gmail auth is outside this test")
+
+    async def disconnect(self) -> None:
+        raise AssertionError("Gmail auth is outside this test")
+
+    async def shutdown(self) -> None:
+        return None
+
+
+_UNUSED_GMAIL_AUTH = _UnusedGmailAuth()
+
+
 def upload(filename: str, content: bytes) -> UploadFile:
     return UploadFile(file=BytesIO(content), filename=filename)
 
@@ -1864,7 +1893,10 @@ async def test_runtime_start_session_timeout_preserves_timeout_failure(
 async def test_singleton_api_returns_exact_active_session_id(tmp_path: Path) -> None:
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     first = await create_valid(manager)
-    app = create_app(HarnessConfig(bearer_token=TOKEN), HarnessDependencies(sessions=manager))
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=manager, gmail_auth=_UNUSED_GMAIL_AUTH),
+    )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://harness.test") as client:
         response = await client.post(
@@ -1981,7 +2013,7 @@ async def test_tombstoned_caller_id_is_a_distinct_conflict_without_uploads(
     assert storage_called is False
     app = create_app(
         HarnessConfig(bearer_token=TOKEN),
-        HarnessDependencies(sessions=manager),
+        HarnessDependencies(sessions=manager, gmail_auth=_UNUSED_GMAIL_AUTH),
     )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(
@@ -3050,7 +3082,10 @@ async def test_api_unknown_and_terminal_command_responses(tmp_path: Path) -> Non
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     created = await create_valid(manager)
     await wait_state(manager, created.session_id, "running")
-    app = create_app(HarnessConfig(bearer_token=TOKEN), HarnessDependencies(sessions=manager))
+    app = create_app(
+        HarnessConfig(bearer_token=TOKEN),
+        HarnessDependencies(sessions=manager, gmail_auth=_UNUSED_GMAIL_AUTH),
+    )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     unknown_id = uuid4()
 
@@ -3623,7 +3658,7 @@ async def test_create_session_uses_latex_source_as_resume_evidence_and_pdf_for_u
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     app = create_app(
         HarnessConfig(bearer_token=TOKEN),
-        HarnessDependencies(sessions=manager),
+        HarnessDependencies(sessions=manager, gmail_auth=_UNUSED_GMAIL_AUTH),
     )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -3684,7 +3719,7 @@ async def test_create_session_rejects_invalid_resume_source_with_fixed_error(
     manager, _fakes, _root = make_manager(tmp_path, blocked_runner)
     app = create_app(
         HarnessConfig(bearer_token=TOKEN),
-        HarnessDependencies(sessions=manager),
+        HarnessDependencies(sessions=manager, gmail_auth=_UNUSED_GMAIL_AUTH),
     )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 

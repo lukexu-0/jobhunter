@@ -13,6 +13,7 @@ import uvicorn
 from pydantic import ValidationError
 
 from .credentials import CredentialStore
+from .gmail_oauth import GmailOAuthManager
 from .api import HarnessDependencies, create_app
 from .playwright_cli import (
     BrowserConfigurationError,
@@ -83,6 +84,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gmail-oauth-client-json",
+        type=Path,
+        default=None,
+        help=(
+            "private Desktop Gmail OAuth client JSON "
+            "(default: ~/.jobhunter/browser-harness/gmail-oauth-client.json)"
+        ),
+    )
+    parser.add_argument(
         "--gmail-token-json",
         type=Path,
         default=None,
@@ -135,6 +145,9 @@ def _resolve_regular_file(
 
 _DEFAULT_TOKEN_PATH = Path("~/.jobhunter/browser-harness/token")
 _DEFAULT_CREDENTIALS_PATH = Path("~/.jobhunter/browser-harness/credentials.json")
+_DEFAULT_GMAIL_OAUTH_CLIENT_PATH = Path(
+    "~/.jobhunter/browser-harness/gmail-oauth-client.json"
+)
 _DEFAULT_GMAIL_TOKEN_PATH = Path("~/.jobhunter/browser-harness/gmail-token.json")
 _MAX_TOKEN_FILE_BYTES = 4096
 
@@ -293,6 +306,11 @@ def parse_config(
                 if args.credentials_json is None
                 else args.credentials_json
             ),
+            gmail_oauth_client_json=_absolute_without_symlink_resolution(
+                _DEFAULT_GMAIL_OAUTH_CLIENT_PATH
+                if args.gmail_oauth_client_json is None
+                else args.gmail_oauth_client_json
+            ),
             gmail_token_json=_absolute_without_symlink_resolution(
                 _DEFAULT_GMAIL_TOKEN_PATH
                 if args.gmail_token_json is None
@@ -321,7 +339,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         browser_launch=browser_launch,
         credential_store=credential_store,
     )
-    app = create_app(config, HarnessDependencies(sessions=sessions))
+    gmail_auth = GmailOAuthManager(
+        client_json=config.gmail_oauth_client_json,
+        token_json=config.gmail_token_json,
+        redirect_uri=(
+            f"http://127.0.0.1:{config.port}/oauth/gmail/callback"
+        ),
+    )
+    app = create_app(
+        config,
+        HarnessDependencies(sessions=sessions, gmail_auth=gmail_auth),
+    )
     uvicorn.run(
         app,
         host="127.0.0.1",
