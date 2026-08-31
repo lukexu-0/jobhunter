@@ -132,12 +132,18 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
 
 def _gmail_callback_response(succeeded: bool) -> HTMLResponse:
     result = "connected" if succeeded else "was not connected"
+    guidance = (
+        " You may close this window."
+        if succeeded
+        else " Return to Providers and try again."
+    )
+    close_script = "<script>window.close()</script>" if succeeded else ""
     return HTMLResponse(
         status_code=200 if succeeded else 400,
         content=(
             "<!doctype html><meta charset=utf-8><title>Gmail connection</title>"
-            f"<p>Gmail {result}. You may close this window.</p>"
-            "<script>window.close()</script>"
+            f"<p>Gmail {result}.{guidance}</p>"
+            f"{close_script}"
         ),
         headers={
             "cache-control": "no-store",

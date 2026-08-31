@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -28,6 +29,8 @@ from .models import (
     GmailAuthStatus,
     HarnessServiceError,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 _SESSION_LIFETIME = timedelta(minutes=10)
 _MAX_CLIENT_BYTES = 65_536
@@ -257,7 +260,11 @@ class GmailOAuthManager:
                     identity = _redact_email(await self._identity_fetcher(token))
                 except Exception:
                     identity = None
-        except Exception:
+        except Exception as error:
+            _LOGGER.warning(
+                "Gmail OAuth token exchange failed (%s)",
+                type(error).__name__,
+            )
             async with self._lock:
                 current = self._sessions.get(session_id)
                 if current is not None and current.state == "pending":
@@ -278,7 +285,11 @@ class GmailOAuthManager:
                 return False
             try:
                 await asyncio.to_thread(_atomic_write_token, self._token_json, encoded)
-            except Exception:
+            except Exception as error:
+                _LOGGER.warning(
+                    "Gmail OAuth token persistence failed (%s)",
+                    type(error).__name__,
+                )
                 current.state = "failed"
                 return False
             current.state = "succeeded"
