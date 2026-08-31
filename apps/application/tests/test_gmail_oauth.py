@@ -142,7 +142,7 @@ async def test_desktop_oauth_success_writes_the_existing_readonly_token_contract
     status = await manager.status()
     assert status.model_dump(exclude_none=True) == {
         "state": "connected",
-        "identity": {"email": "L***@e***.com"},
+        "identity": {"email": "Alex.Example@example.com"},
     }
 @pytest.mark.asyncio
 async def test_oauth_client_must_be_a_private_desktop_file_without_leaking_secrets(
