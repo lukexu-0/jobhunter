@@ -257,7 +257,7 @@ class GmailOAuthManager:
             token = credentials.token
             if isinstance(token, str) and token:
                 try:
-                    identity = _redact_email(await self._identity_fetcher(token))
+                    identity = _validate_email(await self._identity_fetcher(token))
                 except Exception:
                     identity = None
         except Exception as error:
@@ -603,7 +603,7 @@ def _valid_desktop_redirect_uri(value: object) -> bool:
     )
 
 
-def _redact_email(value: str) -> str:
+def _validate_email(value: str) -> str:
     if (
         not isinstance(value, str)
         or value != value.strip()
@@ -616,11 +616,7 @@ def _redact_email(value: str) -> str:
     labels = domain.split(".")
     if not local or not labels[0] or any(not label for label in labels):
         raise ValueError("email is invalid")
-    redacted_local = local[0] + "***"
-    redacted_domain = labels[0][0] + "***"
-    if len(labels) > 1:
-        redacted_domain += "." + labels[-1]
-    return f"{redacted_local}@{redacted_domain}"
+    return value
 
 
 def _state_digest(value: str) -> bytes:
