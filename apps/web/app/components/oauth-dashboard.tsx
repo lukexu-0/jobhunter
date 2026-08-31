@@ -46,9 +46,22 @@ function closeAuthWindow(authWindow: Window | null): void {
 
 function reserveAuthWindow(): Window | null {
   let authWindow: Window | null = null;
+  const width = 620;
+  const height = 760;
+  const left = Math.max(0, Math.round(window.screenX + (window.outerWidth - width) / 2));
+  const top = Math.max(0, Math.round(window.screenY + (window.outerHeight - height) / 2));
+  const features = [
+    "popup=yes",
+    `width=${width}`,
+    `height=${height}`,
+    `left=${left}`,
+    `top=${top}`,
+    "resizable=yes",
+    "scrollbars=yes",
+  ].join(",");
 
   try {
-    authWindow = window.open("", "_blank");
+    authWindow = window.open("", "_blank", features);
     if (!authWindow) return null;
 
     authWindow.opener = null;
