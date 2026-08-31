@@ -208,8 +208,12 @@ interface BrowserNotificationRecord {
 
 async function installBrowserNotificationProbe(
   page: Page,
+  options: {
+    readonly initialPermission?: NotificationPermission;
+    readonly notificationsEnabled?: boolean;
+  } = {},
 ): Promise<() => Promise<BrowserNotificationRecord[]>> {
-  await page.addInitScript(() => {
+  await page.addInitScript((initial) => {
     const notificationWindow = window as typeof window & {
       __browserNotifications: BrowserNotificationRecord[];
     };
@@ -217,17 +221,27 @@ async function installBrowserNotificationProbe(
       configurable: true,
       value: [],
     });
+    const permissionStorageKey = "jobhunter.test.browser-notification-permission";
+    let permission = window.localStorage.getItem(permissionStorageKey) as NotificationPermission | null;
+    if (permission === null) {
+      permission = initial.permission;
+      window.localStorage.setItem(permissionStorageKey, permission);
+    }
     class BrowserNotificationProbe {
-      static readonly permission: NotificationPermission = "granted";
-
-      static requestPermission(): Promise<NotificationPermission> {
-        return Promise.resolve(BrowserNotificationProbe.permission);
+      static get permission(): NotificationPermission {
+        return permission!;
       }
 
-      constructor(title: string, options: NotificationOptions = {}) {
+      static requestPermission(): Promise<NotificationPermission> {
+        permission = "granted";
+        window.localStorage.setItem(permissionStorageKey, permission);
+        return Promise.resolve(permission);
+      }
+
+      constructor(title: string, notificationOptions: NotificationOptions = {}) {
         notificationWindow.__browserNotifications.push({
-          body: options.body ?? "",
-          tag: options.tag ?? "",
+          body: notificationOptions.body ?? "",
+          tag: notificationOptions.tag ?? "",
           title,
         });
       }
@@ -236,7 +250,15 @@ async function installBrowserNotificationProbe(
       configurable: true,
       value: BrowserNotificationProbe,
     });
-    window.localStorage.setItem("jobhunter.browser-notifications.enabled", "true");
+    if (window.localStorage.getItem("jobhunter.browser-notifications.enabled") === null) {
+      window.localStorage.setItem(
+        "jobhunter.browser-notifications.enabled",
+        String(initial.notificationsEnabled),
+      );
+    }
+  }, {
+    notificationsEnabled: options.notificationsEnabled ?? true,
+    permission: options.initialPermission ?? "granted",
   });
   return () => page.evaluate(() => (
     window as typeof window & { __browserNotifications: BrowserNotificationRecord[] }
@@ -1498,8 +1520,11 @@ test("plays an attention alert when resume tailoring becomes ready for review", 
   expect(await notifications()).toEqual([]);
 });
 
-test("persists sound alerts and lets the user test the attention sound", async ({ page }) => {
-  const frequencies = await installSoundProbe(page);
+test("persists alert settings in the application workflow", async ({ page }) => {
+  await installBrowserNotificationProbe(page, {
+    initialPermission: "default",
+    notificationsEnabled: false,
+  });
   await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
@@ -1508,30 +1533,33 @@ test("persists sound alerts and lets the user test the attention sound", async (
 
   await page.goto(`/runs/${runId}`);
   const soundToggle = page.getByRole("checkbox", { name: "Sound alerts" });
-  const testSound = page.getByRole("button", { name: "Test sound" });
+  const notificationToggle = page.getByRole("checkbox", { name: "Browser notifications" });
   await expect(soundToggle).toBeChecked();
-  await expect(testSound).toBeEnabled();
+  await expect(notificationToggle).not.toBeChecked();
+  await expect(notificationToggle).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Test sound" })).toHaveCount(0);
 
-  await testSound.click();
-  await expect.poll(frequencies).toEqual([740, 988]);
   await soundToggle.uncheck();
-  await expect(testSound).toBeDisabled();
+  await notificationToggle.check();
   await expect.poll(() => page.evaluate(() => (
     window.localStorage.getItem("jobhunter.sound-alerts.enabled")
   ))).toBe("false");
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.browser-notifications.enabled")
+  ))).toBe("true");
 
   await page.reload();
   await expect(soundToggle).not.toBeChecked();
-  await expect(testSound).toBeDisabled();
-  expect(await frequencies()).toEqual([]);
+  await expect(notificationToggle).toBeChecked();
 
   await soundToggle.check();
-  await expect(testSound).toBeEnabled();
-  await testSound.click();
-  await expect.poll(frequencies).toEqual([740, 988]);
+  await notificationToggle.uncheck();
   await expect.poll(() => page.evaluate(() => (
     window.localStorage.getItem("jobhunter.sound-alerts.enabled")
   ))).toBe("true");
+  await expect.poll(() => page.evaluate(() => (
+    window.localStorage.getItem("jobhunter.browser-notifications.enabled")
+  ))).toBe("false");
 });
 
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {

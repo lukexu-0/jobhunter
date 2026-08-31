@@ -625,12 +625,14 @@ export function RunDetail({ runId }: RunDetailProps) {
   const diffTabRef = useRef<HTMLButtonElement>(null);
   const viewerPaneRef = useRef<HTMLElement>(null);
   const {
+    notificationPermission,
+    notificationsEnabled,
     observeApplication,
     observeRun,
+    setNotificationsEnabled,
     setSoundEnabled: setSoundAlertsEnabled,
     soundEnabled: soundAlertsEnabled,
-    testSound,
-    testStatus: soundTestStatus,
+    statusMessage: alertStatus,
   } = useAlerts();
   useEffect(() => {
     if (run !== null) observeRun(run);
@@ -1083,6 +1085,14 @@ export function RunDetail({ runId }: RunDetailProps) {
   const awaitingHumanReview = applicationView !== null
     && !("state" in applicationView)
     && applicationView.bridgeState === "awaiting_human_review";
+  const browserNotificationsUnavailable = notificationPermission === null
+    || notificationPermission === "denied"
+    || notificationPermission === "unsupported";
+  const browserNotificationLabel = notificationPermission === "denied"
+    ? "Notifications blocked"
+    : notificationPermission === "unsupported"
+      ? "Notifications unavailable"
+      : "Browser notifications";
   return (
     <main
       className={styles.detailShell}
@@ -1097,8 +1107,8 @@ export function RunDetail({ runId }: RunDetailProps) {
       <header className={styles.topBar}>
         <Link className={styles.backLink} href="/"><Icon name="arrow-left" />Back to opportunities</Link>
         <WorkflowProgress applicationView={applicationView} run={run} />
-        <div className={styles.soundControls}>
-          <label className={styles.soundToggle}>
+        <div className={styles.alertControls}>
+          <label className={styles.alertToggle}>
             <input
               aria-label="Sound alerts"
               checked={soundAlertsEnabled ?? false}
@@ -1108,16 +1118,19 @@ export function RunDetail({ runId }: RunDetailProps) {
             />
             <span>Sound alerts</span>
           </label>
-          <button
-            className={styles.secondaryButton}
-            disabled={soundAlertsEnabled !== true}
-            onClick={() => testSound("attention")}
-            type="button"
-          >
-            Test sound
-          </button>
+          <label className={styles.alertToggle}>
+            <input
+              aria-label="Browser notifications"
+              checked={notificationsEnabled ?? false}
+              disabled={browserNotificationsUnavailable}
+              onChange={(event) => void setNotificationsEnabled(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>{browserNotificationLabel}</span>
+          </label>
+
           <span aria-live="polite" className="visually-hidden" role="status">
-            {soundTestStatus}
+            {alertStatus}
           </span>
         </div>
       </header>

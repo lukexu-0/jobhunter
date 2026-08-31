@@ -335,7 +335,7 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
 async function expectFolderNavigation(
   page: Page,
   width: number,
-  currentLabel: "Alerts" | "Applications" | "Discovery" | "Providers",
+  currentLabel: "Applications" | "Discovery" | "Providers",
 ): Promise<void> {
   const strip = page.locator("header.app-navigation");
   const stripBox = await strip.boundingBox();
@@ -358,7 +358,7 @@ async function expectFolderNavigation(
 
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
   const links = navigation.getByRole("link");
-  await expect(links).toHaveCount(4);
+  await expect(links).toHaveCount(3);
   const linkBoxes = await links.evaluateAll((elements) => elements.map((element) => {
     const box = element.getBoundingClientRect();
     return { x: box.x, width: box.width };
@@ -386,7 +386,7 @@ async function expectFolderNavigation(
   const expectedClipPath = width <= 560
     ? "polygon(8px 0px, calc(100% - 8px) 0px, 100% 100%, 0px 100%)"
     : "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)";
-  expect(linkStyles).toEqual(Array.from({ length: 4 }, () => ({
+  expect(linkStyles).toEqual(Array.from({ length: 3 }, () => ({
     clipPath: expectedClipPath,
     justifyContent: "center",
     whiteSpace: "nowrap",
@@ -395,7 +395,7 @@ async function expectFolderNavigation(
   const current = navigation.getByRole("link", { name: currentLabel });
   const inactive = navigation.locator("a:not([aria-current='page'])");
   await expect(current).toHaveAttribute("aria-current", "page");
-  await expect(inactive).toHaveCount(3);
+  await expect(inactive).toHaveCount(2);
   const currentBox = await current.boundingBox();
   const inactiveBoxes = await inactive.evaluateAll((elements) => elements.map((element) => {
     const box = element.getBoundingClientRect();
@@ -2716,7 +2716,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
   const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
-  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Alerts", "Providers"]);
+  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Providers"]);
   await expect(applicationCount).toHaveText("7");
 
   await primaryNavigation.getByRole("link", { name: "Providers" }).click();

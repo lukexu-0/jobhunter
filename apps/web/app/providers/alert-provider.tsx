@@ -11,15 +11,11 @@ import {
   type ReactNode,
 } from "react";
 import type { ApplicationSessionView, RunDto } from "@jobhunter/pipeline/contracts";
-import { AlertController, type AlertKind } from "../lib/alerts";
+import { AlertController } from "../lib/alerts";
 
 const SOUND_ENABLED_STORAGE_KEY = "jobhunter.sound-alerts.enabled";
 const BROWSER_NOTIFICATIONS_STORAGE_KEY = "jobhunter.browser-notifications.enabled";
-const KIND_LABEL: Record<AlertKind, string> = {
-  attention: "Attention",
-  success: "Success",
-  failure: "Failure",
-};
+
 
 type BrowserNotificationPermission = NotificationPermission | "unsupported" | null;
 
@@ -31,9 +27,7 @@ interface Alerts {
   readonly setNotificationsEnabled: (enabled: boolean) => Promise<void>;
   readonly setSoundEnabled: (enabled: boolean) => void;
   readonly soundEnabled: boolean | null;
-  readonly testNotification: (kind: AlertKind) => void;
-  readonly testSound: (kind: AlertKind) => void;
-  readonly testStatus: string;
+  readonly statusMessage: string;
 }
 
 const AlertsContext = createContext<Alerts | null>(null);
@@ -50,7 +44,7 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [notificationsEnabled, setNotificationsEnabledState] = useState<boolean | null>(null);
   const [notificationPermission, setNotificationPermission] =
     useState<BrowserNotificationPermission>(null);
-  const [testStatus, setTestStatus] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
 
   const observeRun = useCallback((run: RunDto) => {
     controller.observeRun(run);
@@ -64,7 +58,7 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
     settingsRef.current.soundEnabled = nextEnabled;
     controller.configure(settingsRef.current);
     setSoundEnabledState(nextEnabled);
-    setTestStatus("");
+    setStatusMessage("");
     try {
       window.localStorage.setItem(SOUND_ENABLED_STORAGE_KEY, String(nextEnabled));
     } catch {
@@ -77,7 +71,7 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
       settingsRef.current.browserNotificationsEnabled = false;
       controller.configure(settingsRef.current);
       setNotificationsEnabledState(false);
-      setTestStatus("");
+      setStatusMessage("");
       try {
         window.localStorage.setItem(BROWSER_NOTIFICATIONS_STORAGE_KEY, "false");
       } catch {
@@ -91,7 +85,7 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
       controller.configure(settingsRef.current);
       setNotificationPermission("unsupported");
       setNotificationsEnabledState(false);
-      setTestStatus("Browser notifications are unavailable in this browser.");
+      setStatusMessage("Browser notifications are unavailable in this browser.");
       return;
     }
 
@@ -109,7 +103,7 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
     controller.configure(settingsRef.current);
     setNotificationPermission(permission);
     setNotificationsEnabledState(enabled);
-    setTestStatus(enabled
+    setStatusMessage(enabled
       ? ""
       : "Browser notifications are blocked. Change the permission in browser settings.");
     try {
@@ -117,18 +111,6 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
     } catch {
       // The in-memory preference remains effective when storage is unavailable.
     }
-  }, [controller]);
-
-  const testSound = useCallback((kind: AlertKind) => {
-    setTestStatus(controller.playTestSound(kind)
-      ? `${KIND_LABEL[kind]} sound played.`
-      : "Sound is unavailable in this browser.");
-  }, [controller]);
-
-  const testNotification = useCallback((kind: AlertKind) => {
-    setTestStatus(controller.showTestNotification(kind)
-      ? `${KIND_LABEL[kind]} browser notification sent.`
-      : "Browser notifications are not enabled.");
   }, [controller]);
 
   useEffect(() => {
@@ -175,9 +157,7 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
       setNotificationsEnabled,
       setSoundEnabled,
       soundEnabled,
-      testNotification,
-      testSound,
-      testStatus,
+      statusMessage,
     }),
     [
       notificationPermission,
@@ -187,9 +167,7 @@ export function AlertProvider({ children }: Readonly<{ children: ReactNode }>) {
       setNotificationsEnabled,
       setSoundEnabled,
       soundEnabled,
-      testNotification,
-      testSound,
-      testStatus,
+      statusMessage,
     ],
   );
   return <AlertsContext.Provider value={value}>{children}</AlertsContext.Provider>;

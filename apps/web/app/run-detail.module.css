@@ -38,14 +38,14 @@
   background: var(--color-canvas);
 }
 
-.soundControls {
+.alertControls {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-2);
 }
 
-.soundToggle {
+.alertToggle {
   display: inline-flex;
   min-height: var(--control-height);
   align-items: center;
@@ -63,18 +63,18 @@
   text-transform: uppercase;
 }
 
-.soundToggle:hover,
-.soundToggle:focus-within {
+.alertToggle:hover,
+.alertToggle:focus-within {
   border-color: var(--color-accent);
 }
 
-.soundToggle:has(input:disabled) {
+.alertToggle:has(input:disabled) {
   border-color: var(--color-border);
   color: var(--color-faint);
   cursor: not-allowed;
 }
 
-.soundToggle input {
+.alertToggle input {
   width: var(--space-4);
   height: var(--space-4);
   margin: 0;
@@ -1325,7 +1325,7 @@
     padding: var(--space-3) var(--space-4);
   }
 
-  .soundControls {
+  .alertControls {
     justify-content: flex-start;
     flex-wrap: wrap;
   }

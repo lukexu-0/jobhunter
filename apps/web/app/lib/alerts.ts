@@ -5,7 +5,7 @@ import type {
   RunDto,
 } from "@jobhunter/pipeline/contracts";
 
-export type AlertKind = "attention" | "success" | "failure";
+type AlertKind = "attention" | "success" | "failure";
 
 interface BrowserAlertNotification {
   readonly href: string;
@@ -217,31 +217,6 @@ export class AlertController {
       return;
     }
     this.flushPending();
-  }
-
-  playTestSound(kind: AlertKind): boolean {
-    if (!this.soundEnabled) return false;
-    this.primed = true;
-    const context = this.getAudioContext();
-    if (context === null) return false;
-    const play = () => {
-      if (context.state !== "closed") this.play(context, kind, 0);
-    };
-    if (context.state === "suspended") {
-      void context.resume().then(play).catch(() => undefined);
-    } else {
-      play();
-    }
-    return true;
-  }
-
-  showTestNotification(kind: AlertKind): boolean {
-    if (!this.browserNotificationsEnabled) return false;
-    return this.showBrowserNotification(`preview:${kind}`, {
-      identity: `preview:${kind}`,
-      kind,
-      notification: notificationForKind(kind, "/notifications"),
-    });
   }
 
   deactivate(): void {
