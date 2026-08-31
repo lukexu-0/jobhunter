@@ -595,8 +595,8 @@ class FakeInbox:
         self.calls.append(("search", filters))
         return self.search_result
 
-    async def read_email(self, email_id: str) -> InboxEmail:
-        self.calls.append(("read", {"email_id": email_id}))
+    async def read_email(self, email_id: str, *, offset: int = 0) -> InboxEmail:
+        self.calls.append(("read", {"email_id": email_id, "offset": offset}))
         return self.email
 
 
@@ -6942,7 +6942,11 @@ async def test_model_runtime_can_search_and_read_inbox_but_public_runtime_cannot
     email = await runtime_action(
         manager,
         created.session_id,
-        ReadEmailRuntimeAction(type="read_email", email_id="message-1"),
+        ReadEmailRuntimeAction(
+            type="read_email",
+            email_id="message-1",
+            offset=51_000,
+        ),
     )
     assert email.model_dump() == {
         "type": "read_email_result",
@@ -6958,7 +6962,7 @@ async def test_model_runtime_can_search_and_read_inbox_but_public_runtime_cannot
                 "received_within_minutes": 30,
             },
         ),
-        ("read", {"email_id": "message-1"}),
+        ("read", {"email_id": "message-1", "offset": 51_000}),
     ]
 
     with pytest.raises(HarnessServiceError, match="model-only"):

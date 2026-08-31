@@ -39,6 +39,7 @@ BROWSER_URL_MAX_CHARACTERS = 4_096
 BROWSER_TITLE_MAX_CHARACTERS = 4_096
 BROWSER_DOM_MAX_CHARACTERS = 40_000
 PLAYWRIGHT_OUTPUT_MAX_CHARACTERS = 20_000
+READ_EMAIL_OUTPUT_MAX_BYTES = 50 * 1024
 
 OpportunityKind: TypeAlias = Literal[
     "job",
@@ -1408,6 +1409,7 @@ class ReadEmailRuntimeAction(PublicModel):
         str,
         StringConstraints(strict=True, pattern=r"^[A-Za-z0-9_-]{1,256}$"),
     ]
+    offset: Annotated[int, Field(strict=True, ge=0, lt=131_072)] = 0
 
 
 class RequestAdditionalInfoRuntimeAction(PublicModel):
@@ -1479,8 +1481,15 @@ class ReadEmailRuntimeActionResponse(PublicModel):
     type: Literal["read_email_result"]
     content: Annotated[
         str,
-        StringConstraints(strict=True, min_length=1, max_length=131_072),
+        StringConstraints(strict=True, min_length=1, max_length=50 * 1024),
     ]
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content_size(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > READ_EMAIL_OUTPUT_MAX_BYTES:
+            raise ValueError("content exceeds the UTF-8 byte limit")
+        return value
 
 
 class ContinueRuntimeActionResponse(PublicModel):

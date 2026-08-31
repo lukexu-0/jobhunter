@@ -1910,7 +1910,10 @@ class ApplicationSessionManager:
                         ],
                         truncated=result.truncated,
                     )
-                email = await inbox.read_email(action.email_id)
+                email = await inbox.read_email(
+                    action.email_id,
+                    offset=action.offset,
+                )
                 return ReadEmailRuntimeActionResponse(
                     type="read_email_result",
                     content=email.content,

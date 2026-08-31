@@ -2634,10 +2634,19 @@ def test_model_inbox_runtime_contracts_are_strict_and_bounded() -> None:
         {"type": "read_email", "email_id": "message-1"}
     )
     assert email.email_id == "message-1"
-    with pytest.raises(ValidationError):
-        RUNTIME_ACTION_ADAPTER.validate_python(
-            {"type": "read_email", "email_id": "!message-1!"}
-        )
+    assert email.offset == 0
+    continued_email = RUNTIME_ACTION_ADAPTER.validate_python(
+        {"type": "read_email", "email_id": "message-1", "offset": 51_000}
+    )
+    assert continued_email.offset == 51_000
+    for invalid_email in (
+        {"type": "read_email", "email_id": "!message-1!"},
+        {"type": "read_email", "email_id": "message-1", "offset": -1},
+        {"type": "read_email", "email_id": "message-1", "offset": 131_072},
+        {"type": "read_email", "email_id": "message-1", "offset": True},
+    ):
+        with pytest.raises(ValidationError):
+            RUNTIME_ACTION_ADAPTER.validate_python(invalid_email)
 
     inbox_response = RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
         {
@@ -2671,3 +2680,11 @@ def test_model_inbox_runtime_contracts_are_strict_and_bounded() -> None:
         {"type": "read_email_result", "content": "parsed MIME content"}
     )
     assert email_response.content == "parsed MIME content"
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {"type": "read_email_result", "content": "🙂" * 12_801}
+        )
+    with pytest.raises(ValidationError):
+        RUNTIME_ACTION_RESPONSE_ADAPTER.validate_python(
+            {"type": "read_email_result", "content": chr(0xD800)}
+        )

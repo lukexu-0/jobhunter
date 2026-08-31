@@ -31,6 +31,7 @@ _MAX_TOKEN_BYTES = 65_536
 _MAX_RAW_MESSAGE_BYTES = 2_097_152
 _MAX_TEXT_BYTES = 102_400
 _MAX_RENDERED_EMAIL_CHARACTERS = 131_072
+_READ_EMAIL_PAGE_BYTES = 50 * 1024
 _MAX_RESULTS = 20
 _INBOX_MAX_RESULTS = 50
 _HTTP_TIMEOUT_SECONDS = 10.0
@@ -138,7 +139,7 @@ class InboxReader(Protocol):
         received_within_minutes: int | None = None,
     ) -> InboxSearchResult: ...
 
-    async def read_email(self, email_id: str) -> InboxEmail: ...
+    async def read_email(self, email_id: str, *, offset: int = 0) -> InboxEmail: ...
 
 
 def _challenge_matches_origin(
@@ -349,12 +350,19 @@ class GmailVerificationInbox:
         summaries.sort(key=lambda item: item.sent_at, reverse=True)
         return InboxSearchResult(messages=tuple(summaries), truncated=truncated)
 
-    async def read_email(self, message_id: str) -> InboxEmail:
+    async def read_email(self, email_id: str, *, offset: int = 0) -> InboxEmail:
         if (
-            not isinstance(message_id, str)
-            or _GMAIL_MESSAGE_ID_PATTERN.fullmatch(message_id) is None
+            not isinstance(email_id, str)
+            or _GMAIL_MESSAGE_ID_PATTERN.fullmatch(email_id) is None
         ):
             raise ValueError("email_id is invalid")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or offset >= _MAX_RENDERED_EMAIL_CHARACTERS
+        ):
+            raise ValueError("offset is invalid")
         token = await self._token_before_deadline(
             self._clock() + _HTTP_TIMEOUT_SECONDS
         )
@@ -362,13 +370,15 @@ class GmailVerificationInbox:
             return await self._read_email(
                 self._http_client,
                 token=token,
-                message_id=message_id,
+                message_id=email_id,
+                offset=offset,
             )
         async with httpx.AsyncClient(base_url=_GMAIL_API_ROOT) as client:
             return await self._read_email(
                 client,
                 token=token,
-                message_id=message_id,
+                message_id=email_id,
+                offset=offset,
             )
 
     async def _read_email(
@@ -377,6 +387,7 @@ class GmailVerificationInbox:
         *,
         token: str,
         message_id: str,
+        offset: int,
     ) -> InboxEmail:
         try:
             response = await self._get(
@@ -391,7 +402,11 @@ class GmailVerificationInbox:
             _raise_for_status(response)
         except _TransientGmailError:
             raise GmailUnavailable("Gmail is temporarily unavailable") from None
-        return _inbox_email_from_response(response, expected_id=message_id)
+        return _inbox_email_from_response(
+            response,
+            expected_id=message_id,
+            offset=offset,
+        )
 
     async def wait_for_challenge(
         self,
@@ -772,6 +787,7 @@ def _inbox_email_from_response(
     response: httpx.Response,
     *,
     expected_id: str,
+    offset: int,
 ) -> InboxEmail:
     try:
         payload = response.json()
@@ -796,10 +812,33 @@ def _inbox_email_from_response(
         raise GmailUnavailable("Gmail returned an invalid response") from None
     message = _decode_message(raw)
     sent_at = _message_sent_at(message, fallback=received_at)
+    rendered = _model_readable_email(message_id, sent_at, message)
     return InboxEmail(
         message_id=message_id,
-        content=_model_readable_email(message_id, sent_at, message),
+        content=_read_email_page(message_id, rendered, offset=offset),
     )
+
+
+def _read_email_page(message_id: str, rendered: str, *, offset: int) -> str:
+    if offset >= len(rendered):
+        raise GmailUnavailable("Gmail email offset is unavailable")
+    remaining = rendered[offset:]
+    remaining_bytes = remaining.encode("utf-8")
+    if len(remaining_bytes) <= _READ_EMAIL_PAGE_BYTES:
+        return remaining
+
+    longest_footer = (
+        "[Output limited to 50 KB. Call read_email again with "
+        f'email_id "{message_id}" and offset {len(rendered)} to continue.]'
+    )
+    page_budget = _READ_EMAIL_PAGE_BYTES - len(longest_footer.encode("utf-8")) - 1
+    page = remaining_bytes[:page_budget].decode("utf-8", errors="ignore")
+    next_offset = offset + len(page)
+    footer = (
+        "[Output limited to 50 KB. Call read_email again with "
+        f'email_id "{message_id}" and offset {next_offset} to continue.]'
+    )
+    return page + chr(10) + footer
 
 
 def _single_line_header(message: Message, name: str) -> str:

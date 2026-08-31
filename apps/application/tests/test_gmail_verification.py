@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from datetime import UTC, date, datetime, time, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -523,18 +524,85 @@ async def test_read_email_omits_hidden_html_and_bounds_the_complete_render() -> 
             },
         )
 
+    rendered_pages: list[str] = []
+    offset = 0
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="https://gmail.googleapis.com",
     ) as client:
-        result = await GmailVerificationInbox(
+        inbox = GmailVerificationInbox(
             token_provider=_access_token,
             http_client=client,
-        ).read_email("message-html")
+        )
+        for _ in range(4):
+            result = await inbox.read_email("message-html", offset=offset)
+            continuation = re.search(
+                r'\n\[Output limited to 50 KB\. Call read_email again with '
+                r'email_id "message-html" and offset ([1-9][0-9]*) to continue\.\]$',
+                result.content,
+            )
+            if continuation is None:
+                rendered_pages.append(result.content)
+                break
+            rendered_pages.append(result.content[: continuation.start()])
+            next_offset = int(continuation.group(1))
+            assert next_offset > offset
+            offset = next_offset
+        else:
+            pytest.fail("read_email did not reach the final page")
 
-    assert "Your visible code is 482913." in result.content
-    assert "hidden-style-instruction" not in result.content
-    assert "hidden-script-instruction" not in result.content
-    assert len(result.content) <= 131_072
-    assert "[Email rendering truncated to fit the model-readable limit.]" in result.content
-    assert result.content.endswith("--- END EMAIL CONTENT ---")
+    rendered = "".join(rendered_pages)
+    assert "Your visible code is 482913." in rendered
+    assert "hidden-style-instruction" not in rendered
+    assert "hidden-script-instruction" not in rendered
+    assert len(rendered) <= 131_072
+    assert "[Email rendering truncated to fit the model-readable limit.]" in rendered
+    assert rendered.endswith("--- END EMAIL CONTENT ---")
+
+
+@pytest.mark.asyncio
+async def test_read_email_pages_large_render_with_actionable_fifty_kilobyte_limit() -> None:
+    received = datetime(2026, 8, 30, 14, 30, tzinfo=UTC)
+    message = EmailMessage()
+    message["From"] = "accounts@jobs.example"
+    message["To"] = "candidate@example.test"
+    message["Subject"] = "Long verification email"
+    message["Date"] = "Sun, 30 Aug 2026 10:22:03 -0400"
+    message.set_content("🙂" * 16_000)
+    encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "message-large",
+                "internalDate": str(int(received.timestamp() * 1000)),
+                "raw": encoded,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        inbox = GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+        )
+        first = await inbox.read_email("message-large")
+        continuation = re.search(
+            r'\n\[Output limited to 50 KB\. Call read_email again with '
+            r'email_id "message-large" and offset ([1-9][0-9]*) to continue\.\]$',
+            first.content,
+        )
+        assert continuation is not None
+        second = await inbox.read_email(
+            "message-large",
+            offset=int(continuation.group(1)),
+        )
+
+    assert len(first.content.encode("utf-8")) <= 50 * 1024
+    assert not first.content.endswith("--- END EMAIL CONTENT ---")
+    assert len(second.content.encode("utf-8")) <= 50 * 1024
+    assert "[Output limited to 50 KB." not in second.content
+    assert second.content.endswith("--- END EMAIL CONTENT ---")
