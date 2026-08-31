@@ -1430,8 +1430,7 @@ async def test_gmail_callback_is_unauthenticated_one_way_html_without_secrets(
         (private_state, private_code, None)
     ]
 
-
-async def test_gmail_callback_cancellation_returns_only_close_window_failure_html(
+async def test_gmail_callback_failure_stays_open_with_retry_guidance(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
 ) -> None:
     client, service = api_client
@@ -1444,7 +1443,9 @@ async def test_gmail_callback_cancellation_returns_only_close_window_failure_htm
 
     assert response.status_code == 400
     assert response.headers["content-type"].startswith("text/html")
-    assert "window.close()" in response.text
+    assert "window.close()" not in response.text
+    assert "Gmail was not connected" in response.text
+    assert "Return to Providers and try again" in response.text
     assert private_state not in response.text
     assert "access_denied" not in response.text
     assert service.gmail_auth.callback_calls == [
