@@ -466,6 +466,7 @@ const ReadInboxToolParameters = z.object({
   received_before_minutes_ago: z.number().int().min(1).max(1_440).optional(),
 }).strict();
 const ReadEmailToolParameters = ReadEmailRuntimeActionSchema.omit({ type: true });
+const CurrentTimeToolParameters = z.object({}).strict();
 const HumanNavigationToolParameters = z.object({
   instruction: z.string().trim().refine((value) => hasCodePointLength(value, 1, 2_000)),
 }).strict();
@@ -659,6 +660,14 @@ async function runApplicationAgentWithProfile(
         throw new ApplicationAgentFailure("MODEL_PROVIDER_FAILED");
       }
     },
+  });
+
+  const getCurrentTime = runtimeTool({
+    name: "get_current_time",
+    description: "Get the current UTC date and time from the application runtime. Use it for relative time calculations such as inbox age filters. Returns one JSON object with utc_time as an RFC 3339 timestamp.",
+    parameters: CurrentTimeToolParameters,
+    allowAfterApproval: true,
+    execute: async () => JSON.stringify({ utc_time: new Date().toISOString() }),
   });
 
   const readInbox = runtimeTool({
@@ -1027,6 +1036,7 @@ async function runApplicationAgentWithProfile(
     },
     tools: [
       playwrightCli,
+      getCurrentTime,
       readInbox,
       readEmail,
       requestSignIn,
