@@ -20,6 +20,7 @@ import {
 import {
   HttpApplicationHarnessClient,
   type ApplicationHarnessClient,
+  type GmailAuthHarnessClient,
   type SourceCaptureHarnessClient,
 } from "./api/application-harness-client.ts";
 import { ApplicationSessionService } from "./api/application-session-service.ts";
@@ -40,6 +41,7 @@ import {
   professionalizeApplicationAnswer,
   type ProfessionalizeApplicationAnswer,
 } from "./models/application-answer-professionalizer.ts";
+import { createGmailAuthProviderHooks } from "./auth/gmail-provider.ts";
 import * as defaultAuthService from "./auth/service.ts";
 import { createContextApplicationService, type ContextApplicationService } from "./context/application-service.ts";
 import { openContextDatabase } from "./context/database.ts";
@@ -273,7 +275,16 @@ function isSourceCaptureHarnessClient(
     && typeof candidate.completeSourceCapture === "function"
     && typeof candidate.deleteSourceCapture === "function";
 }
-
+function isGmailAuthHarnessClient(
+  client: ApplicationHarnessClient | undefined,
+): client is ApplicationHarnessClient & GmailAuthHarnessClient {
+  if (client === undefined) return false;
+  const candidate = client as Partial<GmailAuthHarnessClient>;
+  return typeof candidate.getGmailAuth === "function"
+    && typeof candidate.createGmailAuthSession === "function"
+    && typeof candidate.getGmailAuthSession === "function"
+    && typeof candidate.deleteGmailAuth === "function";
+}
 export function createPipelineApplication(options: PipelineApplicationOptions = {}): PipelineApplication {
   const webOrigin = validateWebOrigin(
     options.webOrigin ?? process.env.JOBHUNTER_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
@@ -355,7 +366,14 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
             connectors: createDiscoveryConnectors(),
           })
     );
-  const auth = options.auth ?? defaultAuthService;
+  const gmailAuthHarness = isGmailAuthHarnessClient(applicationHarness)
+    ? applicationHarness
+    : undefined;
+  const auth = options.auth ?? defaultAuthService.createManagedAuthService({
+    ...(gmailAuthHarness
+      ? { providerHooks: { gmail: createGmailAuthProviderHooks(gmailAuthHarness) } }
+      : {}),
+  });
   const applicationAgent = options.applicationAgent
     ?? (browserHarnessToken === undefined
       ? undefined
@@ -377,7 +395,8 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     browserHarnessToken,
   );
   const closeAuth = options.closeAuth
-    ?? (options.auth ? options.auth.close?.bind(options.auth) ?? (() => undefined) : defaultAuthService.closeAuth);
+    ?? auth.close?.bind(auth)
+    ?? (() => undefined);
 
   const routeAuth = createAuthRoutes(auth);
   const routeContext = createContextRoutes(context);

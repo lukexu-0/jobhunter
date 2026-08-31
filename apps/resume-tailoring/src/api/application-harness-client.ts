@@ -453,7 +453,26 @@ export type ApplicationHarnessEvent =
     readonly session: ApplicationHarnessSnapshot;
     readonly detail: { readonly revisionCount: number };
   };
+export interface GmailAuthStatus {
+  readonly state: "connected" | "disconnected";
+  readonly identity?: { readonly email: string };
+}
 
+export type GmailAuthSessionState = "pending" | "succeeded" | "failed" | "expired";
+
+export interface GmailAuthSession {
+  readonly id: string;
+  readonly state: GmailAuthSessionState;
+  readonly authorizationUrl?: string;
+  readonly expiresAt: number;
+}
+
+export interface GmailAuthHarnessClient {
+  getGmailAuth(signal: AbortSignal): Promise<GmailAuthStatus>;
+  createGmailAuthSession(signal: AbortSignal): Promise<GmailAuthSession>;
+  getGmailAuthSession(sessionId: string, signal: AbortSignal): Promise<GmailAuthSession>;
+  deleteGmailAuth(signal: AbortSignal): Promise<void>;
+}
 export interface ApplicationHarnessClient {
   create(input: ApplicationHarnessCreateInput, signal: AbortSignal): Promise<void>;
   get(sessionId: string, signal: AbortSignal): Promise<ApplicationHarnessSnapshot>;
@@ -475,6 +494,38 @@ export interface ApplicationHarnessClient {
   delete(sessionId: string, signal: AbortSignal): Promise<void>;
 }
 
+const GmailAuthStatusResponseSchema = z.object({
+  state: z.enum(["connected", "disconnected"]),
+  identity: z.object({ email: z.string().email() }).strict().optional(),
+}).strict();
+const GmailAuthSessionResponseSchema = z.object({
+  id: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  state: z.enum(["pending", "succeeded", "failed", "expired"]),
+  authorization_url: z.string().max(4_096).refine(isGmailAuthorizationUrl).optional(),
+  expires_at: TimestampSchema,
+}).strict();
+function isGmailAuthorizationUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && url.username === ""
+      && url.password === ""
+      && url.hash === "";
+  } catch {
+    return false;
+  }
+}
+
+function projectGmailAuthSession(
+  value: z.infer<typeof GmailAuthSessionResponseSchema>,
+): GmailAuthSession {
+  return {
+    id: value.id,
+    state: value.state,
+    ...(value.authorization_url ? { authorizationUrl: value.authorization_url } : {}),
+    expiresAt: Date.parse(value.expires_at),
+  };
+}
 const ErrorEnvelopeSchema = z.object({
   code: z.string().min(1).max(100),
   message: z.string().max(2_000),
@@ -1101,11 +1152,11 @@ async function mapSourceCaptureErrorResponse(
 
 export class HttpApplicationHarnessClient implements
   ApplicationHarnessClient,
-  SourceCaptureHarnessClient {
+  SourceCaptureHarnessClient,
+  GmailAuthHarnessClient {
   readonly #origin: string;
   readonly #token: string;
   readonly #fetch: ApplicationHarnessFetch;
-
   constructor(options: ApplicationHarnessClientOptions) {
     this.#origin = normalizeHarnessOrigin(options.origin ?? DEFAULT_HARNESS_ORIGIN);
     if (typeof options.token !== "string" || options.token.length < 32) {
@@ -1114,7 +1165,80 @@ export class HttpApplicationHarnessClient implements
     this.#token = options.token;
     this.#fetch = options.fetchImpl ?? fetch;
   }
+  async getGmailAuth(signal: AbortSignal): Promise<GmailAuthStatus> {
+    const response = await this.#request(
+      "/v1/gmail-auth",
+      { method: "GET", headers: { accept: "application/json" } },
+      signal,
+    );
+    if (!response.ok || response.status !== 200) {
+      await cancelResponse(response);
+      throw new ApplicationHarnessError(response.status === 401 ? "unauthorized" : "invalid_response");
+    }
+    const parsed = GmailAuthStatusResponseSchema.safeParse(
+      await readBoundedJson(response, signal, MAX_ERROR_BYTES),
+    );
+    if (!parsed.success) throw new ApplicationHarnessError("invalid_response");
+    return {
+      state: parsed.data.state,
+      ...(parsed.data.identity ? { identity: parsed.data.identity } : {}),
+    };
+  }
 
+  async createGmailAuthSession(signal: AbortSignal): Promise<GmailAuthSession> {
+    const response = await this.#request(
+      "/v1/gmail-auth/sessions",
+      {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json" },
+        body: "{}",
+      },
+      signal,
+    );
+    if (!response.ok || response.status !== 201) {
+      await cancelResponse(response);
+      throw new ApplicationHarnessError(response.status === 401 ? "unauthorized" : "invalid_response");
+    }
+    const parsed = GmailAuthSessionResponseSchema.safeParse(
+      await readBoundedJson(response, signal, MAX_ERROR_BYTES),
+    );
+    if (
+      !parsed.success
+      || parsed.data.state !== "pending"
+      || parsed.data.authorization_url === undefined
+    ) throw new ApplicationHarnessError("invalid_response");
+    return projectGmailAuthSession(parsed.data);
+  }
+
+  async getGmailAuthSession(sessionId: string, signal: AbortSignal): Promise<GmailAuthSession> {
+    const parsedId = GmailAuthSessionResponseSchema.shape.id.safeParse(sessionId);
+    if (!parsedId.success) throw new ApplicationHarnessError("invalid_request");
+    const response = await this.#request(
+      `/v1/gmail-auth/sessions/${parsedId.data}`,
+      { method: "GET", headers: { accept: "application/json" } },
+      signal,
+    );
+    if (!response.ok || response.status !== 200) {
+      await cancelResponse(response);
+      throw new ApplicationHarnessError(response.status === 401 ? "unauthorized" : "invalid_response");
+    }
+    const parsed = GmailAuthSessionResponseSchema.safeParse(
+      await readBoundedJson(response, signal, MAX_ERROR_BYTES),
+    );
+    if (!parsed.success || parsed.data.id !== parsedId.data) {
+      throw new ApplicationHarnessError("invalid_response");
+    }
+    return projectGmailAuthSession(parsed.data);
+  }
+
+  async deleteGmailAuth(signal: AbortSignal): Promise<void> {
+    const response = await this.#request("/v1/gmail-auth", { method: "DELETE" }, signal);
+    if (!response.ok || response.status !== 204) {
+      await cancelResponse(response);
+      throw new ApplicationHarnessError(response.status === 401 ? "unauthorized" : "invalid_response");
+    }
+    await cancelResponse(response);
+  }
   async create(input: ApplicationHarnessCreateInput, signal: AbortSignal): Promise<void> {
     const sessionId = UUIDSchema.safeParse(input.sessionId);
     const opportunityKind = OpportunityKindSchema.safeParse(input.opportunityKind);

@@ -59,16 +59,22 @@ interface InternalSession extends PublicAuthSession {
 export type AuthProviderLogin = (
   provider: AuthProvider,
   controller: OAuthController & {
+    signal: AbortSignal;
     onAuth(info: { url: string; launchUrl?: string; instructions?: string }): void;
     onPrompt(prompt: { message: string; placeholder?: string; allowEmpty?: boolean }): Promise<string>;
   },
 ) => Promise<void>;
+
+export type AuthProviderConnectedAssertion = (provider: AuthProvider) => Promise<void> | void;
+export type AuthProviderLogout = (provider: AuthProvider) => Promise<void>;
 
 export interface AuthSessionDependencies {
   now?: () => number;
   randomId?: () => string;
   schedule?: (callback: () => void, delayMs: number) => unknown;
   providerLogin?: AuthProviderLogin;
+  providerAssertConnected?: AuthProviderConnectedAssertion;
+  providerLogout?: AuthProviderLogout;
 }
 
 
@@ -108,13 +114,25 @@ export class AuthSessionManager {
   readonly #randomId: () => string;
   readonly #schedule: (callback: () => void, delayMs: number) => unknown;
   readonly #providerLogin: AuthProviderLogin;
+  readonly #providerAssertConnected: AuthProviderConnectedAssertion;
+  readonly #providerLogout: AuthProviderLogout;
 
   constructor(private readonly storage: AuthStorageLike, dependencies: AuthSessionDependencies = {}) {
     this.#now = dependencies.now ?? Date.now;
     this.#randomId = dependencies.randomId ?? (() => randomBytes(16).toString("base64url"));
     this.#schedule = dependencies.schedule ?? ((callback, delay) => setTimeout(callback, delay).unref());
     this.#providerLogin = dependencies.providerLogin
-      ?? ((provider, controller) => storage.login(provider, controller));
+      ?? ((provider, controller) => {
+        if (provider !== "openai-codex") throw new Error("OAuth provider is unavailable");
+        return storage.login(provider, controller);
+      });
+    this.#providerAssertConnected = dependencies.providerAssertConnected
+      ?? ((provider) => {
+        if (provider !== "openai-codex") throw new Error("OAuth provider is unavailable");
+        assertProviderOAuthConnected(storage, provider);
+      });
+    this.#providerLogout = dependencies.providerLogout
+      ?? ((provider) => provider === "openai-codex" ? storage.logout(provider) : Promise.resolve());
   }
 
   start(provider: AuthProvider): Promise<PublicAuthSession> {
@@ -249,12 +267,12 @@ export class AuthSessionManager {
       } satisfies OAuthController;
 
       await this.#providerLogin(session.provider, controller);
-      assertProviderOAuthConnected(this.storage, session.provider);
+      await this.#providerAssertConnected(session.provider);
       if (session.terminalAt === undefined) this.#finish(session, "succeeded");
     } catch {
       if (session.terminalAt === undefined) this.#finish(session, "failed", "OAuth sign-in failed");
     } finally {
-      if (session.state !== "succeeded") await this.storage.logout(session.provider);
+      if (session.state !== "succeeded") await this.#providerLogout(session.provider);
       if (this.#activeByProvider.get(session.provider) === session.id) {
         this.#activeByProvider.delete(session.provider);
       }

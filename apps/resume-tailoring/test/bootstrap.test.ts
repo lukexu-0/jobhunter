@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthRouteService } from "../src/api/auth-routes.ts";
+import { HttpApplicationHarnessClient } from "../src/api/application-harness-client.ts";
 import type { ApplicationAgentRouteService } from "../src/agents/application-agent-service.ts";
 import {
   createPipelineApplication,
@@ -44,6 +45,8 @@ interface IngestionOverrides {
   readonly loadJobSource?: LoadJobSource;
   readonly extractJobDescription?: ExtractJobDescription;
   readonly browserHarnessToken?: string;
+  readonly applicationHarness?: PipelineApplicationOptions["applicationHarness"];
+  readonly useDefaultAuth?: boolean;
   readonly applicationAgent?: ApplicationAgentRouteService;
   readonly applicationSessions?: PipelineApplicationSessionService;
   readonly getAuthStatus?: AuthRouteService["getAuthStatus"];
@@ -84,6 +87,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     getAuthStatus: ingestion.getAuthStatus ?? (() => ({
       providers: [
         { provider: "openai-codex", state: "disconnected" },
+        { provider: "gmail", state: "disconnected" },
       ],
     })),
     startSession: async () => {
@@ -140,9 +144,10 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     ...(ingestion.useDefaultWorker
       ? (ingestion.workerOptions ? { workerOptions: ingestion.workerOptions } : {})
       : { worker }),
-    auth,
+    ...(ingestion.useDefaultAuth ? {} : { auth }),
     ...(runs ? { runs } : {}),
     ...(ingestion.discovery ? { discovery: ingestion.discovery } : {}),
+    ...(ingestion.applicationHarness ? { applicationHarness: ingestion.applicationHarness } : {}),
     ...(ingestion.browserHarnessToken
       ? { browserHarnessToken: ingestion.browserHarnessToken }
       : {}),
@@ -417,6 +422,51 @@ describe("pipeline application bootstrap", () => {
     expect(publicBodies).not.toContain("secret-value");
     expect(publicBodies.toLowerCase()).not.toContain("token");
     await fixture.app.close();
+  });
+
+  test("wires the default Gmail provider through the bearer-auth harness client", async () => {
+    const authRoot = mkdtempSync(join(tmpdir(), "pipeline-bootstrap-gmail-auth-"));
+    fixtures.push(authRoot);
+    const previousDatabase = process.env.JOBHUNTER_AUTH_DATABASE;
+    process.env.JOBHUNTER_AUTH_DATABASE = join(authRoot, "auth.sqlite");
+    const requests: Array<{ url: string; authorization: string | null }> = [];
+    const applicationHarness = new HttpApplicationHarnessClient({
+      origin: "http://127.0.0.1:8765",
+      token: HARNESS_TOKEN,
+      fetchImpl: async (input, init) => {
+        requests.push({
+          url: String(input),
+          authorization: new Headers(init?.headers).get("authorization"),
+        });
+        return Response.json({
+          state: "connected",
+          identity: { email: "person@gmail.test" },
+        });
+      },
+    });
+    const fixture = createFixture(false, {
+      applicationHarness,
+      useDefaultAuth: true,
+    });
+
+    try {
+      const response = await fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/auth"));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        providers: [
+          { provider: "openai-codex", state: "disconnected" },
+          { provider: "gmail", state: "connected", identity: { email: "p***@gmail.test" } },
+        ],
+      });
+      expect(requests).toEqual([{
+        url: "http://127.0.0.1:8765/v1/gmail-auth",
+        authorization: `Bearer ${HARNESS_TOKEN}`,
+      }]);
+    } finally {
+      await fixture.app.close();
+      if (previousDatabase === undefined) delete process.env.JOBHUNTER_AUTH_DATABASE;
+      else process.env.JOBHUNTER_AUTH_DATABASE = previousDatabase;
+    }
   });
 
   test("composes the injected application answer tools through the public route boundary", async () => {
@@ -789,6 +839,7 @@ describe("pipeline application bootstrap", () => {
         return {
           providers: [
             { provider: "openai-codex", state: "connected" },
+            { provider: "gmail", state: "disconnected" },
           ],
         };
       },
@@ -892,6 +943,7 @@ describe("pipeline application bootstrap", () => {
       getAuthStatus: () => ({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
+          { provider: "gmail", state: "disconnected" },
         ],
       }),
       startSession: async () => { throw new Error("unexpected authentication"); },

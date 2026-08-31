@@ -12,6 +12,7 @@ import type { ApplicationSessionCommand } from "../src/contracts";
 const ORIGIN = "http://127.0.0.1:8765";
 const TOKEN = "test-token-0123456789abcdef-0123456789";
 const SESSION_ID = "123e4567-e89b-42d3-a456-426614174000";
+const GMAIL_SESSION_ID = "A".repeat(43);
 
 function withReportedByteLength(bytes: Uint8Array, byteLength: number): Uint8Array {
   Object.defineProperty(bytes, "byteLength", { value: byteLength });
@@ -83,6 +84,67 @@ describe("HttpApplicationHarnessClient", () => {
       anecdoteFileBytes: 1_310_720,
       anecdoteTotalBytes: 10_485_760,
     });
+  });
+  test("uses the authenticated strict Gmail OAuth status, session, polling, and disconnect contract", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const responses = [
+      Response.json({
+        state: "connected",
+        identity: { email: "person@example.test" },
+      }),
+      Response.json({
+        id: GMAIL_SESSION_ID,
+        state: "pending",
+        authorization_url: "https://accounts.google.com/o/oauth2/v2/auth?state=opaque",
+        expires_at: "2026-08-31T20:15:00Z",
+      }, { status: 201 }),
+      Response.json({
+        id: GMAIL_SESSION_ID,
+        state: "succeeded",
+        expires_at: "2026-08-31T20:15:00Z",
+      }),
+      new Response(null, { status: 204 }),
+    ];
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async (input, init) => {
+        calls.push({ url: String(input), init });
+        return responses.shift()!;
+      },
+    });
+    const signal = new AbortController().signal;
+
+    await expect(client.getGmailAuth(signal)).resolves.toEqual({
+      state: "connected",
+      identity: { email: "person@example.test" },
+    });
+    await expect(client.createGmailAuthSession(signal)).resolves.toEqual({
+      id: GMAIL_SESSION_ID,
+      state: "pending",
+      authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth?state=opaque",
+      expiresAt: Date.parse("2026-08-31T20:15:00Z"),
+    });
+    await expect(client.getGmailAuthSession(GMAIL_SESSION_ID, signal)).resolves.toEqual({
+      id: GMAIL_SESSION_ID,
+      state: "succeeded",
+      expiresAt: Date.parse("2026-08-31T20:15:00Z"),
+    });
+    await expect(client.deleteGmailAuth(signal)).resolves.toBeUndefined();
+
+    expect(calls.map(({ url }) => url)).toEqual([
+      ORIGIN + "/v1/gmail-auth",
+      ORIGIN + "/v1/gmail-auth/sessions",
+      ORIGIN + "/v1/gmail-auth/sessions/" + GMAIL_SESSION_ID,
+      ORIGIN + "/v1/gmail-auth",
+    ]);
+    expect(calls.map(({ init }) => init?.method)).toEqual(["GET", "POST", "GET", "DELETE"]);
+    expect(calls[1]!.init?.body).toBe("{}");
+    for (const { init } of calls) {
+      expect(init?.redirect).toBe("manual");
+      expect(init?.signal).toBe(signal);
+      expect(init?.headers).toMatchObject({ authorization: `Bearer ${TOKEN}` });
+    }
   });
   test("gets and strictly reprojects a complete harness snapshot without private fields", async () => {
     const calls: Array<{
