@@ -845,7 +845,19 @@ describe("HttpApplicationRuntimeClient", () => {
     expect(ReadEmailRuntimeActionSchema.parse({
       type: "read_email",
       email_id: "message_1-abc",
-    })).toEqual({ type: "read_email", email_id: "message_1-abc" });
+    })).toEqual({ type: "read_email", email_id: "message_1-abc", offset: 0 });
+    expect(ReadEmailRuntimeActionSchema.parse({
+      type: "read_email",
+      email_id: "message_1-abc",
+      offset: 51_000,
+    })).toEqual({ type: "read_email", email_id: "message_1-abc", offset: 51_000 });
+    for (const offset of [-1, 131_072, 1.5, true]) {
+      expect(ReadEmailRuntimeActionSchema.safeParse({
+        type: "read_email",
+        email_id: "message_1-abc",
+        offset,
+      }).success).toBe(false);
+    }
 
     const inboxResponse = {
       type: "read_inbox_result" as const,
@@ -863,6 +875,14 @@ describe("HttpApplicationRuntimeClient", () => {
       type: "read_email_result",
       content: "parsed MIME content",
     })).toEqual({ type: "read_email_result", content: "parsed MIME content" });
+    expect(ReadEmailRuntimeActionResponseSchema.safeParse({
+      type: "read_email_result",
+      content: "🙂".repeat(12_801),
+    }).success).toBe(false);
+    expect(ReadEmailRuntimeActionResponseSchema.safeParse({
+      type: "read_email_result",
+      content: String.fromCharCode(0xD800),
+    }).success).toBe(false);
   });
 
   test("validates and serializes every runtime action variant", async () => {
@@ -903,7 +923,7 @@ describe("HttpApplicationRuntimeClient", () => {
         time: "14:00",
         received_within_minutes: 30,
       },
-      { type: "read_email", email_id: "message_1-abc" },
+      { type: "read_email", email_id: "message_1-abc", offset: 0 },
       {
         type: "request_sign_in",
         account_action: "sign_in",

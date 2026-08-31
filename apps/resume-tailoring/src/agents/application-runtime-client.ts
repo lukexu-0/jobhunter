@@ -292,6 +292,7 @@ export type ReadInboxRuntimeAction = z.infer<typeof ReadInboxRuntimeActionSchema
 export const ReadEmailRuntimeActionSchema = z.object({
   type: z.literal("read_email"),
   email_id: GmailMessageIdSchema,
+  offset: z.number().int().min(0).max(131_071).default(0),
 }).strict();
 export type ReadEmailRuntimeAction = z.infer<typeof ReadEmailRuntimeActionSchema>;
 
@@ -423,7 +424,11 @@ export type ReadInboxRuntimeActionResponse = z.infer<
 
 export const ReadEmailRuntimeActionResponseSchema = z.object({
   type: z.literal("read_email_result"),
-  content: z.string().refine((value) => hasCodePointLength(value, 1, 131_072)),
+  content: z.string().refine((value) => {
+    if (!hasOnlyPairedUtf16Surrogates(value)) return false;
+    const bytes = Buffer.byteLength(value, "utf8");
+    return bytes >= 1 && bytes <= 50 * 1024;
+  }),
 }).strict();
 export type ReadEmailRuntimeActionResponse = z.infer<
   typeof ReadEmailRuntimeActionResponseSchema
