@@ -824,16 +824,21 @@ describe("HttpApplicationRuntimeClient", () => {
       date: "2026-08-30",
       time: "14:05",
       received_within_minutes: 1_440,
+      received_before_minutes_ago: 15,
     })).toEqual({
       type: "read_inbox",
       query: "code",
       date: "2026-08-30",
       time: "14:05",
       received_within_minutes: 1_440,
+      received_before_minutes_ago: 15,
     });
     for (const invalidRequest of [
       { type: "read_inbox", received_within_minutes: 0 },
       { type: "read_inbox", received_within_minutes: 1_441 },
+      { type: "read_inbox", received_before_minutes_ago: 0 },
+      { type: "read_inbox", received_before_minutes_ago: 1_441 },
+      { type: "read_inbox", received_before_minutes_ago: true },
       { type: "read_inbox", date: "2026-02-30" },
       { type: "read_inbox", date: "0000-01-01" },
       { type: "read_inbox", time: "24:00" },

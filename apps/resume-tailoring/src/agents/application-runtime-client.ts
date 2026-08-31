@@ -286,6 +286,7 @@ export const ReadInboxRuntimeActionSchema = z.object({
   date: InboxDateSchema.optional(),
   time: InboxTimeSchema.optional(),
   received_within_minutes: z.number().int().min(1).max(1_440).optional(),
+  received_before_minutes_ago: z.number().int().min(1).max(1_440).optional(),
 }).strict();
 export type ReadInboxRuntimeAction = z.infer<typeof ReadInboxRuntimeActionSchema>;
 
