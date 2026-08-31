@@ -1374,6 +1374,12 @@ class ReadInboxRuntimeAction(PublicModel):
         StringConstraints(strict=True, pattern=r"^\d{2}:\d{2}$"),
     ] | None = None
     received_within_minutes: int | None = Field(default=None, strict=True, ge=1, le=1_440)
+    received_before_minutes_ago: int | None = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        le=1_440,
+    )
 
     @field_validator("query")
     @classmethod

@@ -442,6 +442,65 @@ async def test_search_inbox_intersects_utc_date_time_and_recent_bounds() -> None
 
 
 @pytest.mark.asyncio
+async def test_search_inbox_filters_messages_newer_than_relative_cutoff() -> None:
+    now = datetime(2026, 8, 30, 15, 0, tzinfo=UTC)
+    received_times = {
+        "message-older": datetime(2026, 8, 30, 14, 30, tzinfo=UTC),
+        "message-newer": datetime(2026, 8, 30, 14, 50, tzinfo=UTC),
+    }
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/messages"):
+            queries.append(request.url.params["q"])
+            return httpx.Response(
+                200,
+                json={"messages": [{"id": message_id} for message_id in received_times]},
+            )
+        message_id = request.url.path.rsplit("/", 1)[-1]
+        received = received_times[message_id]
+        return httpx.Response(
+            200,
+            json={
+                "id": message_id,
+                "internalDate": str(int(received.timestamp() * 1000)),
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": message_id},
+                        {"name": "Date", "value": "Sun, 30 Aug 2026 14:30:00 +0000"},
+                    ]
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://gmail.googleapis.com",
+    ) as client:
+        inbox = GmailVerificationInbox(
+            token_provider=_access_token,
+            http_client=client,
+            wall_clock=lambda: now,
+        )
+        result = await inbox.search_inbox(
+            query="verification",
+            received_within_minutes=60,
+            received_before_minutes_ago=15,
+        )
+        with pytest.raises(ValueError, match="received_before_minutes_ago"):
+            await inbox.search_inbox(received_before_minutes_ago=1_441)
+
+    assert [message.message_id for message in result.messages] == ["message-older"]
+    assert queries == [
+        (
+            '"verification" '
+            f"after:{int(datetime(2026, 8, 30, 14, 0, tzinfo=UTC).timestamp()) - 1} "
+            f"before:{int(datetime(2026, 8, 30, 14, 45, tzinfo=UTC).timestamp())}"
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_read_email_parses_mime_into_bounded_untrusted_content() -> None:
     received = datetime(2026, 8, 30, 14, 30, tzinfo=UTC)
     message = EmailMessage()

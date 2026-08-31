@@ -2616,16 +2616,22 @@ def test_model_inbox_runtime_contracts_are_strict_and_bounded() -> None:
             "date": "2026-08-30",
             "time": "14:05",
             "received_within_minutes": 1_440,
+            "received_before_minutes_ago": 15,
         }
     )
     assert search.type == "read_inbox"
     assert search.query == "code"
     assert search.date == "2026-08-30"
     assert search.time == "14:05"
-    with pytest.raises(ValidationError):
-        RUNTIME_ACTION_ADAPTER.validate_python(
-            {"type": "read_inbox", "query": "code", "received_within_minutes": 1_441}
-        )
+    assert search.received_before_minutes_ago == 15
+    for invalid_search in (
+        {"type": "read_inbox", "received_within_minutes": 1_441},
+        {"type": "read_inbox", "received_before_minutes_ago": 0},
+        {"type": "read_inbox", "received_before_minutes_ago": 1_441},
+        {"type": "read_inbox", "received_before_minutes_ago": True},
+    ):
+        with pytest.raises(ValidationError):
+            RUNTIME_ACTION_ADAPTER.validate_python(invalid_search)
     with pytest.raises(ValidationError):
         RUNTIME_ACTION_ADAPTER.validate_python(
             {"type": "read_inbox", "query": "code\nsubject"}

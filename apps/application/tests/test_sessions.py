@@ -6926,6 +6926,7 @@ async def test_model_runtime_can_search_and_read_inbox_but_public_runtime_cannot
             date="2026-08-30",
             time="14:00",
             received_within_minutes=30,
+            received_before_minutes_ago=15,
         ),
     )
     assert search.model_dump(mode="json") == {
@@ -6960,6 +6961,7 @@ async def test_model_runtime_can_search_and_read_inbox_but_public_runtime_cannot
                 "date": date(2026, 8, 30),
                 "time": time(14, 0),
                 "received_within_minutes": 30,
+                "received_before_minutes_ago": 15,
             },
         ),
         ("read", {"email_id": "message-1", "offset": 51_000}),

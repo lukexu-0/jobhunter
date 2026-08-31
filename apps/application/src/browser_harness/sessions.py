@@ -1895,6 +1895,7 @@ class ApplicationSessionManager:
                         date=Date.fromisoformat(action.date) if action.date else None,
                         time=Time.fromisoformat(action.time) if action.time else None,
                         received_within_minutes=action.received_within_minutes,
+                        received_before_minutes_ago=action.received_before_minutes_ago,
                     )
                     return ReadInboxRuntimeActionResponse(
                         type="read_inbox_result",

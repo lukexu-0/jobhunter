@@ -137,6 +137,7 @@ class InboxReader(Protocol):
         date: Date | None = None,
         time: Time | None = None,
         received_within_minutes: int | None = None,
+        received_before_minutes_ago: int | None = None,
     ) -> InboxSearchResult: ...
 
     async def read_email(self, email_id: str, *, offset: int = 0) -> InboxEmail: ...
@@ -262,12 +263,14 @@ class GmailVerificationInbox:
         date: Date | None = None,
         time: Time | None = None,
         received_within_minutes: int | None = None,
+        received_before_minutes_ago: int | None = None,
     ) -> InboxSearchResult:
         canonical_query = _validate_inbox_query(query)
         lower_bound, upper_bound = _inbox_bounds(
             date=date,
             time=time,
             received_within_minutes=received_within_minutes,
+            received_before_minutes_ago=received_before_minutes_ago,
             now=self._wall_clock(),
         )
         if (
@@ -622,6 +625,7 @@ def _inbox_bounds(
     date: Date | None,
     time: Time | None,
     received_within_minutes: int | None,
+    received_before_minutes_ago: int | None,
     now: datetime,
 ) -> tuple[datetime | None, datetime | None]:
     if not isinstance(now, datetime) or now.tzinfo is None:
@@ -636,6 +640,11 @@ def _inbox_bounds(
         or not 1 <= received_within_minutes <= 1_440
     ):
         raise ValueError("received_within_minutes is invalid")
+    if received_before_minutes_ago is not None and (
+        type(received_before_minutes_ago) is not int
+        or not 1 <= received_before_minutes_ago <= 1_440
+    ):
+        raise ValueError("received_before_minutes_ago is invalid")
 
     lower_bound: datetime | None = None
     upper_bound: datetime | None = None
@@ -651,6 +660,9 @@ def _inbox_bounds(
     if received_within_minutes is not None:
         recent_bound = now - timedelta(minutes=received_within_minutes)
         lower_bound = max(lower_bound, recent_bound) if lower_bound else recent_bound
+    if received_before_minutes_ago is not None:
+        cutoff = now - timedelta(minutes=received_before_minutes_ago)
+        upper_bound = min(upper_bound, cutoff) if upper_bound else cutoff
     return lower_bound, upper_bound
 
 
