@@ -4,6 +4,7 @@ import {
   AdditionalInfoQuestionSchema,
   ApplicationAdditionalInfoQuestionSchema,
   ApplicationAnswerSuggestionsResponseSchema,
+  ApplicationBrowserRuntimeFailureReasonSchema,
   ApplicationPlaywrightCliDiagnosticSchema,
   ApplicationFieldResultSchema,
   ApplicationPendingActionSchema,
@@ -227,6 +228,7 @@ const RawPlaywrightCliDiagnosticSchema = z.object({
     "process_exit",
     "browser_runtime",
   ]).nullable(),
+  runtime_failure_reason: ApplicationBrowserRuntimeFailureReasonSchema.nullable().default(null),
   stderr_excerpt: z.union([
     z.literal("[redacted]"),
     z.literal("Browser runtime failed."),
@@ -832,6 +834,9 @@ function projectPlaywrightCliDiagnostic(
     status: diagnostic.status,
     exitCode: diagnostic.exit_code,
     errorCategory: diagnostic.error_category,
+    ...(diagnostic.runtime_failure_reason === null
+      ? {}
+      : { runtimeFailureReason: diagnostic.runtime_failure_reason }),
     stderrExcerpt: diagnostic.stderr_excerpt,
     stderrTruncated: diagnostic.stderr_truncated,
   });

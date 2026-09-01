@@ -210,6 +210,31 @@ describe("HttpApplicationHarnessClient", () => {
     expect(JSON.stringify(snapshot)).not.toContain("ats.private.example");
     expect(JSON.stringify(snapshot)).not.toContain("model");
   });
+  test("retains a browser runtime failure reason", async () => {
+    const client = new HttpApplicationHarnessClient({
+      origin: ORIGIN,
+      token: TOKEN,
+      fetchImpl: async () => Response.json(rawSnapshot({
+        playwright_cli_diagnostics: [{
+          step: 48,
+          status: "failed",
+          exit_code: -1,
+          error_category: "browser_runtime",
+          runtime_failure_reason: "post_action_observation_failed",
+          stderr_excerpt: "Browser runtime failed.",
+          stderr_truncated: false,
+        }],
+      })),
+    });
+
+    await expect(client.get(SESSION_ID, new AbortController().signal))
+      .resolves.toMatchObject({
+        playwrightCliDiagnostics: [{
+          step: 48,
+          runtimeFailureReason: "post_action_observation_failed",
+        }],
+      });
+  });
   test("projects a required null expiry for an unlimited harness session", async () => {
     const client = new HttpApplicationHarnessClient({
       origin: ORIGIN,

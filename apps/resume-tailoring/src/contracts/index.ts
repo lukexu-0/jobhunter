@@ -765,6 +765,16 @@ const PENDING_ACTIONS_BY_STATE: Readonly<
   awaiting_additional_info: { additional_info: true },
   awaiting_human_review: { human_review: true },
 };
+export const ApplicationBrowserRuntimeFailureReasonSchema = z.enum([
+  "artifact_budget_exceeded",
+  "command_execution_failed",
+  "command_rejected",
+  "command_timed_out",
+  "navigation_guard_failed",
+  "post_action_observation_failed",
+  "pre_action_observation_failed",
+  "runtime_unavailable",
+]);
 export const ApplicationPlaywrightCliDiagnosticSchema = z.object({
   step: z.number().int().min(1),
   status: z.enum(["succeeded", "failed"]),
@@ -773,6 +783,7 @@ export const ApplicationPlaywrightCliDiagnosticSchema = z.object({
     "process_exit",
     "browser_runtime",
   ]).nullable(),
+  runtimeFailureReason: ApplicationBrowserRuntimeFailureReasonSchema.optional(),
   stderrExcerpt: z.union([
     z.literal("[redacted]"),
     z.literal("Browser runtime failed."),
@@ -802,6 +813,16 @@ export const ApplicationPlaywrightCliDiagnosticSchema = z.object({
       code: "custom",
       path: ["errorCategory"],
       message: "errorCategory must match the browser result",
+    });
+  }
+  if (
+    diagnostic.errorCategory !== "browser_runtime"
+    && diagnostic.runtimeFailureReason !== undefined
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["runtimeFailureReason"],
+      message: "runtimeFailureReason requires a browser runtime failure",
     });
   }
   if (
