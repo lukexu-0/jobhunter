@@ -2930,6 +2930,7 @@ class ApplicationSessionManager:
                 status="failed",
                 exit_code=-1,
                 error_category="browser_runtime",
+                runtime_failure_reason=outcome.reason,
                 stderr_excerpt=_BROWSER_RUNTIME_ERROR_MESSAGE,
                 stderr_truncated=False,
             )

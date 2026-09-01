@@ -1418,6 +1418,7 @@ async def test_action_process_failure_preserves_error_while_cleanup_runs(
         await runtime.execute("click", ["e3"])
 
     assert first.value.code == "browser_failed"
+    assert first.value.reason == "command_execution_failed"
     assert "private process failure" not in str(first.value)
     assert commands == ["click", "video-stop", "close"]
 
@@ -1465,6 +1466,7 @@ async def test_internal_observation_process_failure_invalidates_runtime(
         await runtime.execute("click", ["e3"])
 
     assert first.value.code == "browser_failed"
+    assert first.value.reason == "post_action_observation_failed"
     assert commands == ["click", "run-code", "video-stop", "close"]
 
     with pytest.raises(PlaywrightCliRuntimeError) as later:

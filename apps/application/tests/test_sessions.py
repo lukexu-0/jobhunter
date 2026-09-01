@@ -4500,7 +4500,10 @@ async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagno
     record = only_session(manager)
     assert record is not None
     record.playwright_runtime = FakePlaywrightRuntime(
-        error=PlaywrightCliRuntimeError("browser_failed")
+        error=PlaywrightCliRuntimeError(
+            "browser_failed",
+            reason="post_action_observation_failed",
+        )
     )
 
     with pytest.raises(HarnessServiceError) as raised:
@@ -4524,6 +4527,7 @@ async def test_runtime_playwright_cli_action_persists_fixed_runtime_error_diagno
             "status": "failed",
             "exit_code": -1,
             "error_category": "browser_runtime",
+            "runtime_failure_reason": "post_action_observation_failed",
             "stderr_excerpt": "Browser runtime failed.",
             "stderr_truncated": False,
         }

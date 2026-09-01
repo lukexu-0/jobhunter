@@ -796,6 +796,18 @@ class SessionError(PublicModel):
         return self
 
 
+BrowserRuntimeFailureReason: TypeAlias = Literal[
+    "artifact_budget_exceeded",
+    "command_execution_failed",
+    "command_rejected",
+    "command_timed_out",
+    "navigation_guard_failed",
+    "post_action_observation_failed",
+    "pre_action_observation_failed",
+    "runtime_unavailable",
+]
+
+
 class PlaywrightCliDiagnostic(PublicModel):
     step: int = Field(ge=1)
     status: Literal["succeeded", "failed"]
@@ -804,6 +816,10 @@ class PlaywrightCliDiagnostic(PublicModel):
         "process_exit",
         "browser_runtime",
     ] | None
+    runtime_failure_reason: BrowserRuntimeFailureReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     stderr_excerpt: Literal[
         "[redacted]",
         "Browser runtime failed.",
@@ -826,6 +842,13 @@ class PlaywrightCliDiagnostic(PublicModel):
             valid_category = self.exit_code == 0
         if not valid_category:
             raise ValueError("error_category does not match the browser outcome")
+        if (
+            self.error_category != "browser_runtime"
+            and self.runtime_failure_reason is not None
+        ):
+            raise ValueError(
+                "runtime_failure_reason requires a browser runtime failure"
+            )
         if (
             expected_excerpt is not None
             and self.stderr_excerpt != expected_excerpt

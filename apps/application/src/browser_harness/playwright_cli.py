@@ -29,6 +29,7 @@ from .models import (
     BrowserLaunchConfig,
     BrowserObservation,
     BrowserScreenshot,
+    BrowserRuntimeFailureReason,
     BrowserTab,
     PlaywrightCliExecutionResult,
     SOURCE_CAPTURE_MAX_BYTES,
@@ -282,11 +283,17 @@ class BrowserConfigurationError(ValueError):
 class PlaywrightCliRuntimeError(RuntimeError):
     """A sanitized runtime failure safe to expose through the harness API."""
 
-    __slots__ = ("code",)
+    __slots__ = ("code", "reason")
 
-    def __init__(self, code: Literal["browser_failed"]) -> None:
+    def __init__(
+        self,
+        code: Literal["browser_failed"],
+        *,
+        reason: BrowserRuntimeFailureReason | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.reason = reason
 
 
 class _ActionRuntimeFailure(Exception):
@@ -2615,38 +2622,75 @@ class PlaywrightCliRuntime:
         expose_applicant_values: bool,
     ) -> PlaywrightCliExecutionResult:
         if not self._started or self._closed or not self._guard_armed:
-            raise PlaywrightCliRuntimeError("browser_failed")
-        normalized = self._validate_model_invocation(command, args)
+            raise PlaywrightCliRuntimeError(
+                "browser_failed",
+                reason="runtime_unavailable",
+            )
+        try:
+            normalized = self._validate_model_invocation(command, args)
+        except PlaywrightCliRuntimeError as error:
+            raise PlaywrightCliRuntimeError(
+                error.code,
+                reason="command_rejected",
+            ) from None
         if self._screenshots_suppressed and command in {
             "eval",
             "screenshot",
             "pdf",
         }:
-            raise PlaywrightCliRuntimeError("browser_failed")
+            raise PlaywrightCliRuntimeError(
+                "browser_failed",
+                reason="command_rejected",
+            )
         if self._screenshots_suppressed and command == "snapshot" and any(
             value == "--filename" or value.startswith("--filename=")
             for value in normalized
         ):
-            raise PlaywrightCliRuntimeError("browser_failed")
+            raise PlaywrightCliRuntimeError(
+                "browser_failed",
+                reason="command_rejected",
+            )
         pre_metadata = self._current_metadata
         if pre_metadata is None:
             try:
                 pre_metadata = await self._metadata()
             except PlaywrightCliRuntimeError as error:
-                raise _ActionRuntimeFailure(error) from None
+                raise _ActionRuntimeFailure(
+                    PlaywrightCliRuntimeError(
+                        error.code,
+                        reason="pre_action_observation_failed",
+                    )
+                ) from None
         if not self._url_is_allowed(pre_metadata.url, self._approved_origins):
-            raise PlaywrightCliRuntimeError("browser_failed")
-        self._validate_tab_command(command, normalized, pre_metadata)
+            raise PlaywrightCliRuntimeError(
+                "browser_failed",
+                reason="navigation_guard_failed",
+            )
+        try:
+            self._validate_tab_command(command, normalized, pre_metadata)
+        except PlaywrightCliRuntimeError as error:
+            raise PlaywrightCliRuntimeError(
+                error.code,
+                reason="command_rejected",
+            ) from None
         try:
             execution = await self._invoke(
                 command,
                 normalized,
             )
         except PlaywrightCliRuntimeError as error:
-            raise _ActionRuntimeFailure(error) from None
+            raise _ActionRuntimeFailure(
+                PlaywrightCliRuntimeError(
+                    error.code,
+                    reason="command_execution_failed",
+                )
+            ) from None
         if execution.timed_out:
             raise _ActionRuntimeFailure(
-                PlaywrightCliRuntimeError("browser_failed")
+                PlaywrightCliRuntimeError(
+                    "browser_failed",
+                    reason="command_timed_out",
+                )
             )
         preserve_snapshot_file = (
             not self._screenshots_suppressed
@@ -2662,7 +2706,12 @@ class PlaywrightCliRuntime:
                 remove_snapshot_file=not preserve_snapshot_file,
             )
         except PlaywrightCliRuntimeError as error:
-            raise _ActionRuntimeFailure(error) from None
+            raise _ActionRuntimeFailure(
+                PlaywrightCliRuntimeError(
+                    error.code,
+                    reason="post_action_observation_failed",
+                )
+            ) from None
         escaped_origin = not self._url_is_allowed(
             post_metadata.url, self._approved_origins
         )
@@ -2676,9 +2725,17 @@ class PlaywrightCliRuntime:
                 if not self._url_is_allowed(
                     post_metadata.url, self._approved_origins
                 ):
-                    raise PlaywrightCliRuntimeError("browser_failed")
+                    raise PlaywrightCliRuntimeError(
+                        "browser_failed",
+                        reason="navigation_guard_failed",
+                    )
             except PlaywrightCliRuntimeError as error:
-                raise _ActionRuntimeFailure(error) from None
+                raise _ActionRuntimeFailure(
+                    PlaywrightCliRuntimeError(
+                        error.code,
+                        reason="navigation_guard_failed",
+                    )
+                ) from None
         self._current_metadata = post_metadata
         if self._screenshots_suppressed and not expose_applicant_values:
             stdout = "[redacted]"
@@ -2707,7 +2764,10 @@ class PlaywrightCliRuntime:
             _MAX_OUTPUT_DIRECTORY_BYTES,
         ):
             await self._emergency_budget_cleanup_unlocked()
-            raise PlaywrightCliRuntimeError("browser_failed")
+            raise PlaywrightCliRuntimeError(
+                "browser_failed",
+                reason="artifact_budget_exceeded",
+            )
         return PlaywrightCliExecutionResult(exit_code=exit_code, stdout=stdout,
         stderr=stderr,
         stdout_truncated=(
