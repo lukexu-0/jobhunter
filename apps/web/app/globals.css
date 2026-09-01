@@ -296,11 +296,16 @@ a {
 
 .applications-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
   gap: var(--space-6);
   padding-bottom: var(--space-5);
   border-bottom: var(--border-width) solid var(--color-border);
+}
+
+.applications-header__alert-controls {
+  justify-content: flex-end;
 }
 
 .applications-header h1,
@@ -2441,6 +2446,10 @@ a {
 
   .applications-header {
     align-items: flex-start;
+  }
+
+  .applications-header__alert-controls {
+    justify-content: flex-start;
   }
 
   .applications-summary {

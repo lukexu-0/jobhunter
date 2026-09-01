@@ -38,6 +38,7 @@ import {
 } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
+import { AlertControls } from "./alert-controls";
 import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
@@ -1160,6 +1161,7 @@ export function RunDashboard() {
     <main className="workspace">
       <header className="applications-header">
         <h1>Applications</h1>
+        <AlertControls className="applications-header__alert-controls" />
       </header>
 
       <form

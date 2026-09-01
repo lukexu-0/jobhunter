@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
 import { type RunDto } from "@jobhunter/pipeline/contracts";
+import { installBrowserNotificationProbe } from "./browser-notification-probe";
 
 async function interceptEmptyRuns(page: Page): Promise<void> {
   await page.route("**/api/pipeline/runs", async (route) => {
@@ -545,6 +546,58 @@ test("filters pipeline and application statuses independently", async ({ page })
   await expect(page.getByText("No applications match the current search and statuses.")).toBeVisible();
   await pipelineFilter.selectOption("all");
   await expect(page.getByRole("table").locator("tbody").getByRole("link")).toHaveText(["Completed role"]);
+});
+
+test("notifies once when a dashboard run becomes Awaiting review", async ({ page }) => {
+  const notifications = await installBrowserNotificationProbe(page, {
+    initialPermission: "default",
+    notificationsEnabled: false,
+  });
+  let reviewReady = false;
+  let listRequestCount = 0;
+  const activeRun: RunDto = {
+    ...runFixture(),
+    id: "dashboard-review-alert",
+    titleOverride: "Alert-ready role",
+    status: "visual_qa",
+    applicationStatus: "pending",
+    revision: 5,
+  };
+  await page.route("**/api/pipeline/runs", async (route) => {
+    listRequestCount += 1;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        runs: [
+          { ...activeRun, status: reviewReady ? "review" : "visual_qa" },
+          {
+            ...activeRun,
+            id: "dashboard-poll-keeper",
+            titleOverride: "Polling role",
+            queueSequence: 2,
+          },
+        ],
+      }),
+    });
+  });
+  await page.goto("/");
+
+  const browserNotifications = page.getByRole("checkbox", { name: "Browser notifications" });
+  await expect(browserNotifications).toBeVisible();
+  await expect(browserNotifications).not.toBeChecked();
+  await browserNotifications.check();
+  await expect(browserNotifications).toBeChecked();
+
+  reviewReady = true;
+  await expect.poll(notifications, { timeout: 7_000 }).toEqual([{
+    body: "Review the tailored resume in Jobhunter.",
+    tag: expect.stringMatching(/^jobhunter:/),
+    title: "Resume ready for review",
+  }]);
+  await expect(page.getByRole("row").filter({ hasText: "Alert-ready role" })).toContainText("Awaiting review");
+  const requestCountAtNotification = listRequestCount;
+  await expect.poll(() => listRequestCount, { timeout: 5_000 }).toBeGreaterThan(requestCountAtNotification);
+  expect(await notifications()).toHaveLength(1);
 });
 
 test("uses lifecycle order and exposes a square accessible row action menu without an arrow", async ({ page }) => {
