@@ -46,6 +46,8 @@ export type ApplicationSubmissionPhase =
   | "attempting"
   | "submitted"
   | "uncertain";
+export const APPLICATION_BROWSER_SESSION_CAPACITY = 3;
+
 const TERMINAL_APPLICATION_SESSION_STATES: Readonly<Partial<Record<ApplicationSessionBridgeState, true>>> = {
   cancelled: true,
   failed: true,
@@ -63,8 +65,15 @@ export class RepositoryConflictError extends Error {
   }
 }
 
-export type DiscoveryJobQueueConflictReason = "already_queued" | "not_found" | "closed";
 
+export class ApplicationSessionCapacityError extends RepositoryConflictError {
+  constructor() {
+    super("application browser session capacity is full");
+    this.name = "ApplicationSessionCapacityError";
+  }
+}
+
+export type DiscoveryJobQueueConflictReason = "already_queued" | "not_found" | "closed";
 export class DiscoveryJobQueueConflictError extends RepositoryConflictError {
   constructor(readonly reason: DiscoveryJobQueueConflictReason) {
     super(`discovery job cannot be queued: ${reason}`);
@@ -747,12 +756,27 @@ export class PipelineRepository {
               AND latest_session.bridge_state IN ('cancelled', 'failed', 'closed', 'lost')
               AND latest_session.submission_phase = 'not_attempted'
           )
+          OR EXISTS (
+            SELECT 1
+            FROM run_application_sessions AS latest_session
+            WHERE latest_session.run_id = runs.id
+              AND latest_session.generation = (
+                SELECT max(generation)
+                FROM run_application_sessions
+                WHERE run_id = runs.id
+              )
+              AND latest_session.resume_revision = runs.current_revision
+              AND latest_session.slot_released = 1
+              AND latest_session.bridge_state = 'closed'
+              AND latest_session.submission_phase = 'not_attempted'
+              AND latest_session.public_snapshot_json IS NULL
+          )
         )
-        AND NOT EXISTS (
-          SELECT 1
+        AND (
+          SELECT count(*)
           FROM run_application_sessions
           WHERE slot_released = 0
-        )
+        ) < ${APPLICATION_BROWSER_SESSION_CAPACITY}
       ORDER BY runs.queue_sequence
     `).all();
     for (const row of rows) {
@@ -814,16 +838,21 @@ export class PipelineRepository {
       ) {
         throw new ApplicationSubmissionFinalError();
       }
-      if (latest && TERMINAL_APPLICATION_SESSION_STATES[latest.bridge_state] !== true) {
-        throw new RepositoryConflictError("application session is active");
+      if (latest) {
+        if (TERMINAL_APPLICATION_SESSION_STATES[latest.bridge_state] !== true) {
+          throw new RepositoryConflictError("application session is active");
+        }
+        if (latest.slot_released !== 1) {
+          throw new RepositoryConflictError("application session slot is not released");
+        }
       }
-      const occupyingSession = this.#db.query<{ session_id: string }, []>(`
-        SELECT session_id
+      const occupancy = this.#db.query<{ count: number }, []>(`
+        SELECT count(*) AS count
         FROM run_application_sessions
         WHERE slot_released = 0
       `).get();
-      if (occupyingSession) {
-        throw new RepositoryConflictError("application browser slot is active");
+      if ((occupancy?.count ?? 0) >= APPLICATION_BROWSER_SESSION_CAPACITY) {
+        throw new ApplicationSessionCapacityError();
       }
       const generation = (latest?.generation ?? 0) + 1;
       const now = this.#now();
@@ -847,6 +876,37 @@ export class PipelineRepository {
       ).get(runId, generation);
       if (!reserved) throw new Error("application session reservation failed");
       return publicApplicationSession(reserved);
+    });
+  }
+
+  abandonApplicationSessionReservation(
+    runId: string,
+    generation: number,
+    sessionId: string,
+  ): void {
+    if (!Number.isSafeInteger(generation) || generation < 1) {
+      throw new Error("application generation must be a positive integer");
+    }
+    this.#immediate(() => {
+      const now = this.#now();
+      const result = this.#db.query(`
+        UPDATE run_application_sessions
+        SET bridge_state = 'closed',
+            slot_released = 1,
+            updated_at = ?,
+            terminal_at = ?
+        WHERE run_id = ?
+          AND generation = ?
+          AND session_id = ?
+          AND bridge_state = 'reserved'
+          AND submission_phase = 'not_attempted'
+          AND slot_released = 0
+          AND public_snapshot_json IS NULL
+          AND last_upstream_event_id IS NULL
+      `).run(now, now, runId, generation, sessionId);
+      if (result.changes !== 1) {
+        throw new RepositoryConflictError("application session reservation changed");
+      }
     });
   }
 
@@ -1238,15 +1298,14 @@ export class PipelineRepository {
     };
   }
 
-  getUnreleasedApplicationSession(): PublicApplicationSession | null {
-    const row = this.#db.query<ApplicationSessionRow, []>(`
+  getUnreleasedApplicationSessions(): readonly PublicApplicationSession[] {
+    const rows = this.#db.query<ApplicationSessionRow, []>(`
       SELECT *
       FROM run_application_sessions
       WHERE slot_released = 0
       ORDER BY created_at, run_id, generation
-      LIMIT 1
-    `).get();
-    return row ? publicApplicationSession(row) : null;
+    `).all();
+    return rows.map(publicApplicationSession);
   }
 
   releaseApplicationSessionSlot(

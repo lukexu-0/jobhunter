@@ -38,6 +38,7 @@ from .playwright_cli import (
     PlaywrightCliRuntime,
     PlaywrightCliRuntimeError,
     ResolvedBrowserLaunch,
+    browser_launch_for_slot,
     recover_stale_playwright_cli_sessions,
     resolve_browser_launch,
 )
@@ -136,6 +137,8 @@ _ADDITIONAL_INFO_GATE_RESPONSE_ADAPTER = TypeAdapter(
         Field(discriminator="type"),
     ]
 )
+_APPLICATION_SESSION_CAPACITY = 3
+_APPLICATION_SESSION_CAPACITY_MESSAGE = "Browser application session capacity is full"
 _EVENT_LIMIT = 256
 _TOMBSTONE_LIMIT = 32
 _HEARTBEAT_SECONDS = 15.0
@@ -241,6 +244,7 @@ class _ApplicationSession:
     session_id: UUID
     snapshot: SessionSnapshot
     deadline_monotonic: float | None
+    browser_slot: int | None = None
     events: deque[HarnessEvent] = field(
         default_factory=lambda: deque(maxlen=_EVENT_LIMIT)
     )
@@ -392,7 +396,7 @@ def _saved_private_values(snapshot: UserInfoSnapshot) -> frozenset[str]:
 
 
 class ApplicationSessionManager:
-    """Own one browser slot for either an application session or source capture."""
+    """Own three application browser slots or one exclusive source capture."""
 
     def __init__(
         self,
@@ -428,7 +432,7 @@ class ApplicationSessionManager:
         self._lock = asyncio.Lock()
         self._startup_lock = asyncio.Lock()
         self._startup_complete = False
-        self._active: _ApplicationSession | None = None
+        self._sessions: dict[UUID, _ApplicationSession] = {}
         self._source_capture: _SourceCapture | None = None
         self._source_capture_replay: _SourceCaptureReplay | None = None
         self._source_capture_tombstones: OrderedDict[
@@ -549,29 +553,35 @@ class ApplicationSessionManager:
                     "An application session is already active",
                     session_id=self._source_capture.request.capture_id,
                 )
-            if self._active is not None:
-                if (
-                    requested_session_id is not None
-                    and self._active.session_id == requested_session_id
-                ):
-                    if self._active.snapshot.state in {
-                        "cancelled",
-                        "failed",
-                        "closed",
-                    }:
-                        raise HarnessServiceError(
-                            409,
-                            "session_terminal",
-                            "The application session has already ended",
-                        )
-                    return self._create_response(requested_session_id)
+            active = self._sessions.get(session_id)
+            if active is not None:
+                if active.snapshot.state in {
+                    "cancelled",
+                    "failed",
+                    "closed",
+                }:
+                    raise HarnessServiceError(
+                        409,
+                        "session_terminal",
+                        "The application session has already ended",
+                    )
+                return self._create_response(session_id)
+            if len(self._sessions) >= _APPLICATION_SESSION_CAPACITY:
                 raise HarnessServiceError(
                     409,
-                    "session_active",
-                    "An application session is already active",
-                    session_id=self._active.session_id,
+                    "session_capacity",
+                    _APPLICATION_SESSION_CAPACITY_MESSAGE,
                 )
-            self._active = record
+            occupied_slots = {
+                active_record.browser_slot
+                for active_record in self._sessions.values()
+            }
+            record.browser_slot = next(
+                slot
+                for slot in range(_APPLICATION_SESSION_CAPACITY)
+                if slot not in occupied_slots
+            )
+            self._sessions[session_id] = record
             if deadline_monotonic is not None:
                 record.ttl_task = asyncio.create_task(
                     self._expire_session(record),
@@ -655,7 +665,10 @@ class ApplicationSessionManager:
 
             runtime = self._runtime_factory(
                 session_id=session_id,
-                launch=self._browser_launch,
+                launch=browser_launch_for_slot(
+                    self._browser_launch,
+                    record.browser_slot,
+                ),
                 session_directory=stored.session_directory,
                 node_executable=self._config.node_executable,
                 cli_script=self._config.playwright_cli_script,
@@ -868,7 +881,7 @@ class ApplicationSessionManager:
                     "unavailable",
                     _SOURCE_CAPTURE_UNAVAILABLE_MESSAGE,
                 )
-            if self._active is not None:
+            if self._sessions:
                 raise HarnessServiceError(
                     409,
                     "source_capture_active",
@@ -1398,8 +1411,8 @@ class ApplicationSessionManager:
         record.closed_event.set()
 
     def get_snapshot(self, session_id: UUID) -> SessionSnapshot:
-        record = self._active
-        if record is not None and record.session_id == session_id:
+        record = self._sessions.get(session_id)
+        if record is not None:
             return SessionSnapshot.model_validate(record.snapshot.model_dump())
         tombstone = self._tombstones.get(session_id)
         if tombstone is not None:
@@ -1411,8 +1424,8 @@ class ApplicationSessionManager:
         session_id: UUID,
         question_id: str,
     ) -> ApplicationAnswerSuggestionsResponse:
-        record = self._active
-        if record is None or record.session_id != session_id:
+        record = self._sessions.get(session_id)
+        if record is None:
             if session_id in self._tombstones:
                 raise HarnessServiceError(
                     409,
@@ -1457,8 +1470,8 @@ class ApplicationSessionManager:
     async def stream_events(
         self, session_id: UUID, last_event_id: int | None
     ) -> AsyncIterator[str]:
-        record = self._active
-        if record is not None and record.session_id == session_id:
+        record = self._sessions.get(session_id)
+        if record is not None:
             async for frame in self._stream_active(record, last_event_id):
                 yield frame
             return
@@ -1473,8 +1486,8 @@ class ApplicationSessionManager:
             yield _sse_frame(event)
 
     async def command(self, session_id: UUID, command: SessionCommand) -> None:
-        record = self._active
-        if record is None or record.session_id != session_id:
+        record = self._sessions.get(session_id)
+        if record is None:
             if session_id in self._tombstones:
                 raise HarnessServiceError(
                     409, "command_conflict", "The session is terminal"
@@ -1689,8 +1702,8 @@ class ApplicationSessionManager:
         *,
         expose_applicant_values: bool,
     ) -> RuntimeActionResponse:
-        record = self._active
-        if record is None or record.session_id != session_id:
+        record = self._sessions.get(session_id)
+        if record is None:
             if session_id in self._tombstones:
                 raise HarnessServiceError(
                     409, "command_conflict", "The session is terminal"
@@ -2267,8 +2280,8 @@ class ApplicationSessionManager:
         )
 
     async def delete(self, session_id: UUID) -> None:
-        record = self._active
-        if record is not None and record.session_id == session_id:
+        record = self._sessions.get(session_id)
+        if record is not None:
             await self._request_terminal(
                 record,
                 _TerminalRequest("closed", "closed"),
@@ -2304,7 +2317,7 @@ class ApplicationSessionManager:
         async with self._lock:
             self._shutting_down = True
             self._clear_source_capture_replay_locked()
-            record = self._active
+            records = tuple(self._sessions.values())
             source_capture = self._source_capture
             if source_capture is not None:
                 self._clear_source_capture_completed_result_locked(
@@ -2320,14 +2333,20 @@ class ApplicationSessionManager:
             )
         if source_cleanup is not None:
             await asyncio.shield(source_cleanup)
-        if record is not None:
-            await self._request_terminal(
-                record,
-                _TerminalRequest("closed", "closed"),
-                wait=True,
-                duplicate_ok=True,
+        if records:
+            await asyncio.gather(
+                *(
+                    self._request_terminal(
+                        record,
+                        _TerminalRequest("closed", "closed"),
+                        wait=True,
+                        duplicate_ok=True,
+                    )
+                    for record in records
+                )
             )
-            await self._close_terminal_tombstone(record.session_id)
+            for record in records:
+                await self._close_terminal_tombstone(record.session_id)
         await self._drain_pending_cleanup()
     async def _drain_pending_cleanup(self) -> None:
         retry_delay = 0.05
@@ -2845,8 +2864,8 @@ class ApplicationSessionManager:
             await self._publish_event(record, event, {})
             record.finalized = True
             async with self._lock:
-                if self._active is record:
-                    self._active = None
+                if self._sessions.get(record.session_id) is record:
+                    del self._sessions[record.session_id]
                 self._tombstones[record.session_id] = _Tombstone(
                     SessionSnapshot.model_validate(record.snapshot.model_dump()),
                     tuple(record.events),

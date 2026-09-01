@@ -338,7 +338,9 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       ...schedulerOptions,
       afterDrain: async (signal) => {
         await schedulerOptions?.afterDrain?.(signal);
-        await applicationSessions.startNextAutomaticApplication(signal);
+        while (await applicationSessions.startNextAutomaticApplication(signal)) {
+          signal.throwIfAborted();
+        }
       },
     },
   });

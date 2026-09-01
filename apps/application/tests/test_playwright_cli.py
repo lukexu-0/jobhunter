@@ -21,6 +21,7 @@ import jobhunter_browser_harness.playwright_cli as playwright_cli
 from jobhunter_browser_harness.gmail_verification import VerificationChallenge
 from jobhunter_browser_harness.models import BrowserLaunchConfig
 from jobhunter_browser_harness.playwright_cli import (
+    browser_launch_for_slot,
     BrowserConfigurationError,
     PlaywrightCliRuntime,
     PlaywrightCliRuntimeError,
@@ -433,6 +434,18 @@ def test_resolve_browser_launch_cdp() -> None:
     assert launch.user_data_dir is None
 
 
+def test_cdp_browser_slots_reuse_the_external_endpoint() -> None:
+    launch = ResolvedBrowserLaunch(
+        cdp_url="http://127.0.0.1:9222",
+        executable_path=None,
+        user_data_dir=None,
+    )
+
+    slots = tuple(browser_launch_for_slot(launch, slot) for slot in range(3))
+
+    assert slots == (launch, launch, launch)
+
+
 def test_resolve_browser_launch_cdp_invalid() -> None:
     config = BrowserLaunchConfig.model_construct(cdp_url="http://google.com/path")
     with pytest.raises(BrowserConfigurationError):
@@ -461,6 +474,40 @@ def test_resolve_browser_launch_native_success(tmp_path: Path, monkeypatch: pyte
     assert launch.user_data_dir == profile.resolve()
     assert profile.exists()
     assert stat.S_IMODE(profile.stat().st_mode) == 0o700
+
+
+def test_native_browser_slots_use_distinct_persistent_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chrome = tmp_path / "chrome"
+    chrome.write_text("executable", encoding="utf-8")
+    chrome.chmod(0o755)
+    profile = tmp_path / "profile"
+    monkeypatch.setattr(
+        "jobhunter_browser_harness.playwright_cli._default_profile_roots",
+        lambda: (Path("/different/root"),),
+    )
+    launch = resolve_browser_launch(
+        BrowserLaunchConfig(
+            chrome_executable=chrome,
+            chrome_user_data_dir=profile,
+        )
+    )
+
+    slots = tuple(browser_launch_for_slot(launch, slot) for slot in range(3))
+
+    assert [slot.user_data_dir for slot in slots] == [
+        profile.resolve(),
+        (tmp_path / "profile-slot-2").resolve(),
+        (tmp_path / "profile-slot-3").resolve(),
+    ]
+    assert all(
+        slot.user_data_dir is not None
+        and slot.user_data_dir.is_dir()
+        and stat.S_IMODE(slot.user_data_dir.stat().st_mode) == 0o700
+        for slot in slots
+    )
 
 
 def test_resolve_browser_launch_native_symlink_rejection(tmp_path: Path) -> None:
@@ -3521,6 +3568,8 @@ async def test_model_outputs_do_not_share_harness_artifact_namespace(
     assert config["snapshot"] == {"mode": "none"}
     assert config["console"] == {"level": "none"}
     assert config["browser"]["contextOptions"] == {"acceptDownloads": False}
+    assert config["browser"]["cdpEndpoint"] == "http://127.0.0.1:9222"
+    assert config["browser"]["isolated"] is True
     assert runtime._video_path.parent != model_output.parent
     await runtime.close()
 

@@ -52,6 +52,7 @@ export type ApplicationHarnessErrorCode =
   | "session_not_found"
   | "session_active_same_id"
   | "session_active_different_id"
+  | "session_capacity"
   | "session_terminal"
   | "command_conflict"
   | "invalid_request"
@@ -63,6 +64,7 @@ const ERROR_MESSAGES: Readonly<Record<ApplicationHarnessErrorCode, string>> = {
   session_not_found: "The application session was not found",
   session_active_same_id: "The requested application session is already active",
   session_active_different_id: "Another application session is active",
+  session_capacity: "Browser application session capacity is full",
   session_terminal: "The application session has already ended",
   command_conflict: "The application session state changed",
   invalid_request: "The browser harness rejected the request",
@@ -1046,6 +1048,9 @@ async function mapErrorResponse(
   }
   const envelope = ErrorEnvelopeSchema.safeParse(body);
   if (!envelope.success) throw new ApplicationHarnessError("invalid_response");
+  if (response.status === 409 && envelope.data.code === "session_capacity") {
+    throw new ApplicationHarnessError("session_capacity");
+  }
   if (response.status === 404 && envelope.data.code === "session_not_found") {
     throw new ApplicationHarnessError("session_not_found");
   }

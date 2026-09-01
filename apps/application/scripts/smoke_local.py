@@ -1002,14 +1002,6 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             event_stream = EventStream(client, events_url, headers, capture)
             event_stream.start()
 
-            concurrent_response, concurrent = await create_session(
-                client, capture, args.harness_url, headers, fixture, inputs
-            )
-            require_status(concurrent_response, 409, "Concurrent session create did not return 409")
-            require(
-                concurrent == {"code": "session_active", "session_id": active_session_id},
-                "Concurrent session create did not identify the active singleton",
-            )
 
             started = await event_stream.wait_for("session_started")
             additional_info = await event_stream.wait_for(
@@ -1256,7 +1248,7 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             require_status(
                 followup_create_response,
                 202,
-                "A fresh session could not start after ordered cleanup released the singleton",
+                "A fresh session could not start after ordered cleanup completed",
             )
             try:
                 followup_session_id = str(UUID(str(followup_created.get("session_id"))))

@@ -554,6 +554,26 @@ def resolve_browser_launch(config: BrowserLaunchConfig) -> ResolvedBrowserLaunch
     )
 
 
+def browser_launch_for_slot(
+    launch: ResolvedBrowserLaunch,
+    slot: int,
+) -> ResolvedBrowserLaunch:
+    if not isinstance(slot, int) or isinstance(slot, bool) or slot < 0:
+        raise BrowserConfigurationError("The browser slot is invalid")
+    if slot == 0 or launch.cdp_url is not None:
+        return launch
+    if launch.executable_path is None or launch.user_data_dir is None:
+        raise BrowserConfigurationError("Local Chrome configuration is incomplete")
+    profile = launch.user_data_dir.with_name(
+        f"{launch.user_data_dir.name}-slot-{slot + 1}"
+    )
+    return ResolvedBrowserLaunch(
+        cdp_url=None,
+        executable_path=launch.executable_path,
+        user_data_dir=_resolve_dedicated_profile(profile),
+    )
+
+
 def _resolve_node_executable(configured: Path | None) -> Path:
     candidate = configured
     if candidate is None:
@@ -1977,6 +1997,7 @@ class PlaywrightCliRuntime:
             browser.update(
                 {
                     "cdpEndpoint": self._launch.cdp_url,
+                    "isolated": True,
                 }
             )
         else:

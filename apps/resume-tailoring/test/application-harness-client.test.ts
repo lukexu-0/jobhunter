@@ -1211,6 +1211,15 @@ describe("HttpApplicationHarnessClient", () => {
       },
       {
         response: Response.json(
+          { code: "session_capacity", message: "private capacity detail" },
+          { status: 409 },
+        ),
+        expected: "session_capacity" as const,
+        invoke: (client: HttpApplicationHarnessClient) =>
+          client.create(createInput, new AbortController().signal),
+      },
+      {
+        response: Response.json(
           { code: "session_terminal", message: "private terminal detail" },
           { status: 409 },
         ),

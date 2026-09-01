@@ -372,7 +372,7 @@ describe("application session service", () => {
     expect(manual.harness!.createCalls).toHaveLength(0);
   });
 
-  test("serializes automatic starts while the harness is occupied and continues after close", async () => {
+  test("starts multiple automatic applications while browser capacity remains", async () => {
     let availabilityKicks = 0;
     const target = await createTarget({
       skipReview: true,
@@ -387,14 +387,16 @@ describe("application session service", () => {
     );
 
     expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
     expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
     expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
       FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
     ]);
 
     await target.service.close(target.runId, signal());
     expect(availabilityKicks).toBe(1);
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
     expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
       FIRST_SESSION_ID,
       SECOND_SESSION_ID,
@@ -407,6 +409,94 @@ describe("application session service", () => {
       bridgeState: "running",
       pdfSha256: second.pdf.sha256,
     });
+  });
+
+  test("protects another run's in-flight reservation during reconciliation", async () => {
+    class InFlightHarness extends FakeHarness {
+      readonly firstGetStarted = deferred<void>();
+      readonly releaseFirstGet = deferred<void>();
+      #firstGet = true;
+
+      override async get(sessionId: string): Promise<ApplicationHarnessSnapshot> {
+        if (this.#firstGet) {
+          this.#firstGet = false;
+          this.getCalls.push(sessionId);
+          this.firstGetStarted.resolve();
+          await this.releaseFirstGet.promise;
+          throw new ApplicationHarnessError("session_not_found");
+        }
+        return await super.get(sessionId);
+      }
+    }
+
+    const harness = new InFlightHarness();
+    const target = await createTarget({
+      harness,
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+    });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2" },
+    );
+
+    const firstStart = target.service.start(target.runId, target.pdf.sha256, signal());
+    await harness.firstGetStarted.promise;
+    const secondView = await target.service.start(
+      second.run.id,
+      second.pdf.sha256,
+      signal(),
+    );
+    harness.releaseFirstGet.resolve();
+    const firstView = await firstStart;
+
+    expect(firstView).toMatchObject({ bridgeState: "running" });
+    expect(secondView).toMatchObject({ bridgeState: "running" });
+    expect(target.repository.getUnreleasedApplicationSessions()).toHaveLength(2);
+    expect(harness.createCalls.map(({ sessionId }) => sessionId)).toEqual([
+      SECOND_SESSION_ID,
+      FIRST_SESSION_ID,
+    ]);
+  });
+
+  test("maps durable fourth-slot admission to the public busy error", async () => {
+    const target = await createTarget({
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID, THIRD_SESSION_ID],
+    });
+    const runs = [
+      await createApprovedRun(
+        target.repository,
+        target.database,
+        target.artifacts,
+        { id: "run-2" },
+      ),
+      await createApprovedRun(
+        target.repository,
+        target.database,
+        target.artifacts,
+        { id: "run-3" },
+      ),
+      await createApprovedRun(
+        target.repository,
+        target.database,
+        target.artifacts,
+        { id: "run-4" },
+      ),
+    ];
+
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    await target.service.start(runs[0]!.run.id, runs[0]!.pdf.sha256, signal());
+    await target.service.start(runs[1]!.run.id, runs[1]!.pdf.sha256, signal());
+
+    await expect(
+      target.service.start(runs[2]!.run.id, runs[2]!.pdf.sha256, signal()),
+    ).rejects.toMatchObject({
+      code: "APPLICATION_SESSION_BUSY",
+      message: "Browser application sessions are currently unavailable",
+      status: 409,
+    });
+    expect(target.repository.getLatestApplicationSession(runs[2]!.run.id)).toBeNull();
   });
 
   test("restores cleanup observation for an unreleased live session after restart", async () => {
@@ -439,12 +529,11 @@ describe("application session service", () => {
     });
     const previousStreamCalls = target.harness!.streamCalls.length;
 
-    expect(await restarted.startNextAutomaticApplication(signal())).toBe(false);
-    expect(target.harness!.streamCalls).toHaveLength(previousStreamCalls + 1);
-    expect(target.harness!.streamCalls.at(-1)).toEqual({
+    expect(await restarted.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.harness!.streamCalls.slice(previousStreamCalls)).toEqual([{
       sessionId: FIRST_SESSION_ID,
       lastEventId: undefined,
-    });
+    }]);
 
     target.harness!.snapshots.delete(FIRST_SESSION_ID);
     cleanupStream.resolve({
@@ -459,10 +548,58 @@ describe("application session service", () => {
     });
     expect(availabilityKicks).toBe(1);
 
-    expect(await restarted.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await restarted.startNextAutomaticApplication(signal())).toBe(false);
     expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
       bridgeState: "running",
       slotReleased: false,
+    });
+    await restarted.dispose();
+  });
+
+  test("reconciles every unreleased application session after restart", async () => {
+    const target = await createTarget({
+      skipReview: true,
+      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+    });
+    const second = await createApprovedRun(
+      target.repository,
+      target.database,
+      target.artifacts,
+      { id: "run-2", skipReview: true },
+    );
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    await target.service.dispose();
+
+    target.harness!.snapshots.set(FIRST_SESSION_ID, {
+      ...harnessSnapshot("closed"),
+      updatedAt: 10_200,
+    });
+    target.harness!.snapshots.set(SECOND_SESSION_ID, {
+      ...harnessSnapshot("closed"),
+      updatedAt: 10_200,
+    });
+    const restarted = new ApplicationSessionService({
+      repository: target.repository,
+      artifacts: target.artifacts,
+      harness: target.harness!,
+      uuidFactory: () => THIRD_SESSION_ID,
+      profileReader: () => PROFILE,
+    });
+    const previousGetCalls = target.harness!.getCalls.length;
+
+    expect(await restarted.startNextAutomaticApplication(signal())).toBe(false);
+    expect(target.harness!.getCalls.slice(previousGetCalls)).toEqual([
+      FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
+    ]);
+    expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
+      bridgeState: "closed",
+      slotReleased: true,
+    });
+    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+      bridgeState: "closed",
+      slotReleased: true,
     });
     await restarted.dispose();
   });
@@ -949,7 +1086,7 @@ describe("application session service", () => {
     });
   });
 
-  test("recovers a timed-out or same-ID create and rejects an unrelated singleton", async () => {
+  test("recovers caller-owned creates and rejects unavailable browser slots", async () => {
     const timedOutHarness = new FakeHarness();
     timedOutHarness.createError = new ApplicationHarnessError("unavailable");
     timedOutHarness.storeSnapshotBeforeCreateError = true;
@@ -986,23 +1123,42 @@ describe("application session service", () => {
       .toMatchObject({ generation: 1, bridgeState: "running" });
     expect(sameIdHarness.getCalls).toEqual([FIRST_SESSION_ID, FIRST_SESSION_ID]);
 
-    const busyHarness = new FakeHarness();
-    busyHarness.createError = new ApplicationHarnessError("session_active_different_id");
-    const busy = await createTarget({ harness: busyHarness });
-    await expect(
-      busy.service.start(busy.runId, busy.pdf.sha256, signal()),
-    ).rejects.toMatchObject({
-      code: "APPLICATION_SESSION_BUSY",
-      message: "Another application session is active",
-      status: 409,
-    });
-    expect(busy.repository.getLatestApplicationSession(busy.runId)).toMatchObject({
-      generation: 1,
-      bridgeState: "reserved",
-      publicSnapshot: null,
-    });
-    expect(JSON.stringify(busy.repository.getLatestApplicationSession(busy.runId)?.publicSnapshot))
-      .not.toContain(JOB_URL);
+    for (const code of ["session_active_different_id", "session_capacity"] as const) {
+      const busyHarness = new FakeHarness();
+      busyHarness.createError = new ApplicationHarnessError(code);
+      const busy = await createTarget({
+        harness: busyHarness,
+        skipReview: true,
+        sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+      });
+      await expect(
+        busy.service.start(busy.runId, busy.pdf.sha256, signal()),
+      ).rejects.toMatchObject({
+        code: "APPLICATION_SESSION_BUSY",
+        message: "Browser application sessions are currently unavailable",
+        status: 409,
+      });
+      expect(busy.repository.getLatestApplicationSession(busy.runId)).toMatchObject({
+        generation: 1,
+        sessionId: FIRST_SESSION_ID,
+        bridgeState: "closed",
+        slotReleased: true,
+        publicSnapshot: null,
+      });
+
+      busyHarness.createError = null;
+      expect(await busy.service.startNextAutomaticApplication(signal())).toBe(true);
+      expect(busyHarness.createCalls.map(({ sessionId }) => sessionId)).toEqual([
+        FIRST_SESSION_ID,
+        SECOND_SESSION_ID,
+      ]);
+      expect(busy.repository.getLatestApplicationSession(busy.runId)).toMatchObject({
+        generation: 2,
+        sessionId: SECOND_SESSION_ID,
+        bridgeState: "running",
+        slotReleased: false,
+      });
+    }
   });
 
   test("marks an observed 404 lost, signals availability once, and rotates only through explicit terminal retry", async () => {
@@ -1178,7 +1334,7 @@ describe("application session service", () => {
     expect(availabilityKicks).toBe(1);
   });
 
-  test("reconciles a persisted terminal slot before starting the next automatic run", async () => {
+  test("reconciles a persisted terminal slot while starting the next automatic run", async () => {
     let availabilityKicks = 0;
     const target = await createTarget({
       skipReview: true,
@@ -1218,7 +1374,7 @@ describe("application session service", () => {
       bridgeState: "failed",
       slotReleased: false,
     });
-    expect(target.repository.getNextAutomaticApplicationStart()).toBeNull();
+    expect(target.repository.getNextAutomaticApplicationStart()?.runId).toBe(second.run.id);
     expect(availabilityKicks).toBe(0);
 
     target.harness!.snapshots.set(FIRST_SESSION_ID, {
@@ -1557,11 +1713,11 @@ describe("application session service", () => {
       canStart: true,
       canStartAfterApproval: false,
     });
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
-    expect(harness.createCalls).toHaveLength(2);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(harness.createCalls).toHaveLength(3);
 
     await target.service.close(blocker.run.id, signal());
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
     expect(harness.createCalls).toHaveLength(3);
     expect(harness.createCalls[2]).toMatchObject({
       sessionId: THIRD_SESSION_ID,

@@ -22,6 +22,7 @@ import {
 import { REPOSITORY_ROOT } from "../context/manifest.ts";
 import { OAuthRequiredError } from "../auth/oauth-only-resolver.ts";
 import {
+  ApplicationSessionCapacityError,
   APPLICATION_SUBMISSION_UNCERTAIN_WARNING,
   ApplicationSubmissionFinalError,
   PipelineRepository,
@@ -108,7 +109,7 @@ const SERVICE_ERRORS: Readonly<
     status: 409,
   },
   APPLICATION_SESSION_BUSY: {
-    message: "Another application session is active",
+    message: "Browser application sessions are currently unavailable",
     status: 409,
   },
   APPLICATION_COMMAND_CONFLICT: {
@@ -286,6 +287,9 @@ function mapRepositoryError(error: unknown): never {
   if (error instanceof ApplicationSubmissionFinalError) {
     throw new ApplicationSessionServiceError("APPLICATION_SUBMISSION_FINAL");
   }
+  if (error instanceof ApplicationSessionCapacityError) {
+    throw new ApplicationSessionServiceError("APPLICATION_SESSION_BUSY");
+  }
   if (error instanceof RunArtifactsPrunedError) throw runArtifactsPruned();
   if (error instanceof RepositoryConflictError) {
     const code = error.message === "run not found"
@@ -315,6 +319,13 @@ function isSupersededApplicationSession(
   return isTerminal(session)
     && !submissionCannotRetry(session)
     && session.resumeRevision < currentRevision;
+}
+
+function isRetryableRejectedReservation(session: PublicApplicationSession): boolean {
+  return session.bridgeState === "closed"
+    && session.slotReleased
+    && session.publicSnapshot === null
+    && session.submissionPhase === "not_attempted";
 }
 
 function retainedSubmissionFinal(session: PublicApplicationSession): boolean {
@@ -416,7 +427,7 @@ export class ApplicationSessionService {
 
   async startNextAutomaticApplication(signal: AbortSignal): Promise<boolean> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal);
+    await this.#reconcileApplicationSessions(signal);
     const candidate = this.dependencies.repository.getNextAutomaticApplicationStart();
     if (!candidate) return false;
     await this.start(candidate.runId, candidate.approvedPdfSha256, signal);
@@ -432,7 +443,11 @@ export class ApplicationSessionService {
     } catch (error) {
       mapRepositoryError(error);
     }
-    if (latest && !isSupersededApplicationSession(latest, run.currentRevision)) {
+    if (
+      latest
+      && !isSupersededApplicationSession(latest, run.currentRevision)
+      && !isRetryableRejectedReservation(latest)
+    ) {
       return this.#storedView(latest);
     }
 
@@ -563,7 +578,7 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal, runId);
+    await this.#reconcileApplicationSessions(signal, runId);
     let latest: PublicApplicationSession | null;
     try {
       latest = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -577,7 +592,13 @@ export class ApplicationSessionService {
       const run = isTerminal(latest)
         ? this.dependencies.repository.getRun(runId)
         : null;
-      if (run && isSupersededApplicationSession(latest, run.currentRevision)) {
+      if (
+        run
+        && (
+          isSupersededApplicationSession(latest, run.currentRevision)
+          || isRetryableRejectedReservation(latest)
+        )
+      ) {
         const prepared = await this.#prepareStart(runId, expectedApprovedPdfSha256, signal);
         let reserved: PublicApplicationSession;
         try {
@@ -650,7 +671,7 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal);
+    await this.#reconcileApplicationSessions(signal);
     let previous: PublicApplicationSession | null;
     try {
       previous = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -1446,7 +1467,11 @@ export class ApplicationSessionService {
       if (error instanceof ApplicationHarnessError) {
         if (error.code === "session_active_same_id" || error.code === "session_terminal") {
           // The same caller-owned UUID exists; the subsequent GET is authoritative.
-        } else if (error.code === "session_active_different_id") {
+        } else if (
+          error.code === "session_active_different_id"
+          || error.code === "session_capacity"
+        ) {
+          this.#abandonReservation(runId, session);
           throw new ApplicationSessionServiceError("APPLICATION_SESSION_BUSY");
         } else if (error.code === "invalid_request") {
           this.#recordLocalClosed(runId, session);
@@ -1669,6 +1694,18 @@ export class ApplicationSessionService {
     });
   }
 
+  #abandonReservation(runId: string, session: PublicApplicationSession): void {
+    try {
+      this.dependencies.repository.abandonApplicationSessionReservation(
+        runId,
+        session.generation,
+        session.sessionId,
+      );
+    } catch (error) {
+      mapRepositoryError(error);
+    }
+  }
+
   #recordLocalClosed(runId: string, session: PublicApplicationSession): void {
     const closed = this.#closedProjection(session, null);
     try {
@@ -1689,47 +1726,52 @@ export class ApplicationSessionService {
     }
   }
 
-  async #reconcileApplicationSlot(
+  async #reconcileApplicationSessions(
     signal: AbortSignal,
     resumableRunId?: string,
   ): Promise<void> {
-    let session: PublicApplicationSession | null;
+    let sessions: readonly PublicApplicationSession[];
     try {
-      session = this.dependencies.repository.getUnreleasedApplicationSession();
+      sessions = this.dependencies.repository.getUnreleasedApplicationSessions();
     } catch (error) {
       mapRepositoryError(error);
     }
-    if (
-      session
-      && session.runId === resumableRunId
-      && session.publicSnapshot === null
-      && (session.bridgeState === "reserved" || session.bridgeState === "starting")
-    ) {
-      return;
-    }
-    if (!session) return;
+    if (sessions.length === 0) return;
     const harness = this.dependencies.harness;
     if (!harness) return;
-    try {
-      const snapshot = await harness.get(session.sessionId, signal);
-      this.#recordHarnessSnapshot(session.runId, session, snapshot);
-      const current =
-        this.dependencies.repository.getLatestApplicationSession(session.runId);
+    for (const session of sessions) {
+      signal.throwIfAborted();
       if (
-        current
-        && current.generation === session.generation
-        && current.sessionId === session.sessionId
-        && !current.slotReleased
+        this.#pendingResumes.has(session.sessionId)
+        || (
+          session.runId === resumableRunId
+          && session.publicSnapshot === null
+          && (session.bridgeState === "reserved" || session.bridgeState === "starting")
+        )
       ) {
-        this.#ensureSlotReleaseObserver(current.runId, current);
+        continue;
       }
-    } catch (error) {
-      if (signal.aborted) signal.throwIfAborted();
-      if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
-        this.#reconcileMissingHarnessSession(session);
-        return;
+      try {
+        const snapshot = await harness.get(session.sessionId, signal);
+        this.#recordHarnessSnapshot(session.runId, session, snapshot);
+        const current =
+          this.dependencies.repository.getLatestApplicationSession(session.runId);
+        if (
+          current
+          && current.generation === session.generation
+          && current.sessionId === session.sessionId
+          && !current.slotReleased
+        ) {
+          this.#ensureSlotReleaseObserver(current.runId, current);
+        }
+      } catch (error) {
+        if (signal.aborted) signal.throwIfAborted();
+        if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
+          this.#reconcileMissingHarnessSession(session);
+          continue;
+        }
+        this.#throwHarnessError(error);
       }
-      this.#throwHarnessError(error);
     }
   }
 
@@ -1944,7 +1986,10 @@ export class ApplicationSessionService {
 
   #throwHarnessError(error: unknown): never {
     if (error instanceof ApplicationHarnessError) {
-      if (error.code === "session_active_different_id") {
+      if (
+        error.code === "session_active_different_id"
+        || error.code === "session_capacity"
+      ) {
         throw new ApplicationSessionServiceError("APPLICATION_SESSION_BUSY");
       }
     }
