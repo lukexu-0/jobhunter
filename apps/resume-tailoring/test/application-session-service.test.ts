@@ -1966,6 +1966,18 @@ describe("application session service", () => {
     }]);
   });
 
+  test("marks an accepted submit command as applied immediately", async () => {
+    const harness = new FakeHarness();
+    harness.snapshotAfterCreate = harnessReviewSnapshot();
+    const target = await createTarget({ harness });
+    await target.service.start(target.runId, target.pdf.sha256, signal());
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("pending");
+
+    await target.service.command(target.runId, { type: "submit" }, signal());
+
+    expect(target.repository.getRun(target.runId)?.applicationStatus).toBe("applied");
+  });
+
   test("persists an expired terminal snapshot before returning command conflict", async () => {
     const target = await createTarget();
     await target.service.start(target.runId, target.pdf.sha256, signal());

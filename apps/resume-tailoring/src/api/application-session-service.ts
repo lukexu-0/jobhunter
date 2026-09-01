@@ -1077,6 +1077,13 @@ export class ApplicationSessionService {
       }
       this.#throwHarnessError(error);
     }
+    if (command.type === "submit") {
+      try {
+        this.dependencies.repository.setApplicationStatus(runId, "applied");
+      } catch (error) {
+        mapRepositoryError(error);
+      }
+    }
   }
 
   async close(runId: string, signal: AbortSignal): Promise<void> {
