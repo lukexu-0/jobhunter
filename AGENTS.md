@@ -6,7 +6,7 @@ Jobhunter is a local, evidence-grounded system for opportunity discovery, resume
 
 - `apps/resume-tailoring/`: Bun/TypeScript pipeline API, SQLite workflow engine, discovery catalog, candidate-context snapshots, model-backed tailoring, TeX/PDF generation, QA, and application orchestration.
 - `apps/web/`: Next.js App Router UI for starting and monitoring runs, reviewing revisions, browsing discovery results, managing application state, and connecting OpenAI Codex OAuth.
-- `apps/application/`: separately launched Python/FastAPI harness that owns one constrained Playwright CLI/Chrome application session with human gates.
+- `apps/application/`: separately launched Python/FastAPI harness that owns up to three constrained Playwright CLI/Chrome application sessions, one exclusive source-capture session, and their human gates.
 
 Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and public-safe failures. `apps/user-info/` contains private candidate evidence; those files are inputs, not operational engineering documentation.
 
@@ -17,7 +17,7 @@ Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and publi
 3. `WorkerScheduler` leases at most five SQLite claims. `PipelineStageProcessor` claim-fences `analyzing → tailoring/editing → compiling/repairing → deterministic_qa → visual_qa → review/approved`. Stages create new artifacts and guarded revisions; they do not mutate finalized output.
 4. `PipelineRepository` owns durable run, revision, attempt, claim, event, source-snapshot, and application-session state. `ArtifactStore` owns bounded, path-contained bytes. Writes are atomic and SHA-256/size verified; claim tokens and source/PDF hashes reject stale work.
 5. Shared React data lives in `DashboardDataProvider`; detail/review and application-stream state live in their owning workspace components. Poll only while work is active and reject stale responses with request/version or generation/event guards.
-6. For approved URL-backed runs, `ApplicationSessionService` sends the approved PDF, TeX source, profile, and mode to the bearer-protected Python harness. Python owns the singleton browser/source-capture slot and human gates, and calls only the private Bun `/v1/internal/application-agent` model boundary. Harness snapshots/events return through SQLite and the web SSE bridge; raw model traces remain private diagnostics.
+6. For approved URL-backed runs, `ApplicationSessionService` sends the approved PDF, TeX source, profile, and mode to the bearer-protected Python harness. Python owns three application browser slots or one exclusive source-capture session and owns all human gates; it calls only the private Bun `/v1/internal/application-agent` model boundary. Harness snapshots/events return through SQLite and the web SSE bridge; raw model traces remain private diagnostics.
 7. Runtime state is outside the checkout: `<data-root>/production/{pipeline.sqlite,context.sqlite,auth.sqlite,runs/}` or `<data-root>/development/<encoded-branch>/...`. `<data-root>` is absolute `JOBHUNTER_DATA_HOME`, otherwise absolute `$XDG_DATA_HOME/jobhunter`, otherwise `~/.local/share/jobhunter`. Never edit these stores directly.
 
 ## Key Directories
@@ -102,7 +102,7 @@ The workspace launcher never starts the Python harness. Keep development and sta
 | `apps/web/app/providers/dashboard-data-provider.tsx` | Shared React run, identity, and OAuth state owner. |
 | `apps/web/app/components/run-review-workspace.tsx` | Application SSE projection, action latches, and review state. |
 | `apps/application/{pyproject.toml,uv.lock}` | Python runtime, exact dependencies, console entry point, and pytest setup. |
-| `apps/application/src/browser_harness/{cli,api,sessions}.py` | Harness composition, HTTP/auth boundary, and singleton browser-session state machine. |
+| `apps/application/src/browser_harness/{cli,api,sessions}.py` | Harness composition, HTTP/auth boundary, and three-slot browser-session state machine. |
 | `apps/resume-tailoring/src/{api/application-session-service,agents/application-agent-service}.ts` | Approved-run handoff, sanitized SSE projection, private model boundary, submission guards, and diagnostic traces. |
 | `info/docs/apps/index.html` | Canonical workspace operations and links to pipeline, web, and harness documentation. |
 
