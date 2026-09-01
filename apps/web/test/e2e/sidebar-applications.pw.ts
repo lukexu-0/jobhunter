@@ -2323,15 +2323,23 @@ test("shows only the Resume tab when the revision has no keyword map", async ({ 
 });
 
 
-test("filters by selectable application state and keeps stored Failed display-only", async ({ page }) => {
+test("filters by independent pipeline and application statuses and keeps Failed display-only", async ({ page }) => {
   await interceptRuns(page);
   await page.goto("/");
 
-  const state = page.getByRole("combobox", { name: "Filter applications by state" });
-  await expect(state.locator("option")).toHaveText([
-    "All states",
-    "Pending",
-    "Applying",
+  const pipelineStatus = page.getByRole("combobox", { name: "Filter applications by pipeline status" });
+  await expect(pipelineStatus.locator("option")).toHaveText([
+    "All pipeline statuses",
+    "Tailoring",
+    "Awaiting review",
+    "In-progress",
+    "Completed",
+  ]);
+
+  const applicationStatus = page.getByRole("combobox", { name: "Filter applications by application status" });
+  await expect(applicationStatus.locator("option")).toHaveText([
+    "All application statuses",
+    "Pending application",
     "Did not apply",
     "Applied",
     "OA received",
@@ -2340,29 +2348,29 @@ test("filters by selectable application state and keeps stored Failed display-on
     "Interview",
     "Accepted",
   ]);
-  await expect(state.locator('option[value="failed"]')).toHaveCount(0);
+  await expect(applicationStatus.locator('option[value="failed"]')).toHaveCount(0);
 
   for (const [status, runId] of [
     ["did_not_apply", "lifecycle-did-not-apply"],
     ["oa_received", "lifecycle-oa-received"],
     ["oa_completed", "lifecycle-oa-completed"],
   ] as const) {
-    await state.selectOption(status);
+    await applicationStatus.selectOption(status);
     await expect(page.locator("tbody tr")).toHaveCount(1);
     await expect(page.locator(`tbody a.application-link[href="/runs/${runId}"]`)).toBeVisible();
   }
 
-  await state.selectOption("interview");
+  await applicationStatus.selectOption("interview");
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await expect(page.locator('tbody a.application-link[href="/runs/lifecycle-interview"]')).toBeVisible();
 
-  await state.selectOption("all");
-  const failedState = page.getByRole("combobox", { name: "Application state for lifecycl…iled" });
-  await expect(failedState).toHaveValue("failed");
-  await expect(failedState.locator('option[value="failed"]')).toBeDisabled();
+  await applicationStatus.selectOption("all");
+  const failedStatus = page.getByRole("combobox", { name: "Application status for lifecycl…iled" });
+  await expect(failedStatus).toHaveValue("failed");
+  await expect(failedStatus.locator('option[value="failed"]')).toBeDisabled();
 });
 
-test("lets the user change application state", async ({ page }) => {
+test("lets the user change application status", async ({ page }) => {
   await interceptRuns(page);
   let requestBody: string | null = null;
   await page.route("**/api/pipeline/runs/lifecycle-applied", async (route) => {
@@ -2380,7 +2388,7 @@ test("lets the user change application state", async ({ page }) => {
   await page.goto("/");
 
   const applicationState = page.getByRole("combobox", {
-    name: "Application state for lifecycl…lied",
+    name: "Application status for lifecycl…lied",
   });
   await expect(applicationState).toHaveValue("applied");
 
@@ -2391,7 +2399,7 @@ test("lets the user change application state", async ({ page }) => {
   await expect(applicationState).toBeEnabled();
 });
 
-test("retains application state when an update fails", async ({ page }) => {
+test("retains application status when an update fails", async ({ page }) => {
   await interceptRuns(page);
   await page.route("**/api/pipeline/runs/lifecycle-applied", async (route) => {
     expect(route.request().method()).toBe("PATCH");
@@ -2406,7 +2414,7 @@ test("retains application state when an update fails", async ({ page }) => {
   await page.goto("/");
 
   const applicationState = page.getByRole("combobox", {
-    name: "Application state for lifecycl…lied",
+    name: "Application status for lifecycl…lied",
   });
   await expect(applicationState).toHaveValue("applied");
 
@@ -2414,7 +2422,7 @@ test("retains application state when an update fails", async ({ page }) => {
 
   await expect(applicationState).toHaveValue("applied");
   await expect(applicationState).toBeEnabled();
-  await expect(page.getByRole("alert", { name: "Application state update error" })).toContainText("Application state could not be updated. Try again.");
+  await expect(page.getByRole("alert", { name: "Application status update error" })).toContainText("Application status could not be updated. Try again.");
 });
 
 test("shows application lifecycle and pipeline progress separately without legacy metadata", async ({ page }) => {
@@ -2482,7 +2490,7 @@ test("calls out an agent awaiting review without marking the application complet
   const applyingStage = workflow.getByRole("listitem").filter({ hasText: "Applying" });
   const appliedStage = workflow.getByRole("listitem").filter({ hasText: "Applied" });
 
-  await expect(applicationSummary.getByText("Pending", { exact: true })).toBeVisible();
+  await expect(applicationSummary.getByText("Pending application", { exact: true })).toBeVisible();
   await expect(reviewAlert).toHaveText("Waiting for review!");
   await expect(applyingStage).toHaveAttribute("aria-current", "step");
   await expect(appliedStage.locator("svg")).toHaveCount(0);
@@ -2974,20 +2982,21 @@ test("uses the dark palette and accessible lifecycle status presentation", async
   }
 });
 
-test("renders Applying as a hollow info status at dashboard typography", async ({ page }) => {
-  const infoColor = "#83c6ef";
+test("renders In-progress separately from pending application status", async ({ page }) => {
+  const accentColor = "#d2f34c";
   const surfaceColor = "#090b0b";
-  const statusTextColor = "#ffffff";
   await interceptRuns(page, [{
-    ...runFixture("lifecycle-applying", "applied", "approved"),
+    ...runFixture("lifecycle-applying", "pending", "approved"),
     isApplying: true,
   }]);
   await page.goto("/");
 
-  const applyingControl = page.locator("span.application-status-control--applying");
-  await expect(page.locator("select.application-status-control--applying")).toHaveCount(0);
-  await expect(applyingControl).toHaveText("Applying");
-  const style = await applyingControl.evaluate((element) => {
+  const pipelineStatus = page.locator("span.pipeline-status-badge--in_progress");
+  const applicationStatus = page.locator("select.application-status-control--pending");
+  await expect(pipelineStatus).toHaveText("In-progress");
+  await expect(applicationStatus).toHaveValue("pending");
+  await expect(applicationStatus.locator("option:checked")).toHaveText("Pending application");
+  const style = await pipelineStatus.evaluate((element) => {
     const computed = getComputedStyle(element);
     return {
       color: computed.color,
@@ -2997,12 +3006,12 @@ test("renders Applying as a hollow info status at dashboard typography", async (
     };
   });
   expect(style).toEqual({
-    color: cssRgb(statusTextColor),
-    borderColor: cssRgb(infoColor),
-    backgroundColor: cssRgb(surfaceColor),
+    color: cssRgb(accentColor),
+    borderColor: cssRgb(accentColor),
+    backgroundColor: "rgba(0, 0, 0, 0)",
     fontSize: "15px",
   });
-  expect(contrastRatio(statusTextColor, surfaceColor)).toBeGreaterThanOrEqual(4.5);
+  expect(contrastRatio(accentColor, surfaceColor)).toBeGreaterThanOrEqual(4.5);
 });
 
 test("uses route-workspace breakpoints for detail panes", async ({ page }) => {

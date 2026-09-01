@@ -49,18 +49,24 @@ const EMPTY_RUNS: RunDto[] = [];
 const ROW_INTERACTIVE_SELECTOR = "a, button, input, select, textarea, summary, [contenteditable='true']";
 const FOCUSABLE_INTERACTIVE_SELECTOR = "a[href], area[href], button:not(:disabled), input:not(:disabled):not([type='hidden']), select:not(:disabled), textarea:not(:disabled), summary, iframe, audio[controls], video[controls], [contenteditable]:not([contenteditable='false']), [tabindex]";
 const SELECTABLE_APPLICATION_STATUSES = APPLICATION_STATUSES.filter((status) => status !== "failed");
-const DASHBOARD_STATUS_FILTERS = [
-  "pending",
-  "applying",
-  "did_not_apply",
-  "applied",
-  "oa_received",
-  "oa_completed",
-  "rejected",
-  "interview",
-  "accepted",
-] as const;
+const PIPELINE_STATUSES = ["tailoring", "awaiting_review", "in_progress", "completed"] as const;
 
+
+type PipelineStatus = "tailoring" | "awaiting_review" | "in_progress" | "completed";
+
+const PIPELINE_STATUS_LABELS: Readonly<Record<PipelineStatus, string>> = {
+  tailoring: "Tailoring",
+  awaiting_review: "Awaiting review",
+  in_progress: "In-progress",
+  completed: "Completed",
+};
+
+function pipelineStatusFor(run: Pick<RunDto, "status" | "applicationStatus">): PipelineStatus {
+  if (run.status === "failed") return "completed";
+  if (run.status === "review") return "awaiting_review";
+  if (run.status !== "approved") return "tailoring";
+  return run.applicationStatus === "pending" ? "in_progress" : "completed";
+}
 
 const IS_TERMINAL_STATUS: Record<RunStatus, boolean> = {
   queued: false,
@@ -84,7 +90,8 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 
 type SortDirection = "newest" | "oldest";
-type StatusFilter = ApplicationStatus | "all" | "applying";
+type PipelineStatusFilter = PipelineStatus | "all";
+type ApplicationStatusFilter = ApplicationStatus | "all";
 type IdentityField = "title" | "organization";
 type OpportunityKindSelection = OpportunityKind | "auto";
 type InitializerSource = "url" | "pasted";
@@ -336,7 +343,8 @@ export function RunDashboard() {
   const [isLoading, setIsLoading] = useState(showInitialLoading.current);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [pipelineStatusFilter, setPipelineStatusFilter] = useState<PipelineStatusFilter>("all");
+  const [applicationStatusFilter, setApplicationStatusFilter] = useState<ApplicationStatusFilter>("all");
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0]);
@@ -769,15 +777,16 @@ export function RunDashboard() {
   const filteredRuns = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return runs
-      .filter((run) => {
-        if (statusFilter === "all") return true;
-        if (statusFilter === "applying") return run.isApplying === true;
-        return run.isApplying !== true && run.applicationStatus === statusFilter;
-      })
+      .filter((run) => (
+        pipelineStatusFilter === "all" || pipelineStatusFor(run) === pipelineStatusFilter
+      ))
+      .filter((run) => (
+        applicationStatusFilter === "all" || run.applicationStatus === applicationStatusFilter
+      ))
       .filter((run) => {
         if (!normalizedQuery) return true;
         const identity = effectiveRunIdentity(run, jobIdentities[run.id]);
-        return [run.id, APPLICATION_STATUS_LABELS[run.applicationStatus], identity.title, identity.organization]
+        return [run.id, PIPELINE_STATUS_LABELS[pipelineStatusFor(run)], APPLICATION_STATUS_LABELS[run.applicationStatus], identity.title, identity.organization]
           .filter((value): value is string => Boolean(value))
           .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
       })
@@ -789,7 +798,7 @@ export function RunDashboard() {
           ? right.updatedAt - left.updatedAt
           : left.updatedAt - right.updatedAt;
       });
-  }, [jobIdentities, query, runs, sortDirection, statusFilter]);
+  }, [applicationStatusFilter, jobIdentities, pipelineStatusFilter, query, runs, sortDirection]);
 
   const totalPages = Math.max(1, Math.ceil(filteredRuns.length / pageSize));
   const safePage = Math.min(currentPage, totalPages);
@@ -806,8 +815,13 @@ export function RunDashboard() {
     setCurrentPage(1);
   };
 
-  const updateStatus = (value: StatusFilter) => {
-    setStatusFilter(value);
+  const updatePipelineStatusFilter = (value: PipelineStatusFilter) => {
+    setPipelineStatusFilter(value);
+    setCurrentPage(1);
+  };
+
+  const updateApplicationStatusFilter = (value: ApplicationStatusFilter) => {
+    setApplicationStatusFilter(value);
     setCurrentPage(1);
   };
 
@@ -820,7 +834,7 @@ export function RunDashboard() {
       setRuns((current) => current?.map((run) => run.id === updated.id ? updated : run) ?? current);
       setStatusUpdateError(null);
     } catch {
-      setStatusUpdateError("Application state could not be updated. Try again.");
+      setStatusUpdateError("Application status could not be updated. Try again.");
     } finally {
       setRunBusy(runId, false);
     }
@@ -1465,17 +1479,28 @@ export function RunDashboard() {
             </label>
             <div className="applications-toolbar__actions">
               <label className="select-control">
-                <span>State</span>
+                <span>Pipeline status</span>
                 <select
-                  aria-label="Filter applications by state"
-                  value={statusFilter}
-                  onChange={(event) => updateStatus(event.target.value as StatusFilter)}
+                  aria-label="Filter applications by pipeline status"
+                  value={pipelineStatusFilter}
+                  onChange={(event) => updatePipelineStatusFilter(event.target.value as PipelineStatusFilter)}
                 >
-                  <option value="all">All states</option>
-                  {DASHBOARD_STATUS_FILTERS.map((status) => (
-                    <option value={status} key={status}>
-                      {status === "applying" ? "Applying" : APPLICATION_STATUS_LABELS[status]}
-                    </option>
+                  <option value="all">All pipeline statuses</option>
+                  {PIPELINE_STATUSES.map((status) => (
+                    <option value={status} key={status}>{PIPELINE_STATUS_LABELS[status]}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="select-control">
+                <span>Application status</span>
+                <select
+                  aria-label="Filter applications by application status"
+                  value={applicationStatusFilter}
+                  onChange={(event) => updateApplicationStatusFilter(event.target.value as ApplicationStatusFilter)}
+                >
+                  <option value="all">All application statuses</option>
+                  {SELECTABLE_APPLICATION_STATUSES.map((status) => (
+                    <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>
                   ))}
                 </select>
               </label>
@@ -1517,7 +1542,7 @@ export function RunDashboard() {
           ) : null}
 
           {statusUpdateError ? (
-            <div className="dashboard-alert dashboard-alert--toolbar" role="alert" aria-label="Application state update error">
+            <div className="dashboard-alert dashboard-alert--toolbar" role="alert" aria-label="Application status update error">
               <span>{statusUpdateError}</span>
             </div>
           ) : null}
@@ -1529,14 +1554,15 @@ export function RunDashboard() {
                     <th scope="col">Role</th>
                     <th scope="col">Organization</th>
                     <th scope="col">Updated</th>
-                    <th scope="col">Status</th>
+                    <th scope="col">Pipeline status</th>
+                    <th scope="col">Application status</th>
                     <th scope="col"><span className="visually-hidden">Application actions</span></th>
                   </tr>
                 </thead>
                 <tbody>
                   {loadError && runs.length === 0 ? (
                     <tr>
-                      <td colSpan={5}>
+                      <td colSpan={6}>
                         <div className="applications-state applications-state--table" role="alert">
                           <p>{loadError}</p>
                           <button className="square-control" type="button" onClick={() => void load(true)}>Try again</button>
@@ -1546,14 +1572,14 @@ export function RunDashboard() {
                   ) : null}
                   {isLoading && !(loadError && runs.length === 0) ? (
                     <tr>
-                      <td colSpan={5}>
+                      <td colSpan={6}>
                         <div className="applications-state applications-state--table" role="status">Loading applications…</div>
                       </td>
                     </tr>
                   ) : null}
                   {showInitialEmpty ? (
                     <tr>
-                      <td colSpan={5}>
+                      <td colSpan={6}>
                         <div className="applications-state applications-state--table">
                           <p>No applications yet. Enter an opportunity URL above to initialize one.</p>
                         </div>
@@ -1562,10 +1588,14 @@ export function RunDashboard() {
                   ) : null}
                   {showFilteredEmpty ? (
                     <tr>
-                      <td colSpan={5}>
+                      <td colSpan={6}>
                         <div className="applications-state applications-state--table">
-                          <p>No applications match the current search and state.</p>
-                          <button className="inline-control" type="button" onClick={() => { updateQuery(""); updateStatus("all"); }}>Clear filters</button>
+                          <p>No applications match the current search and statuses.</p>
+                          <button className="inline-control" type="button" onClick={() => {
+                            updateQuery("");
+                            updatePipelineStatusFilter("all");
+                            updateApplicationStatusFilter("all");
+                          }}>Clear filters</button>
                         </div>
                       </td>
                     </tr>
@@ -1576,6 +1606,7 @@ export function RunDashboard() {
                     const href = `/runs/${encodeURIComponent(run.id)}`;
                     const organization =
                       identity.organization ?? presentation.dashboardOrganizationFallback;
+                    const pipelineStatus = pipelineStatusFor(run);
                     return (
                       <tr
                         key={run.id}
@@ -1595,29 +1626,28 @@ export function RunDashboard() {
                         }</td>
                         <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
                         <td>
-                          {run.isApplying ? (
-                            <span
-                              aria-label={`Application state for ${shortRunId(run.id)}: Applying`}
-                              className="application-status-control application-status-control--applying"
-                            >
-                              Applying
-                            </span>
-                          ) : (
-                            <select
-                              aria-label={`Application state for ${shortRunId(run.id)}`}
-                              className={`application-status-control application-status-control--${run.applicationStatus}`}
-                              value={run.applicationStatus}
-                              disabled={busyRunIds.has(run.id)}
-                              onChange={(event) => {
-                                void changeApplicationStatus(run.id, event.target.value as ApplicationStatus);
-                              }}
-                            >
-                              {run.applicationStatus === "failed" ? <option value="failed" disabled>{APPLICATION_STATUS_LABELS.failed}</option> : null}
-                              {SELECTABLE_APPLICATION_STATUSES.map((status) => (
-                                <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>
-                              ))}
-                            </select>
-                          )}
+                          <span
+                            aria-label={`Pipeline status for ${shortRunId(run.id)}: ${PIPELINE_STATUS_LABELS[pipelineStatus]}`}
+                            className={`pipeline-status-badge pipeline-status-badge--${pipelineStatus}`}
+                          >
+                            {PIPELINE_STATUS_LABELS[pipelineStatus]}
+                          </span>
+                        </td>
+                        <td>
+                          <select
+                            aria-label={`Application status for ${shortRunId(run.id)}`}
+                            className={`application-status-control application-status-control--${run.applicationStatus}`}
+                            value={run.applicationStatus}
+                            disabled={busyRunIds.has(run.id)}
+                            onChange={(event) => {
+                              void changeApplicationStatus(run.id, event.target.value as ApplicationStatus);
+                            }}
+                          >
+                            {run.applicationStatus === "failed" ? <option value="failed" disabled>{APPLICATION_STATUS_LABELS.failed}</option> : null}
+                            {SELECTABLE_APPLICATION_STATUSES.map((status) => (
+                              <option value={status} key={status}>{APPLICATION_STATUS_LABELS[status]}</option>
+                            ))}
+                          </select>
                         </td>
                         <td>
                           <button

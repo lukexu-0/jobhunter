@@ -1025,7 +1025,7 @@ test("shows opportunity kind in white beside application status", async ({ page 
   });
   const kind = summary.locator("p", { hasText: "Hackathon" });
   const icon = kind.locator("svg");
-  const status = summary.getByText("Pending", { exact: true });
+  const status = summary.getByText("Pending application", { exact: true });
   await expect(kind).toHaveCSS("color", "rgb(238, 241, 236)");
   await expect(icon).toHaveCount(1);
   await expect(icon).toHaveAttribute("aria-hidden", "true");
@@ -1266,7 +1266,7 @@ test("failed application start keeps approval and exposes a standalone Apply ret
     { expectedApprovedPdfSha256: pdfHash2 },
   ]);
   await expect(page.getByRole("status").filter({ hasText: "Starting browser" })).toBeVisible();
-  await expect(page.getByText("Pending", { exact: true })).toBeVisible();
+  await expect(page.getByText("Pending application", { exact: true })).toBeVisible();
 });
 
 test("an accepted live projection clears a stale application load failure", async ({ page }) => {
@@ -2822,7 +2822,7 @@ test("navigation, human review, submit approval, and close use exact public comm
   const applicationSummary = page.getByRole("complementary", {
     name: "Application summary and keyword comparison",
   });
-  await expect(applicationSummary.getByText("Pending", { exact: true })).toBeVisible();
+  await expect(applicationSummary.getByText("Pending application", { exact: true })).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ }))
     .toHaveText("Waiting for review!");
   await expect.poll(() => mock.runGetCount).toBe(1);
@@ -2944,7 +2944,7 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
   await expect(page.getByText("The application submission could not be verified.", {
     exact: false,
   })).toBeVisible();
-  await expect(page.getByText("Pending", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Pending application", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ })).toHaveCount(0);
   await expect.poll(() => mock.runGetCount).toBe(2);
 });
@@ -3019,7 +3019,7 @@ test("a failed submitted-run refresh is retryable without resubmitting", async (
   await expect(refreshAlert).toBeVisible();
   await expect(
     page.getByRole("complementary", { name: "Application summary and keyword comparison" })
-      .getByText("Pending", { exact: true }),
+      .getByText("Pending application", { exact: true }),
   ).toBeVisible();
   const appliedStage = page.getByRole("list", { name: "Workflow progress" })
     .getByRole("listitem")

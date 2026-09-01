@@ -1,7 +1,7 @@
 import type { ApplicationStatus } from "@jobhunter/pipeline/contracts";
 
 export const APPLICATION_STATUS_LABELS: Readonly<Record<ApplicationStatus, string>> = {
-  pending: "Pending",
+  pending: "Pending application",
   did_not_apply: "Did not apply",
   applied: "Applied",
   oa_received: "OA received",

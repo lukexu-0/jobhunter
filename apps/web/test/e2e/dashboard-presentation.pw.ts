@@ -201,7 +201,7 @@ test("presents application metadata headings on a raised high-contrast rail", as
   await interceptEmptyRuns(page);
   await page.goto("/");
 
-  for (const name of ["Role", "Organization", "Updated", "Status"]) {
+  for (const name of ["Role", "Organization", "Updated", "Pipeline status", "Application status"]) {
     const heading = page.getByRole("columnheader", { name, exact: true });
     await expect(heading).toHaveCSS("background-color", "rgb(17, 20, 19)");
     await expect(heading).toHaveCSS("color", "rgb(210, 243, 76)");
@@ -223,7 +223,7 @@ test("gives the Role heading extra space before Organization", async ({ page }) 
   const tableBox = await table.boundingBox();
   const roleBox = await roleHeading.boundingBox();
   if (!tableBox || !roleBox) throw new Error("Application header geometry is unavailable");
-  expect(roleBox.width / tableBox.width).toBeCloseTo(0.32, 2);
+  expect(roleBox.width / tableBox.width).toBeCloseTo(0.24, 2);
 });
 
 test("insets application titles from the left table edge", async ({ page }) => {
@@ -377,7 +377,7 @@ test("preserves an explicit Not mentioned organization while malformed targets u
   await expect(page.getByText("Should not be displayed", { exact: true })).toHaveCount(0);
 });
 
-test("uses five application columns in every table state", async ({ page }) => {
+test("uses six application columns in every table state", async ({ page }) => {
   let pendingRoute: Route | undefined;
   await page.route("**/api/pipeline/runs", async (route) => {
     pendingRoute = route;
@@ -386,10 +386,10 @@ test("uses five application columns in every table state", async ({ page }) => {
   await expect.poll(() => Boolean(pendingRoute)).toBe(true);
 
   const table = page.getByRole("table");
-  await expect(table.getByRole("columnheader")).toHaveCount(5);
+  await expect(table.getByRole("columnheader")).toHaveCount(6);
   await expect(table.getByRole("columnheader", { name: "Revision", exact: true })).toHaveCount(0);
   await expect(table.getByText("Loading applications…", { exact: true })).toBeVisible();
-  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "5");
+  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "6");
 
   if (!pendingRoute) throw new Error("Loading request was not captured");
   await pendingRoute.fulfill({
@@ -397,7 +397,7 @@ test("uses five application columns in every table state", async ({ page }) => {
     body: JSON.stringify({ runs: [] }),
   });
   await expect(page.getByText("No applications yet. Enter an opportunity URL above to initialize one.", { exact: true })).toBeVisible();
-  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "5");
+  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "6");
 
   await page.unroute("**/api/pipeline/runs");
   await page.route("**/api/pipeline/runs", async (route) => {
@@ -409,7 +409,7 @@ test("uses five application columns in every table state", async ({ page }) => {
   });
   await page.reload();
   await expect(table.getByRole("alert")).toContainText("The pipeline request failed.");
-  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "5");
+  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "6");
 
   await page.unroute("**/api/pipeline/runs");
   await page.route("**/api/pipeline/runs", async (route) => {
@@ -420,12 +420,12 @@ test("uses five application columns in every table state", async ({ page }) => {
   });
   await page.reload();
   await expect(table.locator("tbody tr")).toHaveCount(1);
-  await expect(table.locator("tbody tr").first().locator("td")).toHaveCount(5);
+  await expect(table.locator("tbody tr").first().locator("td")).toHaveCount(6);
   await expect(table.getByText("R01", { exact: true })).toHaveCount(0);
 
   await page.getByRole("searchbox", { name: "Search applications" }).fill("no match");
-  await expect(page.getByText("No applications match the current search and state.", { exact: true })).toBeVisible();
-  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "5");
+  await expect(page.getByText("No applications match the current search and statuses.", { exact: true })).toBeVisible();
+  await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "6");
 });
 
 test("places the total count before its bottom-aligned label", async ({ page }) => {
@@ -445,7 +445,7 @@ test("places the total count before its bottom-aligned label", async ({ page }) 
   expect(Math.abs(totalBox.y + totalBox.height - (labelBox.y + labelBox.height))).toBeLessThanOrEqual(1);
 });
 
-test("scrolls the applications table locally only when five columns do not fit", async ({ page }) => {
+test("scrolls the applications table locally only when six columns do not fit", async ({ page }) => {
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -468,7 +468,86 @@ test("scrolls the applications table locally only when five columns do not fit",
   );
 });
 
-test("uses the shared filter and lifecycle orders and exposes a square accessible row action menu without an arrow", async ({ page }) => {
+test("keeps the application toolbar within the viewport above its stacking breakpoint", async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  await interceptEmptyRuns(page);
+  await page.goto("/");
+
+  const documentWidth = await page.locator("html").evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }));
+  expect(documentWidth.scrollWidth).toBe(documentWidth.clientWidth);
+});
+
+test("separates pipeline and application status across workflow stages", async ({ page }) => {
+  const runs: RunDto[] = [
+    { ...runFixture(), id: "tailoring-stage", titleOverride: "Tailoring role", status: "tailoring", applicationStatus: "pending" },
+    { ...runFixture(), id: "review-stage", titleOverride: "Review role", status: "review", applicationStatus: "pending" },
+    { ...runFixture(), id: "in-progress-stage", titleOverride: "In-progress role", status: "approved", applicationStatus: "pending" },
+    { ...runFixture(), id: "completed-stage", titleOverride: "Completed role", status: "approved", applicationStatus: "applied" },
+  ];
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs }),
+    });
+  });
+  await page.goto("/");
+
+  await expect(page.getByRole("columnheader", { name: "Pipeline status" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Application status" })).toBeVisible();
+  await expect(page.getByRole("row").filter({ hasText: "Tailoring role" })).toContainText("Tailoring");
+  await expect(page.getByRole("row").filter({ hasText: "Review role" })).toContainText("Awaiting review");
+  await expect(page.getByRole("row").filter({ hasText: "In-progress role" })).toContainText("In-progress");
+  await expect(page.getByRole("row").filter({ hasText: "Completed role" })).toContainText("Completed");
+  const pendingApplicationStatus = page.getByRole("combobox", { name: /Application status for tailorin/ });
+  await expect(pendingApplicationStatus).toHaveValue("pending");
+  await expect(pendingApplicationStatus.locator("option:checked")).toHaveText("Pending application");
+});
+
+test("filters pipeline and application statuses independently", async ({ page }) => {
+  const runs: RunDto[] = [
+    { ...runFixture(), id: "filter-tailoring", titleOverride: "Tailoring role", status: "tailoring", applicationStatus: "pending" },
+    { ...runFixture(), id: "filter-review", titleOverride: "Review role", status: "review", applicationStatus: "pending" },
+    { ...runFixture(), id: "filter-progress", titleOverride: "In-progress role", status: "approved", applicationStatus: "pending" },
+    { ...runFixture(), id: "filter-completed", titleOverride: "Completed role", status: "approved", applicationStatus: "applied" },
+  ];
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs }) });
+  });
+  await page.goto("/");
+
+  const pipelineFilter = page.getByRole("combobox", { name: "Filter applications by pipeline status" });
+  const applicationFilter = page.getByRole("combobox", { name: "Filter applications by application status" });
+  await expect(pipelineFilter.locator("option")).toHaveText([
+    "All pipeline statuses",
+    "Tailoring",
+    "Awaiting review",
+    "In-progress",
+    "Completed",
+  ]);
+  await expect(applicationFilter.locator("option")).toHaveText([
+    "All application statuses",
+    "Pending application",
+    "Did not apply",
+    "Applied",
+    "OA received",
+    "OA completed",
+    "Rejected",
+    "Interview",
+    "Accepted",
+  ]);
+
+  await pipelineFilter.selectOption("awaiting_review");
+  await expect(page.getByRole("table").locator("tbody").getByRole("link")).toHaveText(["Review role"]);
+  await applicationFilter.selectOption("applied");
+  await expect(page.getByText("No applications match the current search and statuses.")).toBeVisible();
+  await pipelineFilter.selectOption("all");
+  await expect(page.getByRole("table").locator("tbody").getByRole("link")).toHaveText(["Completed role"]);
+});
+
+test("uses lifecycle order and exposes a square accessible row action menu without an arrow", async ({ page }) => {
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -478,7 +557,7 @@ test("uses the shared filter and lifecycle orders and exposes a square accessibl
   await page.goto("/");
 
   const statusLabels = [
-    "Pending",
+    "Pending application",
     "Did not apply",
     "Applied",
     "OA received",
@@ -487,23 +566,11 @@ test("uses the shared filter and lifecycle orders and exposes a square accessibl
     "Interview",
     "Accepted",
   ];
-  const filterStatusLabels = [
-    "Pending",
-    "Applying",
-    "Did not apply",
-    "Applied",
-    "OA received",
-    "OA completed",
-    "Rejected",
-    "Interview",
-    "Accepted",
-  ];
-  const filter = page.getByRole("combobox", { name: "Filter applications by state" });
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const applicationFilter = page.getByRole("combobox", { name: "Filter applications by application status" });
+  const rowStatus = page.getByRole("combobox", { name: "Application status for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
   const trigger = row.getByRole("button", { name: "Actions for presenta…-run" });
 
-  await expect(filter.locator("option")).toHaveText(["All states", ...filterStatusLabels]);
   await expect(rowStatus.locator("option")).toHaveText(statusLabels);
   await expect(row.getByRole("link", { name: "Open application presenta…-run" })).toHaveCount(1);
   await expect(row.locator(".row-arrow")).toHaveCount(0);
@@ -545,7 +612,7 @@ test("uses the shared filter and lifecycle orders and exposes a square accessibl
 
   await trigger.click();
   await expect(menu.getByRole("menuitem").first()).toBeFocused();
-  await filter.evaluate((element) => {
+  await applicationFilter.evaluate((element) => {
     (element as HTMLSelectElement).value = "pending";
     element.dispatchEvent(new Event("change", { bubbles: true }));
   });
@@ -553,7 +620,7 @@ test("uses the shared filter and lifecycle orders and exposes a square accessibl
   await expect(menu).toHaveCount(0);
   await page.evaluate(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
   await expect(page.getByRole("searchbox", { name: "Search applications" })).toBeFocused();
-  await filter.evaluate((element) => {
+  await applicationFilter.evaluate((element) => {
     (element as HTMLSelectElement).value = "all";
     element.dispatchEvent(new Event("change", { bubbles: true }));
   });
@@ -577,7 +644,9 @@ test("closes a stale action dialog when polling removes its application", async 
   });
   await page.goto("/");
 
-  await page.getByRole("button", { name: "Actions for Externally deleted" }).click();
+  const trigger = page.getByRole("button", { name: "Actions for Externally deleted" });
+  await trigger.scrollIntoViewIfNeeded();
+  await trigger.click();
   await page.getByRole("menuitem", { name: "Delete" }).click();
   const dialog = page.getByRole("dialog", { name: "Delete application?" });
   await expect(dialog).toBeVisible();
@@ -595,15 +664,15 @@ test("keeps an existing Failed status visible but not selectable", async ({ page
   });
   await page.goto("/");
 
-  const filter = page.getByRole("combobox", { name: "Filter applications by state" });
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const applicationFilter = page.getByRole("combobox", { name: "Filter applications by application status" });
+  const rowStatus = page.getByRole("combobox", { name: "Application status for presenta…-run" });
   const failedOption = rowStatus.locator('option[value="failed"]');
 
-  await expect(filter.locator('option[value="failed"]')).toHaveCount(0);
+  await expect(applicationFilter.locator('option[value="failed"]')).toHaveCount(0);
   await expect(rowStatus).toHaveValue("failed");
   await expect(failedOption).toBeDisabled();
   await expect(rowStatus.locator("option:not([disabled])")).toHaveText([
-    "Pending",
+    "Pending application",
     "Did not apply",
     "Applied",
     "OA received",
@@ -623,7 +692,7 @@ test("renders application status text with stronger contrast", async ({ page }) 
   });
   await page.goto("/");
 
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const rowStatus = page.getByRole("combobox", { name: "Application status for presenta…-run" });
   await expect(rowStatus).toHaveCSS("color", "rgb(255, 255, 255)");
   await expect(rowStatus).toHaveCSS("font-size", "15px");
 });
@@ -703,7 +772,9 @@ test("preserves focus transferred by the Search applications label while dismiss
   });
   await page.goto("/");
 
-  await page.getByRole("button", { name: "Actions for Focus target" }).click();
+  const trigger = page.getByRole("button", { name: "Actions for Focus target" });
+  await trigger.scrollIntoViewIfNeeded();
+  await trigger.click();
   const menu = page.getByRole("menu", { name: "Actions for Focus target" });
   await expect(menu).toBeVisible();
 
@@ -758,7 +829,7 @@ test("opens a run from a non-interactive cell without letting the status selecto
   });
   await page.goto("/");
 
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const rowStatus = page.getByRole("combobox", { name: "Application status for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
   await rowStatus.click();
   expect(new URL(page.url()).pathname).toBe("/");
@@ -814,9 +885,10 @@ test("retains identity input on failure and updates the row only after a success
   });
   await page.goto("/");
 
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const rowStatus = page.getByRole("combobox", { name: "Application status for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
   const trigger = row.getByRole("button", { name: "Actions for Original title" });
+  await trigger.scrollIntoViewIfNeeded();
   await trigger.click();
   await page.getByRole("menuitem", { name: "Edit title" }).click();
 
@@ -852,7 +924,7 @@ test("retains identity input on failure and updates the row only after a success
   await search.fill("Final title");
   await expect(row).toBeVisible();
   await search.fill("Original title");
-  await expect(page.getByText("No applications match the current search and state.")).toBeVisible();
+  await expect(page.getByText("No applications match the current search and statuses.")).toBeVisible();
 
   await search.fill("Final title");
   const finalTrigger = row.getByRole("button", { name: "Actions for Final title" });
@@ -863,7 +935,7 @@ test("retains identity input on failure and updates the row only after a success
   await expect(dialog).toHaveCount(0);
   await expect(row).toHaveCount(0);
   await expect(search).toBeFocused();
-  await expect(page.getByText("No applications match the current search and state.")).toBeVisible();
+  await expect(page.getByText("No applications match the current search and statuses.")).toBeVisible();
   expect(patchBodies).toEqual([
     { title: "New title" },
     { title: "Final title" },
@@ -899,9 +971,10 @@ test("requires delete confirmation and removes a run only after a successful bod
   });
   await page.goto("/");
 
-  const rowStatus = page.getByRole("combobox", { name: "Application state for presenta…-run" });
+  const rowStatus = page.getByRole("combobox", { name: "Application status for presenta…-run" });
   const row = page.getByRole("row").filter({ has: rowStatus });
   const trigger = row.getByRole("button", { name: "Actions for Delete candidate" });
+  await trigger.scrollIntoViewIfNeeded();
   const openDeleteDialog = async () => {
     await trigger.click();
     await page.getByRole("menuitem", { name: "Delete" }).click();
@@ -973,9 +1046,9 @@ test("prioritizes Applying, keeps Rejected last in both date directions, and res
   const table = page.getByRole("table");
   const roleLinks = table.locator("tbody").getByRole("link");
   const applyingRow = table.getByRole("row").filter({ hasText: "Applying oldest" });
-  const applyingStatus = applyingRow.getByLabel(/Application state for .*: Applying/);
-  await expect(applyingStatus).toHaveText("Applying");
-  await expect(applyingRow.getByRole("combobox", { name: /Application state for/ })).toHaveCount(0);
+  const pipelineStatus = applyingRow.getByLabel(/Pipeline status for .*: In-progress/);
+  await expect(pipelineStatus).toHaveText("In-progress");
+  await expect(applyingRow.getByRole("combobox", { name: /Application status for/ })).toHaveValue("pending");
   await expect(roleLinks).toHaveText([
     "Applying oldest",
     "Ordinary new",
@@ -1001,8 +1074,8 @@ test("prioritizes Applying, keeps Rejected last in both date directions, and res
     body: JSON.stringify({ runs: [completedApplyingRun, ...otherRuns] }),
   });
 
-  await expect(applyingStatus).toHaveCount(0);
-  await expect(applyingRow.getByRole("combobox", { name: /Application state for/ })).toHaveValue("pending");
+  await expect(pipelineStatus).toHaveText("In-progress");
+  await expect(applyingRow.getByRole("combobox", { name: /Application status for/ })).toHaveValue("pending");
   await expect(roleLinks).toHaveText([
     "Ordinary old",
     "Applying oldest",
@@ -1012,7 +1085,7 @@ test("prioritizes Applying, keeps Rejected last in both date directions, and res
   ]);
 });
 
-test("filters transient Applying rows separately from their stored lifecycle state", async ({ page }) => {
+test("keeps active application sessions in pending application status", async ({ page }) => {
   const runs = [
     dashboardRun({
       id: "filter-applying",
@@ -1040,15 +1113,14 @@ test("filters transient Applying rows separately from their stored lifecycle sta
   });
   await page.goto("/");
 
-  const filter = page.getByRole("combobox", { name: "Filter applications by state" });
+  const applicationFilter = page.getByRole("combobox", { name: "Filter applications by application status" });
   const visibleRoleLinks = page.getByRole("table").locator("tbody").getByRole("link");
-  await filter.selectOption("applying");
-  await expect(visibleRoleLinks).toHaveText(["Active pending application"]);
-  await expect(page.locator(".application-status-control--applying")).toHaveText("Applying");
+  await applicationFilter.selectOption("pending");
+  await expect(visibleRoleLinks).toHaveText(["Active pending application", "Durable pending application"]);
+  await expect(page.locator(".pipeline-status-badge--in_progress")).toHaveCount(2);
 
-  await filter.selectOption("pending");
-  await expect(visibleRoleLinks).toHaveText(["Durable pending application"]);
-  await expect(page.locator(".application-status-control--applying")).toHaveCount(0);
+  await applicationFilter.selectOption("applied");
+  await expect(visibleRoleLinks).toHaveText(["Durable applied application"]);
 });
 
 test("offers 10, 20, and 50 applications per page and resets every size change to page 1", async ({ page }) => {

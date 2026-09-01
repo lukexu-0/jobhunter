@@ -139,7 +139,7 @@ test("keeps loading a tailoring run artifact across polling and eventually shows
 
   await page.goto("/");
   const applicationRow = page.getByRole("row").filter({
-    has: page.getByRole("combobox", { name: /Application state for metadata…-run/ }),
+    has: page.getByRole("combobox", { name: /Application status for metadata…-run/ }),
   });
   await expect(applicationRow).toBeVisible();
   await expect(applicationRow).not.toContainText(/Tailoring\s+run/);
