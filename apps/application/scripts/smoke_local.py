@@ -966,7 +966,7 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
                 headers=headers,
             )
             status = response_json_object(capture, status_response, "Pipeline status response was not JSON")
-            require_status(status_response, 200, "Pipeline model status was not ready; connect OpenAI Codex in Provider access")
+            require_status(status_response, 200, "Pipeline model status was not ready; connect OpenAI Codex in Credentials")
             require(
                 status
                 == {

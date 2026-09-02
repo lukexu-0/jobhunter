@@ -39,7 +39,7 @@ export class GmailOAuthError extends Error {
       code === "NOT_CONFIGURED"
         ? "Gmail OAuth is not configured"
         : code === "NOT_CONNECTED"
-          ? "Connect Gmail in Provider access"
+          ? "Connect Gmail in Credentials"
           : code === "AUTHORIZATION_FAILED"
             ? "Gmail authorization did not complete"
             : "Google could not complete Gmail authorization",

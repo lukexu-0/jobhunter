@@ -99,7 +99,7 @@ The workspace launcher never starts the Python harness. Keep development and sta
 | `apps/resume-tailoring/src/stages/processor.ts` | End-to-end analysis, tailoring, compile/repair, and QA orchestration. |
 | `apps/resume-tailoring/context-sources.json` | Allowlist of authoritative candidate-context sources. |
 | `apps/web/{next.config.ts,app/lib/pipeline-client.ts}` | Same-origin rewrite and browser validation/redaction boundary. |
-| `apps/web/app/providers/dashboard-data-provider.tsx` | Shared React run, identity, and OAuth state owner. |
+| `apps/web/app/credentials/dashboard-data-provider.tsx` | Shared React run, identity, and OAuth state owner. |
 | `apps/web/app/components/run-review-workspace.tsx` | Application SSE projection, action latches, and review state. |
 | `apps/application/{pyproject.toml,uv.lock}` | Python runtime, exact dependencies, console entry point, and pytest setup. |
 | `apps/application/src/browser_harness/{cli,api,sessions}.py` | Harness composition, HTTP/auth boundary, and singleton browser-session state machine. |
@@ -113,7 +113,7 @@ The workspace launcher never starts the Python harness. Keep development and sta
 - The harness also requires Node.js, exact `@playwright/cli` `0.1.17`, matching `playwright` `1.62.0-alpha-1783623505000`, Chrome, and the installed ffmpeg codec.
 - Pipeline processing targets Linux. TeX/PDF work requires `latexmk`, `pdfinfo`, `pdftotext`, `pdffonts`, and `pdftoppm`; generic rendered HTML fallback also requires the documented Chrome/systemd boundary. Run `doctor` instead of guessing which prerequisite is missing.
 - Under WSL, the harness rejects automatic Windows Chrome discovery and `.exe` paths. Start Windows Chrome separately with an isolated profile and pass its loopback `--cdp-url`; follow `info/docs/apps/browser-harness/application.html`.
-- Provider access is OpenAI Codex OAuth only; do not add provider API keys. Pipeline and harness share a private `JOBHUNTER_HARNESS_TOKEN` of at least 32 code points. Never put it in browser code, URLs, source, or logs.
+- Credentials is OpenAI Codex OAuth only; do not add provider API keys. Pipeline and harness share a private `JOBHUNTER_HARNESS_TOKEN` of at least 32 code points. Never put it in browser code, URLs, source, or logs.
 - No project `.env` template, CI workflow, container deployment, formatter, or linter is configured. Follow manifests and canonical HTML docs rather than inventing tooling.
 - Do not edit generated `apps/web/next-env.d.ts`, pipeline `dist/`, Next `.next/`, test output, browser profiles, credentials, external SQLite state, or run artifacts.
 

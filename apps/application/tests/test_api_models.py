@@ -705,7 +705,7 @@ def test_application_result_rejects_public_bounds(field: str, invalid_value: Any
 
 def test_session_errors_are_limited_to_the_fixed_catalog() -> None:
     expected = {
-        "oauth_required": "Connect OpenAI Codex in Provider access",
+        "oauth_required": "Connect OpenAI Codex in Credentials",
         "pipeline_unavailable": "The local pipeline model service is unavailable",
         "model_timeout": "The model request timed out",
         "invalid_model_output": "The model returned invalid output",

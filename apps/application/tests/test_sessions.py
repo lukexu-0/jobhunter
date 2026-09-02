@@ -1770,7 +1770,7 @@ async def test_preflight_completes_before_playwright_runtime_and_create_contract
 @pytest.mark.parametrize(
     ("code", "message", "status"),
     [
-        ("oauth_required", "Connect OpenAI Codex in Provider access", 409),
+        ("oauth_required", "Connect OpenAI Codex in Credentials", 409),
         ("pipeline_unavailable", "The local pipeline model service is unavailable", 503),
     ],
 )

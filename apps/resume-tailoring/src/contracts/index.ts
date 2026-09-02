@@ -700,7 +700,7 @@ export const ApplicationPendingActionSchema = z.discriminatedUnion("type", [
 export type ApplicationPendingAction = z.infer<typeof ApplicationPendingActionSchema>;
 
 const APPLICATION_SESSION_ERROR_MESSAGES = {
-  oauth_required: "Connect OpenAI Codex in Provider access",
+  oauth_required: "Connect OpenAI Codex in Credentials",
   pipeline_unavailable: "The local pipeline model service is unavailable",
   model_timeout: "The model request timed out",
   invalid_model_output: "The model returned invalid output",
