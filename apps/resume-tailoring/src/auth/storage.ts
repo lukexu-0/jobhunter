@@ -13,7 +13,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import type { AuthProvider } from "../contracts";
 
-export const AUTH_PROVIDERS = ["openai-codex"] as const satisfies readonly AuthProvider[];
+export const AUTH_PROVIDERS = ["openai-codex", "gmail"] as const satisfies readonly AuthProvider[];
 
 export class AuthConfigurationError extends Error {
   readonly code = "INVALID_AUTH_STORAGE";
@@ -385,6 +385,9 @@ function validateOAuthRow(row: StoredAuthCredential): void {
   }
   if (row.provider === "openai-codex" && !credential.accountId) {
     throw new AuthConfigurationError("OpenAI Codex OAuth credential has no account identity");
+  }
+  if (row.provider === "gmail" && !credential.email) {
+    throw new AuthConfigurationError("Gmail OAuth credential has no email identity");
   }
 }
 

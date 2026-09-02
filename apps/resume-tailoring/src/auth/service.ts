@@ -13,6 +13,7 @@ import {
   getAuthStorage,
   type AuthStorageLike,
 } from "./storage";
+import { loginGmailOAuth } from "../gmail/oauth.ts";
 
 const PROVIDER_ENVIRONMENT_KEYS = [
   "OPENAI_API_KEY",
@@ -87,6 +88,7 @@ function contractSession(session: PublicAuthSession): AuthSession {
 
 export interface AuthServiceDependencies extends Omit<AuthSessionDependencies, "providerLogin"> {
   readonly providerLogin?: AuthProviderLogin;
+  readonly gmailLogin?: typeof loginGmailOAuth;
 }
 
 export class AuthService {
@@ -95,8 +97,11 @@ export class AuthService {
   constructor(private readonly storage: AuthStorageLike, dependencies: AuthServiceDependencies = {}) {
     scrubProviderEnvironment();
     assertOAuthOnlyStorage(storage);
+    const gmailLogin = dependencies.gmailLogin ?? loginGmailOAuth;
     const providerLogin: AuthProviderLogin = dependencies.providerLogin
-      ?? ((provider, controller) => storage.login(provider, controller));
+      ?? ((provider, controller) => provider === "gmail"
+        ? gmailLogin(storage, controller)
+        : storage.login(provider, controller));
     this.#sessions = new AuthSessionManager(storage, {
       ...(dependencies.now ? { now: dependencies.now } : {}),
       ...(dependencies.randomId ? { randomId: dependencies.randomId } : {}),

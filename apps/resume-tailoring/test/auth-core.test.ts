@@ -171,6 +171,11 @@ describe("app-owned OAuth storage and sessions", () => {
     } as StoredAuthCredential];
     expect(() => assertOAuthOnlyStorage(retiredGoogle)).toThrow("Unsupported credential provider: google-antigravity");
 
+    const missingGmailIdentity = new FakeStorage();
+    missingGmailIdentity.rows = [oauthRow("gmail", { accountId: undefined, email: undefined })];
+    expect(() => assertOAuthOnlyStorage(missingGmailIdentity))
+      .toThrow("Gmail OAuth credential has no email identity");
+
     const duplicateStorage = new FakeStorage();
     duplicateStorage.rows = [oauthRow("openai-codex"), { ...oauthRow("openai-codex"), id: 2 }];
     expect(() => assertOAuthOnlyStorage(duplicateStorage)).toThrow("Multiple active OAuth credentials");
@@ -352,7 +357,36 @@ describe("app-owned OAuth storage and sessions", () => {
         provider: "openai-codex",
         state: "connected",
       }),
+      { provider: "gmail", state: "disconnected" },
     ]);
+  });
+
+  test("routes Gmail through the app-owned Google OAuth login", async () => {
+    const storage = new FakeStorage();
+    const persisted = Promise.withResolvers<void>();
+    const service = new AuthService(storage, {
+      randomId: () => ids.first,
+      schedule: () => undefined,
+      gmailLogin: async (target, controller) => {
+        controller.onAuth?.({ url: "https://accounts.google.com/o/oauth2/v2/auth?state=opaque" });
+        await target.set("gmail", {
+          type: "oauth",
+          access: "gmail-access",
+          refresh: "gmail-refresh",
+          expires: 2_000_000_000_000,
+          accountId: "person@example.com",
+          email: "person@example.com",
+        });
+        persisted.resolve();
+      },
+    });
+
+    const started = await service.startSession("gmail");
+    expect(started).toMatchObject({ provider: "gmail", state: "pending" });
+    expect(storage.loginProviders).toEqual([]);
+    await persisted.promise;
+    await Promise.resolve();
+    expect(service.getSession(ids.first)?.state).toBe("succeeded");
   });
 
   test("returns only redacted account identity and explicitly logs out", async () => {
@@ -364,7 +398,7 @@ describe("app-owned OAuth storage and sessions", () => {
       state: "connected",
       identity: { email: "p***@example.com", accountId: "***1234" },
     });
-    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex"]);
+    expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex", "gmail"]);
     expect(encoded).not.toContain("stored-access-secret");
     expect(encoded).not.toContain("stored-refresh-secret");
     expect(encoded).not.toContain("person@example.com");
@@ -373,6 +407,7 @@ describe("app-owned OAuth storage and sessions", () => {
     await service.logout("openai-codex");
     expect(service.getAuthStatus().providers).toEqual([
       { provider: "openai-codex", state: "disconnected" },
+      { provider: "gmail", state: "disconnected" },
     ]);
   });
 });

@@ -6,11 +6,14 @@ async function fulfillProviderStatuses(route: Route): Promise<void> {
   await route.fulfill({
     contentType: "application/json",
     body: JSON.stringify({
-      providers: [{
-        provider: "openai-codex",
-        state: "connected",
-        identity: { email: "codex-connected@example.test" },
-      }],
+      providers: [
+        {
+          provider: "openai-codex",
+          state: "connected",
+          identity: { email: "codex-connected@example.test" },
+        },
+        { provider: "gmail", state: "disconnected" },
+      ],
     }),
   });
 }
@@ -52,12 +55,15 @@ test("WEB-AUTH-001 retains connected provider controls across a transient backgr
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
   const providers = page.getByRole("list", { name: "OAuth providers" });
   const codex = providers.getByRole("listitem").filter({ hasText: "OpenAI Codex" });
-  await expect(providers.getByRole("listitem")).toHaveCount(1);
+  const gmail = providers.getByRole("listitem").filter({ hasText: "Gmail" });
+  await expect(providers.getByRole("listitem")).toHaveCount(2);
   await expect(providers).not.toContainText("Indeed Jobs");
 
   await expect(codex.getByText("connected", { exact: true })).toBeVisible();
   await expect(codex.getByText("codex-connected@example.test", { exact: true })).toBeVisible();
   await expect(codex.getByRole("button", { name: "Logout OpenAI Codex" })).toBeEnabled();
+  await expect(gmail.getByText("disconnected", { exact: true })).toBeVisible();
+  await expect(gmail.getByRole("button", { name: "Connect Gmail" })).toBeEnabled();
 
   await navigation.getByRole("link", { name: "Applications" }).click();
   await expect(page).toHaveURL(/\/$/);

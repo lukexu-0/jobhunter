@@ -68,6 +68,7 @@ function connectedStatus(): AuthStatusResponse {
   return {
     providers: [
       { provider: "openai-codex" as const, state: "connected" as const },
+      { provider: "gmail" as const, state: "disconnected" as const },
     ],
   };
 }
@@ -98,6 +99,7 @@ describe("ApplicationAgentService", () => {
       authStatusReader: () => ({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
+          { provider: "gmail", state: "disconnected" },
         ],
       }),
       runtimeClientFactory: () => {
@@ -149,6 +151,10 @@ describe("ApplicationAgentService", () => {
         throw new Error("unused");
       },
     };
+    const gmailClient = {
+      searchInbox: async () => ({ emails: [], truncated: false }),
+      readEmail: async (id: string) => ({ id, payload: { mimeType: "text/plain" } }),
+    };
     const runtimeFactoryCalls: unknown[][] = [];
     const runCalls: unknown[][] = [];
     const agentRuntime = {
@@ -177,6 +183,7 @@ describe("ApplicationAgentService", () => {
         runCalls.push(args);
         return RESULT;
       },
+      gmailClient,
       agentRuntime,
       diagnosticSink,
     });
@@ -203,6 +210,7 @@ describe("ApplicationAgentService", () => {
       providerFactory: agentRuntime.providerFactory,
       runtimeClient,
       submissionGuard,
+      gmailClient,
       steeringInbox: expect.any(Object),
     });
     const serializedSuccess = JSON.stringify(success);
@@ -585,6 +593,7 @@ describe("ApplicationAgentService", () => {
           : {
               providers: [
                 { provider: "openai-codex", state: "disconnected" },
+                { provider: "gmail", state: "disconnected" },
               ],
             };
       },
