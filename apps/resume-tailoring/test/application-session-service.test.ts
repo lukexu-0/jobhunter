@@ -41,6 +41,7 @@ const PROFILE = "# Applicant profile\n\nPrivate candidate evidence.\n";
 const FIRST_SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const THIRD_SESSION_ID = "33333333-3333-4333-8333-333333333333";
+const FOURTH_SESSION_ID = "44444444-4444-4444-8444-444444444444";
 const PDF_BYTES = new TextEncoder().encode("%PDF-1.7\nprivate approved resume\n%%EOF\n");
 const TAILORED_TEX_BYTES = new TextEncoder().encode(
   "\\documentclass{article}\n% exact current Ω source\n",
@@ -361,51 +362,70 @@ async function createProfileRoot(): Promise<{ root: string; profilePath: string 
 
 describe("application session service", () => {
 
-  test("starts one eligible skip-review application and leaves manual-review runs idle", async () => {
+  test("starts eligible skip-review applications and leaves manual-review runs idle", async () => {
     const automatic = await createTarget({ skipReview: true });
 
-    expect(await automatic.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await automatic.service.startAutomaticApplications(signal())).toBe(1);
     expect(automatic.harness!.createCalls).toHaveLength(1);
 
     const manual = await createTarget({ skipReview: false });
-    expect(await manual.service.startNextAutomaticApplication(signal())).toBe(false);
+    expect(await manual.service.startAutomaticApplications(signal())).toBe(0);
     expect(manual.harness!.createCalls).toHaveLength(0);
   });
 
-  test("serializes automatic starts while the harness is occupied and continues after close", async () => {
+  test("fills three automatic application slots and continues after close", async () => {
     let availabilityKicks = 0;
     const target = await createTarget({
       skipReview: true,
       onApplicationSessionReleased: () => { availabilityKicks++; },
-      sessionIds: [FIRST_SESSION_ID, SECOND_SESSION_ID],
+      sessionIds: [
+        FIRST_SESSION_ID,
+        SECOND_SESSION_ID,
+        THIRD_SESSION_ID,
+        FOURTH_SESSION_ID,
+      ],
     });
-    const second = await createApprovedRun(
-      target.repository,
-      target.database,
-      target.artifacts,
-      { id: "run-2", skipReview: true, autoSubmit: true },
-    );
+    const approvedRuns = [
+      await createApprovedRun(
+        target.repository,
+        target.database,
+        target.artifacts,
+        { id: "run-2", skipReview: true, autoSubmit: true },
+      ),
+      await createApprovedRun(
+        target.repository,
+        target.database,
+        target.artifacts,
+        { id: "run-3", skipReview: true, autoSubmit: true },
+      ),
+      await createApprovedRun(
+        target.repository,
+        target.database,
+        target.artifacts,
+        { id: "run-4", skipReview: true, autoSubmit: true },
+      ),
+    ];
 
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(3);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(0);
     expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
       FIRST_SESSION_ID,
+      SECOND_SESSION_ID,
+      THIRD_SESSION_ID,
     ]);
 
     await target.service.close(target.runId, signal());
     expect(availabilityKicks).toBe(1);
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(1);
     expect(target.harness!.createCalls.map((call) => call.sessionId)).toEqual([
       FIRST_SESSION_ID,
       SECOND_SESSION_ID,
+      THIRD_SESSION_ID,
+      FOURTH_SESSION_ID,
     ]);
-    expect(target.harness!.createCalls[1]).toMatchObject({
-      autoSubmit: true,
-      jobUrl: JOB_URL,
-    });
-    expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
+    expect(target.repository.getLatestApplicationSession(approvedRuns[2]!.run.id)).toMatchObject({
       bridgeState: "running",
-      pdfSha256: second.pdf.sha256,
+      pdfSha256: approvedRuns[2]!.pdf.sha256,
     });
   });
 
@@ -422,7 +442,7 @@ describe("application session service", () => {
       target.artifacts,
       { id: "run-2", skipReview: true },
     );
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(2);
 
     const cleanupStream = deferred<AsyncIterable<ApplicationHarnessEvent>>();
     target.harness!.streamReplies.push(cleanupStream.promise);
@@ -439,12 +459,11 @@ describe("application session service", () => {
     });
     const previousStreamCalls = target.harness!.streamCalls.length;
 
-    expect(await restarted.startNextAutomaticApplication(signal())).toBe(false);
-    expect(target.harness!.streamCalls).toHaveLength(previousStreamCalls + 1);
-    expect(target.harness!.streamCalls.at(-1)).toEqual({
-      sessionId: FIRST_SESSION_ID,
-      lastEventId: undefined,
-    });
+    expect(await restarted.startAutomaticApplications(signal())).toBe(0);
+    expect(target.harness!.streamCalls.slice(previousStreamCalls)).toEqual([
+      { sessionId: FIRST_SESSION_ID, lastEventId: undefined },
+      { sessionId: SECOND_SESSION_ID, lastEventId: undefined },
+    ]);
 
     target.harness!.snapshots.delete(FIRST_SESSION_ID);
     cleanupStream.resolve({
@@ -459,7 +478,7 @@ describe("application session service", () => {
     });
     expect(availabilityKicks).toBe(1);
 
-    expect(await restarted.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await restarted.startAutomaticApplications(signal())).toBe(0);
     expect(target.repository.getLatestApplicationSession(second.run.id)).toMatchObject({
       bridgeState: "running",
       slotReleased: false,
@@ -494,7 +513,7 @@ describe("application session service", () => {
       onApplicationSessionReleased: () => { availabilityKicks++; },
     });
 
-    expect(await restarted.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await restarted.startAutomaticApplications(signal())).toBe(1);
     expect(target.repository.getLatestApplicationSession(target.runId)).toMatchObject({
       bridgeState: "closed",
       slotReleased: true,
@@ -513,7 +532,7 @@ describe("application session service", () => {
     const target = await createTarget({ harness, skipReview: true });
 
     await expect(
-      target.service.startNextAutomaticApplication(signal()),
+      target.service.startAutomaticApplications(signal()),
     ).rejects.toMatchObject({ code: "APPLICATION_HARNESS_UNAVAILABLE" });
     expect(target.repository.getRun(target.runId)).toMatchObject({
       status: "approved",
@@ -949,7 +968,7 @@ describe("application session service", () => {
     });
   });
 
-  test("recovers a timed-out or same-ID create and rejects an unrelated singleton", async () => {
+  test("recovers a timed-out or same-ID create and maps an unrelated harness conflict", async () => {
     const timedOutHarness = new FakeHarness();
     timedOutHarness.createError = new ApplicationHarnessError("unavailable");
     timedOutHarness.storeSnapshotBeforeCreateError = true;
@@ -1191,7 +1210,7 @@ describe("application session service", () => {
       target.artifacts,
       { id: "run-2", skipReview: true },
     );
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(2);
 
     const earlyTimeout: ApplicationHarnessSnapshot = {
       ...harnessSnapshot("failed"),
@@ -1237,7 +1256,7 @@ describe("application session service", () => {
       (sessionId) => sessionId === FIRST_SESSION_ID,
     ).length;
 
-    expect(await recovered.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await recovered.startAutomaticApplications(signal())).toBe(0);
     expect(target.harness!.getCalls.filter(
       (sessionId) => sessionId === FIRST_SESSION_ID,
     )).toHaveLength(previousReleaseReads + 1);
@@ -1279,7 +1298,7 @@ describe("application session service", () => {
       target.artifacts,
       { id: "run-2", skipReview: true },
     );
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(2);
 
     const earlyTimeout: ApplicationHarnessSnapshot = {
       ...harnessSnapshot("failed"),
@@ -1333,11 +1352,8 @@ describe("application session service", () => {
       slotReleased: true,
       lastUpstreamEventId: 2,
     });
-    expect(target.repository.getNextAutomaticApplicationStart()).toEqual({
-      runId: second.run.id,
-      approvedPdfSha256: second.pdf.sha256,
-    });
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(target.repository.getNextAutomaticApplicationStart()).toBeNull();
+    expect(await target.service.startAutomaticApplications(signal())).toBe(0);
     expect(target.harness!.createCalls.map(({ sessionId }) => sessionId)).toEqual([
       FIRST_SESSION_ID,
       SECOND_SESSION_ID,
@@ -1460,7 +1476,7 @@ describe("application session service", () => {
     expect(target.repository.getLatestApplicationSession(target.runId)?.generation).toBe(1);
   });
 
-  test("automatically starts an approved edited revision after its cancelled generation is closed", async () => {
+  test("automatically starts an edited revision while another slot is occupied", async () => {
     const harness = new FakeHarness();
     harness.snapshotAfterCreate = harnessSnapshot("cancelled");
     const target = await createTarget({
@@ -1557,11 +1573,11 @@ describe("application session service", () => {
       canStart: true,
       canStartAfterApproval: false,
     });
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(false);
-    expect(harness.createCalls).toHaveLength(2);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(1);
+    expect(harness.createCalls).toHaveLength(3);
 
     await target.service.close(blocker.run.id, signal());
-    expect(await target.service.startNextAutomaticApplication(signal())).toBe(true);
+    expect(await target.service.startAutomaticApplications(signal())).toBe(0);
     expect(harness.createCalls).toHaveLength(3);
     expect(harness.createCalls[2]).toMatchObject({
       sessionId: THIRD_SESSION_ID,

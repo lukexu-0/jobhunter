@@ -8,6 +8,7 @@ import {
   type OpportunityKind,
 } from "../contracts/index.ts";
 
+export const MAX_APPLICATION_CONCURRENCY = 3;
 export const RUN_STATUSES = ["queued", "analyzing", "tailoring", "editing", "compiling", "repairing", "deterministic_qa", "visual_qa", "review", "approved", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 export const APPLICATION_STATUSES = [
@@ -748,11 +749,11 @@ export class PipelineRepository {
               AND latest_session.submission_phase = 'not_attempted'
           )
         )
-        AND NOT EXISTS (
-          SELECT 1
+        AND (
+          SELECT count(*)
           FROM run_application_sessions
           WHERE slot_released = 0
-        )
+        ) < ${MAX_APPLICATION_CONCURRENCY}
       ORDER BY runs.queue_sequence
     `).all();
     for (const row of rows) {
@@ -817,13 +818,13 @@ export class PipelineRepository {
       if (latest && TERMINAL_APPLICATION_SESSION_STATES[latest.bridge_state] !== true) {
         throw new RepositoryConflictError("application session is active");
       }
-      const occupyingSession = this.#db.query<{ session_id: string }, []>(`
-        SELECT session_id
+      const occupyingSessionCount = this.#db.query<{ count: number }, []>(`
+        SELECT count(*) AS count
         FROM run_application_sessions
         WHERE slot_released = 0
-      `).get();
-      if (occupyingSession) {
-        throw new RepositoryConflictError("application browser slot is active");
+      `).get()?.count ?? 0;
+      if (occupyingSessionCount >= MAX_APPLICATION_CONCURRENCY) {
+        throw new RepositoryConflictError("application browser capacity is full");
       }
       const generation = (latest?.generation ?? 0) + 1;
       const now = this.#now();
@@ -1238,15 +1239,14 @@ export class PipelineRepository {
     };
   }
 
-  getUnreleasedApplicationSession(): PublicApplicationSession | null {
-    const row = this.#db.query<ApplicationSessionRow, []>(`
+  getUnreleasedApplicationSessions(): readonly PublicApplicationSession[] {
+    const rows = this.#db.query<ApplicationSessionRow, []>(`
       SELECT *
       FROM run_application_sessions
       WHERE slot_released = 0
       ORDER BY created_at, run_id, generation
-      LIMIT 1
-    `).get();
-    return row ? publicApplicationSession(row) : null;
+    `).all();
+    return rows.map(publicApplicationSession);
   }
 
   releaseApplicationSessionSlot(
