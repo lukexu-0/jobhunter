@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   cpSync,
@@ -9,11 +9,12 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
-  watch,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -26,7 +27,7 @@ import {
 const temporaryRoots: string[] = [];
 
 function temporaryRoot(prefix: string): string {
-  const root = mkdtempSync(join(tmpdir(), prefix));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), prefix));
   temporaryRoots.push(root);
   return root;
 }
@@ -191,15 +192,11 @@ describe("private user-context snapshots", () => {
     const launchEnvironment = environment(dataHome);
     const snapshot = await deterministicSnapshot(appsRoot, launchEnvironment, 1);
     const lockPath = join(dataHome, "production", "user-context-backups", ".operation.lock");
-    writeFileSync(lockPath, "", { mode: 0o600 });
     const holder = Bun.spawn([
-      "/usr/bin/flock",
-      "--exclusive",
-      "--nonblock",
-      lockPath,
       process.execPath,
       "-e",
-      'process.stdout.write("locked\\n"); await Bun.stdin.text();',
+      'import { Database } from "bun:sqlite"; const lock = new Database(process.argv[1], { create: true }); lock.exec("BEGIN EXCLUSIVE"); process.stdout.write("locked\\n"); await Bun.stdin.text(); lock.exec("ROLLBACK"); lock.close();',
+      lockPath,
     ], {
       stdin: "pipe",
       stdout: "pipe",
@@ -448,7 +445,6 @@ describe("private user-context restore", () => {
     const launchEnvironment = environment();
     const answerPath = join(appsRoot, "user-info", "current-context", "personal", "user-info.json");
     const sampleToolDossierPath = join(checkoutRoot, "apps/user-info/current-context/projects/sample-tool-resume-info.md");
-    const sampleToolDossierDirectory = dirname(sampleToolDossierPath);
     const selectedOnlyPath = join(appsRoot, "user-info", "archive", "selected-only.txt");
     mkdirSync(dirname(selectedOnlyPath), { recursive: true, mode: 0o700 });
     writeFileSync(selectedOnlyPath, "selected snapshot only\n");
@@ -458,15 +454,13 @@ describe("private user-context restore", () => {
     writeFileSync(answerPath, '{"synthetic":"current answer"}\n');
     writeFileSync(sampleToolDossierPath, "current project info\n");
     let blockedDossierPublication = false;
-    const watcher = watch(sampleToolDossierDirectory, (_event, filename) => {
-      if (
-        !blockedDossierPublication
-        && typeof filename === "string"
-        && filename.startsWith(".user-context-restore-")
-      ) {
+    const originalRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (source, destination) => {
+      if (destination === sampleToolDossierPath) {
         blockedDossierPublication = true;
-        chmodSync(sampleToolDossierDirectory, 0o500);
+        throw Object.assign(new Error("Injected restore publication failure"), { code: "EACCES" });
       }
+      await originalRename(source, destination);
     });
     try {
       await expect(restoreUserContextSnapshot({
@@ -478,8 +472,7 @@ describe("private user-context restore", () => {
         nonce: "00000000-0000-4000-8000-000000000002",
       })).rejects.toThrow();
     } finally {
-      watcher.close();
-      chmodSync(sampleToolDossierDirectory, 0o700);
+      renameSpy.mockRestore();
     }
     expect(blockedDossierPublication).toBe(true);
     expect(readFileSync(answerPath, "utf8")).toBe('{"synthetic":"current answer"}\n');

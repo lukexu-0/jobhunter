@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import {
   constants,
@@ -37,8 +38,6 @@ const COPY_BUFFER_BYTES = 64 * 1024;
 const MAX_PATH_BYTES = 1_024;
 const MAX_PATH_DEPTH = 64;
 const RETAINED_SNAPSHOT_COUNT = 30;
-const FLOCK_EXECUTABLE = "/usr/bin/flock";
-const FLOCK_CONFLICT_EXIT_CODE = 73;
 const OPERATION_LOCK_NAME = ".operation.lock";
 const LEGACY_ROOT_DOSSIER_PATH = "jobhunter-resume-info.md";
 const USER_INFO_PATH = "apps/user-info";
@@ -387,39 +386,24 @@ async function withOperationLock<T>(
   ) {
     throw new Error("User-context operation lock must be an empty private regular file");
   }
-  const lockProcess = Bun.spawn([
-    FLOCK_EXECUTABLE,
-    "--exclusive",
-    "--nonblock",
-    "--conflict-exit-code",
-    String(FLOCK_CONFLICT_EXIT_CODE),
-    lockPath,
-    process.execPath,
-    "-e",
-    'process.stdout.write("locked\\n"); await Bun.stdin.text();',
-  ], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "ignore",
-  });
-  const lockOutput = lockProcess.stdout.getReader();
-  const readiness = await lockOutput.read();
-  if (readiness.done || new TextDecoder().decode(readiness.value) !== "locked\n") {
-    const exitCode = await lockProcess.exited;
-    lockOutput.releaseLock();
-    if (exitCode === FLOCK_CONFLICT_EXIT_CODE) {
-      throw new Error("Another user-context backup or restore operation is already in progress");
-    }
-    throw new Error(`User-context operation lock failed (${exitCode})`);
-  }
+  const lock = new Database(lockPath, { create: true, strict: true });
+  let acquired = false;
   try {
+    try {
+      lock.exec("BEGIN EXCLUSIVE");
+      acquired = true;
+    } catch (error) {
+      if (errorCode(error) === "SQLITE_BUSY") {
+        throw new Error("Another user-context backup or restore operation is already in progress");
+      }
+      throw error;
+    }
     return await operation();
   } finally {
-    lockProcess.stdin.end();
-    const exitCode = await lockProcess.exited;
-    lockOutput.releaseLock();
-    if (exitCode !== 0) {
-      throw new Error(`User-context operation lock exited unexpectedly (${exitCode})`);
+    try {
+      if (acquired) lock.exec("ROLLBACK");
+    } finally {
+      lock.close();
     }
   }
 }
