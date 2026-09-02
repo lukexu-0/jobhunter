@@ -1,4 +1,4 @@
-import type { AuthIdentity, AuthProvider, AuthSession, AuthStatusResponse } from "../contracts";
+import type { AuthProvider, AuthSession, AuthStatusResponse } from "../contracts";
 import {
   AuthSessionError,
   AuthSessionManager,
@@ -51,23 +51,6 @@ export function scrubProviderEnvironment(environment: NodeJS.ProcessEnv = proces
 
 scrubProviderEnvironment();
 
-function redact(value: string): string {
-  if (value.includes("@")) {
-    const separator = value.lastIndexOf("@");
-    return separator > 0 ? `${value[0]}***${value.slice(separator)}` : "***";
-  }
-  return value.length <= 4 ? "***" : `***${value.slice(-4)}`;
-}
-
-function redactedIdentity(identity: { email?: string; accountId?: string } | undefined): AuthIdentity | undefined {
-  if (!identity) return undefined;
-  const redacted: AuthIdentity = {
-    ...(identity.email ? { email: redact(identity.email) } : {}),
-    ...(identity.accountId ? { accountId: redact(identity.accountId) } : {}),
-  };
-  return Object.keys(redacted).length > 0 ? redacted : undefined;
-}
-
 function contractSession(session: PublicAuthSession): AuthSession {
   const state: AuthSession["state"] =
     session.state === "authenticating" || session.state === "prompt" ? "pending" : session.state;
@@ -116,7 +99,7 @@ export class AuthService {
       providers: AUTH_PROVIDERS.map((provider) => {
         const rows = this.storage.listStoredCredentials(provider);
         if (rows.length === 0) return { provider, state: "disconnected" as const };
-        const identity = redactedIdentity(this.storage.getOAuthAccountIdentity(provider));
+        const identity = this.storage.getOAuthAccountIdentity(provider);
         return {
           provider,
           state: "connected" as const,

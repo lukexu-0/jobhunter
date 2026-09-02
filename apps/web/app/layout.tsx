@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { AppNavigation } from "./components/app-navigation";
-import { DashboardDataProvider } from "./providers/dashboard-data-provider";
+import { DashboardDataProvider } from "./credentials/dashboard-data-provider";
 import "./globals.css";
 
 export const metadata: Metadata = {
