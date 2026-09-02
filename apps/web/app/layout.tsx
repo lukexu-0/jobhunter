@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { AppNavigation } from "./components/app-navigation";
-import { DashboardDataProvider } from "./providers/dashboard-data-provider";
-import { AlertProvider } from "./providers/alert-provider";
+import { DashboardDataProvider } from "./credentials/dashboard-data-provider";
+import { AlertProvider } from "./credentials/alert-provider";
 import "./globals.css";
 
 export const metadata: Metadata = {

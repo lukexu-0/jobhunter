@@ -38,7 +38,7 @@ import {
 } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
-import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
+import { useDashboardData, type JobIdentity } from "../credentials/dashboard-data-provider";
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
 const POLL_INTERVAL_MS = 3_000;

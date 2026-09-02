@@ -56,23 +56,12 @@ export function scrubProviderEnvironment(environment: NodeJS.ProcessEnv = proces
 
 scrubProviderEnvironment();
 
-function redact(value: string): string {
-  if (value.includes("@")) {
-    const separator = value.lastIndexOf("@");
-    return separator > 0 ? `${value[0]}***${value.slice(separator)}` : "***";
-  }
-  return value.length <= 4 ? "***" : `***${value.slice(-4)}`;
-}
-
-function redactedIdentity(
-  identity: { email?: string | undefined; accountId?: string | undefined } | undefined,
-): AuthIdentity | undefined {
+function publicIdentity(identity: AuthIdentity | undefined): AuthIdentity | undefined {
   if (!identity) return undefined;
-  const redacted: AuthIdentity = {
-    ...(identity.email ? { email: redact(identity.email) } : {}),
-    ...(identity.accountId ? { accountId: redact(identity.accountId) } : {}),
+  return {
+    ...(identity.email ? { email: identity.email } : {}),
+    ...(identity.accountId ? { accountId: identity.accountId } : {}),
   };
-  return Object.keys(redacted).length > 0 ? redacted : undefined;
 }
 
 function contractSession(session: PublicAuthSession): AuthSession {
@@ -150,9 +139,9 @@ export class AuthService {
   async getAuthStatus(): Promise<AuthStatusResponse> {
     assertOAuthOnlyStorage(this.storage);
     const codex = await this.#providerHooks["openai-codex"].status();
-    const codexIdentity = redactedIdentity(codex.identity);
+    const codexIdentity = publicIdentity(codex.identity);
     const gmail = await this.#providerHooks.gmail.status();
-    const gmailIdentity = redactedIdentity(gmail.identity);
+    const gmailIdentity = publicIdentity(gmail.identity);
     return {
       providers: [
         {

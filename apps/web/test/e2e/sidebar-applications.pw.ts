@@ -335,7 +335,7 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
 async function expectFolderNavigation(
   page: Page,
   width: number,
-  currentLabel: "Applications" | "Discovery" | "Providers",
+  currentLabel: "Applications" | "Discovery" | "Credentials",
 ): Promise<void> {
   const strip = page.locator("header.app-navigation");
   const stripBox = await strip.boundingBox();
@@ -2650,7 +2650,7 @@ test("uses the simplified opened-run header workflow layout", async ({ page }) =
 });
 
 
-test("keeps dashboard snapshots visible while revalidating between Applications and Providers", async ({ page }) => {
+test("keeps dashboard snapshots visible while revalidating between Applications and Credentials", async ({ page }) => {
   const stableRuns = Array.from(
     { length: 7 },
     (_, index) => runFixture(`stable-${index}`, "applied", "approved"),
@@ -2717,11 +2717,11 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
   const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
-  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Providers"]);
+  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Credentials"]);
   await expect(applicationCount).toHaveText("7");
 
-  await primaryNavigation.getByRole("link", { name: "Providers" }).click();
-  await expect(page).toHaveURL(/\/providers$/);
+  await primaryNavigation.getByRole("link", { name: "Credentials" }).click();
+  await expect(page).toHaveURL(/\/credentials$/);
   const providerBadges = page.locator(".status-badge");
   await expect(providerBadges).toHaveText(["connected", "disconnected"]);
   await expect(page.locator(".provider-row")).toHaveCount(2);
@@ -2736,7 +2736,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   await runRefreshCompleted;
 
   holdAuthRefresh = true;
-  await primaryNavigation.getByRole("link", { name: "Providers" }).click();
+  await primaryNavigation.getByRole("link", { name: "Credentials" }).click();
   await authRefreshStarted;
   await expect(providerBadges).toHaveText(["connected", "disconnected"]);
   await expect(providerBadges.filter({ hasText: "Checking" })).toHaveCount(0);
@@ -2764,10 +2764,10 @@ test("uses full-width physical folder tabs at desktop and narrow widths", async 
   }
 
 
-  await page.goto("/providers/settings");
+  await page.goto("/credentials/settings");
   await expect(
     page.getByRole("navigation", { name: "Primary navigation" })
-      .getByRole("link", { name: "Providers" }),
+      .getByRole("link", { name: "Credentials" }),
   ).toHaveAttribute("aria-current", "page");
 });
 
@@ -2800,8 +2800,8 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
       await tableScroller.evaluate((element) => element.clientWidth),
     );
 
-    await page.goto("/providers");
-    await expectFolderNavigation(page, width, "Providers");
+    await page.goto("/credentials");
+    await expectFolderNavigation(page, width, "Credentials");
     await expectNoDocumentOverflow(page);
     const providerRows = page.locator(".provider-row");
     await expect(providerRows).toHaveCount(2);

@@ -34,7 +34,7 @@ import {
   type ResumeIterationSelection,
 } from "../lib/run-detail-artifacts";
 import { RunReviewWorkspace } from "./run-review-workspace";
-import { useAlerts } from "../providers/alert-provider";
+import { useAlerts } from "../credentials/alert-provider";
 import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
