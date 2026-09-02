@@ -554,6 +554,9 @@ class HarnessServiceError(Exception):
         self.session_id = session_id
 
 
+MAX_APPLICATION_CONCURRENCY = 3
+
+
 class BrowserLaunchConfig(FrozenPrivateModel):
     chrome_executable: Path | None = None
     chrome_user_data_dir: Path = Path("~/.jobhunter/browser-harness/chrome")

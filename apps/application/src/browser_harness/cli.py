@@ -18,7 +18,7 @@ from .playwright_cli import (
     BrowserConfigurationError,
     ResolvedBrowserLaunch,
     default_playwright_cli_script,
-    resolve_browser_launch,
+    resolve_browser_launches,
 )
 from .models import BrowserLaunchConfig, HarnessConfig
 from .sessions import ApplicationSessionManager
@@ -204,7 +204,7 @@ def parse_config(
     *,
     environ: Mapping[str, str] | None = None,
     default_token_path: Path | None = None,
-) -> tuple[HarnessConfig, ResolvedBrowserLaunch]:
+) -> tuple[HarnessConfig, tuple[ResolvedBrowserLaunch, ...]]:
     """Parse and fully validate startup configuration without starting Uvicorn."""
 
     parser = _parser()
@@ -279,7 +279,7 @@ def parse_config(
             ),
             browser=browser,
         )
-        resolved = resolve_browser_launch(browser)
+        resolved = resolve_browser_launches(browser)
     except (ValidationError, BrowserConfigurationError, ValueError) as error:
         parser.error(str(error))
     return config, resolved
@@ -291,12 +291,12 @@ def _configure_logging() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    config, browser_launch = parse_config(argv)
+    config, browser_launches = parse_config(argv)
     _configure_logging()
     credential_store = CredentialStore(config.credentials_json)
     sessions = ApplicationSessionManager(
         config,
-        browser_launch=browser_launch,
+        browser_launches=browser_launches,
         credential_store=credential_store,
     )
     app = create_app(config, HarnessDependencies(sessions=sessions))

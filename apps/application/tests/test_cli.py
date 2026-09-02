@@ -389,7 +389,7 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
     executable.chmod(0o700)
     profile = tmp_path / "dedicated-profile"
 
-    config, launch = cli_module.parse_config(
+    config, launches = cli_module.parse_config(
         [
             *_runtime_args(fake_playwright_cli),
             "--port",
@@ -421,13 +421,27 @@ def test_valid_native_configuration_resolves_fake_executable_and_dedicated_profi
             chrome_user_data_dir=profile,
         ),
     )
-    assert launch == ResolvedBrowserLaunch(
-        cdp_url=None,
-        executable_path=executable.resolve(),
-        user_data_dir=profile.resolve(),
+    assert launches == (
+        ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=executable.resolve(),
+            user_data_dir=profile.resolve(),
+        ),
+        ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=executable.resolve(),
+            user_data_dir=profile.with_name("dedicated-profile-2").resolve(),
+        ),
+        ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=executable.resolve(),
+            user_data_dir=profile.with_name("dedicated-profile-3").resolve(),
+        ),
     )
-    assert profile.is_dir()
-    assert stat.S_IMODE(profile.stat().st_mode) == 0o700
+    for launch in launches:
+        assert launch.user_data_dir is not None
+        assert launch.user_data_dir.is_dir()
+        assert stat.S_IMODE(launch.user_data_dir.stat().st_mode) == 0o700
 
 
 
@@ -447,19 +461,40 @@ def test_default_session_timeout_is_unlimited(
     assert HarnessConfig(bearer_token=TOKEN).session_timeout is None
 
 @pytest.mark.parametrize(
-    ("provided", "canonical"),
+    ("provided", "endpoints"),
     [
-        ("http://127.0.0.1:9222", "http://127.0.0.1:9222"),
-        ("http://localhost:9333/", "http://localhost:9333"),
-        ("http://[::1]:9444", "http://[::1]:9444"),
+        (
+            "http://127.0.0.1:9222",
+            (
+                "http://127.0.0.1:9222",
+                "http://127.0.0.1:9223",
+                "http://127.0.0.1:9224",
+            ),
+        ),
+        (
+            "http://localhost:9333/",
+            (
+                "http://localhost:9333",
+                "http://localhost:9334",
+                "http://localhost:9335",
+            ),
+        ),
+        (
+            "http://[::1]:9444",
+            (
+                "http://[::1]:9444",
+                "http://[::1]:9445",
+                "http://[::1]:9446",
+            ),
+        ),
     ],
 )
 def test_valid_loopback_cdp_configuration(
     provided: str,
-    canonical: str,
+    endpoints: tuple[str, str, str],
     fake_playwright_cli: tuple[Path, Path],
 ) -> None:
-    config, launch = cli_module.parse_config(
+    config, launches = cli_module.parse_config(
         [
             *_runtime_args(fake_playwright_cli),
             "--cdp-url",
@@ -468,11 +503,14 @@ def test_valid_loopback_cdp_configuration(
         environ={"JOBHUNTER_HARNESS_TOKEN": TOKEN},
     )
 
-    assert config.browser.cdp_url == canonical
-    assert launch == ResolvedBrowserLaunch(
-        cdp_url=canonical,
-        executable_path=None,
-        user_data_dir=None,
+    assert config.browser.cdp_url == endpoints[0]
+    assert launches == tuple(
+        ResolvedBrowserLaunch(
+            cdp_url=endpoint,
+            executable_path=None,
+            user_data_dir=None,
+        )
+        for endpoint in endpoints
     )
 
 
@@ -744,10 +782,13 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
 ) -> None:
     executable = tmp_path / "chrome"
     profile = tmp_path / "dedicated-profile"
-    resolved_launch = ResolvedBrowserLaunch(
-        cdp_url=None,
-        executable_path=tmp_path / "resolved-chrome",
-        user_data_dir=tmp_path / "resolved-profile",
+    resolved_launches = tuple(
+        ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=tmp_path / "resolved-chrome",
+            user_data_dir=tmp_path / f"resolved-profile-{index}",
+        )
+        for index in range(3)
     )
     manager = object()
     app = object()
@@ -755,14 +796,16 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     credential_store = object()
     credential_store_calls: list[Path] = []
     manager_calls: list[
-        tuple[HarnessConfig, ResolvedBrowserLaunch, object]
+        tuple[HarnessConfig, tuple[ResolvedBrowserLaunch, ...], object]
     ] = []
     create_app_calls: list[tuple[HarnessConfig, HarnessDependencies]] = []
     uvicorn_calls: list[tuple[object, dict[str, Any]]] = []
 
-    def fake_resolve(browser: BrowserLaunchConfig) -> ResolvedBrowserLaunch:
+    def fake_resolve(
+        browser: BrowserLaunchConfig,
+    ) -> tuple[ResolvedBrowserLaunch, ...]:
         resolve_calls.append(browser)
-        return resolved_launch
+        return resolved_launches
 
     def fake_credential_store(path: Path) -> object:
         credential_store_calls.append(path)
@@ -771,10 +814,10 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     def fake_manager(
         config: HarnessConfig,
         *,
-        browser_launch: ResolvedBrowserLaunch,
+        browser_launches: tuple[ResolvedBrowserLaunch, ...],
         credential_store: object,
     ) -> object:
-        manager_calls.append((config, browser_launch, credential_store))
+        manager_calls.append((config, browser_launches, credential_store))
         return manager
 
     def fake_create_app(
@@ -788,7 +831,7 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
         uvicorn_calls.append((application, kwargs))
 
     monkeypatch.setenv("JOBHUNTER_HARNESS_TOKEN", TOKEN)
-    monkeypatch.setattr(cli_module, "resolve_browser_launch", fake_resolve)
+    monkeypatch.setattr(cli_module, "resolve_browser_launches", fake_resolve)
     monkeypatch.setattr(cli_module, "CredentialStore", fake_credential_store)
     monkeypatch.setattr(cli_module, "ApplicationSessionManager", fake_manager)
     monkeypatch.setattr(cli_module, "create_app", fake_create_app)
@@ -831,7 +874,7 @@ def test_main_wires_exact_configuration_dependencies_and_loopback_uvicorn(
     assert resolve_calls == [expected_browser]
     assert credential_store_calls == [expected_config.credentials_json]
     assert manager_calls == [
-        (expected_config, resolved_launch, credential_store)
+        (expected_config, resolved_launches, credential_store)
     ]
     assert len(create_app_calls) == 1
     created_config, dependencies = create_app_calls[0]
