@@ -551,7 +551,7 @@ describe("application agent HTTP boundary", () => {
     ].join(":");
     const cases = [
       ["INVALID_REQUEST", 422, "Request is invalid"],
-      ["OAUTH_REQUIRED", 409, "Connect OpenAI Codex in Provider access"],
+      ["OAUTH_REQUIRED", 409, "Connect OpenAI Codex in Credentials"],
       ["INVALID_MODEL_OUTPUT", 502, "The model returned invalid output"],
       ["MODEL_PROVIDER_FAILED", 502, "The model request failed"],
       ["APPLICATION_MISMATCH", 409, "The open page does not match the requested job"],
@@ -606,7 +606,7 @@ describe("application agent HTTP boundary", () => {
     }), new URL(`${API_ORIGIN}${APPLICATION_AGENT_PATH}`));
     expect(statusResponse?.status).toBe(409);
     expect(await statusResponse?.json()).toEqual({
-      error: { code: "OAUTH_REQUIRED", message: "Connect OpenAI Codex in Provider access" },
+      error: { code: "OAUTH_REQUIRED", message: "Connect OpenAI Codex in Credentials" },
     });
   });
 });

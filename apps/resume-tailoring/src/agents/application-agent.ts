@@ -117,7 +117,7 @@ export type ApplicationAgentFailureCode =
 
 const APPLICATION_AGENT_FAILURE_MESSAGES: Readonly<Record<ApplicationAgentFailureCode, string>> = {
   INVALID_REQUEST: "Request is invalid",
-  OAUTH_REQUIRED: "Connect OpenAI Codex in Provider access",
+  OAUTH_REQUIRED: "Connect OpenAI Codex in Credentials",
   INVALID_MODEL_OUTPUT: "The model returned invalid output",
   MODEL_PROVIDER_FAILED: "The model request failed",
   APPLICATION_MISMATCH: "The open page does not match the requested job",

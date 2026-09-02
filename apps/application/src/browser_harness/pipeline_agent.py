@@ -41,7 +41,7 @@ _ERROR_RESPONSES: Final[dict[tuple[int, str], tuple[str, str]]] = {
     ),
     (409, "OAUTH_REQUIRED"): (
         "oauth_required",
-        "Connect OpenAI Codex in Provider access",
+        "Connect OpenAI Codex in Credentials",
     ),
     (502, "INVALID_MODEL_OUTPUT"): (
         "invalid_model_output",

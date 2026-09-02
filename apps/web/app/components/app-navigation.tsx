@@ -5,13 +5,13 @@ import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { Compass, KeyRound } from "lucide-react";
 
-function NavIcon({ name }: { readonly name: "applications" | "discovery" | "providers" }): ReactNode {
+function NavIcon({ name }: { readonly name: "applications" | "discovery" | "credentials" }): ReactNode {
   if (name === "discovery") {
     return <Compass aria-hidden="true" strokeWidth={1.7} />;
   }
 
 
-  if (name === "providers") {
+  if (name === "credentials") {
     return <KeyRound aria-hidden="true" strokeWidth={1.7} />;
   }
 
@@ -35,7 +35,7 @@ export function AppNavigationView({ pathname }: { readonly pathname: string }): 
   if (pathname.startsWith("/runs/")) return null;
   const applicationsCurrent = pathname === "/";
   const discoveryCurrent = pathname === "/discovery" || pathname.startsWith("/discovery/");
-  const providersCurrent = pathname === "/providers" || pathname.startsWith("/providers/");
+  const credentialsCurrent = pathname === "/credentials" || pathname.startsWith("/credentials/");
 
   return (
     <header className="app-navigation">
@@ -54,9 +54,9 @@ export function AppNavigationView({ pathname }: { readonly pathname: string }): 
             </Link>
           </li>
           <li>
-            <Link href="/providers" aria-current={providersCurrent ? "page" : undefined}>
-              <NavIcon name="providers" />
-              <span>Providers</span>
+            <Link href="/credentials" aria-current={credentialsCurrent ? "page" : undefined}>
+              <NavIcon name="credentials" />
+              <span>Credentials</span>
             </Link>
           </li>
         </ul>

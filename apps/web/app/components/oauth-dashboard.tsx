@@ -9,7 +9,7 @@ import {
   type AuthSession,
   type AuthStatusResponse,
 } from "@jobhunter/pipeline/contracts";
-import { useDashboardData } from "../providers/dashboard-data-provider";
+import { useDashboardData } from "../credentials/dashboard-data-provider";
 
 const AUTH_ROOT = "/api/pipeline/auth";
 const POLL_INTERVAL_MS = 2_500;
@@ -141,7 +141,7 @@ function launchTarget(session: BrowserAuthSession): string | undefined {
 function terminalMessage(state: AuthSession["state"]): string | null {
   switch (state) {
     case "succeeded":
-      return "Authorization completed. The provider connection was refreshed.";
+      return "Authorization completed. The credential was refreshed.";
     case "failed":
       return "Authorization did not complete. Start a new connection to try again.";
     case "cancelled":
@@ -412,11 +412,11 @@ export function OAuthDashboard() {
           return next;
         });
         await refreshAuthStatus();
-        setNotice(provider, { tone: "success", text: "Provider connection removed." });
+        setNotice(provider, { tone: "success", text: "Credential removed." });
       } catch (error) {
         setNotice(provider, {
           tone: "error",
-          text: error instanceof Error ? redactPublicText(error.message) : "The provider could not be disconnected.",
+          text: error instanceof Error ? redactPublicText(error.message) : "The credential could not be disconnected.",
         });
       } finally {
         setBusyAction(provider, undefined);
@@ -426,7 +426,7 @@ export function OAuthDashboard() {
   );
 
   return (
-    <section className="oauth-dashboard" aria-label="OAuth provider connections">
+    <section className="oauth-dashboard" aria-label="OAuth credentials">
 
       {statusError ? (
         <p className="dashboard-notice dashboard-notice--error" role="alert">
@@ -436,12 +436,12 @@ export function OAuthDashboard() {
 
       <div className="provider-table" aria-busy={isLoadingStatus}>
         <div className="provider-table__head" aria-hidden="true">
-          <span>Provider</span>
+          <span>Credential</span>
           <span>Status</span>
           <span>Action</span>
         </div>
 
-        <ul className="provider-list" aria-label="OAuth providers">
+        <ul className="provider-list" aria-label="Credentials">
           {PROVIDERS.map((provider) => {
             const providerStatus = statusByProvider.get(provider.provider);
             const session = sessions[provider.provider];
@@ -450,7 +450,8 @@ export function OAuthDashboard() {
             const isPending = session?.state === "pending";
             const isConnected = providerStatus?.state === "connected";
             const statusLabel = isLoadingStatus ? "Checking" : providerStatus?.state ?? "Unavailable";
-            const identity = providerStatus?.identity?.email ?? providerStatus?.identity?.accountId;
+            const email = providerStatus?.identity?.email;
+            const accountId = providerStatus?.identity?.accountId;
 
             return (
               <li className="provider-row" key={provider.provider}>
@@ -461,7 +462,10 @@ export function OAuthDashboard() {
 
                 <div className="provider-connection">
                   <span className={`status-badge status-badge--${statusLabel.toLowerCase()}`}>{statusLabel}</span>
-                  {identity ? <span className="provider-account">{redactPublicText(identity)}</span> : null}
+                  {email ? <span className="provider-account">{email}</span> : null}
+                  {accountId && accountId !== email ? (
+                    <span className="provider-account">{accountId}</span>
+                  ) : null}
                 </div>
 
                 <div className="provider-actions">

@@ -78,7 +78,7 @@ export class GmailClientError extends Error {
   constructor(readonly code: "NOT_CONNECTED" | "PROVIDER_FAILED" | "RESPONSE_TOO_LARGE") {
     super(
       code === "NOT_CONNECTED"
-        ? "Connect Gmail in Provider access"
+        ? "Connect Gmail in Credentials"
         : code === "RESPONSE_TOO_LARGE"
           ? "The Gmail response is too large"
           : "Gmail could not complete the request",

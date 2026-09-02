@@ -389,20 +389,20 @@ describe("app-owned OAuth storage and sessions", () => {
     expect(service.getSession(ids.first)?.state).toBe("succeeded");
   });
 
-  test("returns only redacted account identity and explicitly logs out", async () => {
+  test("returns complete account identity without exposing OAuth tokens and explicitly logs out", async () => {
     const storage = new FakeStorage();
     storage.rows = [oauthRow("openai-codex", { email: "person@example.com" })];
     const status = new AuthService(storage).getAuthStatus();
     const encoded = JSON.stringify(status);
     expect(status.providers[0]).toMatchObject({
       state: "connected",
-      identity: { email: "p***@example.com", accountId: "***1234" },
+      identity: { email: "person@example.com", accountId: "acct-secret-1234" },
     });
     expect(status.providers.map(({ provider }) => provider)).toEqual(["openai-codex", "gmail"]);
     expect(encoded).not.toContain("stored-access-secret");
     expect(encoded).not.toContain("stored-refresh-secret");
-    expect(encoded).not.toContain("person@example.com");
-    expect(encoded).not.toContain("acct-secret");
+    expect(encoded).toContain("person@example.com");
+    expect(encoded).toContain("acct-secret-1234");
     const service = new AuthService(storage);
     await service.logout("openai-codex");
     expect(service.getAuthStatus().providers).toEqual([

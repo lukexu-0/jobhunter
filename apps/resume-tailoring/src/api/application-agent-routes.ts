@@ -41,7 +41,7 @@ async function runAbortable<T>(
 
 const APPLICATION_AGENT_ERROR_RESPONSES: Readonly<Record<ApplicationAgentFailureCode, readonly [status: number, message: string]>> = {
   INVALID_REQUEST: [422, "Request is invalid"],
-  OAUTH_REQUIRED: [409, "Connect OpenAI Codex in Provider access"],
+  OAUTH_REQUIRED: [409, "Connect OpenAI Codex in Credentials"],
   INVALID_MODEL_OUTPUT: [502, "The model returned invalid output"],
   MODEL_PROVIDER_FAILED: [502, "The model request failed"],
   APPLICATION_MISMATCH: [409, "The open page does not match the requested job"],
