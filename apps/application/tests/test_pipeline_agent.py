@@ -514,7 +514,7 @@ async def test_check_ready_requires_exact_status(
             409,
             "OAUTH_REQUIRED",
             "oauth_required",
-            "Connect OpenAI Codex in Provider access",
+            "Connect OpenAI Codex in Credentials",
         ),
         (
             502,
@@ -626,7 +626,7 @@ async def test_malformed_success_or_status_json_is_fixed_and_sanitized(
             409,
             "OAUTH_REQUIRED",
             "oauth_required",
-            "Connect OpenAI Codex in Provider access",
+            "Connect OpenAI Codex in Credentials",
         ),
         (
             502,

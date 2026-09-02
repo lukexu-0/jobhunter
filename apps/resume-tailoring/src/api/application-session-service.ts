@@ -125,7 +125,7 @@ const SERVICE_ERRORS: Readonly<
     status: 409,
   },
   OAUTH_REQUIRED: {
-    message: "Connect OpenAI Codex in Provider access",
+    message: "Connect OpenAI Codex in Credentials",
     status: 409,
   },
   MODEL_TIMEOUT: {

@@ -111,7 +111,7 @@ DIRECT_FIELD_NAMES = frozenset(
 
 
 _SESSION_ERROR_MESSAGES: dict[str, str] = {
-    "oauth_required": "Connect OpenAI Codex in Provider access",
+    "oauth_required": "Connect OpenAI Codex in Credentials",
     "pipeline_unavailable": "The local pipeline model service is unavailable",
     "model_timeout": "The model request timed out",
     "invalid_model_output": "The model returned invalid output",

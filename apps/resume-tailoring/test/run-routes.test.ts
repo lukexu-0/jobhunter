@@ -1324,7 +1324,7 @@ describe("application session HTTP routes", () => {
         409,
         "The application question changed; review the latest session state",
       ],
-      ["OAUTH_REQUIRED", 409, "Connect OpenAI Codex in Provider access"],
+      ["OAUTH_REQUIRED", 409, "Connect OpenAI Codex in Credentials"],
       ["MODEL_TIMEOUT", 504, "The model request timed out"],
       ["INVALID_MODEL_OUTPUT", 502, "The model returned invalid output"],
       ["MODEL_PROVIDER_FAILED", 502, "The model request failed"],
