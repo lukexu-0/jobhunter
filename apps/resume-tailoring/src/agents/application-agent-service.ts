@@ -4,6 +4,9 @@ import {
   type AuthStatusResponse,
 } from "../contracts";
 import { getAuthStatus } from "../auth/service";
+import { getAuthStorage } from "../auth/storage";
+import { GmailClient, type GmailToolClient } from "../gmail/client";
+import { getGmailAccessToken } from "../gmail/oauth";
 import {
   ApplicationAgentFailure,
   ApplicationAgentRunInputSchema,
@@ -317,6 +320,7 @@ export interface ApplicationAgentServiceOptions {
   readonly runNonJobApplicationAgent?: ApplicationAgentRunner;
   readonly runtimeClientFactory?: ApplicationRuntimeClientFactory;
   readonly submissionGuardFactory: ApplicationSubmissionGuardFactory;
+  readonly gmailClient?: GmailToolClient;
   readonly agentRuntime?: AgentRuntimeDependencies;
   readonly diagnosticSink?: ApplicationAgentDiagnosticSink;
   readonly traceStore?: Pick<ApplicationAgentTraceStore, "start">;
@@ -403,6 +407,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
   readonly #runNonJobApplicationAgent: ApplicationAgentRunner;
   readonly #runtimeClientFactory: ApplicationRuntimeClientFactory;
   readonly #submissionGuardFactory: ApplicationSubmissionGuardFactory;
+  readonly #gmailClient: GmailToolClient;
   readonly #agentRuntime: AgentRuntimeDependencies;
   readonly #diagnosticSink: ApplicationAgentDiagnosticSink;
   readonly #traceStore: Pick<ApplicationAgentTraceStore, "start"> | undefined;
@@ -426,6 +431,14 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
           bearerToken,
         ));
     this.#submissionGuardFactory = options.submissionGuardFactory;
+    this.#gmailClient = options.gmailClient ?? new GmailClient({
+      accessToken: async (signal) => {
+        signal?.throwIfAborted();
+        const storage = await getAuthStorage();
+        signal?.throwIfAborted();
+        return getGmailAccessToken(storage, {}, signal);
+      },
+    });
     this.#agentRuntime = options.agentRuntime ?? {};
     this.#diagnosticSink = options.diagnosticSink
       ?? defaultApplicationAgentDiagnosticSink;
@@ -517,6 +530,7 @@ export class ApplicationAgentService implements ApplicationAgentRouteService {
           ...this.#agentRuntime,
           runtimeClient,
           submissionGuard,
+          gmailClient: this.#gmailClient,
           steeringInbox,
           ...(trace === undefined ? {} : { modelTraceSink: trace }),
         });
