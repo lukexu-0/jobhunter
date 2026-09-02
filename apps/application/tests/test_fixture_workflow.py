@@ -353,8 +353,11 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
     executable = _chromium_executable()
     node_executable = _node_executable()
     playwright_cli_script = _playwright_cli_script()
-    profile = tmp_path / "chromium-profile"
-    profile.mkdir(mode=0o700)
+    profiles = tuple(
+        tmp_path / f"chromium-profile-{index}" for index in range(3)
+    )
+    for profile in profiles:
+        profile.mkdir(mode=0o700)
     agent = _BlockingApplicationAgent()
     runtimes: list[PlaywrightCliRuntime] = []
 
@@ -373,10 +376,13 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
                 user_info_json=tmp_path / "user-info.json",
             ),
             artifacts_root=tmp_path / "sessions",
-            browser_launch=ResolvedBrowserLaunch(
-                cdp_url=None,
-                executable_path=executable,
-                user_data_dir=profile,
+            browser_launches=tuple(
+                ResolvedBrowserLaunch(
+                    cdp_url=None,
+                    executable_path=executable,
+                    user_data_dir=profile,
+                )
+                for profile in profiles
             ),
             model_factory=lambda *_args: agent,
             runtime_factory=runtime_factory,
@@ -422,7 +428,7 @@ async def test_real_fixture_submits_once_after_automatic_review_approval(
             assert created.session_id == _CALLER_SESSION_ID
             await _wait_for_state(manager, created.session_id, "running")
             await asyncio.wait_for(agent.started.wait(), timeout=5)
-            record = manager._active
+            record = manager._active[created.session_id]
             assert record is not None
             assert len(runtimes) == 1
             runtime = record.playwright_runtime

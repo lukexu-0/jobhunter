@@ -26,6 +26,7 @@ import psutil
 
 from .models import (
     BrowserLaunchConfig,
+    MAX_APPLICATION_CONCURRENCY,
     BrowserObservation,
     BrowserScreenshot,
     BrowserTab,
@@ -550,6 +551,58 @@ def resolve_browser_launch(config: BrowserLaunchConfig) -> ResolvedBrowserLaunch
         cdp_url=None,
         executable_path=_resolve_executable(config.chrome_executable),
         user_data_dir=_resolve_dedicated_profile(config.chrome_user_data_dir),
+    )
+
+
+def resolve_browser_launches(
+    config: BrowserLaunchConfig,
+) -> tuple[ResolvedBrowserLaunch, ...]:
+    """Resolve one isolated browser resource per application slot."""
+
+    first = resolve_browser_launch(config)
+    if first.cdp_url is not None:
+        parsed = urlsplit(first.cdp_url)
+        port = parsed.port
+        host = parsed.hostname
+        if (
+            port is None
+            or host is None
+            or port > 65_535 - MAX_APPLICATION_CONCURRENCY + 1
+        ):
+            raise BrowserConfigurationError(
+                f"The CDP URL port must leave room for "
+                f"{MAX_APPLICATION_CONCURRENCY} consecutive endpoints"
+            )
+        authority = f"[{host}]" if ":" in host else host
+        return tuple(
+            ResolvedBrowserLaunch(
+                cdp_url=f"http://{authority}:{port + index}",
+                executable_path=None,
+                user_data_dir=None,
+            )
+            for index in range(MAX_APPLICATION_CONCURRENCY)
+        )
+
+    if first.executable_path is None or first.user_data_dir is None:
+        raise BrowserConfigurationError("Local Chrome configuration is incomplete")
+    profiles = (
+        first.user_data_dir,
+        *(
+            _resolve_dedicated_profile(
+                first.user_data_dir.with_name(
+                    f"{first.user_data_dir.name}-{index + 1}"
+                )
+            )
+            for index in range(1, MAX_APPLICATION_CONCURRENCY)
+        ),
+    )
+    return tuple(
+        ResolvedBrowserLaunch(
+            cdp_url=None,
+            executable_path=first.executable_path,
+            user_data_dir=profile,
+        )
+        for profile in profiles
     )
 
 

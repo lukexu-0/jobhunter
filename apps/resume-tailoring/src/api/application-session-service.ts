@@ -23,6 +23,7 @@ import { REPOSITORY_ROOT } from "../context/manifest.ts";
 import { OAuthRequiredError } from "../auth/oauth-only-resolver.ts";
 import {
   APPLICATION_SUBMISSION_UNCERTAIN_WARNING,
+  MAX_APPLICATION_CONCURRENCY,
   ApplicationSubmissionFinalError,
   PipelineRepository,
   RepositoryConflictError,
@@ -413,14 +414,17 @@ export class ApplicationSessionService {
     return this.#disposePromise;
   }
 
-
-  async startNextAutomaticApplication(signal: AbortSignal): Promise<boolean> {
+  async startAutomaticApplications(signal: AbortSignal): Promise<number> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal);
-    const candidate = this.dependencies.repository.getNextAutomaticApplicationStart();
-    if (!candidate) return false;
-    await this.start(candidate.runId, candidate.approvedPdfSha256, signal);
-    return true;
+    await this.#reconcileApplicationSlots(signal);
+    let started = 0;
+    while (started < MAX_APPLICATION_CONCURRENCY) {
+      const candidate = this.dependencies.repository.getNextAutomaticApplicationStart();
+      if (!candidate) break;
+      await this.#start(candidate.runId, candidate.approvedPdfSha256, signal, false);
+      started += 1;
+    }
+    return started;
   }
 
   async get(runId: string): Promise<ApplicationSessionView> {
@@ -562,8 +566,17 @@ export class ApplicationSessionService {
     expectedApprovedPdfSha256: string,
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
+    return await this.#start(runId, expectedApprovedPdfSha256, signal, true);
+  }
+
+  async #start(
+    runId: string,
+    expectedApprovedPdfSha256: string,
+    signal: AbortSignal,
+    reconcile: boolean,
+  ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal, runId);
+    if (reconcile) await this.#reconcileApplicationSlots(signal, runId);
     let latest: PublicApplicationSession | null;
     try {
       latest = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -650,7 +663,7 @@ export class ApplicationSessionService {
     signal: AbortSignal,
   ): Promise<ApplicationSessionSnapshotDto> {
     signal.throwIfAborted();
-    await this.#reconcileApplicationSlot(signal);
+    await this.#reconcileApplicationSlots(signal);
     let previous: PublicApplicationSession | null;
     try {
       previous = this.dependencies.repository.getLatestApplicationSession(runId);
@@ -1682,47 +1695,47 @@ export class ApplicationSessionService {
     }
   }
 
-  async #reconcileApplicationSlot(
+  async #reconcileApplicationSlots(
     signal: AbortSignal,
     resumableRunId?: string,
   ): Promise<void> {
-    let session: PublicApplicationSession | null;
+    let sessions: readonly PublicApplicationSession[];
     try {
-      session = this.dependencies.repository.getUnreleasedApplicationSession();
+      sessions = this.dependencies.repository.getUnreleasedApplicationSessions();
     } catch (error) {
       mapRepositoryError(error);
     }
-    if (
-      session
-      && session.runId === resumableRunId
-      && session.publicSnapshot === null
-      && (session.bridgeState === "reserved" || session.bridgeState === "starting")
-    ) {
-      return;
-    }
-    if (!session) return;
     const harness = this.dependencies.harness;
     if (!harness) return;
-    try {
-      const snapshot = await harness.get(session.sessionId, signal);
-      this.#recordHarnessSnapshot(session.runId, session, snapshot);
-      const current =
-        this.dependencies.repository.getLatestApplicationSession(session.runId);
+    for (const session of sessions) {
       if (
-        current
-        && current.generation === session.generation
-        && current.sessionId === session.sessionId
-        && !current.slotReleased
+        session.runId === resumableRunId
+        && session.publicSnapshot === null
+        && (session.bridgeState === "reserved" || session.bridgeState === "starting")
       ) {
-        this.#ensureSlotReleaseObserver(current.runId, current);
+        continue;
       }
-    } catch (error) {
-      if (signal.aborted) signal.throwIfAborted();
-      if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
-        this.#reconcileMissingHarnessSession(session);
-        return;
+      try {
+        const snapshot = await harness.get(session.sessionId, signal);
+        this.#recordHarnessSnapshot(session.runId, session, snapshot);
+        const current =
+          this.dependencies.repository.getLatestApplicationSession(session.runId);
+        if (
+          current
+          && current.generation === session.generation
+          && current.sessionId === session.sessionId
+          && !current.slotReleased
+        ) {
+          this.#ensureSlotReleaseObserver(current.runId, current);
+        }
+      } catch (error) {
+        if (signal.aborted) signal.throwIfAborted();
+        if (error instanceof ApplicationHarnessError && error.code === "session_not_found") {
+          this.#reconcileMissingHarnessSession(session);
+          continue;
+        }
+        this.#throwHarnessError(error);
       }
-      this.#throwHarnessError(error);
     }
   }
 

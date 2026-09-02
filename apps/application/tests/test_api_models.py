@@ -1709,7 +1709,7 @@ async def test_multipart_count_validation(
         assert len(service.create_calls) == 1
 
 
-async def test_singleton_conflict_passes_through_fixed_service_error(
+async def test_capacity_conflict_passes_through_fixed_service_error(
     api_client: tuple[httpx.AsyncClient, FakeSessionService],
 ) -> None:
     client, service = api_client

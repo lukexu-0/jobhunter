@@ -447,7 +447,7 @@ describe("pipeline application bootstrap", () => {
       events: async function* () {},
       command: async () => {},
       close: async () => {},
-      startNextAutomaticApplication: async () => false,
+      startAutomaticApplications: async () => 0,
     };
     const fixture = createFixture(false, { applicationSessions });
 
@@ -930,11 +930,11 @@ describe("pipeline application bootstrap", () => {
     });
     let signalAutomaticStart!: () => void;
     const automaticStart = new Promise<void>((resolve) => { signalAutomaticStart = resolve; });
-    app.services.applicationSessions.startNextAutomaticApplication = async (signal) => {
+    app.services.applicationSessions.startAutomaticApplications = async (signal) => {
       expect(signal.aborted).toBe(false);
       maintenanceOrder.push("automatic-application");
       signalAutomaticStart();
-      return false;
+      return 0;
     };
 
     app.kick();
@@ -974,7 +974,7 @@ describe("pipeline application bootstrap", () => {
         },
       },
     });
-    fixture.app.services.applicationSessions.startNextAutomaticApplication = async () => {
+    fixture.app.services.applicationSessions.startAutomaticApplications = async () => {
       throw reportedError;
     };
 

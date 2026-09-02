@@ -913,7 +913,44 @@ describe("application session ledger", () => {
     )).toThrow(/changed/);
   });
 
-  test("selects the oldest unstarted skip-review approval only when no application session is live", () => {
+  test("admits three application sessions and reuses released capacity", () => {
+    const { repo } = fixture();
+    const hash = "8".repeat(64);
+    const runIds = ["capacity-a", "capacity-b", "capacity-c", "capacity-d"].map((id) => {
+      const runId = createReview(repo, hash, false, id);
+      repo.approve(runId, hash);
+      return runId;
+    });
+    const sessionIds = [
+      "81818181-8181-4181-8181-818181818181",
+      "82828282-8282-4282-8282-828282828282",
+      "83838383-8383-4383-8383-838383838383",
+      "84848484-8484-4484-8484-848484848484",
+    ];
+
+    for (let index = 0; index < 3; index += 1) {
+      repo.reserveApplicationSession(runIds[index]!, null, sessionIds[index]!, hash);
+    }
+    expect(repo.getUnreleasedApplicationSessions().map(({ sessionId }) => sessionId)).toEqual(
+      sessionIds.slice(0, 3),
+    );
+    expect(() => repo.reserveApplicationSession(
+      runIds[3]!,
+      null,
+      sessionIds[3]!,
+      hash,
+    )).toThrow(/capacity/i);
+
+    repo.releaseApplicationSessionSlot(runIds[1]!, 1, sessionIds[1]!);
+    repo.reserveApplicationSession(runIds[3]!, null, sessionIds[3]!, hash);
+    expect(repo.getUnreleasedApplicationSessions().map(({ sessionId }) => sessionId)).toEqual([
+      sessionIds[0]!,
+      sessionIds[2]!,
+      sessionIds[3]!,
+    ]);
+  });
+
+  test("selects oldest skip-review approvals while application capacity remains", () => {
     const { repo } = fixture();
     const hash = "5".repeat(64);
     const manualRunId = createReview(repo, hash, false, "manual-approved");
@@ -963,54 +1000,44 @@ describe("application session ledger", () => {
 
     const manualSessionId = "12121212-1212-4212-8212-121212121212";
     repo.reserveApplicationSession(manualRunId, null, manualSessionId, hash);
-    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+    expect(repo.getNextAutomaticApplicationStart()?.runId).toBe(oldest);
     repo.recordApplicationSnapshot(manualRunId, {
       generation: 1,
       sessionId: manualSessionId,
       bridgeState: "failed",
       publicSnapshot: { state: "failed" },
       slotReleased: false,
-    });
-    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
-    expect(() => repo.reserveApplicationSession(
-      oldest,
-      null,
-      "14141414-1414-4414-8414-141414141414",
-      hash,
-    )).toThrow(/slot|active/i);
-    expect(repo.getLatestApplicationSession(manualRunId)).toMatchObject({
-      bridgeState: "failed",
-      slotReleased: false,
-    });
-    repo.recordApplicationSnapshot(manualRunId, {
-      generation: 1,
-      sessionId: manualSessionId,
-      bridgeState: "failed",
-      publicSnapshot: { state: "failed" },
-      slotReleased: true,
-    });
-    expect(repo.getLatestApplicationSession(manualRunId)).toMatchObject({
-      bridgeState: "failed",
-      slotReleased: true,
     });
     expect(repo.getNextAutomaticApplicationStart()?.runId).toBe(oldest);
 
-    const automaticSessionId = "13131313-1313-4313-8313-131313131313";
-    repo.reserveApplicationSession(oldest, null, automaticSessionId, hash);
+    const oldestSessionId = "13131313-1313-4313-8313-131313131313";
+    repo.reserveApplicationSession(oldest, null, oldestSessionId, hash);
+    expect(repo.getNextAutomaticApplicationStart()?.runId).toBe(next);
+
+    const nextSessionId = "14141414-1414-4414-8414-141414141414";
+    repo.reserveApplicationSession(next, null, nextSessionId, hash);
     expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+
+    repo.recordApplicationSnapshot(manualRunId, {
+      generation: 1,
+      sessionId: manualSessionId,
+      bridgeState: "failed",
+      publicSnapshot: { state: "failed" },
+      slotReleased: true,
+    });
+    expect(repo.getLatestApplicationSession(manualRunId)).toMatchObject({
+      bridgeState: "failed",
+      slotReleased: true,
+    });
+    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+
     repo.recordApplicationSnapshot(oldest, {
       generation: 1,
-      sessionId: automaticSessionId,
+      sessionId: oldestSessionId,
       bridgeState: "closed",
       publicSnapshot: { state: "closed" },
       slotReleased: true,
     });
-    expect(repo.getNextAutomaticApplicationStart()).toEqual({
-      runId: next,
-      approvedPdfSha256: hash,
-    });
-
-    repo.deleteRun(next);
     expect(repo.getNextAutomaticApplicationStart()).toBeNull();
   });
 
@@ -1087,7 +1114,10 @@ describe("application session ledger", () => {
     repo.approve(blockerRunId, blockerHash);
     const blockerSessionId = "15151515-1515-4515-8515-151515151515";
     repo.reserveApplicationSession(blockerRunId, null, blockerSessionId, blockerHash);
-    expect(repo.getNextAutomaticApplicationStart()).toBeNull();
+    expect(repo.getNextAutomaticApplicationStart()).toEqual({
+      runId: run.id,
+      approvedPdfSha256: editedHash,
+    });
     repo.recordApplicationSnapshot(blockerRunId, {
       slotReleased: true,
       generation: 1,

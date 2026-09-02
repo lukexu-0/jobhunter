@@ -75,7 +75,7 @@ export interface PipelineWorkerHandle {
 }
 
 export interface PipelineApplicationSessionService extends ApplicationSessionRouteService {
-  startNextAutomaticApplication(signal: AbortSignal): Promise<boolean>;
+  startAutomaticApplications(signal: AbortSignal): Promise<number>;
   dispose?(): void | Promise<void>;
 }
 
@@ -327,7 +327,7 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
       ...schedulerOptions,
       afterDrain: async (signal) => {
         await schedulerOptions?.afterDrain?.(signal);
-        await applicationSessions.startNextAutomaticApplication(signal);
+        await applicationSessions.startAutomaticApplications(signal);
       },
     },
   });

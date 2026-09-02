@@ -940,6 +940,7 @@ def privacy_scan(capture: Capture, token: str) -> None:
 async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> None:
     headers = {"Authorization": f"Bearer {token}"}
     active_session_id: str | None = None
+    capacity_session_ids: list[str] = []
     event_stream: EventStream | None = None
     fixture: LocalApplicationFixture | None = None
     client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=False)
@@ -1002,14 +1003,46 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             event_stream = EventStream(client, events_url, headers, capture)
             event_stream.start()
 
+            for _ in range(2):
+                capacity_response, capacity = await create_session(
+                    client, capture, args.harness_url, headers, fixture, inputs
+                )
+                require_status(
+                    capacity_response,
+                    202,
+                    "Harness did not admit all three application sessions",
+                )
+                try:
+                    capacity_session_ids.append(
+                        str(UUID(str(capacity.get("session_id"))))
+                    )
+                except (ValueError, TypeError, AttributeError):
+                    raise SmokeFailure(
+                        "Harness capacity response did not contain a UUID session id"
+                    ) from None
+
             concurrent_response, concurrent = await create_session(
                 client, capture, args.harness_url, headers, fixture, inputs
             )
-            require_status(concurrent_response, 409, "Concurrent session create did not return 409")
-            require(
-                concurrent == {"code": "session_active", "session_id": active_session_id},
-                "Concurrent session create did not identify the active singleton",
+            require_status(
+                concurrent_response, 409, "Fourth concurrent session create did not return 409"
             )
+            require(
+                concurrent.get("code") == "session_active"
+                and concurrent.get("session_id")
+                in {active_session_id, *capacity_session_ids},
+                "Fourth concurrent session create did not identify an occupying session",
+            )
+            for capacity_session_id in capacity_session_ids:
+                capacity_delete = await client.delete(
+                    f"{args.harness_url}/v1/sessions/{capacity_session_id}",
+                    headers=headers,
+                )
+                capture.response(capacity_delete)
+                require_status(
+                    capacity_delete, 204, "Capacity probe session DELETE failed"
+                )
+            capacity_session_ids.clear()
 
             started = await event_stream.wait_for("session_started")
             additional_info = await event_stream.wait_for(
@@ -1256,7 +1289,7 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             require_status(
                 followup_create_response,
                 202,
-                "A fresh session could not start after ordered cleanup released the singleton",
+                "A fresh session could not start after ordered cleanup released capacity",
             )
             try:
                 followup_session_id = str(UUID(str(followup_created.get("session_id"))))
@@ -1336,6 +1369,15 @@ async def workflow(args: argparse.Namespace, token: str, capture: Capture) -> No
             final_submit = await asyncio.to_thread(fixture.submit_snapshot)
             require(final_submit.get("submit_count") == 1, "Cleanup changed the one-submit fixture invariant")
         finally:
+            for capacity_session_id in capacity_session_ids:
+                try:
+                    response = await client.delete(
+                        f"{args.harness_url}/v1/sessions/{capacity_session_id}",
+                        headers=headers,
+                    )
+                    capture.response(response)
+                except Exception:
+                    pass
             if active_session_id is not None:
                 try:
                     response = await client.delete(
