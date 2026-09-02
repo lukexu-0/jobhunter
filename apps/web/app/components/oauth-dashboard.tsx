@@ -20,6 +20,10 @@ const PROVIDERS = [
     provider: "openai-codex",
     name: "OpenAI Codex",
   },
+  {
+    provider: "gmail",
+    name: "Gmail",
+  },
 ] as const satisfies ReadonlyArray<{
   provider: AuthProvider;
   name: string;
@@ -269,6 +273,12 @@ export function OAuthDashboard() {
 
   usePendingSessionPolling(
     sessions["openai-codex"],
+    updateSession,
+    refreshAuthStatus,
+    setNotice,
+  );
+  usePendingSessionPolling(
+    sessions.gmail,
     updateSession,
     refreshAuthStatus,
     setNotice,

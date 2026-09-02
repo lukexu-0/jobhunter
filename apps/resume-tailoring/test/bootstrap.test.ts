@@ -84,6 +84,7 @@ function createFixture(suppliedRuns = false, ingestion: IngestionOverrides = {})
     getAuthStatus: ingestion.getAuthStatus ?? (() => ({
       providers: [
         { provider: "openai-codex", state: "disconnected" },
+        { provider: "gmail", state: "disconnected" },
       ],
     })),
     startSession: async () => {
@@ -789,6 +790,7 @@ describe("pipeline application bootstrap", () => {
         return {
           providers: [
             { provider: "openai-codex", state: "connected" },
+            { provider: "gmail", state: "disconnected" },
           ],
         };
       },
@@ -892,6 +894,7 @@ describe("pipeline application bootstrap", () => {
       getAuthStatus: () => ({
         providers: [
           { provider: "openai-codex", state: "disconnected" },
+          { provider: "gmail", state: "disconnected" },
         ],
       }),
       startSession: async () => { throw new Error("unexpected authentication"); },

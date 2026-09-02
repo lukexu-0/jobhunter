@@ -16,6 +16,7 @@ function fakeService(overrides: Partial<AuthRouteService> = {}): AuthRouteServic
   const status: AuthStatusResponse = {
     providers: [
       { provider: "openai-codex", state: "disconnected" },
+      { provider: "gmail", state: "disconnected" },
     ],
   };
   return {
@@ -48,19 +49,21 @@ describe("OAuth HTTP routes", () => {
     expect(await response.json()).toEqual({
       providers: [
         { provider: "openai-codex", state: "disconnected" },
+        { provider: "gmail", state: "disconnected" },
       ],
     });
   });
 
-  test("validates exactly the OpenAI Codex provider status", () => {
+  test("validates exactly the OpenAI Codex and Gmail provider statuses", () => {
     const providers = [
       { provider: "openai-codex", state: "disconnected" },
+      { provider: "gmail", state: "disconnected" },
     ];
     expect(AuthStatusResponseSchema.safeParse({ providers }).success).toBe(true);
     expect(AuthStatusResponseSchema.safeParse({
       providers: [...providers, { provider: "indeed", state: "disconnected" }],
     }).success).toBe(false);
-    expect(AuthStatusResponseSchema.safeParse({ providers: [] }).success).toBe(false);
+    expect(AuthStatusResponseSchema.safeParse({ providers: providers.slice(0, 1) }).success).toBe(false);
   });
 
   test("starts the exact provider with an empty JSON object", async () => {

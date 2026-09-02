@@ -57,9 +57,19 @@ export interface GmailSearchResult {
   readonly truncated: boolean;
 }
 
+export type GmailFetch = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
+export interface GmailToolClient {
+  searchInbox(input: GmailSearchInput, signal?: AbortSignal): Promise<GmailSearchResult>;
+  readEmail(id: string, signal?: AbortSignal): Promise<GmailParsedMessage>;
+}
+
 export interface GmailClientDependencies {
   readonly accessToken: (signal?: AbortSignal) => Promise<string>;
-  readonly fetch?: typeof fetch;
+  readonly fetch?: GmailFetch;
   readonly now?: () => number;
   readonly apiOrigin?: string;
 }
@@ -136,7 +146,7 @@ function headerValue(
 
 export class GmailClient {
   readonly #accessToken: GmailClientDependencies["accessToken"];
-  readonly #fetch: typeof fetch;
+  readonly #fetch: GmailFetch;
   readonly #apiOrigin: string;
   readonly #now: () => number;
 
@@ -161,7 +171,7 @@ export class GmailClient {
     try {
       response = await this.#fetch(url, {
         headers: { authorization: `Bearer ${accessToken}` },
-        signal,
+        ...(signal === undefined ? {} : { signal }),
       });
     } catch {
       signal?.throwIfAborted();
