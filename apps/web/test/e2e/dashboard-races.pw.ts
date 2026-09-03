@@ -75,7 +75,7 @@ test("ignores an older run-list failure after a newer list has loaded", async ({
   await retry.click();
 
   const newerRow = page.getByRole("row").filter({
-    has: page.getByRole("combobox", { name: "Application state for newer-run" }),
+    has: page.getByRole("combobox", { name: "Application status for newer-run" }),
   });
   await expect(newerRow).toBeVisible();
   await expect(initialFailure).not.toBeVisible();
@@ -161,7 +161,7 @@ test("WEB-UI-002 keeps a successful application-status patch after an older list
 
   await page.goto("/");
   const applicationState = page.getByRole("combobox", {
-    name: "Application state for patch-run",
+    name: "Application status for patch-run",
   });
   await expect(applicationState).toHaveValue("applied");
   await staleStarted;
@@ -256,7 +256,7 @@ test("WEB-METADATA-001 retries a failed public job-analysis read on a later acti
 
   await page.goto("/");
   const applicationRow = page.getByRole("row").filter({
-    has: page.getByRole("combobox", { name: "Application state for retry-run" }),
+    has: page.getByRole("combobox", { name: "Application status for retry-run" }),
   });
   await expect(applicationRow).toBeVisible();
   await firstArtifactFailure;

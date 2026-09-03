@@ -24,6 +24,7 @@ import {
   type RunDto,
   type RunStatus,
 } from "@jobhunter/pipeline/contracts";
+import { installBrowserNotificationProbe } from "./browser-notification-probe";
 
 const runId = "run-detail-review-workspace";
 const pipelineRunPath = `/api/pipeline/runs/${runId}`;
@@ -182,6 +183,7 @@ function deferred(): Deferred {
   });
   return { promise, resolve };
 }
+
 async function installSoundProbe(page: Page): Promise<() => Promise<number[]>> {
   await page.addInitScript(() => {
     const audioWindow = window as typeof window & { __soundFrequencies: number[] };
@@ -199,72 +201,6 @@ async function installSoundProbe(page: Page): Promise<() => Promise<number[]>> {
     window as typeof window & { __soundFrequencies: number[] }
   ).__soundFrequencies);
 }
-
-interface BrowserNotificationRecord {
-  readonly body: string;
-  readonly tag: string;
-  readonly title: string;
-}
-
-async function installBrowserNotificationProbe(
-  page: Page,
-  options: {
-    readonly initialPermission?: NotificationPermission;
-    readonly notificationsEnabled?: boolean;
-  } = {},
-): Promise<() => Promise<BrowserNotificationRecord[]>> {
-  await page.addInitScript((initial) => {
-    const notificationWindow = window as typeof window & {
-      __browserNotifications: BrowserNotificationRecord[];
-    };
-    Object.defineProperty(notificationWindow, "__browserNotifications", {
-      configurable: true,
-      value: [],
-    });
-    const permissionStorageKey = "jobhunter.test.browser-notification-permission";
-    let permission = window.localStorage.getItem(permissionStorageKey) as NotificationPermission | null;
-    if (permission === null) {
-      permission = initial.permission;
-      window.localStorage.setItem(permissionStorageKey, permission);
-    }
-    class BrowserNotificationProbe {
-      static get permission(): NotificationPermission {
-        return permission!;
-      }
-
-      static requestPermission(): Promise<NotificationPermission> {
-        permission = "granted";
-        window.localStorage.setItem(permissionStorageKey, permission);
-        return Promise.resolve(permission);
-      }
-
-      constructor(title: string, notificationOptions: NotificationOptions = {}) {
-        notificationWindow.__browserNotifications.push({
-          body: notificationOptions.body ?? "",
-          tag: notificationOptions.tag ?? "",
-          title,
-        });
-      }
-    }
-    Object.defineProperty(notificationWindow, "Notification", {
-      configurable: true,
-      value: BrowserNotificationProbe,
-    });
-    if (window.localStorage.getItem("jobhunter.browser-notifications.enabled") === null) {
-      window.localStorage.setItem(
-        "jobhunter.browser-notifications.enabled",
-        String(initial.notificationsEnabled),
-      );
-    }
-  }, {
-    notificationsEnabled: options.notificationsEnabled ?? true,
-    permission: options.initialPermission ?? "granted",
-  });
-  return () => page.evaluate(() => (
-    window as typeof window & { __browserNotifications: BrowserNotificationRecord[] }
-  ).__browserNotifications);
-}
-
 
 function onePagePdfFixture(): Buffer {
   const stream = "BT /F1 24 Tf 72 540 Td (Review workspace fixture) Tj ET";
@@ -1025,7 +961,7 @@ test("shows opportunity kind in white beside application status", async ({ page 
   });
   const kind = summary.locator("p", { hasText: "Hackathon" });
   const icon = kind.locator("svg");
-  const status = summary.getByText("Pending", { exact: true });
+  const status = summary.getByText("Pending application", { exact: true });
   await expect(kind).toHaveCSS("color", "rgb(238, 241, 236)");
   await expect(icon).toHaveCount(1);
   await expect(icon).toHaveAttribute("aria-hidden", "true");
@@ -1266,7 +1202,7 @@ test("failed application start keeps approval and exposes a standalone Apply ret
     { expectedApprovedPdfSha256: pdfHash2 },
   ]);
   await expect(page.getByRole("status").filter({ hasText: "Starting browser" })).toBeVisible();
-  await expect(page.getByText("Pending", { exact: true })).toBeVisible();
+  await expect(page.getByText("Pending application", { exact: true })).toBeVisible();
 });
 
 test("an accepted live projection clears a stale application load failure", async ({ page }) => {
@@ -2822,7 +2758,7 @@ test("navigation, human review, submit approval, and close use exact public comm
   const applicationSummary = page.getByRole("complementary", {
     name: "Application summary and keyword comparison",
   });
-  await expect(applicationSummary.getByText("Pending", { exact: true })).toBeVisible();
+  await expect(applicationSummary.getByText("Pending application", { exact: true })).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ }))
     .toHaveText("Waiting for review!");
   await expect.poll(() => mock.runGetCount).toBe(1);
@@ -2944,7 +2880,7 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
   await expect(page.getByText("The application submission could not be verified.", {
     exact: false,
   })).toBeVisible();
-  await expect(page.getByText("Pending", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Pending application", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ })).toHaveCount(0);
   await expect.poll(() => mock.runGetCount).toBe(2);
 });
@@ -3019,7 +2955,7 @@ test("a failed submitted-run refresh is retryable without resubmitting", async (
   await expect(refreshAlert).toBeVisible();
   await expect(
     page.getByRole("complementary", { name: "Application summary and keyword comparison" })
-      .getByText("Pending", { exact: true }),
+      .getByText("Pending application", { exact: true }),
   ).toBeVisible();
   const appliedStage = page.getByRole("list", { name: "Workflow progress" })
     .getByRole("listitem")
