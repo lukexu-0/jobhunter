@@ -207,7 +207,7 @@ describe("allowlisted context ingestion", () => {
     }
   });
 
-  test("synchronizes the Sample Tool Go-port directive alongside Sample Testing directives", () => {
+  test("synchronizes the Sample Tool reference directive alongside Sample Testing directives", () => {
     const loaded = loadContextManifest();
     const database = openContextDatabase(":memory:");
     try {

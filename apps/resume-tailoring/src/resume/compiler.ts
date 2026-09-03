@@ -59,7 +59,7 @@ const PARENT_OR_ABSOLUTE_FILE = /(?:\\(?:input|include|includegraphics|bibliogra
 const REPAIRABLE_LOG = /(?:undefined control sequence|missing\s+[{}$]|extra\s+[{}$]|runaway argument|file ended while scanning use of|paragraph ended before \\[^\s]+ was complete|argument of \\[^\s]+ has an extra|misplaced alignment tab character|macro parameter character|illegal parameter number|use of \\[^\s]+ doesn't match its definition|too many \}'s|unbalanced|double subscript|double superscript)/i;
 const TRUSTED_GLYPH_INPUT = "\\input{glyphtounicode}";
 const TRUSTED_BASELINE_END = "\\begin{document}";
-const TRUSTED_BASELINE_SHA256 = "abe8b2120bd736a860e47919dbfb1673a7e5166c2a03d973f2b03a73ea3edccd";
+const TRUSTED_BASELINE_SHA256 = "134c0120cbfde73b3e52784717a3c99c1f427800966aad8dd67da5eac000265c";
 
 function validateTex(tex: string): void {
   const bytes = Buffer.byteLength(tex, "utf8");

@@ -1,0 +1,118 @@
+% Synthetic resume fixture. All people, organizations, dates, locations, and metrics are fictional.
+\documentclass[letterpaper,11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\input{glyphtounicode}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\setlength{\footskip}{4.1pt}
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-.5in}
+\addtolength{\textheight}{1.0in}
+\urlstyle{same}
+\raggedbottom
+\raggedright
+
+\titleformat{\section}{\vspace{-4pt}\scshape\raggedright\large}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+\pdfgentounicode=1
+\hypersetup{pdftitle={Alex Example Resume},pdfauthor={Alex Example},pdfsubject={Synthetic software engineering resume}}
+
+\newcommand{\resumeItem}[1]{\item\small{{#1 \vspace{-2pt}}}}
+\newcommand{\resumeMeta}[1]{%
+  \if\relax\detokenize{#1}\relax\else
+    \unskip\nobreak\hfill\mbox{\small\textnormal{\hspace{0.75em}#1}}%
+  \fi
+}
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \textbf{#1}\resumeMeta{#2} \\
+    \textit{\small #3}\resumeMeta{#4}\vspace{-7pt}
+}
+\newcommand{\resumeProjectHeading}[2]{
+  \item
+    \small #1\resumeMeta{#2}\par\vspace{-7pt}
+}
+\renewcommand\labelitemii{\textbullet}
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}[1][0in]{\begin{itemize}[rightmargin=#1]}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+\begin{document}
+\begin{center}
+  \textbf{\Huge Alex Example} \\ \vspace{1pt}
+  \small Example City, ZZ \enspace\textbar\enspace (202) 555-0100 \enspace\textbar\enspace
+  \href{mailto:candidate@example.test}{\underline{candidate@example.test}} \enspace\textbar\enspace
+  \href{https://example.test/profile}{\underline{example.test/profile}}
+\end{center}
+
+\section{Experience}
+\resumeSubHeadingListStart
+  \resumeSubheading
+    {Software Engineer}{Jan 2020 -- Present}
+    {Example Company}{Remote}
+    \resumeItemListStart[0.35in]
+      \resumeItem{Built deterministic TypeScript services for a synthetic workflow and documented their public contracts.}
+      \resumeItem{Added isolated integration checks that exercise error handling, state transitions, and recovery paths.}
+      \resumeItem{Improved a sample validation workflow by building deterministic TypeScript test automation.}
+    \resumeItemListEnd
+  \resumeSubheading
+    {Engineering Intern}{Jan 2019 -- Dec 2019}
+    {Example Laboratory}{Example City, ZZ}
+    \resumeItemListStart[0.35in]
+      \resumeItem{Implemented a small Python service that validates structured sample records.}
+      \resumeItem{Created reproducible benchmarks and summarized results for a fictional engineering team.}
+    \resumeItemListEnd
+\resumeSubHeadingListEnd
+
+\section{Projects}
+\resumeSubHeadingListStart
+  \resumeProjectHeading
+    {\textbf{Sample Tool} \enspace\textbar\enspace \emph{Go, TypeScript, SQLite}}{Jan 2020 -- Present}
+    \resumeItemListStart
+      \resumeItem{Built a sample workflow that transforms structured inputs into reviewable outputs.}
+      \resumeItem{Developed a Go service with SQLite and a TypeScript dashboard for a synthetic dataset.}
+      \resumeItem{Integrated an automation SDK into a human-in-the-loop sample review workflow.}
+    \resumeItemListEnd
+  \resumeProjectHeading
+    {\textbf{Sample Project} \enspace\textbar\enspace \emph{Python, Gmail API, PostgreSQL}}{Jan 2020 -- Jun 2020}
+    \resumeItemListStart
+      \resumeItem{Built a full-stack sample workflow for deterministic test records.}
+      \resumeItem{Processed over \$123,456 in synthetic order volume using the Gmail API, while preserving reproducible audit records.}
+      \resumeItem{Identified \$1,234 in sample reconciliation exceptions within a fully fictional dataset.}
+    \resumeItemListEnd
+\resumeSubHeadingListEnd
+
+\section{Competitions \& Other}
+\resumeSubHeadingListStart
+  \resumeSubheading
+    {Semifinalist}{Jan 2020 -- Jun 2020}
+    {Example Engineering Competition}{}
+    \resumeItemListStart[0.35in]
+      \resumeItem{Completed a synthetic team exercise using a deterministic scoring model.}
+    \resumeItemListEnd
+\resumeSubHeadingListEnd
+
+\section{Technical Skills}
+\begin{itemize}[leftmargin=0.15in, label={}]
+  \small{\item{
+    \textbf{Languages}{: Go, TypeScript, JavaScript, Python, SQL} \\
+    \textbf{Frontend \& Backend}{: React, Node.js, REST APIs, gRPC, FastAPI} \\
+    \textbf{Data \& Infrastructure}{: PostgreSQL, SQLite, Redis, Docker, Kubernetes, Linux} \\
+    \textbf{Engineering}{: Distributed systems, observability, CI/CD, incident response, automated testing}
+  }}
+\end{itemize}
+\end{document}
