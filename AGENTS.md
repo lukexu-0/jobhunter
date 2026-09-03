@@ -5,7 +5,7 @@
 Jobhunter is a local, evidence-grounded system for opportunity discovery, resume tailoring, review, and application assistance. It has three cooperating processes:
 
 - `apps/resume-tailoring/`: Bun/TypeScript pipeline API, SQLite workflow engine, discovery catalog, candidate-context snapshots, model-backed tailoring, TeX/PDF generation, QA, and application orchestration.
-- `apps/web/`: Next.js App Router UI for starting and monitoring runs, reviewing revisions, browsing discovery results, managing application state, and connecting OpenAI Codex OAuth.
+- `apps/web/`: Next.js App Router UI for starting and monitoring runs, reviewing revisions, browsing discovery results, managing application state, and connecting OAuth credentials.
 - `apps/application/`: separately launched Python/FastAPI harness that owns up to three constrained Playwright CLI/Chrome application sessions, one exclusive source-capture session, and their human gates.
 
 Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and public-safe failures. `apps/user-info/` contains private candidate evidence; those files are inputs, not operational engineering documentation.
@@ -17,7 +17,7 @@ Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and publi
 3. `WorkerScheduler` leases at most five SQLite claims. `PipelineStageProcessor` claim-fences `analyzing → tailoring/editing → compiling/repairing → deterministic_qa → visual_qa → review/approved`. Stages create new artifacts and guarded revisions; they do not mutate finalized output.
 4. `PipelineRepository` owns durable run, revision, attempt, claim, event, source-snapshot, and application-session state. `ArtifactStore` owns bounded, path-contained bytes. Writes are atomic and SHA-256/size verified; claim tokens and source/PDF hashes reject stale work.
 5. Shared React data lives in `DashboardDataProvider`; detail/review and application-stream state live in their owning workspace components. Poll only while work is active and reject stale responses with request/version or generation/event guards.
-6. For approved URL-backed runs, `ApplicationSessionService` sends the approved PDF, TeX source, profile, and mode to the bearer-protected Python harness. Python owns three application browser slots or one exclusive source-capture session and owns all human gates; it calls only the private Bun `/v1/internal/application-agent` model boundary. Harness snapshots/events return through SQLite and the web SSE bridge; raw model traces remain private diagnostics.
+6. For approved URL-backed runs, `ApplicationSessionService` sends the approved PDF, TeX source, profile, and mode to the bearer-protected Python harness. TypeScript and Python enforce at most three concurrent application sessions. Python owns three application browser slots or one exclusive source-capture session and owns all human gates; it calls only the private Bun `/v1/internal/application-agent` model boundary. Harness snapshots/events return through SQLite and the web SSE bridge; raw model traces remain private diagnostics.
 7. Runtime state is outside the checkout: `<data-root>/production/{pipeline.sqlite,context.sqlite,auth.sqlite,runs/}` or `<data-root>/development/<encoded-branch>/...`. `<data-root>` is absolute `JOBHUNTER_DATA_HOME`, otherwise absolute `$XDG_DATA_HOME/jobhunter`, otherwise `~/.local/share/jobhunter`. Never edit these stores directly.
 
 ## Key Directories
@@ -113,7 +113,7 @@ The workspace launcher never starts the Python harness. Keep development and sta
 - The harness also requires Node.js, exact `@playwright/cli` `0.1.17`, matching `playwright` `1.62.0-alpha-1783623505000`, Chrome, and the installed ffmpeg codec.
 - Pipeline processing targets Linux. TeX/PDF work requires `latexmk`, `pdfinfo`, `pdftotext`, `pdffonts`, and `pdftoppm`; generic rendered HTML fallback also requires the documented Chrome/systemd boundary. Run `doctor` instead of guessing which prerequisite is missing.
 - Under WSL, the harness rejects automatic Windows Chrome discovery and `.exe` paths. Start Windows Chrome separately with an isolated profile and pass its loopback `--cdp-url`; follow `info/docs/apps/browser-harness/application.html`.
-- Credentials is OpenAI Codex OAuth only; do not add provider API keys. Pipeline and harness share a private `JOBHUNTER_HARNESS_TOKEN` of at least 32 code points. Never put it in browser code, URLs, source, or logs.
+- Credentials manages OAuth-only OpenAI Codex and read-only Gmail connections; do not add provider API keys. Pipeline and harness share a private `JOBHUNTER_HARNESS_TOKEN` of at least 32 code points. Never put it in browser code, URLs, source, or logs.
 - No project `.env` template, CI workflow, container deployment, formatter, or linter is configured. Follow manifests and canonical HTML docs rather than inventing tooling.
 - Do not edit generated `apps/web/next-env.d.ts`, pipeline `dist/`, Next `.next/`, test output, browser profiles, credentials, external SQLite state, or run artifacts.
 
