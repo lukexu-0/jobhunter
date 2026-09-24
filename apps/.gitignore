@@ -1,5 +1,6 @@
 **/node_modules/
 /.env.local
+harness/.env.local
 **/.playwright-cli/
 **/coverage/
 **/*.tsbuildinfo
