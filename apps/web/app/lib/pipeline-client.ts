@@ -1,6 +1,16 @@
 import { z } from "zod";
 import {
   ApiErrorSchema,
+  ApplicationModelSelectionSchema,
+  AuthPromptAnswerSchema,
+  AuthProviderSchema,
+  AuthSessionSchema,
+  AuthStatusResponseSchema,
+  type ApplicationModelId,
+  type ApplicationModelSelection,
+  type AuthProvider,
+  type AuthSession,
+  type AuthStatusResponse,
   ApplicationAnswerSuggestionsResponseSchema,
   ApplicationProfessionalizeRequestSchema,
   ApplicationProfessionalizeResponseSchema,
@@ -12,12 +22,6 @@ import {
   CreateRunRequestSchema,
   CreateSourceHandoffRequestSchema,
   EditRunRequestSchema,
-  DiscoveryListRequestSchema,
-  DiscoveryListResponseSchema,
-  DiscoveryQueueRequestSchema,
-  DiscoveryQueueResponseSchema,
-  DiscoverySyncRequestSchema,
-  DiscoverySyncResponseSchema,
   RegenerateRunRequestSchema,
   ResumeIterationListResponseSchema,
   RunDtoSchema,
@@ -32,17 +36,13 @@ import {
   type ApplicationProfessionalizeResponse,
   type ApplicationStatus,
   type ResumeIterationListResponse,
-  type DiscoveryListRequest,
-  type DiscoveryListResponse,
-  type DiscoveryQueueResponse,
-  type DiscoverySyncResponse,
   type OpportunityKind,
   type SourceHandoffDto,
   type RunDto,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
   type ApplicationSessionView,
-} from "@jobhunter/pipeline/contracts";
+} from "./pipeline-contracts";
 
 const PIPELINE_ROOT = "/api/pipeline";
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
@@ -60,6 +60,12 @@ const PUBLIC_5XX_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   JOB_EXTRACTION_UNAVAILABLE: "Opportunity description extraction failed",
 });
 const JsonValueSchema = z.json();
+const ContextResponseSchema = z.object({
+  fresh: z.boolean(),
+  manifestMatches: z.boolean(),
+  staleSources: z.array(z.string()),
+  missingSources: z.array(z.string()),
+});
 
 export class PipelineClientError extends Error {
   readonly code: string;
@@ -82,7 +88,8 @@ function publicMessage(message: string): string {
     .replace(/\b(?:api[_-]?key|authorization|password|secret)\b\s*[:=]\s*[^\s,;]+/gi, "credential=[redacted]")
     .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted claim]")
-    .replace(/([?&](?:access_token|refresh_token|id_token|code)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/\b(?:authorization[_\s-]?code|callback(?:[_\s-]?(?:code|token))?|code|state)\b\s*[:=]\s*[^\s,;]+/gi, "credential=[redacted]")
+    .replace(/([?&](?:access_token|refresh_token|id_token|code|state)=)[^&\s]+/gi, "$1[redacted]")
     .replace(/(?:[A-Za-z]:\\|\/)(?:[^\s"'<>:,;]+[\\/])+[^\s"'<>:,;]*/g, "[redacted path]")
     .trim()
     .slice(0, MAX_PUBLIC_MESSAGE_LENGTH);
@@ -221,8 +228,70 @@ async function requestEmptyApplicationResponse(
   }
 }
 
-export async function listRuns(): Promise<RunDto[]> {
-  const response = await fetchPipeline("/runs", { method: "GET" });
+export function getAuthStatus(signal?: AbortSignal): Promise<AuthStatusResponse> {
+  return requestApplicationResponse("/auth", { method: "GET", signal }, 200, AuthStatusResponseSchema);
+}
+
+export async function startAuthSession(provider: AuthProvider, signal?: AbortSignal): Promise<AuthSession> {
+  ensureValidRequest(AuthProviderSchema.safeParse(provider).success);
+  const session = await requestApplicationResponse(
+    "/auth/" + provider + "/sessions", { ...jsonPost({}), signal }, 201, AuthSessionSchema,
+  );
+  if (session.provider !== provider) throw invalidResponse();
+  return session;
+}
+
+export async function getAuthSession(id: string, signal?: AbortSignal): Promise<AuthSession> {
+  const session = await requestApplicationResponse(
+    "/auth/sessions/" + encodeURIComponent(id), { method: "GET", signal }, 200, AuthSessionSchema,
+  );
+  if (session.id !== id) throw invalidResponse();
+  return session;
+}
+
+export async function cancelAuthSession(id: string, signal?: AbortSignal): Promise<AuthSession> {
+  const session = await requestApplicationResponse(
+    "/auth/sessions/" + encodeURIComponent(id), { method: "DELETE", signal }, 200, AuthSessionSchema,
+  );
+  if (session.id !== id) throw invalidResponse();
+  return session;
+}
+
+export async function answerAuthPrompt(id: string, value: string, signal?: AbortSignal): Promise<AuthSession> {
+  const parsed = AuthPromptAnswerSchema.safeParse({ value });
+  ensureValidRequest(parsed.success);
+  const session = await requestApplicationResponse(
+    "/auth/sessions/" + encodeURIComponent(id) + "/prompt", { ...jsonPost(parsed.data), signal }, 200, AuthSessionSchema,
+  );
+  if (session.id !== id) throw invalidResponse();
+  return session;
+}
+
+export function disconnectAuthProvider(provider: AuthProvider, signal?: AbortSignal): Promise<void> {
+  ensureValidRequest(AuthProviderSchema.safeParse(provider).success);
+  return requestEmptyApplicationResponse("/auth/" + provider, { method: "DELETE", signal }, 204);
+}
+
+export function getApplicationModel(signal?: AbortSignal): Promise<ApplicationModelSelection> {
+  return requestApplicationResponse("/auth/application-model", { method: "GET", signal }, 200, ApplicationModelSelectionSchema);
+}
+
+export function setApplicationModel(model: ApplicationModelId, signal?: AbortSignal): Promise<ApplicationModelSelection> {
+  const parsed = ApplicationModelSelectionSchema.safeParse({ model });
+  ensureValidRequest(parsed.success);
+  return requestApplicationResponse(
+    "/auth/application-model", { ...jsonPost(parsed.data), method: "PUT", signal }, 200, ApplicationModelSelectionSchema,
+  );
+}
+
+export function getContext(signal?: AbortSignal): Promise<z.infer<typeof ContextResponseSchema>> {
+  return requestApplicationResponse("/context", { method: "GET", signal }, 200, ContextResponseSchema);
+}
+
+export async function listRuns(signal?: AbortSignal): Promise<RunDto[]> {
+  const init: RequestInit = { method: "GET" };
+  if (signal) init.signal = signal;
+  const response = await fetchPipeline("/runs", init);
   let body: unknown;
   try {
     body = await response.json();
@@ -233,59 +302,6 @@ export async function listRuns(): Promise<RunDto[]> {
   const parsed = RunListResponseSchema.safeParse(body);
   if (!parsed.success) throw invalidResponse();
   return parsed.data.runs;
-}
-
-function discoveryQuery(request: DiscoveryListRequest): string {
-  const query = new URLSearchParams();
-  if (request.role) query.set("role", request.role);
-  query.set("maxAgeDays", request.maxAgeDays === null ? "all" : String(request.maxAgeDays));
-  query.set("status", request.status);
-  if (request.suitable !== undefined) query.set("suitable", String(request.suitable));
-  query.set("sort", request.sort);
-  query.set("hideQueued", String(request.hideQueued));
-  query.set("search", request.search);
-  query.set("limit", String(request.limit));
-  query.set("offset", String(request.offset));
-  return query.toString();
-}
-
-export function listDiscoveryJobs(
-  request: z.input<typeof DiscoveryListRequestSchema> = {},
-): Promise<DiscoveryListResponse> {
-  const parsed = DiscoveryListRequestSchema.safeParse(request);
-  ensureValidRequest(parsed.success);
-  return requestApplicationResponse(
-    `/discovery?${discoveryQuery(parsed.data)}`,
-    { method: "GET" },
-    200,
-    DiscoveryListResponseSchema,
-  );
-}
-
-export function syncDiscoveryJobs(
-  request: z.input<typeof DiscoverySyncRequestSchema> = {},
-): Promise<DiscoverySyncResponse> {
-  const parsed = DiscoverySyncRequestSchema.safeParse(request);
-  ensureValidRequest(parsed.success);
-  return requestApplicationResponse(
-    "/discovery/sync",
-    jsonPost(parsed.data),
-    200,
-    DiscoverySyncResponseSchema,
-  );
-}
-
-export function queueDiscoveryJobs(
-  request: z.input<typeof DiscoveryQueueRequestSchema>,
-): Promise<DiscoveryQueueResponse> {
-  const parsed = DiscoveryQueueRequestSchema.safeParse(request);
-  ensureValidRequest(parsed.success);
-  return requestApplicationResponse(
-    "/discovery/queue",
-    jsonPost(parsed.data),
-    200,
-    DiscoveryQueueResponseSchema,
-  );
 }
 
 export function getRun(id: string): Promise<RunDto> {
@@ -443,10 +459,12 @@ export function approveRun(
   return requestRun(`${runPath(id)}/approve`, jsonPost(body));
 }
 
-export function getApplicationSession(id: string): Promise<ApplicationSessionView> {
+export function getApplicationSession(id: string, signal?: AbortSignal): Promise<ApplicationSessionView> {
+  const init: RequestInit = { method: "GET" };
+  if (signal) init.signal = signal;
   return requestApplicationResponse(
     applicationPath(id),
-    { method: "GET" },
+    init,
     200,
     ApplicationSessionViewSchema,
   );
@@ -455,14 +473,17 @@ export function getApplicationSession(id: string): Promise<ApplicationSessionVie
 export function startApplicationSession(
   id: string,
   expectedApprovedPdfSha256: string,
+  options: Readonly<{ autoSubmit?: boolean; autoEnd?: boolean; reapply?: boolean }> = {},
+  signal?: AbortSignal,
 ): Promise<ApplicationSessionSnapshotDto> {
   const parsed = StartApplicationSessionRequestSchema.safeParse({
     expectedApprovedPdfSha256,
+    ...options,
   });
   ensureValidRequest(parsed.success);
   return requestApplicationResponse(
     applicationPath(id),
-    jsonPost(parsed.data),
+    { ...jsonPost(parsed.data), ...(signal ? { signal } : {}) },
     202,
     ApplicationSessionSnapshotDtoSchema,
   );
@@ -471,14 +492,17 @@ export function startApplicationSession(
 export function retryApplicationSession(
   id: string,
   expectedApprovedPdfSha256: string,
+  options: Readonly<{ autoSubmit?: boolean; autoEnd?: boolean }> = {},
+  signal?: AbortSignal,
 ): Promise<ApplicationSessionSnapshotDto> {
   const parsed = StartApplicationSessionRequestSchema.safeParse({
     expectedApprovedPdfSha256,
+    ...options,
   });
   ensureValidRequest(parsed.success);
   return requestApplicationResponse(
     `${applicationPath(id)}/retry`,
-    jsonPost(parsed.data),
+    { ...jsonPost(parsed.data), ...(signal ? { signal } : {}) },
     202,
     ApplicationSessionSnapshotDtoSchema,
   );
@@ -487,12 +511,13 @@ export function retryApplicationSession(
 export function sendApplicationCommand(
   id: string,
   command: ApplicationSessionCommand,
+  signal?: AbortSignal,
 ): Promise<void> {
   const parsed = ApplicationSessionCommandSchema.safeParse(command);
   ensureValidRequest(parsed.success);
   return requestEmptyApplicationResponse(
     `${applicationPath(id)}/commands`,
-    jsonPost(parsed.data),
+    { ...jsonPost(parsed.data), ...(signal ? { signal } : {}) },
     202,
   );
 }
@@ -532,17 +557,22 @@ export function professionalizeApplicationAnswer(
   );
 }
 
-export function closeApplicationSession(id: string): Promise<void> {
+export function openApplicationBrowser(id: string, signal?: AbortSignal): Promise<void> {
   return requestEmptyApplicationResponse(
-    applicationPath(id),
-    { method: "DELETE" },
+    `${applicationPath(id)}/browser/open`,
+    { method: "POST", ...(signal ? { signal } : {}) },
     204,
   );
 }
 
-export function applicationEventsHref(id: string): string {
-  return `${PIPELINE_ROOT}${applicationPath(id)}/events`;
+export function closeApplicationSession(id: string, signal?: AbortSignal): Promise<void> {
+  return requestEmptyApplicationResponse(
+    applicationPath(id),
+    { method: "DELETE", ...(signal ? { signal } : {}) },
+    204,
+  );
 }
+
 
 export function artifactHref(href: string): string {
   if (!href.startsWith("/") || href.startsWith("//") || !ARTIFACT_PATH.test(href)) {
@@ -620,7 +650,7 @@ async function readBoundedText(response: Response, maxBytes: number): Promise<st
   }
 }
 
-export async function readJsonArtifact(artifact: ArtifactDto): Promise<z.infer<typeof JsonValueSchema>> {
+export async function readJsonArtifact(artifact: ArtifactDto, signal?: AbortSignal): Promise<z.infer<typeof JsonValueSchema>> {
   const parsedArtifact = ArtifactDtoSchema.safeParse(artifact);
   if (!parsedArtifact.success) {
     throw new PipelineClientError("The artifact metadata is invalid.", "INVALID_ARTIFACT");
@@ -630,7 +660,7 @@ export async function readJsonArtifact(artifact: ArtifactDto): Promise<z.infer<t
   }
 
   const href = artifactHref(parsedArtifact.data.href);
-  const response = await fetchPipeline(href.slice(PIPELINE_ROOT.length), { method: "GET" });
+  const response = await fetchPipeline(href.slice(PIPELINE_ROOT.length), { method: "GET", ...(signal ? { signal } : {}) });
   const responseMediaType = response.headers.get("content-type") ?? "";
   if (!isJsonMediaType(responseMediaType)) {
     throw new PipelineClientError("The artifact response is not JSON.", "INVALID_ARTIFACT_RESPONSE");

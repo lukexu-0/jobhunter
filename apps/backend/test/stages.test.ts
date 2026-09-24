@@ -1,0 +1,1689 @@
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type { AnalysisAgentInput } from "../src/agents/analysis-agent.ts";
+import type { AtsKeywordExtractionAgentInput } from "../src/agents/ats-keyword-extraction-agent.ts";
+import type { EditAgentInput } from "../src/agents/edit-agent.ts";
+import { buildMechanicalTailoringPlan, type TailoringAgentInput } from "../src/agents/tailoring-agent.ts";
+import { ResumeDiffSchema, type OpportunityKind } from "../src/contracts/index.ts";
+import type { ContextSnapshot, EvidenceBlock, IndexedContextSource } from "../src/context/types.ts";
+import { openPipelineDatabase } from "../src/db/database.ts";
+import { ClaimRejectedError, PipelineRepository, type RunSourceSnapshotInput } from "../src/db/repository.ts";
+import type { VisualInspection } from "../src/models/visual-inspector.ts";
+import type { CompileRequest, CompileResult } from "../src/resume/compiler.ts";
+import {
+  buildResumeDiff,
+  parseBaselineResume,
+  parseMacroCalls,
+  renderTailoredResume,
+  runDeterministicPdfQa,
+  TailoringPlanSchema,
+  type AtsKeywordExtraction,
+  type EditResult,
+  type DeterministicQaReport,
+  type KeywordMapRequest,
+  type JobAnalysis,
+  type RepairResult,
+  type TailoringPlan,
+  type TailoringResult,
+} from "../src/resume/index.ts";
+import { PipelineStageProcessor, type PipelineStageDependencies } from "../src/stages/index.ts";
+import { ARTIFACT_LIMITS, ArtifactStore } from "../src/system/artifacts.ts";
+import { atsKeywordExtractionFixture, jobAnalysisFixture } from "./job-analysis.fixture.ts";
+import { canonicalJson } from "../src/resume/ledger.ts";
+import { textPage, textTsv } from "./pdf-text.fixture.ts";
+import { SYNTHETIC_RESUME } from "./private-context.fixture.ts";
+setDefaultTimeout(15_000);
+
+const baseline = SYNTHETIC_RESUME;
+const parsedBaseline = parseBaselineResume(baseline);
+const SAMPLE_NOTES_PROJECT_TITLE = "Sample Notes";
+const SAMPLE_NOTES_ENTITY_ID = "project:sample-notes";
+const databases: Database[] = [];
+const roots: string[] = [];
+
+afterEach(async () => {
+  while (databases.length) databases.pop()?.close();
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+interface ResumeFixtures {
+  readonly snapshot: ContextSnapshot;
+  readonly snapshotInput: RunSourceSnapshotInput;
+  readonly atsKeywordExtraction: AtsKeywordExtraction;
+  readonly analysis: JobAnalysis;
+  readonly plan: TailoringPlan;
+}
+
+function resumeFixtures(jobDescription: string): ResumeFixtures {
+  const sources: IndexedContextSource[] = [
+    {
+      id: "resume-baseline",
+      relativePath: ".jobhunt-data/user-info/resume-main/resume.tex",
+      kind: "baseline",
+      entityId: "candidate-resume",
+      displayName: "Synthetic canonical resume",
+      baselineEntityIds: [],
+      sourceVersionId: "version-baseline",
+      sha256: parsedBaseline.sha256,
+      bytes: 10,
+      indexedAt: 1,
+    },
+    {
+      id: "source-automated-testing",
+      relativePath: ".jobhunt-data/user-info/current-context/jobs/example-labs/automated-testing.md",
+      kind: "authoritative-markdown",
+      entityId: "experience:example-labs",
+      displayName: "Synthetic automated testing context",
+      baselineEntityIds: ["Example Labs"],
+      sourceVersionId: "version-automated-testing",
+      sha256: "b".repeat(64),
+      bytes: 10,
+      indexedAt: 1,
+    },
+    {
+      id: "source-sample-delivery",
+      relativePath: ".jobhunt-data/user-info/current-context/projects/sample-delivery-dashboard.md",
+      kind: "authoritative-markdown",
+      entityId: "project:sample-delivery",
+      displayName: "Synthetic shipment verification context",
+      baselineEntityIds: ["Sample Delivery Dashboard", "SampleDeliveryDashboard"],
+      sourceVersionId: "version-sample-delivery",
+      sha256: "d".repeat(64),
+      bytes: 10,
+      indexedAt: 1,
+    },
+    {
+      id: "source-sample-notes",
+      relativePath: ".jobhunt-data/user-info/current-context/projects/sample-notes.md",
+      kind: "authoritative-markdown",
+      entityId: SAMPLE_NOTES_ENTITY_ID,
+      displayName: "Synthetic Sample Notes context",
+      baselineEntityIds: [SAMPLE_NOTES_PROJECT_TITLE],
+      sourceVersionId: "version-sample-notes",
+      sha256: "e".repeat(64),
+      bytes: 10,
+      indexedAt: 1,
+    },
+  ];
+  const sourceIndexByEntity: Readonly<Record<string, number>> = {
+    "Example Labs": 1,
+    [SAMPLE_NOTES_PROJECT_TITLE]: 3,
+    "Sample Delivery Dashboard": 2,
+    SampleDeliveryDashboard: 2,
+  };
+  const evidence: EvidenceBlock[] = parsedBaseline.entities.map((entity, index) => {
+    const source = sources[sourceIndexByEntity[entity.entityId] ?? 0]!;
+    return {
+      id: `evidence-${index}`,
+      sourceVersionId: source.sourceVersionId,
+      sourceId: source.id,
+      entityId: entity.entityId === "Sample Delivery Dashboard"
+        ? "SampleDeliveryDashboard"
+        : entity.entityId === SAMPLE_NOTES_PROJECT_TITLE
+          ? SAMPLE_NOTES_ENTITY_ID
+          : entity.entityId,
+      ordinal: 0,
+      headingPath: [entity.entityId],
+      text: `${entity.bullets.map((item) => item.text).join(" ")} supported fact`,
+      caveats: ["Keep source caveat"],
+      sha256: source.sha256,
+    };
+  });
+  const sampleNotesSource = sources[3]!;
+  const sampleNotesDirective: EvidenceBlock = {
+    id: "sample-notes-go-port-directive",
+    sourceVersionId: sampleNotesSource.sourceVersionId,
+    sourceId: sampleNotesSource.id,
+    entityId: sampleNotesSource.entityId,
+    ordinal: 1,
+    headingPath: ["21. Must Include"],
+    text: "- **Required technology framing:** Present the Sample Notes backend as an ongoing **Go** port; do not describe the port as complete until the owner confirms it.",
+    caveats: [],
+    sha256: sampleNotesSource.sha256,
+  };
+  const snapshot: ContextSnapshot = {
+    manifestSha256: "a".repeat(64),
+    baselineSha256: parsedBaseline.sha256,
+    sourceHashes: Object.fromEntries(sources.map((source) => [source.id, source.sha256])),
+    sources,
+    evidence: [...evidence, sampleNotesDirective],
+    mustIncludeDirectives: [{
+      sourceId: sampleNotesDirective.sourceId,
+      entityId: sampleNotesDirective.entityId,
+      text: sampleNotesDirective.text,
+    }],
+    explicitEntityBindings: { "Sample Delivery Dashboard": "SampleDeliveryDashboard" },
+  };
+  const atsKeywordExtraction = atsKeywordExtractionFixture({ rawJobDescription: jobDescription });
+  const analysis = jobAnalysisFixture({
+    jobDescriptionSha256: createHash("sha256").update(jobDescription).digest("hex"),
+    baselineSource: baseline,
+    jdQuote: jobDescription,
+  });
+  const plan = buildMechanicalTailoringPlan(analysis, baseline);
+  return {
+    snapshot,
+    snapshotInput: {
+      manifestSha256: snapshot.manifestSha256,
+      baselineSha256: snapshot.baselineSha256,
+      sourceHashes: snapshot.sourceHashes,
+    },
+    atsKeywordExtraction,
+    analysis,
+    plan,
+  };
+}
+
+const ACTIVE_DIRECTIVE_EVIDENCE_ID = "active-directive";
+
+function resumeFixturesWithActiveDirective(jobDescription: string): ResumeFixtures {
+  const fixtures = resumeFixtures(jobDescription);
+  const bulletEdit = fixtures.analysis.exactEdits.find((edit) => edit.kind === "bullet")!;
+  const existingSource = fixtures.snapshot.sources.find((source) =>
+    source.id === "source-automated-testing")!;
+  const source: IndexedContextSource = {
+    ...existingSource,
+    baselineEntityIds: [...existingSource.baselineEntityIds, bulletEdit.entityId],
+  };
+  const factualEvidence: EvidenceBlock = {
+    ...fixtures.snapshot.evidence[0]!,
+    sourceVersionId: source.sourceVersionId,
+    sourceId: source.id,
+    entityId: source.entityId,
+    sha256: source.sha256,
+  };
+  const directiveEvidence: EvidenceBlock = {
+    ...factualEvidence,
+    id: ACTIVE_DIRECTIVE_EVIDENCE_ID,
+    ordinal: factualEvidence.ordinal + 1,
+    headingPath: [...factualEvidence.headingPath, "21. Must Include"],
+    text: "The resume must include the candidate's supported testing impact.",
+  };
+  const snapshot: ContextSnapshot = {
+    ...fixtures.snapshot,
+    sources: fixtures.snapshot.sources.map((candidate) =>
+      candidate.id === source.id ? source : candidate),
+    evidence: [
+      factualEvidence,
+      ...fixtures.snapshot.evidence.slice(1),
+      directiveEvidence,
+    ],
+    mustIncludeDirectives: [{
+      sourceId: directiveEvidence.sourceId,
+      entityId: directiveEvidence.entityId,
+      text: directiveEvidence.text,
+    }],
+  };
+  return {
+    ...fixtures,
+    snapshot,
+    snapshotInput: {
+      manifestSha256: snapshot.manifestSha256,
+      baselineSha256: snapshot.baselineSha256,
+      sourceHashes: snapshot.sourceHashes,
+    },
+  };
+}
+
+
+interface HarnessOptions {
+  readonly fixtures?: ResumeFixtures;
+  readonly compileOutcomes?: readonly ("success" | "repairable" | "terminal")[];
+  readonly compiler?: PipelineStageDependencies["compiler"];
+  readonly deterministicPass?: boolean;
+  readonly deterministicReports?: readonly DeterministicQaReport[];
+  readonly visual?: VisualInspection;
+  readonly deterministicQa?: PipelineStageDependencies["deterministicQa"];
+  readonly loadSourceContext?: PipelineStageDependencies["loadSourceContext"];
+  readonly atsKeywordExtractionAgent?: PipelineStageDependencies["atsKeywordExtractionAgent"];
+  readonly analysisAgent?: PipelineStageDependencies["analysisAgent"];
+  readonly tailoringAgent?: PipelineStageDependencies["tailoringAgent"];
+  readonly editAgent?: PipelineStageDependencies["editAgent"];
+  readonly repairAgent?: PipelineStageDependencies["repairAgent"];
+  readonly generateKeywordMap?: boolean;
+  readonly skipReview?: boolean;
+  readonly opportunityKind?: OpportunityKind;
+  readonly keywordMapRenderer?: PipelineStageDependencies["keywordMapRenderer"];
+}
+
+interface AgentInputs {
+  readonly atsKeywordExtraction: AtsKeywordExtractionAgentInput[];
+  readonly analysis: AnalysisAgentInput[];
+  readonly tailoring: TailoringAgentInput[];
+  readonly editing: EditAgentInput[];
+}
+
+interface Harness {
+  readonly repository: PipelineRepository;
+  readonly artifacts: ArtifactStore;
+  readonly processor: PipelineStageProcessor;
+  readonly fixtures: ResumeFixtures;
+  readonly runId: string;
+  readonly compileModes: string[];
+  readonly agentOrder: string[];
+  readonly agentInputs: AgentInputs;
+  readonly tailoringResults: TailoringResult[];
+  readonly keywordMapCalls: { count: number; requests: KeywordMapRequest[] };
+  readonly database: Database;
+}
+
+async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
+  const jobDescription = "Strong TypeScript engineer";
+  const fixtures = options.fixtures ?? resumeFixtures(jobDescription);
+  const database = openPipelineDatabase(":memory:");
+  databases.push(database);
+  let now = 0;
+  let id = 0;
+  let token = 0;
+  const repository = new PipelineRepository(database, {
+    now: () => ++now,
+    idFactory: () => `stage-id-${++id}`,
+    attemptSessionIdFactory: () => `session-${id}`,
+    tokenFactory: () => Buffer.alloc(32, ++token).toString("base64url"),
+  });
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pipeline-stages-")));
+  roots.push(root);
+  const artifacts = new ArtifactStore(root);
+  const queueSequence = repository.nextQueueSequence();
+  const inputRoot = await artifacts.createRunInput({ run: queueSequence });
+  const input = await artifacts.write(join(inputRoot, "job-description.txt"), jobDescription, 1024 * 1024);
+  const run = repository.createQueuedRun(
+    jobDescription,
+    "https://jobs.example.test/stage-run",
+    options.opportunityKind ?? "job",
+    fixtures.snapshotInput,
+    {
+      sha256: input.sha256,
+      path: input.path,
+      byteSize: input.bytes,
+    },
+    "stage-run",
+    options.generateKeywordMap ?? false,
+    queueSequence,
+    options.skipReview ?? false,
+  );
+  const compileOutcomes = [...(options.compileOutcomes ?? ["success"])] ;
+  const compileModes: string[] = [];
+  const keywordMapCalls: { count: number; requests: KeywordMapRequest[] } = {
+    count: 0,
+    requests: [],
+  };
+  const deterministicReports = [...(options.deterministicReports ?? [])];
+  const compiler = async (request: CompileRequest): Promise<CompileResult> => {
+    request.signal?.throwIfAborted();
+    compileModes.push(request.mode);
+    const outcome = compileOutcomes.shift() ?? "success";
+    const attemptRoot = await request.artifacts.createAttempt(request.address);
+    const tex = await request.artifacts.write(join(attemptRoot, "main.tex"), request.tex, ARTIFACT_LIMITS.tex);
+    const log = await request.artifacts.write(join(attemptRoot, "compile.log"), outcome === "success" ? "compile ok" : `${outcome} compile failure`, ARTIFACT_LIMITS.log);
+    if (outcome !== "success") return {
+      ok: false,
+      attemptRoot,
+      tex,
+      log,
+      classification: outcome,
+      reason: `${outcome} compile failure`,
+    };
+    const pdf = await request.artifacts.write(join(attemptRoot, "resume.pdf"), "%PDF-1.7\nresume", ARTIFACT_LIMITS.pdf);
+    return {
+      ok: true,
+      attemptRoot,
+      tex,
+      log,
+      pdf,
+      process: {
+        command: "latexmk",
+        args: [],
+        pid: 101,
+        processStartToken: "start",
+        code: 0,
+        signal: null,
+        timedOut: false,
+        aborted: false,
+        killAcknowledged: false,
+        stdout: { data: new Uint8Array(), bytes: 0, truncated: false },
+        stderr: { data: new Uint8Array(), bytes: 0, truncated: false },
+      },
+    };
+  };
+  const agentInputs: AgentInputs = {
+    atsKeywordExtraction: [],
+    analysis: [],
+    tailoring: [],
+    editing: [],
+  };
+  const agentOrder: string[] = [];
+  const tailoringResults: TailoringResult[] = [];
+  const dependencies: PipelineStageDependencies = {
+    repository,
+    artifacts,
+    loadSourceContext: options.loadSourceContext ?? (() => ({ snapshot: fixtures.snapshot, baseline })),
+    atsKeywordExtractionAgent: options.atsKeywordExtractionAgent ?? (async (attempt) => {
+      agentOrder.push("ats-keyword-extraction");
+      agentInputs.atsKeywordExtraction.push(attempt.input);
+      return fixtures.atsKeywordExtraction;
+    }),
+    analysisAgent: options.analysisAgent ?? (async (attempt) => {
+      agentOrder.push("analysis");
+      agentInputs.analysis.push(attempt.input);
+      return fixtures.analysis;
+    }),
+    tailoringAgent: options.tailoringAgent ?? (async (attempt) => {
+      agentInputs.tailoring.push(attempt.input);
+      const result: TailoringResult = {
+        plan: buildMechanicalTailoringPlan(
+          fixtures.analysis,
+          baseline,
+          attempt.input.onePageCorrection,
+        ),
+        toolCount: 4,
+      };
+      tailoringResults.push(result);
+      return result;
+    }),
+    editAgent: options.editAgent ?? (async (attempt) => {
+      agentInputs.editing.push(attempt.input);
+      const result: EditResult = {
+        plan: fixtures.plan,
+        commentDispositions: attempt.input.comments?.map((_, commentIndex) => ({
+          commentIndex,
+          status: "applied",
+          rationale: "Applied using existing evidence",
+        })) ?? [],
+      };
+      return result;
+    }),
+    ...(options.repairAgent === undefined ? {} : { repairAgent: options.repairAgent }),
+    compiler: options.compiler ?? compiler,
+    keywordMapRenderer: options.keywordMapRenderer ?? (async (request) => {
+      keywordMapCalls.count += 1;
+      keywordMapCalls.requests.push(request);
+      const pdf = await request.artifacts.write(
+        join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
+        "%PDF-1.7\nkeyword-map",
+        ARTIFACT_LIMITS.pdf,
+      );
+      const coverage = await request.artifacts.write(
+        join(dirname(request.compiledPdf.path), "keyword-map.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          pdfSha256: request.compiledPdf.sha256,
+          keywords: request.atsKeywordExtraction.keywords.map((keyword) => ({
+            id: keyword.id,
+            phrase: keyword.phrase,
+            found: false,
+          })),
+        }),
+        1024 * 1024,
+      );
+      return { pdf, coverage };
+    }),
+    deterministicQa: options.deterministicQa ?? (async () => deterministicReports.shift()
+      ?? (options.deterministicPass === false
+        ? { pass: false, pageCount: null, pagesOverLimit: null, checks: [], warnings: [], overflowLineCount: null }
+        : ONE_PAGE_QA)),
+    rasterizer: async (request) => {
+      const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
+      const artifact = await artifacts.write(request.outputPath, png, ARTIFACT_LIMITS.png);
+      return { mediaType: "image/png", page: 1, dpi: 200, byteSize: artifact.bytes, path: artifact.path };
+    },
+    visualInspector: async () => options.visual ?? { status: "pass", summary: "Page is readable", findings: [] },
+  };
+  const processor = new PipelineStageProcessor(dependencies);
+  return {
+    repository,
+    artifacts,
+    processor,
+    fixtures,
+    runId: run.id,
+    compileModes,
+    agentInputs,
+    agentOrder,
+    tailoringResults,
+    keywordMapCalls,
+    database,
+  };
+}
+
+async function processToStop(harness: Harness): Promise<void> {
+  const claim = harness.repository.acquire();
+  if (!claim) throw new Error("claim missing");
+  await harness.processor.processClaim(claim, new AbortController().signal);
+  harness.repository.release(claim);
+}
+async function reportUnexpectedFailure(harness: Harness): Promise<void> {
+  const run = harness.repository.getRun(harness.runId);
+  if (run?.status !== "failed") return;
+  const diagnostic = harness.repository.getArtifact(harness.runId, "stage-error", run.currentRevision);
+  const text = diagnostic
+    ? Buffer.from(await harness.artifacts.read(diagnostic.path, ARTIFACT_LIMITS.log)).toString("utf8")
+    : "(no persisted stage-error artifact)";
+  throw new Error(`Unexpected pipeline failure at ${run.failedStage ?? "unknown stage"}:\n${text}`);
+}
+
+
+function multiPageQa(overflowLineCount: number, pageCount = 2): DeterministicQaReport {
+  return {
+    pass: false,
+    pageCount,
+    pagesOverLimit: pageCount - 1,
+    checks: [{ id: "one-page", status: "fail", detail: "PDF does not have exactly one page" }],
+    warnings: [],
+    overflowLineCount,
+  };
+}
+
+const ONE_PAGE_QA: DeterministicQaReport = {
+  pass: true,
+  pageCount: 1,
+  pagesOverLimit: 0,
+  checks: [{ id: "one-page", status: "pass", detail: "PDF has exactly one page" }],
+  warnings: [],
+  overflowLineCount: 0,
+};
+
+function qaForHeadings(headings: readonly string[]): NonNullable<PipelineStageDependencies["deterministicQa"]> {
+  const outputs: Readonly<Record<string, string>> = {
+    pdfinfo: "Pages: 1\nEncrypted: no\nPage size: 612 x 792 pts (letter)\nMediaBox: 0 0 612 792\nCropBox: 0 0 612 792\n",
+    pdftotext: textTsv([textPage(...headings)]),
+    pdffonts: "name type encoding emb sub uni object ID\n------------------------------------\nABCDEE+Inter TrueType WinAnsi yes yes yes 8 0\n",
+  };
+  return (request) => runDeterministicPdfQa({
+    ...request,
+    boundary: ({ command }) => {
+      const text = outputs[command];
+      if (text === undefined) throw new Error(`unexpected PDF tool ${command}`);
+      return {
+        pid: 101,
+        stdout: (async function* () { yield Buffer.from(text); })(),
+        stderr: (async function* () {})(),
+        wait: async () => ({ code: 0, signal: null }),
+        kill: async () => undefined,
+      };
+    },
+  });
+}
+
+describe.skipIf(process.platform !== "linux")("pipeline stage processor cases requiring Linux /proc process identity", () => {
+  test("preserves historical citation artifacts through edits, one-page correction, regeneration, and QA retry", async () => {
+    const editInputs: EditAgentInput[] = [];
+    const harness = await createHarness({
+      generateKeywordMap: true,
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA, {
+        pass: false, pageCount: null, pagesOverLimit: null, overflowLineCount: null,
+        checks: [{ id: "text-output", status: "fail", detail: "Retryable extraction failure" }], warnings: [],
+      }, ONE_PAGE_QA],
+      editAgent: async ({ input }) => {
+        editInputs.push(input);
+        return {
+          plan: input.currentPlan,
+          commentDispositions: input.comments?.map((_, commentIndex) => ({
+            commentIndex, status: "applied", rationale: "Preserved the supported content",
+          })) ?? [],
+        };
+      },
+    });
+    const { repository, artifacts, runId, fixtures } = harness;
+    const historicalAnalysis = {
+      ...fixtures.analysis,
+      jdKeywords: fixtures.analysis.jdKeywords.map((keyword) => ({ ...keyword, evidenceIds: ["retired-evidence"] })),
+      exactEdits: fixtures.analysis.exactEdits.map((edit) => ({
+        ...edit, evidenceIds: ["retired-evidence"],
+        ...(edit.kind === "skill" ? { evidenceEntityId: "retired-entity" } : {}),
+      })),
+    };
+    const historicalPlan = {
+      ...fixtures.plan,
+      analysisSha256: createHash("sha256").update(canonicalJson(historicalAnalysis)).digest("hex"),
+      factWinners: [],
+      decisions: fixtures.plan.decisions.map((decision) => ({ ...decision, factKeys: [], evidenceIds: ["retired-evidence"] })),
+      skillDecisions: fixtures.plan.skillDecisions.map((decision) => ({ ...decision, entityId: "retired-entity", evidenceIds: ["retired-evidence"] })),
+      baselineOverrides: fixtures.plan.baselineOverrides.map((override) => ({ ...override, evidenceIds: ["retired-evidence"] })),
+      omissions: fixtures.plan.omissions.map((omission) => ({ ...omission, evidenceIds: ["retired-evidence"] })),
+    };
+    const claim = repository.acquire()!;
+    const seeded = [];
+    const stages = [
+      { stage: "analyzing", values: [["ats-keyword-extraction", JSON.stringify(fixtures.atsKeywordExtraction)], ["job-analysis", JSON.stringify(historicalAnalysis)]] },
+      { stage: "tailoring", values: [["tailoring-plan", JSON.stringify(historicalPlan)], ["tailored-tex", renderTailoredResume(fixtures.plan, baseline, fixtures.snapshot)]] },
+      { stage: "compiling", values: [["compiled-pdf", "%PDF-1.7\nhistorical resume"]] },
+      { stage: "deterministic_qa", values: [["deterministic-qa", JSON.stringify(ONE_PAGE_QA)]] },
+      { stage: "visual_qa", values: [["visual-qa", JSON.stringify({ status: "pass", summary: "Page is readable", findings: [] })]] },
+    ] as const;
+    for (const { stage, values } of stages) {
+      repository.transition(claim, stage);
+      const attempt = repository.startAttempt(claim, stage);
+      const directory = await artifacts.createAttempt({
+        run: repository.getRun(runId)!.queueSequence, revision: "1", stage, attempt: attempt.attemptNo,
+      });
+      for (const [kind, content] of values) {
+        const metadata = await artifacts.write(join(directory, kind), content, ARTIFACT_LIMITS.tex);
+        const artifact = repository.finalizeArtifact(claim, {
+          attemptId: attempt.id, stage, kind, path: metadata.path,
+          sha256: metadata.sha256, byteSize: metadata.bytes,
+        });
+        seeded.push({ artifact, content });
+      }
+      repository.finishAttempt(claim, attempt.id, "succeeded");
+    }
+    repository.transition(claim, "review");
+    repository.release(claim);
+    const oldPlan = repository.getArtifact(runId, "tailoring-plan")!;
+    const oldAnalysis = repository.getArtifact(runId, "job-analysis")!;
+    repository.editRun(runId, "Keep the supported content concise", repository.getArtifact(runId, "compiled-pdf")!.sha256, fixtures.snapshotInput);
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+    expect(repository.getRun(runId)).toMatchObject({ status: "review", currentRevision: 2 });
+    expect(repository.getArtifact(runId, "one-page-correction")?.revision).toBe(2);
+    expect(harness.keywordMapCalls.requests[0]?.analysis).toEqual(fixtures.analysis);
+    const editedReport = repository.getArtifact(runId, "edit-report")!;
+    expect(harness.database.query<{ source_artifact_id: string }, [string]>(
+      "SELECT source_artifact_id FROM artifacts WHERE id=?",
+    ).get(editedReport.id)?.source_artifact_id).toBe(oldPlan.id);
+    const secondPlan = repository.getArtifact(runId, "tailoring-plan")!;
+    repository.regenerate(runId, repository.getArtifact(runId, "compiled-pdf")!.sha256, fixtures.snapshotInput);
+    await processToStop(harness);
+    expect(repository.getRun(runId)).toMatchObject({ status: "failed", currentRevision: 3, failedStage: "deterministic_qa" });
+    const regeneratedPlan = repository.getArtifact(runId, "tailoring-plan")!;
+    expect(harness.database.query<{ source_artifact_id: string }, [string]>(
+      "SELECT source_artifact_id FROM artifacts WHERE id=?",
+    ).get(regeneratedPlan.id)?.source_artifact_id).toBe(secondPlan.id);
+    repository.retry(runId, fixtures.snapshotInput);
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+    expect(repository.getRun(runId)).toMatchObject({ status: "review", currentRevision: 4 });
+    expect(repository.getArtifact(runId, "job-analysis")).toEqual(oldAnalysis);
+    expect(repository.getArtifact(runId, "tailoring-plan")).toEqual(regeneratedPlan);
+    expect(editInputs[0]?.analysis).toEqual(fixtures.analysis);
+    expect(editInputs[0]?.currentPlan).toEqual(fixtures.plan);
+    expect(editInputs[1]?.machineFindings).toBeDefined();
+    expect(harness.agentInputs.analysis).toEqual([]);
+    expect(harness.agentInputs.tailoring[0]?.onePageCorrection).toBeDefined();
+    expect(harness.keywordMapCalls.requests[1]?.analysis).toEqual(fixtures.analysis);
+    for (const artifact of [secondPlan, regeneratedPlan]) {
+      const plan = JSON.parse(await Bun.file(artifact.path).text());
+      expect(TailoringPlanSchema.safeParse(plan).success).toBeTrue();
+      expect(plan.analysisSha256).toBe(fixtures.plan.analysisSha256);
+      expect(JSON.stringify(plan)).not.toMatch(/evidenceIds|evidenceEntityId|factKeys|factWinners/);
+    }
+    for (const { artifact, content } of seeded) {
+      expect(await Bun.file(artifact.path).text()).toBe(content);
+      expect(createHash("sha256").update(await Bun.file(artifact.path).bytes()).digest("hex")).toBe(artifact.sha256);
+    }
+  });
+
+  test("runs the initial public state sequence, QA, and immutable artifact finalization", async () => {
+    const harness = await createHarness();
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    const transitions = harness.repository.timeline(harness.runId).events
+      .filter((event) => event.kind === "run.transitioned")
+      .map((event) => event.payload);
+    expect(transitions).toEqual([
+      { from: "queued", to: "analyzing", failedStage: null },
+      { from: "analyzing", to: "tailoring", failedStage: null },
+      { from: "tailoring", to: "compiling", failedStage: null },
+      { from: "compiling", to: "deterministic_qa", failedStage: null },
+      { from: "deterministic_qa", to: "visual_qa", failedStage: null },
+      { from: "visual_qa", to: "review", failedStage: null },
+    ]);
+    expect(harness.agentOrder).toEqual(["ats-keyword-extraction", "analysis"]);
+    expect(harness.agentInputs.atsKeywordExtraction).toEqual([{
+      opportunityKind: "job",
+      rawJobDescription: "Strong TypeScript engineer",
+    }]);
+    expect(harness.agentInputs.analysis).toHaveLength(1);
+    expect(harness.agentInputs.analysis[0]?.opportunityKind).toBe("job");
+    expect(harness.agentInputs.analysis[0]?.canonicalCv).toBe(baseline);
+    expect(harness.agentInputs.analysis[0]?.context).toEqual(harness.fixtures.snapshot);
+    expect(harness.agentInputs.analysis[0]?.atsKeywordExtraction)
+      .toBe(harness.fixtures.atsKeywordExtraction);
+    expect(harness.agentInputs.tailoring).toHaveLength(1);
+    expect(Object.keys(harness.agentInputs.tailoring[0]!)).not.toContain("rawJobDescription");
+    expect(Object.keys(harness.agentInputs.tailoring[0]!)).not.toContain("context");
+    expect(harness.agentInputs.tailoring[0]?.analysis).toEqual(harness.fixtures.analysis);
+    const [result] = harness.tailoringResults;
+    expect(result).toBeDefined();
+    const texArtifact = harness.repository.getArtifact(harness.runId, "tailored-tex");
+    expect(texArtifact).not.toBeNull();
+    expect(await Bun.file(texArtifact!.path).text()).toBe(
+      renderTailoredResume(result!.plan, baseline, harness.fixtures.snapshot),
+    );
+    const diffArtifact = harness.repository.getArtifact(harness.runId, "resume-diff");
+    expect(diffArtifact).not.toBeNull();
+    expect(ResumeDiffSchema.parse(JSON.parse(await Bun.file(diffArtifact!.path).text()))).toEqual(
+      buildResumeDiff(baseline, result!.plan),
+    );
+    expect(harness.repository.listResolvedArtifacts(harness.runId).map((artifact) => artifact.kind)).toEqual(expect.arrayContaining([
+      "job-description", "ats-keyword-extraction", "job-analysis", "tailoring-plan", "change-summary", "resume-diff", "tailored-tex",
+      "latex-log", "compiled-pdf", "deterministic-qa", "page-image", "visual-qa",
+    ]));
+    const timeline = harness.repository.timeline(harness.runId);
+    expect(timeline.attempts.map((attempt) => attempt.stage)).toEqual(["analyzing", "tailoring", "compiling", "deterministic_qa", "visual_qa"]);
+    expect(timeline.attempts.find((attempt) => attempt.stage === "analyzing")?.toolCount).toBe(2);
+    expect(timeline.attempts.find((attempt) => attempt.stage === "compiling")?.compileCount).toBe(1);
+    const jobDescriptionArtifact = harness.repository.getArtifact(harness.runId, "job-description");
+    const extractionArtifact = harness.repository.getArtifact(harness.runId, "ats-keyword-extraction");
+    const analysisArtifact = harness.repository.getArtifact(harness.runId, "job-analysis");
+    const sourceArtifactId = (artifactId: string): string | null | undefined =>
+      harness.database.query<{ source_artifact_id: string | null }, [string]>(
+        "SELECT source_artifact_id FROM artifacts WHERE id=?",
+      ).get(artifactId)?.source_artifact_id;
+    expect(sourceArtifactId(extractionArtifact!.id)).toBe(jobDescriptionArtifact!.id);
+    expect(sourceArtifactId(analysisArtifact!.id)).toBe(extractionArtifact!.id);
+    expect(JSON.stringify({ run: harness.repository.getRun(harness.runId), timeline })).not.toContain("token");
+    expect(JSON.stringify(harness.repository.listResolvedArtifacts(harness.runId))).not.toContain("Strong TypeScript engineer");
+    expect(harness.keywordMapCalls.count).toBe(0);
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+  });
+
+  test("automatically approves a skip-review run only after clean visual QA", async () => {
+    const harness = await createHarness({ skipReview: true });
+    await processToStop(harness);
+
+    const pdf = harness.repository.getArtifact(harness.runId, "compiled-pdf");
+    expect(pdf).not.toBeNull();
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "approved",
+      approvedPdfSha256: pdf!.sha256,
+      visualAcknowledgementRequired: false,
+    });
+    expect(harness.repository.timeline(harness.runId).events.at(-1)).toMatchObject({
+      kind: "run.approved",
+      payload: {
+        pdfSha256: pdf!.sha256,
+        visualAcknowledged: false,
+        automatic: true,
+      },
+    });
+  });
+
+  test("persists canonical TeX rendered from an injected reduced tailoring result", async () => {
+    const fixture = resumeFixtures("Strong TypeScript engineer");
+    const result: TailoringResult = { plan: fixture.plan, toolCount: 4 };
+    const harness = await createHarness({
+      tailoringAgent: async () => result,
+    });
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    const artifact = harness.repository.getArtifact(harness.runId, "tailored-tex");
+    expect(artifact).not.toBeNull();
+    expect(await Bun.file(artifact!.path).text()).toBe(
+      renderTailoredResume(result.plan, baseline, fixture.snapshot),
+    );
+  });
+
+  test("generates and finalizes the requested keyword map only after deterministic QA passes", async () => {
+    const harness = await createHarness({ generateKeywordMap: true });
+    await processToStop(harness);
+
+    expect(harness.keywordMapCalls.count).toBe(1);
+    expect(harness.keywordMapCalls.requests[0]?.atsKeywordExtraction)
+      .toEqual(harness.fixtures.atsKeywordExtraction);
+    expect(harness.keywordMapCalls.requests[0]?.analysis).toEqual(harness.fixtures.analysis);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    const compiled = harness.repository.getArtifact(harness.runId, "compiled-pdf");
+    const keywordMap = harness.repository.getArtifact(harness.runId, "keyword-map-pdf");
+    expect(compiled).not.toBeNull();
+    expect(keywordMap).not.toBeNull();
+    expect(keywordMap?.revision).toBe(compiled?.revision);
+    expect(harness.database.query<{ source_artifact_id: string | null }, [string]>(
+      "SELECT source_artifact_id FROM artifacts WHERE id=?",
+    ).get(keywordMap!.id)?.source_artifact_id).toBe(compiled!.id);
+    expect(harness.repository.timeline(harness.runId).events
+      .filter((event) => event.kind === "artifact.finalized")
+      .map((event) => event.payload && typeof event.payload === "object" && "kind" in event.payload
+        && typeof event.payload.kind === "string" ? event.payload.kind : undefined)).toEqual(expect.arrayContaining([
+      "compiled-pdf",
+      "keyword-map-pdf",
+      "deterministic-qa",
+    ]));
+  });
+
+  test("generates a keyword map after a human edit from a revision-one historical ATS extraction", async () => {
+    const harness = await createHarness({ generateKeywordMap: true });
+    await processToStop(harness);
+
+    const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
+    const extractionArtifact = harness.repository.getArtifact(
+      harness.runId,
+      "ats-keyword-extraction",
+    )!;
+    const historicalExtraction: AtsKeywordExtraction = {
+      ...harness.fixtures.atsKeywordExtraction,
+      keywordExtractionWorkflowSha256: "f".repeat(64),
+    };
+    await Bun.write(extractionArtifact.path, JSON.stringify(historicalExtraction));
+
+    harness.repository.editRun(
+      harness.runId,
+      "shorten the second experience bullet",
+      firstPdf.sha256,
+      harness.fixtures.snapshotInput,
+    );
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "review",
+      currentRevision: 2,
+    });
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")?.revision)
+      .toBe(1);
+    expect(harness.keywordMapCalls.count).toBe(2);
+    expect(harness.keywordMapCalls.requests[1]?.atsKeywordExtraction)
+      .toEqual(historicalExtraction);
+  });
+
+  test("routes multi-page PDFs back to same-revision tailoring with or without a keyword map request", async () => {
+    for (const generateKeywordMap of [false, true]) {
+      const fixtures = resumeFixtures("Strong TypeScript engineer");
+      const harness = await createHarness({
+        fixtures: { ...fixtures, snapshot: { ...fixtures.snapshot, evidence: [] } },
+        generateKeywordMap,
+        deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
+      });
+      await processToStop(harness);
+      await reportUnexpectedFailure(harness);
+
+      expect(harness.repository.getRun(harness.runId)).toMatchObject({
+        status: "review",
+        currentRevision: 1,
+        failedStage: null,
+      });
+      expect(harness.agentInputs.tailoring).toHaveLength(2);
+      expect(harness.agentInputs.tailoring[0]?.onePageCorrection).toBeUndefined();
+      expect(harness.agentInputs.tailoring[1]?.onePageCorrection).toMatchObject({
+        note: "Resume is 2 pages, 1 page over the one-page limit, with 6 visible lines after page 1. Remove lower-priority content until it fits.",
+        failureCount: 1,
+        requiredOmissionCount: 1,
+        pageCount: 2,
+        pagesOverLimit: 1,
+        overflowLineCount: 6,
+      });
+      expect(harness.tailoringResults[1]?.plan.omissions).toHaveLength(1);
+      const timeline = harness.repository.timeline(harness.runId);
+      const deterministicAttempts = timeline.attempts
+        .filter((attempt) => attempt.stage === "deterministic_qa");
+      const compilingAttempts = timeline.attempts
+        .filter((attempt) => attempt.stage === "compiling");
+      const correction = harness.repository.getArtifact(harness.runId, "one-page-correction");
+      const deterministicReport = harness.repository.getArtifact(harness.runId, "deterministic-qa");
+      expect(await Bun.file(correction!.path).json()).toMatchObject({
+        pageCount: 2,
+        pagesOverLimit: 1,
+        overflowLineCount: 6,
+      });
+      const compiled = harness.repository.getArtifact(harness.runId, "compiled-pdf");
+      const compiledTex = harness.repository.getArtifact(harness.runId, "tailored-tex");
+      const tailoringPlan = harness.repository.getArtifact(harness.runId, "tailoring-plan");
+      const sourceArtifactId = (artifactId: string): string | null | undefined =>
+        harness.database.query<{ source_artifact_id: string | null }, [string]>(
+          "SELECT source_artifact_id FROM artifacts WHERE id=?",
+        ).get(artifactId)?.source_artifact_id;
+      const firstAttemptArtifacts = harness.database.query<{
+        id: string;
+        kind: string;
+        path: string;
+        source_artifact_id: string | null;
+        source_attempt_id: string | null;
+      }, [string]>(`
+        SELECT artifact.id,
+               artifact.kind,
+               artifact.path,
+               artifact.source_artifact_id,
+               source.attempt_id AS source_attempt_id
+        FROM artifacts AS artifact
+        LEFT JOIN artifacts AS source ON source.id = artifact.source_artifact_id
+        WHERE artifact.attempt_id = ?
+          AND artifact.kind IN ('deterministic-qa', 'one-page-correction')
+        ORDER BY artifact.kind
+      `).all(deterministicAttempts[0]!.id);
+      const firstDeterministicReport = firstAttemptArtifacts
+        .find((artifact) => artifact.kind === "deterministic-qa");
+      const firstCorrection = firstAttemptArtifacts
+        .find((artifact) => artifact.kind === "one-page-correction");
+      expect(firstAttemptArtifacts.map((artifact) => artifact.kind)).toEqual([
+        "deterministic-qa",
+        "one-page-correction",
+      ]);
+      expect(dirname(firstDeterministicReport!.path)).toBe(dirname(firstCorrection!.path));
+      expect(firstCorrection?.source_artifact_id).toBe(firstDeterministicReport?.id);
+      expect(firstDeterministicReport?.source_attempt_id).toBe(compilingAttempts[0]?.id);
+      expect(harness.repository.getArtifact(harness.runId, "stage-error")).toBeNull();
+      expect(correction?.attemptId).toBe(deterministicAttempts[0]?.id);
+      expect(deterministicReport?.attemptId).toBe(deterministicAttempts[1]?.id);
+      expect(compiled?.attemptId).toBe(compilingAttempts[1]?.id);
+      expect(compiledTex?.attemptId).toBe(compilingAttempts[1]?.id);
+      expect(sourceArtifactId(deterministicReport!.id)).toBe(compiled?.id);
+      expect(sourceArtifactId(compiled!.id)).toBe(compiledTex?.id);
+      expect(sourceArtifactId(tailoringPlan!.id)).toBe(correction?.id);
+      expect(deterministicAttempts
+        .map((attempt) => ({ revision: attempt.revision, status: attempt.status }))).toEqual([
+        { revision: 1, status: "failed" },
+        { revision: 1, status: "succeeded" },
+      ]);
+      expect(timeline.events
+        .filter((event) => event.kind === "run.transitioned")
+        .map((event) => event.payload)).toEqual(expect.arrayContaining([
+        { from: "deterministic_qa", to: "tailoring", failedStage: null },
+        { from: "deterministic_qa", to: "visual_qa", failedStage: null },
+      ]));
+      expect(harness.keywordMapCalls.count).toBe(generateKeywordMap ? 1 : 0);
+      expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf") !== null)
+        .toBe(generateKeywordMap);
+      expect(harness.repository.getArtifact(harness.runId, "keyword-map") !== null)
+        .toBe(generateKeywordMap);
+    }
+  });
+
+  test("continues a tailoring stage from a pre-page-metrics correction artifact", async () => {
+    let harness: Harness;
+    let replacedCorrection = false;
+    harness = await createHarness({
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
+      loadSourceContext: async () => {
+        const correction = harness?.repository.getArtifact(
+          harness.runId,
+          "one-page-correction",
+        );
+        if (!replacedCorrection && correction) {
+          await Bun.write(correction.path, JSON.stringify({
+            failureCount: 1,
+            overflowLineCount: 6,
+            note: "6 visible lines over one page. Remove lower-priority content until it fits.",
+          }));
+          replacedCorrection = true;
+        }
+        return { snapshot: harness.fixtures.snapshot, baseline };
+      },
+    });
+
+    await processToStop(harness);
+
+    expect(replacedCorrection).toBe(true);
+    expect(harness.agentInputs.tailoring[1]?.onePageCorrection).toMatchObject({
+      pageCount: null,
+      pagesOverLimit: null,
+      overflowLineCount: 6,
+      note: "6 visible lines over one page. Remove lower-priority content until it fits.",
+    });
+    await reportUnexpectedFailure(harness);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+  });
+
+  test("protects explicitly bound must-include entities from one-page omissions", async () => {
+    const baseFixture = resumeFixtures("Strong TypeScript engineer");
+    const competition = parsedBaseline.entities.find((entity) =>
+      entity.section === "competitions-other")!;
+    const existingSource = baseFixture.snapshot.sources.find((candidate) =>
+      candidate.id === "source-sample-delivery")!;
+    const source: IndexedContextSource = {
+      ...existingSource,
+      baselineEntityIds: [...existingSource.baselineEntityIds, "competition:required"],
+    };
+    const sources = baseFixture.snapshot.sources.map((candidate) =>
+      candidate.id === source.id ? source : candidate);
+    const snapshot: ContextSnapshot = {
+      ...baseFixture.snapshot,
+      sources,
+      sourceHashes: Object.fromEntries(sources.map((item) => [item.id, item.sha256])),
+      explicitEntityBindings: {
+        ...baseFixture.snapshot.explicitEntityBindings,
+        [competition.entityId]: "competition:required",
+      },
+      mustIncludeDirectives: [{
+        sourceId: source.id,
+        entityId: source.entityId,
+        text: "The resume must include the competition result when supported.",
+      }],
+    };
+    const fixtures: ResumeFixtures = {
+      ...baseFixture,
+      snapshot,
+      snapshotInput: {
+        manifestSha256: snapshot.manifestSha256,
+        baselineSha256: snapshot.baselineSha256,
+        sourceHashes: snapshot.sourceHashes,
+      },
+    };
+    const harness = await createHarness({
+      fixtures,
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
+    });
+
+    await processToStop(harness);
+
+    const correction = harness.agentInputs.tailoring[1]?.onePageCorrection;
+    expect(correction?.candidates.map((candidate) => candidate.entityId))
+      .not.toContain(competition.entityId);
+    await reportUnexpectedFailure(harness);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    const renderedArtifact = harness.repository.getArtifact(harness.runId, "tailored-tex")!;
+    const rendered = parseBaselineResume(await Bun.file(renderedArtifact.path).text());
+    expect(rendered.bullets.map((bullet) => bullet.text)).toContain(competition.bullets[0]!.text);
+  });
+
+  test("does not offer must-include bullets for one-page omission without model citations", async () => {
+    const fixtures = resumeFixturesWithActiveDirective("Strong TypeScript engineer");
+    const activeEdit = fixtures.analysis.exactEdits.find((edit) =>
+      edit.kind === "bullet")!;
+    const harness = await createHarness({
+      fixtures,
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
+    });
+
+    await processToStop(harness);
+
+    const correction = harness.agentInputs.tailoring[1]?.onePageCorrection;
+    expect(correction?.candidates.map((candidate) => candidate.baselineItemId))
+      .not.toContain(activeEdit.baselineItemId);
+    await reportUnexpectedFailure(harness);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+  });
+
+  test("repeats progressively stronger one-page corrections until deterministic QA passes", async () => {
+    const harness = await createHarness({
+      generateKeywordMap: true,
+      deterministicReports: [multiPageQa(6), multiPageQa(1), ONE_PAGE_QA],
+    });
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.failureCount ?? 0)).toEqual([0, 1, 2]);
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.note)).toEqual([
+      undefined,
+      "Resume is 2 pages, 1 page over the one-page limit, with 6 visible lines after page 1. Remove lower-priority content until it fits.",
+      "Resume is 2 pages, 1 page over the one-page limit, with 1 visible line after page 1. Remove lower-priority content until it fits.",
+    ]);
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.requiredOmissionCount ?? 0)).toEqual([0, 1, 2]);
+    expect(harness.tailoringResults.map((result) => result.plan.omissions.length)).toEqual([0, 1, 2]);
+    const timeline = harness.repository.timeline(harness.runId);
+    const deterministicAttempts = timeline.attempts
+      .filter((attempt) => attempt.stage === "deterministic_qa");
+    const compilingAttempts = timeline.attempts
+      .filter((attempt) => attempt.stage === "compiling");
+    expect(deterministicAttempts.map((attempt) => attempt.status)).toEqual(["failed", "failed", "succeeded"]);
+    const correction = harness.repository.getArtifact(harness.runId, "one-page-correction");
+    expect(correction?.attemptId).toBe(deterministicAttempts[1]?.id);
+    expect(await Bun.file(correction!.path).json()).toMatchObject({ failureCount: 2 });
+    expect(harness.repository.getArtifact(harness.runId, "deterministic-qa")?.attemptId)
+      .toBe(deterministicAttempts[2]?.id);
+    expect(harness.repository.getArtifact(harness.runId, "compiled-pdf")?.attemptId)
+      .toBe(compilingAttempts[2]?.id);
+    expect(harness.keywordMapCalls.count).toBe(1);
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).not.toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map")).not.toBeNull();
+  });
+
+  test("allows exactly five automatic one-page correction cycles after the initial attempt", async () => {
+    const harness = await createHarness({
+      deterministicReports: [
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+        multiPageQa(6),
+      ],
+    });
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "deterministic_qa",
+      currentRevision: 1,
+    });
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.failureCount ?? 0)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(harness.agentInputs.tailoring.map((input) =>
+      input.onePageCorrection?.requiredOmissionCount ?? 0)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(harness.tailoringResults.map((result) => result.plan.omissions.length))
+      .toEqual([0, 1, 2, 3, 4, 5]);
+
+    const deterministicAttempts = harness.repository.timeline(harness.runId).attempts
+      .filter((attempt) => attempt.stage === "deterministic_qa");
+    expect(deterministicAttempts.map((attempt) => attempt.status))
+      .toEqual(["failed", "failed", "failed", "failed", "failed", "failed"]);
+    const correction = harness.repository.getArtifact(harness.runId, "one-page-correction");
+    expect(correction?.attemptId).toBe(deterministicAttempts[4]?.id);
+    expect(await Bun.file(correction!.path).json()).toMatchObject({ failureCount: 5 });
+    expect(harness.repository.getArtifact(harness.runId, "deterministic-qa")?.attemptId)
+      .toBe(deterministicAttempts[5]?.id);
+  });
+
+  test("fails deterministic QA when an eligible requested keyword map cannot be generated", async () => {
+    const harness = await createHarness({
+      generateKeywordMap: true,
+      keywordMapRenderer: async () => {
+        throw new Error("bbox extraction failed");
+      },
+    });
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "deterministic_qa" });
+    expect(harness.repository.getArtifact(harness.runId, "compiled-pdf")).not.toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map")).toBeNull();
+    expect(harness.repository.timeline(harness.runId).attempts.find((attempt) => attempt.stage === "deterministic_qa")).toMatchObject({
+      status: "failed",
+    });
+  });
+
+  test("fails keyword-map QA instead of falling back from an invalid extraction artifact", async () => {
+    const harness = await createHarness({
+      generateKeywordMap: true,
+      deterministicQa: async () => {
+        const extractionArtifact = harness.repository.getArtifact(
+          harness.runId,
+          "ats-keyword-extraction",
+        );
+        if (!extractionArtifact) throw new Error("test extraction artifact is missing");
+        await Bun.write(extractionArtifact.path, JSON.stringify({
+          ...harness.fixtures.atsKeywordExtraction,
+          jobDescriptionSha256: "f".repeat(64),
+        }));
+        return ONE_PAGE_QA;
+      },
+    });
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "deterministic_qa",
+    });
+    expect(harness.keywordMapCalls.count).toBe(0);
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map-pdf")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "keyword-map")).toBeNull();
+  });
+
+  test("finalizes neither analyzing product when ATS extraction fails", async () => {
+    let analysisCalls = 0;
+    const harness = await createHarness({
+      atsKeywordExtractionAgent: async () => {
+        throw new Error("transient ATS extraction failure");
+      },
+      analysisAgent: async () => {
+        analysisCalls += 1;
+        return harness.fixtures.analysis;
+      },
+    });
+
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "analyzing",
+    });
+    expect(analysisCalls).toBe(0);
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+  });
+
+  test("retries a failed analysis before its immutable artifact exists", async () => {
+    let analysisCalls = 0;
+    const harness = await createHarness({
+      analysisAgent: async () => {
+        analysisCalls += 1;
+        if (analysisCalls === 1) throw new Error("transient analysis failure");
+        return harness.fixtures.analysis;
+      },
+    });
+    await processToStop(harness);
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(1);
+    const diagnostic = harness.repository.getArtifact(harness.runId, "stage-error");
+    expect(diagnostic).not.toBeNull();
+    expect(Buffer.from(await harness.artifacts.read(diagnostic!.path, ARTIFACT_LIMITS.log)).toString("utf8"))
+      .toBe("Error: transient analysis failure\n");
+
+    harness.repository.retry(harness.runId, harness.fixtures.snapshotInput);
+    await processToStop(harness);
+
+    expect(analysisCalls).toBe(2);
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(2);
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")?.revision).toBe(2);
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(2);
+  });
+
+  test("persists bounded private model responses when an agent attempt fails", async () => {
+    let analysisCalls = 0;
+    const harness = await createHarness({
+      analysisAgent: async (attempt) => {
+        analysisCalls += 1;
+        if (analysisCalls === 1) {
+          await attempt.runtime?.modelTraceSink?.record({
+            type: "model_response",
+            model: "gpt-5.6-sol",
+            response: {
+              usage: {
+                requests: 1,
+                inputTokens: 10,
+                outputTokens: 5,
+                totalTokens: 15,
+              } as never,
+              output: [{
+                type: "function_call",
+                callId: "call-rejected",
+                name: "submit_job_analysis",
+                arguments: "{\"unsupported\":\"model output\"}",
+              }],
+            },
+          });
+          throw new Error("model output rejected");
+        }
+        return harness.fixtures.analysis;
+      },
+    });
+
+    await processToStop(harness);
+
+    const run = harness.repository.getRun(harness.runId)!;
+    const transcript = harness.repository.getArtifact(
+      harness.runId,
+      "agent-transcript",
+      run.currentRevision,
+    );
+    expect(transcript).not.toBeNull();
+    const payload = JSON.parse(
+      Buffer.from(await harness.artifacts.read(transcript!.path, 2 * 1024 * 1024))
+        .toString("utf8"),
+    );
+    expect(payload).toMatchObject({
+      schemaVersion: 1,
+      stage: "analyzing",
+      attemptId: transcript!.attemptId,
+      truncated: false,
+      events: [{
+        type: "model_response",
+        model: "gpt-5.6-sol",
+        response: {
+          output: [{
+            type: "function_call",
+            callId: "call-rejected",
+            name: "submit_job_analysis",
+            arguments: "{\"unsupported\":\"model output\"}",
+          }],
+        },
+      }],
+    });
+  });
+
+  test("bounds an oversized rejected model response while preserving its head and tail", async () => {
+    const oversizedArguments = `{"head":"${"x".repeat(2 * 1024 * 1024)}","tail":"kept"}`;
+    const harness = await createHarness({
+      analysisAgent: async (attempt) => {
+        await attempt.runtime?.modelTraceSink?.record({
+          type: "model_response",
+          response: {
+            usage: {
+              requests: 1,
+              inputTokens: 10,
+              outputTokens: 5,
+              totalTokens: 15,
+            } as never,
+            output: [{
+              type: "function_call",
+              callId: "call-oversized",
+              name: "submit_job_analysis",
+              arguments: oversizedArguments,
+            }],
+          },
+        });
+        throw new Error("oversized model output rejected");
+      },
+    });
+
+    await processToStop(harness);
+
+    const transcript = harness.repository.getArtifact(harness.runId, "agent-transcript")!;
+    expect(transcript.byteSize).toBeLessThan(2 * 1024 * 1024);
+    const payload = JSON.parse(
+      Buffer.from(await harness.artifacts.read(transcript.path, 2 * 1024 * 1024))
+        .toString("utf8"),
+    );
+    expect(payload.events[0].head).toHaveLength(32 * 1024);
+    expect(payload.events[0].tail).toHaveLength(32 * 1024);
+    expect(payload).toMatchObject({
+      schemaVersion: 1,
+      truncated: true,
+      events: [{
+        type: "trace_event_truncated",
+        originalType: "model_response",
+        originalBytes: expect.any(Number),
+        head: expect.stringContaining("\"type\":\"model_response\""),
+        tail: expect.stringContaining("tail"),
+      }],
+    });
+  });
+
+  test("inherits analyzing artifacts on later-stage retry without rerunning either agent", async () => {
+    const deterministicFailure: DeterministicQaReport = {
+      pageCount: null,
+      pagesOverLimit: null,
+      pass: false,
+      checks: [{ id: "text-output", status: "fail", detail: "Synthetic deterministic failure" }],
+      warnings: [],
+      overflowLineCount: null,
+    };
+    const harness = await createHarness({
+      deterministicReports: [deterministicFailure, ONE_PAGE_QA],
+    });
+    await processToStop(harness);
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "deterministic_qa",
+    });
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(1);
+    expect(harness.agentInputs.analysis).toHaveLength(1);
+
+    harness.repository.retry(harness.runId, harness.fixtures.snapshotInput);
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "review",
+      currentRevision: 2,
+    });
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(1);
+    expect(harness.agentInputs.analysis).toHaveLength(1);
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")?.revision).toBe(1);
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(1);
+  });
+
+});
+
+describe.skipIf(process.platform !== "linux" && process.platform !== "darwin")("pipeline compile and repair recovery", () => {
+  test.each([true, false])("PDF QA permits missing competitions but still requires Projects (present: %s)", async (projectsPresent) => {
+    const headings = ["Education", "Experience", ...(projectsPresent ? ["Projects"] : []), "Technical Skills"];
+    const harness = await createHarness({ deterministicQa: qaForHeadings(headings) });
+    await processToStop(harness);
+    expect(harness.repository.getRun(harness.runId)).toMatchObject(projectsPresent
+      ? { status: "review" } : { status: "failed", failedStage: "deterministic_qa" });
+    const artifact = harness.repository.getArtifact(harness.runId, "deterministic-qa")!;
+    const report: DeterministicQaReport = await Bun.file(artifact.path).json();
+    expect(report.checks.find((check) => check.id === "required-headings")?.status).toBe(projectsPresent ? "pass" : "fail");
+  });
+
+  test.each(["compiling", "repairing", "deterministic_qa"] as const)("retry accepts an omitted competitions section after failure in %s", async (failedStage) => {
+    const competitionCount = parsedBaseline.bullets.filter((bullet) => bullet.section === "competitions-other").length;
+    let correctionsRemaining = competitionCount;
+    let repairDeclined = false;
+    let legacyHeadingCheck = failedStage === "deterministic_qa";
+    const validQa = qaForHeadings(["Education", "Experience", "Projects", "Technical Skills"]);
+    const harness = await createHarness({
+      compileOutcomes: [
+        ...Array<"success">(competitionCount).fill("success"),
+        failedStage === "compiling" ? "terminal" : failedStage === "repairing" ? "repairable" : "success",
+        "success", "success",
+      ],
+      deterministicQa: async (request) => {
+        if (correctionsRemaining > 0) { correctionsRemaining--; return multiPageQa(6); }
+        if (legacyHeadingCheck) {
+          legacyHeadingCheck = false;
+          return validQa({ ...request, requiredHeadings: [...request.requiredHeadings, "Competitions & Other"] });
+        }
+        return validQa(request);
+      },
+      repairAgent: async ({ input, signal }) => {
+        if (!repairDeclined) {
+          repairDeclined = true;
+          return { status: "unrepaired", tailoredTex: null, changes: [], remainingDiagnostics: ["Repair could not complete"] };
+        }
+        expect((await input.operations.validateCandidate(input.failedTex, signal)).ok).toBeTrue();
+        expect((await input.operations.compileCandidate(input.failedTex, signal)).ok).toBeTrue();
+        return { status: "repaired", tailoredTex: input.failedTex, changes: [], remainingDiagnostics: [] };
+      },
+    });
+    await processToStop(harness);
+    const { repository, runId, fixtures } = harness;
+    expect(repository.getRun(runId)).toMatchObject({ status: "failed", failedStage });
+    const before = repository.getArtifact(runId, "tailored-tex")!;
+    expect((await Bun.file(before.path).text()).includes("\\section{Competitions \\& Other}")).toBeFalse();
+
+    repository.retry(runId, fixtures.snapshotInput);
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+
+    expect(repository.getRun(runId)).toMatchObject({ status: "review", currentRevision: 2 });
+    const after = repository.getArtifact(runId, "tailored-tex")!;
+    expect((await Bun.file(after.path).text()).includes("\\section{Competitions \\& Other}")).toBeFalse();
+    const qa = repository.getArtifact(runId, "deterministic-qa")!;
+    expect(qa.revision).toBe(2);
+    expect((await Bun.file(qa.path).json()).pass).toBeTrue();
+  });
+
+  test("edits and regeneration keep an approved competitions omission", async () => {
+    let correctionsRemaining = parsedBaseline.bullets.filter((bullet) => bullet.section === "competitions-other").length;
+    const validQa = qaForHeadings(["Education", "Experience", "Projects", "Technical Skills"]);
+    const harness = await createHarness({
+      deterministicQa: async (request) => {
+        if (correctionsRemaining > 0) { correctionsRemaining--; return multiPageQa(6); }
+        return validQa(request);
+      },
+      editAgent: async ({ input }) => ({
+        plan: input.currentPlan,
+        commentDispositions: (input.comments ?? []).map((_, commentIndex) => ({
+          commentIndex, status: "applied", rationale: "Keep the existing content omissions.",
+        })),
+      }),
+    });
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+    const { repository, runId, fixtures } = harness;
+    const original = repository.getArtifact(runId, "tailored-tex")!;
+    expect((await Bun.file(original.path).text()).includes("\\section{Competitions \\& Other}")).toBeFalse();
+    for (const [revision, command] of [[2, "edit"], [3, "regenerate"]] as const) {
+      const pdf = repository.getArtifact(runId, "compiled-pdf")!;
+      if (command === "edit") repository.editRun(runId, "Keep competitions omitted", pdf.sha256, fixtures.snapshotInput);
+      else repository.regenerate(runId, pdf.sha256, fixtures.snapshotInput);
+      await processToStop(harness);
+      await reportUnexpectedFailure(harness);
+      expect(repository.getRun(runId)).toMatchObject({ status: "review", currentRevision: revision });
+      const tex = repository.getArtifact(runId, "tailored-tex")!;
+      expect(tex.revision).toBe(revision);
+      expect((await Bun.file(tex.path).text()).includes("\\section{Competitions \\& Other}")).toBeFalse();
+    }
+  });
+
+  test("compile Retry repairs a retained historical empty competitions section", async () => {
+    const emptyList = /\\resumeSubHeadingListStart\s*\\resumeSubHeadingListEnd/;
+    const diagnostic = "LaTeX Error: Something's wrong--perhaps a missing \\item.";
+    const harness = await createHarness({
+      deterministicQa: qaForHeadings(["Education", "Experience", "Projects", "Technical Skills"]),
+      compiler: async (request) => {
+        const broken = emptyList.test(request.tex);
+        const attemptRoot = await request.artifacts.createAttempt(request.address);
+        const tex = await request.artifacts.write(join(attemptRoot, "main.tex"), request.tex, ARTIFACT_LIMITS.tex);
+        const log = await request.artifacts.write(join(attemptRoot, "compile.log"), broken ? diagnostic : "compile ok", ARTIFACT_LIMITS.log);
+        if (broken) return { ok: false, attemptRoot, tex, log, classification: "repairable", reason: diagnostic };
+        const pdf = await request.artifacts.write(join(attemptRoot, "resume.pdf"), "%PDF-1.7\nresume", ARTIFACT_LIMITS.pdf);
+        return {
+          ok: true, attemptRoot, tex, log, pdf,
+          process: {
+            command: "latexmk", args: [], pid: 101, processStartToken: "start", code: 0, signal: null,
+            timedOut: false, aborted: false, killAcknowledged: false,
+            stdout: { data: new Uint8Array(), bytes: 0, truncated: false },
+            stderr: { data: new Uint8Array(), bytes: 0, truncated: false },
+          },
+        };
+      },
+      repairAgent: async ({ input, signal }) => {
+        if (!input.latexLog.includes("missing \\item")) throw new Error("Missing list diagnostic is unavailable");
+        const competition = parseBaselineResume(input.failedTex).regions["competitions-other"]!;
+        const tailoredTex = input.failedTex.slice(0, competition.headingStart) + input.failedTex.slice(competition.bodyEnd);
+        expect((await input.operations.validateCandidate(tailoredTex, signal)).ok).toBeTrue();
+        expect((await input.operations.compileCandidate(tailoredTex, signal)).ok).toBeTrue();
+        return { status: "repaired", tailoredTex, changes: [{ category: "syntax", summary: "Remove the empty optional section" }], remainingDiagnostics: [] };
+      },
+    });
+    const { repository, artifacts, runId, fixtures } = harness;
+    const candidates = parsedBaseline.bullets.filter((bullet) => bullet.section === "competitions-other").map((bullet) => ({
+      baselineItemId: bullet.id, section: bullet.section, entityId: bullet.entityId, text: bullet.text,
+    }));
+    const plan = buildMechanicalTailoringPlan(fixtures.analysis, baseline, {
+      failureCount: 1, pageCount: 2, pagesOverLimit: 1, overflowLineCount: 6,
+      note: "Remove lower-priority competitions to meet the one-page requirement.",
+      requiredOmissionCount: candidates.length, candidates,
+    });
+    const currentTex = renderTailoredResume(plan, baseline, fixtures.snapshot);
+    const failedTex = currentTex.replace("\\section{Technical Skills}", "\\section{Competitions \\& Other}\n  \\resumeSubHeadingListStart\n\n  \\resumeSubHeadingListEnd\n\n\\section{Technical Skills}");
+    // Seed immutable history rather than asking the current renderer to recreate an old defect.
+    const claim = repository.acquire()!;
+    const stages = [
+      { stage: "analyzing", values: [["ats-keyword-extraction", JSON.stringify(fixtures.atsKeywordExtraction)], ["job-analysis", JSON.stringify(fixtures.analysis)]] },
+      { stage: "tailoring", values: [["tailoring-plan", JSON.stringify(plan)], ["resume-diff", JSON.stringify(buildResumeDiff(baseline, plan))], ["tailored-tex", failedTex]] },
+      { stage: "compiling", values: [["tailored-tex", failedTex], ["latex-log", diagnostic]] },
+    ] as const;
+    for (const { stage, values } of stages) {
+      repository.transition(claim, stage);
+      const attempt = repository.startAttempt(claim, stage);
+      const root = await artifacts.createAttempt({ run: repository.getRun(runId)!.queueSequence, revision: "1", stage, attempt: attempt.attemptNo });
+      for (const [kind, content] of values) {
+        const stored = await artifacts.write(join(root, kind), content, ARTIFACT_LIMITS.tex);
+        repository.finalizeArtifact(claim, { attemptId: attempt.id, stage, kind, path: stored.path, sha256: stored.sha256, byteSize: stored.bytes });
+      }
+      repository.finishAttempt(claim, attempt.id, stage === "compiling" ? "failed" : "succeeded");
+    }
+    repository.transition(claim, "failed", { failedStage: "compiling" });
+    repository.release(claim);
+    const diff = repository.getArtifact(runId, "resume-diff");
+
+    repository.retry(runId, fixtures.snapshotInput);
+    await processToStop(harness);
+    await reportUnexpectedFailure(harness);
+
+    expect(repository.getRun(runId)).toMatchObject({ status: "review", currentRevision: 2 });
+    expect(repository.getArtifact(runId, "compiled-pdf")?.revision).toBe(2);
+    expect(repository.getArtifact(runId, "resume-diff")).toEqual(diff);
+    const repaired = repository.getArtifact(runId, "tailored-tex")!;
+    expect((await Bun.file(repaired.path).text()).includes("\\section{Competitions \\& Other}")).toBeFalse();
+  });
+
+  test("persists processor-created repairing attempts with the repair-loop origin", async () => {
+    const harness = await createHarness({
+      compileOutcomes: ["repairable", "success"],
+      repairAgent: async (attempt): Promise<RepairResult> => ({
+        status: "repaired",
+        tailoredTex: attempt.input.failedTex,
+        changes: [{ category: "escaping", summary: "Restored escaping" }],
+        remainingDiagnostics: [],
+      }),
+    });
+
+    await processToStop(harness);
+
+    const repairingAttempt = harness.repository.timeline(harness.runId).attempts
+      .find((attempt) => attempt.stage === "repairing");
+    expect(repairingAttempt?.origin).toBe("repair_loop");
+  });
+
+  test("rejects a repair that would make the current resume diff stale", async () => {
+    let candidateValidated = false;
+    let candidateCompiled = false;
+    const harness = await createHarness({
+      compileOutcomes: ["repairable", "success"],
+      repairAgent: async (attempt): Promise<RepairResult> => {
+        const parsed = parseBaselineResume(attempt.input.failedTex);
+        const [firstBullet] = parseMacroCalls(parsed.regions.experience.body, "resumeItem", 1);
+        if (!firstBullet) throw new Error("repair test requires an experience bullet");
+        const start = parsed.regions.experience.bodyStart + firstBullet.start;
+        const end = parsed.regions.experience.bodyStart + firstBullet.end;
+        const tailoredTex = `${attempt.input.failedTex.slice(0, start)}\\resumeItem{Changed without updating the resume diff.}${attempt.input.failedTex.slice(end)}`;
+        const valid = await attempt.input.operations.validateCandidate(tailoredTex, attempt.signal);
+        candidateValidated = valid.ok;
+        if (!valid.ok) throw new Error(valid.diagnostics.join("\n"));
+        const candidate = await attempt.input.operations.compileCandidate(tailoredTex, attempt.signal);
+        candidateCompiled = candidate.ok;
+        if (!candidate.ok) throw new Error(candidate.diagnostics.join("\n"));
+        return {
+          status: "repaired",
+          tailoredTex,
+          changes: [{ category: "escaping", summary: "Changed a resume bullet" }],
+          remainingDiagnostics: [],
+        };
+      },
+    });
+    await processToStop(harness);
+
+    expect(candidateValidated).toBeTrue();
+    expect(candidateCompiled).toBeTrue();
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({
+      status: "failed",
+      failedStage: "repairing",
+    });
+  });
+
+  test("treats the post-repair full compile as authority and terminalizes a failed repaired revision", async () => {
+    const harness = await createHarness({
+      compileOutcomes: ["repairable", "success", "repairable"],
+      repairAgent: async (attempt): Promise<RepairResult> => {
+        await attempt.input.operations.validateCandidate(attempt.input.failedTex, attempt.signal);
+        await attempt.input.operations.compileCandidate(attempt.input.failedTex, attempt.signal);
+        return { status: "repaired", tailoredTex: attempt.input.failedTex, changes: [{ category: "escaping", summary: "Restored escaping" }], remainingDiagnostics: [] };
+      },
+    });
+    await processToStop(harness);
+
+    expect(harness.compileModes).toEqual(["full", "candidate", "full"]);
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "compiling" });
+    expect(harness.repository.getArtifact(harness.runId, "compiled-pdf")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "latex-log")).not.toBeNull();
+  });
+
+  test("always finalizes bounded terminal compile logs and never finalizes a failed PDF", async () => {
+    const harness = await createHarness({ compileOutcomes: ["terminal"] });
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "compiling" });
+    const log = harness.repository.getArtifact(harness.runId, "latex-log");
+    expect(log?.byteSize).toBeLessThanOrEqual(ARTIFACT_LIMITS.log);
+    expect(harness.repository.getArtifact(harness.runId, "compiled-pdf")).toBeNull();
+    expect(harness.repository.timeline(harness.runId).attempts.find((attempt) => attempt.stage === "compiling")).toMatchObject({ status: "failed", compileCount: 1 });
+  });
+});
+
+describe.skipIf(process.platform !== "linux")("remaining Linux pipeline stages", () => {
+
+  test("fails deterministic defects but keeps visual issues and uncertainty reviewable with acknowledgement", async () => {
+    const deterministic = await createHarness({
+      deterministicReports: [{
+        pageCount: null,
+        pagesOverLimit: null,
+        pass: false,
+        checks: [{ id: "letter-size", status: "fail", detail: "page is not US Letter" }],
+        warnings: [],
+        overflowLineCount: null,
+      }],
+    });
+    await processToStop(deterministic);
+    expect(deterministic.repository.getRun(deterministic.runId)).toMatchObject({ status: "failed", failedStage: "deterministic_qa" });
+    expect(deterministic.repository.getArtifact(deterministic.runId, "visual-qa")).toBeNull();
+    expect(deterministic.repository.getArtifact(deterministic.runId, "one-page-correction")).toBeNull();
+
+    for (const status of ["issue", "uncertain"] as const) {
+      const visual = await createHarness({
+        skipReview: true,
+        visual: {
+          status,
+          summary: "Needs human judgement",
+          findings: [{ severity: "warning", description: "Possible crowding", page: 1 }],
+        },
+      });
+      await processToStop(visual);
+      expect(visual.repository.getRun(visual.runId)).toMatchObject({ status: "review", visualAcknowledgementRequired: true });
+      expect(visual.repository.getArtifact(visual.runId, "visual-qa")).not.toBeNull();
+    }
+  });
+
+  test("human and machine edits reuse revision-one analysis and receive exact immutable prior QA", async () => {
+    const editInputs: EditAgentInput[] = [];
+    const harness = await createHarness({
+      deterministicReports: [multiPageQa(6), ONE_PAGE_QA],
+      editAgent: async (attempt) => {
+        editInputs.push(attempt.input);
+        return {
+          plan: attempt.input.currentPlan,
+          commentDispositions: attempt.input.comments?.map((_, commentIndex) => ({
+            commentIndex,
+            status: "applied",
+            rationale: "Applied using existing evidence",
+          })) ?? [],
+        };
+      },
+    });
+    await processToStop(harness);
+    const firstPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
+    harness.repository.editRun(harness.runId, "shorten the second experience bullet", firstPdf.sha256, harness.fixtures.snapshotInput);
+    await processToStop(harness);
+
+    const secondPdf = harness.repository.getArtifact(harness.runId, "compiled-pdf")!;
+    harness.repository.regenerate(harness.runId, secondPdf.sha256, harness.fixtures.snapshotInput);
+    await processToStop(harness);
+
+    expect(harness.agentInputs.analysis).toHaveLength(1);
+    expect(editInputs).toHaveLength(2);
+    expect(editInputs[0]?.comments).toEqual(["shorten the second experience bullet"]);
+    expect(editInputs[0]?.deterministicQa).toEqual(ONE_PAGE_QA);
+    expect(editInputs.every((input) => input.context === harness.fixtures.snapshot)).toBeTrue();
+    expect(editInputs[0]?.machineFindings).toBeUndefined();
+    expect(editInputs[1]?.comments).toEqual([]);
+    expect(editInputs[1]?.machineFindings).toEqual({
+      deterministicQa: ONE_PAGE_QA,
+      visualQa: { status: "pass", summary: "Page is readable", findings: [] },
+    });
+    expect(Object.keys(editInputs[0] ?? {})).not.toContain("rawJobDescription");
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")?.revision).toBe(1);
+    expect(harness.repository.getArtifact(harness.runId, "edit-request")?.revision).toBe(3);
+    const currentDiff = harness.repository.getArtifact(harness.runId, "resume-diff");
+    expect(currentDiff?.revision).toBe(3);
+    expect(ResumeDiffSchema.parse(JSON.parse(await Bun.file(currentDiff!.path).text()))).toEqual(
+      buildResumeDiff(baseline, editInputs[1]!.currentPlan),
+    );
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("review");
+  });
+
+
+  test("acknowledges only the active attempt after claim-loss cancellation and commits nothing later", async () => {
+    const started = Promise.withResolvers<void>();
+    const harness = await createHarness({
+      analysisAgent: async (attempt) => {
+        started.resolve();
+        await new Promise<void>((resolvePromise, rejectPromise) => {
+          if (attempt.signal.aborted) rejectPromise(attempt.signal.reason);
+          else attempt.signal.addEventListener("abort", () => rejectPromise(attempt.signal.reason), { once: true });
+        });
+        throw new Error("unreachable");
+      },
+    });
+    const claim = harness.repository.acquire()!;
+    const controller = new AbortController();
+    const processing = harness.processor.processClaim(claim, controller.signal);
+    await started.promise;
+    controller.abort(new ClaimRejectedError("heartbeat lost"));
+    await processing;
+
+    const attempts = harness.repository.timeline(harness.runId).attempts;
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({ stage: "analyzing", status: "cancelled" });
+    expect(attempts[0]?.cancellationAcknowledgedAt).not.toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+    expect(harness.repository.getRun(harness.runId)?.status).toBe("analyzing");
+  });
+});
+
+describe("pipeline stage processor portable pre-attempt behavior", () => {
+  test("detects source drift before agent execution and fails the active stage", async () => {
+    let loads = 0;
+    const fixture = resumeFixtures("Strong TypeScript engineer");
+    const harness = await createHarness({
+      loadSourceContext: () => {
+        loads += 1;
+        if (loads === 1) return { snapshot: fixture.snapshot, baseline };
+        return { snapshot: { ...fixture.snapshot, manifestSha256: "f".repeat(64) }, baseline };
+      },
+    });
+    await processToStop(harness);
+
+    expect(harness.repository.getRun(harness.runId)).toMatchObject({ status: "failed", failedStage: "analyzing" });
+    expect(harness.agentInputs.atsKeywordExtraction).toHaveLength(0);
+    expect(harness.agentInputs.analysis).toHaveLength(0);
+    expect(harness.repository.getArtifact(harness.runId, "ats-keyword-extraction")).toBeNull();
+    expect(harness.repository.getArtifact(harness.runId, "job-analysis")).toBeNull();
+  });
+});

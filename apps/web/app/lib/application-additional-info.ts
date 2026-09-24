@@ -3,7 +3,7 @@ import {
   MAX_ADDITIONAL_INFO_SELECTED_OPTIONS,
   type ApplicationAdditionalInfoQuestion,
   type ApplicationSessionCommand,
-} from "@jobhunter/pipeline/contracts";
+} from "./pipeline-contracts";
 import { hasCodePointLength } from "./application-text";
 
 export type AdditionalInfoDraft =

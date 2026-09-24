@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { ApplicationSessionSnapshotDto } from "@jobhunter/pipeline/contracts";
+import {
+  ApplicationSessionSnapshotDtoSchema,
+  type ApplicationSessionSnapshotDto,
+} from "../app/lib/pipeline-contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   ApplicationSessionPanel,
   buildApplicationSteerCommand,
-  simpleApplicationGateCommand,
 } from "../app/components/application-session-panel";
 import { buildApplicationCredentialCommand } from "../app/components/application-credentials-form";
 
@@ -40,9 +42,11 @@ function snapshot(
 
 const callbacks = {
   actionBusy: null,
+  browserOpenBusy: false,
   steeringState: "idle" as const,
   onCancel: async () => {},
   onClose: async () => {},
+  onOpenBrowser: async () => {},
   onRetry: async () => {},
   onResume: async () => {},
   onCommand: async () => {},
@@ -130,7 +134,6 @@ describe("ApplicationSessionPanel", () => {
     expect(submitting).toContain("Submitting application");
     expect(submitting).not.toContain("Cancel application");
     expect(submitting).not.toContain("Retry applying");
-    expect(submitting).not.toContain("Close browser");
     expect(submitting).not.toContain("Steer the agent");
 
     const submitted = renderToStaticMarkup(
@@ -144,25 +147,10 @@ describe("ApplicationSessionPanel", () => {
       />,
     );
     expect(submitted).toContain("Application submitted");
-    expect(submitted).toContain("Close browser");
-    expect(submitted).toContain("stays open until");
+    expect(submitted).not.toContain("Headed Chrome stays open until");
     expect(submitted).not.toContain("Cancel application");
     expect(submitted).not.toContain("Retry applying");
     expect(submitted).not.toContain("Steer the agent");
-
-    const unlimitedSubmitted = renderToStaticMarkup(
-      <ApplicationSessionPanel
-        {...callbacks}
-        snapshot={snapshot({
-          bridgeState: "submitted",
-          harnessState: "submitted",
-          submissionPhase: "submitted",
-          expiresAt: null,
-        })}
-      />,
-    );
-    expect(unlimitedSubmitted).toContain("stays open until you close it");
-    expect(unlimitedSubmitted).not.toContain("browser session expires");
 
     const uncertain = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -178,10 +166,25 @@ describe("ApplicationSessionPanel", () => {
       />,
     );
     expect(uncertain).toContain("Submission could not be verified");
-    expect(uncertain).toContain("Close browser");
+    expect(uncertain).toContain("Headed Chrome stays open until");
     expect(uncertain).not.toContain("Cancel application");
     expect(uncertain).not.toContain("Retry applying");
     expect(uncertain).not.toContain("Steer the agent");
+
+    const closedUncertain = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "closed",
+          harnessState: "closed",
+          submissionPhase: "uncertain",
+          terminalAt: 3,
+          expiresAt: null,
+        })}
+      />,
+    );
+    expect(closedUncertain).toContain("Retry applying");
+    expect(closedUncertain).not.toContain("Steer the agent");
 
     const closedSubmitted = renderToStaticMarkup(
       <ApplicationSessionPanel
@@ -195,9 +198,68 @@ describe("ApplicationSessionPanel", () => {
         })}
       />,
     );
-    expect(closedSubmitted).not.toContain("Retry applying");
-    expect(closedSubmitted).not.toContain("Close browser");
+    expect(closedSubmitted).toContain("Retry applying");
     expect(closedSubmitted).not.toContain("Steer the agent");
+  });
+
+  test("keeps the browser button available throughout an active application", () => {
+    const activeSnapshots: ApplicationSessionSnapshotDto[] = [
+      snapshot({ bridgeState: "reserved", harnessState: null, expiresAt: null }),
+      snapshot({ bridgeState: "starting", harnessState: "starting" }),
+      snapshot(),
+      snapshot({
+        bridgeState: "awaiting_human_review",
+        harnessState: "awaiting_human_review",
+        pendingAction: { type: "human_review" },
+      }),
+      snapshot({
+        bridgeState: "submitting",
+        harnessState: "submitting",
+        submissionPhase: "attempting",
+      }),
+      snapshot({
+        bridgeState: "submitted",
+        harnessState: "submitted",
+        submissionPhase: "submitted",
+      }),
+      snapshot({
+        bridgeState: "submission_uncertain",
+        harnessState: "submission_uncertain",
+        submissionPhase: "uncertain",
+      }),
+    ];
+
+    const markups = activeSnapshots.map((activeSnapshot) => renderToStaticMarkup(
+      <ApplicationSessionPanel {...callbacks} snapshot={activeSnapshot} />,
+    ));
+    for (const markup of markups) {
+      expect(markup).toContain("Open application browser");
+    }
+    expect(buttonOpeningTag(markups[0]!, "Open application browser")).toContain('disabled=""');
+    expect(buttonOpeningTag(markups[1]!, "Open application browser")).toContain('disabled=""');
+    expect(buttonOpeningTag(markups[2]!, "Open application browser")).not.toContain("disabled");
+
+    const busy = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        browserOpenBusy
+        snapshot={snapshot()}
+      />,
+    );
+    expect(buttonOpeningTag(busy, "Opening browser…")).toContain('disabled=""');
+
+    const closed = renderToStaticMarkup(
+      <ApplicationSessionPanel
+        {...callbacks}
+        snapshot={snapshot({
+          bridgeState: "closed",
+          harnessState: "closed",
+          terminalAt: 3,
+          expiresAt: null,
+        })}
+      />,
+    );
+    expect(closed).not.toContain("Open application browser");
   });
 
   test("renders actionable warnings in one accessible alert only when present", () => {
@@ -224,6 +286,26 @@ describe("ApplicationSessionPanel", () => {
       />,
     );
     expect(withoutWarnings).not.toContain('aria-label="Application warnings"');
+  });
+
+  test("shows exhausted model usage as a public application error", () => {
+    const exhausted = ApplicationSessionSnapshotDtoSchema.parse({
+      ...snapshot(),
+      bridgeState: "failed",
+      harnessState: "failed",
+      terminalAt: 3,
+      expiresAt: null,
+      error: {
+        code: "usage_exhausted",
+        message: "The model provider's usage quota is exhausted",
+      },
+    });
+
+    const markup = renderToStaticMarkup(
+      <ApplicationSessionPanel {...callbacks} snapshot={exhausted} />,
+    );
+    expect(markup).toContain('role="alert"');
+    expect(markup).toContain("The model provider&#x27;s usage quota is exhausted");
   });
 
   test("renders accessible steering while the application agent is running or gated", () => {
@@ -313,12 +395,11 @@ describe("ApplicationSessionPanel", () => {
     }
   });
 
-  test("renders navigation and keeps legacy origin snapshots non-actionable", () => {
+  test("renders human navigation with a continuation action", () => {
     const navigation = {
       type: "human_navigation",
       instruction: "Complete the account sign-in, then return here.",
     } as const;
-    expect(simpleApplicationGateCommand(navigation)).toEqual({ type: "continue" });
     const navigationMarkup = renderToStaticMarkup(
       <ApplicationSessionPanel
         {...callbacks}
@@ -331,25 +412,6 @@ describe("ApplicationSessionPanel", () => {
     );
     expect(navigationMarkup).toContain(navigation.instruction);
     expect(navigationMarkup).toContain("Continue application");
-
-    const origin = {
-      type: "origin_approval",
-      origin: "https://apply.example.com",
-    } as const;
-    const originMarkup = renderToStaticMarkup(
-      <ApplicationSessionPanel
-        {...callbacks}
-        snapshot={snapshot({
-          bridgeState: "awaiting_origin_approval",
-          harnessState: "awaiting_origin_approval",
-          pendingAction: origin,
-        })}
-      />,
-    );
-    expect(originMarkup).toContain("https://apply.example.com");
-    expect(originMarkup).toContain("Restart required");
-    expect(originMarkup).not.toContain("Approve origin");
-    expect(originMarkup).not.toContain("Steer the agent");
   });
 
   test("builds strict credential commands with trimmed usernames and exact passwords", () => {
@@ -611,7 +673,7 @@ describe("ApplicationSessionPanel", () => {
     expect(buttonOpeningTag(continuingMarkup, "Continuing…")).toContain("disabled");
   });
 
-  test("renders transient revision guidance and the submission confirmation", () => {
+  test("renders transient revision guidance and the submit action", () => {
     const markup = renderToStaticMarkup(
       <ApplicationSessionPanel
         {...callbacks}
@@ -627,8 +689,6 @@ describe("ApplicationSessionPanel", () => {
     expect(markup).toContain("Request application revision");
     expect(markup).not.toContain("Steer and request revision");
     expect(markup).toContain("Approve and submit");
-    expect(markup).toContain("Submit this application?");
-    expect(markup).toContain("This action is irreversible.");
     expect(markup).toContain("not saved as profile facts");
     expect(markup).toContain("Cancel application");
     expect(markup).not.toContain("Ready for human submit");

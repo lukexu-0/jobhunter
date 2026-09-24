@@ -1,2 +1,6 @@
-/output/runs/
+/output/
 .playwright-cli/
+.DS_Store
+/.worktrees/
+/.jobhunt-data/
+/apps/.env.local

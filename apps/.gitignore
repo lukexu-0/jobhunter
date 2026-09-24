@@ -1,4 +1,19 @@
 **/node_modules/
+/.env.local
+**/.playwright-cli/
+**/coverage/
+**/*.tsbuildinfo
 web/.next/
-resume-tailoring/dist/
+web/test-results/
+web/playwright-report/
+web/blob-report/
+backend/dist/
+backend/data/
+
+# Legacy runtime directories retained only for migration and cleanup.
 resume-tailoring/data/
+resume-tailoring/dist/
+application/.venv/
+application/.pytest_cache/
+application/**/__pycache__/
+application/*.egg-info/

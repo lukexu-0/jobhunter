@@ -17,71 +17,101 @@ import {
   APPLICATION_STATUSES,
   CreateRunRequestSchema,
   type ApplicationStatus,
-  type ArtifactDto,
   type OpportunityKind,
   type RunDto,
-  type RunStatus,
   type SourceHandoffDto,
-} from "@jobhunter/pipeline/contracts";
+} from "../lib/pipeline-contracts";
 import {
   PipelineClientError,
+  approveRun,
+  closeApplicationSession,
   completeSourceHandoff,
   createPastedRun,
   createRun,
   createSourceHandoff,
   deleteRun,
   deleteSourceHandoff,
-  listRuns,
-  readJsonArtifact,
+  getContext,
+  getApplicationSession,
+  retryApplicationSession,
+  retryRun,
+  startApplicationSession,
   updateApplicationStatus,
   updateRunIdentity,
 } from "../lib/pipeline-client";
 import { APPLICATION_STATUS_LABELS } from "../lib/application-status";
+import { isApplicationSessionOpen } from "../lib/application-session-state";
 import { opportunityPresentation } from "../lib/opportunity-presentation";
 import { AlertControls } from "./alert-controls";
-import { useDashboardData, type JobIdentity } from "../providers/dashboard-data-provider";
+import { useDashboardData } from "../credentials/dashboard-data-provider";
+import type { JobIdentity } from "../lib/run-collection";
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
-const POLL_INTERVAL_MS = 3_000;
 const MAX_PUBLIC_MESSAGE_LENGTH = 240;
 const MAX_CONCURRENT_RUN_CREATIONS = 5;
+const MAX_CONCURRENT_SESSION_ENDS = 3;
 const MAX_RUNS_PER_SUBMISSION = 100;
 const EMPTY_RUNS: RunDto[] = [];
 const ROW_INTERACTIVE_SELECTOR = "a, button, input, select, textarea, summary, [contenteditable='true']";
 const FOCUSABLE_INTERACTIVE_SELECTOR = "a[href], area[href], button:not(:disabled), input:not(:disabled):not([type='hidden']), select:not(:disabled), textarea:not(:disabled), summary, iframe, audio[controls], video[controls], [contenteditable]:not([contenteditable='false']), [tabindex]";
 const SELECTABLE_APPLICATION_STATUSES = APPLICATION_STATUSES.filter((status) => status !== "failed");
-const PIPELINE_STATUSES = ["tailoring", "awaiting_review", "in_progress", "completed"] as const;
+const UNAPPLIED_APPLICATION_STATUSES: Partial<Record<ApplicationStatus, true>> = {
+  pending: true,
+  did_not_apply: true,
+  failed: true,
+};
+const SUBMITTED_APPLICATION_STATUSES: Partial<Record<ApplicationStatus, true>> = {
+  applied: true,
+  oa_received: true,
+  oa_completed: true,
+  rejected: true,
+  interview: true,
+  accepted: true,
+};
+
+function isUnappliedRun(run: Pick<RunDto, "applicationStatus">): boolean {
+  return UNAPPLIED_APPLICATION_STATUSES[run.applicationStatus] === true;
+}
+
+function isSubmittedRun(run: Pick<RunDto, "applicationStatus">): boolean {
+  return SUBMITTED_APPLICATION_STATUSES[run.applicationStatus] === true;
+}
+
+function isApplyableRun(run: RunDto): boolean {
+  return isUnappliedRun(run)
+    && (run.status === "approved" || run.status === "review")
+    && Boolean(run.jobUrl && run.currentPdfSha256)
+    && !isApplicationSessionOpen(run);
+}
+
+function isReapplyableRun(run: RunDto): boolean {
+  return run.applicationStatus === "applied"
+    && (run.status === "approved" || run.status === "review")
+    && Boolean(run.jobUrl && run.currentPdfSha256)
+    && !isApplicationSessionOpen(run);
+}
+const PIPELINE_STATUSES = ["tailoring", "awaiting_review", "in_progress", "completed", "failed"] as const;
 
 
-type PipelineStatus = "tailoring" | "awaiting_review" | "in_progress" | "completed";
+type PipelineStatus = (typeof PIPELINE_STATUSES)[number];
 
 const PIPELINE_STATUS_LABELS: Readonly<Record<PipelineStatus, string>> = {
   tailoring: "Tailoring",
   awaiting_review: "Awaiting review",
   in_progress: "In-progress",
   completed: "Completed",
+  failed: "Failed",
 };
 
-function pipelineStatusFor(run: Pick<RunDto, "status" | "applicationStatus">): PipelineStatus {
-  if (run.status === "failed") return "completed";
+function pipelineStatusFor(
+  run: Pick<RunDto, "status" | "applicationStatus" | "applicationFailureGeneration">,
+): PipelineStatus {
+  if (run.status === "failed" || run.applicationFailureGeneration !== undefined) return "failed";
   if (run.status === "review") return "awaiting_review";
   if (run.status !== "approved") return "tailoring";
   return run.applicationStatus === "pending" ? "in_progress" : "completed";
 }
 
-const IS_TERMINAL_STATUS: Record<RunStatus, boolean> = {
-  queued: false,
-  analyzing: false,
-  tailoring: false,
-  editing: false,
-  compiling: false,
-  repairing: false,
-  deterministic_qa: false,
-  visual_qa: false,
-  review: true,
-  approved: true,
-  failed: true,
-};
 const DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   day: "numeric",
   month: "short",
@@ -117,7 +147,7 @@ type RunDialog =
     readonly runName: string;
   }
   | {
-    readonly kind: "delete";
+    readonly kind: "delete" | "reapply";
     readonly runId: string;
     readonly runName: string;
   };
@@ -171,7 +201,7 @@ function sourceVerificationMessage(error: unknown, fallback: string): string {
     error instanceof PipelineClientError
     && error.code === "SOURCE_HANDOFF_NOT_FOUND"
   ) {
-    return "This verification session is no longer available. Cancel verification, then open a new browser session.";
+    return "This browser session is no longer available. Cancel, then open a new browser session.";
   }
   return publicMessage(error, fallback);
 }
@@ -236,51 +266,12 @@ async function mapWithConcurrency<Item, Result>(
   return results;
 }
 
-function mergeRuns(current: readonly RunDto[] | undefined, incoming: readonly RunDto[]): RunDto[] {
-  const merged: RunDto[] = [];
-  const seenIds = new Set<string>();
-  for (const run of incoming) {
-    if (seenIds.has(run.id)) continue;
-    seenIds.add(run.id);
-    merged.push(run);
-  }
-  for (const run of current ?? EMPTY_RUNS) {
-    if (seenIds.has(run.id)) continue;
-    seenIds.add(run.id);
-    merged.push(run);
-  }
-  return merged;
-}
-
 function batchFailureMessage(successCount: number, totalCount: number, error: unknown): string {
   const failure = publicMessage(error, "An opportunity could not be initialized. Try again.");
   return `${successCount} of ${totalCount} applications initialized. ${failure}`.slice(
     0,
     MAX_PUBLIC_MESSAGE_LENGTH,
   );
-}
-
-function parseJobIdentity(value: unknown): JobIdentity | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const analysis = value as Record<string, unknown>;
-  if (analysis.schemaVersion !== 2) return null;
-
-  const target = analysis.target;
-  if (!target || typeof target !== "object" || Array.isArray(target)) return null;
-  const targetRecord = target as Record<string, unknown>;
-  const title = typeof targetRecord.title === "string" ? targetRecord.title.trim() : "";
-  if (!title) return null;
-
-  const organization = typeof targetRecord.organization === "string"
-    ? targetRecord.organization.trim()
-    : "";
-  return organization ? { title, organization } : { title };
-}
-
-function latestJobAnalysis(run: RunDto): ArtifactDto | undefined {
-  return run.artifacts
-    .filter((artifact) => artifact.kind === "job-analysis" && artifact.public)
-    .sort((left, right) => right.createdAt - left.createdAt)[0];
 }
 
 function effectiveRunIdentity(run: RunDto, artifactIdentity: JobIdentity | undefined): EffectiveIdentity {
@@ -338,12 +329,31 @@ function visiblePageNumbers(currentPage: number, totalPages: number): Array<numb
 
 export function RunDashboard() {
   const router = useRouter();
-  const { runs: runSnapshot, setRuns, jobIdentities, setJobIdentities } = useDashboardData();
+  const {
+    runs: runSnapshot, acceptRun, collectCreatedRuns, acceptRemoval, acceptApplicationStarted, jobIdentities,
+    isLoadingRuns: isLoading, runsError: loadError, refreshRuns: load, applicationAttention, watchJobIdentities,
+  } = useDashboardData();
+  const [baselineMissing, setBaselineMissing] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    void getContext(controller.signal).then(
+      (context) => setBaselineMissing(context.missingSources.includes("resume-baseline")),
+      () => {},
+    );
+    return () => controller.abort();
+  }, []);
+  useEffect(() => watchJobIdentities(), [watchJobIdentities]);
   const runs = runSnapshot ?? EMPTY_RUNS;
-  const showInitialLoading = useRef(runSnapshot === undefined);
-  const [isLoading, setIsLoading] = useState(showInitialLoading.current);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const applicationCount = useMemo(
+    () => runs.reduce((count, run) => count + (isSubmittedRun(run) ? 1 : 0), 0),
+    [runs],
+  );
+  const openSessionRuns = useMemo(() => runs.filter(isApplicationSessionOpen), [runs]);
+  const applyableRuns = useMemo(() => runs.filter(isApplyableRun), [runs]);
+  const retryableRuns = useMemo(() => runs.filter((run) => run.status === "failed"), [runs]);
   const [query, setQuery] = useState("");
+  const [applicationAutoSubmit, setApplicationAutoSubmit] = useState(false);
+  const [applicationAutoEnd, setApplicationAutoEnd] = useState(false);
   const [pipelineStatusFilter, setPipelineStatusFilter] = useState<PipelineStatusFilter>("all");
   const [applicationStatusFilter, setApplicationStatusFilter] = useState<ApplicationStatusFilter>("all");
   const [sortDirection, setSortDirection] = useState<SortDirection>("newest");
@@ -369,9 +379,17 @@ export function RunDashboard() {
   const [sourceVerificationError, setSourceVerificationError] =
     useState<string | null>(null);
   const [busyRunIds, setBusyRunIds] = useState<Set<string>>(() => new Set());
-  const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
+  const [runActionError, setRunActionError] = useState<string | null>(null);
+  const [isApplyingAll, setIsApplyingAll] = useState(false);
+  const [isEndingAllSessions, setIsEndingAllSessions] = useState(false);
+  const [isRetryingAll, setIsRetryingAll] = useState(false);
   const [actionMenu, setActionMenu] = useState<ActionMenuState | null>(null);
-  const [activeDialog, setActiveDialog] = useState<RunDialog | null>(null);
+  const [activeDialog, setActiveDialogState] = useState<RunDialog | null>(null);
+  const activeDialogRef = useRef<RunDialog | null>(null);
+  const setActiveDialog = useCallback((dialog: RunDialog | null) => {
+    activeDialogRef.current = dialog;
+    setActiveDialogState(dialog);
+  }, []);
   const [editValue, setEditValue] = useState("");
   const [dialogError, setDialogError] = useState<string | null>(null);
   const actionMenuRef = useRef<HTMLDivElement>(null);
@@ -384,6 +402,9 @@ export function RunDashboard() {
   const restoreInitializerFocusRef = useRef(false);
   const initializerPendingRef = useRef(false);
   const sourceVerificationActionRef = useRef<"open" | "complete" | "cancel" | null>(null);
+  const bulkApplyPendingRef = useRef(false);
+  const bulkEndPendingRef = useRef(false);
+  const bulkRetryPendingRef = useRef(false);
   const sourceVerificationRef = useRef<SourceVerificationFlow | null>(null);
   const awaitingSourceHandoffIdRef = useRef<string | null>(null);
   const releasedSourceHandoffIdRef = useRef<string | null>(null);
@@ -407,12 +428,20 @@ export function RunDashboard() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const actionTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
   const scheduleFocusRestoration = useCallback((runId?: string) => {
+    const dialog = dialogRef.current;
+    let nativeRestorationTarget: Element | null = null;
+    if (dialog?.open && dialog.contains(document.activeElement)) {
+      // Release modal focus before restoring it; native close may focus its previous opener.
+      dialog.close();
+      nativeRestorationTarget = document.activeElement;
+    }
     window.requestAnimationFrame(() => {
       const focusedElement = document.activeElement;
       if (
         focusedElement
         && focusedElement !== document.body
         && focusedElement.isConnected
+        && focusedElement !== nativeRestorationTarget
         && !actionMenuRef.current?.contains(focusedElement)
         && !dialogRef.current?.contains(focusedElement)
       ) return;
@@ -446,7 +475,7 @@ export function RunDashboard() {
     };
     commitSourceVerification(ended);
     setSourceVerificationError(
-      "Verification session ended. Open a new verification browser session.",
+      "Browser session ended. Open a new browser session.",
     );
   }, [commitSourceVerification]);
   const handleSourceHandoffPageHide = useCallback(() => {
@@ -458,8 +487,6 @@ export function RunDashboard() {
       markReleasedSourceHandoffEnded();
     }
   }, [markReleasedSourceHandoffEnded]);
-  const requestedArtifacts = useRef(new Set<string>());
-  const latestListRequest = useRef(0);
   const createRunRequests = useMemo(
     () => parseCreateRunRequests(jobUrl, opportunityKind, skipReview, autoSubmit),
     [autoSubmit, jobUrl, opportunityKind, skipReview],
@@ -521,70 +548,6 @@ export function RunDashboard() {
     });
     return () => window.cancelAnimationFrame(focusFrame);
   }, [sourceVerification]);
-
-  const load = useCallback(async (showLoading = false) => {
-    const requestId = ++latestListRequest.current;
-    if (showLoading) setIsLoading(true);
-    try {
-      const nextRuns = await listRuns();
-      if (requestId !== latestListRequest.current) return;
-      setRuns(nextRuns);
-      setLoadError(null);
-    } catch (error) {
-      if (requestId !== latestListRequest.current) return;
-      setLoadError(publicMessage(error, "Applications are unavailable. Try again."));
-    } finally {
-      if (requestId === latestListRequest.current) setIsLoading(false);
-    }
-  }, [setRuns]);
-
-  useEffect(() => {
-    void load(showInitialLoading.current);
-    return () => {
-      latestListRequest.current += 1;
-    };
-  }, [load]);
-
-  const hasActiveRuns = runs.some((run) => run.isApplying === true || !IS_TERMINAL_STATUS[run.status]);
-
-  useEffect(() => {
-    if (!hasActiveRuns) return;
-    let cancelled = false;
-    let timeout = 0;
-    const poll = async () => {
-      await load();
-      if (!cancelled) timeout = window.setTimeout(() => void poll(), POLL_INTERVAL_MS);
-    };
-    timeout = window.setTimeout(() => void poll(), POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeout);
-    };
-  }, [hasActiveRuns, load]);
-
-  useEffect(() => {
-    const pending = runs.flatMap((run) => {
-      const artifact = latestJobAnalysis(run);
-      if (!artifact || requestedArtifacts.current.has(artifact.id)) return [];
-      requestedArtifacts.current.add(artifact.id);
-      return [{ artifact, runId: run.id }];
-    });
-
-    if (pending.length === 0) return;
-
-    void Promise.all(
-      pending.map(async ({ artifact, runId }) => {
-        try {
-          const identity = parseJobIdentity(await readJsonArtifact(artifact));
-          if (!identity) return;
-          setJobIdentities((existing) => ({ ...existing, [runId]: identity }));
-        } catch {
-          requestedArtifacts.current.delete(artifact.id);
-          // Job metadata is optional. The role remains empty without a valid identity.
-        }
-      }),
-    );
-  }, [runs, setJobIdentities]);
 
   const toggleActionMenu = (runId: string, trigger: HTMLButtonElement) => {
     if (actionMenu?.runId === runId) {
@@ -707,6 +670,16 @@ export function RunDashboard() {
     });
   };
 
+  const openReapplyDialog = (run: RunDto, identity: EffectiveIdentity) => {
+    setActionMenu(null);
+    setDialogError(null);
+    setActiveDialog({
+      kind: "reapply",
+      runId: run.id,
+      runName: identity.title ?? shortRunId(run.id),
+    });
+  };
+
   const closeDialog = () => {
     if (activeDialog && busyRunIds.has(activeDialog.runId)) return;
     const runId = activeDialog?.runId;
@@ -732,7 +705,8 @@ export function RunDashboard() {
       setDialogError("Enter 1 to 200 characters.");
       return;
     }
-    const { field, runId } = activeDialog;
+    const submittedDialog = activeDialog;
+    const { field, runId } = submittedDialog;
     setRunBusy(runId, true);
     setDialogError(null);
     try {
@@ -740,11 +714,12 @@ export function RunDashboard() {
         runId,
         field === "title" ? { title: value } : { organization: value },
       );
-      latestListRequest.current += 1;
-      setRuns((current) => current?.map((run) => run.id === updated.id ? updated : run) ?? current);
+      acceptRun(updated);
+      if (activeDialogRef.current !== submittedDialog) return;
       setActiveDialog(null);
       restoreActionTriggerFocus(runId);
     } catch (error) {
+      if (activeDialogRef.current !== submittedDialog) return;
       setDialogError(publicMessage(error, `${field === "title" ? "Title" : "Organization"} could not be updated. Try again.`));
     } finally {
       setRunBusy(runId, false);
@@ -754,21 +729,18 @@ export function RunDashboard() {
   const submitDelete = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (activeDialog?.kind !== "delete" || busyRunIds.has(activeDialog.runId)) return;
-    const { runId } = activeDialog;
+    const submittedDialog = activeDialog;
+    const { runId } = submittedDialog;
     setRunBusy(runId, true);
     setDialogError(null);
     try {
       await deleteRun(runId);
-      latestListRequest.current += 1;
-      setRuns((current) => current?.filter((run) => run.id !== runId) ?? current);
-      setJobIdentities((current) => {
-        const next = { ...current };
-        delete next[runId];
-        return next;
-      });
+      acceptRemoval(runId);
+      if (activeDialogRef.current !== submittedDialog) return;
       setActiveDialog(null);
       focusSearchApplications();
     } catch (error) {
+      if (activeDialogRef.current !== submittedDialog) return;
       setDialogError(publicMessage(error, "The application could not be deleted. Try again."));
     } finally {
       setRunBusy(runId, false);
@@ -792,12 +764,12 @@ export function RunDashboard() {
           .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
       })
       .sort((left, right) => {
-        const leftBucket = left.isApplying ? 0 : left.applicationStatus === "rejected" ? 2 : 1;
-        const rightBucket = right.isApplying ? 0 : right.applicationStatus === "rejected" ? 2 : 1;
+        const leftBucket = isApplicationSessionOpen(left) ? 0 : left.applicationStatus === "rejected" ? 2 : 1;
+        const rightBucket = isApplicationSessionOpen(right) ? 0 : right.applicationStatus === "rejected" ? 2 : 1;
         if (leftBucket !== rightBucket) return leftBucket - rightBucket;
         return sortDirection === "newest"
-          ? right.updatedAt - left.updatedAt
-          : left.updatedAt - right.updatedAt;
+          ? right.createdAt - left.createdAt
+          : left.createdAt - right.createdAt;
       });
   }, [applicationStatusFilter, jobIdentities, pipelineStatusFilter, query, runs, sortDirection]);
 
@@ -828,16 +800,244 @@ export function RunDashboard() {
 
   const changeApplicationStatus = async (runId: string, applicationStatus: ApplicationStatus) => {
     setRunBusy(runId, true);
-    setStatusUpdateError(null);
+    setRunActionError(null);
     try {
       const updated = await updateApplicationStatus(runId, applicationStatus);
-      latestListRequest.current += 1;
-      setRuns((current) => current?.map((run) => run.id === updated.id ? updated : run) ?? current);
-      setStatusUpdateError(null);
+      acceptRun(updated);
+      setRunActionError(null);
     } catch {
-      setStatusUpdateError("Application status could not be updated. Try again.");
+      setRunActionError("Application status could not be updated. Try again.");
     } finally {
       setRunBusy(runId, false);
+    }
+  };
+
+  const startApplyingToRun = async (run: RunDto, reapply = false): Promise<string | null> => {
+    if (!run.currentPdfSha256) return "The resume PDF is unavailable to apply.";
+    let applicationPdfSha256 = run.currentPdfSha256;
+    if (run.status === "review") {
+      const availability = await getApplicationSession(run.id);
+      if (!("state" in availability) || !availability.canStartAfterApproval) {
+        return "Automatic application is not available for this run yet. Open the run to review what is required.";
+      }
+      const approved = await approveRun(
+        run.id,
+        run.currentPdfSha256,
+        run.visualAcknowledgementRequired,
+      );
+      acceptRun(approved);
+      if (!approved.currentPdfSha256) {
+        return "The resume was approved, but its PDF is unavailable to apply.";
+      }
+      applicationPdfSha256 = approved.currentPdfSha256;
+    }
+    const session = await startApplicationSession(run.id, applicationPdfSha256, {
+      autoSubmit: applicationAutoSubmit,
+      autoEnd: applicationAutoEnd,
+      ...(reapply ? { reapply: true } : {}),
+    });
+    if (
+      session.bridgeState === "cancelled"
+      || session.bridgeState === "failed"
+      || session.bridgeState === "closed"
+      || session.bridgeState === "lost"
+    ) {
+      await retryApplicationSession(run.id, applicationPdfSha256, {
+        autoSubmit: applicationAutoSubmit,
+        autoEnd: applicationAutoEnd,
+      });
+    }
+    acceptApplicationStarted(run.id);
+    return null;
+  };
+
+  const applyToRun = async (run: RunDto) => {
+    if (!isApplyableRun(run) || busyRunIds.has(run.id)) return;
+    setRunBusy(run.id, true);
+    setRunActionError(null);
+    try {
+      const failureMessage = await startApplyingToRun(run);
+      if (failureMessage) {
+        setRunActionError(failureMessage);
+        return;
+      }
+      await load();
+    } catch (error) {
+      if (run.status === "review") await load();
+      setRunActionError(publicMessage(error, "The application could not be started. Try again."));
+    } finally {
+      setRunBusy(run.id, false);
+    }
+  };
+
+  const submitReapply = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (activeDialog?.kind !== "reapply" || busyRunIds.has(activeDialog.runId)) return;
+    const run = runs.find(({ id }) => id === activeDialog.runId);
+    if (!run || !isReapplyableRun(run)) {
+      setDialogError("This application is no longer available to reapply.");
+      return;
+    }
+    const submittedDialog = activeDialog;
+    const { runId } = submittedDialog;
+    setRunBusy(runId, true);
+    setDialogError(null);
+    try {
+      const failureMessage = await startApplyingToRun(run, true);
+      if (failureMessage) {
+        if (activeDialogRef.current === submittedDialog) setDialogError(failureMessage);
+        return;
+      }
+      await load();
+      if (activeDialogRef.current !== submittedDialog) return;
+      setActiveDialog(null);
+      restoreActionTriggerFocus(runId);
+    } catch (error) {
+      if (run.status === "review") await load();
+      if (activeDialogRef.current !== submittedDialog) return;
+      setDialogError(publicMessage(error, "The application could not be restarted. Try again."));
+    } finally {
+      setRunBusy(runId, false);
+    }
+  };
+
+  const applyToAllRuns = async () => {
+    if (bulkApplyPendingRef.current) return;
+    const candidates = applyableRuns
+      .filter((run) => !busyRunIds.has(run.id))
+      .sort((left, right) => right.createdAt - left.createdAt);
+    if (candidates.length === 0) return;
+    bulkApplyPendingRef.current = true;
+    setIsApplyingAll(true);
+    setRunActionError(null);
+    setBusyRunIds((current) => {
+      const next = new Set(current);
+      for (const run of candidates) next.add(run.id);
+      return next;
+    });
+    let failureCount = 0;
+    try {
+      for (const run of candidates) {
+        try {
+          if (await startApplyingToRun(run) !== null) failureCount += 1;
+        } catch {
+          failureCount += 1;
+        }
+      }
+      await load();
+      if (failureCount > 0) {
+        const successCount = candidates.length - failureCount;
+        setRunActionError(
+          successCount > 0
+            ? successCount + " of " + candidates.length + " applications started; " + failureCount + " could not be started."
+            : "No applications could be started. Try each application individually for details.",
+        );
+      }
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        for (const run of candidates) next.delete(run.id);
+        return next;
+      });
+      bulkApplyPendingRef.current = false;
+      setIsApplyingAll(false);
+    }
+  };
+
+  const endAllApplicationSessions = async () => {
+    if (bulkEndPendingRef.current || openSessionRuns.length === 0) return;
+    const candidates = openSessionRuns;
+    bulkEndPendingRef.current = true;
+    setIsEndingAllSessions(true);
+    setRunActionError(null);
+    setBusyRunIds((current) => {
+      const next = new Set(current);
+      for (const run of candidates) next.add(run.id);
+      return next;
+    });
+    try {
+      const results = await mapWithConcurrency(
+        candidates,
+        MAX_CONCURRENT_SESSION_ENDS,
+        async (run) => {
+          try {
+            await closeApplicationSession(run.id);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+      );
+      await load();
+      const failureCount = results.filter((ended) => !ended).length;
+      if (failureCount > 0) {
+        const successCount = candidates.length - failureCount;
+        setRunActionError(
+          successCount > 0
+            ? successCount + " of " + candidates.length + " sessions ended; " + failureCount + " could not be ended."
+            : "No application sessions could be ended. Try ending each session individually.",
+        );
+      }
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        for (const run of candidates) next.delete(run.id);
+        return next;
+      });
+      bulkEndPendingRef.current = false;
+      setIsEndingAllSessions(false);
+    }
+  };
+
+  const retryFailedRun = async (runId: string) => {
+    if (busyRunIds.has(runId)) return;
+    setRunBusy(runId, true);
+    setRunActionError(null);
+    try {
+      const updated = await retryRun(runId);
+      acceptRun(updated);
+    } catch (error) {
+      setRunActionError(publicMessage(error, "The tailoring run could not be retried. Try again."));
+    } finally {
+      setRunBusy(runId, false);
+    }
+  };
+
+  const retryAllFailedRuns = async () => {
+    if (bulkRetryPendingRef.current) return;
+    const candidates = retryableRuns.filter((run) => !busyRunIds.has(run.id));
+    if (candidates.length === 0) return;
+    bulkRetryPendingRef.current = true;
+    setIsRetryingAll(true);
+    setRunActionError(null);
+    setBusyRunIds((current) => {
+      const next = new Set(current);
+      for (const run of candidates) next.add(run.id);
+      return next;
+    });
+    try {
+      const results = await Promise.allSettled(candidates.map(async (run) => {
+        const updated = await retryRun(run.id);
+        acceptRun(updated);
+        return updated;
+      }));
+      const retriedRuns = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+      const failureCount = candidates.length - retriedRuns.length;
+      if (failureCount > 0) {
+        setRunActionError(
+          retriedRuns.length > 0
+            ? retriedRuns.length + " of " + candidates.length + " tailoring runs retried; " + failureCount + " could not be retried."
+            : "No tailoring runs could be retried. Try each run individually for details.",
+        );
+      }
+    } finally {
+      setBusyRunIds((current) => {
+        const next = new Set(current);
+        for (const run of candidates) next.delete(run.id);
+        return next;
+      });
+      bulkRetryPendingRef.current = false;
+      setIsRetryingAll(false);
     }
   };
 
@@ -848,41 +1048,37 @@ export function RunDashboard() {
     setCreateError(null);
     setCreateSuccess(null);
     setSourceVerificationError(null);
-
     try {
-      const results = await mapWithConcurrency(
-        requests,
-        MAX_CONCURRENT_RUN_CREATIONS,
-        async (request): Promise<CreateRunResult> => {
-          try {
-            return {
-              success: true,
-              run: await createRun(
-                request.jobUrl,
-                request.generateKeywordMap,
-                request.skipReview,
-                request.autoSubmit,
-                request.opportunityKind,
-              ),
-            };
-          } catch (error) {
-            return { success: false, request, error };
-          }
-        },
-      );
-      const successfulRuns: RunDto[] = [];
       const failures: Extract<CreateRunResult, { success: false }>[] = [];
-      for (const result of results) {
-        if (result.success) successfulRuns.push(result.run);
-        else failures.push(result);
-      }
-
-      if (successfulRuns.length > 0) {
-        latestListRequest.current += 1;
-        setIsLoading(false);
-        setRuns((current) => mergeRuns(current, successfulRuns));
-        void load();
-      }
+      const successfulRuns = await collectCreatedRuns(async () => {
+        const results = await mapWithConcurrency(
+          requests,
+          MAX_CONCURRENT_RUN_CREATIONS,
+          async (request): Promise<CreateRunResult> => {
+            try {
+              return {
+                success: true,
+                run: await createRun(
+                  request.jobUrl,
+                  request.generateKeywordMap,
+                  request.skipReview,
+                  request.autoSubmit,
+                  request.opportunityKind,
+                ),
+              };
+            } catch (error) {
+              return { success: false, request, error };
+            }
+          },
+        );
+        const created: RunDto[] = [];
+        for (const result of results) {
+          if (result.success) created.push(result.run);
+          else failures.push(result);
+        }
+        return created;
+      });
+      if (successfulRuns.length > 0) void load();
 
       if (failures.length === 0) {
         setJobUrl("");
@@ -915,7 +1111,7 @@ export function RunDashboard() {
       setCreateError(
         requests.length === 1
           ? publicMessage(failures[0]!.error, "The opportunity could not be initialized. Try again.")
-          : batchFailureMessage(successfulRuns.length, results.length, failures[0]!.error),
+          : batchFailureMessage(successfulRuns.length, requests.length, failures[0]!.error),
       );
     } finally {
       initializerPendingRef.current = false;
@@ -924,7 +1120,7 @@ export function RunDashboard() {
   };
 
   const openSourceVerification = async () => {
-    const verification = sourceVerification;
+    const verification = sourceVerificationRef.current;
     if (
       verification?.phase !== "required"
       || sourceVerificationActionRef.current !== null
@@ -950,7 +1146,7 @@ export function RunDashboard() {
     } catch (error) {
       if (sourceHandoffReleaseRequestedRef.current) return;
       setSourceVerificationError(
-        sourceVerificationMessage(error, "The verification browser could not be opened. Try again."),
+        sourceVerificationMessage(error, "The local browser could not be opened. Try again."),
       );
     } finally {
       sourceVerificationActionRef.current = null;
@@ -969,19 +1165,17 @@ export function RunDashboard() {
     setSourceVerificationAction("complete");
     setSourceVerificationError(null);
     try {
-      const run = await completeSourceHandoff(verification.handoff.id);
-      const currentVerification = sourceVerificationRef.current;
-      if (
-        currentVerification?.phase !== "awaiting"
-        || currentVerification.handoff.id !== verification.handoff.id
-      ) {
-        void load();
-        return;
-      }
-      latestListRequest.current += 1;
-      setIsLoading(false);
-      setRuns((current) => mergeRuns(current, [run]));
+      const created = await collectCreatedRuns(async () => {
+        const run = await completeSourceHandoff(verification.handoff.id);
+        const currentVerification = sourceVerificationRef.current;
+        if (
+          currentVerification?.phase !== "awaiting"
+          || currentVerification.handoff.id !== verification.handoff.id
+        ) return [];
+        return [run];
+      });
       void load();
+      if (created.length === 0) return;
       setJobUrl("");
       setOpportunityKind("auto");
       setSkipReview(false);
@@ -1002,11 +1196,11 @@ export function RunDashboard() {
           sessionEnded: true,
         });
         setSourceVerificationError(
-          "Verification session ended. Open a new verification browser session.",
+          "Browser session ended. Open a new browser session.",
         );
       } else {
         setSourceVerificationError(
-          sourceVerificationMessage(error, "Verification could not be completed. Try again."),
+          sourceVerificationMessage(error, "The description could not be captured. Try again."),
         );
       }
     } finally {
@@ -1023,7 +1217,7 @@ export function RunDashboard() {
       restoreInitializerFocusRef.current = true;
       commitSourceVerification(null);
       setSourceVerificationError(null);
-      setCreateSuccess("Verification cancelled. The URL and options were kept.");
+      setCreateSuccess("Browser capture cancelled. The URL and options were kept.");
       return;
     }
 
@@ -1035,7 +1229,7 @@ export function RunDashboard() {
       await deleteSourceHandoff(verification.handoff.id);
       restoreInitializerFocusRef.current = true;
       commitSourceVerification(null);
-      setCreateSuccess("Verification cancelled. The URL and options were kept.");
+      setCreateSuccess("Browser capture cancelled. The URL and options were kept.");
     } catch (error) {
       if (
         error instanceof PipelineClientError
@@ -1044,7 +1238,7 @@ export function RunDashboard() {
         restoreInitializerFocusRef.current = true;
         commitSourceVerification(null);
         setSourceVerificationError(null);
-        setCreateSuccess("Verification session ended. The URL and options were kept.");
+        setCreateSuccess("Browser session ended. The URL and options were kept.");
       } else if (sourceHandoffReleaseRequestedRef.current) {
         commitSourceVerification({
           phase: "required",
@@ -1052,11 +1246,11 @@ export function RunDashboard() {
           sessionEnded: true,
         });
         setSourceVerificationError(
-          "Verification session ended. Open a new verification browser session.",
+          "Browser session ended. Open a new browser session.",
         );
       } else {
         setSourceVerificationError(
-          sourceVerificationMessage(error, "Verification could not be cancelled. Try again."),
+          sourceVerificationMessage(error, "Browser capture could not be cancelled. Try again."),
         );
         if (releasedSourceHandoffIdRef.current === verification.handoff.id) {
           releasedSourceHandoffIdRef.current = null;
@@ -1074,14 +1268,11 @@ export function RunDashboard() {
     setIsCreating(true);
     clearCreateStatus();
     try {
-      const run = await createPastedRun(
+      await collectCreatedRuns(async () => [await createPastedRun(
         request.jobTitle,
         request.jobDescription,
         request.generateKeywordMap,
-      );
-      latestListRequest.current += 1;
-      setIsLoading(false);
-      setRuns((current) => mergeRuns(current, [run]));
+      )]);
       void load();
       setJobTitle("");
       setJobDescription("");
@@ -1163,6 +1354,13 @@ export function RunDashboard() {
         <h1>Applications</h1>
         <AlertControls className="applications-header__alert-controls" />
       </header>
+
+      {baselineMissing ? (
+        <p className="dashboard-notice" role="status">
+          Place your own generic resume.tex at <code>.jobhunt-data/user-info/resume-main/resume.tex</code>.
+          This baseline is required before creating an application. Reload this page after adding it.
+        </p>
+      ) : null}
 
       <form
         className={`run-initializer run-initializer--${initializerSource}`}
@@ -1371,8 +1569,7 @@ export function RunDashboard() {
             {sourceVerification.phase === "required" ? (
               <>
                 <p id="source-verification-description" role="status">
-                  This site requires a verification step that Jobhunter will not attempt. Open the trusted
-                  local browser and complete the verification manually.
+                  This site requires a verification step that Jobhunt will not attempt. Open the trusted local browser and complete the verification manually.
                 </p>
                 <div className="run-initializer__verification-actions">
                   <button
@@ -1382,9 +1579,7 @@ export function RunDashboard() {
                     onClick={() => void openSourceVerification()}
                     type="button"
                   >
-                    {sourceVerificationAction === "open"
-                      ? "Opening verification browser…"
-                      : "Open verification browser"}
+                    {sourceVerificationAction === "open" ? "Opening verification browser…" : "Open verification browser"}
                   </button>
                   {sourceVerification.sessionEnded ? null : (
                     <button
@@ -1402,8 +1597,7 @@ export function RunDashboard() {
               <>
                 <h3>Complete verification in the local browser</h3>
                 <p id="source-verification-description" role="status">
-                  A trusted local browser window is open. Complete the site&apos;s verification there,
-                  then return here and confirm below.
+                  A trusted local browser window is open. Complete the site's verification there, then return here and confirm below.
                 </p>
                 <div className="run-initializer__verification-actions">
                   <button
@@ -1413,9 +1607,7 @@ export function RunDashboard() {
                     onClick={() => void completeSourceVerification()}
                     type="button"
                   >
-                    {sourceVerificationAction === "complete"
-                      ? "Completing verification…"
-                      : "I've completed verification"}
+                    {sourceVerificationAction === "complete" ? "Completing verification…" : "I've completed verification"}
                   </button>
                   <button
                     className="square-control"
@@ -1423,9 +1615,7 @@ export function RunDashboard() {
                     onClick={() => void cancelSourceVerification()}
                     type="button"
                   >
-                    {sourceVerificationAction === "cancel"
-                      ? "Cancelling verification…"
-                      : "Cancel verification"}
+                    {sourceVerificationAction === "cancel" ? "Cancelling verification…" : "Cancel verification"}
                   </button>
                 </div>
               </>
@@ -1457,29 +1647,123 @@ export function RunDashboard() {
         ) : null}
       </form>
 
-        <section className="applications-summary" aria-label="Application count">
-          <p className="applications-total">{isLoading || (loadError && runs.length === 0) ? "—" : runs.length.toLocaleString()}</p>
-          <p className="applications-label">Total applications</p>
+      {openSessionRuns.length > 0 ? (
+        <section className="active-applications" aria-labelledby="active-applications-heading">
+          <header className="active-applications__header">
+            <h2 id="active-applications-heading">Open application sessions</h2>
+            <span className="active-applications__count">{openSessionRuns.length} open</span>
+            <button
+              className="square-control bulk-action-control active-applications__end-all"
+              type="button"
+              aria-label="End all"
+              disabled={isEndingAllSessions || isApplyingAll}
+              onClick={() => { void endAllApplicationSessions(); }}
+            >
+              {isEndingAllSessions ? "Ending…" : "End all"}
+            </button>
+          </header>
+          <ul className="active-applications__list">
+            {openSessionRuns.map((run) => {
+              const identity = effectiveRunIdentity(run, jobIdentities[run.id]);
+              const presentation = opportunityPresentation(run.opportunityKind);
+              const KindIcon = presentation.icon;
+              const title = identity.title ?? presentation.titleFallback;
+              const organization = identity.organization ?? presentation.organizationFallback;
+              const needsAttention = applicationAttention.has(run.id);
+              return (
+                <li key={run.id}>
+                  <Link
+                    className="active-application"
+                    data-needs-attention={needsAttention || undefined}
+                    href={`/runs/${encodeURIComponent(run.id)}`}
+                    aria-label={`${needsAttention ? "Needs attention. " : ""}View application: ${title}, ${organization} (${shortRunId(run.id)})`}
+                  >
+                    <KindIcon className="application-kind-icon" aria-hidden="true" />
+                    <span className="active-application__identity">
+                      <span className="active-application__title">{title}</span>
+                      <span className="active-application__organization">{organization}</span>
+                      {needsAttention ? <span className="active-application__attention">Needs attention</span> : null}
+                    </span>
+                    <span className="active-application__action">
+                      View application <span aria-hidden="true">→</span>
+                    </span>
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      ) : null}
+
+        <section className="applications-summary" aria-label="Resume and application counts">
+          <div className="applications-summary__metric" role="group" aria-labelledby="total-resumes-label">
+            <p className="applications-total">{isLoading || (loadError && runs.length === 0) ? "—" : runs.length.toLocaleString()}</p>
+            <p className="applications-label" id="total-resumes-label">Total resumes</p>
+          </div>
+          <div className="applications-summary__metric" role="group" aria-labelledby="applications-count-label">
+            <p className="applications-total">{isLoading || (loadError && runs.length === 0) ? "—" : applicationCount.toLocaleString()}</p>
+            <p className="applications-label" id="applications-count-label">Applications</p>
+          </div>
         </section>
 
         <section className="applications-list" aria-labelledby="applications-list-heading">
           <h2 className="visually-hidden" id="applications-list-heading">Application runs</h2>
           <div className="applications-toolbar">
-            <label className="search-control">
-              <span className="visually-hidden">Search applications</span>
-              <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18">
-                <circle cx="11" cy="11" r="6.5" />
-                <path d="m16 16 4 4" />
-              </svg>
-              <input
-                ref={searchInputRef}
-                type="search"
-                value={query}
-                placeholder="Search applications"
-                onChange={(event) => updateQuery(event.target.value)}
-              />
-            </label>
+            <div className="applications-toolbar__primary">
+              <label className="search-control">
+                <span className="visually-hidden">Search applications</span>
+                <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18">
+                  <circle cx="11" cy="11" r="6.5" />
+                  <path d="m16 16 4 4" />
+                </svg>
+                <input
+                  ref={searchInputRef}
+                  type="search"
+                  value={query}
+                  placeholder="Search applications"
+                  onChange={(event) => updateQuery(event.target.value)}
+                />
+              </label>
+              <div className="application-defaults" aria-label="Application defaults">
+                <label className="application-default-toggle">
+                  <input
+                    type="checkbox"
+                    aria-label="Auto-submit applications"
+                    checked={applicationAutoSubmit}
+                    onChange={(event) => setApplicationAutoSubmit(event.currentTarget.checked)}
+                  />
+                  <span>Auto-submit</span>
+                </label>
+                <label className="application-default-toggle">
+                  <input
+                    type="checkbox"
+                    aria-label="Auto-end successful sessions"
+                    checked={applicationAutoEnd}
+                    onChange={(event) => setApplicationAutoEnd(event.currentTarget.checked)}
+                  />
+                  <span>Auto-end</span>
+                </label>
+              </div>
+            </div>
             <div className="applications-toolbar__actions">
+              <button
+                className="square-control bulk-action-control"
+                type="button"
+                aria-label="Retry all"
+                disabled={isRetryingAll || !retryableRuns.some((run) => !busyRunIds.has(run.id))}
+                onClick={() => { void retryAllFailedRuns(); }}
+              >
+                Retry all
+              </button>
+              <button
+                className="square-control square-control--primary bulk-action-control"
+                type="button"
+                aria-label="Apply all"
+                disabled={isApplyingAll || !applyableRuns.some((run) => !busyRunIds.has(run.id))}
+                onClick={() => { void applyToAllRuns(); }}
+              >
+                Apply all
+              </button>
               <label className="select-control">
                 <span>Pipeline status</span>
                 <select
@@ -1521,18 +1805,20 @@ export function RunDashboard() {
                   ))}
                 </select>
               </label>
-              <button
-                className="square-control sort-control"
-                type="button"
-                onClick={() => {
-                  setSortDirection((direction) => direction === "newest" ? "oldest" : "newest");
-                  setCurrentPage(1);
-                }}
-                aria-label={`Sort by updated date, currently ${sortDirection}`}
-              >
-                <span>Updated: {sortDirection}</span>
-                <span aria-hidden="true">{sortDirection === "newest" ? "↓" : "↑"}</span>
-              </button>
+              <label className="select-control">
+                <span>Sort</span>
+                <select
+                  aria-label="Sort applications"
+                  value={sortDirection}
+                  onChange={(event) => {
+                    setSortDirection(event.target.value === "oldest" ? "oldest" : "newest");
+                    setCurrentPage(1);
+                  }}
+                >
+                  <option value="newest">Date added: newest</option>
+                  <option value="oldest">Date added: oldest</option>
+                </select>
+              </label>
             </div>
           </div>
 
@@ -1543,9 +1829,9 @@ export function RunDashboard() {
             </div>
           ) : null}
 
-          {statusUpdateError ? (
-            <div className="dashboard-alert dashboard-alert--toolbar" role="alert" aria-label="Application status update error">
-              <span>{statusUpdateError}</span>
+          {runActionError ? (
+            <div className="dashboard-alert dashboard-alert--toolbar" role="alert" aria-label="Run action error">
+              <span>{runActionError}</span>
             </div>
           ) : null}
 
@@ -1555,7 +1841,7 @@ export function RunDashboard() {
                   <tr>
                     <th scope="col">Role</th>
                     <th scope="col">Organization</th>
-                    <th scope="col">Updated</th>
+                    <th scope="col">Added</th>
                     <th scope="col">Pipeline status</th>
                     <th scope="col">Application status</th>
                     <th scope="col"><span className="visually-hidden">Application actions</span></th>
@@ -1615,7 +1901,11 @@ export function RunDashboard() {
                         onClick={(event) => {
                           const target = event.target;
                           if (target instanceof Element && target.closest(ROW_INTERACTIVE_SELECTOR)) return;
-                          router.push(href);
+                          if (event.metaKey || event.ctrlKey) {
+                            window.open(href, "_blank", "noopener,noreferrer");
+                          } else {
+                            router.push(href);
+                          }
                         }}
                       >
                         <td>
@@ -1626,7 +1916,7 @@ export function RunDashboard() {
                             ? <span className="application-organization-name">{organization}</span>
                             : <span className="table-placeholder-line table-placeholder-line--organization" role="img" aria-label="Unknown organization" />
                         }</td>
-                        <td><time dateTime={new Date(run.updatedAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.updatedAt))}</time></td>
+                        <td><time dateTime={new Date(run.createdAt).toISOString()}>{DATE_FORMATTER.format(new Date(run.createdAt))}</time></td>
                         <td>
                           <span
                             aria-label={`Pipeline status for ${shortRunId(run.id)}: ${PIPELINE_STATUS_LABELS[pipelineStatus]}`}
@@ -1652,29 +1942,64 @@ export function RunDashboard() {
                           </select>
                         </td>
                         <td>
-                          <button
-                            ref={(element) => {
-                              if (element) actionTriggerRefs.current.set(run.id, element);
-                              else actionTriggerRefs.current.delete(run.id);
-                            }}
-                            className="run-action-trigger"
-                            type="button"
-                            aria-label={`Actions for ${identity.title ?? presentation.dashboardTitleFallback ?? shortRunId(run.id)}`}
-                            aria-haspopup="menu"
-                            aria-expanded={actionMenu?.runId === run.id}
-                            aria-controls={`run-actions-${encodeURIComponent(run.id)}`}
-                            disabled={busyRunIds.has(run.id)}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              toggleActionMenu(run.id, event.currentTarget);
-                            }}
-                          >
-                            <svg aria-hidden="true" viewBox="0 0 24 24">
-                              <circle cx="5" cy="12" r="1.5" />
-                              <circle cx="12" cy="12" r="1.5" />
-                              <circle cx="19" cy="12" r="1.5" />
-                            </svg>
-                          </button>
+                          <div className="run-row-actions">
+                            {isApplyableRun(run) ? (
+                              <button
+                                className="run-action-trigger run-apply-button"
+                                type="button"
+                                aria-label={`Apply for ${identity.title ?? presentation.dashboardTitleFallback ?? shortRunId(run.id)}`}
+                                disabled={busyRunIds.has(run.id)}
+                                onClick={() => { void applyToRun(run); }}
+                              >
+                                Apply
+                              </button>
+                            ) : null}
+                            {isReapplyableRun(run) ? (
+                              <button
+                                className="run-action-trigger run-apply-button"
+                                type="button"
+                                aria-label={`Reapply for ${identity.title ?? presentation.dashboardTitleFallback ?? shortRunId(run.id)}`}
+                                disabled={busyRunIds.has(run.id)}
+                                onClick={() => { openReapplyDialog(run, identity); }}
+                              >
+                                Reapply
+                              </button>
+                            ) : null}
+                            {run.status === "failed" ? (
+                              <button
+                                className="run-action-trigger run-retry-button"
+                                type="button"
+                                aria-label={`Retry tailoring for ${shortRunId(run.id)}`}
+                                disabled={busyRunIds.has(run.id)}
+                                onClick={() => { void retryFailedRun(run.id); }}
+                              >
+                                Retry
+                              </button>
+                            ) : null}
+                            <button
+                              ref={(element) => {
+                                if (element) actionTriggerRefs.current.set(run.id, element);
+                                else actionTriggerRefs.current.delete(run.id);
+                              }}
+                              className="run-action-trigger"
+                              type="button"
+                              aria-label={`Actions for ${identity.title ?? presentation.dashboardTitleFallback ?? shortRunId(run.id)}`}
+                              aria-haspopup="menu"
+                              aria-expanded={actionMenu?.runId === run.id}
+                              aria-controls={`run-actions-${encodeURIComponent(run.id)}`}
+                              disabled={busyRunIds.has(run.id)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleActionMenu(run.id, event.currentTarget);
+                              }}
+                            >
+                              <svg aria-hidden="true" viewBox="0 0 24 24">
+                                <circle cx="5" cy="12" r="1.5" />
+                                <circle cx="12" cy="12" r="1.5" />
+                                <circle cx="19" cy="12" r="1.5" />
+                              </svg>
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -1788,7 +2113,7 @@ export function RunDashboard() {
           ref={dialogRef}
           className="run-action-dialog"
           aria-labelledby="run-action-dialog-title"
-          aria-describedby={activeDialog.kind === "delete" ? "run-action-dialog-description" : undefined}
+          aria-describedby={activeDialog.kind === "identity" ? undefined : "run-action-dialog-description"}
           onCancel={(event) => {
             event.preventDefault();
             closeDialog();
@@ -1830,6 +2155,25 @@ export function RunDashboard() {
                 <button className="square-control" data-dialog-cancel type="button" disabled={isDialogBusy} onClick={closeDialog}>Cancel</button>
                 <button className="square-control square-control--primary" type="submit" disabled={isDialogBusy || !isEditValueValid}>
                   {isDialogBusy ? "Saving…" : "Save"}
+                </button>
+              </footer>
+            </form>
+          ) : activeDialog.kind === "reapply" ? (
+            <form className="run-action-dialog__form" onSubmit={(event) => void submitReapply(event)}>
+              <header className="run-action-dialog__header">
+                <p className="applications-label">Repeat application</p>
+                <h2 id="run-action-dialog-title">Reapply to {activeDialog.runName}?</h2>
+              </header>
+              <div className="run-action-dialog__body">
+                <p id="run-action-dialog-description">
+                  This starts another application even though this run is already marked applied. Continue only if you intend to submit again.
+                </p>
+                {dialogError ? <p className="run-action-dialog__error" id="run-action-dialog-error" role="alert">{dialogError}</p> : null}
+              </div>
+              <footer className="run-action-dialog__actions">
+                <button className="square-control" data-dialog-cancel type="button" disabled={isDialogBusy} onClick={closeDialog}>Cancel</button>
+                <button className="square-control square-control--primary" type="submit" disabled={isDialogBusy}>
+                  {isDialogBusy ? "Reapplying…" : "Reapply"}
                 </button>
               </footer>
             </form>

@@ -10,7 +10,8 @@ export async function installBrowserNotificationProbe(
   page: Page,
   options: {
     readonly initialPermission?: NotificationPermission;
-    readonly notificationsEnabled?: boolean;
+    readonly notificationsEnabled?: boolean | null;
+    readonly requireUserGesture?: boolean;
   } = {},
 ): Promise<() => Promise<BrowserNotificationRecord[]>> {
   await page.addInitScript((initial) => {
@@ -21,24 +22,35 @@ export async function installBrowserNotificationProbe(
       configurable: true,
       value: [],
     });
-    const permissionStorageKey = "jobhunter.test.browser-notification-permission";
+    const permissionStorageKey = "jobhunt.test.browser-notification-permission";
     let permission = window.localStorage.getItem(permissionStorageKey) as NotificationPermission | null;
     if (permission === null) {
       permission = initial.permission;
       window.localStorage.setItem(permissionStorageKey, permission);
     }
+    let userGesture = false;
+    const recordGesture = (event: Event) => { if (event.isTrusted) userGesture = true; };
+    document.addEventListener("pointerdown", recordGesture, true);
+    document.addEventListener("keydown", recordGesture, true);
     class BrowserNotificationProbe {
       static get permission(): NotificationPermission {
-        return permission!;
+        return window.localStorage.getItem(permissionStorageKey) as NotificationPermission;
       }
 
       static requestPermission(): Promise<NotificationPermission> {
+        if (initial.requireUserGesture && !userGesture) {
+          return Promise.resolve(BrowserNotificationProbe.permission);
+        }
         permission = "granted";
         window.localStorage.setItem(permissionStorageKey, permission);
         return Promise.resolve(permission);
       }
 
       constructor(title: string, notificationOptions: NotificationOptions = {}) {
+        if (BrowserNotificationProbe.permission !== "granted"
+          || window.localStorage.getItem("jobhunt.test.notification-construction-failure") === "true") {
+          throw new Error("Browser notification unavailable");
+        }
         notificationWindow.__browserNotifications.push({
           body: notificationOptions.body ?? "",
           tag: notificationOptions.tag ?? "",
@@ -50,15 +62,21 @@ export async function installBrowserNotificationProbe(
       configurable: true,
       value: BrowserNotificationProbe,
     });
-    if (window.localStorage.getItem("jobhunter.browser-notifications.enabled") === null) {
+    if (
+      initial.notificationsEnabled !== null
+      && window.localStorage.getItem("jobhunt.browser-notifications.enabled") === null
+    ) {
       window.localStorage.setItem(
-        "jobhunter.browser-notifications.enabled",
+        "jobhunt.browser-notifications.enabled",
         String(initial.notificationsEnabled),
       );
     }
   }, {
-    notificationsEnabled: options.notificationsEnabled ?? true,
+    notificationsEnabled: options.notificationsEnabled === undefined
+      ? true
+      : options.notificationsEnabled,
     permission: options.initialPermission ?? "granted",
+    requireUserGesture: options.requireUserGesture ?? false,
   });
   return () => page.evaluate(() => (
     window as typeof window & { __browserNotifications: BrowserNotificationRecord[] }

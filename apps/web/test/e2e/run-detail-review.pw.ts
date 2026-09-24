@@ -1,4 +1,3 @@
-import { createServer, type Server } from "node:http";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import {
   ApiErrorSchema,
@@ -23,14 +22,13 @@ import {
   type RevisionOrigin,
   type RunDto,
   type RunStatus,
-} from "@jobhunter/pipeline/contracts";
+} from "../../app/lib/pipeline-contracts";
 import { installBrowserNotificationProbe } from "./browser-notification-probe";
 
 const runId = "run-detail-review-workspace";
 const pipelineRunPath = `/api/pipeline/runs/${runId}`;
-const nativeSsePort = Number(process.env.JOBHUNTER_E2E_PIPELINE_PORT ?? "3467");
 const createdAt = 1_700_000_000_000;
-const jobUrl = "https://jobs.example.com/platform-engineer";
+const jobUrl = "https://jobs.example.test/platform-engineer";
 const expiresAt = 1_700_086_400_000;
 const pdfHash1 = "1".repeat(64);
 const pdfHash2 = "2".repeat(64);
@@ -45,7 +43,7 @@ const privateHarnessValues = [
   "/home/private/applicant-profile.md",
   "private-returned-answer",
 ] as const;
-const privateCredentialUsername = "credential-user@example.test";
+const privateCredentialUsername = "candidate@example.test";
 const privateCredentialPassword = "credential password must stay private";
 
 interface Deferred {
@@ -60,9 +58,8 @@ interface QueuedReply {
   readonly waitFor?: Promise<void>;
 }
 
-interface SseReply {
-  readonly body: string;
-  readonly publicEvents: readonly ApplicationSessionEventDto[];
+interface ApplicationReply {
+  readonly view: ApplicationSessionView;
   readonly waitFor: Promise<void>;
   readonly before?: () => void;
 }
@@ -87,94 +84,18 @@ interface MockPipeline {
   readonly commandReplies: QueuedReply[];
   readonly suggestionReplies: QueuedReply[];
   readonly professionalizeReplies: QueuedReply[];
-  readonly sseReplies: SseReply[];
-  readonly useNativeSse: boolean;
+  readonly applicationReplies: ApplicationReply[];
   onDelete: (() => void) | null;
   readonly requests: RequestRecord[];
   readonly commands: ApplicationSessionCommand[];
   readonly startBodies: unknown[];
   readonly retryBodies: unknown[];
-  readonly sseHeaders: Array<string | null>;
   readonly artifactRequests: string[];
   readonly publicResponseBodies: string[];
   runGetCount: number;
   applicationGetCount: number;
   deleteCount: number;
 }
-
-interface NativeSseScenario {
-  readonly headers: Array<string | null>;
-  readonly servedBodies: string[];
-  readonly initialBody: string;
-  readonly resumedBody: string;
-  readonly initialFollowupBody?: string;
-  readonly onResume: () => void;
-  readonly waitForResume: Promise<void>;
-  readonly waitForInitialClose?: Promise<void>;
-  readonly waitForInitialFollowup?: Promise<void>;
-}
-
-let nativeSseScenario: NativeSseScenario | null = null;
-let nativeSseServer: Server;
-
-test.beforeAll(async () => {
-  nativeSseServer = createServer(async (request, response) => {
-    if (
-      request.method !== "GET"
-      || request.url !== `/v1/runs/${runId}/application/events`
-      || nativeSseScenario === null
-    ) {
-      response.writeHead(404).end();
-      return;
-    }
-    const rawCursor = request.headers["last-event-id"];
-    if (!request.headers.accept?.includes("text/event-stream")) {
-      response.writeHead(406).end();
-      return;
-    }
-    const cursor = Array.isArray(rawCursor) ? rawCursor[0] ?? null : rawCursor ?? null;
-    const connectionOrdinal = nativeSseScenario.headers.length + 1;
-    nativeSseScenario.headers.push(cursor);
-    const resumed = connectionOrdinal > 1;
-    if (resumed) {
-      await nativeSseScenario.waitForResume;
-      nativeSseScenario.onResume();
-    }
-    response.writeHead(200, {
-      "cache-control": "no-store",
-      "content-type": "text/event-stream",
-      connection: "close",
-    });
-    const body = resumed ? nativeSseScenario.resumedBody : nativeSseScenario.initialBody;
-    nativeSseScenario.servedBodies.push(body);
-    response.write(body);
-    if (!resumed && nativeSseScenario.initialFollowupBody !== undefined) {
-      await nativeSseScenario.waitForInitialFollowup;
-      nativeSseScenario.servedBodies.push(nativeSseScenario.initialFollowupBody);
-      response.write(nativeSseScenario.initialFollowupBody);
-    }
-    if (!resumed) await nativeSseScenario.waitForInitialClose;
-    response.end();
-  });
-  await new Promise<void>((resolve, reject) => {
-    nativeSseServer.once("error", reject);
-    nativeSseServer.listen(nativeSsePort, "127.0.0.1", () => {
-      nativeSseServer.off("error", reject);
-      resolve();
-    });
-  });
-});
-
-test.afterEach(() => {
-  nativeSseScenario = null;
-});
-
-test.afterAll(async () => {
-  if (!nativeSseServer.listening) return;
-  await new Promise<void>((resolve, reject) => {
-    nativeSseServer.close((error) => error ? reject(error) : resolve());
-  });
-});
 
 function deferred(): Deferred {
   let resolve!: () => void;
@@ -422,51 +343,19 @@ function eventFixture(
   });
 }
 
-function eventBlock(event: ApplicationSessionEventDto, cursor: number): string {
-  return `id: ${event.generation}:${cursor}\nevent: ${event.event}\ndata: ${JSON.stringify(event)}\n\n`;
-}
-
-function queueSse(
+function queueApplicationProjection(
   mock: MockPipeline,
   event: ApplicationSessionEventDto,
-  cursor: number,
   waitFor: Promise<void> = Promise.resolve(),
   before?: () => void,
 ): void {
-  mock.sseReplies.push({
-    body: `retry: 25\n${eventBlock(event, cursor)}`,
-    publicEvents: [event],
+  mock.applicationReplies.push({
+    view: event.session,
     waitFor,
     before,
   });
 }
 
-function queueSseBatch(
-  mock: MockPipeline,
-  events: ReadonlyArray<{ readonly event: ApplicationSessionEventDto; readonly cursor: number }>,
-  waitFor: Promise<void> = Promise.resolve(),
-  before?: () => void,
-): void {
-  mock.sseReplies.push({
-    body: `retry: 100\n${events.map(({ event, cursor }) => eventBlock(event, cursor)).join("")}`,
-    publicEvents: events.map(({ event }) => event),
-    waitFor,
-    before,
-  });
-}
-
-function queueMalformedSse(
-  mock: MockPipeline,
-  body: string,
-  before?: () => void,
-): void {
-  mock.sseReplies.push({
-    body,
-    publicEvents: [],
-    waitFor: Promise.resolve(),
-    before,
-  });
-}
 
 function analysisPayload(revision: number): unknown {
   return {
@@ -483,7 +372,6 @@ function analysisPayload(revision: number): unknown {
       id: `included-r${revision}`,
       phrase: `Revision ${revision} orchestration`,
       jdQuote: `Revision ${revision} orchestration is required.`,
-      evidenceIds: [`evidence-r${revision}`],
     }],
     exactEdits: [],
   };
@@ -575,7 +463,6 @@ async function installPipeline(
     readonly run?: RunDto;
     readonly iterations?: ResumeIterationListResponse;
     readonly application?: ApplicationSessionView;
-    readonly useNativeSse?: boolean;
   } = {},
 ): Promise<MockPipeline> {
   const mock: MockPipeline = {
@@ -595,14 +482,12 @@ async function installPipeline(
     commandReplies: [],
     suggestionReplies: [],
     professionalizeReplies: [],
-    sseReplies: [],
-    useNativeSse: options.useNativeSse ?? false,
+    applicationReplies: [],
     onDelete: null,
     requests: [],
     commands: [],
     startBodies: [],
     retryBodies: [],
-    sseHeaders: [],
     artifactRequests: [],
     publicResponseBodies: [],
     runGetCount: 0,
@@ -619,6 +504,10 @@ async function installPipeline(
     const requestBody = method === "POST" ? request.postDataJSON() as unknown : undefined;
     mock.requests.push({ method, path, ...(requestBody === undefined ? {} : { body: requestBody }) });
 
+    if (path === "/api/pipeline/runs" && method === "GET") {
+      await fulfillJson(route, mock, { runs: [mock.run] });
+      return;
+    }
     if (path === pipelineRunPath && method === "GET") {
       mock.runGetCount += 1;
       const queuedReply = mock.runReplies.shift();
@@ -736,41 +625,6 @@ async function installPipeline(
       return;
     }
 
-    if (path === `${pipelineRunPath}/application/events` && method === "GET") {
-      if (mock.useNativeSse) {
-        await route.continue();
-        return;
-      }
-      const requestHeaders = await request.allHeaders();
-      expect(requestHeaders.accept).toContain("text/event-stream");
-      mock.sseHeaders.push(requestHeaders["last-event-id"] ?? null);
-      const reply = mock.sseReplies.shift();
-      if (!reply) {
-        await route.fulfill({
-          status: 200,
-          headers: {
-            "cache-control": "no-store",
-            "content-type": "text/event-stream",
-          },
-          body: "retry: 60000\n\n",
-        });
-        return;
-      }
-      await reply.waitFor;
-      reply.before?.();
-      for (const event of reply.publicEvents) {
-        mock.publicResponseBodies.push(JSON.stringify(event));
-      }
-      await route.fulfill({
-        status: 200,
-        headers: {
-          "cache-control": "no-store",
-          "content-type": "text/event-stream",
-        },
-        body: reply.body,
-      });
-      return;
-    }
 
     if (path === `${pipelineRunPath}/application/commands` && method === "POST") {
       const parsed = requestBody as ApplicationSessionCommand;
@@ -804,6 +658,15 @@ async function installPipeline(
 
     if (path === `${pipelineRunPath}/application` && method === "GET") {
       mock.applicationGetCount += 1;
+      const reply = mock.applicationGetCount <= 2
+        ? undefined
+        : mock.applicationReplies[0];
+      if (reply) {
+        await reply.waitFor;
+        if (mock.applicationReplies[0] === reply) mock.applicationReplies.shift();
+        reply.before?.();
+        mock.application = reply.view;
+      }
       await fulfillJson(route, mock, ApplicationSessionViewSchema.parse(mock.application));
       return;
     }
@@ -860,80 +723,6 @@ function questionFixtures(): ApplicationAdditionalInfoQuestion[] {
     },
     { id: "portfolio_note", scope: "application", question: "Optional portfolio note?", answerType: "text" },
   ];
-}
-
-async function installControlledEventSource(page: Page): Promise<void> {
-  await page.addInitScript(() => {
-    const instances: EventTarget[] = [];
-    class ControlledEventSource extends EventTarget {
-      static readonly CONNECTING = 0;
-      static readonly OPEN = 1;
-      static readonly CLOSED = 2;
-      readonly url: string;
-      readonly withCredentials = false;
-      readyState = ControlledEventSource.OPEN;
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-
-      constructor(url: string | URL) {
-        super();
-        this.url = String(url);
-        instances.push(this);
-        window.setTimeout(() => this.onopen?.(new Event("open")), 0);
-      }
-
-      close(): void {
-        this.readyState = ControlledEventSource.CLOSED;
-      }
-    }
-    Object.defineProperty(window, "EventSource", {
-      configurable: true,
-      value: ControlledEventSource,
-    });
-    Object.defineProperty(window, "__applicationEventSources", {
-      configurable: true,
-      value: instances,
-    });
-  });
-}
-
-async function controlledEventSourceCount(page: Page): Promise<number> {
-  return page.evaluate(() => (
-    window as typeof window & { __applicationEventSources: EventTarget[] }
-  ).__applicationEventSources.length);
-}
-
-async function emitControlledEventSourceError(page: Page, sourceIndex: number): Promise<void> {
-  await page.evaluate((index) => {
-    const sources = (
-      window as typeof window & {
-        __applicationEventSources: Array<EventTarget & {
-          onerror: ((event: Event) => void) | null;
-        }>;
-      }
-    ).__applicationEventSources;
-    sources[index]?.onerror?.(new Event("error"));
-  }, sourceIndex);
-}
-
-async function emitControlledApplicationEvent(
-  page: Page,
-  event: ApplicationSessionEventDto,
-  cursor: number,
-  sourceIndex: number,
-): Promise<void> {
-  await page.evaluate(({ data, eventName, index, lastEventId }) => {
-    const sources = (
-      window as typeof window & { __applicationEventSources: EventTarget[] }
-    ).__applicationEventSources;
-    sources[index]?.dispatchEvent(new MessageEvent(eventName, { data, lastEventId }));
-  }, {
-    data: JSON.stringify(event),
-    eventName: event.event,
-    index: sourceIndex,
-    lastEventId: `${event.generation}:${cursor}`,
-  });
 }
 
 function approvedRun(): RunDto {
@@ -1136,6 +925,26 @@ test("pasted review approves without starting an application", async ({ page }) 
   )).toBeVisible();
 });
 
+test("unknown application availability allows resume-only approval without an application POST", async ({ page }) => {
+  const mock = await installPipeline(page, { run: { ...runFixture(), jobUrl } });
+  mock.approveReply = approvedRun();
+  await page.route(`**${pipelineRunPath}/application`, async (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify(apiError("APPLICATION_HARNESS_UNAVAILABLE", "The local application service is unavailable")) });
+  });
+  await page.goto(`/runs/${runId}`);
+  const approve = page.getByRole("button", { name: "Approve", exact: true });
+  await expect(approve).toBeEnabled();
+  mock.iterations = approvedIterations();
+  await approve.click();
+  await expect(approve).toHaveCount(0);
+  expect(mock.requests.filter((request) => request.method === "POST").map((request) => request.path)).toEqual([
+    `${pipelineRunPath}/approve`,
+  ]);
+  expect(mock.startBodies).toEqual([]);
+  await expect(page.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
+});
+
 test("approved pasted run without a job URL never offers standalone Apply", async ({ page }) => {
   const mock = await installPipeline(page, {
     run: runFixture({ status: "approved", revision: 2, origin: "human-comments", pdfSha256: pdfHash2 }),
@@ -1170,9 +979,7 @@ test("failed application start keeps approval and exposes a standalone Apply ret
   mock.startReplies.push({ status: 202, body: starting });
 
   await page.goto(`/runs/${runId}`);
-  await page.getByRole("checkbox", {
-    name: "I reviewed the reported visual QA issues and accept them.",
-  }).check();
+  await expect(page.getByRole("button", { name: "Approve and apply" })).toBeEnabled();
   mock.iterations = approvedIterations();
   await page.getByRole("button", { name: "Approve and apply" }).click();
 
@@ -1205,7 +1012,7 @@ test("failed application start keeps approval and exposes a standalone Apply ret
   await expect(page.getByText("Pending application", { exact: true })).toBeVisible();
 });
 
-test("an accepted live projection clears a stale application load failure", async ({ page }) => {
+test("a successful poll clears a stale application load failure", async ({ page }) => {
   const running = snapshotFixture({
     bridgeState: "running",
     updatedAt: createdAt + 100,
@@ -1214,17 +1021,17 @@ test("an accepted live projection clears a stale application load failure", asyn
     bridgeState: "failed",
     updatedAt: createdAt + 200,
   });
-  const failedFrame = deferred();
   const mock = await installPipeline(page, {
     run: runFixture({ status: "queued" }),
     application: running,
   });
-  queueSse(mock, eventFixture("failed", failed, {}), 2, failedFrame.promise);
+  let rejectApplicationReads = true;
   let failedApplicationReads = 0;
   await page.route(`**${pipelineRunPath}/application`, async (route) => {
     if (
       route.request().method() === "GET"
       && mock.run.status === "approved"
+      && rejectApplicationReads
     ) {
       failedApplicationReads += 1;
       await route.fulfill({
@@ -1244,19 +1051,17 @@ test("an accepted live projection clears a stale application load failure", asyn
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
   mock.run = approvedRun();
   mock.iterations = approvedIterations();
-  await page.waitForTimeout(2_600);
   const loadFailure = page.getByRole("alert").filter({
     hasText: "The local application service is unavailable",
   });
   await expect.poll(() => failedApplicationReads).toBeGreaterThan(0);
   await expect(loadFailure).toBeVisible();
 
-  failedFrame.resolve();
+  mock.application = failed;
+  rejectApplicationReads = false;
   await expect(page.getByRole("status").filter({ hasText: "Failed" })).toBeVisible();
   await expect(loadFailure).toHaveCount(0);
-  mock.application = failed;
 });
-
 
 test("alerts once when an application is already waiting for human input", async ({ page }) => {
   const frequencies = await installSoundProbe(page);
@@ -1280,8 +1085,8 @@ test("alerts once when an application is already waiting for human input", async
   await expect(page.getByText("Complete the public identity check.", { exact: true })).toBeVisible();
   expect(await frequencies()).toEqual([]);
   await expect.poll(notifications).toEqual([{
-    body: "Return to Jobhunter to continue the application.",
-    tag: expect.stringMatching(/^jobhunter:/),
+    body: "Return to Jobhunt to continue the application.",
+    tag: expect.stringMatching(/^jobhunt:/),
     title: "Application needs attention",
   }]);
 
@@ -1296,10 +1101,9 @@ test("alerts once when an application is already waiting for human input", async
   expect(await notifications()).toEqual([]);
 });
 
-test("plays one success alert when the application is submitted", async ({ page }) => {
+test("plays one success alert when polling observes application submission", async ({ page }) => {
   const frequencies = await installSoundProbe(page);
   const notifications = await installBrowserNotificationProbe(page);
-  await installControlledEventSource(page);
   const running = snapshotFixture({
     bridgeState: "running",
     generation: 6,
@@ -1322,7 +1126,7 @@ test("plays one success alert when the application is submitted", async ({ page 
     submissionPhase: "submitted",
     updatedAt: createdAt + 400,
   });
-  await installPipeline(page, {
+  const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
     application: running,
@@ -1330,44 +1134,29 @@ test("plays one success alert when the application is submitted", async ({ page 
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
-  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(0);
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
-  const sourceIndex = (await controlledEventSourceCount(page)) - 1;
 
-  await emitControlledApplicationEvent(
-    page,
-    eventFixture("application_submitted", submitted, {}),
-    40,
-    sourceIndex,
-  );
+  mock.application = submitted;
   await expect.poll(frequencies).toEqual([523, 659, 784]);
   await expect.poll(notifications).toEqual([{
-    body: "Jobhunter submitted the application successfully.",
-    tag: expect.stringMatching(/^jobhunter:/),
+    body: "Jobhunt submitted the application successfully.",
+    tag: expect.stringMatching(/^jobhunt:/),
     title: "Application submitted",
   }]);
 
-  await emitControlledApplicationEvent(
-    page,
-    eventFixture("snapshot", submittedReplay, {}),
-    41,
-    sourceIndex,
-  );
-  await emitControlledApplicationEvent(
-    page,
-    eventFixture("closed", closed, {}),
-    42,
-    sourceIndex,
-  );
-  await page.waitForTimeout(100);
+  const submittedReads = mock.applicationGetCount;
+  mock.application = submittedReplay;
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThan(submittedReads);
+  const replayReads = mock.applicationGetCount;
+  mock.application = closed;
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThan(replayReads);
   expect(await frequencies()).toEqual([523, 659, 784]);
   expect(await notifications()).toHaveLength(1);
 });
 
-test("plays one failure alert when the application agent fails", async ({ page }) => {
+test("plays one failure alert when polling observes an agent failure", async ({ page }) => {
   const frequencies = await installSoundProbe(page);
   const notifications = await installBrowserNotificationProbe(page);
-  await installControlledEventSource(page);
   const running = snapshotFixture({
     bridgeState: "running",
     generation: 8,
@@ -1386,24 +1175,16 @@ test("plays one failure alert when the application agent fails", async ({ page }
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
-  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(0);
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
-  const sourceIndex = (await controlledEventSourceCount(page)) - 1;
 
-  await emitControlledApplicationEvent(
-    page,
-    eventFixture("failed", failed, {}),
-    50,
-    sourceIndex,
-  );
+  mock.application = failed;
   await expect.poll(frequencies).toEqual([392, 262]);
   await expect.poll(notifications).toEqual([{
-    body: "Open Jobhunter to review the failure and retry.",
-    tag: expect.stringMatching(/^jobhunter:/),
+    body: "Open Jobhunt to review the failure and retry.",
+    tag: expect.stringMatching(/^jobhunt:/),
     title: "Application failed",
   }]);
 
-  mock.application = failed;
   await page.reload();
   await expect(page.getByRole("status").filter({ hasText: "Failed" })).toBeVisible();
   await page.getByRole("heading", { name: "Public Role 2", exact: true, level: 1 }).click();
@@ -1443,8 +1224,8 @@ test("plays an attention alert when resume tailoring becomes ready for review", 
   await expect(reviewStage).toHaveAttribute("aria-current", "step", { timeout: 6_000 });
   await expect.poll(frequencies).toEqual([740, 988]);
   await expect.poll(notifications).toEqual([{
-    body: "Review the tailored resume in Jobhunter.",
-    tag: expect.stringMatching(/^jobhunter:/),
+    body: "Review the tailored resume in Jobhunt.",
+    tag: expect.stringMatching(/^jobhunt:/),
     title: "Resume ready for review",
   }]);
 
@@ -1478,10 +1259,10 @@ test("persists alert settings in the application workflow", async ({ page }) => 
   await soundToggle.uncheck();
   await notificationToggle.check();
   await expect.poll(() => page.evaluate(() => (
-    window.localStorage.getItem("jobhunter.sound-alerts.enabled")
+    window.localStorage.getItem("jobhunt.sound-alerts.enabled")
   ))).toBe("false");
   await expect.poll(() => page.evaluate(() => (
-    window.localStorage.getItem("jobhunter.browser-notifications.enabled")
+    window.localStorage.getItem("jobhunt.browser-notifications.enabled")
   ))).toBe("true");
 
   await page.reload();
@@ -1491,11 +1272,33 @@ test("persists alert settings in the application workflow", async ({ page }) => 
   await soundToggle.check();
   await notificationToggle.uncheck();
   await expect.poll(() => page.evaluate(() => (
-    window.localStorage.getItem("jobhunter.sound-alerts.enabled")
+    window.localStorage.getItem("jobhunt.sound-alerts.enabled")
   ))).toBe("true");
   await expect.poll(() => page.evaluate(() => (
-    window.localStorage.getItem("jobhunter.browser-notifications.enabled")
+    window.localStorage.getItem("jobhunt.browser-notifications.enabled")
   ))).toBe("false");
+});
+
+test("shows an additional-information gate without sidebar scrolling", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  const question = questionFixtures()[0]!;
+  await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: snapshotFixture({
+      bridgeState: "awaiting_additional_info",
+      pendingAction: { type: "additional_info", questions: [question] },
+    }),
+  });
+
+  await page.goto(`/runs/${runId}`);
+
+  await expect(page.getByRole("heading", { name: "Additional information needed" }))
+    .toBeInViewport();
+  await expect(
+    page.getByRole("group", { name: "What name should appear?" })
+      .getByRole("textbox", { name: "Answer", exact: true }),
+  ).toBeInViewport();
 });
 
 test("additional-information answers survive conflict reconciliation and clear only on progress", async ({ page }) => {
@@ -1532,16 +1335,14 @@ test("additional-information answers survive conflict reconciliation and clear o
     },
   });
   mock.commandReplies.push({ status: 202 }, { status: 202 });
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("snapshot", authoritativeQuestions, {}),
-    2,
     conflictFrame.promise,
   );
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("additional_info_saved", progressed, { count: questions.length }),
-    3,
     progressFrame.promise,
   );
 
@@ -1591,7 +1392,7 @@ test("additional-information answers survive conflict reconciliation and clear o
   await expect(declineQuestion.getByRole("checkbox", { name: "Decline to answer" })).toBeChecked();
 
   conflictFrame.resolve();
-  await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(1);
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThanOrEqual(2);
   await expect(page.getByRole("alert").filter({
     hasText: "The application state changed; review the latest session state",
   })).toBeVisible();
@@ -1616,8 +1417,7 @@ test("additional-information answers survive conflict reconciliation and clear o
   mock.application = progressed;
   await expect(page.getByRole("group", { name: "What name should appear?" })).toHaveCount(0);
 });
-
-test("additional-information answers recover through a fresh EventSource after an error", async ({ page }) => {
+test("additional-information answers settle without persistent application streams", async ({ page }) => {
   const questions = [questionFixtures()[0]!];
   const awaitingAnswers = snapshotFixture({
     bridgeState: "awaiting_additional_info",
@@ -1628,7 +1428,6 @@ test("additional-information answers recover through a fresh EventSource after a
     bridgeState: "running",
     updatedAt: createdAt + 200,
   });
-  const savedEvent = eventFixture("additional_info_saved", running, { count: questions.length });
   const expectedCommand: ApplicationSessionCommand = {
     type: "provide_additional_info",
     answers: [{
@@ -1638,13 +1437,17 @@ test("additional-information answers recover through a fresh EventSource after a
       value: "Ada Public",
     }],
   };
-  await installControlledEventSource(page);
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
     application: awaitingAnswers,
   });
-  mock.commandReplies.push({ status: 202 });
+  mock.commandReplies.push({
+    status: 202,
+    before: () => {
+      mock.application = running;
+    },
+  });
 
   await page.goto(`/runs/${runId}`);
   const questionGate = page.getByRole("heading", { name: "Additional information needed" });
@@ -1652,48 +1455,20 @@ test("additional-information answers recover through a fresh EventSource after a
     .getByRole("group", { name: "What name should appear?" })
     .getByRole("textbox", { name: "Answer", exact: true });
   await expect(questionGate).toBeVisible();
-  await expect.poll(() => controlledEventSourceCount(page)).toBe(1);
+  const initialApplicationReads = mock.applicationGetCount;
   await nameAnswer.fill("  Ada Public  ");
   await page.getByRole("button", { name: "Answer questions", exact: true }).click();
 
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands).toEqual([expectedCommand]);
-  const confirmedApplicationReads = mock.applicationGetCount;
-  await emitControlledEventSourceError(page, 0);
-  await emitControlledEventSourceError(page, 0);
-  expect(await page.evaluate(() => {
-    const sources = (
-      window as typeof window & {
-        __applicationEventSources: Array<EventTarget & { readyState: number }>;
-      }
-    ).__applicationEventSources;
-    return sources[0]?.readyState;
-  })).toBe(2);
-
-  const reconnectNotice = page.getByRole("status").filter({
-    hasText: "Reconnecting to live application updates. The latest confirmed state remains visible.",
-  });
-  await expect(reconnectNotice).toBeVisible();
-  await expect(questionGate).toBeVisible();
-  await expect(nameAnswer).toHaveValue("  Ada Public  ");
-  await expect.poll(() => mock.applicationGetCount).toBe(confirmedApplicationReads + 1);
-  await expect.poll(
-    () => controlledEventSourceCount(page),
-    { intervals: [50, 100, 250], timeout: 1_500 },
-  ).toBe(2);
-  expect(mock.commands).toEqual([expectedCommand]);
-
-  mock.application = running;
-  await emitControlledApplicationEvent(page, savedEvent, 2, 1);
-
-  await expect(questionGate).toHaveCount(0);
-  await expect(reconnectNotice).toHaveCount(0);
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThan(initialApplicationReads);
+  await expect(questionGate).toHaveCount(0, { timeout: 2_500 });
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
-  expect(await controlledEventSourceCount(page)).toBe(2);
+  expect(mock.requests.some(({ path }) => path.endsWith("/application/events"))).toBe(false);
   expect(mock.commands).toEqual([expectedCommand]);
 });
 
-test("additional-information Continue sends no answers and stays busy across a same-gate projection", async ({ page }) => {
+test("additional-information Continue stays busy across the same polled gate", async ({ page }) => {
   const questions: ApplicationAdditionalInfoQuestion[] = [{
     id: "location",
     scope: "application",
@@ -1709,32 +1484,16 @@ test("additional-information Continue sends no answers and stays busy across a s
     bridgeState: "awaiting_additional_info",
     pendingAction: { type: "additional_info", questions },
     updatedAt: createdAt + 200,
-    company: "Same gate projection",
   });
   const progressed = snapshotFixture({
     bridgeState: "running",
     updatedAt: createdAt + 300,
-    company: "Progressed projection",
   });
-  const sameGateFrame = deferred();
-  const progressFrame = deferred();
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
     application: initial,
   });
-  queueSse(
-    mock,
-    eventFixture("snapshot", sameGate, {}),
-    2,
-    sameGateFrame.promise,
-  );
-  queueSse(
-    mock,
-    eventFixture("snapshot", progressed, {}),
-    3,
-    progressFrame.promise,
-  );
 
   await page.goto(`/runs/${runId}`);
   const continueButton = page.getByRole("button", { name: "Continue", exact: true });
@@ -1749,13 +1508,16 @@ test("additional-information Continue sends no answers and stays busy across a s
   const continuingButton = page.getByRole("button", { name: "Continuing…", exact: true });
   await expect(continuingButton).toBeDisabled();
 
-  sameGateFrame.resolve();
-  await expect(page.getByText("Same gate projection", { exact: true })).toBeVisible();
+  const initialReads = mock.applicationGetCount;
+  mock.application = sameGate;
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThan(initialReads);
   await expect(continuingButton).toBeDisabled();
   expect(mock.commands).toEqual([{ type: "continue_without_additional_info" }]);
 
-  progressFrame.resolve();
-  await expect(page.getByText("Progressed projection", { exact: true })).toBeVisible();
+  const sameGateReads = mock.applicationGetCount;
+  mock.application = progressed;
+  await expect.poll(() => mock.applicationGetCount).toBeGreaterThan(sameGateReads);
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
   await expect(continuingButton).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Additional information needed" }))
     .toHaveCount(0);
@@ -1803,10 +1565,9 @@ test("a changed question gate suppresses stale continuation after steering", asy
     },
     { status: 202 },
   );
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("snapshot", changed, {}),
-    2,
     gateFrame.promise,
     () => {
       mock.application = changed;
@@ -1881,10 +1642,9 @@ test("an authoritative replacement gate clears ambiguous steering delivery", asy
     },
     { status: 202 },
   );
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("snapshot", changed, {}),
-    2,
     gateFrame.promise,
     () => {
       mock.application = changed;
@@ -2196,10 +1956,9 @@ test("a professionalize response from an old question gate cannot replace the ne
     body: { answer: "An obsolete professional answer." },
     waitFor: modelFrame.promise,
   });
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("snapshot", changed, {}),
-    2,
     gateFrame.promise,
     () => {
       mock.application = changed;
@@ -2249,9 +2008,6 @@ test("credential gate sends exact actions, retains failures, clears on progress,
     pendingAction: { type: "credentials" },
     updatedAt: createdAt + 400,
   });
-  const changedFrame = deferred();
-  const progressFrame = deferred();
-  const returnFrame = deferred();
   const mock = await installPipeline(page, {
     run: approvedRun(),
     iterations: approvedIterations(),
@@ -2268,33 +2024,6 @@ test("credential gate sends exact actions, retains failures, clears on progress,
     },
   });
   mock.commandReplies.push({ status: 202 });
-  queueSse(
-    mock,
-    eventFixture("credentials_required", changedCredentials, {}),
-    2,
-    changedFrame.promise,
-    () => {
-      mock.application = changedCredentials;
-    },
-  );
-  queueSse(
-    mock,
-    eventFixture("snapshot", progressed, {}),
-    3,
-    progressFrame.promise,
-    () => {
-      mock.application = progressed;
-    },
-  );
-  queueSse(
-    mock,
-    eventFixture("credentials_required", returnedCredentials, {}),
-    4,
-    returnFrame.promise,
-    () => {
-      mock.application = returnedCredentials;
-    },
-  );
 
   await page.goto(`/runs/${runId}`);
   const credentialsForm = page.getByRole("form", { name: "Credentials needed" });
@@ -2399,11 +2128,11 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   expect(renderedText).not.toContain(privateCredentialUsername);
   expect(renderedText).not.toContain(privateCredentialPassword);
 
-  changedFrame.resolve();
+  mock.application = changedCredentials;
   await expect(username).toHaveValue("");
   await expect(password).toHaveValue("");
 
-  const savedUsername = "new-account@example.test";
+  const savedUsername = "updated@example.test";
   const savedPassword = "new account private password";
   await username.fill(savedUsername);
   await password.fill(savedPassword);
@@ -2424,10 +2153,10 @@ test("credential gate sends exact actions, retains failures, clears on progress,
   await expect(username).toHaveValue(savedUsername);
   await expect(password).toHaveValue(savedPassword);
 
-  progressFrame.resolve();
+  mock.application = progressed;
   await expect(credentialsForm).toHaveCount(0);
   await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
-  returnFrame.resolve();
+  mock.application = returnedCredentials;
   await expect(page.getByRole("form", { name: "Credentials needed" })).toBeVisible();
   await expect(page.getByLabel("Username or email")).toHaveValue("");
   await expect(page.getByLabel("Password")).toHaveValue("");
@@ -2460,10 +2189,9 @@ test("credential values survive a network failure while both actions stay latche
     application: credentials,
   });
   mock.commandReplies.push({ status: 0 }, { status: 202 });
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("cancelled", cancelled, {}),
-    2,
     cancelFrame.promise,
     () => {
       mock.application = cancelled;
@@ -2562,10 +2290,29 @@ test("an uncertain revision response keeps the command latch engaged", async ({ 
   await expect(page.getByRole("button", { name: "Requesting revision…" })).toBeDisabled();
 });
 
-test("an uncertain retry response keeps the lifecycle latch engaged", async ({ page }) => {
+test("confirmed application revision clears instructions without leaving the review gate", async ({ page }) => {
+  const review = snapshotFixture({ bridgeState: "awaiting_human_review", pendingAction: { type: "human_review" }, updatedAt: createdAt + 100 });
+  const mock = await installPipeline(page, { run: approvedRun(), iterations: approvedIterations(), application: review });
+  await page.goto(`/runs/${runId}`);
+  const instructions = page.getByLabel("Revision instructions");
+  await instructions.fill("Correct the public salary field.");
+  await page.getByRole("button", { name: "Request application revision" }).click();
+  await expect.poll(() => mock.commands.length).toBe(1);
+  await expect(instructions).toHaveValue("Correct the public salary field.");
+  mock.application = snapshotFixture({ bridgeState: "awaiting_human_review", pendingAction: { type: "human_review" }, revisionCount: 1, updatedAt: createdAt + 200 });
+  await expect(instructions).toHaveValue("");
+  await expect(page.getByRole("button", { name: "Approve and submit" })).toBeEnabled();
+});
+
+test("an uncertain retry response polls until the new generation appears", async ({ page }) => {
   const failed = snapshotFixture({
     bridgeState: "failed",
     updatedAt: createdAt + 100,
+  });
+  const running = snapshotFixture({
+    bridgeState: "running",
+    generation: 2,
+    updatedAt: createdAt + 200,
   });
   const mock = await installPipeline(page, {
     run: approvedRun(),
@@ -2576,6 +2323,10 @@ test("an uncertain retry response keeps the lifecycle latch engaged", async ({ p
     status: 503,
     body: apiError("PIPELINE_UNAVAILABLE", "The pipeline request failed."),
   });
+  mock.applicationReplies.push(
+    { view: failed, waitFor: Promise.resolve() },
+    { view: running, waitFor: Promise.resolve() },
+  );
 
   await page.goto(`/runs/${runId}`);
   await page.getByRole("button", { name: "Retry applying" }).click();
@@ -2585,6 +2336,8 @@ test("an uncertain retry response keeps the lifecycle latch engaged", async ({ p
     hasText: "The pipeline request failed.",
   })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retrying…" })).toBeDisabled();
+  await expect(page.getByRole("status").filter({ hasText: "Applying" })).toBeVisible();
+  expect(mock.applicationGetCount).toBeGreaterThanOrEqual(3);
 });
 
 test("a definite submit conflict releases the approval latch", async ({ page }) => {
@@ -2617,9 +2370,6 @@ test("a definite submit conflict releases the approval latch", async ({ page }) 
   await page.goto(`/runs/${runId}`);
   const submitButton = page.getByRole("button", { name: "Approve and submit" }).first();
   await submitButton.click();
-  await page.getByRole("dialog", { name: "Submit this application?" })
-    .getByRole("button", { name: "Approve and submit" })
-    .click();
 
   await expect.poll(() => mock.commands.length).toBe(1);
   expect(mock.commands[0]).toEqual({ type: "submit" });
@@ -2651,6 +2401,89 @@ test("preserves a downstream lifecycle while an application remains parked for r
   await expect(page.getByRole("alert").filter({ hasText: /^Waiting for review!$/ }))
     .toHaveText("Waiting for review!");
   await expect.poll(() => mock.runGetCount).toBe(1);
+});
+
+test("End session supersedes a pending submission and ignores its late rejection", async ({ page }) => {
+  const review = snapshotFixture({
+    bridgeState: "awaiting_human_review",
+    pendingAction: { type: "human_review" },
+  });
+  const closed = snapshotFixture({
+    bridgeState: "closed",
+    submissionPhase: "uncertain",
+    updatedAt: createdAt + 200,
+  });
+  const submissionReply = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: review,
+  });
+  mock.commandReplies.push({
+    status: 409,
+    body: apiError("APPLICATION_SUBMISSION_FINAL", "The application submission cannot be retried"),
+    waitFor: submissionReply.promise,
+  });
+  mock.onDelete = () => { mock.application = closed; };
+
+  await page.goto("/runs/" + runId);
+  await page.getByRole("button", { name: "Approve and submit" }).click();
+  await expect.poll(() => mock.commands).toEqual([{ type: "submit" }]);
+  await page.getByRole("button", { name: "End session", exact: true }).click();
+  await expect.poll(() => mock.deleteCount).toBe(1);
+  await expect(page.getByRole("status").filter({ hasText: /^Closed$/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
+
+  const lateRejection = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === pipelineRunPath + "/application/commands"
+    && response.status() === 409
+  );
+  submissionReply.resolve();
+  await lateRejection;
+  await expect(page.getByRole("status").filter({ hasText: /^Closed$/ })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "cannot be retried" })).toHaveCount(0);
+});
+
+test("End session supersedes a pending cancellation at a post-submit human gate", async ({ page }) => {
+  const navigation = snapshotFixture({
+    bridgeState: "awaiting_human_navigation",
+    submissionPhase: "attempting",
+    pendingAction: { type: "human_navigation", instruction: "Complete the CAPTCHA in Chrome." },
+  });
+  const closed = snapshotFixture({
+    bridgeState: "closed",
+    submissionPhase: "uncertain",
+    updatedAt: createdAt + 200,
+  });
+  const cancellationReply = deferred();
+  const mock = await installPipeline(page, {
+    run: approvedRun(),
+    iterations: approvedIterations(),
+    application: navigation,
+  });
+  mock.commandReplies.push({
+    status: 409,
+    body: apiError("APPLICATION_COMMAND_CONFLICT", "The application state changed"),
+    waitFor: cancellationReply.promise,
+  });
+  mock.onDelete = () => { mock.application = closed; };
+
+  await page.goto("/runs/" + runId);
+  await page.getByRole("button", { name: "Cancel assistant" }).click();
+  await expect.poll(() => mock.commands).toEqual([{ type: "cancel" }]);
+  await page.getByRole("button", { name: "End session", exact: true }).click();
+  await expect.poll(() => mock.deleteCount).toBe(1);
+  await expect(page.getByRole("status").filter({ hasText: /^Closed$/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
+
+  const lateRejection = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === pipelineRunPath + "/application/commands"
+    && response.status() === 409
+  );
+  cancellationReply.resolve();
+  await lateRejection;
+  await expect(page.getByRole("status").filter({ hasText: /^Closed$/ })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "The application state changed" })).toHaveCount(0);
 });
 
 test("navigation, human review, submit approval, and close use exact public commands", async ({ page }) => {
@@ -2715,11 +2548,11 @@ test("navigation, human review, submit approval, and close use exact public comm
   mock.commandReplies.push(
     { status: 202, waitFor: continueResponse.promise },
   );
-  queueSse(mock, eventFixture("snapshot", unrelatedNavigation, {}), 2, unrelatedFrame.promise);
-  queueSse(mock, eventFixture("review_required", review, {}), 3, continueFrame.promise);
-  queueSse(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), 4, reviseFrame.promise);
-  queueSse(mock, eventFixture("application_submitted", submitted, {}), 5, submittedFrame.promise);
-  queueSse(mock, eventFixture("closed", closed, {}), 6, closeFrame.promise);
+  queueApplicationProjection(mock, eventFixture("snapshot", unrelatedNavigation, {}), unrelatedFrame.promise);
+  queueApplicationProjection(mock, eventFixture("review_required", review, {}), continueFrame.promise);
+  queueApplicationProjection(mock, eventFixture("revision_applied", revised, { revisionCount: 1 }), reviseFrame.promise);
+  queueApplicationProjection(mock, eventFixture("application_submitted", submitted, {}), submittedFrame.promise);
+  queueApplicationProjection(mock, eventFixture("closed", closed, {}), closeFrame.promise);
 
   await page.goto(`/runs/${runId}`);
   const applicationPanel = page.getByRole("region", {
@@ -2794,7 +2627,13 @@ test("navigation, human review, submit approval, and close use exact public comm
   });
   await expect(page.getByRole("button", { name: "Requesting revision…" })).toBeDisabled();
   reviseFrame.resolve();
+  await expect(revisionInstructions).toHaveValue("");
+  await expect(requestRevisionButton).toBeDisabled();
+  await expect(submitButton).toBeEnabled();
+  await revisionInstructions.fill("Check the corrected salary.");
   await expect(requestRevisionButton).toBeEnabled();
+  await revisionInstructions.fill("");
+  await expect(requestRevisionButton).toBeDisabled();
   await expect(
     applicationPanel.getByText("Application revisions", { exact: true }),
   ).toHaveCount(0);
@@ -2802,12 +2641,7 @@ test("navigation, human review, submit approval, and close use exact public comm
   mock.application = revised;
 
   await submitButton.click();
-  const submitDialog = page.getByRole("dialog", { name: "Submit this application?" });
-  await expect(submitDialog).toBeVisible();
-  await expect(submitDialog).toContainText(
-    "This action is irreversible. The application assistant will submit the completed application in the headed browser. Continue only after you have reviewed every field and warning.",
-  );
-  await submitDialog.getByRole("button", { name: "Approve and submit" }).click();
+  await expect(page.getByRole("dialog", { name: "Submit this application?" })).toHaveCount(0);
   await expect.poll(() => mock.commands.length).toBe(3);
   expect(mock.commands[2]).toEqual({ type: "submit" });
   await expect(page.getByRole("button", { name: "Approving submission…" })).toBeDisabled();
@@ -2819,24 +2653,24 @@ test("navigation, human review, submit approval, and close use exact public comm
   submittedFrame.resolve();
 
   await expect(page.getByRole("status").filter({ hasText: "Application submitted" })).toBeVisible();
-  await expect(page.getByText(/Headed Chrome stays open until .* so you can inspect the final application state/)).toBeVisible();
+  await expect(page.getByText(/Headed Chrome stays open until/)).toHaveCount(0);
   await expect.poll(() => mock.runGetCount).toBe(2);
   await expect(applyingStage).not.toHaveAttribute("aria-current", "step");
   await expect(applyingStage.locator("svg")).toHaveCount(1);
   await expect(appliedStage.locator("svg")).toHaveCount(1);
   mock.application = submitted;
   await expect(page.getByRole("button", { name: "Cancel application" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Close browser" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "End session" })).toBeVisible();
   await expect(page.getByText("Applied", { exact: true }).first()).toBeVisible();
 
   mock.onDelete = () => {
     mock.application = closed;
     closeFrame.resolve();
   };
-  await page.getByRole("button", { name: "Close browser" }).click();
+  await page.getByRole("button", { name: "End session" }).click();
   await expect.poll(() => mock.deleteCount).toBe(1);
   await expect(page.getByRole("status").filter({ hasText: "Closed" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Retry applying" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
   expect(mock.commands).toEqual([
     { type: "continue" },
     { type: "revise", context: "Correct the public salary field." },
@@ -2875,7 +2709,7 @@ test("submission uncertainty keeps Applying current and never offers Retry", asy
   await expect(applyingStage).toHaveAttribute("aria-current", "step");
   await expect(appliedStage).not.toHaveAttribute("aria-current", "step");
   await expect(appliedStage.locator("svg")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Close browser" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "End session" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry applying" })).toHaveCount(0);
   await expect(page.getByText("The application submission could not be verified.", {
     exact: false,
@@ -3035,25 +2869,25 @@ test("a reserved generation resumes, running cancel is a command, and cancelled 
   const reserved = snapshotFixture({ bridgeState: "reserved" });
   const running = snapshotFixture({ bridgeState: "running", updatedAt: createdAt + 200 });
   const cancelled = snapshotFixture({ bridgeState: "cancelled", updatedAt: createdAt + 300 });
-  const editingRun = runFixture({
+  const editingRun = { ...runFixture({
     status: "editing",
     revision: 3,
     origin: "human-comments",
     pdfSha256: null,
-  });
+  }), jobUrl };
   const revisedIteration = iteration(3, "human-comments", pdfHash3);
-  const revisedRun = runFixture({
+  const revisedRun = { ...runFixture({
     status: "review",
     revision: 3,
     origin: "human-comments",
     pdfSha256: pdfHash3,
-  });
-  const revisedApprovedRun = runFixture({
+  }), jobUrl };
+  const revisedApprovedRun = { ...runFixture({
     status: "approved",
     revision: 3,
     origin: "human-comments",
     pdfSha256: pdfHash3,
-  });
+  }), jobUrl };
   const revisedStarting = snapshotFixture({
     bridgeState: "starting",
     generation: 2,
@@ -3069,7 +2903,7 @@ test("a reserved generation resumes, running cancel is a command, and cancelled 
     { status: 202, body: running },
     { status: 202, body: revisedStarting },
   );
-  queueSse(mock, eventFixture("cancelled", cancelled, {}), 2, cancelFrame.promise);
+  queueApplicationProjection(mock, eventFixture("cancelled", cancelled, {}), cancelFrame.promise);
   mock.editReply = editingRun;
   mock.editReplies.push({
     status: 200,
@@ -3187,12 +3021,17 @@ test("a not-yet-created reserved generation cancels locally with DELETE", async 
   await expect(page.getByRole("status").filter({ hasText: "Closed" })).toBeVisible();
 });
 
-test("lost, failed, and closed generations retry with the approved hash and fresh stream cursors", async ({ page }) => {
+test("lost, failed, and closed generations retry with the approved hash", async ({ page }) => {
   const lost = snapshotFixture({ bridgeState: "lost", generation: 2, updatedAt: createdAt + 200 });
   const running3 = snapshotFixture({ bridgeState: "running", generation: 3, updatedAt: createdAt + 300 });
   const failed3 = snapshotFixture({ bridgeState: "failed", generation: 3, updatedAt: createdAt + 400 });
   const running4 = snapshotFixture({ bridgeState: "running", generation: 4, updatedAt: createdAt + 500 });
-  const closed4 = snapshotFixture({ bridgeState: "closed", generation: 4, updatedAt: createdAt + 600 });
+  const closed4 = snapshotFixture({
+    bridgeState: "closed",
+    submissionPhase: "uncertain",
+    generation: 4,
+    updatedAt: createdAt + 600,
+  });
   const reserved5 = snapshotFixture({ bridgeState: "reserved", generation: 5, updatedAt: createdAt + 700 });
   const failedFrame = deferred();
   const closedFrame = deferred();
@@ -3206,8 +3045,8 @@ test("lost, failed, and closed generations retry with the approved hash and fres
     { status: 202, body: running4 },
     { status: 202, body: reserved5 },
   );
-  queueSse(mock, eventFixture("failed", failed3, {}), 1, failedFrame.promise);
-  queueSse(mock, eventFixture("closed", closed4, {}), 1, closedFrame.promise);
+  queueApplicationProjection(mock, eventFixture("failed", failed3, {}), failedFrame.promise);
+  queueApplicationProjection(mock, eventFixture("closed", closed4, {}), closedFrame.promise);
 
   await page.goto(`/runs/${runId}`);
   await expect(page.getByText("Before retrying, verify whether the application was submitted.", { exact: false })).toBeVisible();
@@ -3232,181 +3071,8 @@ test("lost, failed, and closed generations retry with the approved hash and fres
     { expectedApprovedPdfSha256: pdfHash2 },
     { expectedApprovedPdfSha256: pdfHash2 },
   ]);
-  expect(mock.sseHeaders.slice(0, 2)).toEqual([null, null]);
 });
 
-test("finite SSE replay preserves the current gate, reconnects with a fresh source for durable recovery, and reconciles lost", async ({ page }) => {
-  const olderNavigation = snapshotFixture({
-    bridgeState: "awaiting_human_navigation",
-    generation: 2,
-    pendingAction: { type: "human_navigation", instruction: "Stale navigation instruction." },
-    updatedAt: createdAt + 100,
-    company: "Stale Regression Company",
-  });
-  const currentOrigin = snapshotFixture({
-    bridgeState: "awaiting_origin_approval",
-    generation: 2,
-    pendingAction: { type: "origin_approval", origin: "https://current.example.test" },
-    updatedAt: createdAt + 200,
-  });
-  const staleGeneration = snapshotFixture({
-    bridgeState: "awaiting_human_navigation",
-    generation: 1,
-    pendingAction: { type: "human_navigation", instruction: "Generation one must stay stale." },
-    updatedAt: createdAt + 900,
-    company: "Stale Generation Company",
-  });
-  const lost = snapshotFixture({
-    bridgeState: "lost",
-    generation: 2,
-    updatedAt: createdAt + 300,
-  });
-  const resumeFrame = deferred();
-  const initialClose = deferred();
-  const initialFollowup = deferred();
-  const mock = await installPipeline(page, {
-    run: approvedRun(),
-    iterations: approvedIterations(),
-    application: olderNavigation,
-    useNativeSse: true,
-  });
-  const replayEvents = [
-    eventFixture("human_navigation_required", olderNavigation, {
-      instruction: "Stale navigation instruction.",
-    }),
-    eventFixture("origin_approval_required", currentOrigin, {
-      origin: "https://current.example.test",
-    }),
-  ] as const;
-  const staleEvent = eventFixture("human_navigation_required", staleGeneration, {
-    instruction: "Generation one must stay stale.",
-  });
-  nativeSseScenario = {
-    headers: mock.sseHeaders,
-    servedBodies: mock.publicResponseBodies,
-    initialBody: `retry: 25\n${eventBlock(replayEvents[0], 6)}`,
-    initialFollowupBody: eventBlock(replayEvents[1], 7),
-    resumedBody: `retry: 60000\n${eventBlock(staleEvent, 99)}`,
-    waitForResume: resumeFrame.promise,
-    waitForInitialClose: initialClose.promise,
-    waitForInitialFollowup: initialFollowup.promise,
-    onResume: () => {
-      mock.application = lost;
-    },
-  };
-
-  await page.goto(`/runs/${runId}`);
-  await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(1);
-  initialFollowup.resolve();
-  try {
-    await expect(page.getByText("https://current.example.test", { exact: true })).toBeVisible();
-  } finally {
-    initialClose.resolve();
-  }
-  await expect(page.getByText("Stale navigation instruction.", { exact: true })).toHaveCount(0);
-  await expect.poll(() => mock.sseHeaders.length).toBeGreaterThanOrEqual(2);
-  await expect.poll(() => mock.sseHeaders.slice(0, 2)).toEqual([null, null]);
-  resumeFrame.resolve();
-
-  await expect(page.getByRole("status").filter({ hasText: "Connection lost" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Retry applying" })).toBeVisible();
-  await expect(page.getByText("Generation one must stay stale.", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Stale Generation Company", { exact: true })).toHaveCount(0);
-  expect(mock.applicationGetCount).toBeGreaterThanOrEqual(3);
-  expect(mock.runGetCount).toBe(1);
-  expect(mock.commands).toEqual([]);
-  expect(mock.startBodies).toEqual([]);
-  expect(mock.retryBodies).toEqual([]);
-  await assertNoPrivateHarnessDetails(page, mock);
-});
-
-test("an invalid live frame reconnects before a later gate command can wedge", async ({ page }) => {
-  const navigation = snapshotFixture({
-    bridgeState: "awaiting_human_navigation",
-    generation: 2,
-    pendingAction: { type: "human_navigation", instruction: "Use the public navigation step." },
-    updatedAt: createdAt + 100,
-  });
-  const origin = snapshotFixture({
-    bridgeState: "awaiting_origin_approval",
-    generation: 2,
-    pendingAction: { type: "origin_approval", origin: "https://recovered.example.test" },
-    updatedAt: createdAt + 200,
-  });
-  const recoveredEvent = eventFixture("origin_approval_required", origin, {
-    origin: "https://recovered.example.test",
-  });
-  await installControlledEventSource(page);
-  const mock = await installPipeline(page, {
-    run: approvedRun(),
-    iterations: approvedIterations(),
-    application: navigation,
-  });
-
-  await page.goto(`/runs/${runId}`);
-  await expect(page.getByText("Use the public navigation step.", { exact: true })).toBeVisible();
-  const initialSourceCount = await controlledEventSourceCount(page);
-  await page.evaluate(() => {
-    const sources = (
-      window as typeof window & { __applicationEventSources: EventTarget[] }
-    ).__applicationEventSources;
-    sources.at(-1)?.dispatchEvent(new MessageEvent("snapshot", {
-      data: "not-json",
-      lastEventId: "2:8",
-    }));
-  });
-
-  await expect(page.getByRole("alert").filter({
-    hasText: "The application service returned an invalid live update.",
-  })).toBeVisible();
-  await expect.poll(() => mock.applicationGetCount).toBeGreaterThanOrEqual(2);
-  await expect.poll(() => controlledEventSourceCount(page)).toBeGreaterThan(initialSourceCount);
-  await emitControlledApplicationEvent(page, recoveredEvent, 9, initialSourceCount);
-
-  await expect(page.getByText("https://recovered.example.test", { exact: true })).toBeVisible();
-  await expect(page.getByRole("alert").filter({
-    hasText: "The application service returned an invalid live update.",
-  })).toHaveCount(0);
-});
-
-test("an invalid SSE frame reconciles through authoritative GET and does not render its private payload", async ({ page }) => {
-  const running = snapshotFixture({ bridgeState: "running", generation: 2, updatedAt: createdAt + 100 });
-  const lost = snapshotFixture({ bridgeState: "lost", generation: 2, updatedAt: createdAt + 200 });
-  const mock = await installPipeline(page, {
-    run: approvedRun(),
-    iterations: approvedIterations(),
-    application: running,
-  });
-  const malformedSession = {
-    ...running,
-    harnessBaseUrl: privateHarnessValues[0],
-    harnessSessionId: privateHarnessValues[1],
-    authorization: privateHarnessValues[2],
-    jobUrl: privateHarnessValues[3],
-    approvedOrigins: [privateHarnessValues[4]],
-    profilePath: privateHarnessValues[5],
-    acceptedAnswers: [privateHarnessValues[6]],
-  };
-  queueMalformedSse(
-    mock,
-    `retry: 25\nid: 2:8\nevent: snapshot\ndata: ${JSON.stringify({
-      generation: 2,
-      event: "snapshot",
-      session: malformedSession,
-      detail: {},
-    })}\n\n`,
-    () => {
-      mock.application = lost;
-    },
-  );
-
-  await page.goto(`/runs/${runId}`);
-  await expect(page.getByRole("status").filter({ hasText: "Connection lost" })).toBeVisible();
-  expect(mock.applicationGetCount).toBeGreaterThanOrEqual(2);
-  for (const privateValue of privateHarnessValues) {
-    await expect(page.getByText(privateValue, { exact: false })).toHaveCount(0);
-  }
-});
 
 test("guidance remains accessible across gates and ambiguous delivery resets on state exit", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -3434,18 +3100,16 @@ test("guidance remains accessible across gates and ambiguous delivery resets on 
     iterations: approvedIterations(),
     application: running,
   });
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("human_navigation_required", waiting, {
       instruction: "Complete the public checkpoint.",
     }),
-    2,
     leaveRunning.promise,
   );
-  queueSse(
+  queueApplicationProjection(
     mock,
     eventFixture("snapshot", resumed, {}),
-    3,
     returnToRunning.promise,
   );
   mock.commandReplies.push(

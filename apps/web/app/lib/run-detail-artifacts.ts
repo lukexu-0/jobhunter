@@ -2,7 +2,7 @@ import type {
   ArtifactDto,
   ArtifactKind,
   ResumeIterationDto,
-} from "@jobhunter/pipeline/contracts";
+} from "./pipeline-contracts";
 
 export interface ResumeIterationSelection {
   readonly mode: "follow-latest" | "pinned";

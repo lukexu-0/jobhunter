@@ -3,7 +3,7 @@ import type {
   ApplicationSessionSnapshotDto,
   ApplicationSessionView,
   RunDto,
-} from "@jobhunter/pipeline/contracts";
+} from "./pipeline-contracts";
 
 type AlertKind = "attention" | "success" | "failure";
 
@@ -31,7 +31,7 @@ type AudioContextWindow = typeof window & {
   readonly webkitAudioContext?: typeof AudioContext;
 };
 
-const LEDGER_STORAGE_KEY = "jobhunter.alerts.ledger.v2";
+const LEDGER_STORAGE_KEY = "jobhunt.alerts.ledger.v2";
 const FREQUENCIES_BY_KIND: Record<AlertKind, readonly number[]> = {
   attention: [740, 988],
   success: [523, 659, 784],
@@ -39,15 +39,15 @@ const FREQUENCIES_BY_KIND: Record<AlertKind, readonly number[]> = {
 };
 const NOTIFICATION_COPY_BY_KIND: Record<AlertKind, Readonly<{ body: string; title: string }>> = {
   attention: {
-    body: "Return to Jobhunter to continue the application.",
+    body: "Return to Jobhunt to continue the application.",
     title: "Application needs attention",
   },
   success: {
-    body: "Jobhunter submitted the application successfully.",
+    body: "Jobhunt submitted the application successfully.",
     title: "Application submitted",
   },
   failure: {
-    body: "Open Jobhunter to review the failure and retry.",
+    body: "Open Jobhunt to review the failure and retry.",
     title: "Application failed",
   },
 };
@@ -66,9 +66,16 @@ function pendingActionPayload(
 ): unknown {
   if (action.type === "human_navigation") return action.instruction;
   if (action.type === "additional_info") return action.questions;
-  if (action.type === "origin_approval") return action.origin;
   if (action.type === "human_review") return snapshot.revisionCount;
   return null;
+}
+
+function applicationFailureDescriptor(runId: string, generation: number): AlertDescriptor {
+  return {
+    identity: JSON.stringify([runId, generation, "failed"]),
+    kind: "failure",
+    notification: notificationForKind("failure", `/runs/${encodeURIComponent(runId)}`),
+  };
 }
 
 function applicationAlertDescriptor(
@@ -76,16 +83,7 @@ function applicationAlertDescriptor(
   view: ApplicationSessionView,
 ): AlertDescriptor | null {
   if ("state" in view || !("bridgeState" in view)) return null;
-  if (view.bridgeState === "failed") {
-    return {
-      identity: JSON.stringify([runId, view.generation, "failed"]),
-      kind: "failure",
-      notification: notificationForKind(
-        "failure",
-        `/runs/${encodeURIComponent(runId)}`,
-      ),
-    };
-  }
+  if (view.bridgeState === "failed") return applicationFailureDescriptor(runId, view.generation);
   if (view.submissionPhase === "submitted") {
     return {
       identity: JSON.stringify([runId, view.generation, "submitted"]),
@@ -114,12 +112,23 @@ function applicationAlertDescriptor(
 }
 
 function runAlertDescriptor(run: RunDto): AlertDescriptor | null {
+  if (run.status === "failed") {
+    return {
+      identity: JSON.stringify([run.id, run.revision, "failed"]),
+      kind: "failure",
+      notification: {
+        body: "Open Jobhunt to review the failed pipeline stage and retry.",
+        href: `/runs/${encodeURIComponent(run.id)}`,
+        title: "Pipeline failed",
+      },
+    };
+  }
   if (run.status !== "review") return null;
   return {
     identity: JSON.stringify([run.id, run.revision, "review"]),
     kind: "attention",
     notification: {
-      body: "Review the tailored resume in Jobhunter.",
+      body: "Review the tailored resume in Jobhunt.",
       href: `/runs/${encodeURIComponent(run.id)}`,
       title: "Resume ready for review",
     },
@@ -176,12 +185,13 @@ function readLedger(): AlertLedger {
 export class AlertController {
   private readonly ledger: AlertLedger;
   private readonly pending = new Map<string, AlertDescriptor>();
+  private readonly applicationVersions = new Map<string, { generation: number; updatedAt: number }>();
   private audioContext: AudioContext | null = null;
   private browserNotificationsEnabled = false;
   private soundEnabled = false;
   private primed = false;
 
-  constructor() {
+  constructor(private readonly onNotificationFailure?: () => void) {
     this.ledger = readLedger();
   }
 
@@ -199,13 +209,40 @@ export class AlertController {
 
   observeRun(run: RunDto): void {
     this.observe(`run:${run.id}`, runAlertDescriptor(run), false);
+    const applicationScope = `application:${run.id}`;
+    if (
+      run.applicationFailureGeneration !== undefined
+      && run.applicationFailureGeneration >= (this.applicationVersions.get(run.id)?.generation ?? 0)
+    ) {
+      this.observe(
+        applicationScope,
+        applicationFailureDescriptor(run.id, run.applicationFailureGeneration),
+        false,
+      );
+    } else if (this.ledger[applicationScope] === undefined) {
+      // Establish a baseline without clearing alerts owned by the application stream.
+      this.observe(applicationScope, null, false);
+    }
   }
 
   observeApplication(runId: string, view: ApplicationSessionView): void {
-    this.observe(
-      `application:${runId}`,
-      applicationAlertDescriptor(runId, view),
-    );
+    const previous = this.applicationVersions.get(runId);
+    if ("state" in view) {
+      if (previous !== undefined) return;
+    } else {
+      if (previous && (
+        view.generation < previous.generation
+        || (view.generation === previous.generation && view.updatedAt < previous.updatedAt)
+      )) return;
+      this.applicationVersions.set(runId, { generation: view.generation, updatedAt: view.updatedAt });
+    }
+    const scope = `application:${runId}`;
+    const descriptor = applicationAlertDescriptor(runId, view);
+    if (previous === undefined && descriptor?.kind === "success") {
+      this.baseline(scope, descriptor);
+      return;
+    }
+    this.observe(scope, descriptor);
   }
 
   prime(): void {
@@ -225,6 +262,21 @@ export class AlertController {
     this.audioContext = null;
     if (context === null || context.state === "closed") return;
     void context.close().catch(() => undefined);
+  }
+
+  private baseline(scope: string, descriptor: AlertDescriptor): void {
+    const entry = this.ledger[scope];
+    if (entry?.current?.identity === descriptor.identity) {
+      this.deliverEnabledChannels(scope, entry);
+      return;
+    }
+    this.pending.delete(scope);
+    this.ledger[scope] = {
+      current: descriptor,
+      deliveredNotificationIdentity: descriptor.identity,
+      deliveredSoundIdentity: descriptor.identity,
+    };
+    this.persistLedger();
   }
 
   private observe(
@@ -282,9 +334,12 @@ export class AlertController {
       this.browserNotificationsEnabled
       && entry.deliveredNotificationIdentity !== descriptor.identity
     ) {
-      entry.deliveredNotificationIdentity = descriptor.identity;
-      this.persistLedger();
-      this.showBrowserNotification(scope, descriptor);
+      if (this.showBrowserNotification(scope, descriptor)) {
+        entry.deliveredNotificationIdentity = descriptor.identity;
+        this.persistLedger();
+      } else {
+        this.onNotificationFailure?.();
+      }
     }
   }
 
@@ -350,8 +405,17 @@ export class AlertController {
     try {
       const browserNotification = new window.Notification(descriptor.notification.title, {
         body: descriptor.notification.body,
-        tag: `jobhunter:${scope}`,
+        tag: `jobhunt:${scope}`,
       });
+      browserNotification.onerror = () => {
+        browserNotification.onerror = null;
+        const entry = this.ledger[scope];
+        if (entry?.current?.identity !== descriptor.identity
+          || entry.deliveredNotificationIdentity !== descriptor.identity) return;
+        entry.deliveredNotificationIdentity = null;
+        this.persistLedger();
+        this.onNotificationFailure?.();
+      };
       browserNotification.onclick = () => {
         window.focus();
         window.location.assign(descriptor.notification.href);

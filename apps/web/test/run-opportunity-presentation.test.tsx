@@ -4,7 +4,7 @@ import { Briefcase, CalendarDays, Code2, Trophy } from "lucide-react";
 import {
   OpportunityKindSchema,
   type RunDto,
-} from "@jobhunter/pipeline/contracts";
+} from "../app/lib/pipeline-contracts";
 import { RunIdentityLink } from "../app/components/run-dashboard";
 import { RunIdentitySummary } from "../app/components/run-detail";
 import {

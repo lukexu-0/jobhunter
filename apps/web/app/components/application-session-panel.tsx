@@ -7,45 +7,31 @@ import {
   type ApplicationAnswerSuggestionsResponse,
   type ApplicationProfessionalizeRequest,
   type ApplicationProfessionalizeResponse,
-  type ApplicationPendingAction,
   type ApplicationSessionBridgeState,
   type ApplicationSessionCommand,
   type ApplicationSessionSnapshotDto,
-} from "@jobhunter/pipeline/contracts";
+} from "../lib/pipeline-contracts";
 import { ApplicationAdditionalInfoForm } from "./application-additional-info-form";
 import { ApplicationCredentialsForm } from "./application-credentials-form";
 import { ApplicationReviewGate } from "./application-review-gate";
 import styles from "../run-detail.module.css";
 
-export type ApplicationLifecycleAction = "cancel" | "close" | "resume" | "retry";
-export type ApplicationGateCommandType = Exclude<
-  ApplicationSessionCommand["type"],
-  "steer"
->;
-export type ApplicationPanelAction =
-  | ApplicationLifecycleAction
-  | ApplicationGateCommandType;
-export type ApplicationSteerCommand = Extract<
-  ApplicationSessionCommand,
-  { readonly type: "steer" }
->;
-export type ApplicationSteeringState = "idle" | "sending" | "ambiguous";
-export type ApplicationSteeringSubmissionResult =
-  | { readonly status: "accepted"; readonly current: boolean }
-  | { readonly status: "rejected"; readonly message: string }
-  | { readonly status: "ambiguous" };
-
-type SimpleApplicationPendingAction = Extract<
-  ApplicationPendingAction,
-  { readonly type: "human_navigation" }
->;
+import {
+  canGuideApplicationAgent,
+  type ApplicationPanelAction,
+  type ApplicationSteerCommand,
+  type ApplicationSteeringState,
+  type ApplicationDispatchResult,
+} from "../lib/application-session";
 
 export interface ApplicationSessionPanelProps {
   readonly snapshot: ApplicationSessionSnapshotDto;
   readonly actionBusy: ApplicationPanelAction | null;
+  readonly browserOpenBusy: boolean;
   readonly steeringState: ApplicationSteeringState;
   readonly onCancel: () => Promise<void>;
   readonly onClose: () => Promise<void>;
+  readonly onOpenBrowser: () => Promise<void>;
   readonly onRetry: () => Promise<void>;
   readonly onLoadSuggestions: (
     questionId: string,
@@ -60,7 +46,7 @@ export interface ApplicationSessionPanelProps {
   readonly onCommand: (command: ApplicationSessionCommand) => Promise<void>;
   readonly onSteer: (
     command: ApplicationSteerCommand,
-  ) => Promise<ApplicationSteeringSubmissionResult>;
+  ) => Promise<ApplicationDispatchResult>;
 }
 
 const STATE_LABELS: Readonly<Record<ApplicationSessionBridgeState, string>> = {
@@ -68,7 +54,6 @@ const STATE_LABELS: Readonly<Record<ApplicationSessionBridgeState, string>> = {
   starting: "Starting browser",
   running: "Applying",
   awaiting_human_navigation: "Waiting for navigation",
-  awaiting_origin_approval: "Waiting for origin approval",
   awaiting_additional_info: "Waiting for additional information",
   awaiting_human_review: "Waiting for application review",
   submitting: "Submitting application",
@@ -84,12 +69,11 @@ const ACTION_STATUS_LABELS: Readonly<Record<ApplicationPanelAction, string>> = {
   resume: "Starting application",
   retry: "Retrying application",
   cancel: "Cancelling application",
-  close: "Closing browser",
+  close: "Ending session",
   continue: "Continuing application",
   continue_without_additional_info: "Continuing without answers",
   sign_in: "Signing in with credentials",
   save_credentials: "Saving credentials",
-  approve_origin: "Approving origin",
   provide_additional_info: "Answering questions",
   revise: "Requesting application revision",
   submit: "Approving submission",
@@ -101,31 +85,11 @@ const TERMINAL_STATES = new Set<ApplicationSessionBridgeState>([
   "closed",
   "lost",
 ]);
-const STEERABLE_APPLICATION_STATES = new Set<ApplicationSessionBridgeState>([
-  "running",
-  "awaiting_human_navigation",
-  "awaiting_additional_info",
-  "awaiting_human_review",
-]);
-
-export function canGuideApplicationAgent(
-  snapshot: ApplicationSessionSnapshotDto,
-): boolean {
-  return STEERABLE_APPLICATION_STATES.has(snapshot.bridgeState)
-    && snapshot.submissionPhase === "not_attempted"
-    && snapshot.terminalAt === null;
-}
-
 
 function formatTimestamp(timestamp: number): string {
   return new Date(timestamp).toISOString().replace("T", " ").replace(".000Z", " UTC");
 }
 
-export function simpleApplicationGateCommand(
-  _action: SimpleApplicationPendingAction,
-): ApplicationSessionCommand {
-  return { type: "continue" };
-}
 
 const INVALID_STEERING_MESSAGE =
   "Enter guidance between 1 and 8,000 Unicode characters without null characters.";
@@ -243,9 +207,11 @@ function ApplicationSteeringForm({
 export function ApplicationSessionPanel({
   snapshot,
   actionBusy,
+  browserOpenBusy,
   steeringState,
   onCancel,
   onClose,
+  onOpenBrowser,
   onRetry,
   onLoadSuggestions,
   onProfessionalize,
@@ -254,12 +220,10 @@ export function ApplicationSessionPanel({
   onSteer,
 }: ApplicationSessionPanelProps) {
   const terminal = TERMINAL_STATES.has(snapshot.bridgeState);
-  const finalSubmission = snapshot.submissionPhase === "submitted"
-    || snapshot.submissionPhase === "uncertain";
   const parked = snapshot.bridgeState === "submitted"
     || snapshot.bridgeState === "submission_uncertain";
-  const submitting = snapshot.bridgeState === "submitting";
-  const retryableTerminal = terminal && !finalSubmission;
+  const submissionInProgress = snapshot.submissionPhase === "attempting" || actionBusy === "submit";
+  const retryableTerminal = terminal;
   const busy = actionBusy !== null;
   const [steeringDraft, setSteeringDraft] = useState("");
   const [steeringValidationError, setSteeringValidationError] =
@@ -271,6 +235,7 @@ export function ApplicationSessionPanel({
   const steeringSubmissionPendingRef = useRef<symbol | null>(null);
   const steeringSnapshotIdentity = [
     snapshot.generation,
+    snapshot.revisionCount,
     snapshot.bridgeState,
     JSON.stringify(snapshot.pendingAction),
     snapshot.submissionPhase,
@@ -348,7 +313,8 @@ export function ApplicationSessionPanel({
   };
   const cancelDisabled = busy
     && actionBusy !== "sign_in"
-    && actionBusy !== "save_credentials";
+    && actionBusy !== "save_credentials"
+    && actionBusy !== "submit";
   const pendingAction = snapshot.pendingAction;
   const commandBusy =
     actionBusy === "close" || actionBusy === "resume" || actionBusy === "retry"
@@ -361,30 +327,32 @@ export function ApplicationSessionPanel({
     ? `${baseStateLabel} — ${ACTION_STATUS_LABELS[actionBusy]}`
     : baseStateLabel;
 
+  const steeringForm = canGuideApplicationAgent(snapshot) ? (
+    <ApplicationSteeringForm
+      deliveryError={steeringDeliveryError}
+      deliveryStatus={steeringDeliveryStatus}
+      disabled={steeringDisabled}
+      draft={steeringDraft}
+      onChange={(value) => {
+        setSteeringDraft(value);
+        setSteeringValidationError(null);
+        setSteeringDeliveryError(null);
+        setSteeringDeliveryStatus(null);
+      }}
+      onSubmit={() => submitSteering()}
+      onRetry={() => submitSteering(
+        RETRY_CURRENT_GUIDANCE,
+        false,
+      )}
+      steeringState={steeringState}
+      validationError={steeringValidationError}
+    />
+  ) : null;
+
   return (
     <section className={styles.workspaceSection} aria-label="Application">
       <p className={styles.eyebrow}>Application</p>
-      {canGuideApplicationAgent(snapshot) ? (
-        <ApplicationSteeringForm
-          deliveryError={steeringDeliveryError}
-          deliveryStatus={steeringDeliveryStatus}
-          disabled={steeringDisabled}
-          draft={steeringDraft}
-          onChange={(value) => {
-            setSteeringDraft(value);
-            setSteeringValidationError(null);
-            setSteeringDeliveryError(null);
-            setSteeringDeliveryStatus(null);
-          }}
-          onSubmit={() => submitSteering()}
-          onRetry={() => submitSteering(
-            RETRY_CURRENT_GUIDANCE,
-            false,
-          )}
-          steeringState={steeringState}
-          validationError={steeringValidationError}
-        />
-      ) : null}
+      {pendingAction ? null : steeringForm}
       <p
         aria-atomic="true"
         aria-live="polite"
@@ -426,20 +394,11 @@ export function ApplicationSessionPanel({
           <button
             className={styles.primaryButton}
             disabled={busy || steeringState === "sending"}
-            onClick={() => void onCommand(simpleApplicationGateCommand(pendingAction))}
+            onClick={() => void onCommand({ type: "continue" })}
             type="button"
           >
             {actionBusy === "continue" ? "Continuing…" : "Continue application"}
           </button>
-        </div>
-      ) : pendingAction?.type === "origin_approval" ? (
-        <div className={styles.applicationGate}>
-          <h3>Restart required</h3>
-          <p>
-            This session was created by an older browser harness that required
-            manual origin approval. Cancel or close it, then retry the application.
-          </p>
-          <code>{pendingAction.origin}</code>
         </div>
       ) : pendingAction?.type === "additional_info" ? (
         <ApplicationAdditionalInfoForm
@@ -456,36 +415,58 @@ export function ApplicationSessionPanel({
         />
       ) : pendingAction?.type === "human_review" ? (
         <ApplicationReviewGate
+          key={`${snapshot.generation}:${snapshot.revisionCount}`}
           busy={busy || steeringState === "sending"}
           busyAction={commandBusy}
           onCommand={onCommand}
         />
       ) : null}
+      {pendingAction ? steeringForm : null}
       {snapshot.error ? <p className={styles.panelError} role="alert">{snapshot.error.message}</p> : null}
       {snapshot.bridgeState === "lost" ? (
         <p className={styles.workspaceNotice} role="status">
           The browser connection was lost. Before retrying, verify whether the application was submitted.
         </p>
       ) : null}
-      {parked ? (
+      {snapshot.bridgeState === "submission_uncertain" ? (
         <p className={styles.workspaceNotice}>
           Headed Chrome stays open until {snapshot.expiresAt === null
             ? "you close it"
             : formatTimestamp(snapshot.expiresAt)} so you can inspect the final application state.
         </p>
       ) : null}
+      {submissionInProgress ? (
+        <p className={styles.workspaceNotice}>
+          Cancelling stops the assistant. It cannot undo an application already submitted.
+        </p>
+      ) : null}
 
       <div className={styles.workspaceActions}>
-        {parked ? (
+        {!terminal ? (
           <button
             className={styles.secondaryButton}
-            disabled={busy}
+            disabled={
+              browserOpenBusy
+              || snapshot.bridgeState === "reserved"
+              || snapshot.bridgeState === "starting"
+            }
+            onClick={() => void onOpenBrowser()}
+            type="button"
+          >
+            {browserOpenBusy ? "Opening browser…" : "Open application browser"}
+          </button>
+        ) : null}
+        {snapshot.bridgeState !== "closed" ? (
+          <button
+            className={styles.secondaryButton}
+            disabled={actionBusy === "close" || actionBusy === "retry"}
             onClick={() => void onClose()}
             type="button"
           >
-            {actionBusy === "close" ? "Closing…" : "Close browser"}
+            {actionBusy === "close" ? "Ending…" : "End session"}
           </button>
-        ) : retryableTerminal ? (
+        ) : null}
+        {retryableTerminal ? (
           <button
             className={styles.primaryButton}
             disabled={busy}
@@ -494,7 +475,7 @@ export function ApplicationSessionPanel({
           >
             {actionBusy === "retry" ? "Retrying…" : "Retry applying"}
           </button>
-        ) : !terminal && !submitting ? (
+        ) : !terminal && !parked ? (
           <>
             {snapshot.bridgeState === "reserved" ? (
               <button
@@ -512,7 +493,7 @@ export function ApplicationSessionPanel({
               onClick={() => void onCancel()}
               type="button"
             >
-              {actionBusy === "cancel" ? "Cancelling…" : "Cancel application"}
+              {actionBusy === "cancel" ? "Cancelling…" : submissionInProgress ? "Cancel assistant" : "Cancel application"}
             </button>
           </>
         ) : null}

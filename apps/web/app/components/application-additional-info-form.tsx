@@ -14,7 +14,7 @@ import type {
   ApplicationProfessionalizeRequest,
   ApplicationProfessionalizeResponse,
   ApplicationSessionCommand,
-} from "@jobhunter/pipeline/contracts";
+} from "../lib/pipeline-contracts";
 import {
   buildAdditionalInfoCommand,
   type AdditionalInfoDraft,

@@ -40,3 +40,25 @@
   margin: 0;
   accent-color: var(--color-accent);
 }
+
+.recovery {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  border-bottom: var(--border-width) solid var(--color-warning);
+  padding: var(--space-3) var(--space-6);
+  background: var(--color-surface-raised);
+  font-size: var(--font-size-sm);
+}
+
+.recovery p {
+  flex: 1 1 24rem;
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}

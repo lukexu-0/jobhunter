@@ -3,7 +3,7 @@ import {
   type ApplicationSessionView,
   type ResumeIterationListResponse,
   type RunDto,
-} from "@jobhunter/pipeline/contracts";
+} from "../../app/lib/pipeline-contracts";
 
 const runId = "run-detail-analysis-v2";
 const jobUrl = "https://jobs.example.test/openings/staff-ai?gh_jid=123&source=viewer";
@@ -99,13 +99,11 @@ const analysis = {
       id: "keyword-observability",
       phrase: "Operational observability",
       jdQuote: "Own Operational observability across every production service.",
-      evidenceIds: ["evidence-observability"],
     },
     {
       id: "keyword-typescript",
       phrase: "Production TypeScript",
       jdQuote: "Build reliable agent orchestration services with Production TypeScript.",
-      evidenceIds: ["evidence-keyword"],
     },
   ],
   exactEdits: [
@@ -118,18 +116,15 @@ const analysis = {
       before: "Built typed deployment services for internal teams.",
       after: "Built Production TypeScript deployment services used by ten internal teams.",
       keywordIds: ["keyword-typescript"],
-      evidenceIds: ["evidence-keyword", "evidence-bullet"],
     },
     {
       id: "edit-skill",
       kind: "skill",
       baselineItemId: "skill-languages-typescript",
       category: "Languages",
-      evidenceEntityId: "skills",
       before: "TypeScript",
       after: "Production TypeScript",
       keywordIds: ["keyword-typescript"],
-      evidenceIds: ["evidence-keyword", "evidence-skill"],
     },
   ],
 };
@@ -368,10 +363,6 @@ test("shows the minimal summary and phrase-only keyword comparison", async ({ pa
     "Build reliable agent orchestration services with Production TypeScript.",
     "Lead Distributed tracing adoption across the platform.",
     "Create Zero-downtime delivery systems.",
-    "evidence-observability",
-    "evidence-keyword",
-    "evidence-bullet",
-    "evidence-skill",
     "Built typed deployment services for internal teams.",
     "Built Production TypeScript deployment services used by ten internal teams.",
     "a".repeat(64),

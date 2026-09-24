@@ -1,6 +1,6 @@
 "use client";
 
-import { useAlerts } from "../providers/alert-provider";
+import { useAlerts } from "../credentials/alert-provider";
 import styles from "./alert-controls.module.css";
 
 interface AlertControlsProps {
@@ -11,10 +11,10 @@ export function AlertControls({ className }: AlertControlsProps) {
   const {
     notificationPermission,
     notificationsEnabled,
+    notificationRequestPending,
     setNotificationsEnabled,
     setSoundEnabled,
     soundEnabled,
-    statusMessage,
   } = useAlerts();
   const browserNotificationsUnavailable = notificationPermission === null
     || notificationPermission === "denied"
@@ -41,15 +41,38 @@ export function AlertControls({ className }: AlertControlsProps) {
         <input
           aria-label="Browser notifications"
           checked={notificationsEnabled ?? false}
-          disabled={browserNotificationsUnavailable}
+          disabled={browserNotificationsUnavailable || notificationRequestPending}
           onChange={(event) => void setNotificationsEnabled(event.currentTarget.checked)}
           type="checkbox"
         />
         <span>{browserNotificationLabel}</span>
       </label>
-      <span aria-live="polite" className="visually-hidden" role="status">
-        {statusMessage}
-      </span>
     </div>
+  );
+}
+
+export function NotificationRecovery() {
+  const { notificationPermission, notificationRequestPending, setNotificationsEnabled, statusMessage } = useAlerts();
+  if (!statusMessage) return null;
+  return (
+    <section aria-label="Notification permissions" className={styles.recovery}>
+      <p role="status">{statusMessage}</p>
+      <div className={styles.actions}>
+        {notificationPermission !== "unsupported" ? (
+          <button
+            className="inline-control"
+            disabled={notificationRequestPending}
+            onClick={() => void setNotificationsEnabled(true)}
+            type="button"
+          >
+            {notificationRequestPending ? "Requesting permission…" : notificationPermission === "default"
+              ? "Enable notifications" : "Retry notifications"}
+          </button>
+        ) : null}
+        <button className="inline-control" onClick={() => void setNotificationsEnabled(false)} type="button">
+          Turn off notifications
+        </button>
+      </div>
+    </section>
   );
 }

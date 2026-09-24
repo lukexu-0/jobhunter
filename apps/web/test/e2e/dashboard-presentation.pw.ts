@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { type RunDto } from "@jobhunter/pipeline/contracts";
+import { ApplicationSessionSnapshotDtoSchema, type RunDto } from "../../app/lib/pipeline-contracts";
 import { installBrowserNotificationProbe } from "./browser-notification-probe";
 
 async function interceptEmptyRuns(page: Page): Promise<void> {
@@ -37,12 +37,14 @@ function dashboardRun({
   id,
   title,
   updatedAt,
+  createdAt = updatedAt,
   applicationStatus = "pending",
   isApplying = false,
 }: {
   id: string;
   title: string;
   updatedAt: number;
+  createdAt?: number;
   applicationStatus?: RunDto["applicationStatus"];
   isApplying?: boolean;
 }): RunDto {
@@ -50,6 +52,7 @@ function dashboardRun({
     ...runFixture(),
     id,
     titleOverride: title,
+    createdAt,
     updatedAt,
     applicationStatus,
     isApplying,
@@ -202,29 +205,12 @@ test("presents application metadata headings on a raised high-contrast rail", as
   await interceptEmptyRuns(page);
   await page.goto("/");
 
-  for (const name of ["Role", "Organization", "Updated", "Pipeline status", "Application status"]) {
+  for (const name of ["Role", "Organization", "Added", "Pipeline status", "Application status"]) {
     const heading = page.getByRole("columnheader", { name, exact: true });
     await expect(heading).toHaveCSS("background-color", "rgb(17, 20, 19)");
     await expect(heading).toHaveCSS("color", "rgb(210, 243, 76)");
     await expect(heading).toHaveCSS("font-size", "13px");
   }
-});
-
-test("gives the Role heading extra space before Organization", async ({ page }) => {
-  await page.setViewportSize({ width: 1_280, height: 900 });
-  await interceptEmptyRuns(page);
-  await page.goto("/");
-
-  const table = page.getByRole("table");
-  const roleHeading = table.getByRole("columnheader", { name: "Role", exact: true });
-  await expect(roleHeading).toHaveCSS("padding-left", "24px");
-  await expect(roleHeading).toHaveCSS("padding-right", "24px");
-  await expect(table.getByRole("columnheader", { name: "Organization", exact: true })).toHaveCSS("padding-right", "16px");
-
-  const tableBox = await table.boundingBox();
-  const roleBox = await roleHeading.boundingBox();
-  if (!tableBox || !roleBox) throw new Error("Application header geometry is unavailable");
-  expect(roleBox.width / tableBox.width).toBeCloseTo(0.24, 2);
 });
 
 test("insets application titles from the left table edge", async ({ page }) => {
@@ -378,6 +364,33 @@ test("preserves an explicit Not mentioned organization while malformed targets u
   await expect(page.getByText("Should not be displayed", { exact: true })).toHaveCount(0);
 });
 
+test("guides first-run setup only when the required resume baseline is missing", async ({ page }) => {
+  await interceptEmptyRuns(page);
+  let baselineMissing = true;
+  await page.route("**/api/pipeline/context", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        fresh: !baselineMissing,
+        manifestMatches: !baselineMissing,
+        staleSources: [],
+        missingSources: baselineMissing ? ["resume-baseline"] : [],
+      }),
+    });
+  });
+
+  await page.goto("/");
+  const guidance = page.getByText(/Place your own generic resume\.tex/);
+  await expect(guidance).toContainText(".jobhunt-data/user-info/resume-main/resume.tex");
+  await expect(guidance).toContainText("required before creating an application");
+  await expect(page.getByText("No applications yet. Enter an opportunity URL above to initialize one.")).toBeVisible();
+
+  baselineMissing = false;
+  await page.reload();
+  await expect(guidance).toHaveCount(0);
+  await expect(page.getByText("No applications yet. Enter an opportunity URL above to initialize one.")).toBeVisible();
+});
+
 test("uses six application columns in every table state", async ({ page }) => {
   let pendingRoute: Route | undefined;
   await page.route("**/api/pipeline/runs", async (route) => {
@@ -429,21 +442,47 @@ test("uses six application columns in every table state", async ({ page }) => {
   await expect(table.locator("tbody td[colspan]")).toHaveAttribute("colspan", "6");
 });
 
-test("places the total count before its bottom-aligned label", async ({ page }) => {
-  await interceptEmptyRuns(page);
+test("shows total resumes beside the submitted application count", async ({ page }) => {
+  const applicationStatuses: RunDto["applicationStatus"][] = [
+    "pending",
+    "did_not_apply",
+    "manual_application",
+    "applied",
+    "oa_received",
+    "oa_completed",
+    "rejected",
+    "interview",
+    "accepted",
+    "failed",
+  ];
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        runs: applicationStatuses.map((applicationStatus, index) => dashboardRun({
+          id: `summary-run-${index}`,
+          title: `Summary role ${index}`,
+          updatedAt: 1_700_000_000_000 + index,
+          applicationStatus,
+        })),
+      }),
+    });
+  });
   await page.goto("/");
 
-  const summary = page.getByRole("region", { name: "Application count" });
-  const total = summary.getByText("0", { exact: true });
-  const label = summary.getByText("Total applications", { exact: true });
-  await expect(label).toHaveCSS("font-size", "11px");
+  const summary = page.getByRole("region", { name: "Resume and application counts" });
+  const resumeMetric = summary.getByRole("group", { name: "Total resumes" });
+  const applicationMetric = summary.getByRole("group", { name: "Applications" });
+  await expect(resumeMetric.getByText("10", { exact: true })).toBeVisible();
+  await expect(applicationMetric.getByText("6", { exact: true })).toBeVisible();
+  await expect(summary.getByText("Total resumes", { exact: true })).toHaveCSS("font-size", "11px");
 
-  const totalBox = await total.boundingBox();
-  const labelBox = await label.boundingBox();
-  if (!totalBox || !labelBox) throw new Error("Application metric geometry is unavailable");
+  const resumeBox = await resumeMetric.boundingBox();
+  const applicationBox = await applicationMetric.boundingBox();
+  if (!resumeBox || !applicationBox) throw new Error("Summary metric geometry is unavailable");
 
-  expect(totalBox.x + totalBox.width).toBeLessThanOrEqual(labelBox.x);
-  expect(Math.abs(totalBox.y + totalBox.height - (labelBox.y + labelBox.height))).toBeLessThanOrEqual(1);
+  expect(resumeBox.x + resumeBox.width).toBeLessThanOrEqual(applicationBox.x);
+  expect(Math.abs(resumeBox.y + resumeBox.height - (applicationBox.y + applicationBox.height))).toBeLessThanOrEqual(1);
 });
 
 test("scrolls the applications table locally only when six columns do not fit", async ({ page }) => {
@@ -513,6 +552,8 @@ test("filters pipeline and application statuses independently", async ({ page })
     { ...runFixture(), id: "filter-review", titleOverride: "Review role", status: "review", applicationStatus: "pending" },
     { ...runFixture(), id: "filter-progress", titleOverride: "In-progress role", status: "approved", applicationStatus: "pending" },
     { ...runFixture(), id: "filter-completed", titleOverride: "Completed role", status: "approved", applicationStatus: "applied" },
+    { ...runFixture(), id: "filter-tailoring-failed", titleOverride: "Tailoring failure", status: "failed", applicationStatus: "pending" },
+    { ...runFixture(), id: "filter-application-failed", titleOverride: "Application failure", status: "approved", applicationStatus: "pending", applicationFailureGeneration: 1 },
   ];
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs }) });
@@ -521,25 +562,18 @@ test("filters pipeline and application statuses independently", async ({ page })
 
   const pipelineFilter = page.getByRole("combobox", { name: "Filter applications by pipeline status" });
   const applicationFilter = page.getByRole("combobox", { name: "Filter applications by application status" });
-  await expect(pipelineFilter.locator("option")).toHaveText([
-    "All pipeline statuses",
-    "Tailoring",
-    "Awaiting review",
-    "In-progress",
-    "Completed",
-  ]);
-  await expect(applicationFilter.locator("option")).toHaveText([
-    "All application statuses",
-    "Pending application",
-    "Did not apply",
-    "Applied",
-    "OA received",
-    "OA completed",
-    "Rejected",
-    "Interview",
-    "Accepted",
-  ]);
 
+  const rows = page.getByRole("table").locator("tbody");
+  for (const title of ["Tailoring failure", "Application failure"]) {
+    await expect(rows.getByRole("row").filter({ hasText: title }).getByLabel(/Pipeline status for/)).toHaveText("Failed");
+  }
+  await pipelineFilter.selectOption("failed");
+  await expect(rows.getByRole("link")).toHaveText(["Tailoring failure", "Application failure"]);
+  await applicationFilter.selectOption("applied");
+  await expect(page.getByText("No applications match the current search and statuses.")).toBeVisible();
+  await applicationFilter.selectOption("all");
+  await pipelineFilter.selectOption("completed");
+  await expect(rows.getByRole("link")).toHaveText(["Completed role"]);
   await pipelineFilter.selectOption("awaiting_review");
   await expect(page.getByRole("table").locator("tbody").getByRole("link")).toHaveText(["Review role"]);
   await applicationFilter.selectOption("applied");
@@ -548,10 +582,10 @@ test("filters pipeline and application statuses independently", async ({ page })
   await expect(page.getByRole("table").locator("tbody").getByRole("link")).toHaveText(["Completed role"]);
 });
 
-test("notifies once when a dashboard run becomes Awaiting review", async ({ page }) => {
+test("requests browser notifications on first startup and notifies once when a dashboard run becomes Awaiting review", async ({ page }) => {
   const notifications = await installBrowserNotificationProbe(page, {
     initialPermission: "default",
-    notificationsEnabled: false,
+    notificationsEnabled: null,
   });
   let reviewReady = false;
   let listRequestCount = 0;
@@ -584,19 +618,51 @@ test("notifies once when a dashboard run becomes Awaiting review", async ({ page
 
   const browserNotifications = page.getByRole("checkbox", { name: "Browser notifications" });
   await expect(browserNotifications).toBeVisible();
-  await expect(browserNotifications).not.toBeChecked();
-  await browserNotifications.check();
+  await expect.poll(() => page.evaluate(() => Notification.permission)).toBe("granted");
   await expect(browserNotifications).toBeChecked();
 
   reviewReady = true;
   await expect.poll(notifications, { timeout: 7_000 }).toEqual([{
-    body: "Review the tailored resume in Jobhunter.",
-    tag: expect.stringMatching(/^jobhunter:/),
+    body: "Review the tailored resume in Jobhunt.",
+    tag: expect.stringMatching(/^jobhunt:/),
     title: "Resume ready for review",
   }]);
   await expect(page.getByRole("row").filter({ hasText: "Alert-ready role" })).toContainText("Awaiting review");
   const requestCountAtNotification = listRequestCount;
   await expect.poll(() => listRequestCount, { timeout: 5_000 }).toBeGreaterThan(requestCountAtNotification);
+  expect(await notifications()).toHaveLength(1);
+});
+
+test("alerts for an application needing attention while viewing credentials", async ({ page }) => {
+  const notifications = await installBrowserNotificationProbe(page);
+  let applying = false;
+  const run = dashboardRun({ id: "global-attention", title: "Background application", updatedAt: 10 });
+  await page.route("**/api/pipeline/runs", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ runs: [{ ...run, isApplying: applying }] }),
+  }));
+  await page.route("**/api/pipeline/runs/global-attention/application", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify(ApplicationSessionSnapshotDtoSchema.parse({
+      generation: 1, bridgeState: "awaiting_human_navigation", harnessState: "awaiting_human_navigation",
+      submissionPhase: "not_attempted", createdAt: 10, updatedAt: 11, terminalAt: null, expiresAt: null,
+      company: null, role: null, fieldsFilled: [], fieldsNeedingHuman: [], filesAttached: [], warnings: [],
+      revisionCount: 0, pendingAction: { type: "human_navigation", instruction: "Complete the checkpoint." },
+      error: null,
+    })),
+  }));
+  await page.goto("/");
+  await expect(page.getByRole("row").filter({ hasText: "Background application" })).toBeVisible();
+  await page.getByRole("link", { name: "Credentials", exact: true }).click();
+  await expect(page).toHaveURL(/\/credentials$/);
+  applying = true;
+  await expect.poll(notifications, { timeout: 8_000 }).toEqual([{
+    body: "Return to Jobhunt to continue the application.",
+    tag: "jobhunt:application:global-attention",
+    title: "Application needs attention",
+  }]);
+  await page.getByRole("link", { name: "Applications", exact: true }).click();
+  await expect(page.getByRole("row").filter({ hasText: "Background application" })).toBeVisible();
   expect(await notifications()).toHaveLength(1);
 });
 
@@ -612,6 +678,7 @@ test("uses lifecycle order and exposes a square accessible row action menu witho
   const statusLabels = [
     "Pending application",
     "Did not apply",
+    "Manual application",
     "Applied",
     "OA received",
     "OA completed",
@@ -727,6 +794,7 @@ test("keeps an existing Failed status visible but not selectable", async ({ page
   await expect(rowStatus.locator("option:not([disabled])")).toHaveText([
     "Pending application",
     "Did not apply",
+    "Manual application",
     "Applied",
     "OA received",
     "OA completed",
@@ -750,7 +818,7 @@ test("renders application status text with stronger contrast", async ({ page }) 
   await expect(rowStatus).toHaveCSS("font-size", "15px");
 });
 
-test("keeps the action trigger inset and its menu and dialog usable at narrow widths", async ({ page }) => {
+test("keeps the action menu and dialog usable at narrow widths", async ({ page }) => {
   const run = {
     ...runFixture(),
     titleOverride: "Platform Engineer",
@@ -767,8 +835,6 @@ test("keeps the action trigger inset and its menu and dialog usable at narrow wi
 
   const trigger = page.getByRole("button", { name: "Actions for Platform Engineer" });
   await trigger.scrollIntoViewIfNeeded();
-  const triggerCell = trigger.locator("..");
-  await expect(triggerCell).toHaveCSS("padding-right", "16px");
   await trigger.click();
   const menu = page.getByRole("menu", { name: "Actions for Platform Engineer" });
   await expect(menu).toBeVisible();
@@ -809,7 +875,7 @@ test("keeps the action trigger inset and its menu and dialog usable at narrow wi
 
   await trigger.click();
   await expect(menu).toBeVisible();
-  const sortControl = page.getByRole("button", { name: /Sort by updated date/ });
+  const sortControl = page.getByRole("combobox", { name: "Sort applications" });
   await sortControl.click();
   await expect(menu).toHaveCount(0);
   await expect(sortControl).toBeFocused();
@@ -894,6 +960,491 @@ test("opens a run from a non-interactive cell without letting the status selecto
   await row.getByRole("cell").nth(1).click();
   await expect(page).toHaveURL(/\/runs\/presentation-run$/);
 });
+
+test("approves and immediately applies an awaiting-review resume from the dashboard", async ({ page }) => {
+  const pdfSha256 = "a".repeat(64);
+  let run: RunDto = {
+    ...runFixture(),
+    id: "direct-apply-review",
+    titleOverride: "Review role",
+    status: "review",
+    applicationStatus: "pending",
+    jobUrl: "https://example.com/jobs/review-role",
+    currentPdfSha256: pdfSha256,
+    visualAcknowledgementRequired: true,
+  };
+  const running = ApplicationSessionSnapshotDtoSchema.parse({
+    generation: 1, bridgeState: "running", harnessState: "running",
+    submissionPhase: "not_attempted", createdAt: 10, updatedAt: 11, terminalAt: null, expiresAt: null,
+    company: null, role: null, fieldsFilled: [], fieldsNeedingHuman: [], filesAttached: [], warnings: [],
+    revisionCount: 0, pendingAction: null, error: null,
+  });
+  const requests: string[] = [];
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [run] }),
+    });
+  });
+  await page.route("**/api/pipeline/runs/direct-apply-review/approve", async (route) => {
+    requests.push("approve");
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({
+      expectedPdfSha256: pdfSha256,
+      acknowledgeVisualIssues: true,
+    });
+    run = { ...run, status: "approved" };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.route("**/api/pipeline/runs/direct-apply-review/application", async (route) => {
+    if (route.request().method() === "GET" && run.isApplying) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(running) });
+      return;
+    }
+    if (route.request().method() === "GET") {
+      requests.push("preflight");
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ state: "not_started", canStart: false, canStartAfterApproval: true }),
+      });
+      return;
+    }
+    requests.push("start");
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({
+      expectedApprovedPdfSha256: pdfSha256,
+      autoSubmit: true,
+      autoEnd: true,
+    });
+    run = { ...run, isApplying: true, isApplicationSessionOpen: true };
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(running) });
+  });
+
+  await page.goto("/");
+  await page.getByRole("checkbox", { name: "Auto-submit applications" }).check();
+  await page.getByRole("checkbox", { name: "Auto-end successful sessions" }).check();
+
+  const apply = page.getByRole("button", { name: "Apply for Review role" });
+  await expect(apply).toBeVisible();
+  await apply.click();
+  await expect.poll(() => requests).toEqual(["preflight", "approve", "start"]);
+  await expect(apply).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Open application sessions" })).toBeVisible();
+  await expect(page).toHaveURL("/");
+});
+
+test("does not approve an awaiting-review resume when application preflight is blocked", async ({ page }) => {
+  const pdfSha256 = "b".repeat(64);
+  const run: RunDto = {
+    ...runFixture(),
+    id: "blocked-review-apply",
+    titleOverride: "Blocked review role",
+    status: "review",
+    applicationStatus: "pending",
+    jobUrl: "https://example.com/jobs/blocked-review-role",
+    currentPdfSha256: pdfSha256,
+  };
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs: [run] }) });
+  });
+  let approvalRequests = 0;
+  await page.route("**/api/pipeline/runs/blocked-review-apply/approve", async (route) => {
+    approvalRequests += 1;
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...run, status: "approved" }) });
+  });
+  await page.route("**/api/pipeline/runs/blocked-review-apply/application", async (route) => {
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        state: "not_started",
+        canStart: false,
+        canStartAfterApproval: false,
+        blockedReason: "harness_unconfigured",
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Apply for Blocked review role" }).click();
+
+  await expect(page.getByRole("alert", { name: "Run action error" })).toHaveText(
+    "Automatic application is not available for this run yet. Open the run to review what is required.",
+  );
+  expect(approvalRequests).toBe(0);
+});
+
+test("keeps a manual application visible without offering Apply", async ({ page }) => {
+  const run: RunDto = {
+    ...runFixture(),
+    titleOverride: "Manual role",
+    jobUrl: "https://example.com/jobs/manual",
+    currentPdfSha256: "a".repeat(64),
+    applicationStatus: "manual_application" as RunDto["applicationStatus"],
+  };
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ runs: [run] }),
+    });
+  });
+  await page.goto("/");
+
+  const row = page.getByRole("row").filter({ has: page.getByRole("link", { name: /^Open Manual role/ }) });
+  const rowStatus = row.getByRole("combobox", { name: /Application status/ });
+  await expect(rowStatus).toHaveValue("manual_application");
+  await expect(rowStatus.locator('option[value="manual_application"]')).toHaveText("Manual application");
+  await expect(page.getByRole("button", { name: "Apply for Manual role" })).toHaveCount(0);
+});
+
+test("queues every applyable job from newest to oldest creation date", async ({ page }) => {
+  const pdfSha256 = "b".repeat(64);
+  const baseRun: RunDto = {
+    ...runFixture(),
+    jobUrl: "https://example.com/jobs/apply-all",
+    currentPdfSha256: pdfSha256,
+  };
+  const runs: RunDto[] = [
+    { ...baseRun, id: "apply-all-pending", titleOverride: "Older pending role", applicationStatus: "pending", createdAt: 100, updatedAt: 900 },
+    { ...baseRun, id: "apply-all-skipped", titleOverride: "Newer skipped role", applicationStatus: "did_not_apply", createdAt: 300, updatedAt: 400 },
+    { ...baseRun, id: "apply-all-manual", titleOverride: "Manual role", applicationStatus: "manual_application" },
+    { ...baseRun, id: "apply-all-applied", titleOverride: "Applied role", applicationStatus: "applied" },
+    { ...baseRun, id: "apply-all-no-url", titleOverride: "Missing URL role", jobUrl: undefined },
+  ];
+  const applyingRunIds = new Set<string>();
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        runs: runs.map((run) => applyingRunIds.has(run.id) ? { ...run, isApplying: true } : run),
+      }),
+    });
+  });
+  const running = ApplicationSessionSnapshotDtoSchema.parse({
+    generation: 1, bridgeState: "running", harnessState: "running",
+    submissionPhase: "not_attempted", createdAt: 10, updatedAt: 11, terminalAt: null, expiresAt: null,
+    company: null, role: null, fieldsFilled: [], fieldsNeedingHuman: [], filesAttached: [], warnings: [],
+    revisionCount: 0, pendingAction: null, error: null,
+  });
+  const startRequests: string[] = [];
+  const startBodies: unknown[] = [];
+  let releaseStarts: (() => void) | undefined;
+  const startsReleased = new Promise<void>((resolve) => { releaseStarts = resolve; });
+  await page.route("**/api/pipeline/runs/*/application", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "SESSION_NOT_FOUND", message: "No session" } }) });
+      return;
+    }
+    const runId = new URL(route.request().url()).pathname.split("/").at(-2);
+    if (!runId) throw new Error("Application start request omitted its run ID");
+    startRequests.push(runId);
+    startBodies.push(route.request().postDataJSON());
+    applyingRunIds.add(runId);
+    await startsReleased;
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(running) });
+  });
+  await page.goto("/");
+  await page.getByRole("checkbox", { name: "Auto-submit applications" }).check();
+  await page.getByRole("checkbox", { name: "Auto-end successful sessions" }).check();
+
+  const applyAll = page.getByRole("button", { name: "Apply all" });
+  await expect(applyAll).toBeEnabled();
+  await applyAll.click();
+  await expect.poll(() => startRequests).toEqual(["apply-all-skipped"]);
+  await expect(applyAll).toBeDisabled();
+  releaseStarts?.();
+  await expect.poll(() => startRequests).toEqual(["apply-all-skipped", "apply-all-pending"]);
+  expect(startBodies).toEqual([
+    { expectedApprovedPdfSha256: pdfSha256, autoSubmit: true, autoEnd: true },
+    { expectedApprovedPdfSha256: pdfSha256, autoSubmit: true, autoEnd: true },
+  ]);
+  await expect(page.getByRole("button", { name: "Apply all" })).toBeDisabled();
+});
+
+test("retries every and only failed tailoring run from Retry all", async ({ page }) => {
+  let runs: RunDto[] = [
+    { ...runFixture(), id: "retry-all-first", titleOverride: "First failed role", status: "failed" },
+    { ...runFixture(), id: "retry-all-approved", titleOverride: "Approved role", status: "approved" },
+    { ...runFixture(), id: "retry-all-second", titleOverride: "Second failed role", status: "failed" },
+  ];
+  await page.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs }) });
+  });
+  const retryRequests: string[] = [];
+  let releaseRetries: (() => void) | undefined;
+  const retriesReleased = new Promise<void>((resolve) => { releaseRetries = resolve; });
+  await page.route("**/api/pipeline/runs/*/retry", async (route) => {
+    expect(route.request().method()).toBe("POST");
+    const runId = new URL(route.request().url()).pathname.split("/").at(-2);
+    const run = runs.find((candidate) => candidate.id === runId);
+    if (!runId || !run) throw new Error("Retry request omitted a failed run ID");
+    retryRequests.push(runId);
+    await retriesReleased;
+    const updated = { ...run, status: "queued" as const };
+    runs = runs.map((candidate) => candidate.id === runId ? updated : candidate);
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(updated) });
+  });
+  await page.goto("/");
+
+  const retryAll = page.getByRole("button", { name: "Retry all" });
+  await expect(retryAll).toBeEnabled();
+  await retryAll.click();
+  await expect.poll(() => retryRequests.toSorted()).toEqual(["retry-all-first", "retry-all-second"]);
+  await expect(retryAll).toBeDisabled();
+  releaseRetries?.();
+  await expect(retryAll).toBeDisabled();
+});
+
+test("starts unapplied resumes directly and confirms reapplying an applied resume", async ({ page }) => {
+  const pdfSha256 = "a".repeat(64);
+  const baseRun: RunDto = {
+    ...runFixture(),
+    jobUrl: "https://example.com/jobs/direct-apply",
+    currentPdfSha256: pdfSha256,
+  };
+  const runs: RunDto[] = [
+    { ...baseRun, id: "direct-apply-pending", titleOverride: "Pending role", applicationStatus: "pending" },
+    { ...baseRun, id: "direct-apply-skipped", titleOverride: "Did not apply role", applicationStatus: "did_not_apply" },
+    {
+      ...baseRun,
+      id: "direct-apply-lost-session",
+      titleOverride: "Lost session role",
+      applicationStatus: "pending",
+    },
+    { ...baseRun, id: "direct-apply-failed-status", titleOverride: "Failed status role", applicationStatus: "failed" },
+    { ...baseRun, id: "direct-apply-complete", titleOverride: "Applied role", applicationStatus: "applied" },
+  ];
+  const running = ApplicationSessionSnapshotDtoSchema.parse({
+    generation: 2, bridgeState: "running", harnessState: "running",
+    submissionPhase: "not_attempted", createdAt: 10, updatedAt: 11, terminalAt: null, expiresAt: null,
+    company: null, role: null, fieldsFilled: [], fieldsNeedingHuman: [], filesAttached: [], warnings: [],
+    revisionCount: 0, pendingAction: null, error: null,
+  });
+  const lost = ApplicationSessionSnapshotDtoSchema.parse({
+    ...running,
+    generation: 1, bridgeState: "lost", harnessState: "running", terminalAt: 10,
+    warnings: ["Verify whether the application was submitted before retrying."],
+    error: null,
+  });
+  const applyingRunIds = new Set<string>();
+  const listedRuns = () => runs.map((run) => applyingRunIds.has(run.id) ? { ...run, isApplying: true } : run);
+  const fulfillRuns = (route: Route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ runs: listedRuns() }),
+  });
+  let holdNextRefresh = false;
+  let heldRefresh: Route | undefined;
+  await page.route("**/api/pipeline/runs", async (route) => {
+    if (holdNextRefresh) {
+      holdNextRefresh = false;
+      heldRefresh = route;
+      return;
+    }
+    await fulfillRuns(route);
+  });
+  let startRequests = 0;
+  await page.route("**/api/pipeline/runs/direct-apply-skipped/application", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(running) });
+      return;
+    }
+    startRequests += 1;
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({
+      expectedApprovedPdfSha256: pdfSha256,
+      autoSubmit: false,
+      autoEnd: false,
+    });
+    applyingRunIds.add("direct-apply-skipped");
+    holdNextRefresh = true;
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(running) });
+  });
+  let terminalStartRequests = 0;
+  await page.route("**/api/pipeline/runs/direct-apply-lost-session/application", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(running) });
+      return;
+    }
+    terminalStartRequests += 1;
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(lost) });
+  });
+  let retryRequests = 0;
+  await page.route("**/api/pipeline/runs/direct-apply-lost-session/application/retry", async (route) => {
+    retryRequests += 1;
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({
+      expectedApprovedPdfSha256: pdfSha256,
+      autoSubmit: false,
+      autoEnd: false,
+    });
+    applyingRunIds.add("direct-apply-lost-session");
+    holdNextRefresh = true;
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(running) });
+  });
+  let reapplyRequests = 0;
+  await page.route("**/api/pipeline/runs/direct-apply-complete/application", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(running) });
+      return;
+    }
+    reapplyRequests += 1;
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({
+      expectedApprovedPdfSha256: pdfSha256,
+      autoSubmit: false,
+      autoEnd: false,
+      reapply: true,
+    });
+    applyingRunIds.add("direct-apply-complete");
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(running) });
+  });
+  await page.goto("/");
+
+  const applyButtons = page.getByRole("button", { name: /^Apply for / });
+  await expect(applyButtons).toHaveCount(4);
+  await expect(page.getByRole("button", { name: "Apply for Pending role" })).toBeVisible();
+  const startApply = page.getByRole("button", { name: "Apply for Did not apply role" });
+  const retryApply = page.getByRole("button", { name: "Apply for Lost session role" });
+  await expect(page.getByRole("button", { name: "Apply for Failed status role" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Apply for Applied role", exact: true })).toHaveCount(0);
+  const reapply = page.getByRole("button", { name: "Reapply for Applied role" });
+  await expect(reapply).toBeVisible();
+  await reapply.click();
+  const reapplyDialog = page.getByRole("dialog", { name: "Reapply to Applied role?" });
+  await expect(reapplyDialog).toBeVisible();
+  expect(reapplyRequests).toBe(0);
+  await reapplyDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(reapplyDialog).toHaveCount(0);
+
+  await reapply.click();
+  await page.getByRole("dialog", { name: "Reapply to Applied role?" })
+    .getByRole("button", { name: "Reapply" }).click();
+  await expect.poll(() => reapplyRequests).toBe(1);
+  await expect(reapply).toHaveCount(0);
+
+  await startApply.click();
+  await expect.poll(() => heldRefresh !== undefined).toBe(true);
+  await expect(startApply).toHaveCount(0);
+  expect(startRequests).toBe(1);
+  await expect(page).toHaveURL("/");
+  const firstRefresh = heldRefresh;
+  if (!firstRefresh) throw new Error("Post-start run refresh was not held");
+  heldRefresh = undefined;
+  await fulfillRuns(firstRefresh);
+
+  await retryApply.click();
+  await expect.poll(() => retryRequests).toBe(1);
+  await expect.poll(() => heldRefresh !== undefined).toBe(true);
+  await expect(retryApply).toHaveCount(0);
+  expect(terminalStartRequests).toBe(1);
+  await expect(page).toHaveURL("/");
+  const secondRefresh = heldRefresh;
+  if (!secondRefresh) throw new Error("Post-retry run refresh was not held");
+  heldRefresh = undefined;
+  await fulfillRuns(secondRefresh);
+});
+
+test("Cmd-click opens a run row and its title in new tabs without leaving the dashboard", async ({ context, page }) => {
+  const run = { ...runFixture(), titleOverride: "Platform Engineer" };
+  await context.route("**/api/pipeline/runs", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs: [run] }) });
+  });
+  await context.route("**/api/pipeline/runs/presentation-run", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(run) });
+  });
+  await page.goto("/");
+
+  const row = page.getByRole("row").filter({ hasText: "Platform Engineer" });
+  const [rowTab] = await Promise.all([
+    context.waitForEvent("page", { timeout: 5_000 }),
+    row.getByRole("cell").nth(1).click({ modifiers: ["Meta"] }),
+  ]);
+  await expect(rowTab).toHaveURL(/\/runs\/presentation-run$/);
+  await expect(page).toHaveURL("/");
+  await expect(row).toBeVisible();
+  await rowTab.close();
+
+  const [titleTab] = await Promise.all([
+    context.waitForEvent("page", { timeout: 5_000 }),
+    row.getByRole("link").click({ modifiers: ["ControlOrMeta"] }),
+  ]);
+  await expect(titleTab).toHaveURL(/\/runs\/presentation-run$/);
+  await expect(page).toHaveURL("/");
+  expect(context.pages()).toHaveLength(2);
+  await titleTab.close();
+});
+
+for (const outcome of ["success", "failure"] as const) {
+  test(
+    outcome === "success"
+      ? "late successful identity edits cannot close a replacement dialog"
+      : "late failed identity edits cannot overwrite a replacement dialog's errors",
+    async ({ page }) => {
+      const first: RunDto = { ...runFixture(), id: "dialog-first", titleOverride: "First role" };
+      const second: RunDto = { ...runFixture(), id: "dialog-second", titleOverride: "Second role" };
+      let listed = [first, second];
+      let pendingPatch: Route | undefined;
+      let markPatchStarted!: () => void;
+      const patchStarted = new Promise<void>((resolve) => { markPatchStarted = resolve; });
+      await page.route("**/api/pipeline/runs", (route) => route.fulfill({
+        contentType: "application/json", body: JSON.stringify({ runs: listed }),
+      }));
+      await page.route("**/api/pipeline/runs/dialog-first", (route) => {
+        expect(route.request().method()).toBe("PATCH");
+        pendingPatch = route;
+        markPatchStarted();
+      });
+      await page.route("**/api/pipeline/runs/dialog-second", (route) => route.fulfill({
+        status: 409, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "IDENTITY_UPDATE_REJECTED", message: "Second role update was rejected." } }),
+      }));
+      await page.goto("/");
+      const firstTrigger = page.getByRole("button", { name: "Actions for First role" });
+      await firstTrigger.scrollIntoViewIfNeeded();
+      await firstTrigger.click();
+      await page.getByRole("menuitem", { name: "Edit title" }).click();
+      const dialog = page.getByRole("dialog", { name: "Edit application title" });
+      const input = dialog.getByRole("textbox", { name: "Title" });
+      await input.fill("First role edited");
+      await dialog.getByRole("button", { name: "Save" }).click();
+      await patchStarted;
+      listed = [second];
+      await expect(dialog).toHaveCount(0, { timeout: 5_000 });
+      const secondTrigger = page.getByRole("button", { name: "Actions for Second role" });
+      await secondTrigger.scrollIntoViewIfNeeded();
+      await secondTrigger.click();
+      await page.getByRole("menuitem", { name: "Edit title" }).click();
+      await expect(input).toHaveValue("Second role");
+      await input.fill("Replacement draft");
+      await expect(input).toBeFocused();
+
+      if (!pendingPatch) throw new Error("First identity request was not intercepted");
+      const patch = pendingPatch;
+      const response = page.waitForResponse((next) => next.request() === patch.request());
+      await patch.fulfill(outcome === "success" ? {
+        contentType: "application/json",
+        body: JSON.stringify({ ...first, titleOverride: "First role edited", updatedAt: first.updatedAt + 1 }),
+      } : {
+        status: 409, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "IDENTITY_UPDATE_REJECTED", message: "First role update was rejected." } }),
+      });
+      await (await response).finished();
+      await page.evaluate(() => new Promise<void>((resolve) => {
+        window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+      }));
+      await expect(dialog).toBeVisible();
+      await expect(input).toHaveValue("Replacement draft");
+      await expect(input).toBeFocused();
+      await expect(dialog.getByRole("alert")).toHaveCount(0);
+      if (outcome === "failure") {
+        await dialog.getByRole("button", { name: "Save" }).click();
+        await expect(dialog.getByRole("alert")).toHaveText("Second role update was rejected.");
+        await expect(input).toHaveValue("Replacement draft");
+      }
+    },
+  );
+}
 
 test("retains identity input on failure and updates the row only after a successful edit", async ({ page }) => {
   const run: RunDto = {
@@ -1063,82 +1614,151 @@ test("requires delete confirmation and removes a run only after a successful bod
   expect(deleteBodies).toEqual([null, null]);
 });
 
-test("prioritizes Applying, keeps Rejected last in both date directions, and restores completed runs to date order", async ({ page }) => {
+test("prioritizes every non-ended session and restores closed sessions to creation order", async ({ page }) => {
   const baseTime = 1_700_000_000_000;
-  const applyingRun = dashboardRun({
-    id: "applying-priority",
-    title: "Applying oldest",
-    updatedAt: baseTime + 300,
-    isApplying: true,
-  });
-  const completedApplyingRun: RunDto = {
-    ...applyingRun,
-    isApplying: false,
+  const openSessionRun: RunDto = {
+    ...dashboardRun({
+      id: "open-session-priority",
+      title: "Submitted oldest",
+      updatedAt: baseTime + 300,
+      isApplying: false,
+    }),
+    isApplicationSessionOpen: true,
   };
+  const closedSessionRun: RunDto = {
+    ...openSessionRun,
+    isApplicationSessionOpen: false,
+  };
+  const submitted = ApplicationSessionSnapshotDtoSchema.parse({
+    generation: 1, bridgeState: "submitted", harnessState: "submitted",
+    submissionPhase: "submitted", createdAt: 10, updatedAt: 11, terminalAt: null, expiresAt: null,
+    company: null, role: null, fieldsFilled: [], fieldsNeedingHuman: [], filesAttached: [], warnings: [],
+    revisionCount: 0, playwrightCliDiagnostics: [], pendingAction: null, error: null,
+  });
   const otherRuns = [
-    dashboardRun({ id: "ordinary-old", title: "Ordinary old", updatedAt: baseTime + 200 }),
+    dashboardRun({ id: "ordinary-old", title: "Ordinary old", createdAt: baseTime + 200, updatedAt: baseTime + 900 }),
     dashboardRun({ id: "ordinary-new", title: "Ordinary new", updatedAt: baseTime + 400, applicationStatus: "applied" }),
     dashboardRun({ id: "rejected-new", title: "Rejected new", updatedAt: baseTime + 500, applicationStatus: "rejected" }),
     dashboardRun({ id: "rejected-old", title: "Rejected old", updatedAt: baseTime + 50, applicationStatus: "rejected" }),
   ];
-  let listRequests = 0;
+  let pollRequests = 0;
+  let holdPoll = false;
   let pendingPoll: Route | undefined;
+  await page.route("**/api/pipeline/runs/open-session-priority/application", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify(submitted),
+  }));
   await page.route("**/api/pipeline/runs", async (route) => {
-    listRequests += 1;
-    if (listRequests === 1) {
+    if (!holdPoll) {
       await route.fulfill({
         contentType: "application/json",
-        body: JSON.stringify({ runs: [applyingRun, ...otherRuns] }),
+        body: JSON.stringify({ runs: [openSessionRun, ...otherRuns] }),
       });
       return;
     }
+    pollRequests += 1;
     pendingPoll = route;
   });
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
 
   const table = page.getByRole("table");
   const roleLinks = table.locator("tbody").getByRole("link");
-  const applyingRow = table.getByRole("row").filter({ hasText: "Applying oldest" });
-  const pipelineStatus = applyingRow.getByLabel(/Pipeline status for .*: In-progress/);
+  const sessionRow = table.getByRole("row").filter({ hasText: "Submitted oldest" });
+  const openSessions = page.getByRole("region", { name: "Open application sessions", exact: true });
+  await expect(openSessions).toBeVisible();
+  await expect(openSessions.getByRole("link")).toHaveCount(1);
+  await expect(openSessions.getByRole("link", { name: /Submitted oldest/ })).toHaveAttribute("href", "/runs/open-session-priority");
+  const pipelineStatus = sessionRow.getByLabel(/Pipeline status for .*: In-progress/);
   await expect(pipelineStatus).toHaveText("In-progress");
-  await expect(applyingRow.getByRole("combobox", { name: /Application status for/ })).toHaveValue("pending");
   await expect(roleLinks).toHaveText([
-    "Applying oldest",
+    "Submitted oldest",
     "Ordinary new",
     "Ordinary old",
     "Rejected new",
     "Rejected old",
   ]);
 
-  await page.getByRole("button", { name: "Sort by updated date, currently newest" }).click();
+  await page.getByRole("combobox", { name: "Sort applications" }).selectOption("oldest");
   await expect(roleLinks).toHaveText([
-    "Applying oldest",
+    "Submitted oldest",
     "Ordinary old",
     "Ordinary new",
     "Rejected old",
     "Rejected new",
   ]);
 
-  await expect.poll(() => Boolean(pendingPoll), { timeout: 5_000 }).toBe(true);
+  holdPoll = true;
   await page.waitForTimeout(3_250);
-  expect(listRequests).toBe(2);
+  expect(pollRequests).toBe(1);
+  await expect.poll(() => Boolean(pendingPoll), { timeout: 5_000 }).toBe(true);
   await pendingPoll!.fulfill({
     contentType: "application/json",
-    body: JSON.stringify({ runs: [completedApplyingRun, ...otherRuns] }),
+    body: JSON.stringify({ runs: [closedSessionRun, ...otherRuns] }),
   });
 
+  await expect(openSessions).toHaveCount(0);
   await expect(pipelineStatus).toHaveText("In-progress");
-  await expect(applyingRow.getByRole("combobox", { name: /Application status for/ })).toHaveValue("pending");
   await expect(roleLinks).toHaveText([
     "Ordinary old",
-    "Applying oldest",
+    "Submitted oldest",
     "Ordinary new",
     "Rejected old",
     "Rejected new",
   ]);
 });
 
-test("keeps active application sessions in pending application status", async ({ page }) => {
+test("ends every and only open application session with bodyless requests", async ({ page }) => {
+  const openIds = new Set(["end-all-running", "end-all-submitted"]);
+  const runs = [
+    dashboardRun({ id: "end-all-running", title: "Running session", updatedAt: 300, isApplying: true }),
+    dashboardRun({ id: "end-all-submitted", title: "Submitted session", updatedAt: 200 }),
+    dashboardRun({ id: "end-all-closed", title: "Closed session", updatedAt: 100 }),
+  ];
+  const running = ApplicationSessionSnapshotDtoSchema.parse({
+    generation: 1, bridgeState: "running", harnessState: "running",
+    submissionPhase: "not_attempted", createdAt: 10, updatedAt: 11, terminalAt: null, expiresAt: null,
+    company: null, role: null, fieldsFilled: [], fieldsNeedingHuman: [], filesAttached: [], warnings: [],
+    revisionCount: 0, playwrightCliDiagnostics: [], pendingAction: null, error: null,
+  });
+  const endedIds: string[] = [];
+  const deleteBodies: Array<string | null> = [];
+
+  await page.route("**/api/pipeline/runs/*/application", async (route) => {
+    const match = new URL(route.request().url()).pathname.match(/\/runs\/([^/]+)\/application$/);
+    expect(match).not.toBeNull();
+    const id = decodeURIComponent(match![1]!);
+    if (route.request().method() === "GET") {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(running) });
+      return;
+    }
+    expect(route.request().method()).toBe("DELETE");
+    deleteBodies.push(route.request().postData());
+    endedIds.push(id);
+    openIds.delete(id);
+    await route.fulfill({ status: 204 });
+  });
+  await page.route("**/api/pipeline/runs", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({
+      runs: runs.map((run) => ({
+        ...run,
+        isApplying: run.id === "end-all-running" && openIds.has(run.id),
+        isApplicationSessionOpen: openIds.has(run.id),
+      })),
+    }),
+  }));
+
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const openSessions = page.getByRole("region", { name: "Open application sessions" });
+  await expect(openSessions.getByRole("link")).toHaveCount(2);
+  await openSessions.getByRole("button", { name: "End all" }).click();
+
+  await expect.poll(() => endedIds.sort()).toEqual(["end-all-running", "end-all-submitted"]);
+  expect(deleteBodies).toEqual([null, null]);
+  await expect(openSessions).toHaveCount(0);
+});
+
+test("keeps active application sessions in pending status and visible independently of table filters", async ({ page }) => {
   const runs = [
     dashboardRun({
       id: "filter-applying",
@@ -1166,21 +1786,102 @@ test("keeps active application sessions in pending application status", async ({
   });
   await page.goto("/");
 
+  const activeApplications = page.getByRole("region", { name: "Open application sessions", exact: true });
+  const activeLink = activeApplications.getByRole("link", { name: /Active pending application/ });
+  const pipelineFilter = page.getByRole("combobox", { name: "Filter applications by pipeline status" });
   const applicationFilter = page.getByRole("combobox", { name: "Filter applications by application status" });
   const visibleRoleLinks = page.getByRole("table").locator("tbody").getByRole("link");
   await applicationFilter.selectOption("pending");
   await expect(visibleRoleLinks).toHaveText(["Active pending application", "Durable pending application"]);
-  await expect(page.locator(".pipeline-status-badge--in_progress")).toHaveCount(2);
+  await expect(activeApplications.getByRole("link")).toHaveCount(1);
+  await expect(activeLink).toBeVisible();
 
   await applicationFilter.selectOption("applied");
   await expect(visibleRoleLinks).toHaveText(["Durable applied application"]);
+  await expect(activeLink).toBeVisible();
+
+  await applicationFilter.selectOption("all");
+  await pipelineFilter.selectOption("completed");
+  await expect(visibleRoleLinks).toHaveText(["Durable applied application"]);
+  await expect(activeLink).toBeVisible();
+
+  await pipelineFilter.selectOption("all");
+  await page.getByRole("searchbox", { name: "Search applications" }).fill("Durable pending");
+  await expect(visibleRoleLinks).toHaveText(["Durable pending application"]);
+  await expect(activeLink).toBeVisible();
 });
 
-test("offers 10, 20, and 50 applications per page and resets every size change to page 1", async ({ page }) => {
+test("updates active application attention from session polls without losing unresolved attention on read failure", async ({ page }) => {
+  test.setTimeout(45_000);
+  const run = dashboardRun({ id: "attention-lifecycle", title: "Attention lifecycle application", updatedAt: 10, isApplying: true });
+  let applying = true;
+  let pendingSession: Route | undefined;
+  const running = ApplicationSessionSnapshotDtoSchema.parse({
+    generation: 1, bridgeState: "running", harnessState: "running",
+    submissionPhase: "not_attempted", createdAt: 10, updatedAt: 11, terminalAt: null, expiresAt: null,
+    company: null, role: null, fieldsFilled: [], fieldsNeedingHuman: [], filesAttached: [], warnings: [],
+    revisionCount: 0, pendingAction: null, error: null,
+  });
+  await page.route("**/api/pipeline/runs", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ runs: [{ ...run, isApplying: applying }] }),
+  }));
+  await page.route("**/api/pipeline/runs/attention-lifecycle/application", (route) => {
+    pendingSession = route;
+  });
+  const waitForSessionPoll = async () => {
+    await expect.poll(() => Boolean(pendingSession), { timeout: 7_000 }).toBe(true);
+  };
+  const answerSessionPoll = async (snapshot: typeof running, status = 200) => {
+    await waitForSessionPoll();
+    const route = pendingSession!;
+    pendingSession = undefined;
+    await route.fulfill({
+      status,
+      contentType: "application/json",
+      body: JSON.stringify(status === 200 ? ApplicationSessionSnapshotDtoSchema.parse(snapshot) : { error: "Temporary session read failure" }),
+    });
+    // The next real provider poll starts only after this response has been processed.
+    await waitForSessionPoll();
+  };
+  await page.goto("/");
+  const activeApplications = page.getByRole("region", { name: "Open application sessions", exact: true });
+  const activeCard = activeApplications.getByRole("link", { name: /Attention lifecycle application/ });
+  const attention = activeCard.getByText("Needs attention", { exact: true });
+  await answerSessionPoll(running);
+  await expect(activeCard).toBeVisible();
+  await expect(attention).toHaveCount(0);
+
+  await answerSessionPoll({ ...running, bridgeState: "awaiting_human_review", harnessState: "awaiting_human_review", pendingAction: { type: "human_review" } });
+  await expect(attention).toBeVisible();
+
+  await answerSessionPoll(running, 503);
+  await expect(attention).toBeVisible();
+  await expect(activeCard).toBeVisible();
+
+  await answerSessionPoll(running);
+  await expect(attention).toHaveCount(0);
+  await expect(activeCard).toBeVisible();
+
+  await answerSessionPoll({ ...running, bridgeState: "awaiting_human_navigation", harnessState: "awaiting_human_navigation", pendingAction: { type: "human_navigation", instruction: "Complete the checkpoint." } });
+  await expect(attention).toBeVisible();
+  await answerSessionPoll(running);
+  await expect(attention).toHaveCount(0);
+  await answerSessionPoll({ ...running, bridgeState: "awaiting_human_navigation", harnessState: "awaiting_human_navigation", pendingAction: { type: "credentials" } });
+  await expect(attention).toBeVisible();
+
+  applying = false;
+  await pendingSession!.fulfill({ contentType: "application/json", body: JSON.stringify(running) });
+  await expect(activeApplications).toHaveCount(0);
+  await expect(page.getByRole("table").getByRole("link", { name: /Attention lifecycle application/ })).toBeVisible();
+});
+
+test("keeps every active application visible while paginating and resets every page size change to page 1", async ({ page }) => {
   const runs = Array.from({ length: 70 }, (_, index) => dashboardRun({
     id: `page-size-${index + 1}`,
     title: `Application ${String(index + 1).padStart(2, "0")}`,
     updatedAt: 1_700_000_000_000 + index,
+    isApplying: index < 12,
   }));
   await page.route("**/api/pipeline/runs", async (route) => {
     await route.fulfill({
@@ -1190,15 +1891,24 @@ test("offers 10, 20, and 50 applications per page and resets every size change t
   });
   await page.goto("/");
 
+  const activeApplications = page.getByRole("region", { name: "Open application sessions", exact: true });
+  const activeLinks = activeApplications.getByRole("link");
+  const tableLinks = page.getByRole("table").locator("tbody").getByRole("link");
   const pageSize = page.getByRole("combobox", { name: "Applications per page" });
   const pagination = page.getByRole("navigation", { name: "Applications pagination" });
   await expect(pageSize.locator("option")).toHaveText(["10", "20", "50"]);
   await expect(pageSize).toHaveValue("10");
   await expect(pagination).toContainText("Showing 1 to 10 of 70 applications");
+  await expect(activeLinks).toHaveCount(12);
+  await expect(activeLinks.filter({ hasText: "Application 01" })).toBeVisible();
+  await expect(tableLinks.filter({ hasText: "Application 01" })).toHaveCount(0);
 
   for (const size of [20, 50, 10]) {
     await pagination.getByRole("button", { name: "Next page" }).click();
     await expect(pagination.getByRole("button", { name: "Page 2" })).toHaveAttribute("aria-current", "page");
+    await expect(activeLinks).toHaveCount(12);
+    await expect(activeLinks.filter({ hasText: "Application 12" })).toBeVisible();
+    await expect(tableLinks.filter({ hasText: "Application 12" })).toHaveCount(0);
     await pageSize.selectOption(String(size));
     await expect(pagination.getByRole("button", { name: "Page 1" })).toHaveAttribute("aria-current", "page");
     await expect(pagination).toContainText(`Showing 1 to ${size} of 70 applications`);

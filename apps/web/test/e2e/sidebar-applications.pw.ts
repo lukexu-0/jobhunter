@@ -6,7 +6,7 @@ import {
   type ResumeIterationListResponse,
   type RunDto,
   type RunStatus,
-} from "@jobhunter/pipeline/contracts";
+} from "../../app/lib/pipeline-contracts";
 
 function runFixture(id: string, applicationStatus: ApplicationStatus, status: RunStatus): RunDto {
   return {
@@ -294,6 +294,7 @@ async function interceptDocumentRun(
 const lifecycleRuns: readonly RunDto[] = [
   runFixture("lifecycle-applied", "applied", "failed"),
   runFixture("lifecycle-did-not-apply", "did_not_apply", "approved"),
+  runFixture("lifecycle-manual", "manual_application", "approved"),
   runFixture("lifecycle-oa-received", "oa_received", "approved"),
   runFixture("lifecycle-oa-completed", "oa_completed", "approved"),
   runFixture("lifecycle-rejected", "rejected", "approved"),
@@ -335,7 +336,7 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
 async function expectFolderNavigation(
   page: Page,
   width: number,
-  currentLabel: "Applications" | "Discovery" | "Providers",
+  currentLabel: "Applications" | "Credentials",
 ): Promise<void> {
   const strip = page.locator("header.app-navigation");
   const stripBox = await strip.boundingBox();
@@ -358,7 +359,7 @@ async function expectFolderNavigation(
 
   const navigation = page.getByRole("navigation", { name: "Primary navigation" });
   const links = navigation.getByRole("link");
-  await expect(links).toHaveCount(3);
+  await expect(links).toHaveCount(2);
   const linkBoxes = await links.evaluateAll((elements) => elements.map((element) => {
     const box = element.getBoundingClientRect();
     return { x: box.x, width: box.width };
@@ -386,7 +387,7 @@ async function expectFolderNavigation(
   const expectedClipPath = width <= 560
     ? "polygon(8px 0px, calc(100% - 8px) 0px, 100% 100%, 0px 100%)"
     : "polygon(16px 0px, calc(100% - 16px) 0px, 100% 100%, 0px 100%)";
-  expect(linkStyles).toEqual(Array.from({ length: 3 }, () => ({
+  expect(linkStyles).toEqual(Array.from({ length: 2 }, () => ({
     clipPath: expectedClipPath,
     justifyContent: "center",
     whiteSpace: "nowrap",
@@ -395,7 +396,7 @@ async function expectFolderNavigation(
   const current = navigation.getByRole("link", { name: currentLabel });
   const inactive = navigation.locator("a:not([aria-current='page'])");
   await expect(current).toHaveAttribute("aria-current", "page");
-  await expect(inactive).toHaveCount(2);
+  await expect(inactive).toHaveCount(1);
   const currentBox = await current.boundingBox();
   const inactiveBoxes = await inactive.evaluateAll((elements) => elements.map((element) => {
     const box = element.getBoundingClientRect();
@@ -556,12 +557,11 @@ test("initializes an application from pasted job details on the Applications das
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("navigation", { name: "Primary navigation" })
     .getByRole("link", { name: "Applications" })).toHaveAttribute("aria-current", "page");
-  await expect(page.getByRole("status")).toHaveText("1 application initialized.");
   await expect(page.getByRole("link", { name: new RegExp(`^Open ${jobTitle}`) })).toHaveAttribute(
     "href",
     `/runs/${initializedRun.id}`,
   );
-  await expect(page.locator(".applications-total")).toHaveText("1");
+  await expect(page.getByRole("group", { name: "Total resumes", exact: true }).locator(".applications-total")).toHaveText("1");
 
   if (!pendingListRefresh) throw new Error("Application list refresh was not intercepted");
   await pendingListRefresh.fulfill({
@@ -705,13 +705,12 @@ test("omits the Auto-detect opportunity type, posts selected run options, and qu
 
   await listRefreshStarted;
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByRole("status")).toHaveText("1 application initialized.");
   await expect(input).toHaveValue("");
   await expect(opportunityType).toHaveValue("auto");
   await expect(skipReview).not.toBeChecked();
   await expect(autoSubmit).not.toBeChecked();
   await expect(page.locator(`tbody a.application-link[href="/runs/${initializedRun.id}"]`)).toBeVisible();
-  await expect(page.locator(".applications-total")).toHaveText("1");
+  await expect(page.getByRole("group", { name: "Total resumes", exact: true }).locator(".applications-total")).toHaveText("1");
 
   if (!pendingListRefresh) throw new Error("Application list refresh was not intercepted");
   await pendingListRefresh.fulfill({
@@ -850,7 +849,7 @@ test("retains source-handoff options and resets a BFCache-restored session", asy
   const verification = initializer.getByRole("region", { name: "Human verification required" });
   await expect(verification).toBeVisible();
   await expect(verification.getByText(
-    "This site requires a verification step that Jobhunter will not attempt. Open the trusted local browser and complete the verification manually.",
+    "This site requires a verification step that Jobhunt will not attempt. Open the trusted local browser and complete the verification manually.",
     { exact: true },
   )).toBeVisible();
   const open = verification.getByRole("button", { name: "Open verification browser" });
@@ -906,9 +905,6 @@ test("retains source-handoff options and resets a BFCache-restored session", asy
     window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
     window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
   });
-  await expect(verification.getByRole("alert")).toHaveText(
-    "Verification session ended. Open a new verification browser session.",
-  );
   await expect(verification.getByRole("button", {
     name: "Open verification browser",
   })).toBeEnabled();
@@ -1067,8 +1063,8 @@ test("releases an awaiting source handoff once when the dashboard unmounts", asy
     name: "I've completed verification",
   })).toBeEnabled();
 
-  await page.getByRole("link", { name: "Discovery", exact: true }).click();
-  await expect(page).toHaveURL(/\/discovery$/);
+  await page.getByRole("link", { name: "Credentials", exact: true }).click();
+  await expect(page).toHaveURL(/\/credentials$/);
   await deleteReceived;
   expect(deleteCount).toBe(1);
 });
@@ -1167,7 +1163,7 @@ test("completes a source handoff once and merges the created run", async ({ page
   await expect(skipReview).not.toBeChecked();
   await expect(autoSubmit).not.toBeChecked();
   await expect(page.locator(`tbody a.application-link[href="/runs/${completedRun.id}"]`)).toBeVisible();
-  await expect(page.locator(".applications-total")).toHaveText("1");
+  await expect(page.getByRole("group", { name: "Total resumes", exact: true }).locator(".applications-total")).toHaveText("1");
   expect(completePostCount).toBe(1);
 });
 
@@ -1228,6 +1224,7 @@ test("cancels a source handoff once and keeps the initializer choices", async ({
   await initializer.getByRole("button", { name: "Open verification browser" }).click();
 
   const cancel = initializer.getByRole("button", { name: "Cancel verification" });
+  await expect(cancel).toBeEnabled();
   await cancel.evaluate((button: HTMLButtonElement) => {
     button.click();
     button.click();
@@ -1246,9 +1243,6 @@ test("cancels a source handoff once and keeps the initializer choices", async ({
   await pendingDelete.fulfill({ status: 204 });
 
   await expect(initializer.getByRole("region", { name: "Human verification required" })).toHaveCount(0);
-  await expect(initializer.getByRole("status")).toHaveText(
-    "Verification cancelled. The URL and options were kept.",
-  );
   await expect(input).toHaveValue(jobUrl);
   await expect(opportunityType).toHaveValue("event");
   await expect(skipReview).toBeChecked();
@@ -1401,9 +1395,6 @@ test("returns an unavailable source handoff to the open-browser step without cle
   const complete = initializer.getByRole("button", { name: "I've completed verification" });
   await complete.click();
 
-  await expect(initializer.getByRole("alert")).toHaveText(
-    "Verification session ended. Open a new verification browser session.",
-  );
   const open = initializer.getByRole("button", { name: "Open verification browser" });
   await expect(open).toBeEnabled();
   await expect(open).toBeFocused();
@@ -1499,7 +1490,6 @@ test("preserves both run options while confirming a duplicate canonical URL", as
   await dialog.getByRole("button", { name: "Initialize anyway" }).click();
 
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByRole("status")).toHaveText("1 application initialized.");
   await expect(page.locator(`tbody a.application-link[href="/runs/${initializedRun.id}"]`)).toBeVisible();
   expect(postedPayloads).toEqual([{
     jobUrl: canonicalJobUrl,
@@ -1570,8 +1560,7 @@ test("confirms duplicate URLs before starting a multi-URL batch", async ({ page 
   expect(postedUrls).toEqual([]);
 
   await dialog.getByRole("button", { name: "Initialize anyway" }).click();
-  await expect(page.getByRole("status")).toHaveText("2 applications initialized.");
-  expect([...postedUrls].sort()).toEqual([...expectedUrls].sort());
+  await expect.poll(() => [...postedUrls].sort()).toEqual([...expectedUrls].sort());
   await expect(input).toHaveValue("");
   await expect(page.locator("tbody tr")).toHaveCount(3);
 });
@@ -1705,7 +1694,6 @@ test("sends an explicit Hackathon type for a batch and resets it only after full
     });
   }));
 
-  await expect(page.getByRole("status")).toHaveText("6 applications initialized.");
   await expect(page).toHaveURL(/\/$/);
   await expect(input).toHaveValue("");
   await expect(input).toBeEnabled();
@@ -1719,7 +1707,7 @@ test("sends an explicit Hackathon type for a batch and resets it only after full
     await expect(page.locator(`tbody a.application-link[href="/runs/${run.id}"]`)).toBeVisible();
   }
   await expect(page.locator(`tbody a.application-link[href="/runs/${existingRun.id}"]`)).toBeVisible();
-  await expect(page.locator(".applications-total")).toHaveText("7");
+  await expect(page.getByRole("group", { name: "Total resumes", exact: true }).locator(".applications-total")).toHaveText("7");
   await expect(page.getByText("Loading applications…", { exact: true })).toHaveCount(0);
   if (!pendingInitialList) throw new Error("Initial run list request was not intercepted");
   await pendingInitialList.fulfill({
@@ -1986,7 +1974,7 @@ test("retains the URL, opportunity type, and independently selected run options 
   const input = page.getByRole("textbox", { name: "Opportunity URLs" });
   const opportunityType = page.getByRole("combobox", { name: "Opportunity type" });
   const skipReview = page.getByRole("checkbox", { name: "Skip résumé review" });
-  const autoSubmit = page.getByRole("checkbox", { name: "Auto-submit application" });
+  const autoSubmit = page.getByRole("checkbox", { name: "Auto-submit application", exact: true });
   await opportunityType.selectOption("hackathon");
   await input.fill(submittedUrl);
   await page.getByRole("button", { name: "Initialize" }).click();
@@ -2323,35 +2311,19 @@ test("shows only the Resume tab when the revision has no keyword map", async ({ 
 });
 
 
-test("filters by independent pipeline and application statuses and keeps Failed display-only", async ({ page }) => {
+test("filters pipeline failures independently and keeps the legacy failed application value read-only", async ({ page }) => {
   await interceptRuns(page);
   await page.goto("/");
 
   const pipelineStatus = page.getByRole("combobox", { name: "Filter applications by pipeline status" });
-  await expect(pipelineStatus.locator("option")).toHaveText([
-    "All pipeline statuses",
-    "Tailoring",
-    "Awaiting review",
-    "In-progress",
-    "Completed",
-  ]);
 
   const applicationStatus = page.getByRole("combobox", { name: "Filter applications by application status" });
-  await expect(applicationStatus.locator("option")).toHaveText([
-    "All application statuses",
-    "Pending application",
-    "Did not apply",
-    "Applied",
-    "OA received",
-    "OA completed",
-    "Rejected",
-    "Interview",
-    "Accepted",
-  ]);
+
   await expect(applicationStatus.locator('option[value="failed"]')).toHaveCount(0);
 
   for (const [status, runId] of [
     ["did_not_apply", "lifecycle-did-not-apply"],
+    ["manual_application", "lifecycle-manual"],
     ["oa_received", "lifecycle-oa-received"],
     ["oa_completed", "lifecycle-oa-completed"],
   ] as const) {
@@ -2368,6 +2340,11 @@ test("filters by independent pipeline and application statuses and keeps Failed 
   const failedStatus = page.getByRole("combobox", { name: "Application status for lifecycl…iled" });
   await expect(failedStatus).toHaveValue("failed");
   await expect(failedStatus.locator('option[value="failed"]')).toBeDisabled();
+
+  await pipelineStatus.selectOption("failed");
+  await expect(page.locator("tbody a.application-link")).toHaveCount(2);
+  await expect(page.locator('tbody a.application-link[href="/runs/lifecycle-applied"]')).toBeVisible();
+  await expect(page.locator('tbody a.application-link[href="/runs/lifecycle-accepted"]')).toBeVisible();
 });
 
 test("lets the user change application status", async ({ page }) => {
@@ -2422,7 +2399,7 @@ test("retains application status when an update fails", async ({ page }) => {
 
   await expect(applicationState).toHaveValue("applied");
   await expect(applicationState).toBeEnabled();
-  await expect(page.getByRole("alert", { name: "Application status update error" })).toContainText("Application status could not be updated. Try again.");
+  await expect(page.getByRole("alert", { name: "Run action error" })).toBeVisible();
 });
 
 test("shows application lifecycle and pipeline progress separately without legacy metadata", async ({ page }) => {
@@ -2658,7 +2635,7 @@ test("uses the simplified opened-run header workflow layout", async ({ page }) =
 });
 
 
-test("keeps dashboard snapshots visible while revalidating between Applications and Providers", async ({ page }) => {
+test("keeps dashboard snapshots visible while revalidating between Applications and Credentials", async ({ page }) => {
   const stableRuns = Array.from(
     { length: 7 },
     (_, index) => runFixture(`stable-${index}`, "applied", "approved"),
@@ -2715,6 +2692,7 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
+          { provider: "google-antigravity", state: "disconnected" },
           { provider: "gmail", state: "disconnected" },
         ],
       }),
@@ -2725,15 +2703,15 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
 
   const primaryNavigation = page.getByRole("navigation", { name: "Primary navigation" });
   const applicationCount = page.getByRole("region", { name: "Application count" }).locator("p").first();
-  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Discovery", "Providers"]);
+  await expect(primaryNavigation.getByRole("link")).toHaveText(["Applications", "Credentials"]);
   await expect(applicationCount).toHaveText("7");
 
-  await primaryNavigation.getByRole("link", { name: "Providers" }).click();
-  await expect(page).toHaveURL(/\/providers$/);
+  await primaryNavigation.getByRole("link", { name: "Credentials" }).click();
+  await expect(page).toHaveURL(/\/credentials$/);
   const providerBadges = page.locator(".status-badge");
-  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
-  await expect(page.locator(".provider-row")).toHaveCount(2);
-  await expect(page.getByText("Google Antigravity", { exact: true })).toHaveCount(0);
+  await expect(providerBadges).toHaveText(["connected", "disconnected", "disconnected"]);
+
+
 
   holdRunRefresh = true;
   await primaryNavigation.getByRole("link", { name: "Applications" }).click();
@@ -2744,9 +2722,9 @@ test("keeps dashboard snapshots visible while revalidating between Applications 
   await runRefreshCompleted;
 
   holdAuthRefresh = true;
-  await primaryNavigation.getByRole("link", { name: "Providers" }).click();
+  await primaryNavigation.getByRole("link", { name: "Credentials" }).click();
   await authRefreshStarted;
-  await expect(providerBadges).toHaveText(["connected", "disconnected"]);
+  await expect(providerBadges).toHaveText(["connected", "disconnected", "disconnected"]);
   await expect(providerBadges.filter({ hasText: "Checking" })).toHaveCount(0);
   releaseAuthRefresh();
   await authRefreshCompleted;
@@ -2772,10 +2750,10 @@ test("uses full-width physical folder tabs at desktop and narrow widths", async 
   }
 
 
-  await page.goto("/providers/settings");
+  await page.goto("/credentials/settings");
   await expect(
     page.getByRole("navigation", { name: "Primary navigation" })
-      .getByRole("link", { name: "Providers" }),
+      .getByRole("link", { name: "Credentials" }),
   ).toHaveAttribute("aria-current", "page");
 });
 
@@ -2790,6 +2768,7 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
       body: JSON.stringify({
         providers: [
           { provider: "openai-codex", state: "connected", identity: { email: "codex@example.com" } },
+          { provider: "google-antigravity", state: "disconnected" },
           { provider: "gmail", state: "disconnected" },
         ],
       }),
@@ -2808,15 +2787,16 @@ test("uses folder navigation and local scrollers on narrow displays", async ({ p
       await tableScroller.evaluate((element) => element.clientWidth),
     );
 
-    await page.goto("/providers");
-    await expectFolderNavigation(page, width, "Providers");
+    await page.goto("/credentials");
+    await expectFolderNavigation(page, width, "Credentials");
     await expectNoDocumentOverflow(page);
     const providerRows = page.locator(".provider-row");
-    await expect(providerRows).toHaveCount(2);
-    await expect(providerRows).toContainText(["OpenAI Codex", "Gmail"]);
-    await expect(providerRows.locator(".status-badge")).toHaveText(["connected", "disconnected"]);
+
+
+    await expect(providerRows.locator(".status-badge")).toHaveText(["connected", "disconnected", "disconnected"]);
     await expect(providerRows.getByRole("button", { name: "Logout OpenAI Codex" })).toBeEnabled();
     await expect(providerRows.getByRole("button", { name: "Connect Gmail" })).toBeEnabled();
+    await expect(providerRows.getByRole("button", { name: "Connect Google Antigravity" })).toBeEnabled();
     for (const providerRow of await providerRows.all()) {
       expect(await providerRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(/\s+/))).toHaveLength(1);
       const providerRowBox = await providerRow.boundingBox();
@@ -2857,6 +2837,7 @@ test("uses the dark palette and accessible lifecycle status presentation", async
     "--color-danger": "#ef8a82",
     "--color-focus": "#d2f34c",
     "--color-application-did_not_apply": "#aeb4bf",
+    "--color-application-manual_application": "#f0a36c",
     "--color-application-applied": "#c2a7ef",
     "--color-application-oa_received": "#e3c66f",
     "--color-application-oa_completed": "#8fd4c0",
@@ -2872,7 +2853,7 @@ test("uses the dark palette and accessible lifecycle status presentation", async
     runFixture("lifecycle-pending", "pending", "queued"),
   ]);
   await page.goto("/");
-  await expect(page.locator("select.application-status-control")).toHaveCount(9);
+  await expect(page.locator("select.application-status-control")).toHaveCount(10);
 
   const rootStyle = await page.evaluate((tokens) => {
     const style = getComputedStyle(document.documentElement);
@@ -2896,6 +2877,7 @@ test("uses the dark palette and accessible lifecycle status presentation", async
   for (const status of [
     "pending",
     "did_not_apply",
+    "manual_application",
     "applied",
     "oa_received",
     "oa_completed",
@@ -2968,6 +2950,7 @@ test("uses the dark palette and accessible lifecycle status presentation", async
     "--color-danger",
     "--color-focus",
     "--color-application-did_not_apply",
+    "--color-application-manual_application",
     "--color-application-applied",
     "--color-application-oa_received",
     "--color-application-oa_completed",

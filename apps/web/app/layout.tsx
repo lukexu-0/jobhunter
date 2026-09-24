@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { AppNavigation } from "./components/app-navigation";
-import { DashboardDataProvider } from "./providers/dashboard-data-provider";
-import { AlertProvider } from "./providers/alert-provider";
+import { NotificationRecovery } from "./components/alert-controls";
+import { DashboardDataProvider } from "./credentials/dashboard-data-provider";
+import { AlertProvider } from "./credentials/alert-provider";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -18,7 +19,10 @@ export default function RootLayout({ children }: Readonly<{ children: ReactNode 
           <div className="app-shell">
             <AppNavigation />
             <DashboardDataProvider>
-              <div className="app-shell__workspace">{children}</div>
+              <div className="app-shell__workspace">
+                <NotificationRecovery />
+                {children}
+              </div>
             </DashboardDataProvider>
           </div>
         </AlertProvider>

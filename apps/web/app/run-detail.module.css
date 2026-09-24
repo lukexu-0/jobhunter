@@ -49,6 +49,28 @@
   display: grid;
   gap: var(--space-2);
 }
+
+.failureAlert {
+  display: grid;
+  gap: var(--space-3);
+  border-bottom: var(--border-width) solid var(--color-danger);
+  padding: var(--space-3) var(--space-5);
+  background: var(--color-surface-raised);
+}
+
+.failureAlert [role="alert"] {
+  color: var(--color-danger);
+}
+
+.failureAlert p,
+.failureAlert ul {
+  margin-block: 0;
+}
+
+.failureAlert button {
+  justify-self: start;
+}
+
 .reviewAlert {
   margin: 0;
   border-block: var(--border-width) solid var(--color-warning);
@@ -716,6 +738,10 @@
 
 .applicationBadge--did_not_apply {
   --application-badge-color: var(--color-application-did_not_apply);
+}
+
+.applicationBadge--manual_application {
+  --application-badge-color: var(--color-application-manual_application);
 }
 
 .applicationBadge--applied {

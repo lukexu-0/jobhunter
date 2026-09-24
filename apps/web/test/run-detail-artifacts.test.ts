@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ArtifactDto, ResumeIterationDto } from "@jobhunter/pipeline/contracts";
+import type { ArtifactDto, ResumeIterationDto } from "../app/lib/pipeline-contracts";
 import {
   publicArtifacts,
   reconcileResumeIterationSelection,

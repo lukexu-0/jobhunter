@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { type RunDto } from "@jobhunter/pipeline/contracts";
+import { type RunDto } from "../../app/lib/pipeline-contracts";
 
 const newerRun: RunDto = {
   id: "newer-run",
@@ -32,6 +32,7 @@ function fulfillError(route: Route, message: string): Promise<void> {
 
 test("ignores an older run-list failure after a newer list has loaded", async ({ page }) => {
   let requestCount = 0;
+  let olderRoute: Route | undefined;
   let markOlderStarted: () => void = () => {};
   const olderStarted = new Promise<void>((resolve) => {
     markOlderStarted = resolve;
@@ -51,13 +52,13 @@ test("ignores an older run-list failure after a newer list has loaded", async ({
     }
 
     if (requestCount === 2) {
+      olderRoute = route;
       markOlderStarted();
       await olderRelease;
       await fulfillError(route, "Stale list failure");
       return;
     }
 
-    expect(requestCount).toBe(3);
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({ runs: [newerRun] }),
@@ -72,6 +73,10 @@ test("ignores an older run-list failure after a newer list has loaded", async ({
 
   await retry.click();
   await olderStarted;
+  const olderSettled = Promise.race([
+    page.waitForEvent("requestfailed", { predicate: (request) => request === olderRoute!.request() }),
+    page.waitForResponse((response) => response.request() === olderRoute!.request()).then((response) => response.finished()),
+  ]);
   await retry.click();
 
   const newerRow = page.getByRole("row").filter({
@@ -81,14 +86,8 @@ test("ignores an older run-list failure after a newer list has loaded", async ({
   await expect(initialFailure).not.toBeVisible();
   await expect(staleFailure).not.toBeVisible();
 
-  const staleResponse = page.waitForResponse((response) =>
-    response.url().endsWith("/api/pipeline/runs") && response.status() === 409,
-  );
   releaseOlder();
-  await (await staleResponse).finished();
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-  }));
+  await olderSettled;
 
   await expect(newerRow).toBeVisible();
   await expect(initialFailure).not.toBeVisible();
@@ -117,6 +116,7 @@ test("WEB-UI-002 keeps a successful application-status patch after an older list
     updatedAt: 1_700_000_002_000,
   };
   let listRequests = 0;
+  let staleRoute: Route | undefined;
   let markStaleStarted: () => void = () => {};
   const staleStarted = new Promise<void>((resolve) => {
     markStaleStarted = resolve;
@@ -141,7 +141,11 @@ test("WEB-UI-002 keeps a successful application-status patch after an older list
       return;
     }
 
-    expect(listRequests).toBe(2);
+    if (listRequests > 2) {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ runs: [patchedRun] }) });
+      return;
+    }
+    staleRoute = route;
     markStaleStarted();
     await staleRelease;
     await route.fulfill({
@@ -166,19 +170,16 @@ test("WEB-UI-002 keeps a successful application-status patch after an older list
   await expect(applicationState).toHaveValue("applied");
   await staleStarted;
 
+  const staleSettled = Promise.race([
+    page.waitForEvent("requestfailed", { predicate: (request) => request === staleRoute!.request() }),
+    page.waitForResponse((response) => response.request() === staleRoute!.request()).then((response) => response.finished()),
+  ]);
   await applicationState.selectOption("interview");
   await patchCompleted;
   await expect(applicationState).toHaveValue("interview");
 
-  const staleResponse = page.waitForResponse((response) =>
-    response.url().endsWith("/api/pipeline/runs")
-      && response.request().method() === "GET",
-  );
   releaseStale();
-  await (await staleResponse).finished();
-  await page.evaluate(() => new Promise<void>((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-  }));
+  await staleSettled;
 
   expect(await applicationState.inputValue()).toBe("interview");
 });

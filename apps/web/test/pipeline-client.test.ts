@@ -5,37 +5,34 @@ import {
   type ArtifactDto,
   type RunDto,
   type ResumeIterationListResponse,
-  type DiscoveryJob,
   type RunStatus,
-} from "@jobhunter/pipeline/contracts";
+} from "../app/lib/pipeline-contracts";
 import {
   PipelineClientError,
-  applicationEventsHref,
   approveRun,
   artifactHref,
   closeApplicationSession,
+  openApplicationBrowser,
   completeSourceHandoff,
   createRun,
   createSourceHandoff,
   deleteRun,
   deleteSourceHandoff,
-  listDiscoveryJobs,
   editRun,
   getApplicationAnswerSuggestions,
   getApplicationSession,
+  startAuthSession,
   getRun,
   getSourceHandoff,
   listRuns,
   listResumeIterations,
   readJsonArtifact,
   professionalizeApplicationAnswer,
-  queueDiscoveryJobs,
   regenerateRun,
   retryApplicationSession,
   retryRun,
   sendApplicationCommand,
   startApplicationSession,
-  syncDiscoveryJobs,
   updateApplicationStatus,
   updateRunIdentity,
 } from "../app/lib/pipeline-client";
@@ -74,28 +71,6 @@ function run(status: RunStatus = "queued"): RunDto {
     attempts: [],
     artifacts: [],
     timeline: [],
-  };
-}
-
-function discoveredJob(overrides: Partial<DiscoveryJob> = {}): DiscoveryJob {
-  return {
-    id: "job-1",
-    title: "Machine Learning Intern",
-    company: "Example Labs",
-    location: null,
-    roles: ["machine_learning"],
-    season: "unspecified",
-    suitable: true,
-    canonicalUrl: "https://example.com/jobs/ml-intern",
-    applyUrl: "https://example.com/jobs/ml-intern/apply",
-    descriptionPreview: "Build and evaluate production machine learning systems.",
-    queueable: true,
-    postedAt: null,
-    firstSeenAt: 1_775_174_400_000,
-    lastSeenAt: 1_775_174_460_000,
-    status: "open",
-    sourceNames: ["Simplify"],
-    ...overrides,
   };
 }
 
@@ -768,11 +743,14 @@ describe("pipeline application session requests", () => {
 
     const id = "run /1?";
     await expect(getApplicationSession(id)).resolves.toEqual(applicationView);
-    await expect(startApplicationSession(id, sha256)).resolves.toEqual(applicationSnapshot);
+    await expect(startApplicationSession(id, sha256, {
+      autoSubmit: true,
+      autoEnd: true,
+      reapply: true,
+    })).resolves.toEqual(applicationSnapshot);
     await expect(retryApplicationSession(id, sha256)).resolves.toEqual(applicationSnapshot);
     await expect(sendApplicationCommand(id, {
-      type: "approve_origin",
-      origin: "https://apply.example.test",
+      type: "continue",
     })).resolves.toBeUndefined();
     await expect(sendApplicationCommand(id, {
       type: "sign_in",
@@ -790,9 +768,6 @@ describe("pipeline application session requests", () => {
     })).resolves.toBeUndefined();
     await expect(sendApplicationCommand(id, { type: "submit" })).resolves.toBeUndefined();
     await expect(closeApplicationSession(id)).resolves.toBeUndefined();
-    expect(applicationEventsHref(id)).toBe(
-      "/api/pipeline/runs/run%20%2F1%3F/application/events",
-    );
 
     expect(requests).toEqual([
       {
@@ -802,7 +777,12 @@ describe("pipeline application session requests", () => {
       {
         input: "/api/pipeline/runs/run%20%2F1%3F/application",
         init: {
-          body: JSON.stringify({ expectedApprovedPdfSha256: sha256 }),
+          body: JSON.stringify({
+            expectedApprovedPdfSha256: sha256,
+            autoSubmit: true,
+            autoEnd: true,
+            reapply: true,
+          }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
           method: "POST",
@@ -821,8 +801,7 @@ describe("pipeline application session requests", () => {
         input: "/api/pipeline/runs/run%20%2F1%3F/application/commands",
         init: {
           body: JSON.stringify({
-            type: "approve_origin",
-            origin: "https://apply.example.test",
+            type: "continue",
           }),
           cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -883,7 +862,19 @@ describe("pipeline application session requests", () => {
     ]);
     expect(JSON.stringify(requests)).not.toContain("127.0.0.1:8765");
     expect(JSON.stringify(requests)).not.toContain("authorization");
-    expect(JSON.stringify(requests)).not.toContain("JOBHUNTER_HARNESS_TOKEN");
+    expect(JSON.stringify(requests)).not.toContain("JOBHUNT_HARNESS_TOKEN");
+  });
+
+  test("opens the run-scoped application browser without a request body", async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    capture(new Response(null, { status: 204 }), requests);
+
+    await expect(openApplicationBrowser("run /1?")).resolves.toBeUndefined();
+
+    expect(requests).toEqual([{
+      input: "/api/pipeline/runs/run%20%2F1%3F/application/browser/open",
+      init: { cache: "no-store", method: "POST" },
+    }]);
   });
 
   test("loads suggestions and professionalizes through exact same-origin question paths", async () => {
@@ -949,7 +940,7 @@ describe("pipeline application session requests", () => {
       },
     ]);
     expect(JSON.stringify(requests)).not.toContain("authorization");
-    expect(JSON.stringify(requests)).not.toContain("JOBHUNTER_HARNESS_TOKEN");
+    expect(JSON.stringify(requests)).not.toContain("JOBHUNT_HARNESS_TOKEN");
     expect(JSON.stringify(requests)).not.toContain("127.0.0.1:8765");
   });
 
@@ -1101,6 +1092,27 @@ describe("pipeline application session requests", () => {
   });
 });
 
+describe("pipeline authorization requests", () => {
+  test("redacts callback credentials from rejected sign-in requests", async () => {
+    setFetchMock(async () => json({ error: { code: "AUTH_REJECTED", message: "code=private-code state=private-state callback=private-callback" } }, { status: 400 }));
+    const error = await startAuthSession("gmail").catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(PipelineClientError);
+    expect(error).toMatchObject({ code: "AUTH_REJECTED", status: 400 });
+    for (const credential of ["private-code", "private-state", "private-callback"]) {
+      expect((error as Error).message).not.toContain(credential);
+    }
+  });
+  test("rejects private and mismatched provider sessions instead of exposing them", async () => {
+    const session = { id: "auth-1", provider: "gmail", state: "pending", progress: [], expiresAt: 60_000 };
+    setFetchMock(async () => json({ ...session, accessToken: "private-access-token" }, { status: 201 }));
+    await expect(startAuthSession("gmail")).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+    setFetchMock(async () => json({ ...session, provider: "openai-codex" }, { status: 201 }));
+    await expect(startAuthSession("gmail")).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+    setFetchMock(async () => json({ ...session, url: "not a URL" }, { status: 201 }));
+    await expect(startAuthSession("gmail")).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+  });
+});
+
 describe("pipeline artifacts", () => {
   test("prefixes only same-origin public pipeline artifact paths", () => {
     expect(artifactHref("/v1/runs/run%201/artifacts/artifact-1")).toBe(
@@ -1173,148 +1185,5 @@ describe("pipeline artifacts", () => {
 
     setFetchMock(async () => new Response("{}", { headers: { "content-type": "application/json", "content-length": "1048577" } }));
     await expect(readJsonArtifact(artifact())).rejects.toThrow("The artifact is too large to read.");
-  });
-});
-
-describe("pipeline discovery requests", () => {
-  test("builds the complete filtered list query and validates nullable preview queueability", async () => {
-    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
-    const response = {
-      jobs: [discoveredJob({ descriptionPreview: null, queueable: false })],
-      total: 1,
-      lastSyncAt: 1_775_174_460_000,
-    };
-    capture(json(response), requests);
-
-    await expect(listDiscoveryJobs({
-      role: "machine_learning",
-      maxAgeDays: 14,
-      status: "queued",
-      suitable: false,
-      sort: "source",
-      hideQueued: true,
-      search: "model evaluation",
-      limit: 1_000,
-      offset: 0,
-    })).resolves.toEqual(response);
-    expect(requests).toEqual([{
-      input: "/api/pipeline/discovery?role=machine_learning&maxAgeDays=14&status=queued&suitable=false&sort=source&hideQueued=true&search=model+evaluation&limit=1000&offset=0",
-      init: { cache: "no-store", method: "GET" },
-    }]);
-  });
-
-  test("encodes the unbounded recent filter and rejects malformed list responses", async () => {
-    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
-    capture(json({
-      jobs: [{ ...discoveredJob(), description: "Unexpected full description" }],
-      total: 1,
-      lastSyncAt: null,
-    }), requests);
-
-    await expect(listDiscoveryJobs({
-      maxAgeDays: null,
-      status: "all",
-      search: "",
-      limit: 1_000,
-      offset: 0,
-    })).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
-    expect(requests[0]?.input).toBe(
-      "/api/pipeline/discovery?maxAgeDays=all&status=all&sort=recency&hideQueued=false&search=&limit=1000&offset=0",
-    );
-  });
-
-  test("requires queueability in list responses", async () => {
-    const { queueable: _queueable, ...jobWithoutQueueable } = discoveredJob();
-    setFetchMock(async () => json({
-      jobs: [jobWithoutQueueable],
-      total: 1,
-      lastSyncAt: null,
-    }));
-
-    await expect(listDiscoveryJobs({
-      maxAgeDays: null,
-      status: "all",
-      search: "",
-      limit: 1_000,
-      offset: 0,
-    })).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
-  });
-
-  test("queues selected jobs once with the exact run modes and validates the result", async () => {
-    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
-    const response = {
-      queued: [{ jobId: "job-2", run: run() }],
-      skipped: [{ jobId: "job-1", reason: "description_unavailable" as const }],
-    };
-    capture(json(response), requests);
-
-    await expect(queueDiscoveryJobs({
-      jobIds: ["job-2", "job-1"],
-      generateKeywordMap: false,
-      skipReview: true,
-      autoSubmit: true,
-    })).resolves.toEqual(response);
-    expect(requests).toEqual([{
-      input: "/api/pipeline/discovery/queue",
-      init: {
-        body: JSON.stringify({
-          jobIds: ["job-2", "job-1"],
-          generateKeywordMap: false,
-          skipReview: true,
-          autoSubmit: true,
-        }),
-        cache: "no-store",
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      },
-    }]);
-  });
-
-  test("rejects invalid discovery requests before fetching", () => {
-    let fetchCalls = 0;
-    setFetchMock(async () => {
-      fetchCalls += 1;
-      return json({});
-    });
-
-    expect(() => listDiscoveryJobs({ maxAgeDays: 0 } as never)).toThrow(PipelineClientError);
-    expect(() => syncDiscoveryJobs({ unexpected: true } as never)).toThrow(PipelineClientError);
-    expect(() => queueDiscoveryJobs({ jobIds: ["same", "same"] })).toThrow(PipelineClientError);
-    expect(fetchCalls).toBe(0);
-  });
-
-  test("validates sync and queue responses instead of exposing upstream data", async () => {
-    const syncResponse = {
-      sources: [],
-      totals: {
-        sources: 0,
-        succeeded: 0,
-        failed: 0,
-        received: 0,
-        created: 0,
-        updated: 0,
-        closed: 0,
-        descriptionUnavailable: 0,
-      },
-      completedAt: 10,
-    };
-    setFetchMock(async (input) => input.toString().endsWith("/sync")
-      ? json(syncResponse)
-      : json({
-          queued: [],
-          skipped: [{ jobId: "job-1", reason: "closed", upstreamBody: "private" }],
-        }));
-
-    await expect(syncDiscoveryJobs()).resolves.toMatchObject({ completedAt: 10 });
-    await expect(queueDiscoveryJobs({ jobIds: ["job-1"] })).rejects.toMatchObject({
-      code: "INVALID_RESPONSE",
-    });
-
-    const { descriptionUnavailable: _descriptionUnavailable, ...incompleteTotals } = syncResponse.totals;
-    setFetchMock(async () => json({ ...syncResponse, totals: incompleteTotals }));
-    await expect(syncDiscoveryJobs()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
-
-    setFetchMock(async () => json({ ...syncResponse, upstreamBody: "private" }));
-    await expect(syncDiscoveryJobs()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
   });
 });

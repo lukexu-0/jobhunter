@@ -1,20 +1,7 @@
 {
-  "name": "@jobhunter/apps",
+  "name": "@jobhunt/apps-launcher",
   "private": true,
-  "workspaces": ["web", "resume-tailoring"],
-  "packageManager": "bun@1.3.14",
-  "dependencies": {
-    "@playwright/cli": "0.1.17",
-    "playwright": "1.62.0-alpha-1783623505000"
-  },
   "scripts": {
-    "dev": "bun scripts/serve.ts dev",
-    "start": "bun scripts/serve.ts start",
-    "typecheck": "bun run --cwd resume-tailoring typecheck && bun run --cwd web typecheck",
-    "build": "bun run --cwd resume-tailoring build && bun run --cwd web build",
-    "test": "bun test scripts/launch-config.test.ts scripts/user-context-backup.test.ts && bun test --cwd resume-tailoring && bun test --cwd web",
-    "artifacts:restore": "bun scripts/restore-artifacts.ts",
-    "user-context:backup": "bun scripts/backup-user-context.ts",
-    "user-context:restore": "bun scripts/restore-user-context.ts"
+    "start": "bun ../misc/scripts/serve.ts start"
   }
 }

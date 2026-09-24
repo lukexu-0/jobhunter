@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { type RunDto } from "@jobhunter/pipeline/contracts";
+import { type RunDto } from "../../app/lib/pipeline-contracts";
 
 const reviewRun: RunDto = {
   id: "metadata-review-run",

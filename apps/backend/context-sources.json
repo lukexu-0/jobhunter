@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "resume-baseline",
+      "relativePath": ".jobhunt-data/user-info/resume-main/resume.tex",
+      "kind": "baseline",
+      "entityId": "candidate-resume",
+      "displayName": "Resume baseline",
+      "baselineEntityIds": []
+    }
+  ],
+  "explicitEntityBindings": {}
+}

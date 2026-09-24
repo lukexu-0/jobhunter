@@ -1,7 +1,7 @@
 import {
   ApplicationSessionCommandSchema,
   type ApplicationSessionCommand,
-} from "@jobhunter/pipeline/contracts";
+} from "./pipeline-contracts";
 import { hasCodePointLength } from "./application-text";
 
 type ReviseCommand = Extract<

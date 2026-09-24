@@ -1,0 +1,33 @@
+{
+  "name": "@jobhunt/browser-harness",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "scripts": {
+    "build": "bun build src/host/index.ts --target bun --outdir dist",
+    "start": "bun dist/index.js",
+    "dev": "bun src/host/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "playwright:install-ffmpeg": "PLAYWRIGHT_BROWSERS_PATH=${HOME}/.cache/ms-playwright bun node_modules/playwright/cli.js install ffmpeg",
+    "smoke": "bun tests/e2e/smoke-local.ts"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-agent-core": "16.4.6",
+    "@oh-my-pi/pi-ai": "16.4.6",
+    "@oh-my-pi/pi-catalog": "16.4.6",
+    "@openai/agents-core": "0.13.2",
+    "@playwright/cli": "0.1.17",
+    "gpt-tokenizer": "4.0.0",
+    "image-size": "2.0.2",
+    "playwright": "1.62.0-alpha-1783623505000",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.11",
+    "typescript": "6.0.2"
+  },
+  "patchedDependencies": {
+    "playwright-core@1.62.0-alpha-1783623505000": "../../misc/patches/playwright-core@1.62.0-alpha-1783623505000.patch"
+  }
+}

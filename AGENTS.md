@@ -2,127 +2,133 @@
 
 ## Project Overview
 
-Jobhunter is a local, evidence-grounded system for opportunity discovery, resume tailoring, review, and application assistance. It has three cooperating processes:
+Jobhunt is a local-first job-application system. It imports job details, analyzes fit, tailors and compiles a resume, runs deterministic and visual QA, presents the result for review, and can hand an approved run to human-gated browser automation.
 
-- `apps/resume-tailoring/`: Bun/TypeScript pipeline API, SQLite workflow engine, discovery catalog, candidate-context snapshots, model-backed tailoring, TeX/PDF generation, QA, and application orchestration.
-- `apps/web/`: Next.js App Router UI for starting and monitoring runs, reviewing revisions, browsing discovery results, managing application state, and connecting OpenAI Codex OAuth.
-- `apps/application/`: separately launched Python/FastAPI harness that owns up to three constrained Playwright CLI/Chrome application sessions, one exclusive source-capture session, and their human gates.
+Three processes cooperate:
 
-Prefer strict contracts, provenance, immutable artifacts, bounded I/O, and public-safe failures. `apps/user-info/` contains private candidate evidence; those files are inputs, not operational engineering documentation.
+- `apps/backend`: Bun/TypeScript pipeline, durable workflow, and HTTP API.
+- `apps/web`: Next.js App Router review and operations UI.
+- `apps/harness`: TypeScript/Bun service that drives Playwright CLI sessions.
+
+Treat `.jobhunt-data/user-info/`, credentials, generated resumes, model traces, runtime databases, artifacts, and browser profiles as private runtime data. Never use their contents in logs, tests, commits, or documentation examples.
 
 ## Architecture & Data Flow
 
-1. Browser code calls same-origin `/api/pipeline/*` through `apps/web/app/lib/pipeline-client.ts`. `apps/web/next.config.ts` rewrites those calls to the Bun `/v1/*` API; application SSE uses `apps/web/app/api/application-events/[runId]/route.ts`.
-2. Run creation validates a URL or pasted description, loads/extracts opportunity text, requires a fresh candidate-context snapshot, writes a bounded input artifact, and transactionally creates the queued run, revision, source snapshot, and events.
-3. `WorkerScheduler` leases at most five SQLite claims. `PipelineStageProcessor` claim-fences `analyzing → tailoring/editing → compiling/repairing → deterministic_qa → visual_qa → review/approved`. Stages create new artifacts and guarded revisions; they do not mutate finalized output.
-4. `PipelineRepository` owns durable run, revision, attempt, claim, event, source-snapshot, and application-session state. `ArtifactStore` owns bounded, path-contained bytes. Writes are atomic and SHA-256/size verified; claim tokens and source/PDF hashes reject stale work.
-5. Shared React data lives in `DashboardDataProvider`; detail/review and application-stream state live in their owning workspace components. Poll only while work is active and reject stale responses with request/version or generation/event guards.
-6. For approved URL-backed runs, `ApplicationSessionService` sends the approved PDF, TeX source, profile, and mode to the bearer-protected Python harness. Python owns three application browser slots or one exclusive source-capture session and owns all human gates; it calls only the private Bun `/v1/internal/application-agent` model boundary. Harness snapshots/events return through SQLite and the web SSE bridge; raw model traces remain private diagnostics.
-7. Runtime state is outside the checkout: `<data-root>/production/{pipeline.sqlite,context.sqlite,auth.sqlite,runs/}` or `<data-root>/development/<encoded-branch>/...`. `<data-root>` is absolute `JOBHUNTER_DATA_HOME`, otherwise absolute `$XDG_DATA_HOME/jobhunter`, otherwise `~/.local/share/jobhunter`. Never edit these stores directly.
+1. The web UI calls same-origin `/api/pipeline` endpoints through `apps/web/app/lib/pipeline-client.ts`. `apps/web/next.config.ts` rewrites them to backend `/v1` routes. Application sessions reconcile public snapshots by polling; the frontend does not hold persistent application event streams.
+2. `apps/backend/src/index.ts` starts the pipeline. `apps/backend/src/bootstrap.ts` is the composition root for repositories, artifact storage, workers, services, routes, model tooling, and the harness client.
+3. API contracts originate in Zod schemas under `apps/backend/src/contracts/`. The web mirrors and validates wire payloads; the harness uses strict Zod models. Coordinate contract changes across all three processes.
+4. `PipelineRepository` stores runs, attempts, events, claims, application sessions, and artifact lineage in SQLite. `WorkerScheduler` leases fenced claims; `PipelineStageProcessor` advances analysis → tailoring/editing → compile/repair → deterministic/visual QA → review. Do not bypass repository or state-machine transitions.
+5. Approved runs can create harness sessions. The Bun harness owns browser state, credential redaction, and human gates for missing information, CAPTCHA, review, and final submission. Harness SSE is projected durably by the backend; the web reconciles those public snapshots.
+
+Frontend coordination belongs to framework-independent modules:
+
+- `application-session.ts` owns command lifetimes, projection ordering, polling, and ambiguous delivery. `use-application-session.ts` binds that lifetime to React. HTTP acceptance is not workflow completion.
+- `authorization-session.ts` owns provider/session coordination, cancellation, status reconciliation, and application-model selection. The OAuth view retains synchronous popup reservation and private prompt drafts.
+- `run-collection.ts` owns Run membership, attention observers, dashboard-scoped identity metadata, and semantic updates. `DashboardDataProvider` subscribes to it; the dashboard retains view state and distinct bulk-operation policies. Creation scopes prevent delayed results from restoring removed Runs.
+
+Keep reconciliation in these modules and transient drafts in their views. An asynchronous dialog completion may change errors, close a dialog, or restore focus only while it still owns that exact dialog.
+
+Preserve these boundaries. Keep external I/O bounded and cancellation-aware, sanitize public errors, and never blindly retry an ambiguous application submission.
 
 ## Key Directories
 
 | Path | Purpose |
 | --- | --- |
-| `apps/resume-tailoring/src/` | Pipeline contracts, API, persistence, scheduler/stages, context, discovery, auth, agents, artifacts, and process boundaries. |
-| `apps/resume-tailoring/test/` | Bun unit and integration tests for pipeline behavior. |
-| `apps/web/app/` | Next pages, route handlers, components, provider state, and typed pipeline client. |
-| `apps/web/test/` | Bun web tests; `test/e2e/` contains Playwright `*.pw.ts` scenarios. |
-| `apps/application/src/browser_harness/` | FastAPI boundary, session state machine, Playwright adapter, credentials, artifacts, and pipeline client. |
-| `apps/application/tests/` | Pytest protocol, API, session, process, and optional real-browser fixture tests. |
-| `apps/scripts/` | Coordinated launch, port/storage selection, backups, state import, and verified recovery. |
-| `apps/user-info/` | Canonical private resume and candidate evidence consumed by context sync. |
-| `info/docs/apps/` | Current source-linked operational documentation. `info/planning/` is historical, not authoritative. |
+| `apps/backend/src/` | Pipeline API, contracts, SQLite persistence, stages, agents, resume tools, and workers. |
+| `apps/backend/test/` | Bun behavior and integration tests for the pipeline. |
+| `apps/web/app/` | App Router pages, components, providers, API bridges, and typed pipeline transport. |
+| `apps/web/test/` | Bun tests; `test/e2e/` contains Playwright specs. |
+| `apps/harness/src/` | CLI, HTTP surface, sessions, browser tools, credentials, and OAuth. |
+| `apps/harness/tests/` | Bun test suite and loopback browser fixtures. |
+| `misc/scripts/` | Launch, doctor, backup/restore, context sync, and production operations. |
+| `misc/patches/` | Required dependency patches, including patched Playwright core. |
+| `.jobhunt-data/user-info/` | Git-ignored applicant source data shared by development and production in this checkout; never treat it as test or documentation material. |
+
+Backend launcher storage lives in Git-ignored `.jobhunt-data/` at the checkout root, split into `development/<encoded-branch>/` and `production/`. Launch does not import data from an external namespace. Existing installations require a one-time, deliberate offline copy before starting the matching pipeline: stop that pipeline, copy the relevant SQLite databases and their WAL state consistently into the checkout-local namespace, copy run artifacts and user-context snapshots, then rebind persisted artifact paths and backup manifests to the destination checkout and storage root. Keep the external originals unmodified for rollback; do not rely on launch or artifact restore to find them. Stable startup snapshots a present user-context tree before launch, and restores use local storage only. Harness browser and OAuth data remain separate under `~/.jobhunt/browser-harness/`.
+
+For a new checkout, start with no applicant tree or create your own private files under .jobhunt-data/user-info/. A fresh stable start skips its pre-start snapshot only while that tree does not exist; an existing tree must snapshot successfully. The baseline resume source ID is resume-main at .jobhunt-data/user-info/resume-main/resume.tex. To supply your own source: mkdir -p .jobhunt-data/user-info/resume-main, then create .jobhunt-data/user-info/resume-main/resume.tex privately. No applicant resume, transcript, credentials, or sample data is checked in. An optional transcript requires JOBHUNT_TRANSCRIPT_PDF set to an absolute private PDF path. Put local launch secrets in Git-ignored apps/.env.local, and keep independent user-context backups outside this checkout. Startup never imports a top-level user-info/ tree; older snapshots with user-info/ or apps/user-info/ paths restore into the checkout-local tree.
 
 ## Development Commands
 
-Run these from the repository root:
+Use the root `Makefile` as the command facade:
 
 ```sh
-# Install
-cd apps && bun install
-cd apps && bun node_modules/playwright/cli.js install ffmpeg
-cd apps/application && uv sync --extra dev
-
-# Coordinated pipeline + web workspace
-cd apps && bun run dev
-cd apps && bun run typecheck
-cd apps && bun run test
-cd apps && bun run build
-cd apps && bun run start
+make install       # frozen Bun installs for all three applications
+make dev           # backend and web; does not start the harness
+make harness       # harness on :8865 against development pipeline :3557
+make typecheck     # backend, web, and harness TypeScript
+make build         # backend, harness, and Next production builds
+make test          # script, backend, web, and harness suites
+make check         # typecheck + build + test; excludes E2E
+make test-e2e      # web Playwright suite
+make doctor        # runtime and external-tool diagnostics
 ```
 
-Focused checks:
+`make dev` runs from `apps/` so Bun loads `apps/.env.local`. Start `make harness` separately from the repository root; it requires the same `JOBHUNT_HARNESS_TOKEN` as the pipeline.
+
+Useful narrow checks:
 
 ```sh
-cd apps && bun run --cwd resume-tailoring test
-cd apps && bun run --cwd web test
-cd apps && bun run --cwd web test:e2e
-cd apps/application && uv run --extra dev python -m pytest
-
-cd apps && bun test scripts/launch-config.test.ts scripts/user-context-backup.test.ts
-cd apps && bun run --cwd resume-tailoring context:sync -- --check
-cd apps && bun run --cwd resume-tailoring context:sync
-cd apps && bun run --cwd resume-tailoring doctor
+(cd apps/backend && bun test test/repository.test.ts)
+(cd apps/backend && bun test test/artifact-repository.test.ts)
+(cd apps/web && bun test test/pipeline-client.test.ts)
+(cd apps/harness && bun test tests/sessions.test.ts)
+bun run --cwd apps/backend typecheck
+bun run --cwd apps/web typecheck
 ```
 
-| Mode | Command | Web | Pipeline | Harness | Storage |
-| --- | --- | --- | --- | --- | --- |
-| Development | `cd apps && bun run dev` | `127.0.0.1:3556` | `127.0.0.1:3557` | separately launch on `127.0.0.1:8865` against pipeline `3557` | `<data-root>/development/<encoded-branch>` |
-| Stable | `cd apps && bun run build && bun run start` | `127.0.0.1:3456` | `127.0.0.1:3457` | separately launch on `127.0.0.1:8765` against pipeline `3457` | `<data-root>/production` |
+On macOS, run backend tests from `apps/backend` with `TMPDIR="$(bun -p 'require("node:fs").realpathSync(require("node:os").tmpdir())')" bun test` so temporary paths satisfy the canonical-path checks.
 
-The workspace launcher never starts the Python harness. Keep development and stable harness ports, Chrome profiles, credentials, user-information files, and storage namespaces separate. Stable start is allowed only from the primary checkout on `main`; linked worktrees must use development services and storage. See `info/docs/apps/browser-harness/application.html` for token, profile, credential, and launch commands.
+There is no configured lint or formatter command. Do not invent one; `make check` is the repository-defined non-E2E gate.
 
 ## Code Conventions & Common Patterns
 
-- **Contract-first boundaries:** TypeScript uses strict/discriminated Zod schemas; Python models are strict/frozen Pydantic and forbid extra fields. Validate URLs, enums, sizes, hashes, and semantics at ingress and persistence boundaries.
-- **Explicit dependency injection:** `apps/resume-tailoring/src/bootstrap.ts` is the TypeScript composition root. Python wires protocol-backed collaborators in `browser_harness/cli.py`. Extend constructor/options seams; do not add mutable globals.
-- **Guarded state machines:** Run, revision, attempt, claim, application-session, and browser states have explicit transitions. Keep related SQLite writes in repository-owned `BEGIN IMMEDIATE` transactions.
-- **Bounded async work:** Propagate `AbortSignal` and deadlines through TypeScript fetches, model calls, subprocesses, scheduler work, and cleanup. Python uses `asyncio` locks, tasks, conditions, and monotonic deadlines. Avoid detached work, fixed-sleep race handling, unbounded queues, and unconstrained concurrency.
-- **Public-safe errors:** Map expected failures to stable codes and bounded messages. Never expose exceptions, provider output, prompts, tokens, private evidence, claims, PIDs, session details, or filesystem paths. Preserve `no-store` responses.
-- **Filesystem/process safety:** Reject traversal and symlinks; use private modes, atomic writes, byte limits, and SHA-256 checks. Keep subprocesses allowlisted, `shell: false`, environment-sanitized, output-bounded, timed out, and process-group cancellable.
-- **Frontend state:** Reuse `DashboardDataProvider` and the existing detail/review state owners. Browser code must use the same-origin typed pipeline client, not direct loopback APIs.
-- **Naming and formatting:** TypeScript files are generally kebab-case; symbols use PascalCase/camelCase. Python modules/functions use snake_case and classes use PascalCase. Tests use `*.test.ts[x]`, `*.pw.ts`, and `test_*.py`. No formatter or linter is configured—match adjacent style and avoid broad restyling.
-- **Optional fields:** Pipeline TypeScript enables `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`; preserve distinctions among missing, `undefined`, and `null`.
-- **Documentation:** Before changing behavior, read the relevant `info/docs/` page and update every affected page afterward. These pages are standalone semantic HTML with source links, commands, boundaries, failure states, troubleshooting, and valid local links/fragments. Prefer `info/docs/apps/` and current manifests over historical `info/planning/` or candidate dossiers.
+- **TypeScript:** strict ESM, 2-space indentation, double quotes, semicolons, and trailing commas. Use kebab-case filenames, `PascalCase` types/classes, and `*Schema` for Zod schemas. Prefer `readonly` public data and `#private` class state.
+- **Contracts:** parse untrusted data at process boundaries. Keep backend Zod, web mirrors, and harness Zod models synchronized; do not add a second transport convention.
+- **Dependency injection:** extend existing factories and options such as `PipelineApplicationOptions`, `PipelineStageDependencies`, and harness option interfaces. Inject clocks, IDs, fetchers, repositories, and fakes instead of patching globals.
+- **State management:** durable workflow state belongs in SQLite through `PipelineRepository`; artifacts are immutable and lineage-tracked. Keep Next route pages thin, shared transport in `app/lib`, cross-route state in providers, and transient state in components.
+- **Async work:** use recursive `setTimeout` polling rather than overlapping `setInterval`. Pair work with `AbortController`, cleanup, request/version fences, and explicit timeouts. Preserve cancellation and bounded browser operations.
+- **Errors and privacy:** retain structured internal causes, but expose stable sanitized API/UI errors. Redact tokens, credentials, model context, applicant data, and browser/session details.
 
 ## Important Files
 
 | Path | Why it matters |
 | --- | --- |
-| `apps/package.json` and `apps/bun.lock` | Bun version, workspaces, dependencies, and aggregate commands. |
-| `apps/scripts/{serve,launch-config,launch-storage}.ts` | Process lifecycle, stable/development isolation, ports, external storage, and import safety. |
-| `apps/scripts/user-context-backup.ts` | Private candidate-context snapshot, verification, retention, restore, and rollback rules. |
-| `apps/resume-tailoring/src/{index,bootstrap}.ts` | Pipeline process entry point and composition/lifecycle root. |
-| `apps/resume-tailoring/src/contracts/index.ts` | Strict shared API contracts consumed by pipeline and web. |
-| `apps/resume-tailoring/src/db/repository.ts` | Durable state machines, transactions, claims, revisions, events, and artifact metadata. |
-| `apps/resume-tailoring/src/stages/processor.ts` | End-to-end analysis, tailoring, compile/repair, and QA orchestration. |
-| `apps/resume-tailoring/context-sources.json` | Allowlist of authoritative candidate-context sources. |
-| `apps/web/{next.config.ts,app/lib/pipeline-client.ts}` | Same-origin rewrite and browser validation/redaction boundary. |
-| `apps/web/app/providers/dashboard-data-provider.tsx` | Shared React run, identity, and OAuth state owner. |
-| `apps/web/app/components/run-review-workspace.tsx` | Application SSE projection, action latches, and review state. |
-| `apps/application/{pyproject.toml,uv.lock}` | Python runtime, exact dependencies, console entry point, and pytest setup. |
-| `apps/application/src/browser_harness/{cli,api,sessions}.py` | Harness composition, HTTP/auth boundary, and three-slot browser-session state machine. |
-| `apps/resume-tailoring/src/{api/application-session-service,agents/application-agent-service}.ts` | Approved-run handoff, sanitized SSE projection, private model boundary, submission guards, and diagnostic traces. |
-| `info/docs/apps/index.html` | Canonical workspace operations and links to pipeline, web, and harness documentation. |
+| `Makefile` | Canonical install, development, build, test, doctor, and restart commands. |
+| `apps/package.json` | Dependency-free stable launcher; this repository is not a Bun workspace. |
+| `apps/backend/src/index.ts` | Backend process entry point and shutdown handling. |
+| `apps/backend/src/bootstrap.ts` | Main TypeScript composition root. |
+| `apps/backend/src/contracts/index.ts` | Central backend API and domain schemas. |
+| `apps/backend/src/db/repository.ts` | Durable workflow, claim fencing, transactions, and events. |
+| `apps/backend/src/db/artifacts.ts` | Internal artifact publication checks, metadata reads, and retry inheritance. |
+| `apps/backend/src/stages/processor.ts` | Pipeline stage orchestration. |
+| `apps/web/app/lib/pipeline-client.ts` | Validated web-to-pipeline transport, including authorization operations. |
+| `apps/web/app/lib/application-session.ts` | Application commands and authoritative snapshot reconciliation. |
+| `apps/web/app/lib/use-application-session.ts` | React subscription and lifetime adapter for application sessions. |
+| `apps/web/app/lib/authorization-session.ts` | Provider authorization and application-model coordination. |
+| `apps/web/app/lib/run-collection.ts` | Shared Run snapshots, membership, attention, and identity metadata lifetimes. |
+| `apps/web/next.config.ts` | Same-origin pipeline rewrites and backend-origin configuration. |
+| `apps/web/playwright.config.ts` | One-worker web E2E setup and isolated ports. |
+| `apps/harness/package.json` | Harness dependencies, CLI scripts, build, and test commands. |
+| `apps/harness/src/host/index.ts` | Harness configuration and dependency composition. |
+| `apps/harness/src/host/server.ts` | Authenticated loopback HTTP surface. |
+| `apps/harness/src/contracts/models.ts` | Strict harness transport contracts. |
+| `.omp/RULES.md` | Repository-specific prohibition on production use from worktrees. |
 
 ## Runtime/Tooling Preferences
 
-- Use Bun `1.3.14` with committed `apps/bun.lock`; do not create npm, pnpm, Yarn, or alternate lockfiles.
-- Use Python `>=3.12,<3.13` with `uv` and committed `apps/application/uv.lock`.
-- The harness also requires Node.js, exact `@playwright/cli` `0.1.17`, matching `playwright` `1.62.0-alpha-1783623505000`, Chrome, and the installed ffmpeg codec.
-- Pipeline processing targets Linux. TeX/PDF work requires `latexmk`, `pdfinfo`, `pdftotext`, `pdffonts`, and `pdftoppm`; generic rendered HTML fallback also requires the documented Chrome/systemd boundary. Run `doctor` instead of guessing which prerequisite is missing.
-- Under WSL, the harness rejects automatic Windows Chrome discovery and `.exe` paths. Start Windows Chrome separately with an isolated profile and pass its loopback `--cdp-url`; follow `info/docs/apps/browser-harness/application.html`.
-- Provider access is OpenAI Codex OAuth only; do not add provider API keys. Pipeline and harness share a private `JOBHUNTER_HARNESS_TOKEN` of at least 32 code points. Never put it in browser code, URLs, source, or logs.
-- No project `.env` template, CI workflow, container deployment, formatter, or linter is configured. Follow manifests and canonical HTML docs rather than inventing tooling.
-- Do not edit generated `apps/web/next-env.d.ts`, pipeline `dist/`, Next `.next/`, test output, browser profiles, credentials, external SQLite state, or run artifacts.
+- Use **Bun 1.3.14**. `apps/backend`, `apps/web`, and `apps/harness` each have an independent `package.json` and `bun.lock`; use frozen installs and update the matching lockfile. Never substitute npm, pnpm, or Yarn.
+- Harness browser automation also requires a real Node executable, Chrome/Chromium, pinned `@playwright/cli`, and `misc/patches/playwright-core@1.62.0-alpha-1783623505000.patch`. Preserve the patch.
+- Resume processing requires `latexmk` and Poppler (`pdfinfo`, `pdftotext`, `pdffonts`, `pdftoppm`). Run `make doctor` before treating missing-tool failures as application bugs.
+- `apps/.env.local` may contain live secrets. Never print or quote it. Runtime state belongs under configured data homes, not in source control.
+- Do not edit generated outputs such as `apps/backend/dist/`, `apps/web/.next/`, `apps/web/next-env.d.ts`, `*.tsbuildinfo`, coverage files, or test results.
+- In linked worktrees, use development services and storage only. Never touch, restart, or modify production. Production restart targets are restricted to the primary `main` checkout.
 
 ## Testing & QA
 
-- `cd apps && bun run test` runs both workspace-script tests (`launch-config` and `user-context-backup`), then all pipeline and web Bun tests. It does not run Playwright E2E or Python pytest.
-- Pipeline and web unit/integration tests use `bun:test`. Prefer in-memory SQLite, temporary roots, deterministic clocks/IDs, injected fetch/model/process collaborators, controlled promises/events, and exact contract assertions. Do not use live providers or non-loopback network.
-- Restore globals such as `fetch`, close databases/services/servers, and remove temporary resources in hooks or `finally`.
-- Web component tests use pure helpers or `renderToStaticMarkup`; browser interaction belongs in Playwright. E2E uses one worker, a fresh Next server, intercepted `/api/pipeline/**` calls, and controlled SSE. Prefer `expect.poll` or events over fixed sleeps.
-- Python uses pytest with `pytest-asyncio` automatic mode, `tmp_path`, `monkeypatch`, fake runtime collaborators, and HTTPX ASGI/Mock transports. The real-Chromium fixture is optional and skips when Chrome, Node, or Playwright CLI is unavailable.
-- `apps/resume-tailoring/test/docs.test.ts` validates canonical HTML docs, links/fragments, and documented commands. After changing `info/docs/`, run `cd apps && bun test resume-tailoring/test/docs.test.ts`.
-- No coverage tool or threshold is configured. For behavior changes, add or update the narrowest observable contract test, run the focused suite plus relevant typecheck, and use Playwright or the documented headed smoke when behavior crosses a browser/runtime boundary.
+- Backend, web, and operational-script tests use Bun's built-in runner with `*.test.ts` or `*.test.tsx` names. Web component tests commonly render with `react-dom/server`; do not assume Testing Library or JSDOM exists.
+- Harness tests use Bun's built-in runner. Prefer temporary directories, injected fetchers/clocks/process runners, and hand-written fakes.
+- Web E2E uses `@playwright/test` files named `*.pw.ts`. The config runs one worker, starts a fresh Next dev server, and uses isolated loopback ports.
+- Match existing isolation patterns: inject dependencies, use in-memory SQLite, restore environment/time overrides in `finally`, close databases/servers, and remove temporary directories.
+- Test observable contracts, state transitions, race handling, and real failures—not field forwarding or implementation details. Start with the narrow affected test, then run the package typecheck/test and `make test`; add `make test-e2e` for browser-visible web changes.
+- No coverage threshold is configured. Do not claim or enforce one without an explicit project decision.

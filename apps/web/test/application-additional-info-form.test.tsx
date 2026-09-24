@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ApplicationAdditionalInfoQuestion } from "@jobhunter/pipeline/contracts";
+import type { ApplicationAdditionalInfoQuestion } from "../app/lib/pipeline-contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ApplicationAdditionalInfoForm } from "../app/components/application-additional-info-form";
 

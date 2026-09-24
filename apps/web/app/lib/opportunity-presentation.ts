@@ -1,4 +1,4 @@
-import type { OpportunityKind } from "@jobhunter/pipeline/contracts";
+import type { OpportunityKind } from "./pipeline-contracts";
 import {
   Briefcase,
   CalendarDays,

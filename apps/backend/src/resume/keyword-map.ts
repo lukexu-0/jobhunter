@@ -1,0 +1,562 @@
+import { dirname, join } from "node:path";
+import {
+  PDFDocument,
+  StandardFonts,
+  rgb,
+  type PDFEmbeddedPage,
+  type PDFFont,
+  type PDFPage,
+} from "pdf-lib";
+import {
+  ResumeKeywordCoverageSchema,
+  type ResumeKeywordCoverage,
+} from "../contracts/index.ts";
+import { ARTIFACT_LIMITS, type ArtifactMetadata, type ArtifactStore } from "../system/artifacts.ts";
+import { runTrustedProcess, type ProcessBoundary } from "../system/process.ts";
+import type { AtsKeywordExtraction, JobAnalysis } from "./types.ts";
+import { parsePdfTextTsv, type PdfTextPage } from "./pdf-text.ts";
+
+const PAGE_WIDTH = 792;
+const PAGE_HEIGHT = 612;
+const PAGE_MARGIN = 18;
+const COLUMN_GAP = 18;
+const TEXT_SIZE = 8.25;
+const LINE_HEIGHT = 10.5;
+const TEXT_TOP = PAGE_HEIGHT - 24;
+const TEXT_BOTTOM = 24;
+const BBOX_OUTPUT_LIMIT = 4 * 1024 * 1024;
+const BBOX_TIMEOUT_MS = 30_000;
+const KEYWORD_COVERAGE_OUTPUT_LIMIT = 1024 * 1024;
+const RED = rgb(0.85, 0.05, 0.05);
+const YELLOW = rgb(1, 0.85, 0);
+const LIGHT_GRAY = rgb(0.82, 0.82, 0.82);
+const ASCII_REPLACEMENTS: Readonly<Record<string, string>> = Object.freeze({
+  "\u00a0": " ",
+  "\u2010": "-",
+  "\u2011": "-",
+  "\u2012": "-",
+  "\u2013": "-",
+  "\u2014": "-",
+  "\u2015": "-",
+  "\u2018": "'",
+  "\u2019": "'",
+  "\u201a": "'",
+  "\u201c": "\"",
+  "\u201d": "\"",
+  "\u201e": "\"",
+  "\u2022": "*",
+  "\u2026": "...",
+  "\u2212": "-",
+});
+
+export interface KeywordMapRequest {
+  readonly artifacts: ArtifactStore;
+  readonly compiledPdf: ArtifactMetadata;
+  readonly jobDescription: string;
+  readonly analysis: JobAnalysis;
+  readonly atsKeywordExtraction: AtsKeywordExtraction;
+  readonly signal?: AbortSignal;
+  readonly processBoundary?: ProcessBoundary;
+}
+
+export interface RenderedKeywordMapArtifacts {
+  readonly pdf: ArtifactMetadata;
+  readonly coverage: ArtifactMetadata;
+}
+
+
+interface WordBox {
+  readonly text: string;
+  readonly page: number;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly blockIndex?: number;
+  readonly lineIndex?: number;
+}
+
+interface BoxRange {
+  readonly page: number;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+interface KeywordMatch {
+  readonly resume: BoxRange;
+  readonly job: BoxRange;
+}
+
+interface KeywordHighlights {
+  readonly matches: readonly KeywordMatch[];
+  readonly unmatchedJobBoxes: readonly BoxRange[];
+  readonly coverage: ResumeKeywordCoverage["keywords"];
+}
+
+interface ResumeLayout {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly right: number;
+  readonly boxes: readonly WordBox[];
+}
+
+
+function canEncode(font: PDFFont, value: string): boolean {
+  try {
+    font.encodeText(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pdfSafeText(value: string, font: PDFFont): string {
+  let result = "";
+  for (const scalar of value) {
+    const replacement = ASCII_REPLACEMENTS[scalar];
+    if (replacement !== undefined) {
+      result += replacement;
+      continue;
+    }
+    if (scalar === "\t") {
+      result += "    ";
+      continue;
+    }
+    if (scalar === "\n" || scalar === "\r") {
+      result += scalar;
+      continue;
+    }
+    if (canEncode(font, scalar)) {
+      result += scalar;
+      continue;
+    }
+    const decomposed = scalar.normalize("NFKD").replace(/\p{Mark}/gu, "");
+    if (decomposed && canEncode(font, decomposed)) {
+      result += decomposed;
+      continue;
+    }
+    result += `<U+${scalar.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}>`;
+  }
+  return result;
+}
+
+export function normalizeJobDescription(value: string): string {
+  const readable = value
+    .replace(/<br\s*\/?\s*>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<\/(?:li|p|div|ul|ol|h[1-6])\s*>/gi, "\n")
+    .replace(/<\/?[A-Za-z][^>\n]*>/g, "")
+    .replace(
+      /&(?:#(\d+)|#x([\da-f]+)|([a-z]+));/gi,
+      (entity, decimal: string | undefined, hexadecimal: string | undefined, name: string | undefined) => {
+        if (decimal !== undefined || hexadecimal !== undefined) {
+          const codePoint = Number.parseInt(decimal ?? hexadecimal!, decimal === undefined ? 16 : 10);
+          if (Number.isSafeInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff && (codePoint < 0xd800 || codePoint > 0xdfff)) {
+            return String.fromCodePoint(codePoint);
+          }
+          return entity;
+        }
+        switch (name?.toLowerCase()) {
+          case "amp": return "&";
+          case "apos": return "'";
+          case "gt": return ">";
+          case "lt": return "<";
+          case "nbsp": return " ";
+          case "quot": return "\"";
+          default: return entity;
+        }
+      },
+    );
+  return readable
+    .normalize("NFC")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function splitLongWord(word: string, font: PDFFont, width: number): readonly string[] {
+  if (font.widthOfTextAtSize(word, TEXT_SIZE) <= width) return [word];
+  const parts: string[] = [];
+  let part = "";
+  for (const scalar of word) {
+    const candidate = part + scalar;
+    if (part && font.widthOfTextAtSize(candidate, TEXT_SIZE) > width) {
+      parts.push(part);
+      part = scalar;
+    } else part = candidate;
+  }
+  if (part) parts.push(part);
+  return parts;
+}
+
+function wrapJobDescription(value: string, font: PDFFont, width: number): readonly string[] {
+  const lines: string[] = [];
+  const spaceWidth = font.widthOfTextAtSize(" ", TEXT_SIZE);
+  for (const paragraph of value.split("\n")) {
+    if (!paragraph.trim()) {
+      lines.push("");
+      continue;
+    }
+    let line = "";
+    let lineWidth = 0;
+    for (const rawWord of paragraph.trimStart().split(/\s+/)) {
+      for (const word of splitLongWord(rawWord, font, width)) {
+        const wordWidth = font.widthOfTextAtSize(word, TEXT_SIZE);
+        if (line && lineWidth + spaceWidth + wordWidth > width) {
+          lines.push(line);
+          line = word;
+          lineWidth = wordWidth;
+        } else {
+          line += line ? ` ${word}` : word;
+          lineWidth += (lineWidth > 0 ? spaceWidth : 0) + wordWidth;
+        }
+      }
+    }
+    lines.push(line);
+  }
+  return lines.length > 0 ? lines : [""];
+}
+
+function canonicalTokens(value: string): readonly string[] {
+  const normalized = value
+    .normalize("NFKD")
+    .replace(/\p{Mark}/gu, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/[’']/g, "");
+  return normalized
+    .split(/[^\p{Letter}\p{Number}+#]+/u)
+    .filter(Boolean);
+}
+
+
+function range(boxes: readonly WordBox[]): BoxRange {
+  const x = Math.min(...boxes.map((box) => box.x));
+  const y = Math.min(...boxes.map((box) => box.y));
+  const right = Math.max(...boxes.map((box) => box.x + box.width));
+  const top = Math.max(...boxes.map((box) => box.y + box.height));
+  return { page: boxes[0]!.page, x, y, width: right - x, height: top - y };
+}
+
+function sameVisualTextLine(left: WordBox, right: WordBox): boolean {
+  if (left.page !== right.page) return false;
+  if (left.blockIndex !== undefined || right.blockIndex !== undefined) {
+    return left.blockIndex !== undefined
+      && right.blockIndex !== undefined
+      && left.lineIndex !== undefined
+      && right.lineIndex !== undefined
+      && left.blockIndex === right.blockIndex
+      && left.lineIndex === right.lineIndex;
+  }
+  const verticalOverlap = Math.min(left.y + left.height, right.y + right.height)
+    - Math.max(left.y, right.y);
+  const baselineDistance = Math.abs(left.y - right.y);
+  return verticalOverlap >= Math.min(left.height, right.height) / 2
+    || baselineDistance <= Math.max(left.height, right.height) / 2;
+}
+
+function findPhrase(boxes: readonly WordBox[], phrase: string): BoxRange | undefined {
+  const tokens = canonicalTokens(phrase);
+  if (tokens.length === 0) return undefined;
+  const indexedTokens = boxes.flatMap((box, boxIndex) =>
+    canonicalTokens(box.text).map((token) => ({ token, boxIndex })));
+  for (let start = 0; start + tokens.length <= indexedTokens.length; start++) {
+    const first = indexedTokens[start]!;
+    const page = boxes[first.boxIndex]!.page;
+    let matches = true;
+    for (let offset = 0; offset < tokens.length; offset++) {
+      const indexedToken = indexedTokens[start + offset]!;
+      const box = boxes[indexedToken.boxIndex]!;
+      const previousToken = offset > 0 ? indexedTokens[start + offset - 1]! : undefined;
+      const previousBox = previousToken ? boxes[previousToken.boxIndex]! : undefined;
+      if (
+        box.page !== page
+        || indexedToken.token !== tokens[offset]
+        || (previousBox && !boxesAreContinuous(previousBox, box))
+      ) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      const last = indexedTokens[start + tokens.length - 1]!;
+      return range(boxes.slice(first.boxIndex, last.boxIndex + 1));
+    }
+  }
+  return undefined;
+}
+
+function boxesAreContinuous(left: WordBox, right: WordBox): boolean {
+  if (left.page !== right.page) return false;
+  if (sameVisualTextLine(left, right)) return true;
+  return left.blockIndex !== undefined
+    && right.blockIndex !== undefined
+    && left.lineIndex !== undefined
+    && right.lineIndex !== undefined
+    && left.blockIndex === right.blockIndex
+    && right.lineIndex === left.lineIndex + 1;
+}
+
+function keywordMatches(
+  atsKeywordExtraction: AtsKeywordExtraction,
+  analysis: JobAnalysis,
+  resumeBoxes: readonly WordBox[],
+  jobBoxes: readonly WordBox[],
+): KeywordHighlights {
+  const matches: KeywordMatch[] = [];
+  const unmatchedJobBoxes: BoxRange[] = [];
+  const coverage: Array<ResumeKeywordCoverage["keywords"][number]> = [];
+  for (const keyword of atsKeywordExtraction.keywords) {
+    const evidenceBackedKeyword = analysis.jdKeywords.find((candidate) =>
+      candidate.id === keyword.id
+      && candidate.phrase === keyword.phrase
+      && candidate.jdQuote === keyword.jdQuote);
+    const resumeCandidates = [
+      keyword.phrase,
+      ...(evidenceBackedKeyword
+        ? analysis.exactEdits
+          .filter((edit) => edit.keywordIds.includes(evidenceBackedKeyword.id))
+          .map((edit) => edit.after)
+        : []),
+    ];
+    const resume = resumeCandidates
+      .map((candidate) => findPhrase(resumeBoxes, candidate))
+      .find(Boolean);
+    coverage.push({ id: keyword.id, phrase: keyword.phrase, found: resume !== undefined });
+    const job = findPhrase(jobBoxes, keyword.phrase);
+    if (!job) continue;
+    if (resume) matches.push({ resume, job });
+    else unmatchedJobBoxes.push(job);
+  }
+  return { matches, unmatchedJobBoxes, coverage };
+}
+
+function drawBox(page: PDFPage, box: BoxRange): void {
+  page.drawRectangle({
+    x: box.x - 1.5,
+    y: box.y - 1.5,
+    width: box.width + 3,
+    height: box.height + 3,
+    borderColor: RED,
+    borderWidth: 0.85,
+  });
+}
+
+function drawUnmatchedJobBox(page: PDFPage, box: BoxRange): void {
+  page.drawRectangle({
+    x: box.x - 1.5,
+    y: box.y - 1.5,
+    width: box.width + 3,
+    height: box.height + 3,
+    color: YELLOW,
+    opacity: 0.28,
+  });
+}
+
+function drawPageMatches(page: PDFPage, highlights: KeywordHighlights, pageIndex: number): void {
+  for (const job of highlights.unmatchedJobBoxes) {
+    if (job.page === pageIndex) drawUnmatchedJobBox(page, job);
+  }
+  for (const match of highlights.matches) {
+    if (match.job.page !== pageIndex) continue;
+    drawBox(page, match.resume);
+    drawBox(page, match.job);
+    page.drawLine({
+      start: { x: match.resume.x + match.resume.width + 1.5, y: match.resume.y + match.resume.height / 2 },
+      end: { x: match.job.x - 1.5, y: match.job.y + match.job.height / 2 },
+      color: RED,
+      thickness: 0.7,
+    });
+  }
+}
+
+function createResumeLayout(source: PdfTextPage): ResumeLayout {
+  const availableHeight = PAGE_HEIGHT - 2 * PAGE_MARGIN;
+  const availableWidth = PAGE_WIDTH * 0.58 - PAGE_MARGIN;
+  const scale = Math.min(availableHeight / source.height, availableWidth / source.width);
+  const width = source.width * scale;
+  const height = source.height * scale;
+  const x = PAGE_MARGIN;
+  const y = (PAGE_HEIGHT - height) / 2;
+  return {
+    x,
+    y,
+    width,
+    height,
+    right: x + width,
+    boxes: source.words.map((word) => ({
+      text: word.text,
+      page: 0,
+      x: x + word.xMin * scale,
+      y: y + (source.height - word.yMax) * scale,
+      width: (word.xMax - word.xMin) * scale,
+      height: (word.yMax - word.yMin) * scale,
+      blockIndex: word.blockIndex,
+      lineIndex: word.lineIndex,
+    })),
+  };
+}
+
+function drawResume(page: PDFPage, resume: PDFEmbeddedPage, layout: ResumeLayout): void {
+  page.drawPage(resume, { x: layout.x, y: layout.y, width: layout.width, height: layout.height });
+}
+
+function drawJobLines(page: PDFPage, pageIndex: number, lines: readonly string[], font: PDFFont, x: number): readonly WordBox[] {
+  const boxes: WordBox[] = [];
+  page.setFont(font);
+  for (const [lineIndex, line] of lines.entries()) {
+    const y = TEXT_TOP - lineIndex * LINE_HEIGHT - TEXT_SIZE;
+    if (!line) continue;
+    page.drawText(line, { x, y, size: TEXT_SIZE, color: rgb(0.08, 0.08, 0.08) });
+    for (const match of line.matchAll(/\S+/g)) {
+      const text = match[0];
+      const prefix = line.slice(0, match.index);
+      boxes.push({
+        text,
+        page: pageIndex,
+        x: x + font.widthOfTextAtSize(prefix, TEXT_SIZE),
+        y: y - 0.8,
+        width: font.widthOfTextAtSize(text, TEXT_SIZE),
+        height: LINE_HEIGHT - 1,
+      });
+    }
+  }
+  return boxes;
+}
+
+async function extractBbox(request: KeywordMapRequest): Promise<PdfTextPage> {
+  request.signal?.throwIfAborted();
+  const result = await runTrustedProcess({
+    command: "pdftotext",
+    args: ["-tsv", "-enc", "UTF-8", request.compiledPdf.path, "-"],
+    cwd: dirname(request.compiledPdf.path),
+    timeoutMs: BBOX_TIMEOUT_MS,
+    ...(request.signal ? { signal: request.signal } : {}),
+    stdoutLimit: BBOX_OUTPUT_LIMIT,
+    stderrLimit: ARTIFACT_LIMITS.stderr,
+  }, request.processBoundary);
+  if (result.aborted) request.signal?.throwIfAborted();
+  if (result.timedOut) throw new Error("pdftotext bbox extraction timed out");
+  if (result.code !== 0 || result.signal !== null) {
+    const detail = Buffer.from(result.stderr.data).toString("utf8").trim().slice(0, 500);
+    throw new Error(`pdftotext bbox extraction failed${detail ? `: ${detail}` : ""}`);
+  }
+  if (result.stdout.truncated) throw new Error("pdftotext bbox output exceeds its limit");
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(result.stdout.data);
+  } catch (error) {
+    throw new Error("pdftotext output is not valid UTF-8", { cause: error });
+  }
+  const pages = parsePdfTextTsv(text);
+  if (!pages || pages.length !== 1) throw new Error("keyword map requires exactly one page of valid text geometry");
+  const page = pages[0]!;
+  if (page.words.length === 0 || page.words.some(({ xMin, yMin, xMax, yMax }) =>
+    xMin < 0 || yMin < 0 || xMax <= xMin || yMax <= yMin || xMax > page.width + 1 || yMax > page.height + 1)) {
+    throw new Error("keyword map requires non-empty text within page bounds");
+  }
+  return page;
+}
+
+async function buildKeywordMap(request: KeywordMapRequest): Promise<{
+  readonly bytes: Uint8Array;
+  readonly coverage: ResumeKeywordCoverage;
+}> {
+  request.signal?.throwIfAborted();
+  const compiledBytes = await request.artifacts.read(request.compiledPdf.path, ARTIFACT_LIMITS.pdf);
+  const [source, bbox] = await Promise.all([
+    PDFDocument.load(compiledBytes),
+    extractBbox(request),
+  ]);
+  if (source.getPageCount() !== 1) throw new Error("keyword map requires a one-page compiled resume");
+  request.signal?.throwIfAborted();
+
+  const output = await PDFDocument.create();
+  output.setProducer("jobhunt keyword map");
+  output.setCreator("jobhunt pipeline");
+  output.setTitle("Resume keyword map");
+  output.setSubject("Compiled resume and complete job description keyword alignment");
+  output.setCreationDate(new Date(0));
+  output.setModificationDate(new Date(0));
+  const font = await output.embedFont(StandardFonts.Helvetica);
+  const resume = await output.embedPage(source.getPage(0));
+
+  const resumeLayout = createResumeLayout(bbox);
+  const textX = resumeLayout.right + COLUMN_GAP;
+  const textWidth = PAGE_WIDTH - PAGE_MARGIN - textX;
+  if (textWidth < 180) throw new Error("keyword map job-description column is too narrow");
+  const normalized = normalizeJobDescription(request.jobDescription);
+  if (!normalized) throw new Error("job description is empty");
+  const safeDescription = pdfSafeText(normalized, font);
+  const lines = wrapJobDescription(safeDescription, font, textWidth);
+  const linesPerPage = Math.floor((TEXT_TOP - TEXT_BOTTOM) / LINE_HEIGHT);
+  const pageCount = Math.max(1, Math.ceil(lines.length / linesPerPage));
+  const pages: PDFPage[] = [];
+  const jobBoxes: WordBox[] = [];
+  const resumeBoxes = resumeLayout.boxes;
+
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+    request.signal?.throwIfAborted();
+    const page = output.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
+    drawResume(page, resume, resumeLayout);
+    page.drawLine({
+      start: { x: resumeLayout.right + COLUMN_GAP / 2, y: PAGE_MARGIN },
+      end: { x: resumeLayout.right + COLUMN_GAP / 2, y: PAGE_HEIGHT - PAGE_MARGIN },
+      color: LIGHT_GRAY,
+      thickness: 0.5,
+    });
+    const pageLines = lines.slice(pageIndex * linesPerPage, (pageIndex + 1) * linesPerPage);
+    jobBoxes.push(...drawJobLines(page, pageIndex, pageLines, font, textX));
+    pages.push(page);
+  }
+
+  const highlights = keywordMatches(
+    request.atsKeywordExtraction,
+    request.analysis,
+    resumeBoxes,
+    jobBoxes,
+  );
+  for (const [pageIndex, page] of pages.entries()) drawPageMatches(page, highlights, pageIndex);
+  request.signal?.throwIfAborted();
+  const bytes = await output.save({ useObjectStreams: false, addDefaultPage: false });
+  const coverage = ResumeKeywordCoverageSchema.parse({
+    schemaVersion: 1,
+    pdfSha256: request.compiledPdf.sha256,
+    keywords: highlights.coverage,
+  });
+  request.signal?.throwIfAborted();
+  return { bytes, coverage };
+}
+
+export async function renderKeywordMapPdf(request: KeywordMapRequest): Promise<ArtifactMetadata> {
+  const rendered = await buildKeywordMap(request);
+  request.signal?.throwIfAborted();
+  return await request.artifacts.write(
+    join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
+    rendered.bytes,
+    ARTIFACT_LIMITS.pdf,
+  );
+}
+
+export async function renderKeywordMapArtifacts(request: KeywordMapRequest): Promise<RenderedKeywordMapArtifacts> {
+  const rendered = await buildKeywordMap(request);
+  request.signal?.throwIfAborted();
+  const pdf = await request.artifacts.write(
+    join(dirname(request.compiledPdf.path), "keyword-map.pdf"),
+    rendered.bytes,
+    ARTIFACT_LIMITS.pdf,
+  );
+  const coverage = await request.artifacts.write(
+    join(dirname(request.compiledPdf.path), "keyword-map.json"),
+    `${JSON.stringify(rendered.coverage, null, 2)}\n`,
+    KEYWORD_COVERAGE_OUTPUT_LIMIT,
+  );
+  return { pdf, coverage };
+}

@@ -10,12 +10,13 @@ import {
   type ApplicationSessionView,
   type ArtifactKind,
   type AttemptDto,
+  type DeterministicQaCheckId,
   type ResumeDiff,
   type ResumeIterationDto,
   type ResumeIterationListResponse,
   type RunDto,
   type RunStatus,
-} from "@jobhunter/pipeline/contracts";
+} from "../lib/pipeline-contracts";
 import {
   PipelineClientError,
   approveRun,
@@ -35,7 +36,7 @@ import {
 } from "../lib/run-detail-artifacts";
 import { AlertControls } from "./alert-controls";
 import { RunReviewWorkspace } from "./run-review-workspace";
-import { useAlerts } from "../providers/alert-provider";
+import { useAlerts } from "../credentials/alert-provider";
 import styles from "../run-detail.module.css";
 
 const POLL_INTERVAL_MS = 2_500;
@@ -56,6 +57,18 @@ const STATUS_LABELS: Record<RunStatus, string> = {
   review: "Ready for review",
   approved: "Approved",
   failed: "Failed",
+};
+const QA_FAILURE_LABELS: Record<DeterministicQaCheckId, string> = {
+  "pdfinfo-output": "PDF properties could not be read.",
+  "unencrypted": "The PDF must be unencrypted.",
+  "one-page": "The resume must fit on one page.",
+  "page-count-consistency": "PDF and extracted-text page counts could not be matched.",
+  "letter-size": "The PDF must use US Letter page size.",
+  "text-output": "PDF text and word coordinates could not be extracted. Check the Poppler installation.",
+  "required-headings": "Required section headings could not be verified.",
+  "font-output": "PDF font information could not be read.",
+  "embedded-fonts": "All fonts must be embedded and must not be Type 3.",
+  "word-bounds": "Text could not be verified within the page bounds.",
 };
 
 type WorkflowStageKey = RunStatus | "applying" | "applied";
@@ -1095,6 +1108,21 @@ export function RunDetail({ runId }: RunDetailProps) {
         <AlertControls className={styles.alertControls} />
       </header>
       <div className={styles.topAlerts}>
+        {run.status === "failed" ? (
+          <section className={styles.failureAlert}>
+            <div role="alert">
+              <strong>Failed stage: {run.failureCode && Object.hasOwn(STATUS_LABELS, run.failureCode)
+                ? STATUS_LABELS[run.failureCode as RunStatus]
+                : "Unavailable"}</strong>
+              {run.failureChecks?.length ? (
+                <ul>{run.failureChecks.map((id) => <li key={id}>{QA_FAILURE_LABELS[id]}</li>)}</ul>
+              ) : <p>No detailed failure report is available.</p>}
+            </div>
+            <p>Unchanged sources resume the failed stage. Changed sources restart analysis with the latest résumé, preserving earlier revisions.</p>
+            <button className={styles.primaryButton} type="button" disabled={actionsDisabled} onClick={() => void submitRetry()}><Icon name="refresh" />{busyAction === "retry" ? "Retrying…" : "Retry failed run"}</button>
+          </section>
+        ) : null}
+        {actionError ? <p className={styles.panelError} role="alert">{actionError}</p> : null}
         {awaitingHumanReview ? (
           <p className={styles.reviewAlert} role="alert">Waiting for review!</p>
         ) : null}
@@ -1303,8 +1331,6 @@ export function RunDetail({ runId }: RunDetailProps) {
                     }</p>
                   </>
                 )}
-                {run.status === "failed" ? <button className={styles.primaryButton} type="button" disabled={actionsDisabled} onClick={() => void submitRetry()}><Icon name="refresh" />{busyAction === "retry" ? "Retrying…" : "Retry failed run"}</button> : null}
-                {actionError ? <p className={styles.panelError} role="alert">{actionError}</p> : null}
               </div>
             )}
           </div>

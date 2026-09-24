@@ -1,0 +1,587 @@
+diff --git a/lib/coreBundle.js b/lib/coreBundle.js
+index a03548be477dc6a9633930872c2b8345c4bfb24b..79c849211ae690ef86809f7d1398abd13344cd08 100644
+--- a/lib/coreBundle.js
++++ b/lib/coreBundle.js
+@@ -64241,6 +64241,21 @@ var init_context = __esm({
+         this.sessionLog = options.sessionLog;
+         this.options = options;
+         this._rawBrowserContext = browserContext;
++        this._ownedPage = options.ownedPage;
++        this._pageToken = options.pageToken;
++        this._pendingOwnedPageChecks = /* @__PURE__ */ new Set();
++        this._pendingOwnedPageError = void 0;
++        this._closingOwnedPages = false;
++        this._ownedPageListener = void 0;
++        this._targetPath = options.targetPath;
++        this._ownedTargetId = options.ownedTargetId;
++        this._ownedWindowId = options.ownedWindowId;
++        this._ownedTargetIds = new Set(options.ownedTargetIds ?? (options.ownedTargetId ? [options.ownedTargetId] : []));
++        this._ownedWindowIds = new Set(options.ownedWindowIds ?? (options.ownedWindowId ? [options.ownedWindowId] : []));
++        this._journaledTargetIds = new Set(this._ownedTargetIds);
++        this._journaledWindowIds = new Set(options.journaledWindowIds ?? this._ownedWindowIds);
++        this._borrowedPages = options.borrowedPages;
++        this._targetJournal = Promise.resolve();
+         testDebug("create context");
+         process.on("unhandledRejection", this._onUnhandledRejection);
+       }
+@@ -64253,6 +64268,22 @@ var init_context = __esm({
+         this._currentTab = void 0;
+         await this.stopVideoRecording();
+       }
++      async closeOwnedPages() {
++        if (!this._ownedPage)
++          return;
++        this._closingOwnedPages = true;
++        await this._ownedPageListener?.dispose();
++        this._ownedPageListener = void 0;
++        while (this._pendingOwnedPageChecks.size)
++          await Promise.allSettled([...this._pendingOwnedPageChecks]);
++        const closeResults = await Promise.allSettled(this._tabs.map((tab2) => tab2.page.close()));
++        while (this._pendingOwnedPageChecks.size)
++          await Promise.allSettled([...this._pendingOwnedPageChecks]);
++        const failure = this._pendingOwnedPageError ?? closeResults.find((result2) => result2.status === "rejected")?.reason;
++        this._pendingOwnedPageError = void 0;
++        if (failure)
++          throw failure;
++      }
+       drainPendingUnhandledRejections() {
+         const reasons = this._pendingUnhandledRejections.slice();
+         this._pendingUnhandledRejections.length = 0;
+@@ -64278,8 +64309,12 @@ var init_context = __esm({
+       }
+       async newTab() {
+         const browserContext = await this.ensureBrowserContext();
+-        const page = await browserContext.newPage();
+-        this._currentTab = this._tabs.find((t) => t.page === page);
++        const page = this._ownedPage ? await this._createOwnedWindow() : await browserContext.newPage();
++        if (this._ownedPage)
++          await this._trackOwnedPageCheck(page, true);
++        else if (!this._tabs.some((tab2) => tab2.page === page))
++          this._onPageCreated(page);
++        this._currentTab = this._tabs.find((tab2) => tab2.page === page);
+         return this._currentTab;
+       }
+       async selectTab(index) {
+@@ -64298,8 +64333,11 @@ var init_context = __esm({
+           });
+           this._currentTab = void 0;
+         }
+-        if (!this._currentTab)
++        if (!this._currentTab) {
++          if (this._ownedPage)
++            throw new Error("No open pages available.");
+           await this.newTab();
++        }
+         if (crashed)
+           this._currentTab.logErrorMessage("Page crashed and was reset to about:blank.");
+         await this._currentTab.waitForInitialized();
+@@ -64324,16 +64362,16 @@ var init_context = __esm({
+         if (this._video)
+           throw new Error("Video recording has already been started.");
+         this._video = { params: params2, fileName, fileNames: [] };
+-        const browserContext = await this.ensureBrowserContext();
+-        for (const page of browserContext.pages())
+-          await this._startPageVideo(page);
++        await this.ensureBrowserContext();
++        for (const tab2 of this._tabs)
++          await this._startPageVideo(tab2.page);
+       }
+       async stopVideoRecording() {
+         if (!this._video)
+           return [];
+         const video = this._video;
+-        for (const page of this._rawBrowserContext.pages())
+-          await page.screencast.stop();
++        for (const tab2 of this._tabs)
++          await tab2.page.screencast.stop();
+         this._video = void 0;
+         return [...video.fileNames];
+       }
+@@ -64350,7 +64388,180 @@ var init_context = __esm({
+         this._video.fileNames.push(fileName);
+         await page.screencast.start({ path: fileName, ...this._video.params });
+       }
++      async _writeTargetRecords(records) {
++        if (!this._targetPath || !records.length)
++          return;
++        const file = await import_fs51.default.promises.open(this._targetPath, "a", 384);
++        try {
++          await file.writeFile(records.map((record) => record + "\n").join(""));
++          await file.sync();
++        } finally {
++          await file.close();
++        }
++      }
++      async _appendJournalMarker(markerToken) {
++        this._targetJournal = this._targetJournal.then(() => this._writeTargetRecords(["marker:" + markerToken]));
++        await this._targetJournal;
++      }
++      async _pageTargetMetadata(page) {
++        if (page === this._ownedPage && this._ownedTargetId && this._ownedWindowId)
++          return { targetId: this._ownedTargetId, windowId: this._ownedWindowId };
++        const pageSession = await this._rawBrowserContext.newCDPSession(page);
++        const browserSession = await this._rawBrowserContext.browser().newBrowserCDPSession();
++        try {
++          const { targetInfo } = await pageSession.send("Target.getTargetInfo");
++          const targetId = targetInfo?.targetId;
++          if (!/^[A-Fa-f0-9]{8,128}$/.test(targetId ?? ""))
++            throw new Error("Unable to identify owned target");
++          const { windowId } = await browserSession.send("Browser.getWindowForTarget", { targetId });
++          if (!Number.isSafeInteger(windowId) || windowId <= 0)
++            throw new Error("Unable to identify owned window");
++          const openerId = /^[A-Fa-f0-9]{8,128}$/.test(targetInfo?.openerId ?? "") ? targetInfo.openerId : void 0;
++          return { targetId, windowId, openerId };
++        } finally {
++          await pageSession.detach().catch(() => {
++          });
++          await browserSession.detach().catch(() => {
++          });
++        }
++      }
++      async _hasOwnedLineage(initialOpenerId) {
++        if (!initialOpenerId)
++          return false;
++        const cdpSession = await this._rawBrowserContext.browser().newBrowserCDPSession();
++        const seen = /* @__PURE__ */ new Set();
++        let openerId = initialOpenerId;
++        try {
++          while (openerId && !seen.has(openerId) && seen.size < 100) {
++            seen.add(openerId);
++            if (this._ownedTargetIds.has(openerId))
++              return true;
++            try {
++              const { windowId } = await cdpSession.send("Browser.getWindowForTarget", { targetId: openerId });
++              if (this._ownedWindowIds.has(windowId))
++                return true;
++            } catch {
++            }
++            const { targetInfo } = await cdpSession.send("Target.getTargetInfo", { targetId: openerId });
++            openerId = /^[A-Fa-f0-9]{8,128}$/.test(targetInfo?.openerId ?? "") ? targetInfo.openerId : void 0;
++          }
++          return false;
++        } catch {
++          return false;
++        } finally {
++          await cdpSession.detach().catch(() => {
++          });
++        }
++      }
++      async _journalOwnedPage(metadata, ownsWindow) {
++        if (!this._targetPath)
++          return;
++        this._targetJournal = this._targetJournal.then(async () => {
++          const records = [];
++          if (!this._journaledTargetIds.has(metadata.targetId))
++            records.push(metadata.targetId);
++          if (ownsWindow && !this._journaledWindowIds.has(metadata.windowId))
++            records.push("window:" + metadata.windowId + ":" + metadata.targetId);
++          await this._writeTargetRecords(records);
++          this._journaledTargetIds.add(metadata.targetId);
++          if (ownsWindow)
++            this._journaledWindowIds.add(metadata.windowId);
++        });
++        await this._targetJournal;
++      }
++      async _admitOwnedPage(page, metadata, ownsWindow) {
++        try {
++          await this._journalOwnedPage(metadata, ownsWindow);
++        } catch (error) {
++          if (!this._borrowedPages?.has(page))
++            await page.close().catch(() => {
++            });
++          throw error;
++        }
++        if (this._closingOwnedPages) {
++          await page.close();
++          return;
++        }
++        if (!page.isClosed())
++          this._onPageCreated(page);
++      }
++      async _considerOwnedPage(page, force = false) {
++        if (page.isClosed())
++          return;
++        let metadata;
++        try {
++          metadata = await this._pageTargetMetadata(page);
++        } catch (error) {
++          if (page.isClosed())
++            return;
++          const opener = await page.opener().catch(() => null);
++          if (force || page === this._ownedPage || opener?.__jobhuntPageOwner === this._pageToken)
++            throw error;
++          return;
++        }
++        let owned = force || page === this._ownedPage || this._ownedTargetIds.has(metadata.targetId) || this._ownedWindowIds.has(metadata.windowId) || await this._hasOwnedLineage(metadata.openerId);
++        if (!owned) {
++          const opener = await page.opener().catch(() => null);
++          owned = opener?.__jobhuntPageOwner === this._pageToken;
++        }
++        if (!owned)
++          return;
++        const ownsWindow = !this._borrowedPages?.has(page) || this._ownedWindowIds.has(metadata.windowId);
++        this._ownedTargetIds.add(metadata.targetId);
++        if (ownsWindow)
++          this._ownedWindowIds.add(metadata.windowId);
++        page.__jobhuntPageOwner = this._pageToken;
++        page.__jobhuntTargetId = metadata.targetId;
++        await this._admitOwnedPage(page, metadata, ownsWindow);
++      }
++      _trackOwnedPageCheck(page, force = false) {
++        const pending = this._considerOwnedPage(page, force);
++        this._pendingOwnedPageChecks.add(pending);
++        pending.then(
++          () => this._pendingOwnedPageChecks.delete(pending),
++          (error) => {
++            this._pendingOwnedPageChecks.delete(pending);
++            if (!force && this._pendingOwnedPageError === void 0)
++              this._pendingOwnedPageError = error;
++          }
++        );
++        return pending;
++      }
++      async _createOwnedWindow() {
++        const markerToken = require("crypto").randomBytes(32).toString("hex");
++        const marker = "about:blank#jobhunt-" + markerToken;
++        await this._appendJournalMarker(markerToken);
++        const cdpSession = await this._rawBrowserContext.browser().newBrowserCDPSession();
++        let targetId;
++        let page;
++        try {
++          ({ targetId } = await cdpSession.send("Target.createTarget", { url: marker, newWindow: true, background: true }));
++          const deadline = Date.now() + 5e3;
++          while (!page && Date.now() < deadline) {
++            page = this._rawBrowserContext.pages().find((candidate) => candidate.url() === marker);
++            if (!page)
++              await new Promise((resolve) => setTimeout(resolve, 20));
++          }
++          if (!page)
++            throw new Error("Unable to resolve owned window");
++          return page;
++        } catch (error) {
++          await page?.close().catch(() => {
++          });
++          if (targetId)
++            await cdpSession.send("Target.closeTarget", { targetId }).catch(() => {
++            });
++          throw error;
++        } finally {
++          await cdpSession.detach().catch(() => {
++          });
++        }
++      }
+       _onPageCreated(page) {
++        if (this._tabs.some((tab2) => tab2.page === page))
++          return;
++        if (this._pageToken)
++          page.__jobhuntPageOwner = this._pageToken;
+         const tab2 = new Tab(this, page, (tab3) => this._onPageClosed(tab3));
+         this._tabs.push(tab2);
+         if (!this._currentTab)
+@@ -64423,9 +64634,25 @@ var init_context = __esm({
+         await this._setupRequestInterception(browserContext);
+         for (const initScript of this.config.browser?.initScript || [])
+           this._disposables.push(await browserContext.addInitScript({ path: import_path45.default.resolve(this.options.cwd, initScript) }));
+-        for (const page of browserContext.pages())
+-          this._onPageCreated(page);
+-        this._disposables.push(eventsHelper.addEventListener(browserContext, "page", (page) => this._onPageCreated(page)));
++        if (this._ownedPage) {
++          this._ownedPageListener = eventsHelper.addEventListener(browserContext, "page", (page) => {
++            this._trackOwnedPageCheck(page);
++          });
++          this._disposables.push(this._ownedPageListener);
++          if (this._borrowedPages) {
++            for (const page of browserContext.pages())
++              await this._trackOwnedPageCheck(page);
++          } else {
++            await this._trackOwnedPageCheck(this._ownedPage);
++          }
++          this._currentTab = this._tabs.find((tab2) => tab2.page === this._ownedPage);
++          if (!this._currentTab)
++            throw new Error("Jobhunt owned page is no longer open");
++        } else {
++          for (const page of browserContext.pages())
++            this._onPageCreated(page);
++          this._disposables.push(eventsHelper.addEventListener(browserContext, "page", (page) => this._onPageCreated(page)));
++        }
+         return browserContext;
+       }
+       checkUrlAllowed(url3) {
+@@ -64928,8 +65155,9 @@ var init_browserBackend = __esm({
+     z5 = require("./utilsBundle").z;
+     debug10 = require("./utilsBundle").debug;
+     BrowserBackend = class {
+-      constructor(config, browserContext, tools) {
++      constructor(config, browserContext, tools, options = {}) {
+         this._disconnected = false;
++        this._options = options;
+         this._config = config;
+         this._tools = tools;
+         this.browserContext = browserContext;
+@@ -64944,12 +65172,26 @@ var init_browserBackend = __esm({
+         this._context = new Context(this.browserContext, {
+           config: this._config,
+           sessionLog: this._sessionLog,
+-          cwd: clientInfo.cwd
++          cwd: clientInfo.cwd,
++          ownedPage: this._options.ownedPage,
++          pageToken: this._options.pageToken,
++          targetPath: this._options.targetPath,
++          ownedTargetId: this._options.ownedTargetId,
++          ownedWindowId: this._options.ownedWindowId,
++          ownedTargetIds: this._options.ownedTargetIds,
++          ownedWindowIds: this._options.ownedWindowIds,
++          journaledWindowIds: this._options.journaledWindowIds,
++          borrowedPages: this._options.borrowedPages
+         });
++        if (this._options.borrowedPages)
++          await this._context.ensureBrowserContext();
+       }
+       async dispose() {
+         await this._context?.dispose().catch((e) => debug10("pw:tools:error")(e));
+       }
++      async closeOwnedPages() {
++        await this._context?.closeOwnedPages();
++      }
+       async callTool(name, rawArguments = {}, signal) {
+         const json = !!rawArguments._meta?.json;
+         const formatError = (message) => ({
+@@ -73066,13 +73308,15 @@ async function startCliDaemonServer(sessionName, browserContext, browserInfo2, c
+   const sessionConfig = createSessionConfig(clientInfo, sessionName, browserInfo2, options);
+   const { socketPath } = sessionConfig;
+   if (process.platform !== "win32" && await socketExists(socketPath)) {
++    if (options.borrowedPages)
++      throw new Error("A Jobhunt controller socket already exists");
+     try {
+       await import_fs66.default.promises.unlink(socketPath);
+     } catch (error) {
+       throw error;
+     }
+   }
+-  const backend = new BrowserBackend(contextConfig, browserContext, browserTools);
++  const backend = new BrowserBackend(contextConfig, browserContext, browserTools, options);
+   await backend.initialize(mcpClientInfo);
+   if (browserContext.isClosed())
+     throw new Error("Browser context was closed before the daemon could start");
+@@ -73084,6 +73328,7 @@ async function startCliDaemonServer(sessionName, browserContext, browserInfo2, c
+       const { id, method, params: params2 } = message;
+       try {
+         if (method === "stop") {
++          await backend.closeOwnedPages();
+           await deleteSessionFile(clientInfo, sessionConfig);
+           const sendAck = async () => connection.send({ id, result: "ok" }).catch(() => {
+           });
+@@ -73182,6 +73427,145 @@ var init_daemon = __esm({
+ });
+ 
+ // packages/playwright-core/src/tools/cli-daemon/program.ts
++async function writeJobhuntTargetRecords(targetPath, records, flag = "a") {
++  const file = await import_fs66.default.promises.open(targetPath, flag, 384);
++  try {
++    await file.writeFile(records.map((record) => record + "\n").join(""));
++    await file.sync();
++  } finally {
++    await file.close();
++  }
++}
++async function reconnectJobhuntOwnedPage(browser, browserContext, pageToken, targetPath, targetId) {
++  if (!/^[A-Fa-f0-9]{8,128}$/.test(targetId))
++    throw new Error("Invalid Jobhunt reconnect target");
++  const file = await import_fs66.default.promises.open(targetPath, import_fs66.default.constants.O_RDONLY | import_fs66.default.constants.O_NOFOLLOW);
++  let records;
++  try {
++    const metadata = await file.stat();
++    if (!metadata.isFile() || metadata.size > 1048576 || (metadata.mode & 511) !== 384 || metadata.uid !== process.getuid?.())
++      throw new Error("Invalid Jobhunt target journal");
++    const bytes = Buffer.alloc(metadata.size + 1);
++    let length = 0;
++    while (length < bytes.length) {
++      const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
++      if (!bytesRead)
++        break;
++      length += bytesRead;
++    }
++    if (length !== metadata.size || bytes.subarray(0, length).some((byte) => byte > 127))
++      throw new Error("Invalid Jobhunt target journal");
++    records = bytes.subarray(0, length).toString("ascii").split("\n");
++    if (records.at(-1) === "")
++      records.pop();
++  } finally {
++    await file.close();
++  }
++  const ownedTargetIds = /* @__PURE__ */ new Set();
++  const windows = /* @__PURE__ */ new Map();
++  const seen = /* @__PURE__ */ new Set();
++  for (const record of records) {
++    if (seen.has(record))
++      throw new Error("Invalid Jobhunt target journal");
++    seen.add(record);
++    if (/^[A-Fa-f0-9]{8,128}$/.test(record)) {
++      ownedTargetIds.add(record);
++    } else if (!/^marker:[a-f0-9]{64}$/.test(record)) {
++      const match = /^window:([1-9][0-9]{0,15}):([A-Fa-f0-9]{8,128})$/.exec(record);
++      const windowId = match ? Number(match[1]) : 0;
++      if (!Number.isSafeInteger(windowId) || !windowId || windows.has(windowId))
++        throw new Error("Invalid Jobhunt target journal");
++      windows.set(windowId, match[2]);
++    }
++  }
++  if (!ownedTargetIds.has(targetId) || [...windows.values()].some((witness) => !ownedTargetIds.has(witness)))
++    throw new Error("Jobhunt reconnect target is not owned");
++  const cdpSession = await browser.newBrowserCDPSession();
++  try {
++    const { targetInfos } = await cdpSession.send("Target.getTargets");
++    const liveTargets = new Set(targetInfos.filter((info) => info.type === "page").map((info) => info.targetId));
++    if (!liveTargets.has(targetId))
++      throw new Error("Jobhunt reconnect target is no longer open");
++    const ownedWindowIds = /* @__PURE__ */ new Set();
++    for (const [windowId, witness] of windows) {
++      if (!liveTargets.has(witness))
++        continue;
++      const current = await cdpSession.send("Browser.getWindowForTarget", { targetId: witness }).catch(() => null);
++      if (current?.windowId === windowId)
++        ownedWindowIds.add(windowId);
++    }
++    const { windowId } = await cdpSession.send("Browser.getWindowForTarget", { targetId });
++    if (!ownedWindowIds.has(windowId))
++      throw new Error("Jobhunt reconnect window ownership cannot be verified");
++    for (const page of browserContext.pages()) {
++      if (page.isClosed())
++        continue;
++      const pageSession = await browserContext.newCDPSession(page);
++      try {
++        const { targetInfo } = await pageSession.send("Target.getTargetInfo");
++        if (targetInfo.targetId === targetId)
++          return { ownedPage: page, pageToken, targetPath, ownedTargetId: targetId, ownedWindowId: windowId,
++            ownedTargetIds, ownedWindowIds, journaledWindowIds: windows.keys(), borrowedPages: new Set(browserContext.pages()) };
++      } finally {
++        await pageSession.detach().catch(() => {
++        });
++      }
++    }
++    throw new Error("Unable to resolve Jobhunt reconnect page");
++  } finally {
++    await cdpSession.detach().catch(() => {
++    });
++  }
++}
++async function createJobhuntOwnedPage(browser, browserContext, sessionName) {
++  const pageToken = process.env.JOBHUNT_PLAYWRIGHT_PAGE_TOKEN;
++  const targetPath = process.env.JOBHUNT_PLAYWRIGHT_TARGET_PATH;
++  const reconnectTargetId = process.env.JOBHUNT_PLAYWRIGHT_RECONNECT_TARGET_ID;
++  if (!pageToken && !targetPath && reconnectTargetId === void 0)
++    return {};
++  if (!/^jobhunt-[a-f0-9]{32}$/.test(pageToken ?? "") || pageToken !== sessionName || !targetPath || !import_path60.default.isAbsolute(targetPath))
++    throw new Error("Invalid Jobhunt page lease configuration");
++  if (reconnectTargetId !== void 0)
++    return await reconnectJobhuntOwnedPage(browser, browserContext, pageToken, targetPath, reconnectTargetId);
++  const markerToken = require("crypto").randomBytes(32).toString("hex");
++  const marker = "about:blank#jobhunt-" + markerToken;
++  await writeJobhuntTargetRecords(targetPath, ["marker:" + markerToken], "wx");
++  const cdpSession = await browser.newBrowserCDPSession();
++  let targetId;
++  let windowId;
++  let ownedPage;
++  try {
++    ({ targetId } = await cdpSession.send("Target.createTarget", {
++      url: marker,
++      newWindow: true,
++      background: true
++    }));
++    const deadline = Date.now() + 5e3;
++    while (!ownedPage && Date.now() < deadline) {
++      ownedPage = browserContext.pages().find((page) => page.url() === marker);
++      if (!ownedPage)
++        await new Promise((resolve) => setTimeout(resolve, 20));
++    }
++    if (!ownedPage)
++      throw new Error("Unable to resolve Jobhunt page lease");
++    ({ windowId } = await cdpSession.send("Browser.getWindowForTarget", { targetId }));
++    if (!Number.isSafeInteger(windowId) || windowId <= 0)
++      throw new Error("Unable to identify Jobhunt page window");
++    await writeJobhuntTargetRecords(targetPath, [targetId, "window:" + windowId + ":" + targetId]);
++    return { ownedPage, pageToken, targetPath, ownedTargetId: targetId, ownedWindowId: windowId };
++  } catch (error) {
++    await ownedPage?.close().catch(() => {
++    });
++    if (targetId)
++      await cdpSession.send("Target.closeTarget", { targetId }).catch(() => {
++      });
++    throw error;
++  } finally {
++    await cdpSession.detach().catch(() => {
++    });
++  }
++}
++
+ function decorateProgram3(program4) {
+   program4.argument("[session-name]", "name of the session to create or connect to", "default").option("--headed", "run in headed mode (non-headless)").option("--device <device>", 'emulate a specific device, for example "iPhone 15"').option("--mobile", "emulate a generic mobile device (Pixel 10 for Chromium, iPhone 17 for WebKit)").option("--extension", "run with the extension").option("--browser <name>", "browser to use (chromium, chrome, firefox, webkit)").option("--persistent", "use a persistent browser context").option("--profile <path>", "path to the user data dir").option("--config <path>", "path to the config file; by default uses .playwright/cli.config.json in the project directory and ~/.playwright/cli.config.json as global config").option("--cdp <url>", "connect to an existing browser via CDP endpoint URL").option("--endpoint <endpoint>", "attach to a running Playwright browser endpoint").option("--init-workspace", "initialize workspace").option("--init-skills <value>", 'install skills for the given agent type ("claude" or "agents")').action(async (sessionName, options) => {
+     if (options.initWorkspace) {
+@@ -73195,18 +73579,25 @@ function decorateProgram3(program4) {
+       cwd: process.cwd(),
+       clientName: guessClientName()
+     };
++    let ownedPage;
+     try {
++      if (process.env.JOBHUNT_PLAYWRIGHT_RECONNECT_TARGET_ID !== void 0 && (!options.cdp || mcpConfig.browser.isolated))
++        throw new Error("Jobhunt reconnect requires an existing CDP context");
+       const { browser, browserInfo: browserInfo2, canBind, ownership } = await createBrowserWithInfo(mcpConfig, mcpClientInfo, options);
+       if (canBind)
+         await browser.bind(sessionName, { workspaceDir: clientInfo.workspaceDir });
+       const browserContext = mcpConfig.browser.isolated ? await browser.newContext(mcpConfig.browser.contextOptions) : browser.contexts()[0];
+       if (!browserContext)
+         throw new Error("Error: unable to connect to a browser that does not have any contexts");
++      const pageLease = await createJobhuntOwnedPage(browser, browserContext, sessionName);
++      ownedPage = pageLease.borrowedPages ? void 0 : pageLease.ownedPage;
+       const persistent = options.persistent || options.profile || mcpConfig.browser.userDataDir ? true : void 0;
+-      const socketPath = await startCliDaemonServer(sessionName, browserContext, browserInfo2, mcpConfig, clientInfo, mcpClientInfo, { persistent, exitOnClose: true, ownership });
++      const socketPath = await startCliDaemonServer(sessionName, browserContext, browserInfo2, mcpConfig, clientInfo, mcpClientInfo, { persistent, exitOnClose: true, ownership, ...pageLease });
+       console.log(`Daemon listening on ${socketPath}
+ `);
+     } catch (error) {
++      await ownedPage?.close().catch(() => {
++      });
+       console.log(error);
+       gracefullyProcessExitDoNotHang(1);
+     }
+diff --git a/lib/tools/cli-client/program.js b/lib/tools/cli-client/program.js
+index 137dca1d47291320aba01bb701fb232434c6c121..2c18f16506c740ea3b85c1828613d7d42127f749 100644
+--- a/lib/tools/cli-client/program.js
++++ b/lib/tools/cli-client/program.js
+@@ -59,6 +59,10 @@ async function program(options) {
+   const clientInfo = (0, import_registry.createClientInfo)();
+   const help = require((0, import_package.libPath)("tools", "cli-client", "help.json"));
+   const argv = process.argv.slice(2);
++  if (argv.length === 3 && /^--session=jobhunt-[a-f0-9]{32}$/.test(argv[0]) && argv[1] === "--jobhunt-page-lease-version" && argv[2] === "--json") {
++    process.stdout.write("1\n");
++    return;
++  }
+   const boolean = [...help.booleanOptions, ...booleanOptions];
+   const args = (0, import_minimist.minimist)(argv, { boolean, string: ["_"] });
+   if (args.s) {
+@@ -148,8 +152,7 @@ async function program(options) {
+       const attachSessionName = (0, import_registry.explicitSessionName)(args.session) ?? attachTarget ?? cdpChannel ?? extensionChannel ?? sessionName;
+       args.session = attachSessionName;
+       const { pid } = await startSession(attachSessionName, registry, clientInfo, args, "attach");
+-      const newEntry = await registry.loadEntry(clientInfo, attachSessionName);
+-      const toolText = await runInSessionOrStop(newEntry, clientInfo, { _: ["snapshot"], filename: "<auto>" }, output);
++      const toolText = process.env.JOBHUNT_PLAYWRIGHT_RECONNECT_TARGET_ID !== void 0 ? "{}" : await runInSessionOrStop(await registry.loadEntry(clientInfo, attachSessionName), clientInfo, { _: ["snapshot"], filename: "<auto>" }, output);
+       output.attach(attachSessionName, pid, targetName, toolText);
+       return;
+     }
+@@ -250,8 +253,14 @@ async function program(options) {
+ }
+ async function startSession(sessionName, registry, clientInfo, args, mode) {
+   const entry = registry.entry(clientInfo, sessionName);
+-  if (entry)
++  if (process.env.JOBHUNT_PLAYWRIGHT_RECONNECT_TARGET_ID !== void 0) {
++    if (mode !== "attach" || typeof args.cdp !== "string" || args.endpoint || args.extension)
++      throw new Error("Jobhunt reconnect requires explicit CDP attach");
++    if (entry && await new import_session.Session(entry).canConnect())
++      throw new Error("A Jobhunt controller is already connected");
++  } else if (entry) {
+     await new import_session.Session(entry).stop();
++  }
+   return await import_session.Session.startDaemon(clientInfo, args, mode);
+ }
+ async function runInSession(entry, clientInfo, args, output) {

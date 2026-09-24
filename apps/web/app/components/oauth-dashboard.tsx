@@ -1,37 +1,36 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  ApiErrorSchema,
-  AuthSessionSchema,
-  AuthStatusResponseSchema,
-  type AuthProvider,
-  type AuthSession,
-  type AuthStatusResponse,
-} from "@jobhunter/pipeline/contracts";
-import { useDashboardData } from "../providers/dashboard-data-provider";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import type { AuthProvider, AuthSession } from "../lib/pipeline-contracts";
+import { AuthorizationSession, type AuthorizationAction } from "../lib/authorization-session";
+import { useDashboardData } from "../credentials/dashboard-data-provider";
+import controlStyles from "./alert-controls.module.css";
 
-const AUTH_ROOT = "/api/pipeline/auth";
-const POLL_INTERVAL_MS = 2_500;
 const MAX_PUBLIC_TEXT_LENGTH = 480;
 
 const PROVIDERS = [
   {
     provider: "openai-codex",
     name: "OpenAI Codex",
+    description: "Résumé workflows and the default application agent.",
+  },
+  {
+    provider: "google-antigravity",
+    name: "Google Antigravity",
+    description: "Application agent access for Gemini 3.8 Flash.",
   },
   {
     provider: "gmail",
     name: "Gmail",
+    description: "Application verification emails. Separate from model access.",
   },
 ] as const satisfies ReadonlyArray<{
   provider: AuthProvider;
   name: string;
+  description: string;
 }>;
 
-type BrowserAuthSession = AuthSession & { url?: string };
-type Notice = { tone: "error" | "info" | "success"; text: string };
-type BusyAction = "connect" | "logout" | "cancel" | "prompt";
+type BusyAction = AuthorizationAction;
 type ProviderMap<T> = Partial<Record<AuthProvider, T>>;
 
 function closeAuthWindow(authWindow: Window | null): void {
@@ -111,35 +110,7 @@ function redactPublicText(value: string): string {
     .slice(0, MAX_PUBLIC_TEXT_LENGTH);
 }
 
-function apiMessage(value: unknown): string {
-  const parsed = ApiErrorSchema.safeParse(value);
-  return parsed.success ? redactPublicText(parsed.data.error.message) : "The request could not be completed.";
-}
-
-async function readResponseJson(response: Response): Promise<unknown> {
-  let value: unknown;
-
-  try {
-    value = await response.json();
-  } catch {
-    throw new Error("The service returned an unreadable response.");
-  }
-
-  if (!response.ok) throw new Error(apiMessage(value));
-  return value;
-}
-
-function parseAuthSession(value: unknown): BrowserAuthSession | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-
-  const { url, ...sessionValue } = value as Record<string, unknown>;
-  const parsed = AuthSessionSchema.safeParse(sessionValue);
-  if (!parsed.success) return null;
-
-  return typeof url === "string" ? { ...parsed.data, url } : parsed.data;
-}
-
-function launchTarget(session: BrowserAuthSession): string | undefined {
+function launchTarget(session: AuthSession): string | undefined {
   const candidate = session.launchUrl ?? session.url;
   if (!candidate) return undefined;
 
@@ -154,7 +125,7 @@ function launchTarget(session: BrowserAuthSession): string | undefined {
 function terminalMessage(state: AuthSession["state"]): string | null {
   switch (state) {
     case "succeeded":
-      return "Authorization completed. The provider connection was refreshed.";
+      return "Authorization completed. The credential was refreshed.";
     case "failed":
       return "Authorization did not complete. Start a new connection to try again.";
     case "cancelled":
@@ -166,293 +137,97 @@ function terminalMessage(state: AuthSession["state"]): string | null {
   }
 }
 
-function usePendingSessionPolling(
-  session: BrowserAuthSession | undefined,
-  updateSession: (session: BrowserAuthSession) => void,
-  refreshAuthStatus: () => Promise<void>,
-  setNotice: (provider: AuthProvider, notice: Notice) => void,
-): void {
-  const sessionId = session?.state === "pending" ? session.id : undefined;
-  const provider = session?.state === "pending" ? session.provider : undefined;
-  const currentSession = useRef(session);
-  currentSession.current = session;
-
-  useEffect(() => {
-    if (!sessionId || !provider) return;
-
-    const controller = new AbortController();
-    let current = true;
-
-    const poll = async () => {
-      const requestedSession = currentSession.current;
-      if (
-        requestedSession?.state !== "pending"
-        || requestedSession.id !== sessionId
-        || requestedSession.provider !== provider
-      ) return;
-
-      try {
-        const response = await fetch(`${AUTH_ROOT}/sessions/${encodeURIComponent(sessionId)}`, {
-          cache: "no-store",
-          signal: controller.signal,
-        });
-        const value = await readResponseJson(response);
-        const nextSession = parseAuthSession(value);
-        if (!nextSession) throw new Error("The service returned an invalid authorization session.");
-        if (!current || currentSession.current !== requestedSession) return;
-
-        updateSession(nextSession);
-        if (nextSession.state === "succeeded") {
-          await refreshAuthStatus();
-        }
-      } catch (error) {
-        if (!current || controller.signal.aborted) return;
-        setNotice(provider, {
-          tone: "error",
-          text: error instanceof Error ? redactPublicText(error.message) : "Authorization status is unavailable.",
-        });
-      }
-    };
-
-    void poll();
-    const interval = window.setInterval(() => void poll(), POLL_INTERVAL_MS);
-
-    return () => {
-      current = false;
-      controller.abort();
-      window.clearInterval(interval);
-    };
-  }, [provider, refreshAuthStatus, sessionId, setNotice, updateSession]);
-}
-
-function PendingSessionPolling({
-  session,
-  updateSession,
-  refreshAuthStatus,
-  setNotice,
-}: {
-  session: BrowserAuthSession | undefined;
-  updateSession: (session: BrowserAuthSession) => void;
-  refreshAuthStatus: () => Promise<void>;
-  setNotice: (provider: AuthProvider, notice: Notice | undefined) => void;
-}): null {
-  usePendingSessionPolling(session, updateSession, refreshAuthStatus, setNotice);
-  return null;
-}
-
 export function OAuthDashboard() {
   const { authStatus, setAuthStatus } = useDashboardData();
-  const showInitialLoading = useRef(authStatus === undefined);
-  const [isLoadingStatus, setIsLoadingStatus] = useState(showInitialLoading.current);
-  const [statusError, setStatusError] = useState<string | null>(null);
-  const [sessions, setSessions] = useState<ProviderMap<BrowserAuthSession>>({});
-  const [notices, setNotices] = useState<ProviderMap<Notice>>({});
-  const [busy, setBusy] = useState<ProviderMap<BusyAction>>({});
+  const [authorization] = useState(() => new AuthorizationSession({ initialStatus: authStatus }));
+  const {
+    isLoadingStatus, statusError, sessions, notices, busy, applicationModel,
+    isLoadingApplicationModel, applicationModelError, authStatus: latestStatus,
+  } = useSyncExternalStore(authorization.subscribe, authorization.getSnapshot, authorization.getSnapshot);
   const [promptValues, setPromptValues] = useState<ProviderMap<string>>({});
-
-  const refreshAuthStatus = useCallback(async (showLoading = false) => {
-    if (showLoading) setIsLoadingStatus(true);
-
-    try {
-      const response = await fetch(AUTH_ROOT, { cache: "no-store" });
-      const value = await readResponseJson(response);
-      const parsed = AuthStatusResponseSchema.safeParse(value);
-      if (!parsed.success) throw new Error("The service returned an invalid connection status.");
-
-      setAuthStatus(parsed.data);
-      setStatusError(null);
-    } catch (error) {
-      setStatusError(error instanceof Error ? redactPublicText(error.message) : "Connection status is unavailable.");
-    } finally {
-      if (showLoading) setIsLoadingStatus(false);
-    }
-  }, [setAuthStatus]);
+  const lifetime = useRef(0);
+  const reservedWindows = useRef(new Set<Window>());
 
   useEffect(() => {
-    void refreshAuthStatus(showInitialLoading.current);
-  }, [refreshAuthStatus]);
+    const windows = reservedWindows.current;
+    authorization.start();
+    return () => {
+      lifetime.current += 1;
+      authorization.stop();
+      for (const authWindow of windows) closeAuthWindow(authWindow);
+      windows.clear();
+    };
+  }, [authorization]);
+
+  useEffect(() => {
+    if (latestStatus) setAuthStatus(latestStatus);
+  }, [latestStatus, setAuthStatus]);
 
   const statusByProvider = useMemo(
-    () => new Map(authStatus?.providers.map((status) => [status.provider, status]) ?? []),
-    [authStatus],
+    () => new Map((latestStatus ?? authStatus)?.providers.map((status) => [status.provider, status]) ?? []),
+    [authStatus, latestStatus],
   );
 
-  const updateSession = useCallback((session: BrowserAuthSession) => {
-    setSessions((current) => ({ ...current, [session.provider]: session }));
-  }, []);
+  const startSession = useCallback(async (provider: AuthProvider) => {
+    // Reserve during user activation; neither Window nor prompt credentials enter the session owner.
+    const authWindow = reserveAuthWindow();
+    if (authWindow) reservedWindows.current.add(authWindow);
+    const currentLifetime = lifetime.current;
+    const session = await authorization.connect(provider);
+    if (authWindow) reservedWindows.current.delete(authWindow);
+    if (!session || currentLifetime !== lifetime.current) {
+      closeAuthWindow(authWindow);
+      return;
+    }
+    const target = launchTarget(session);
+    if (target && authWindow && navigateAuthWindow(authWindow, target)) {
+      authorization.notice(provider, {
+        tone: "info",
+        text: "Sign-in opened in a new tab. Return here when authorization is complete.",
+      });
+    } else if (target) {
+      closeAuthWindow(authWindow);
+      authorization.notice(provider, {
+        tone: "error",
+        text: "Your browser blocked the sign-in window. Use the Open sign-in link below.",
+      });
+    } else {
+      closeAuthWindow(authWindow);
+      authorization.notice(provider, { tone: "info", text: "Connection session started. Follow the instructions below." });
+    }
+  }, [authorization]);
 
-  const setNotice = useCallback((provider: AuthProvider, notice: Notice | undefined) => {
-    setNotices((current) => {
-      const next = { ...current };
-      if (notice) next[provider] = notice;
-      else delete next[provider];
-      return next;
-    });
-  }, []);
+  const answerPrompt = useCallback(async (session: AuthSession) => {
+    const currentLifetime = lifetime.current;
+    const result = await authorization.answer(session, promptValues[session.provider] ?? "");
+    if (result && currentLifetime === lifetime.current) {
+      setPromptValues((current) => ({ ...current, [session.provider]: "" }));
+    }
+  }, [authorization, promptValues]);
 
-  const setBusyAction = useCallback((provider: AuthProvider, action: BusyAction | undefined) => {
-    setBusy((current) => {
-      const next = { ...current };
-      if (action) next[provider] = action;
-      else delete next[provider];
-      return next;
-    });
-  }, []);
-
-
-  const startSession = useCallback(
-    async (provider: AuthProvider) => {
-      const authWindow = reserveAuthWindow();
-      setBusyAction(provider, "connect");
-      setNotice(provider, undefined);
-
-      try {
-        const response = await fetch(`${AUTH_ROOT}/${provider}/sessions`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-        });
-        const value = await readResponseJson(response);
-        const session = parseAuthSession(value);
-        if (!session) throw new Error("The service returned an invalid authorization session.");
-
-        updateSession(session);
-        const target = launchTarget(session);
-        if (target && authWindow && navigateAuthWindow(authWindow, target)) {
-          setNotice(provider, {
-            tone: "info",
-            text: "Sign-in opened in a new tab. Return here when authorization is complete.",
-          });
-        } else if (target) {
-          closeAuthWindow(authWindow);
-          setNotice(provider, {
-            tone: "error",
-            text: "Your browser blocked the sign-in window. Use the Open sign-in link below.",
-          });
-        } else {
-          closeAuthWindow(authWindow);
-          setNotice(provider, { tone: "info", text: "Connection session started. Follow the instructions below." });
-        }
-
-        if (session.state === "succeeded") await refreshAuthStatus();
-      } catch (error) {
-        closeAuthWindow(authWindow);
-        setNotice(provider, {
-          tone: "error",
-          text: error instanceof Error ? redactPublicText(error.message) : "The connection could not be started.",
-        });
-      } finally {
-        setBusyAction(provider, undefined);
-      }
-    },
-    [refreshAuthStatus, setBusyAction, setNotice, updateSession],
+  const cancelSession = authorization.cancel;
+  const logout = authorization.disconnect;
+  const refreshApplicationModel = authorization.refreshModel;
+  const toggleApplicationModel = (useAntigravity: boolean) => authorization.selectModel(
+    useAntigravity ? "gemini-3.8-flash" : "gpt-5.6-sol",
   );
 
-  const cancelSession = useCallback(
-    async (session: BrowserAuthSession) => {
-      setBusyAction(session.provider, "cancel");
-      setNotice(session.provider, undefined);
-
-      try {
-        const response = await fetch(`${AUTH_ROOT}/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
-        const value = await readResponseJson(response);
-        const cancelled = parseAuthSession(value);
-        if (!cancelled) throw new Error("The service returned an invalid authorization session.");
-
-        updateSession(cancelled);
-      } catch (error) {
-        setNotice(session.provider, {
-          tone: "error",
-          text: error instanceof Error ? redactPublicText(error.message) : "The session could not be cancelled.",
-        });
-      } finally {
-        setBusyAction(session.provider, undefined);
-      }
-    },
-    [setBusyAction, setNotice, updateSession],
-  );
-
-  const answerPrompt = useCallback(
-    async (session: BrowserAuthSession) => {
-      const value = promptValues[session.provider]?.trim() ?? "";
-      if (!value) return;
-
-      setBusyAction(session.provider, "prompt");
-      setNotice(session.provider, undefined);
-
-      try {
-        const response = await fetch(`${AUTH_ROOT}/sessions/${encodeURIComponent(session.id)}/prompt`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ value }),
-        });
-        const responseValue = await readResponseJson(response);
-        const updated = parseAuthSession(responseValue);
-        if (!updated) throw new Error("The service returned an invalid authorization session.");
-
-        updateSession(updated);
-        setPromptValues((current) => ({ ...current, [session.provider]: "" }));
-        setNotice(session.provider, { tone: "info", text: "Response submitted. Waiting for authorization to continue." });
-      } catch (error) {
-        setNotice(session.provider, {
-          tone: "error",
-          text: error instanceof Error ? redactPublicText(error.message) : "The response could not be submitted.",
-        });
-      } finally {
-        setBusyAction(session.provider, undefined);
-      }
-    },
-    [promptValues, setBusyAction, setNotice, updateSession],
-  );
-
-  const logout = useCallback(
-    async (provider: AuthProvider) => {
-      setBusyAction(provider, "logout");
-      setNotice(provider, undefined);
-
-      try {
-        const response = await fetch(`${AUTH_ROOT}/${provider}`, { method: "DELETE" });
-        if (!response.ok) {
-          let value: unknown = null;
-          try {
-            value = await response.json();
-          } catch {
-            // The public response is optional for a bodyless DELETE.
-          }
-          throw new Error(apiMessage(value));
-        }
-
-        setSessions((current) => {
-          const next = { ...current };
-          delete next[provider];
-          return next;
-        });
-        await refreshAuthStatus();
-        setNotice(provider, { tone: "success", text: "Provider connection removed." });
-      } catch (error) {
-        setNotice(provider, {
-          tone: "error",
-          text: error instanceof Error ? redactPublicText(error.message) : "The provider could not be disconnected.",
-        });
-      } finally {
-        setBusyAction(provider, undefined);
-      }
-    },
-    [refreshAuthStatus, setBusyAction, setNotice],
-  );
+  const usesAntigravity = applicationModel === "gemini-3.8-flash";
+  const requestedModelProvider = usesAntigravity ? "openai-codex" : "google-antigravity";
+  const requestedModelConnected = statusByProvider.get(requestedModelProvider)?.state === "connected";
+  const requestedModelProviderName = requestedModelProvider === "google-antigravity"
+    ? "Google Antigravity"
+    : "OpenAI Codex";
+  const applicationModelSwitchDescription = applicationModel === undefined
+    ? "Application model status is unavailable. Retry model status to enable this switch."
+    : requestedModelConnected
+      ? usesAntigravity
+        ? "Turn off to use OpenAI Codex for applications."
+        : "Turn on to use Google Antigravity 3.8 Flash for applications."
+      : `Connect ${requestedModelProviderName} to switch models.`;
 
   return (
-    <section className="oauth-dashboard" aria-label="OAuth provider connections">
-      {PROVIDERS.map(({ provider }) => (
-        <PendingSessionPolling
-          key={provider}
-          session={sessions[provider]}
-          updateSession={updateSession}
-          refreshAuthStatus={refreshAuthStatus}
-          setNotice={setNotice}
-        />
-      ))}
-
+    <section className="oauth-dashboard" aria-label="OAuth credentials">
       {statusError ? (
         <p className="dashboard-notice dashboard-notice--error" role="alert">
           {statusError}
@@ -461,12 +236,12 @@ export function OAuthDashboard() {
 
       <div className="provider-table" aria-busy={isLoadingStatus}>
         <div className="provider-table__head" aria-hidden="true">
-          <span>Provider</span>
+          <span>Credential</span>
           <span>Status</span>
           <span>Action</span>
         </div>
 
-        <ul className="provider-list" aria-label="OAuth providers">
+        <ul className="provider-list" aria-label="Credentials">
           {PROVIDERS.map((provider) => {
             const providerStatus = statusByProvider.get(provider.provider);
             const session = sessions[provider.provider];
@@ -475,21 +250,46 @@ export function OAuthDashboard() {
             const isPending = session?.state === "pending";
             const isConnected = providerStatus?.state === "connected";
             const statusLabel = isLoadingStatus ? "Checking" : providerStatus?.state ?? "Unavailable";
-            const identity = providerStatus?.identity?.email ?? providerStatus?.identity?.accountId;
+            const email = providerStatus?.identity?.email;
 
             return (
               <li className="provider-row" key={provider.provider}>
-                <div className="provider-identity">
+                <div>
                   <p className="provider-identity__name">{provider.name}</p>
-                  <p className="provider-identity__id">{provider.provider}</p>
+                  <p className="oauth-session__instructions">{provider.description}</p>
                 </div>
 
                 <div className="provider-connection">
                   <span className={`status-badge status-badge--${statusLabel.toLowerCase()}`}>{statusLabel}</span>
-                  {identity ? <span className="provider-account">{redactPublicText(identity)}</span> : null}
+                  {email ? <span className="provider-account">{redactPublicText(email)}</span> : null}
                 </div>
 
-                <div className="provider-actions">
+                <div className={`provider-actions ${controlStyles.controls}`}>
+                  {provider.provider === "google-antigravity" ? (
+                    <label
+                      className={controlStyles.toggle}
+                      title={requestedModelConnected ? undefined : `Connect ${requestedModelProviderName} to switch models.`}
+                    >
+                      <input
+                        aria-describedby="application-model-switch-description"
+                        aria-label="Use Google Antigravity 3.8 Flash for applications"
+                        checked={usesAntigravity}
+                        disabled={
+                          isLoadingApplicationModel
+                          || applicationModel === undefined
+                          || Boolean(busy["google-antigravity"])
+                          || !requestedModelConnected
+                        }
+                        onChange={(event) => void toggleApplicationModel(event.currentTarget.checked)}
+                        role="switch"
+                        type="checkbox"
+                      />
+                      <span>{busy["google-antigravity"] === "model" ? "Switching…" : "Use 3.8 Flash"}</span>
+                      <span className="visually-hidden" id="application-model-switch-description">
+                        {applicationModelSwitchDescription}
+                      </span>
+                    </label>
+                  ) : null}
                   {isConnected ? (
                     <button
                       className="control control--quiet"
@@ -527,6 +327,23 @@ export function OAuthDashboard() {
                   />
                 ) : null}
 
+                {provider.provider === "google-antigravity" && applicationModelError ? (
+                  <div
+                    className={`dashboard-notice dashboard-notice--error ${controlStyles.controls}`}
+                    role="alert"
+                  >
+                    <span>{applicationModelError}</span>
+                    <button
+                      className="control control--quiet"
+                      disabled={isLoadingApplicationModel}
+                      onClick={() => void refreshApplicationModel()}
+                      type="button"
+                    >
+                      {isLoadingApplicationModel ? "Retrying…" : "Retry model status"}
+                    </button>
+                  </div>
+                ) : null}
+
                 {notice ? (
                   <p
                     className={`dashboard-notice dashboard-notice--${notice.tone}`}
@@ -554,7 +371,7 @@ function SessionDetail({
   onAnswerPrompt,
   onCancel,
 }: {
-  session: BrowserAuthSession;
+  session: AuthSession;
   providerName: string;
   busyAction: BusyAction | undefined;
   promptValue: string;

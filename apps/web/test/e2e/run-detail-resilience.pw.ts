@@ -3,7 +3,7 @@ import {
   type ApplicationSessionView,
   type ResumeIterationListResponse,
   type RunDto,
-} from "@jobhunter/pipeline/contracts";
+} from "../../app/lib/pipeline-contracts";
 
 const runId = "inherited-resolved-artifacts";
 const resumeArtifactId = "compiled-pdf-revision-1";

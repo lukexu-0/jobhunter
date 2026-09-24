@@ -8,7 +8,7 @@ import {
 import {
   ApplicationSessionCommandSchema,
   type ApplicationSessionCommand,
-} from "@jobhunter/pipeline/contracts";
+} from "../lib/pipeline-contracts";
 import styles from "../run-detail.module.css";
 
 export type ApplicationCredentialCommandType = Extract<
