@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Jobhunt is a local-first workspace for preparing, reviewing, and managing job applications.">
+  <title>Jobhunt — README</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root { color-scheme: light; font: 16px/1.7 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1e293b; background: #f5f8fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { background: #102836; color: white; }
+    .bar { max-width: 960px; margin: auto; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+    .bar strong { color: #e2f5f4; font-size: .95rem; letter-spacing: .04em; }
+    .bar nav { display: flex; gap: 20px; }
+    .bar a { color: #c6e7e8; text-decoration: none; font-size: .9rem; }
+    .bar a:hover, .bar a:focus-visible { text-decoration: underline; }
+    main { max-width: 960px; margin: 40px auto 64px; padding: 0 24px; }
+    article { padding: 42px clamp(24px, 6vw, 72px) 56px; border: 1px solid #dce6ec; border-radius: 14px; background: white; box-shadow: 0 14px 40px #1028360d; }
+    h1, h2, h3 { color: #102836; line-height: 1.25; }
+    h1 { margin: 0 0 16px; font-size: clamp(2.4rem, 6vw, 3.7rem); letter-spacing: -.045em; }
+    h2 { margin: 44px 0 14px; padding-bottom: 10px; border-bottom: 1px solid #e3edf0; font-size: 1.55rem; }
+    h3 { margin: 28px 0 10px; font-size: 1.15rem; }
+    p, li { overflow-wrap: anywhere; }
+    p { margin: 12px 0 18px; }
+    li { margin: 6px 0; }
+    ul, ol { padding-left: 24px; }
+    a { color: #006977; text-underline-offset: 3px; }
+    a:hover { color: #004853; }
+    strong { color: #152e38; }
+    :not(pre) > code { padding: .12em .35em; border-radius: 5px; background: #eef3f5; font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { overflow-x: auto; padding: 18px 20px; border-radius: 9px; background: #102836; color: #e2f5f4; line-height: 1.55; }
+    pre code { font: .87rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+    table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: .94rem; }
+    th, td { padding: 12px 14px; border: 1px solid #dce6ec; text-align: left; vertical-align: top; }
+    th { background: #eff5f6; color: #102836; }
+    footer { max-width: 960px; margin: -40px auto 32px; padding: 0 24px; color: #546a75; font-size: .85rem; }
+    @media (max-width: 600px) { main { margin-top: 16px; padding: 0 12px; } article { padding: 28px 20px 38px; } .bar { padding: 14px 18px; } table { display: block; overflow-x: auto; } }
+  </style>
+</head>
+<body>
+  <!-- Static HTML rendering of README.md; regenerate when the Markdown changes. -->
+  <header><div class="bar"><strong>JOBHUNT / README</strong><nav><a href="README.md">Markdown</a><a href="https://github.com/lukexu-0/jobhunter">GitHub</a></nav></div></header>
+  <main><article>
+<h1>Jobhunt</h1>
+<p><strong>From an opportunity to a tailored résumé you can review—and an application you control.</strong></p>
+<p>Jobhunt is a local-first workspace for preparing job applications. It collects an opportunity, analyzes fit, tailors and compiles a résumé, checks the result, and lets you review it before an optional browser-assisted application.</p>
+<h2>What it does</h2>
+<ul>
+<li><strong>Bring an opportunity:</strong> enter a job URL or paste a title and description. Some URLs require a manual browser-capture step.</li>
+<li><strong>Prepare a résumé:</strong> analyze the opportunity, tailor a LaTeX résumé, compile a PDF, and run deterministic and visual checks.</li>
+<li><strong>Review before applying:</strong> compare iterations, inspect the PDF and findings, request edits, and approve a version.</li>
+<li><strong>Keep track:</strong> manage runs and application statuses in a local dashboard backed by SQLite.</li>
+<li><strong>Apply with assistance (optional):</strong> use a separate browser harness for approved runs, with human gates for missing details, CAPTCHA, form review, and submission.</li>
+</ul>
+<h2>Quickstart</h2>
+<h3>Prerequisites</h3>
+<ul>
+<li><a href="https://bun.sh/">Bun</a> <strong>1.3.14</strong>, Git, and <code>make</code>.</li>
+<li>For résumé processing: <code>latexmk</code> and Poppler (<code>pdfinfo</code>, <code>pdftotext</code>, <code>pdffonts</code>, <code>pdftoppm</code>). Run <code>make doctor</code> to diagnose missing system tools and configuration. It may report missing private context or authorization on a fresh checkout.</li>
+</ul>
+<h3>Start the development app</h3>
+<pre><code class="language-sh">git clone https://github.com/lukexu-0/jobhunter.git
+cd jobhunter
+make install
+make dev
+</code></pre>
+<p>Open <strong>http://127.0.0.1:3556</strong>. In another terminal, check the backend:</p>
+<pre><code class="language-sh">curl -fsS http://127.0.0.1:3557/v1/health
+# {&quot;status&quot;:&quot;ok&quot;}
+</code></pre>
+<p><code>make dev</code> starts the web UI and pipeline, <strong>not</strong> the browser harness. The app can open without applicant data, but creating a useful résumé run requires your own private source files. Development data is kept under <code>.jobhunt-data/development/</code> in this checkout.</p>
+<h3>Prepare your first run</h3>
+<ol>
+<li>Create <code>.jobhunt-data/user-info/resume-main/resume.tex</code> with <strong>your own</strong> LaTeX résumé. The directory and résumé are not included; create the directory with <code>mkdir -p .jobhunt-data/user-info/resume-main</code>. Other context sources, if configured, are listed in <code>apps/backend/context-sources.json</code>.</li>
+<li>Open <strong>Credentials</strong> in the app and connect OpenAI Codex for the résumé workflow. <code>make doctor</code> can help diagnose remaining setup issues.</li>
+<li>On the dashboard, enter an opportunity URL or choose <strong>Paste job details</strong> and provide a title and description.</li>
+<li>Open the run to inspect the generated PDF and checks, request edits if needed, and approve the result.</li>
+</ol>
+<p>Pasted job details have no application URL, so they can be used to prepare a résumé but <strong>cannot start an automatic browser application</strong>. Browser-assisted applications need an approved run with an HTTPS job URL.</p>
+<h3>Optional: browser-assisted applications</h3>
+<p>Install Node.js and Chrome/Chromium. Set <code>JOBHUNT_HARNESS_TOKEN</code> to the <strong>same private random value</strong> (at least 32 characters) in Git-ignored <code>apps/.env.local</code> for <code>make dev</code> and in the environment of the terminal running <code>make harness</code>. Restart <code>make dev</code> after setting it, then start the harness in the second terminal:</p>
+<pre><code class="language-sh">make harness
+</code></pre>
+<p>The harness listens on <code>127.0.0.1:8865</code> in development. Keep the browser session available for information requests, CAPTCHA, application review, and submission approval. <code>make harness</code> is not needed to create or review a résumé.</p>
+<h2>How it fits together</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>apps/web</code></td>
+<td>Next.js dashboard for opportunity intake, résumé review, credentials, and application status.</td>
+</tr>
+<tr>
+<td><code>apps/backend</code></td>
+<td>Bun API and durable pipeline for analysis, tailoring, PDF checks, and run state.</td>
+</tr>
+<tr>
+<td><code>apps/harness</code></td>
+<td>Separate Bun service for human-gated browser application sessions.</td>
+</tr>
+</tbody>
+</table>
+<h2>Development</h2>
+<p>From the repository root:</p>
+<pre><code class="language-sh">make doctor      # Check external tools and local setup
+make typecheck   # Type-check all three apps
+make check       # Type-check, build, and run tests (not browser E2E)
+make test-e2e    # Run the web Playwright suite
+</code></pre>
+<h2>Privacy</h2>
+<p>Applicant files, credentials, generated résumés, browser state, and local databases are private runtime data. Keep them out of commits and examples. Put applicant sources under Git-ignored <code>.jobhunt-data/user-info/</code> and local launch secrets in Git-ignored <code>apps/.env.local</code>. No personal résumé or credentials are bundled.</p>
+  </article></main>
+  <footer>Local-first application workspace · README preview</footer>
+</body>
+</html>
