@@ -723,6 +723,9 @@ describe("pipeline application bootstrap", () => {
     expect(() => createPipelineApplication({
       browserHarnessToken: "too-short",
     })).toThrow("JOBHUNT_HARNESS_TOKEN must contain at least 32 characters");
+    expect(() => createPipelineApplication({
+      browserHarnessToken: "😀".repeat(16),
+    })).toThrow("JOBHUNT_HARNESS_TOKEN must contain at least 32 characters");
   });
 
   test("starts worker scheduling only when kicked and exactly once per startup kick", async () => {
@@ -905,6 +908,95 @@ describe("pipeline application bootstrap", () => {
     expect(() => fixture.contextDatabase.query("SELECT 1").get()).toThrow();
     await fixture.app.close();
     expect(fixture.calls.close).toHaveLength(6);
+  });
+
+  test("keeps context available while a configured harness is offline", async () => {
+    const harness = new HttpApplicationHarnessClient({
+      token: HARNESS_TOKEN,
+      fetchImpl: async () => { throw new Error("harness is offline"); },
+    });
+    const fixture = createFixture(false, { applicationHarness: harness });
+
+    const context = await fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/context"));
+    expect(context.status).toBe(200);
+    const sync = await fixture.app.fetch(mutation("/v1/context/sync", {}));
+    expect(sync.status).toBe(200);
+    expect((await sync.json()).fresh).toBe(true);
+    const auth = await fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/auth/application-model"));
+    expect(auth.status).toBe(503);
+    expect((await auth.json()).error.code).toBe("APPLICATION_HARNESS_UNAVAILABLE");
+    await fixture.app.close();
+  });
+  test("reports a mismatched harness token without blocking context", async () => {
+    const harness = new HttpApplicationHarnessClient({
+      token: HARNESS_TOKEN,
+      fetchImpl: async () => new Response(null, { status: 401 }),
+    });
+    const fixture = createFixture(false, { applicationHarness: harness });
+    const auth = await fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/auth/application-model"));
+    expect(auth.status).toBe(502);
+    expect((await auth.json()).error.code).toBe("HARNESS_AUTH_FAILED");
+    expect((await fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/context"))).status).toBe(200);
+    await fixture.app.close();
+  });
+
+  test("queues and reads a run with a configured offline harness", async () => {
+    const harness = new HttpApplicationHarnessClient({
+      token: HARNESS_TOKEN,
+      fetchImpl: async () => { throw new Error("harness is offline"); },
+    });
+    const fixture = createFixture(true, { applicationHarness: harness });
+    expect((await fixture.app.fetch(mutation("/v1/context/sync", {}))).status).toBe(200);
+
+    const created = await fixture.app.fetch(mutation("/v1/runs", { jobUrl: JOB_URL }));
+    expect(created.status).toBe(201);
+    const run = await created.json();
+    const listed = await fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/runs"));
+    expect(listed.status).toBe(200);
+    expect((await listed.json()).runs[0].id).toBe(run.id);
+    const application = await fixture.app.fetch(new Request(
+      "http://127.0.0.1:3457/v1/runs/" + run.id + "/application",
+    ));
+    expect(application.status).toBe(200);
+    await fixture.app.close();
+  });
+
+  test("recovers credential and model synchronization after the harness comes online", async () => {
+    const authRoot = mkdtempSync(join(TEMP_ROOT, "pipeline-bootstrap-harness-recovery-"));
+    fixtures.push(authRoot);
+    const previousDatabase = process.env.JOBHUNT_AUTH_DATABASE;
+    process.env.JOBHUNT_AUTH_DATABASE = join(authRoot, "auth.sqlite");
+    let online = false;
+    const mirroredModels: string[] = [];
+    const harness = new HttpApplicationHarnessClient({
+      token: HARNESS_TOKEN,
+      fetchImpl: async (input, init) => {
+        if (!online) throw new Error("harness is offline");
+        if (String(input).endsWith("/v1/application-model")) {
+          mirroredModels.push(JSON.parse(String(init?.body)).model);
+        }
+        if (String(input).endsWith("/v1/gmail-auth")) {
+          return Response.json({ state: "disconnected" });
+        }
+        return new Response(null, { status: 204 });
+      },
+    });
+    const fixture = createFixture(false, { applicationHarness: harness, useDefaultAuth: true });
+    const model = () => fixture.app.fetch(new Request("http://127.0.0.1:3457/v1/auth/application-model"));
+    try {
+      expect((await model()).status).toBe(503);
+      await expect(fixture.app.services.auth.getAuthStatus()).rejects.toThrow(
+        "The local application service is unavailable",
+      );
+      online = true;
+      const response = await model();
+      expect(response.status).toBe(200);
+      expect(mirroredModels).toEqual([(await response.json()).model]);
+    } finally {
+      await fixture.app.close();
+      if (previousDatabase === undefined) delete process.env.JOBHUNT_AUTH_DATABASE;
+      else process.env.JOBHUNT_AUTH_DATABASE = previousDatabase;
+    }
   });
 
   test("synchronizes persisted and updated application models with the harness", async () => {

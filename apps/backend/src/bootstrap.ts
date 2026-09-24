@@ -7,6 +7,7 @@ import {
   type ApplicationSessionRouteService,
 } from "./api/application-session-routes.ts";
 import {
+  ApplicationHarnessError,
   HttpApplicationHarnessClient,
   type ApplicationHarnessClient,
   type GmailAuthHarnessClient,
@@ -16,7 +17,7 @@ import {
 import { ApplicationSessionService } from "./api/application-session-service.ts";
 import { createAuthRoutes, type AuthRouteService } from "./api/auth-routes.ts";
 import { createContextRoutes, type ContextRouteService } from "./api/context-routes.ts";
-import { createApiHandler, type ApiRequestContext } from "./api/handler.ts";
+import { apiResponse, createApiHandler, type ApiRequestContext } from "./api/handler.ts";
 import { createRunRoutes } from "./api/run-routes.ts";
 import {
   createSourceHandoffRoutes,
@@ -38,6 +39,7 @@ import { openPipelineDatabase } from "./db/database.ts";
 import { PipelineRepository } from "./db/repository.ts";
 import { ApplicationModelIdSchema } from "./contracts/index.ts";
 import { ArtifactStore } from "./system/artifacts.ts";
+import { resolveBrowserHarnessToken } from "./system/harness-token.ts";
 import {
   createPipelineWorkerRuntime,
   type PipelineWorkerRuntimeOptions,
@@ -188,10 +190,9 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   const webOrigin = validateWebOrigin(
     options.webOrigin ?? process.env.JOBHUNT_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
   );
-  const browserHarnessToken = options.browserHarnessToken ?? process.env.JOBHUNT_HARNESS_TOKEN;
-  if (browserHarnessToken !== undefined && browserHarnessToken.length < 32) {
-    throw new Error("JOBHUNT_HARNESS_TOKEN must contain at least 32 characters");
-  }
+  const browserHarnessToken = resolveBrowserHarnessToken({
+    JOBHUNT_HARNESS_TOKEN: options.browserHarnessToken ?? process.env.JOBHUNT_HARNESS_TOKEN,
+  });
   const artifacts = options.artifacts ?? new ArtifactStore();
   const pipelineDatabase = options.pipelineDatabase ?? (options.repository ? undefined : openPipelineDatabase());
   const repository = options.repository ?? new PipelineRepository(pipelineDatabase!);
@@ -270,13 +271,15 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
   let harnessReady: Promise<void> | undefined;
   const ensureHarnessReady = (): Promise<void> => {
     if (modelAuthHarness === undefined) return Promise.resolve();
-    harnessReady ??= Promise.all([
-      auth.getAuthStatus(),
-      modelAuthHarness.setApplicationModel(
+    harnessReady ??= Promise.resolve(auth.getAuthStatus())
+      .then(() => modelAuthHarness.setApplicationModel(
         repository.getApplicationModel(defaultApplicationModel),
         AbortSignal.timeout(10_000),
-      ),
-    ]).then(() => undefined);
+      ))
+      .catch((error: unknown) => {
+        harnessReady = undefined;
+        throw error;
+      });
     return harnessReady;
   };
 
@@ -299,7 +302,26 @@ export function createPipelineApplication(options: PipelineApplicationOptions = 
     internalRoute: routeApplicationSubmissions,
     webOrigin,
     route: async (request, url, context) => {
-      await ensureHarnessReady();
+      // Context and run management must remain available when the optional harness is offline.
+      if (
+        url.pathname === "/v1/auth"
+        || url.pathname.startsWith("/v1/auth/")
+        || (request.method === "POST" && /^\/v1\/runs\/[^/]+\/application(?:\/retry)?$/.test(url.pathname))
+      ) {
+        try {
+          await ensureHarnessReady();
+        } catch (error) {
+          if (error instanceof ApplicationHarnessError) {
+            if (error.code === "unavailable") {
+              return apiResponse.error("APPLICATION_HARNESS_UNAVAILABLE", error.message, 503);
+            }
+            if (error.code === "unauthorized") {
+              return apiResponse.error("HARNESS_AUTH_FAILED", error.message, 502);
+            }
+          }
+          throw error;
+        }
+      }
       return (await routeAuth(request, url))
       ?? (await routeContext(request, url))
       ?? (await routeApplicationSessions(request, url))

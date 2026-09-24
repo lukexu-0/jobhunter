@@ -275,8 +275,16 @@ export function createManagedAuthService(
   const service = (): Promise<AuthService> => {
     servicePromise ??= getAuthStorage().then(async (storage) => {
       const authService = new AuthService(storage, dependencies);
-      await authService.synchronizeModelCredentials();
-      return authService;
+      try {
+        await authService.synchronizeModelCredentials();
+        return authService;
+      } catch (error) {
+        await authService.close();
+        throw error;
+      }
+    }).catch((error: unknown) => {
+      servicePromise = undefined;
+      throw error;
     });
     return servicePromise;
   };
