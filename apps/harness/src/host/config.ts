@@ -1,4 +1,4 @@
-import { access, open, realpath, stat } from "node:fs/promises";
+import { access, realpath, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, delimiter, join, resolve } from "node:path";
 
@@ -112,56 +112,6 @@ function loopbackOrigin(value: string, name: string): string {
   }
   return `http://${url.host.toLowerCase()}`;
 }
-async function defaultToken(path: string): Promise<string> {
-  let handle;
-  try {
-    handle = await open(
-      path,
-      fsConstants.O_RDONLY |
-        ((fsConstants as Record<string, number>).O_CLOEXEC ?? 0) |
-        fsConstants.O_NOFOLLOW |
-        fsConstants.O_NONBLOCK,
-    );
-  } catch (error) {
-    const code = error instanceof Error && "code" in error ? error.code : undefined;
-    if (code === "ENOENT") throw new ConfigParseError(`default token file does not exist: ${path}`);
-    if (code === "ELOOP") throw new ConfigParseError(`default token path must not be a symbolic link: ${path}`);
-    throw new ConfigParseError(`default token file could not be read: ${path}`);
-  }
-  try {
-    const details = await handle.stat();
-    if (!details.isFile()) throw new ConfigParseError(`default token path must be a regular file: ${path}`);
-    if ((details.mode & 0o077) !== 0) {
-      throw new ConfigParseError(`default token file must not grant group or other permissions: ${path}`);
-    }
-    if (details.size > 4_096) throw new ConfigParseError(`default token file must not exceed 4096 bytes: ${path}`);
-    const bytes = Buffer.alloc(4_097);
-    let bytesRead = 0;
-    while (bytesRead < bytes.length) {
-      const result = await handle.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead);
-      if (result.bytesRead === 0) break;
-      bytesRead += result.bytesRead;
-    }
-    if (bytesRead > 4_096) throw new ConfigParseError(`default token file must not exceed 4096 bytes: ${path}`);
-    let token: string;
-    try {
-      token = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, bytesRead));
-    } catch {
-      throw new ConfigParseError(`default token file must contain UTF-8 text: ${path}`);
-    }
-    if (token.startsWith("\ufeff")) token = token.slice(1);
-    token = token.trim();
-    if ([...token].length < 32) {
-      throw new ConfigParseError(`default token file must contain at least 32 characters: ${path}`);
-    }
-    return token;
-  } catch (error) {
-    if (error instanceof ConfigParseError) throw error;
-    throw new ConfigParseError(`default token file could not be read: ${path}`);
-  } finally {
-    await handle.close().catch(() => {});
-  }
-}
 
 export async function parseHarnessConfig(
   argv: readonly string[],
@@ -182,15 +132,9 @@ export async function parseHarnessConfig(
   }
   const home = env.HOME;
   if (!home) throw new ConfigParseError("HOME is unavailable");
-  const explicitToken = env.JOBHUNT_HARNESS_TOKEN;
-  let token: string;
-  if (explicitToken !== undefined) {
-    if ([...explicitToken].length < 32) {
-      throw new ConfigParseError("JOBHUNT_HARNESS_TOKEN must be configured with at least 32 characters");
-    }
-    token = explicitToken;
-  } else {
-    token = await defaultToken(resolve(home, ".jobhunt/browser-harness/token"));
+  const token = env.JOBHUNT_HARNESS_TOKEN;
+  if (token == null || [...token].length < 32) {
+    throw new ConfigParseError("JOBHUNT_HARNESS_TOKEN must be configured with at least 32 characters");
   }
   const configuredNode = values.get("--node-executable");
   const node = configuredNode == null

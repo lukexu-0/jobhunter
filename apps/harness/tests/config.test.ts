@@ -85,19 +85,20 @@ describe("harness configuration", () => {
       gmailVerificationTimeout: 240,
     });
   });
-  test("loads a private default token after removing BOM and outer whitespace", async () => {
+  test("requires an explicit token even when HOME contains a private token file", async () => {
     const { root, node, script, env } = await fixture();
     delete env.JOBHUNT_HARNESS_TOKEN;
     const directory = join(root, ".jobhunt/browser-harness");
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await writeFile(join(directory, "token"), `\ufeff \n\t${"😀".repeat(32)}\t \n`, { mode: 0o600 });
+    await writeFile(join(directory, "token"), TOKEN, { mode: 0o600 });
 
-    const parsed = await parseHarnessConfig(
+    const parsed = parseHarnessConfig(
       [...runtimeArgs(node, script), "--cdp-url", "http://127.0.0.1:9222"],
       env,
     );
 
-    expect(parsed.config.bearerToken).toBe("😀".repeat(32));
+    await expect(parsed).rejects.toBeInstanceOf(ConfigParseError);
+    await expect(parsed).rejects.toThrow("JOBHUNT_HARNESS_TOKEN must be configured with at least 32 characters");
   });
   test("rejects unknown options and long-option abbreviations without exposing values", async () => {
     const { node, script, env } = await fixture();
@@ -144,28 +145,6 @@ describe("harness configuration", () => {
     expect(parsed.config.playwrightCliScript).toBe(
       join(process.cwd(), "node_modules/@playwright/cli/playwright-cli.js"),
     );
-  });
-  test("fails closed on unsafe or malformed default token files", async () => {
-    const { root, node, script, env } = await fixture();
-    delete env.JOBHUNT_HARNESS_TOKEN;
-    const directory = join(root, ".jobhunt/browser-harness");
-    const tokenPath = join(directory, "token");
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const argv = [...runtimeArgs(node, script), "--cdp-url", "http://127.0.0.1:9222"];
-
-    await writeFile(tokenPath, TOKEN, { mode: 0o640 });
-    await expect(parseHarnessConfig(argv, env)).rejects.toThrow("must not grant group or other permissions");
-    await rm(tokenPath);
-    await writeFile(join(root, "token-target"), TOKEN, { mode: 0o600 });
-    await symlink(join(root, "token-target"), tokenPath);
-    await expect(parseHarnessConfig(argv, env)).rejects.toThrow("must not be a symbolic link");
-    await rm(tokenPath);
-    await writeFile(tokenPath, "private-prefix" + "x".repeat(4_100), { mode: 0o600 });
-    const oversized = parseHarnessConfig(argv, env);
-    await expect(oversized).rejects.toThrow("must not exceed 4096 bytes");
-    await expect(oversized).rejects.not.toThrow("private-prefix");
-    await writeFile(tokenPath, new Uint8Array([...new TextEncoder().encode("x".repeat(32)), 0xff]), { mode: 0o600 });
-    await expect(parseHarnessConfig(argv, env)).rejects.toThrow("must contain UTF-8 text");
   });
 
   test("rejects non-loopback endpoints, out-of-range integers, and mixed browser modes", async () => {
