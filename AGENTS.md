@@ -64,7 +64,7 @@ make test-e2e      # web Playwright suite
 make doctor        # runtime and external-tool diagnostics
 ```
 
-`make dev` runs from `apps/` so Bun loads `apps/.env.local`. Start `make harness` separately from the repository root; it requires the same `JOBHUNT_HARNESS_TOKEN` as the pipeline.
+`make dev` runs from `apps/` so Bun loads `apps/.env.local`. Start `make harness` separately from the repository root; configure the same `JOBHUNT_HARNESS_TOKEN` (at least 32 characters) explicitly for the pipeline and harness. The pipeline does not inherit a token from `~/.jobhunt/browser-harness/token`.
 
 Useful narrow checks:
 

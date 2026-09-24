@@ -95,7 +95,7 @@ export function startPipelineHttpServer(
 
 export async function main(): Promise<void> {
   bootstrapAgentRuntime();
-  const browserHarnessToken = await resolveBrowserHarnessToken();
+  const browserHarnessToken = resolveBrowserHarnessToken();
   const port = resolvePipelinePort(process.env.JOBHUNT_PIPELINE_PORT);
   const app = createPipelineApplication(
     browserHarnessToken === undefined ? {} : { browserHarnessToken },
