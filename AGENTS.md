@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+**READ `architecture.md` BEFORE MAKING CHANGES; IT DOCUMENTS THE SYSTEM BOUNDARIES, BENEFITS, AND KNOWN RISKS.**
+
 ## Project Overview
 
 Jobhunt is a local-first job-application system. It imports job details, analyzes fit, tailors and compiles a resume, runs deterministic and visual QA, presents the result for review, and can hand an approved run to human-gated browser automation.
